@@ -3106,6 +3106,9 @@ class HostDispatchScheduler:
                     event_log_store=self._event_log_store,
                 ),
                 wait_adapter_registry=tooling_options.wait_adapter_registry,
+                wait_activation_registry=(
+                    tooling_options.wait_activation_registry
+                ),
                 duplicate_governance_policy=(
                     tooling_options.duplicate_governance_policy
                 ),

@@ -340,9 +340,13 @@ EngineEvent ingest 校验 run / attempt / execution identity、当前 durable st
 
 ToolRuntime 把 construction-time `HostToolingOptions` 中的业务工具 bundle 与 Host framework tools 组合成 effective tool bundle，并向 Engine 提供受治理的 `ToolExecutor`。工具结果只有通过 Host accept barrier 后才会返回给 Engine；side-effect / paid tool 必须携带工具幂等键；attempt-local duplicate governance、run-scoped truncation cursor 和 optional `fetch_more` 都在 ToolRuntime 内治理。
 
+长事务工具需要启动外部工作时，业务 callable 先返回 awaiting outcome；ToolRuntime 只在 Host awaiting accept ack 已 durable 成立后，才通过 construction-time activation registry 调用 provider 内部 activation adapter。该 adapter 不进入 Engine contract，也不暴露给 LLM-facing tool schema。
+
 ### Waiting
 
 长事务工具返回 `ToolAwaitingOutcome` 时，ToolRuntime 先提交 awaiting facts；Host 在同一治理路径中创建 wait record，把 Run 推进为 `WAITING`、Attempt 推进为 `SUSPENDED`。外部结果通过 `resolve_wait` 回到 Host，Host 决定恢复、失败、取消或 lost。
+
+Engine 不拥有 wait record、activation 或外部 job 生命周期。Engine 只观察 ToolRuntime 返回的 awaiting outcome，并在本次 run 内产出诊断性的 awaiting / suspended 事件；等待真源、activation 时机和后续 resume 都由 Host / ToolRuntime 治理。
 
 ### Context governance
 

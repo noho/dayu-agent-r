@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Final
 
 import pytest
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts import (
     BatchToolExecutionContext,
     JsonValue,
@@ -20,14 +23,27 @@ from dayu.contracts import (
     ToolCancelledOutcome,
     ToolDefinition,
     ToolExecutionOutcome,
+    ToolAwaitingOutcome,
     ToolFunctionSchema,
     ToolParametersSchema,
     ToolSchema,
 )
 from dayu.engine import AgentFallbackMode, AgentPolicy
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy
-from dayu.fins.ingestion.wait_adapter import FINS_INGESTION_WAIT_ADAPTER_KEY
-from dayu.fins.tools.download_tools import DOWNLOAD_TOOL_NAME
+from dayu.fins.direct_events import FinsOperationKind
+from dayu.fins.ingestion.observation_handle import (
+    FinsObservationHandle,
+    FinsObservationSnapshot,
+    FinsObservationStatus,
+    parse_observation_handle_id_token,
+)
+from dayu.fins.ingestion.wait_adapter import (
+    FINS_INGESTION_WAIT_ADAPTER_KEY,
+    FinsIngestionWaitActivationAdapter,
+)
+from dayu.fins.ingestion_runtime import FinsIngestionRuntime
+from dayu.fins.service_runtime import DefaultFinsRuntime
+from dayu.fins.tools.download_tools import DOWNLOAD_TOOL_NAME, FinsDownloadToolCallable
 from dayu.fins.tools.preprocess_tools import PREPROCESS_TOOL_NAME
 from dayu.fins.tools.upload_tools import UPLOAD_TOOL_NAME
 from dayu.contracts.tool_await import ToolAwaitKind
@@ -40,6 +56,8 @@ from dayu.host.api import (
 from dayu.host.tool_duplicate_governance import (
     DuplicateDecisionKind,
 )
+from dayu.host.wait_adapter import WaitActivationRequest
+from dayu.host.waiting import ToolAwaitingAcceptedAck, ToolAwaitingEventRef
 from dayu.runtime.config_loader import ConfigLoader, RuntimeConfig
 from dayu.runtime.config_loader import (
     ToolDuplicateGovernanceMessagesConfig,
@@ -73,7 +91,7 @@ from dayu.service.host_assembly import (
     _resolve_prompt_asset_path,
     _resolve_project_path,
     _runner_spec_from_model,
-    _tool_discovery_specs,
+    _tool_discovery_spec,
     _tooling_options_from_discovery,
     assemble_effective_tool_provider_configs,
     compose_open_host_options,
@@ -685,6 +703,7 @@ def test_tooling_options_from_discovery_requires_source_refs() -> None:
             tool_bundle=ToolBundle(definitions=(_tool_definition("lookup_fact"),)),
             source_refs=(),
             provider_configs=(),
+            fins_awaiting_runtime=None,
             duplicate_governance_policy_config=_duplicate_governance_policy_config(),
         )
 
@@ -705,12 +724,14 @@ def test_tooling_options_without_fins_awaiting_providers_has_no_wait_adapter_reg
                 workspace_root=(tmp_path / "ordinary-workspace").resolve(strict=False),
             ),
         ),
+        fins_awaiting_runtime=None,
         duplicate_governance_policy_config=_duplicate_governance_policy_config(),
     )
 
     assert tooling_options is not None
     assert tooling_options.business_tool_bundle.definitions[0].name == "lookup_fact"
     assert tooling_options.wait_adapter_registry is None
+    assert tooling_options.wait_activation_registry is None
 
 
 def test_tooling_options_binds_fins_wait_adapter_registry_for_enabled_awaiting_providers(
@@ -719,6 +740,9 @@ def test_tooling_options_binds_fins_wait_adapter_registry_for_enabled_awaiting_p
     """Service assembly 应为启用的 Fins awaiting providers 绑定 wait adapter。"""
 
     workspace_root = (tmp_path / "fins-workspace").resolve(strict=False)
+    fins_runtime = DefaultFinsRuntime.create(
+        workspace_root=workspace_root
+    ).get_ingestion_runtime()
     tooling_options = _tooling_options_from_discovery(
         tool_bundle=ToolBundle(
             definitions=(
@@ -748,11 +772,13 @@ def test_tooling_options_binds_fins_wait_adapter_registry_for_enabled_awaiting_p
                 workspace_root=workspace_root,
             ),
         ),
+        fins_awaiting_runtime=fins_runtime,
         duplicate_governance_policy_config=_duplicate_governance_policy_config(),
     )
 
     assert tooling_options is not None
     assert tooling_options.wait_adapter_registry is not None
+    assert tooling_options.wait_activation_registry is not None
     download_binding = tooling_options.wait_adapter_registry.resolve_binding(
         tool_name=DOWNLOAD_TOOL_NAME,
         await_kind=ToolAwaitKind.EXTERNAL_JOB,
@@ -771,6 +797,79 @@ def test_tooling_options_binds_fins_wait_adapter_registry_for_enabled_awaiting_p
     assert download_binding.adapter_key == FINS_INGESTION_WAIT_ADAPTER_KEY
     assert preprocess_binding.adapter_key == FINS_INGESTION_WAIT_ADAPTER_KEY
     assert upload_binding.adapter_key == FINS_INGESTION_WAIT_ADAPTER_KEY
+    activation_adapter = tooling_options.wait_activation_registry.resolve_adapter(
+        FINS_INGESTION_WAIT_ADAPTER_KEY
+    )
+    assert isinstance(activation_adapter, FinsIngestionWaitActivationAdapter)
+    assert activation_adapter.runtime is fins_runtime
+
+
+@pytest.mark.asyncio
+async def test_service_fins_awaiting_wiring_uses_shared_runtime_for_activation(
+    tmp_path: Path,
+) -> None:
+    """Service discovery、HostToolingOptions 与 activation 必须共享 Fins runtime。"""
+
+    workspace_root = (tmp_path / "fins-workspace").resolve(strict=False)
+    provider_configs = (
+        _provider_config(
+            provider_id="financial-download-tools",
+            import_path="dayu.fins.tools.download_provider:discover_tools",
+            source_id="dayu.fins.tools.download_provider",
+            workspace_root=workspace_root,
+        ),
+    )
+    discovered_tools = discover_service_tools(provider_configs)
+
+    tooling_options = _tooling_options_from_discovery(
+        tool_bundle=discovered_tools.tool_bundle,
+        source_refs=discovered_tools.source_refs,
+        provider_configs=discovered_tools.effective_provider_configs,
+        fins_awaiting_runtime=discovered_tools.fins_awaiting_runtime,
+        duplicate_governance_policy_config=_duplicate_governance_policy_config(),
+    )
+
+    assert tooling_options is not None
+    assert tooling_options.wait_adapter_registry is not None
+    assert tooling_options.wait_activation_registry is not None
+    definition = tooling_options.business_tool_bundle.definitions[0]
+    callable_ = definition.callable
+    assert definition.name == DOWNLOAD_TOOL_NAME
+    assert isinstance(callable_, FinsDownloadToolCallable)
+    activation_adapter = tooling_options.wait_activation_registry.resolve_adapter(
+        FINS_INGESTION_WAIT_ADAPTER_KEY
+    )
+    assert isinstance(activation_adapter, FinsIngestionWaitActivationAdapter)
+    assert activation_adapter.runtime is discovered_tools.fins_awaiting_runtime
+    assert activation_adapter.runtime is callable_.runtime
+
+    outcome = await callable_(
+        _service_tool_call(
+            DOWNLOAD_TOOL_NAME,
+            {
+                "ticker": "AAPL",
+                "source": "unknown",
+            },
+        ),
+        _service_tool_context(),
+    )
+
+    assert isinstance(outcome, ToolAwaitingOutcome)
+    runtime = callable_.runtime
+    handle = _observation_handle_from_awaiting(outcome)
+    before_activation = await runtime.poll_observation(handle)
+    assert before_activation.status is FinsObservationStatus.PENDING
+
+    activation_adapter.activate_accepted_wait(
+        WaitActivationRequest(
+            tool_name=DOWNLOAD_TOOL_NAME,
+            await_spec=outcome.await_spec,
+            accepted_ack=_accepted_awaiting_ack(),
+        )
+    )
+
+    after_activation = await _wait_until_observation_leaves_pending(runtime, handle)
+    assert after_activation.status is not FinsObservationStatus.PENDING
 
 
 def test_tooling_options_skips_wait_adapter_for_missing_awaiting_tool_definition(
@@ -790,11 +889,13 @@ def test_tooling_options_skips_wait_adapter_for_missing_awaiting_tool_definition
                 workspace_root=workspace_root,
             ),
         ),
+        fins_awaiting_runtime=None,
         duplicate_governance_policy_config=_duplicate_governance_policy_config(),
     )
 
     assert tooling_options is not None
     assert tooling_options.wait_adapter_registry is None
+    assert tooling_options.wait_activation_registry is None
 
 
 def test_fins_awaiting_provider_workspace_root_mismatch_fails_before_open_host(
@@ -831,6 +932,7 @@ def test_fins_awaiting_provider_workspace_root_mismatch_fails_before_open_host(
                     workspace_root=(tmp_path / "one").resolve(strict=False),
                 ),
             ),
+            fins_awaiting_runtime=None,
             duplicate_governance_policy_config=_duplicate_governance_policy_config(),
         )
 
@@ -850,6 +952,7 @@ def test_fins_awaiting_provider_missing_workspace_root_fails_before_open_host() 
                     config={},
                 ),
             ),
+            fins_awaiting_runtime=None,
             duplicate_governance_policy_config=_duplicate_governance_policy_config(),
         )
 
@@ -869,6 +972,7 @@ def test_fins_awaiting_provider_relative_workspace_root_fails_before_open_host()
                     config={"workspace_root": "relative/fins-workspace"},
                 ),
             ),
+            fins_awaiting_runtime=None,
             duplicate_governance_policy_config=_duplicate_governance_policy_config(),
         )
 
@@ -897,6 +1001,7 @@ def test_fins_awaiting_provider_duplicate_binding_fails_before_open_host(
                     workspace_root=workspace_root,
                 ),
             ),
+            fins_awaiting_runtime=None,
             duplicate_governance_policy_config=_duplicate_governance_policy_config(),
         )
 
@@ -925,11 +1030,12 @@ def test_fins_upload_awaiting_provider_duplicate_binding_fails_before_open_host(
                     workspace_root=workspace_root,
                 ),
             ),
+            fins_awaiting_runtime=None,
             duplicate_governance_policy_config=_duplicate_governance_policy_config(),
         )
 
 
-def test_tool_discovery_specs_requires_provider_location() -> None:
+def test_tool_discovery_spec_requires_provider_location() -> None:
     """工具发现 provider 必须声明 import_path 或 entry_point。
 
     :returns: ``None``。
@@ -947,10 +1053,10 @@ def test_tool_discovery_specs_requires_provider_location() -> None:
     )
 
     with pytest.raises(ValueError, match="import_path or entry_point"):
-        _tool_discovery_specs((provider,))
+        _tool_discovery_spec(provider)
 
 
-def test_tool_discovery_specs_uses_entry_point_location() -> None:
+def test_tool_discovery_spec_uses_entry_point_location() -> None:
     """工具发现 provider 可以使用 entry point 位置。
 
     :returns: ``None``。
@@ -970,12 +1076,11 @@ def test_tool_discovery_specs_uses_entry_point_location() -> None:
         config={"provider_option": "entry"},
     )
 
-    specs = _tool_discovery_specs((provider,))
+    spec = _tool_discovery_spec(provider)
 
-    assert len(specs) == 1
-    assert specs[0].spec_id == "entry-provider"
-    assert specs[0].enabled is True
-    assert specs[0].config["provider_option"] == "entry"
+    assert spec.spec_id == "entry-provider"
+    assert spec.enabled is True
+    assert spec.config["provider_option"] == "entry"
 
 
 def test_tool_discovery_provider_config_survives_loader_and_service_mapping(
@@ -1009,11 +1114,11 @@ def test_tool_discovery_provider_config_survives_loader_and_service_mapping(
     )
 
     config = ConfigLoader(package_config_dir=package_root).load_tool_discovery()
-    specs = _tool_discovery_specs(tuple(config.providers.values()))
+    provider = config.providers["doc-tools"]
+    spec = _tool_discovery_spec(provider)
 
-    assert len(specs) == 1
-    assert specs[0].config["allowed_paths"] == ["workspace/docs"]
-    assert specs[0].config["limits"] == {"read_file_max_chars": 2048}
+    assert spec.config["allowed_paths"] == ["workspace/docs"]
+    assert spec.config["limits"] == {"read_file_max_chars": 2048}
 
 
 def test_web_tool_discovery_config_survives_service_mapping() -> None:
@@ -1042,11 +1147,10 @@ def test_web_tool_discovery_config_survives_service_mapping() -> None:
         config=web_config,
     )
 
-    specs = _tool_discovery_specs((provider,))
+    spec = _tool_discovery_spec(provider)
 
-    assert len(specs) == 1
-    assert specs[0].spec_id == "web-tools"
-    assert specs[0].config == web_config
+    assert spec.spec_id == "web-tools"
+    assert spec.config == web_config
 
 
 def test_fins_tool_discovery_spec_injects_runtime_workspace_root(
@@ -1077,10 +1181,9 @@ def test_fins_tool_discovery_spec_injects_runtime_workspace_root(
         (provider,),
         workspace_root=tmp_path,
     )
-    specs = _tool_discovery_specs(effective_providers)
+    spec = _tool_discovery_spec(effective_providers[0])
 
-    assert len(specs) == 1
-    assert specs[0].config["workspace_root"] == str(tmp_path.resolve(strict=False))
+    assert spec.config["workspace_root"] == str(tmp_path.resolve(strict=False))
     assert raw_config["workspace_root"] is None
 
 
@@ -1110,10 +1213,9 @@ def test_fins_tool_discovery_spec_preserves_explicit_workspace_root(
         (provider,),
         workspace_root=runtime_workspace,
     )
-    specs = _tool_discovery_specs(effective_providers)
+    spec = _tool_discovery_spec(effective_providers[0])
 
-    assert len(specs) == 1
-    assert specs[0].config["workspace_root"] == str(configured_workspace)
+    assert spec.config["workspace_root"] == str(configured_workspace)
 
 
 def test_fins_tool_discovery_spec_resolves_relative_workspace_root(
@@ -1141,10 +1243,9 @@ def test_fins_tool_discovery_spec_resolves_relative_workspace_root(
         (provider,),
         workspace_root=runtime_workspace,
     )
-    specs = _tool_discovery_specs(effective_providers)
+    spec = _tool_discovery_spec(effective_providers[0])
 
-    assert len(specs) == 1
-    assert specs[0].config["workspace_root"] == str(
+    assert spec.config["workspace_root"] == str(
         (runtime_workspace / "workspace").resolve(strict=False)
     )
     assert provider.config["workspace_root"] == "workspace/"
@@ -2232,6 +2333,143 @@ def _provider_config_with_config(
         enabled=True,
         config=config,
     )
+
+
+def _service_tool_call(
+    tool_name: str,
+    arguments: dict[str, JsonValue],
+) -> ToolCallRequest:
+    """构造 Service assembly focused 测试用工具调用请求。
+
+    :param tool_name: 工具名。
+    :param arguments: 工具参数。
+    :returns: 工具调用请求。
+    :raises ValueError: 请求字段非法时由契约构造抛出。
+    """
+
+    return ToolCallRequest(
+        tool_call_id=f"call-{tool_name}",
+        name=tool_name,
+        arguments=arguments,
+        index_in_iteration=0,
+        provider_state=None,
+    )
+
+
+def _service_tool_context() -> BatchToolExecutionContext:
+    """构造 Service assembly focused 测试用批执行上下文。
+
+    :returns: 批执行上下文。
+    :raises ValueError: 上下文字段非法时由契约构造抛出。
+    """
+
+    return BatchToolExecutionContext(
+        run_id="run-service-fins-awaiting",
+        session_id="session-service-fins-awaiting",
+        iteration_id="iteration-service-fins-awaiting",
+        timeout_seconds=30.0,
+        cancellation_token=_OpenCancellationToken(),
+        correlation_id="correlation-service-fins-awaiting",
+    )
+
+
+def _observation_handle_from_awaiting(
+    outcome: ToolAwaitingOutcome,
+) -> FinsObservationHandle:
+    """从 awaiting outcome 恢复测试观察用 Fins handle。
+
+    :param outcome: Fins awaiting 工具返回的 outcome。
+    :returns: Fins observation handle。
+    :raises ValueError: resume token 非法时抛出。
+    """
+
+    return FinsObservationHandle(
+        handle_id=parse_observation_handle_id_token(outcome.await_spec.resume_token),
+        operation_kind=FinsOperationKind.DOWNLOAD,
+        created_at=datetime.now(timezone.utc),
+    )
+
+
+async def _wait_until_observation_leaves_pending(
+    runtime: FinsIngestionRuntime,
+    handle: FinsObservationHandle,
+) -> FinsObservationSnapshot:
+    """等待 observation 被 activation 提交并离开 prepared 状态。
+
+    :param runtime: Fins ingestion runtime。
+    :param handle: observation handle。
+    :returns: observation snapshot。
+    :raises AssertionError: observation 在限定时间内仍停留在 ``PENDING`` 时抛出。
+    """
+
+    last_snapshot = await runtime.poll_observation(handle)
+    for _ in range(100):
+        if last_snapshot.status is not FinsObservationStatus.PENDING:
+            return last_snapshot
+        await asyncio.sleep(0.01)
+        last_snapshot = await runtime.poll_observation(handle)
+    raise AssertionError("Fins observation did not leave PENDING after activation")
+
+
+def _accepted_awaiting_ack() -> ToolAwaitingAcceptedAck:
+    """构造测试用 Host awaiting accepted ack。
+
+    :returns: accepted ack。
+    :raises ValueError: ack 字段非法时由契约构造抛出。
+    """
+
+    tool_ref = ToolAwaitingEventRef(
+        event_id="event-service-tool-awaiting",
+        event_sequence=1,
+    )
+    run_ref = ToolAwaitingEventRef(
+        event_id="event-service-run-waiting",
+        event_sequence=2,
+    )
+    attempt_ref = ToolAwaitingEventRef(
+        event_id="event-service-attempt-suspended",
+        event_sequence=3,
+    )
+    return ToolAwaitingAcceptedAck(
+        accepted_event_refs=(tool_ref, run_ref, attempt_ref),
+        wait_id="wait-service-fins-awaiting",
+        tool_awaiting_event_ref=tool_ref,
+        run_waiting_event_ref=run_ref,
+        attempt_suspended_event_ref=attempt_ref,
+        result_digest="digest-service-fins-awaiting",
+        idempotency_record_ref="idempotency-service-fins-awaiting",
+    )
+
+
+class _OpenCancellationToken(CancellationToken):
+    """测试用未取消 token。"""
+
+    def is_cancelled(self) -> bool:
+        """返回是否已取消。
+
+        :returns: 始终返回 ``False``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return False
+
+    def cancel_reason(self) -> str | None:
+        """返回取消原因。
+
+        :returns: 始终返回 ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return None
+
+    def requested_at(self) -> datetime | None:
+        """返回取消请求时间戳。
+
+        :returns: 始终返回 ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return None
 
 
 def _write_json(path: Path, value: JsonValue) -> None:

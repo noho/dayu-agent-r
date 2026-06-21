@@ -195,6 +195,20 @@ class FinsObservationRuntime(Protocol):
         """
         ...
 
+    def prepare_observed_download(
+        self,
+        request: FinsDownloadRequest,
+        cancellation_token: CancellationToken,
+    ) -> FinsObservationHandle:
+        """登记可观察 download operation，但不启动后台执行。
+
+        :param request: Fins download typed request。
+        :param cancellation_token: operation-scoped 取消观察 token。
+        :returns: lightweight observation handle。
+        :raises Exception: prepare 失败时由实现抛出。
+        """
+        ...
+
     def start_observed_preprocess(
         self,
         request: FinsPreprocessRequest,
@@ -209,6 +223,20 @@ class FinsObservationRuntime(Protocol):
         """
         ...
 
+    def prepare_observed_preprocess(
+        self,
+        request: FinsPreprocessRequest,
+        cancellation_token: CancellationToken,
+    ) -> FinsObservationHandle:
+        """登记可观察 preprocess operation，但不启动后台执行。
+
+        :param request: Fins preprocess typed request。
+        :param cancellation_token: operation-scoped 取消观察 token。
+        :returns: lightweight observation handle。
+        :raises Exception: prepare 失败时由实现抛出。
+        """
+        ...
+
     def start_observed_upload(
         self,
         request: FinsUploadRequest,
@@ -220,6 +248,29 @@ class FinsObservationRuntime(Protocol):
         :param cancellation_token: operation-scoped 取消观察 token。
         :returns: lightweight observation handle。
         :raises Exception: 启动失败时由实现抛出。
+        """
+        ...
+
+    def prepare_observed_upload(
+        self,
+        request: FinsUploadRequest,
+        cancellation_token: CancellationToken,
+    ) -> FinsObservationHandle:
+        """登记可观察 upload operation，但不启动后台执行。
+
+        :param request: Fins upload typed request。
+        :param cancellation_token: operation-scoped 取消观察 token。
+        :returns: lightweight observation handle。
+        :raises Exception: prepare 失败时由实现抛出。
+        """
+        ...
+
+    def activate_observation(self, handle: FinsObservationHandle) -> None:
+        """激活已登记的可观察 operation。
+
+        :param handle: lightweight observation handle。
+        :returns: ``None``。
+        :raises Exception: activation 失败时由实现抛出。
         """
         ...
 

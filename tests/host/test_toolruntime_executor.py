@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 from collections.abc import Mapping
 from datetime import datetime
+from typing import cast
 
 import pytest
 
@@ -77,6 +79,9 @@ from dayu.host.tool_runtime import (
     TruncationManager,
 )
 from dayu.host.wait_adapter import (
+    WaitActivationAdapterRegistration,
+    WaitActivationRegistry,
+    WaitActivationRequest,
     WaitAdapterBinding,
     WaitAdapterRegistry,
     WaitExternalJobRefSource,
@@ -152,6 +157,51 @@ class _AlreadyCancelledToken:
         """
 
         return "test_cancel"
+
+    def requested_at(self) -> datetime | None:
+        """返回取消请求时间。
+
+        :returns: 本测试不关心请求时间，返回 ``None``。
+        """
+
+        return None
+
+
+class _MutableCancellationToken:
+    """测试用可翻转取消 token。"""
+
+    def __init__(self) -> None:
+        """初始化未取消 token。
+
+        :returns: ``None``。
+        """
+
+        self._cancel_reason: str | None = None
+
+    def cancel(self, reason: str) -> None:
+        """请求取消。
+
+        :param reason: 取消原因。
+        :returns: ``None``。
+        """
+
+        self._cancel_reason = reason
+
+    def is_cancelled(self) -> bool:
+        """返回是否已取消。
+
+        :returns: 已调用 ``cancel`` 时返回 ``True``。
+        """
+
+        return self._cancel_reason is not None
+
+    def cancel_reason(self) -> str | None:
+        """返回取消原因。
+
+        :returns: 已取消时返回取消原因，否则返回 ``None``。
+        """
+
+        return self._cancel_reason
 
     def requested_at(self) -> datetime | None:
         """返回取消请求时间。
@@ -466,6 +516,34 @@ class _AwaitingAcceptPort(HostToolAwaitingAcceptPort):
         )
 
 
+class _CancellingAwaitingAcceptPort(HostToolAwaitingAcceptPort):
+    """返回 accepted ack 后立即翻转取消 token 的 fake port。"""
+
+    def __init__(self, cancellation_token: _MutableCancellationToken) -> None:
+        """初始化 fake awaiting accept port。
+
+        :param cancellation_token: accepted ack 后需要翻转的取消 token。
+        :returns: ``None``。
+        """
+
+        self._cancellation_token = cancellation_token
+        self.candidates: list[ToolAwaitingAcceptCandidate] = []
+
+    def accept_tool_awaiting(
+        self, candidate: ToolAwaitingAcceptCandidate
+    ) -> ToolAwaitingAcceptResult:
+        """记录 candidate、返回 accepted ack，并模拟随后发生的取消。
+
+        :param candidate: awaiting candidate。
+        :returns: accepted ack。
+        """
+
+        self.candidates.append(candidate)
+        ack = _awaiting_accepted_ack(candidate.wait_id)
+        self._cancellation_token.cancel("cancel-after-awaiting-accept")
+        return ack
+
+
 class _SequencedAwaitingAcceptPort(HostToolAwaitingAcceptPort):
     """按序返回 awaiting accept 结果的 fake port。"""
 
@@ -527,6 +605,32 @@ class _TimeoutAwaitingAcceptPort(HostToolAwaitingAcceptPort):
 
         del candidate
         raise TimeoutError("sync awaiting timeout should not be caught")
+
+
+class _SpyWaitActivationAdapter:
+    """记录 accepted wait activation 请求的测试 adapter。"""
+
+    def __init__(self, failure: Exception | None = None) -> None:
+        """初始化 spy adapter。
+
+        :param failure: 可选的 activation 异常。
+        :returns: ``None``。
+        """
+
+        self._failure = failure
+        self.requests: list[WaitActivationRequest] = []
+
+    def activate_accepted_wait(self, request: WaitActivationRequest) -> None:
+        """记录 activation 请求，并按需抛出脚本化异常。
+
+        :param request: accepted wait activation 请求。
+        :returns: ``None``。
+        :raises Exception: 初始化传入 failure 时抛出该异常。
+        """
+
+        self.requests.append(request)
+        if self._failure is not None:
+            raise self._failure
 
 
 @pytest.mark.asyncio
@@ -1004,7 +1108,12 @@ async def test_tool_runtime_pre_cancelled_context_returns_governed_failure() -> 
 
     callable_ = _CountingCallable({"secret": "must-not-run"})
     accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
-    executor = _executor(callable_, accept_port)
+    activation_adapter = _SpyWaitActivationAdapter()
+    executor = _executor(
+        callable_,
+        accept_port,
+        wait_activation_registry=_wait_activation_registry(activation_adapter),
+    )
 
     outcome = await executor.execute(
         _request(_call("tool-call-1"), cancellation_token=_AlreadyCancelledToken())
@@ -1020,6 +1129,7 @@ async def test_tool_runtime_pre_cancelled_context_returns_governed_failure() -> 
     assert record.outcome.result.error == "tool_call_governed"
     assert record.outcome.result.hint == "tool_runtime_cancelled"
     assert "must-not-run" not in record.outcome.result.message
+    assert activation_adapter.requests == []
 
 
 @pytest.mark.asyncio
@@ -1055,11 +1165,13 @@ async def test_awaiting_outcome_returns_only_after_awaiting_accepted_ack(
     callable_ = _AwaitingCallable()
     accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
     awaiting_accept_port = _AwaitingAcceptPort()
+    activation_adapter = _SpyWaitActivationAdapter()
     executor = _executor(
         callable_,
         accept_port,
         awaiting_accept_port=awaiting_accept_port,
         wait_adapter_registry=_wait_adapter_registry(),
+        wait_activation_registry=_wait_activation_registry(activation_adapter),
     )
 
     outcome = await executor.execute(_request(_call("tool-call-1")))
@@ -1073,7 +1185,105 @@ async def test_awaiting_outcome_returns_only_after_awaiting_accepted_ack(
     assert awaiting_accept_port.candidates[0].external_job_ref.external_job_id == (
         "resume-token"
     )
+    assert len(activation_adapter.requests) == 1
+    assert activation_adapter.requests[0].tool_name == "fake_tool"
+    assert activation_adapter.requests[0].await_spec.resume_token == "resume-token"
+    assert activation_adapter.requests[0].accepted_ack.wait_id == (
+        awaiting_accept_port.candidates[0].wait_id
+    )
     assert recorded_reasons == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_awaiting_accept_skips_activation() -> None:
+    """awaiting accept 返回 accepted 后若取消，不能再触发 activation。"""
+
+    cancellation_token = _MutableCancellationToken()
+    callable_ = _AwaitingCallable()
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    awaiting_accept_port = _CancellingAwaitingAcceptPort(cancellation_token)
+    activation_adapter = _SpyWaitActivationAdapter()
+    executor = _executor(
+        callable_,
+        accept_port,
+        awaiting_accept_port=awaiting_accept_port,
+        wait_adapter_registry=_wait_adapter_registry(),
+        wait_activation_registry=_wait_activation_registry(activation_adapter),
+    )
+
+    outcome = await executor.execute(
+        _request(_call("tool-call-1"), cancellation_token=cancellation_token)
+    )
+
+    record = outcome.records[0]
+    assert callable_.call_count == 1
+    assert len(awaiting_accept_port.candidates) == 1
+    assert cancellation_token.is_cancelled()
+    assert isinstance(record.outcome, ToolAwaitingOutcome)
+    assert activation_adapter.requests == []
+
+
+@pytest.mark.asyncio
+async def test_awaiting_activation_failure_keeps_accepted_awaiting_outcome(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """activation adapter 异常只产生有界诊断，不覆盖 accepted awaiting。"""
+
+    callable_ = _AwaitingCallable()
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    awaiting_accept_port = _AwaitingAcceptPort()
+    diagnostics = InMemoryToolTraceDiagnosticEmitter()
+    activation_adapter = _SpyWaitActivationAdapter(
+        RuntimeError("raw-provider-job-secret")
+    )
+    executor = _executor(
+        callable_,
+        accept_port,
+        awaiting_accept_port=awaiting_accept_port,
+        wait_adapter_registry=_wait_adapter_registry(),
+        wait_activation_registry=_wait_activation_registry(activation_adapter),
+        diagnostic_emitter=diagnostics,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="dayu.host.tool_runtime"):
+        outcome = await executor.execute(_request(_call("tool-call-1")))
+
+    record = outcome.records[0]
+    assert isinstance(record.outcome, ToolAwaitingOutcome)
+    assert len(activation_adapter.requests) == 1
+    assert len(diagnostics.records) == 1
+    assert diagnostics.records[0].reason_code == "wait_activation_failed"
+    assert "RuntimeError" in diagnostics.records[0].message
+    assert "raw-provider-job-secret" not in diagnostics.records[0].message
+    assert "RuntimeError" in caplog.text
+    assert _SESSION_ID in caplog.text
+    assert _RUN_ID in caplog.text
+    assert _ATTEMPT_ID in caplog.text
+    assert "fake_tool" in caplog.text
+    assert "poll:fake-tool" in caplog.text
+    assert "raw-provider-job-secret" not in caplog.text
+
+
+def test_wait_activation_request_rejects_empty_tool_name() -> None:
+    """WaitActivationRequest 拒绝空工具名。"""
+
+    with pytest.raises(ValueError, match="tool_name"):
+        WaitActivationRequest(
+            tool_name=" ",
+            await_spec=_external_job_await_spec(),
+            accepted_ack=_awaiting_accepted_ack("wait-validation"),
+        )
+
+
+def test_wait_activation_request_rejects_invalid_await_spec() -> None:
+    """WaitActivationRequest 拒绝非法等待规约对象。"""
+
+    with pytest.raises(ValueError, match="await_spec"):
+        WaitActivationRequest(
+            tool_name="fake_tool",
+            await_spec=cast(ToolAwaitSpec, "invalid-await-spec"),
+            accepted_ack=_awaiting_accepted_ack("wait-validation"),
+        )
 
 
 @pytest.mark.asyncio
@@ -1133,11 +1343,13 @@ async def test_awaiting_marker_failure_keeps_owner_outcome_and_suppresses_cleanu
     accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
     awaiting_accept_port = _AwaitingAcceptPort()
     diagnostics = InMemoryToolTraceDiagnosticEmitter()
+    activation_adapter = _SpyWaitActivationAdapter()
     executor = _executor(
         callable_,
         accept_port,
         awaiting_accept_port=awaiting_accept_port,
         wait_adapter_registry=_wait_adapter_registry(),
+        wait_activation_registry=_wait_activation_registry(activation_adapter),
         diagnostic_emitter=diagnostics,
     )
 
@@ -1154,6 +1366,7 @@ async def test_awaiting_marker_failure_keeps_owner_outcome_and_suppresses_cleanu
     assert diagnostics.records[0].reason_code == "duplicate_awaiting_marker_failed"
     assert "marker write failed" not in diagnostics.records[0].message
     assert awaiting_accept_port.candidates[0].wait_id not in diagnostics.records[0].message
+    assert len(activation_adapter.requests) == 1
 
 
 @pytest.mark.asyncio
@@ -1162,7 +1375,12 @@ async def test_awaiting_outcome_without_adapter_binding_is_governed_error() -> N
 
     callable_ = _AwaitingCallable()
     accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
-    executor = _executor(callable_, accept_port)
+    activation_adapter = _SpyWaitActivationAdapter()
+    executor = _executor(
+        callable_,
+        accept_port,
+        wait_activation_registry=_wait_activation_registry(activation_adapter),
+    )
 
     outcome = await executor.execute(_request(_call("tool-call-1")))
 
@@ -1171,6 +1389,7 @@ async def test_awaiting_outcome_without_adapter_binding_is_governed_error() -> N
     assert accept_port.candidates == []
     assert isinstance(record.outcome, ToolFailedOutcome)
     assert record.outcome.result.hint == "awaiting_adapter_not_configured"
+    assert activation_adapter.requests == []
 
 
 @pytest.mark.asyncio
@@ -1204,6 +1423,7 @@ async def test_awaiting_accept_rejected_returns_governed_error(
     )
     callable_ = _AwaitingCallable()
     accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    activation_adapter = _SpyWaitActivationAdapter()
     awaiting_accept_port = _SequencedAwaitingAcceptPort(
         (
             ToolAwaitingRejectedAck(
@@ -1218,6 +1438,7 @@ async def test_awaiting_accept_rejected_returns_governed_error(
         accept_port,
         awaiting_accept_port=awaiting_accept_port,
         wait_adapter_registry=_wait_adapter_registry(),
+        wait_activation_registry=_wait_activation_registry(activation_adapter),
     )
 
     outcome = await executor.execute(_request(_call("tool-call-1")))
@@ -1227,6 +1448,66 @@ async def test_awaiting_accept_rejected_returns_governed_error(
     assert record.outcome.result.error == "tool_awaiting_accept_rejected"
     assert record.outcome.result.hint == "accept_rejected:idempotency_conflict"
     assert recorded_reasons == [DuplicateDurableMissingReason.HOST_ACCEPT_REJECTED]
+    assert activation_adapter.requests == []
+
+
+@pytest.mark.asyncio
+async def test_stale_execution_awaiting_rejection_does_not_activate_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host stale execution 拒绝 awaiting accept 时不得执行 activation。"""
+
+    recorded_reasons: list[DuplicateDurableMissingReason] = []
+
+    async def _record_durable_missing(
+        self: InMemoryAttemptDuplicateGovernance,
+        request: DuplicateGovernanceRequest,
+        reason: DuplicateDurableMissingReason,
+    ) -> None:
+        """记录测试观察到的 durable-missing cleanup。
+
+        :param self: duplicate governance 实例。
+        :param request: duplicate governance 查询。
+        :param reason: durable missing 原因。
+        :returns: ``None``。
+        """
+
+        del self, request
+        recorded_reasons.append(reason)
+
+    monkeypatch.setattr(
+        InMemoryAttemptDuplicateGovernance,
+        "record_durable_missing",
+        _record_durable_missing,
+    )
+    callable_ = _AwaitingCallable()
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    activation_adapter = _SpyWaitActivationAdapter()
+    awaiting_accept_port = _SequencedAwaitingAcceptPort(
+        (
+            ToolAwaitingRejectedAck(
+                reason_code=ToolAwaitingAcceptRejectReason.STALE_EXECUTION,
+                message="stale execution",
+                retryable=False,
+            ),
+        )
+    )
+    executor = _executor(
+        callable_,
+        accept_port,
+        awaiting_accept_port=awaiting_accept_port,
+        wait_adapter_registry=_wait_adapter_registry(),
+        wait_activation_registry=_wait_activation_registry(activation_adapter),
+    )
+
+    outcome = await executor.execute(_request(_call("tool-call-1")))
+
+    record = outcome.records[0]
+    assert isinstance(record.outcome, ToolFailedOutcome)
+    assert record.outcome.result.error == "tool_awaiting_accept_rejected"
+    assert record.outcome.result.hint == "accept_rejected:stale_execution"
+    assert recorded_reasons == [DuplicateDurableMissingReason.HOST_ACCEPT_REJECTED]
+    assert activation_adapter.requests == []
 
 
 @pytest.mark.asyncio
@@ -1260,6 +1541,7 @@ async def test_awaiting_accept_timeout_returns_governed_error(
     )
     callable_ = _AwaitingCallable()
     accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    activation_adapter = _SpyWaitActivationAdapter()
     awaiting_accept_port = _SequencedAwaitingAcceptPort(
         (
             ToolAwaitingAcceptTimedOut(
@@ -1273,6 +1555,7 @@ async def test_awaiting_accept_timeout_returns_governed_error(
         accept_port,
         awaiting_accept_port=awaiting_accept_port,
         wait_adapter_registry=_wait_adapter_registry(),
+        wait_activation_registry=_wait_activation_registry(activation_adapter),
     )
 
     outcome = await executor.execute(_request(_call("tool-call-1")))
@@ -1284,6 +1567,7 @@ async def test_awaiting_accept_timeout_returns_governed_error(
     assert record.outcome.result.hint.startswith("accept_ack_lost;diagnostic_refs=")
     assert "tool-diagnostic-" in record.outcome.result.hint
     assert recorded_reasons == [DuplicateDurableMissingReason.HOST_ACCEPT_TIMEOUT]
+    assert activation_adapter.requests == []
 
 
 @pytest.mark.asyncio
@@ -1294,11 +1578,13 @@ async def test_awaiting_accept_retry_exhaustion_emits_diagnostic_ref() -> None:
     accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
     awaiting_accept_port = _RetryExhaustedAwaitingAcceptPort()
     diagnostics = InMemoryToolTraceDiagnosticEmitter()
+    activation_adapter = _SpyWaitActivationAdapter()
     executor = _executor(
         callable_,
         accept_port,
         awaiting_accept_port=awaiting_accept_port,
         wait_adapter_registry=_wait_adapter_registry(),
+        wait_activation_registry=_wait_activation_registry(activation_adapter),
         diagnostic_emitter=diagnostics,
     )
 
@@ -1313,6 +1599,7 @@ async def test_awaiting_accept_retry_exhaustion_emits_diagnostic_ref() -> None:
     )
     assert len(diagnostics.records) == 1
     assert diagnostics.records[0].reason_code == "accept_timeout"
+    assert activation_adapter.requests == []
 
 
 @pytest.mark.asyncio
@@ -1339,11 +1626,13 @@ async def test_poll_awaiting_without_external_job_ref_is_governed_error() -> Non
     callable_ = _AwaitingCallable()
     accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
     awaiting_accept_port = _AwaitingAcceptPort()
+    activation_adapter = _SpyWaitActivationAdapter()
     executor = _executor(
         callable_,
         accept_port,
         awaiting_accept_port=awaiting_accept_port,
         wait_adapter_registry=_wait_adapter_registry_without_external_job_ref(),
+        wait_activation_registry=_wait_activation_registry(activation_adapter),
     )
 
     outcome = await executor.execute(_request(_call("tool-call-1")))
@@ -1352,6 +1641,7 @@ async def test_poll_awaiting_without_external_job_ref_is_governed_error() -> Non
     assert awaiting_accept_port.candidates == []
     assert isinstance(record.outcome, ToolFailedOutcome)
     assert record.outcome.result.hint == "awaiting_external_job_missing"
+    assert activation_adapter.requests == []
 
 
 @pytest.mark.asyncio
@@ -1363,11 +1653,13 @@ async def test_concurrent_duplicate_awaiting_fanout_does_not_start_second_job() 
     callable_ = _BlockingAwaitingCallable(entered=entered, release=release)
     accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
     awaiting_accept_port = _AwaitingAcceptPort()
+    activation_adapter = _SpyWaitActivationAdapter()
     executor = _executor(
         callable_,
         accept_port,
         awaiting_accept_port=awaiting_accept_port,
         wait_adapter_registry=_wait_adapter_registry(),
+        wait_activation_registry=_wait_activation_registry(activation_adapter),
     )
 
     owner = asyncio.create_task(executor.execute(_request(_call("tool-call-1"))))
@@ -1388,6 +1680,7 @@ async def test_concurrent_duplicate_awaiting_fanout_does_not_start_second_job() 
     assert isinstance(owner_record.outcome, ToolAwaitingOutcome)
     assert isinstance(waiter_record.outcome, ToolAwaitingOutcome)
     assert waiter_record.tool_call_id == "tool-call-2"
+    assert len(activation_adapter.requests) == 1
 
 
 @pytest.mark.asyncio
@@ -1492,6 +1785,7 @@ def _executor(
     *,
     awaiting_accept_port: HostToolAwaitingAcceptPort | None = None,
     wait_adapter_registry: WaitAdapterRegistry | None = None,
+    wait_activation_registry: WaitActivationRegistry | None = None,
     retry_policy: ToolAcceptRetryPolicy | None = None,
     policy_view: ToolRuntimePolicyView | None = None,
     allow_tool_calls: bool = True,
@@ -1503,6 +1797,7 @@ def _executor(
     :param accept_port: fake accept port。
     :param awaiting_accept_port: fake awaiting accept port。
     :param wait_adapter_registry: wait adapter registry。
+    :param wait_activation_registry: wait activation registry。
     :param retry_policy: accept retry policy。
     :param policy_view: Host 内部工具 policy view。
     :param allow_tool_calls: ToolRuntime scope 是否允许工具调用。
@@ -1530,6 +1825,7 @@ def _executor(
             accept_port=accept_port,
             awaiting_accept_port=awaiting_accept_port,
             wait_adapter_registry=wait_adapter_registry,
+            wait_activation_registry=wait_activation_registry,
             retry_policy=(
                 retry_policy
                 if retry_policy is not None
@@ -1688,6 +1984,72 @@ def _wait_adapter_registry_without_external_job_ref() -> WaitAdapterRegistry:
                 external_job_ref_source=WaitExternalJobRefSource.NONE,
             ),
         )
+    )
+
+
+def _wait_activation_registry(
+    adapter: _SpyWaitActivationAdapter,
+) -> WaitActivationRegistry:
+    """构造测试用 wait activation registry。
+
+    :param adapter: spy activation adapter。
+    :returns: wait activation registry。
+    """
+
+    return WaitActivationRegistry(
+        (
+            WaitActivationAdapterRegistration(
+                adapter_key=WaitAdapterKey("poll:fake-tool"),
+                adapter=adapter,
+            ),
+        )
+    )
+
+
+def _external_job_await_spec() -> ToolAwaitSpec:
+    """构造测试用 external job 等待规约。
+
+    :returns: external job 等待规约。
+    """
+
+    return ToolAwaitSpec(
+        await_kind=ToolAwaitKind.EXTERNAL_JOB,
+        deadline=None,
+        resume_token="resume-token",
+    )
+
+
+def _awaiting_accepted_ack(wait_id: str) -> ToolAwaitingAcceptedAck:
+    """构造测试用 awaiting accepted ack。
+
+    :param wait_id: Host wait id。
+    :returns: awaiting accepted ack。
+    """
+
+    tool_awaiting_ref = ToolAwaitingEventRef(
+        event_id=f"event-tool-awaiting-{wait_id}",
+        event_sequence=1,
+    )
+    run_waiting_ref = ToolAwaitingEventRef(
+        event_id=f"event-run-waiting-{wait_id}",
+        event_sequence=2,
+    )
+    attempt_suspended_ref = ToolAwaitingEventRef(
+        event_id=f"event-attempt-suspended-{wait_id}",
+        event_sequence=3,
+    )
+    return ToolAwaitingAcceptedAck(
+        accepted_event_refs=(
+            tool_awaiting_ref,
+            run_waiting_ref,
+            attempt_suspended_ref,
+        ),
+        wait_id=wait_id,
+        tool_awaiting_event_ref=tool_awaiting_ref,
+        run_waiting_event_ref=run_waiting_ref,
+        attempt_suspended_event_ref=attempt_suspended_ref,
+        result_digest=sha256_digest_json({"wait_id": wait_id}),
+        idempotency_record_ref=f"awaiting:{wait_id}",
     )
 
 

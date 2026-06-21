@@ -97,7 +97,7 @@ class FinsUploadToolCallable:
             return _cancelled_outcome(started_at)
         try:
             request = _upload_request_from_arguments(call.arguments)
-            handle = self.runtime.start_observed_upload(
+            handle = self.runtime.prepare_observed_upload(
                 request,
                 cancellation_token=cancellation_token,
             )

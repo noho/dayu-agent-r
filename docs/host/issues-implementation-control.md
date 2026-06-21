@@ -156,13 +156,13 @@ git push -u github <branch>
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
 | gate | final-closeout-pass |
-| implementation status | WU-TOOLS-AWAIT-FANOUT-01 / GitHub Issue #111 final closeout artifact `docs/reviews/wu-tools-await-fanout-01-final-closeout.md` recorded; draft PR #161 remains open/draft and no active #111 residual risk remains. |
-| active work unit | WU-TOOLS-AWAIT-FANOUT-01 |
-| default next work unit | WU-TOOLS-AWAIT-FANOUT-01 |
-| next entry point | Await user / maintainer handling for draft PR #161; do not mark ready, merge, close issue, request reviewers, or delete branch without explicit authorization. |
+| implementation status | WU-TOOLS-01-F01-02-R1 / GitHub Issue #129 final closeout completed. Draft PR #162 remains open/draft; issue closeout comment posted at https://github.com/noho/dayu-agent-r/issues/129#issuecomment-4762165431. PR body uses `Closes #129`, so merge will auto-close the issue. |
+| active work unit | WU-TOOLS-01-F01-02-R1 |
+| default next work unit | WU-WAIT-01 |
+| next entry point | Await maintainer/user handling of draft PR #162. After PR #162 is merged, sync `main`, then start the next phaseflow run from WU-WAIT-01 / GitHub Issue #89 unless this control doc is updated first. Do not mark ready, merge, close GitHub Issue #129, request reviewers, or delete branch without explicit authorization. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
-| issue status comments | Active/backlog issue owners retained here: #111 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #112 / #20 / #89 / #90 / #92 / #80 / #115, plus residual-risk destinations #121 / #122 / #129. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`; #63 / #130 / #133 are no longer active implementation owners. |
-| blocking open questions | None after user confirmed the current goal direction, including upload `allowed_upload_roots` removal and deferring unified file-read permission governance to future Host / policy design. |
+| issue status comments | Active/backlog issue owners retained here: #129 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #112 / #20 / #89 / #90 / #92 / #80 / #115, plus residual-risk destinations #121 / #122. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`; #63 / #111 / #130 / #133 are no longer active implementation owners. |
+| blocking open questions | None. |
 
 状态约定：
 
@@ -232,7 +232,8 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 | Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|---|
-| WU-TOOLS-AWAIT-FANOUT-01 | final-closeout-pass | Host ToolRuntime awaiting fanout governance hardening | GitHub Issue #111 / Draft PR #161 | Final closeout 已记录；Draft PR #161 仍为 open draft，等待用户 / maintainer 处理；不得未经授权 mark ready、merge、close issue 或删分支。 |
+| WU-TOOLS-01-F01-02-R1 | final-closeout-pass | Awaiting external job two-phase activation | GitHub Issue #129 / draft PR #162 | Final closeout 已完成；等待 maintainer/user 处理 draft PR #162。PR body 使用 `Closes #129`，merge 会自动关闭 issue。当前目标是 Host 支持 accepted-wait 后 activation hook，且 Fins download / preprocess / upload awaiting tools 本轮直接迁移到 prepare / activate；禁止过度设计。 |
+| WU-TOOLS-AWAIT-FANOUT-01 | completed | Host ToolRuntime awaiting fanout governance hardening | GitHub Issue #111 / PR #161 | PR 161 merged on 2026-06-21; not an active implementation entry point. |
 | WU-TOOLS-01-F03-R4 | completed | Tools Discovery spec semantics cleanup | GitHub Issue #133 / PR #160 | PR 160 merged on 2026-06-21 and issue #133 is closed; not an active implementation entry point. |
 | WU-ENG-02-R1 | completed | Provider debugging correlation default enablement and fallback diagnostics | GitHub Issue #63 / PR #159 | PR 159 merged on 2026-06-20 and issue #63 is closed; not an active WU for this branch. |
 | WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
@@ -256,6 +257,55 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-WAIT-04 | pending-prerequisite | UI / Service production-grade awaiting E2E smoke | depends on #89 / #90 / #92 | dependent smoke，不独立实施 |
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
+
+## WU-TOOLS-01-F01-02-R1 Awaiting External Job Two-Phase Activation
+
+### 状态
+
+GitHub Issue #129 当前为 OPEN。本条来自 `WU-TOOLS-01-F01-02` residual risk：Fins awaiting external job 当前存在 submit-before-accept 窗口。PR 161 / WU-TOOLS-AWAIT-FANOUT-01 已 merge，#111 的单 owner / fanout 语义已可作为本条设计依据。用户在 2026-06-21 goal confirmation 中确认本条进入 plan gate，并补充裁决：本 WU 必须一次到位实现 Host two-phase activation 支持，并让当前 Fins download / preprocess / upload awaiting tools 直接使用 two-phase；禁止引入过度设计。Plan artifact 为 `docs/host/wu-tools-01-f01-02-r1-plan.md`。Plan review artifacts 为 `docs/reviews/plan-review-20260621-180827.md` 与 `docs/reviews/plan-review-20260621-181350.md`，controller adjudication 为 `docs/reviews/wu-tools-01-f01-02-r1-plan-review-controller-adjudication.md`。Plan-fix artifact 为 `docs/reviews/wu-tools-01-f01-02-r1-plan-fix-codex.md`。Plan re-review artifacts 为 `docs/reviews/plan-review-20260621-182034.md` 与 `docs/reviews/plan-review-20260621-182047.md`，controller adjudication 为 `docs/reviews/wu-tools-01-f01-02-r1-plan-rereview-controller-adjudication.md`。两路 re-review 均通过，所有 accepted findings 已修复。Accepted plan commit 为 `478f5f77`。Slice 1 implementation artifact 为 `docs/reviews/wu-tools-01-f01-02-r1-slice1-implementation-codex.md`；focused test reported `34 passed` and pyright reported 0 errors. Slice 1 code review artifacts 为 `docs/reviews/wu-tools-01-f01-02-r1-slice1-code-review-mimo.md` 与 `docs/reviews/wu-tools-01-f01-02-r1-slice1-code-review-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-02-r1-slice1-code-review-controller-adjudication.md`。Fix artifact 为 `docs/reviews/wu-tools-01-f01-02-r1-slice1-fix-codex.md`；focused test reported `37 passed` and pyright reported 0 errors. Slice 1 code re-review artifacts 为 `docs/reviews/wu-tools-01-f01-02-r1-slice1-code-rereview-mimo.md` 与 `docs/reviews/wu-tools-01-f01-02-r1-slice1-code-rereview-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-02-r1-slice1-code-rereview-controller-adjudication.md`。Accepted Slice 1 commit 为 `e10f2e99`。Slice 2 implementation artifact 为 `docs/reviews/wu-tools-01-f01-02-r1-slice2-implementation-codex.md`；Fins focused tests reported `51 passed` and `68 passed`, pyright reported 0 errors. Slice 2 code review artifacts 为 `docs/reviews/wu-tools-01-f01-02-r1-slice2-code-review-mimo.md` 与 `docs/reviews/wu-tools-01-f01-02-r1-slice2-code-review-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-02-r1-slice2-code-review-controller-adjudication.md`。Fix artifact 为 `docs/reviews/wu-tools-01-f01-02-r1-slice2-fix-codex.md`；Fins focused tests reported `68 passed` and `51 passed`, pyright reported 0 errors. Slice 2 code re-review artifacts 为 `docs/reviews/wu-tools-01-f01-02-r1-slice2-code-rereview-mimo.md` 与 `docs/reviews/wu-tools-01-f01-02-r1-slice2-code-rereview-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-02-r1-slice2-code-rereview-controller-adjudication.md`。Accepted Slice 2 commit 为 `4f45f8de`。Slice 3 implementation artifact 为 `docs/reviews/wu-tools-01-f01-02-r1-slice3-implementation-codex.md`；Service test reported `52 passed`, focused Host/Fins tests reported `159 passed`, pyright reported 0 errors. Slice 3 code review artifacts 为 `docs/reviews/wu-tools-01-f01-02-r1-slice3-code-review-mimo.md` 与 `docs/reviews/wu-tools-01-f01-02-r1-slice3-code-review-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-02-r1-slice3-code-review-controller-adjudication.md`。Fix artifact 为 `docs/reviews/wu-tools-01-f01-02-r1-slice3-fix-codex.md`；Service test reported `52 passed`, focused Host/Fins tests reported `159 passed`, pyright reported 0 errors. Slice 3 code re-review artifacts 为 `docs/reviews/wu-tools-01-f01-02-r1-slice3-code-rereview-mimo.md` 与 `docs/reviews/wu-tools-01-f01-02-r1-slice3-code-rereview-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-02-r1-slice3-code-rereview-controller-adjudication.md`。Narrow fix artifact 为 `docs/reviews/wu-tools-01-f01-02-r1-slice3-rereview-fix-codex.md`；narrow code re-review artifacts 为 `docs/reviews/wu-tools-01-f01-02-r1-slice3-narrow-rereview-mimo.md` 与 `docs/reviews/wu-tools-01-f01-02-r1-slice3-narrow-rereview-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-02-r1-slice3-narrow-rereview-controller-adjudication.md`。两路 narrow re-review 均通过，S3-RR-F01 已关闭。Accepted Slice 3 commit 为 `80ab56ab`。Aggregate deepreview artifacts 为 `docs/reviews/wu-tools-01-f01-02-r1-aggregate-deepreview-mimo.md` 与 `docs/reviews/wu-tools-01-f01-02-r1-aggregate-deepreview-ds.md`；aggregate fix artifact 为 `docs/reviews/wu-tools-01-f01-02-r1-aggregate-fix-codex.md`；aggregate fix narrow re-review artifacts 为 `docs/reviews/wu-tools-01-f01-02-r1-aggregate-rereview-mimo.md` 与 `docs/reviews/wu-tools-01-f01-02-r1-aggregate-rereview-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-02-r1-aggregate-deepreview-controller-adjudication.md`。AGG-F01 已关闭，controller 裁决无当前 WU 未归属 residual risk。Accepted deepreview commit 为 `95f652de`。Draft PR #162 已创建：https://github.com/noho/dayu-agent-r/pull/162。`gh pr checks 162` reported no checks on branch `phase/wu-tools-01-f01-02-r1`。PR review artifacts 为 `docs/reviews/wu-tools-01-f01-02-r1-pr-review-mimo.md` 与 `docs/reviews/wu-tools-01-f01-02-r1-pr-review-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-02-r1-pr-review-controller-adjudication.md`。两路 PR review 均通过，无 accepted current fix。Accepted PR review commit 为 `50431ab2` 并已 push 到 draft PR #162。Final closeout artifact 为 `docs/reviews/wu-tools-01-f01-02-r1-final-closeout.md`。Issue closeout comment 已发布：https://github.com/noho/dayu-agent-r/issues/129#issuecomment-4762165431。PR body 使用 `Closes #129`，merge 会自动关闭 #129。当前进入 final-closeout-pass gate，等待用户 / maintainer 处理 draft PR #162；不得未经授权 mark ready、merge、close issue、request reviewers 或 delete branch。Merge PR #162 后，应从 `main` 拉取最新代码，再按本文档 next entry point 进入 WU-WAIT-01 / GitHub Issue #89。
+
+### 设计与代码核对
+
+- Engine 设计真源规定：Engine 只消费 `ToolExecutor.execute(...)` 的 bounded handshake outcome；长事务 awaiting、orphan cleanup、工具级取消和 batch 内执行策略属于 Host / ToolRuntime，不属于 Engine。
+- Host 设计真源规定：`ToolAwaitingOutcome` 只能经 ToolRuntime Host awaiting accept path 写入 `TOOL_AWAITING`、`RUN_WAITING`、`ATTEMPT_SUSPENDED` 与 wait record；Engine `tool_awaiting` / `run_suspended` 只能作为确认或诊断，不创建 wait record。
+- `dayu/fins/tools/download_tools.py`、`dayu/fins/tools/preprocess_tools.py` 与 `dayu/fins/tools/upload_tools.py` 当前在工具 callable 内调用 `runtime.start_observed_download(...)`、`runtime.start_observed_preprocess(...)`、`runtime.start_observed_upload(...)`，随后才返回 `ToolAwaitingOutcome`。
+- `dayu/fins/ingestion_runtime.py` 当前 `start_observed_*` 会注册 process-local observation，并立即调用 `executor.submit(...)`。Host wait record 写入发生在 `dayu/host/tool_runtime.py` 的 `_accept_awaiting(...)` 之后，因此存在 external job 已启动但 Host wait truth 尚未 durable accepted 的窗口。
+- `FinsIngestionJobStatus` 当前只有 `queued / running / cancelling / succeeded / failed / cancelled`，没有 prepared / activated 语义；`claim_running_or_cancelled(...)` 是 executor operation 内部进入 running 的 claim，不等价于 Host accepted-wait 后 activation。
+- Fins wait adapter 当前已覆盖 `start_fins_download`、`start_fins_preprocess`、`start_fins_upload`，通过 lightweight observation handle poll completion；仅调整 poller 不能关闭 submit-before-accept root cause。
+
+### 目标
+
+- 设计并实现最小 two-phase activation：Fins awaiting tool 先 prepare / 登记可观察长事务，不 submit 后台 executor；Host awaiting accept 成功后通过 activation hook 触发 activate / submit。
+- Host / ToolRuntime 必须只在 awaiting accept ack 成立后触发 activation；accept rejected、accept timeout、pre-accept cancellation 或 stale execution 不得启动外部长事务。
+- Fins download / preprocess / upload awaiting tools 本轮直接迁移到 prepare / activate，不能只预留 Host hook。
+- Activation 必须幂等；同一 prepared operation 重试 activation 不得 double-submit。
+- Cancellation between prepare and activate 必须能关闭 prepared operation，不启动后台执行。
+- Poller / wait adapter 对 prepared-but-not-active 状态必须有明确行为，不误报 terminal 或 lost；activation failure after accepted wait 必须有结构化收口。
+
+### 非目标
+
+- 不改变 Engine awaiting 公共模型，不让 Engine 拥有 activation、wait record 或 external job lifecycle truth。
+- 不把 activation、execution context、cancellation token 或 Host governance id 暴露到 LLM-facing tool schema。
+- 不为未来所有 provider 设计通用 lifecycle supervisor、durable follower ledger、跨 Attempt duplicate table、通用 wait alias schema 或新的 public await contract。
+- 不在本条实现 #89 callback endpoint / auth / replay、#90 production poller loop / backoff / fencing / retry，或 #92 external job physical cancel / revoke / abandon 全量能力。
+- 不用 Fins-only workaround 绕过 Host awaiting accept barrier；如新增 Host hook，必须是当前 ToolRuntime accepted-wait 后 activation 所需的最小层内契约。
+
+### Plan Gate 约束
+
+- Plan 必须明确 Host activation hook 放置位置、调用时机、失败收口、幂等语义和不暴露 LLM-facing schema 的证据。
+- Plan 必须明确 Fins runtime prepare / activate API、prepared 状态表达、activation 幂等、pre-activation cancel、activation failure 和 poller prepared 状态行为。
+- Plan 必须覆盖 download / preprocess / upload 三类 awaiting tools，不能只覆盖其中一个。
+- Plan 必须按本文档 Slice 切分原则控制 gate 成本。小型跨模块 cleanup 默认上限为 3 个 implementation slices；若超过 3 个 slices，必须证明不能合并为更少的语义闭环。
+- Plan 必须说明为什么没有过度设计，尤其是为什么没有引入通用 lifecycle supervisor、跨 provider activation 平台或新的 public await contract。
+
+### 验收信号
+
+- 受控测试能证明 awaiting accept 成功前不会 submit / activate Fins background job。
+- Accept rejected / timeout / stale execution / pre-accept cancel 不会 activate prepared operation。
+- Accepted wait 后 activation 成功会进入当前 Fins observation / poll / resolve path，download / preprocess / upload 均覆盖。
+- Activation retry 不 double-submit；prepared operation 被取消或 abandoned 时不启动执行。
+- Activation failure after accepted wait 有结构化 failed / lost / diagnostic 收口，且不让 Run 永久卡在无法解释的 WAITING。
+- 受影响 Host / Fins tests、pyright 通过；涉及 Host / Engine contract 或 Fins runtime contract 的设计变化同步到设计真源和必要 README。
 
 ## WU-TOOLS-AWAIT-FANOUT-01 Host ToolRuntime Awaiting Fanout Governance Hardening
 

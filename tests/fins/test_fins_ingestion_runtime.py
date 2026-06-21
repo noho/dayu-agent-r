@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import asyncio
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Event, Lock as ThreadingLock, Thread
 from typing import cast
 
 import pytest
@@ -22,12 +24,33 @@ from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins import ticker_normalization
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins import ingestion_runtime
-from dayu.fins.direct_events import FinsEvent, FinsEventType, FinsOperationKind, FinsResultStatus
+from dayu.fins.direct_events import (
+    FinsErrorKind,
+    FinsEvent,
+    FinsEventType,
+    FinsOperationKind,
+    FinsResultStatus,
+)
 from dayu.fins.ingestion_events import (
     FinsIngestionJobEventAppend,
     FinsIngestionJobEventRecord,
     FinsIngestionJobEventType,
 )
+from dayu.fins.ingestion.wait_adapter import FinsIngestionWaitPollAdapter
+from dayu.fins.ingestion.wait_adapter import FINS_INGESTION_WAIT_ADAPTER_KEY
+from dayu.fins.ingestion.observation_handle import (
+    FinsObservationHandle,
+    FinsObservationStatus,
+)
+from dayu.fins.tools.download_tools import DOWNLOAD_TOOL_NAME
+from dayu.host.durable.state import (
+    ExternalJobRef,
+    WaitRecordRow,
+    WaitRecordStatus,
+    WaitResumePolicy,
+)
+from dayu.host.api import ResolveWaitFailedOutcome
+from dayu.host.wait_adapter import WaitPollReady
 from dayu.fins.domain.document_models import (
     CompanyMeta,
     SourceDocumentUpsertRequest,
@@ -118,6 +141,103 @@ class _HoldingExecutor(FinsIngestionExecutor):
         self.operations.clear()
         for operation in operations:
             operation()
+
+
+class _FailingSubmitExecutor(FinsIngestionExecutor):
+    """测试用提交失败执行器。"""
+
+    def __init__(self, exc: Exception) -> None:
+        """初始化提交异常。
+
+        Args:
+            exc: submit 时抛出的异常。
+
+        Returns:
+            无。
+        """
+
+        self.exc = exc
+        self.submitted_job_ids: tuple[str, ...] = ()
+
+    def submit(self, job_id: str, operation: Callable[[], None]) -> None:
+        """记录提交并抛出预设异常。
+
+        Args:
+            job_id: opaque job id。
+            operation: 待执行操作。
+
+        Returns:
+            无。
+
+        Raises:
+            Exception: 始终抛出初始化传入的异常。
+        """
+
+        del operation
+        self.submitted_job_ids = self.submitted_job_ids + (job_id,)
+        raise self.exc
+
+
+class _HookedObservationLock:
+    """可控阻塞的 observation lock，用于证明 cancel/activate 共用锁。"""
+
+    def __init__(self) -> None:
+        """初始化同步事件。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+        """
+
+        self._lock = ThreadingLock()
+        self.first_entered = Event()
+        self.allow_first_exit = Event()
+        self.second_enter_attempted = Event()
+        self.enter_attempts = 0
+
+    def __enter__(self) -> "_HookedObservationLock":
+        """进入锁并在第一次进入后阻塞。
+
+        Returns:
+            当前锁对象。
+
+        Raises:
+            无。
+        """
+
+        self.enter_attempts += 1
+        if self.enter_attempts == 2:
+            self.second_enter_attempted.set()
+        self._lock.acquire()
+        if self.enter_attempts == 1:
+            self.first_entered.set()
+            self.allow_first_exit.wait()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: object | None,
+    ) -> None:
+        """释放锁。
+
+        Args:
+            exc_type: 异常类型。
+            exc: 异常对象。
+            traceback: traceback 对象。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        del exc_type, exc, traceback
+        self._lock.release()
 
 
 class _FakeDownloadAdapter(FinsSourceDownloadAdapter):
@@ -437,6 +557,37 @@ class _CancelOnSecondCheckToken(CancellationToken):
 
         if self._cancelled:
             return self._requested_at
+        return None
+
+
+class _NeverCancelledToken(CancellationToken):
+    """始终未取消的测试 token。"""
+
+    def is_cancelled(self) -> bool:
+        """返回当前是否已取消。
+
+        Returns:
+            始终返回 ``False``。
+        """
+
+        return False
+
+    def cancel_reason(self) -> str | None:
+        """返回取消原因。
+
+        Returns:
+            始终返回 ``None``。
+        """
+
+        return None
+
+    def requested_at(self) -> datetime | None:
+        """返回取消请求时间。
+
+        Returns:
+            始终返回 ``None``。
+        """
+
         return None
 
 
@@ -1913,6 +2064,182 @@ def test_result_summaries_allow_slash_in_document_ids() -> None:
     assert upload_summary.to_json_summary()["internal_document_id"] == "sec/aapl-2024-10ka-internal"
 
 
+def test_prepare_observed_operations_do_not_submit_until_activation(tmp_path: Path) -> None:
+    """download/preprocess/upload prepare 只登记 observation，activation 才提交。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    runtime = _build_ingestion_runtime(workspace_root, executor=executor)
+
+    download = runtime.prepare_observed_download(
+        FinsDownloadRequest(ticker="AAPL"),
+        cancellation_token=_NeverCancelledToken(),
+    )
+    preprocess = runtime.prepare_observed_preprocess(
+        FinsPreprocessRequest(ticker="AAPL"),
+        cancellation_token=_NeverCancelledToken(),
+    )
+    upload = runtime.prepare_observed_upload(
+        FinsUploadFilingRequest(ticker="AAPL"),
+        cancellation_token=_NeverCancelledToken(),
+    )
+
+    assert executor.operations == []
+
+    runtime.activate_observation(download)
+    runtime.activate_observation(preprocess)
+    runtime.activate_observation(upload)
+
+    assert len(executor.operations) == 3
+
+
+def test_activate_observation_is_idempotent_for_same_handle(tmp_path: Path) -> None:
+    """同一 observation 重复 activation 不得 double-submit。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    runtime = _build_ingestion_runtime(workspace_root, executor=executor)
+    handle = runtime.prepare_observed_download(
+        FinsDownloadRequest(ticker="AAPL"),
+        cancellation_token=_NeverCancelledToken(),
+    )
+
+    runtime.activate_observation(handle)
+    runtime.activate_observation(handle)
+
+    assert len(executor.operations) == 1
+
+
+def test_cancel_prepared_observation_prevents_later_activation_submit(
+    tmp_path: Path,
+) -> None:
+    """prepared observation activation 前取消后不得提交，并可观察为 CANCELLED。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    runtime = _build_ingestion_runtime(workspace_root, executor=executor)
+    handle = runtime.prepare_observed_preprocess(
+        FinsPreprocessRequest(ticker="AAPL"),
+        cancellation_token=_NeverCancelledToken(),
+    )
+
+    cancelled = asyncio.run(runtime.cancel_observation(handle))
+    runtime.activate_observation(handle)
+    polled = asyncio.run(runtime.poll_observation(handle))
+
+    assert cancelled.status is FinsObservationStatus.CANCELLED
+    assert cancelled.result is not None
+    assert cancelled.result.status is FinsResultStatus.CANCELLED
+    assert cancelled.result.error_kind is FinsErrorKind.CANCELLED
+    assert cancelled.result.error_message == "Observation was cancelled before activation."
+    assert polled.status is FinsObservationStatus.CANCELLED
+    assert executor.operations == []
+
+
+def test_cancel_and_activate_share_observation_lock_without_timing_sleep(
+    tmp_path: Path,
+) -> None:
+    """cancel 持有 observation lock 时 activation 必须等待同一把锁。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    runtime = _build_ingestion_runtime(workspace_root, executor=executor)
+    handle = runtime.prepare_observed_upload(
+        FinsUploadFilingRequest(ticker="AAPL"),
+        cancellation_token=_NeverCancelledToken(),
+    )
+    hooked_lock = _HookedObservationLock()
+    object.__setattr__(runtime, "_observation_lock", hooked_lock)
+    snapshots: list[FinsObservationStatus] = []
+    exceptions: list[BaseException] = []
+
+    def cancel_operation() -> None:
+        """执行取消并记录结果。"""
+
+        try:
+            snapshot = asyncio.run(runtime.cancel_observation(handle))
+            snapshots.append(snapshot.status)
+        except BaseException as exc:
+            exceptions.append(exc)
+
+    def activate_operation() -> None:
+        """执行 activation 并记录异常。"""
+
+        try:
+            runtime.activate_observation(handle)
+        except BaseException as exc:
+            exceptions.append(exc)
+
+    cancel_thread = Thread(target=cancel_operation)
+    cancel_thread.start()
+    assert hooked_lock.first_entered.wait(timeout=1.0)
+
+    activate_thread = Thread(target=activate_operation)
+    activate_thread.start()
+    assert hooked_lock.second_enter_attempted.wait(timeout=1.0)
+    assert executor.operations == []
+
+    hooked_lock.allow_first_exit.set()
+    cancel_thread.join(timeout=1.0)
+    activate_thread.join(timeout=1.0)
+
+    assert not cancel_thread.is_alive()
+    assert not activate_thread.is_alive()
+    assert exceptions == []
+    assert snapshots == [FinsObservationStatus.CANCELLED]
+    assert executor.operations == []
+
+
+def test_activation_submit_failure_is_observed_as_failed_by_wait_adapter(
+    tmp_path: Path,
+) -> None:
+    """activation submit failure 必须转为 FAILED，且现有 wait adapter 可观察。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    runtime = _build_ingestion_runtime(
+        workspace_root,
+        executor=_FailingSubmitExecutor(OSError("submit unavailable")),
+    )
+    handle = runtime.prepare_observed_download(
+        FinsDownloadRequest(ticker="AAPL"),
+        cancellation_token=_NeverCancelledToken(),
+    )
+
+    with pytest.raises(OSError):
+        runtime.activate_observation(handle)
+
+    poll = FinsIngestionWaitPollAdapter(runtime=runtime).poll_wait(
+        _observation_wait_record(handle, DOWNLOAD_TOOL_NAME)
+    )
+
+    assert isinstance(poll, WaitPollReady)
+    assert isinstance(poll.outcome, ResolveWaitFailedOutcome)
+
+
+def test_unexpected_activation_exception_terminalizes_prepared_observation(
+    tmp_path: Path,
+) -> None:
+    """prepared observation 存在后 activation 非预期异常不得遗留 PENDING。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    runtime = _build_ingestion_runtime(
+        workspace_root,
+        executor=_FailingSubmitExecutor(ValueError("unexpected activation error")),
+    )
+    handle = runtime.prepare_observed_upload(
+        FinsUploadFilingRequest(ticker="AAPL"),
+        cancellation_token=_NeverCancelledToken(),
+    )
+
+    with pytest.raises(ValueError):
+        runtime.activate_observation(handle)
+    snapshot = asyncio.run(runtime.poll_observation(handle))
+
+    assert snapshot.status is FinsObservationStatus.FAILED
+    assert snapshot.result is not None
+    assert snapshot.result.error_message == "Observation activation failed."
+
+
 def test_job_serialization_validates_upload_operation_shape(tmp_path: Path) -> None:
     """upload job record 序列化/反序列化应校验 operation/source/source_kind 组合。"""
 
@@ -3052,6 +3379,56 @@ def _build_ingestion_runtime(
         executor=executor,
         download_adapters=download_adapters,
         upload_runner=upload_runner,
+    )
+
+
+def _observation_wait_record(
+    handle: FinsObservationHandle,
+    tool_name: str,
+) -> WaitRecordRow:
+    """构造 observation wait adapter 测试用 Host wait record。
+
+    Args:
+        handle: Fins observation handle。
+        tool_name: awaiting 工具名。
+
+    Returns:
+        Host wait record row。
+
+    Raises:
+        ValueError: 字段非法时由 Host durable 类型抛出。
+    """
+
+    return WaitRecordRow(
+        wait_id=f"wait-{handle.handle_id}",
+        session_id="session-fins",
+        run_id="run-fins",
+        attempt_id="attempt-fins",
+        execution_id="execution-fins",
+        tool_call_id=f"call-{tool_name}",
+        tool_name=tool_name,
+        adapter_key=FINS_INGESTION_WAIT_ADAPTER_KEY,
+        await_kind="external_job",
+        resume_policy=WaitResumePolicy.POLL,
+        resume_token=handle.handle_id,
+        snapshot_ref=None,
+        external_job_ref=ExternalJobRef(
+            adapter_key=FINS_INGESTION_WAIT_ADAPTER_KEY,
+            external_job_id=handle.handle_id,
+        ),
+        accept_idempotency_key=f"accept-{handle.handle_id}",
+        resolve_idempotency_key=None,
+        resolve_semantic_digest=None,
+        deadline_at=None,
+        expires_at=None,
+        status=WaitRecordStatus.WAITING,
+        created_event_id=f"event-created-{handle.handle_id}",
+        created_event_sequence=1,
+        updated_event_id=f"event-updated-{handle.handle_id}",
+        updated_event_sequence=1,
+        created_at="2026-01-01T00:00:00Z",
+        updated_at="2026-01-01T00:00:00Z",
+        terminal_at=None,
     )
 
 

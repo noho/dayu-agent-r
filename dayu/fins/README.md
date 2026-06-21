@@ -146,6 +146,10 @@ Fins ingestion 通过三个独立 awaiting provider 暴露 awaiting tools：
 - `start_observed_download(...) -> FinsObservationHandle`
 - `start_observed_preprocess(...) -> FinsObservationHandle`
 - `start_observed_upload(...) -> FinsObservationHandle`
+- `prepare_observed_download(...) -> FinsObservationHandle`
+- `prepare_observed_preprocess(...) -> FinsObservationHandle`
+- `prepare_observed_upload(...) -> FinsObservationHandle`
+- `activate_observation(handle) -> None`
 - `poll_observation(handle) -> FinsObservationSnapshot`
 - `cancel_observation(handle) -> FinsObservationSnapshot`
 - `abandon_observation(handle) -> None`
@@ -159,10 +163,13 @@ Fins ingestion 通过三个独立 awaiting provider 暴露 awaiting tools：
 - `FINS_UPLOAD_AWAITING_TOOL_NAME = "start_fins_upload"`
 - `FinsIngestionWaitPollAdapter`
 - `build_fins_wait_adapter_registry(workspace_root=..., tool_names=...)`
+- `FinsIngestionWaitActivationAdapter`
+- `build_fins_wait_activation_registry(runtime=..., tool_names=...)`
 
 ## 调用者装配示例
 
 调用者进入 Fins 的稳定入口是 `DefaultFinsRuntime`。不同入口可以创建各自的 runtime 实例，但同一 `workspace_root` 会使用同一套仓储布局、processor registry 构造逻辑和 legacy job store。
+awaiting tool callable 与 wait activation registry 例外：activation adapter 必须接收 awaiting tool callable 使用的同一个 `FinsIngestionRuntime` 实例，因为 prepared observation 是进程内 runtime 状态，不是可由 `workspace_root` 重新发现的持久事实。
 
 ### Read caller
 
@@ -272,8 +279,10 @@ Tool awaiting provider 使用同一装配根，但入口是 observation handle�
 
 ```text
 start_fins_download / start_fins_preprocess / start_fins_upload
-  -> FinsIngestionRuntime.start_observed_download / start_observed_preprocess / start_observed_upload
+  -> FinsIngestionRuntime.prepare_observed_download / prepare_observed_preprocess / prepare_observed_upload
   -> return ToolAwaitingOutcome(EXTERNAL_JOB)
+  -> Host accepted wait activation
+  -> FinsIngestionRuntime.activate_observation(handle)
   -> FinsIngestionWaitPollAdapter polls observation snapshot
 ```
 
@@ -501,19 +510,21 @@ ToolsDiscovery
   -> get_ingestion_runtime()
   -> start_fins_download / start_fins_preprocess / start_fins_upload tool call
   -> observe BatchToolExecutionContext.cancellation_token
-  -> FinsIngestionRuntime.start_observed_download / start_observed_preprocess / start_observed_upload
+  -> FinsIngestionRuntime.prepare_observed_download / prepare_observed_preprocess / prepare_observed_upload
   -> checkpoint before observation start
-  -> register process-local lightweight observation handle
+  -> register process-local lightweight observation handle as pending
   -> return ToolAwaitingOutcome(EXTERNAL_JOB)
+  -> Host awaiting accept succeeds
+  -> FinsIngestionWaitActivationAdapter activates observation
   -> background executor runs pipeline
   -> update observation snapshot with terminal result
   -> FinsIngestionWaitPollAdapter maps observation snapshot to Host wait result
   -> Host resolve / resume governance
 ```
 
-Download、preprocess 与 upload awaiting tools 会先观察 Host ToolRuntime 传入的 cancellation token；start 前已取消时返回 `ToolCancelledOutcome`，不注册 observation handle。后台 submit 后取消是 best-effort cooperative：runtime 通过 operation-scoped cancellation state / checker 传播取消请求，底层 blocking adapter 只有在检查点或自然返回时才会收口。
+Download、preprocess 与 upload awaiting tools 会先观察 Host ToolRuntime 传入的 cancellation token；prepare 前已取消时返回 `ToolCancelledOutcome`，不注册 observation handle。工具 callable 只登记 process-local observation 并返回 awaiting outcome，不提交 executor。Host awaiting accept 成功后，activation adapter 解析现有 resume token 并调用 `activate_observation(handle)`；activation 在 observation lock 内幂等检查取消、终态与已提交标志后才提交后台 executor。activation 前取消的 prepared observation 会收口为 `cancelled`，不会启动后台执行。后台 submit 后取消是 best-effort cooperative：runtime 通过 operation-scoped cancellation state / checker 传播取消请求，底层 blocking adapter 只有在检查点或自然返回时才会收口。
 
-工具调用边界内的参数错误、observation 启动失败或上传本地文件形态校验失败会返回工具失败 outcome；observation handle 注册成功且未取消时工具立即返回 awaiting outcome，不等待后台任务完成。
+工具调用边界内的参数错误、observation prepare 失败或上传本地文件形态校验失败会返回工具失败 outcome；observation handle 注册成功且未取消时工具立即返回 awaiting outcome，不等待后台任务完成。activation submit 失败会把 observation terminal 化为 `failed`，由现有 wait adapter 映射为 Host wait failed，不新增 durable Fins prepared job 状态。
 
 ### Upload runtime 路径
 
@@ -571,8 +582,9 @@ Legacy job 终态是 `succeeded`、`failed`、`cancelled`。`request_cancel(job_
 典型状态流如下：
 
 ```text
-start_observed_download / start_observed_preprocess / start_observed_upload
+prepare_observed_download / prepare_observed_preprocess / prepare_observed_upload
   -> pending
+      -> activate_observation
       -> running
       -> succeeded
       -> failed
@@ -660,7 +672,7 @@ SecProcessor
 
 `DefaultFinsRuntime` 是 read、download、preprocess / process 与 upload foundation 的 shared assembly root。它统一装配同一 workspace 下的文件系统仓储、processor registry、`FinsReadRuntime`、`FinsIngestionRuntime` 和 legacy ingestion job store。
 
-这个机制用于保证多入口调用时 Fins 业务逻辑不漂移：工具 provider、测试 / CI 夹具或其它入口应调用 shared Fins runtime 的 typed API，而不是复制 ticker 归一、仓储路径、processor 选择、download、preprocess / process、upload、direct event 或 observation 逻辑。当前共享语义不是“所有入口必须共享同一个 Python 对象实例”，而是“同一 `workspace_root` 下走同一套业务代码、仓储布局和 runtime 装配”。
+这个机制用于保证多入口调用时 Fins 业务逻辑不漂移：工具 provider、测试 / CI 夹具或其它入口应调用 shared Fins runtime 的 typed API，而不是复制 ticker 归一、仓储路径、processor 选择、download、preprocess / process、upload、direct event 或 observation 逻辑。当前共享语义通常不是“所有入口必须共享同一个 Python 对象实例”，而是“同一 `workspace_root` 下走同一套业务代码、仓储布局和 runtime 装配”；但 awaiting observation 的 tool callable 与 activation adapter 必须共享同一个 `FinsIngestionRuntime` 实例，避免 activation 看不到 callable 准备的 process-local observation。
 
 ### Workspace root 与 provider fail fast
 
@@ -688,11 +700,11 @@ Read tools 的 schema、错误和结果字段必须面向 LLM 自解释。工具
 
 ### Direct stream / observation / legacy job 与取消
 
-Direct stream 不创建 durable job record；调用方关闭 async iterator、取消 task 或传入 cancellation token 时，runtime 通过 operation-scoped cancellation state / checker 做合作式取消。Awaiting tools 不等待长事务完成，只注册 process-local observation handle 并返回 `ToolAwaitingOutcome(EXTERNAL_JOB)`；Host wait cancel 通过 wait adapter 调用 `cancel_observation(handle)` / `abandon_observation(handle)`。Legacy `start_*` job helpers 仍可创建 durable `queued` job record 并通过 `request_cancel(job_id)` 合作式取消，但 Service direct 和 awaiting tools 不消费该路径。
+Direct stream 不创建 durable job record；调用方关闭 async iterator、取消 task 或传入 cancellation token 时，runtime 通过 operation-scoped cancellation state / checker 做合作式取消。Awaiting tools 不等待长事务完成，只 prepare 并注册 process-local observation handle，返回 `ToolAwaitingOutcome(EXTERNAL_JOB)`；Host awaiting accept ack durable 成立后，ToolRuntime 通过 Fins activation adapter 调用 `activate_observation(handle)` 提交后台执行。Host wait cancel 通过 wait adapter 调用 `cancel_observation(handle)` / `abandon_observation(handle)`。Legacy `start_*` job helpers 仍可创建 durable `queued` job record 并通过 `request_cancel(job_id)` 合作式取消，但 Service direct 和 awaiting tools 不消费该路径。
 
 ### Wait adapter 与 Host resume
 
-Fins awaiting tools 不直接恢复 Host Run。Service assembly 根据启用的 Fins awaiting provider 显式构造 wait adapter registry；Host poller 通过 `FinsIngestionWaitPollAdapter` 读取 process-local observation snapshot，再由 Host 自己执行 resolve / resume / failed / lost 治理。Fins wait adapter 不改变 Host wait record，不写 Host EventLog，也不恢复旧 Engine 生成器。
+Fins awaiting tools 不直接恢复 Host Run。Service assembly 根据启用的 Fins awaiting provider 显式构造 wait adapter registry 与 wait activation registry，并确保 awaiting tool callable 与 activation adapter 使用同一个 workspace-scoped ingestion runtime。Host poller 通过 `FinsIngestionWaitPollAdapter` 读取 process-local observation snapshot，再由 Host 自己执行 resolve / resume / failed / lost 治理。Fins wait adapter 不改变 Host wait record，不写 Host EventLog，也不恢复旧 Engine 生成器。
 
 ### Ticker normalization
 

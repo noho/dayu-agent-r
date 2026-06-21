@@ -2396,10 +2396,12 @@ ToolRuntime receives ToolAwaitingOutcome
   -> Host closes current Attempt as SUSPENDED
   -> Host updates Run to WAITING
   -> Host persists wait record
+  -> ToolRuntime may call an internal activation adapter after accepted ack
   -> Engine may emit tool_awaiting / run_suspended with accepted refs as diagnostic confirmation
 ```
 
 Engine `tool_awaiting` / `run_suspended` 不拥有 Host waiting 状态迁移；它们不能创建 wait record、不能关闭 Attempt、不能更新 Run。
+需要 submit-before-accept barrier 的长事务工具只能在 Host durable accepted ack 之后由 ToolRuntime 调用内部 activation adapter。activation adapter 是 Host construction-time wiring，不进入 Engine awaiting 公共模型，不改变 `ToolAwaitingOutcome`，也不让 Engine 拥有 activation、外部 job lifecycle 或 wait record truth。
 
 Resume：
 

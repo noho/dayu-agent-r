@@ -50,6 +50,9 @@ from dayu.host.api import (
 )
 from dayu.host.durable.state import WaitRecordRow, WaitResumePolicy
 from dayu.host.wait_adapter import (
+    WaitActivationAdapterRegistration,
+    WaitActivationRegistry,
+    WaitActivationRequest,
     WaitAdapterBinding,
     WaitAdapterRegistry,
     WaitExternalJobRefSource,
@@ -154,6 +157,34 @@ class FinsIngestionWaitPollAdapter:
                 raise
 
 
+@dataclass(frozen=True, slots=True)
+class FinsIngestionWaitActivationAdapter:
+    """Fins lightweight observation 的 Host accepted-wait activation adapter。
+
+    :param runtime: Fins observation runtime；adapter 只解析已有 resume token
+        并触发 runtime activation。
+    """
+
+    runtime: FinsObservationRuntime
+
+    def activate_accepted_wait(self, request: WaitActivationRequest) -> None:
+        """激活 Host 已 durable accepted 的 Fins observation。
+
+        :param request: Host accepted wait activation 请求。
+        :returns: ``None``。
+        :raises ValueError: resume token 或工具名无法解析时抛出。
+        :raises Exception: runtime activation 失败时按原异常抛出。
+        """
+
+        handle_id = parse_observation_handle_id_token(request.await_spec.resume_token)
+        handle = FinsObservationHandle(
+            handle_id=handle_id,
+            operation_kind=_operation_kind_from_tool_name(request.tool_name),
+            created_at=datetime.now(timezone.utc),
+        )
+        self.runtime.activate_observation(handle)
+
+
 def build_fins_wait_adapter_registry(
     *, workspace_root: Path, tool_names: Sequence[str]
 ) -> WaitAdapterRegistry:
@@ -173,6 +204,35 @@ def build_fins_wait_adapter_registry(
         _binding_for_tool_name(tool_name) for tool_name in _deterministic_tool_names(tool_names)
     )
     return WaitAdapterRegistry(bindings)
+
+
+def build_fins_wait_activation_registry(
+    *, runtime: FinsObservationRuntime, tool_names: Sequence[str]
+) -> WaitActivationRegistry:
+    """为启用的 Fins awaiting tools 构造 Host activation registry。
+
+    activation adapter 必须接收 awaiting tool callable 使用的同一个 runtime；
+    该 runtime 保存 process-local prepared observation，不能由 builder 自建。
+
+    :param runtime: Fins awaiting tool callable 使用的共享 observation runtime。
+    :param tool_names: 本次 Service assembly 中由启用 provider 声明的 Fins
+        awaiting 工具名；重复名称视为配置错误。
+    :returns: Host wait activation registry。
+    :raises ValueError: 工具名为空、重复或不属于 Fins awaiting 稳定工具名时
+        抛出。
+    """
+
+    # activation 由单个 adapter key 分发，tool_names 只用于装配期校验。
+    _deterministic_tool_names(tool_names)
+    adapter = FinsIngestionWaitActivationAdapter(runtime=runtime)
+    return WaitActivationRegistry(
+        (
+            WaitActivationAdapterRegistration(
+                adapter_key=FINS_INGESTION_WAIT_ADAPTER_KEY,
+                adapter=adapter,
+            ),
+        )
+    )
 
 
 def _require_absolute_workspace_root(workspace_root: Path) -> None:
