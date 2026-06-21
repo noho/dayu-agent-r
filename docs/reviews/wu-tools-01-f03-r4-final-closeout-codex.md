@@ -36,12 +36,14 @@ Final closeout pass is complete.
 
 - Focused WU suites passed as recorded in final validation and PR review artifacts.
 - `pyright dayu tests utils`: `0 errors, 0 warnings, 0 informations`.
-- Broad affected suite excluding classified non-WU web smoke residual: `866 passed, 1 skipped`.
+- Broad affected suite excluding historical web smoke caveat: `866 passed, 1 skipped`.
+- Post-reconciliation `python utils/smoke_web_ci.py --output-dir workspace/output/web_smoke/manual-wu-tools-f03-r4-final --run-label manual-wu-tools-f03-r4-final`: `SMOKE STATUS passed`, `SMOKE EXIT_CODE 0`, `SMOKE FAILURES 0`.
+- Post-reconciliation `pytest tests/tools/web -q`: `76 passed`, with 3 upstream `edgar` deprecation warnings.
 - PR review confirmed PR body accuracy, issue-133 completeness, residual owners, and no blocking PR issues.
 
 ## Remaining Risks / Owners
 
-- `WU-TOOLS-01-F03-R4-WEB-SMOKE-R1`: Web smoke / CI owner owns the stdout-vs-logging capture mismatch in `tests/tools/web/test_smoke_web_ci.py`.
+- No active WU-TOOLS-01-F03-R4 residual risk remains after residual reconciliation.
 
 ## Issue Link Status
 

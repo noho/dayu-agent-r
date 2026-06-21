@@ -216,7 +216,6 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-S1-R1 | transferred-to-issue | GitHub Issues #121 and #122 | SEC/Fins CI pipeline / smoke 与 CN/HK Docling CI pipeline / smoke 改由对应 issue 直接追踪；不再作为本文档默认 next work unit。 |
 | WU-TOOLS-01-F01-02-R1 | transferred-to-issue | GitHub Issue #129 | 设计 awaiting 两阶段启动后，才能扩展 Host wait adapter 或 Fins runtime activation contract。 |
 | WU-TOOLS-01-F01-02-R2 | deferred-with-owner | WU-WAIT-03 / GitHub Issue #92；provider-specific adapter owners | 由 WU-WAIT-03 统一裁决 external job physical cancel / revoke / abandon；具体 provider/runtime 只在支持时实现物理中断，当前 WU 使用 cooperative checkpoint 与 bounded wait。 |
-| WU-TOOLS-01-F03-R4-WEB-SMOKE-R1 | deferred-with-owner | Web smoke / CI owner | `tests/tools/web/test_smoke_web_ci.py::test_default_run_executes_local_html_pdf_and_browser_cases` 当前断言日志必须进入 stdout，但实际日志进入 pytest captured log；该问题非 WU-TOOLS-01-F03-R4 引入，后续由 web smoke owner 单独裁决测试断言或日志输出通道。 |
 
 ## 当前 Work Units
 
@@ -556,7 +555,9 @@ Slice 7 final validation:
 - `pytest tests/runtime/test_scene_assets_migration.py -q`: `7 passed`
 - `pytest tests/fins/test_sec_downloader.py::test_sec_request_debug_logs_success_response -q`: `1 passed`
 - `pytest tests/runtime tests/service tests/fins tests/tools -q --ignore=tests/tools/web/test_smoke_web_ci.py`: `866 passed, 1 skipped, 3 upstream edgar deprecation warnings`
-- `pytest tests/tools/web -q`: `75 passed, 1 failed, 3 upstream edgar deprecation warnings`; failing test is `tests/tools/web/test_smoke_web_ci.py::test_default_run_executes_local_html_pdf_and_browser_cases`, where log text is captured under pytest captured log rather than stdout. This is classified as non-WU residual `WU-TOOLS-01-F03-R4-WEB-SMOKE-R1`.
+- Historical `pytest tests/tools/web -q` result before web smoke reconciliation: `75 passed, 1 failed, 3 upstream edgar deprecation warnings`; failing test was `tests/tools/web/test_smoke_web_ci.py::test_default_run_executes_local_html_pdf_and_browser_cases`, where the test asserted diagnostic log text in stdout instead of pytest captured log.
+- Post-reconciliation `python utils/smoke_web_ci.py --output-dir workspace/output/web_smoke/manual-wu-tools-f03-r4-final --run-label manual-wu-tools-f03-r4-final`: `SMOKE STATUS passed`, `SMOKE EXIT_CODE 0`, `SMOKE FAILURES 0`.
+- Post-reconciliation `pytest tests/tools/web -q`: `76 passed, 3 upstream edgar deprecation warnings`.
 - `pyright dayu tests utils`: `0 errors, 0 warnings, 0 informations`
 - `rg -n "include_read_tools|allowed_upload_roots" dayu tests README.md`: only `allowed_upload_roots` hit is the packaged config negative assertion in `tests/runtime/test_config_loader.py`; `include_read_tools` has no active production/test/README hits.
 - `rg -n "workspace_root\": null" dayu/config/tool_discovery.json tests`: no matches.
@@ -564,7 +565,7 @@ Slice 7 final validation:
 
 Slice 7 residual risk:
 
-- `deferred-with-owner`：`WU-TOOLS-01-F03-R4-WEB-SMOKE-R1` belongs to web smoke / CI owner. Current WU does not change `tests/tools/web/test_smoke_web_ci.py` or `utils/smoke_web_ci.py`, and the failure reproduces when running `tests/tools/web` directly.
+- No active WU-TOOLS-01-F03-R4 residual risk remains after reconciliation. Fresh web smoke passed after removing the obsolete smoke overlay `allow_empty` field, and the web smoke test now asserts diagnostic logs through pytest log capture instead of stdout.
 
 Aggregate deepreview artifacts:
 
@@ -573,15 +574,15 @@ Aggregate deepreview artifacts:
 
 Aggregate deepreview validation:
 
-- AgentMiMo reran focused tests, broad affected suite excluding the classified web smoke residual, pyright, and stale-field grep; result `pass`.
-- AgentDS reran focused tests, web smoke residual confirmation, broad affected suite excluding the classified web smoke residual, pyright, stale-field grep, and scene manifest grep; result `pass`.
+- AgentMiMo reran focused tests, broad affected suite excluding the then-classified web smoke caveat, pyright, and stale-field grep; result `pass`.
+- AgentDS reran focused tests, web smoke caveat confirmation, broad affected suite excluding the then-classified web smoke caveat, pyright, stale-field grep, and scene manifest grep; result `pass`.
 
 Controller aggregate deepreview judgment:
 
 - `accepted`：AgentMiMo found no substantive issues and confirmed all seven WU success dimensions: provider-level `allow_empty` removal, `include_read_tools` removal, Fins `workspace/` effective resolution, Doc/Fins packaged limits, upload `allowed_upload_roots` removal, default scene upload non-exposure, and docs/tests/control semantic consistency.
 - `rejected-with-reason`：AgentDS F-01 notes `ToolBundle._allow_empty=True` has insufficient semantic distinction. This is not a current defect: `_allow_empty=True` is only used to construct the legitimate zero-enabled-provider empty bundle, while enabled provider output still passes `_validate_provider_output(...)` and cannot return empty definitions. No code change is warranted in this WU.
 - `rejected-with-reason`：AgentDS F-02 notes double `enabled` filtering in `ToolsDiscovery.discover(...)` and `discover_from_bindings(...)`. This is an intentional defensive boundary for the public `discover_from_bindings(...)` method and does not create incorrect behavior or maintenance risk requiring a fix.
-- `deferred-with-owner`：`WU-TOOLS-01-F03-R4-WEB-SMOKE-R1` remains assigned to web smoke / CI owner and is not a current WU blocker.
+- `accepted`：No active WU-TOOLS-01-F03-R4 residual risk remains after residual reconciliation.
 
 Accepted deepreview commit:
 
@@ -595,8 +596,8 @@ Draft PR readiness decision:
 
 - Branch `phase/wu-tools-01-f03-r4` contains only WU-TOOLS-01-F03-R4 gate commits from `fe212365` through `3463ae9d`.
 - All approved slices and aggregate deepreview are complete; no accepted finding requires fix / re-review.
-- Validation is recorded: focused WU suites passed, `pyright dayu tests utils` passed, broad affected suite excluding classified non-WU web smoke residual passed.
-- Deferred residual risks have explicit owners / destinations.
+- Validation is recorded: focused WU suites passed, `pyright dayu tests utils` passed, broad affected suite excluding the historical web smoke caveat passed, and post-reconciliation `tests/tools/web` plus fresh web smoke passed.
+- No active WU-TOOLS-01-F03-R4 residual risk remains after residual reconciliation.
 - GitHub issue-133 remains OPEN and its six requested Tools Discovery spec items are implemented, tested, and documented. Draft PR body should use `Closes #133` and list deferred owners.
 
 Draft PR:
@@ -617,7 +618,7 @@ Controller PR review judgment:
 - `accepted`：AgentMiMo verified PR 160 metadata, body, issue-133 completion, residual owners, diff scope, validation claims, and stale-field grep; no issues found.
 - `rejected-with-reason`：AgentDS F01 notes `start_fins_upload.files` description no longer carries path authorization semantics. This is not a current defect. The accepted design deliberately removed provider-local upload allowlists, and the current tool schema truthfully states the active tool boundary: files must be existing non-empty regular files. Adding generic "system administrator controls allowed directories" wording before Host / policy owns a concrete contract would create an implicit rule with no enforcement source.
 - `accepted`：PR body `Closes #133` is correct because all six issue-133 requested Tools Discovery spec changes are implemented, tested, and documented. Deferred risks are separately owned and do not leave issue-133 partially implemented.
-- `accepted`：`WU-TOOLS-01-F03-R4-WEB-SMOKE-R1` remains a non-WU residual owned by web smoke / CI; it is listed in PR body and control doc, and does not block PR 160.
+- `accepted`：No active WU-TOOLS-01-F03-R4 residual risk remains after residual reconciliation; the historical web smoke caveat has been rechecked and fixed by aligning the smoke overlay and test assertions with current logging/config semantics.
 - `accepted`：User-requested process improvement was written into the Slice 切分原则 section: small cross-module cleanup work should default to 2-3 semantic slices and any plan exceeding 3 implementation slices must justify why the work cannot be merged into those verification loops.
 
 Accepted PR review commit and final push:
