@@ -1,8 +1,8 @@
 """Doc tools 的当前 ToolsDiscovery provider。
 
 本模块只负责解析 provider 配置、维护 provider id / version / source refs，
-并把 Doc 原生 ``ToolDefinition`` 集合交给 ``ToolsDiscovery``。路径白名单
-为空时 fail closed，返回空工具集合。
+并把 Doc 原生 ``ToolDefinition`` 集合交给 ``ToolsDiscovery``。启用 Doc
+provider 时必须显式配置路径白名单；缺失或为空属于 Doc 业务配置错误。
 """
 
 from __future__ import annotations
@@ -25,6 +25,9 @@ _VERSION_REF: Final[str] = "doc-tools-provider-v1"
 _SOURCE_ID: Final[str] = "dayu.tools.doc_provider"
 _CONFIG_LIMITS_FIELD: Final[str] = "limits"
 _CONFIG_ALLOWED_PATHS_FIELD: Final[str] = "allowed_paths"
+_EMPTY_ALLOWED_PATHS_ERROR: Final[str] = (
+    "doc provider config.allowed_paths must contain at least one path when doc-tools is enabled"
+)
 
 
 def discover_tools(spec: ToolsDiscoveryProviderSpec) -> ToolsDiscoveryProviderOutput:
@@ -34,22 +37,17 @@ def discover_tools(spec: ToolsDiscoveryProviderSpec) -> ToolsDiscoveryProviderOu
         spec: ToolsDiscovery 传入的 provider 显式配置。
 
     Returns:
-        provider 输出；当 provider 启用但未配置显式路径白名单时返回空工具集。
+        provider 输出，包含 Doc 工具定义与来源引用。
 
     Raises:
-        ValueError: provider config 字段类型非法时抛出。
+        ValueError: provider config 字段类型非法，或启用时未配置路径白名单时抛出。
     """
 
     limits = _parse_limits(spec.config)
     allowed_roots = _parse_allowed_paths(spec.config)
     source_ref = _source_ref()
     if not allowed_roots:
-        return ToolsDiscoveryProviderOutput(
-            provider_id=_PROVIDER_ID,
-            version_ref=_VERSION_REF,
-            source_refs=(source_ref,),
-            definitions=(),
-        )
+        raise ValueError(_EMPTY_ALLOWED_PATHS_ERROR)
 
     return ToolsDiscoveryProviderOutput(
         provider_id=_PROVIDER_ID,
@@ -141,7 +139,7 @@ def _parse_allowed_paths(config: Mapping[str, JsonValue]) -> tuple[Path, ...]:
         config: provider 自有 JSON 配置。
 
     Returns:
-        归一化后的绝对路径根元组；缺失或空列表返回空元组。
+        归一化后的绝对路径根元组；缺失或空列表返回空元组，由调用方决定是否允许。
 
     Raises:
         ValueError: ``allowed_paths`` 字段不是字符串数组，或包含空白字符串时抛出。

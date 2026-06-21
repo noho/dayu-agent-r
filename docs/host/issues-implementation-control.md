@@ -144,10 +144,10 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
 | gate | accepted-slice |
-| implementation status | WU-TOOLS-01-F03-R4 Slice 4 implementation completed by AgentCodex and passed AgentMiMo / AgentDS code review with no blocking findings. Controller reran affected pytest, pyright, and grep checks successfully. Awaiting accepted slice commit. |
+| implementation status | WU-TOOLS-01-F03-R4 Slice 5 implementation, code review, accepted fix, and fix re-review are complete. AgentMiMo / AgentDS confirmed F1/F2 closed, and controller reran affected pytest plus pyright successfully. Awaiting accepted slice commit. |
 | active work unit | WU-TOOLS-01-F03-R4 |
 | default next work unit | WU-TOOLS-01-F03-R4 |
-| next entry point | Commit accepted WU-TOOLS-01-F03-R4 Slice 4 changes, then continue Slice 5 from the accepted plan. WU-ENG-02-R1 remains final-closeout-pass with draft PR 159 awaiting user merge / PR disposition. |
+| next entry point | Commit accepted WU-TOOLS-01-F03-R4 Slice 5 changes, then continue Slice 6 documentation/design synchronization. WU-ENG-02-R1 remains final-closeout-pass with draft PR 159 awaiting user merge / PR disposition. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | Active/backlog issue owners retained here: #63 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #20 / #89 / #90 / #92 / #80 / #115, plus residual-risk destinations #121 / #122 / #129 / #133. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`. |
 | blocking open questions | None after user confirmed the current goal direction, including upload `allowed_upload_roots` removal and deferring unified file-read permission governance to future Host / policy design. |
@@ -210,7 +210,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 | Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|---|
-| WU-TOOLS-01-F03-R4 | accepted-slice | Tools Discovery spec semantics cleanup | GitHub Issue #133 | Active work unit. Slice 4 implementation and code review passed; accepted slice commit is next. |
+| WU-TOOLS-01-F03-R4 | accepted-slice | Tools Discovery spec semantics cleanup | GitHub Issue #133 | Active work unit. Slice 5 implementation/review/fix/re-review passed; accepted slice commit is next. |
 | WU-ENG-02-R1 | final-closeout-pass | Provider debugging correlation default enablement and fallback diagnostics | GitHub Issue #63 reopened / draft PR 159 | Local gate chain is complete and draft PR 159 awaits user merge / PR disposition; not the active WU for this branch. |
 | WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
@@ -237,7 +237,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 ### 状态
 
-GitHub Issue #133 当前为 OPEN。本 WU 从 WU-TOOLS-01-F03 final closeout residual risk 转入独立实施入口，goal confirmation 已由用户确认，plan gate 已完成，plan review completed with blocking findings，plan-fix gate 已完成，plan re-review passed，accepted plan commit 已创建，Slice 1 implementation / code review / accepted slice commit 已完成，Slice 2 已由 controller 裁决为 covered by Slice 1，Slice 3 implementation / code review / accepted slice commit 已完成，Slice 4 implementation / code review 已完成，当前进入 Slice 4 accepted slice commit gate。
+GitHub Issue #133 当前为 OPEN。本 WU 从 WU-TOOLS-01-F03 final closeout residual risk 转入独立实施入口，goal confirmation 已由用户确认，plan gate 已完成，plan review completed with blocking findings，plan-fix gate 已完成，plan re-review passed，accepted plan commit 已创建，Slice 1 implementation / code review / accepted slice commit 已完成，Slice 2 已由 controller 裁决为 covered by Slice 1，Slice 3 implementation / code review / accepted slice commit 已完成，Slice 4 implementation / code review / accepted slice commit 已完成，Slice 5 implementation / code review / fix / re-review 已完成，当前进入 Slice 5 accepted slice commit gate。
 
 Plan artifact:
 
@@ -423,6 +423,65 @@ Slice 4 controller validation:
 - `pyright dayu tests utils`: `0 errors, 0 warnings, 0 informations`
 - `rg -n "allowed_upload_roots|_CONFIG_ALLOWED_UPLOAD_ROOTS_FIELD|parse_allowed_upload_roots_config" dayu tests utils`: only `tests/runtime/test_config_loader.py` negative assertion
 - `rg -n '"fins"|fins-upload|"ingestion"|start_fins_upload' dayu/config/prompts/manifests`: no matches
+
+Accepted Slice 4 commit:
+
+- `4514f550` (`gateflow: accept WU-TOOLS-01-F03-R4 slice 4`)
+
+Slice 5 implementation artifact:
+
+- `docs/reviews/wu-tools-01-f03-r4-slice5-implementation-codex.md` by AgentCodex
+
+Slice 5 implementation validation:
+
+- `pytest tests/runtime/test_config_loader.py tests/tools/test_doc_tools_provider.py tests/fins/test_fins_storage_provider.py -q`: `97 passed`, 3 upstream `edgar` deprecation warnings
+- `pytest tests/tools/test_combined_tools_acceptance.py -q`: `8 passed`, 3 upstream `edgar` deprecation warnings
+- `pyright dayu tests utils`: `0 errors, 0 warnings, 0 informations`
+
+Slice 5 code review focus:
+
+- Verify enabled Doc provider with missing or empty `allowed_paths` raises the Doc-specific `ValueError` at provider boundary and no longer returns empty `definitions`.
+- Verify Doc provider limits parsing remains provider-owned, ConfigLoader does not parse provider-specific limits, and packaged config values remain explicitly asserted.
+- Verify new Doc explicit limits test actually checks schema maximums and truncate specs produced from config, not dataclass defaults.
+- Verify new Fins explicit limits test checks all ToolDefinition-visible limits and correctly treats `processor_cache_max_entries` as runtime cache input that is not visible in `ToolDefinition`.
+- Verify README update is minimal tests README sync and not a docs/design Slice 6 overrun.
+
+Slice 5 code review artifacts:
+
+- `docs/reviews/wu-tools-01-f03-r4-slice5-code-review-mimo.md` by AgentMiMo, verdict `accept-with-conditions`, blocking findings `0`
+- `docs/reviews/wu-tools-01-f03-r4-slice5-code-review-ds.md` by AgentDS, verdict `pass`, blocking findings `0`
+
+Controller Slice 5 code-review judgment:
+
+- `accepted`：MiMo F1 — Fins explicit limits test should assert `processor_cache_max_entries` is not projected into any ToolDefinition truncate limits. This directly matches Slice 5 focus on treating that field as runtime-only.
+- `accepted`：MiMo F2 — Partial limits fallback to dataclass defaults is a plan invariant and should have a focused test. Low risk but cheap to cover in the same fix.
+- `accepted`：DS review — no blocking findings; DS residual risks are informational and consistent with the accepted fix items.
+
+Slice 5 fix artifact:
+
+- `docs/reviews/wu-tools-01-f03-r4-slice5-fix-codex.md` by AgentCodex
+
+Slice 5 fix validation:
+
+- `pytest tests/tools/test_doc_tools_provider.py tests/fins/test_fins_storage_provider.py -q`: `57 passed`, 3 upstream `edgar` deprecation warnings
+- `pytest tests/runtime/test_config_loader.py tests/tools/test_combined_tools_acceptance.py -q`: `49 passed`, 3 upstream `edgar` deprecation warnings
+- `pyright dayu tests utils`: `0 errors, 0 warnings, 0 informations`
+
+Slice 5 fix re-review artifacts:
+
+- `docs/reviews/wu-tools-01-f03-r4-slice5-fix-rereview-mimo.md` by AgentMiMo, verdict `accept`, F1 closed, F2 closed
+- `docs/reviews/wu-tools-01-f03-r4-slice5-fix-rereview-ds.md` by AgentDS, verdict `pass`, F1 closed, F2 closed
+
+Controller Slice 5 final judgment:
+
+- `closed`：MiMo F1 — fixed by asserting `processor_cache_max_entries` is absent from every Fins ToolDefinition `truncate.limits` while preserving all visible limit assertions.
+- `closed`：MiMo F2 — fixed by adding partial Doc limits fallback coverage: explicit `list_files_max=99` overrides default, missing visible Doc limits fall back to `DocToolLimits()` defaults.
+- `accepted`：No production code was changed by the fix; review agents found no regressions.
+
+Slice 5 controller validation:
+
+- `pytest tests/runtime/test_config_loader.py tests/tools/test_doc_tools_provider.py tests/fins/test_fins_storage_provider.py tests/tools/test_combined_tools_acceptance.py -q`: `106 passed`, 3 upstream `edgar` deprecation warnings
+- `pyright dayu tests utils`: `0 errors, 0 warnings, 0 informations`
 
 当前裁决来自 controller 对 `docs/host/design.md`、`docs/engine/design.md`、`dayu/config/tool_discovery.json`、`dayu/runtime/tools_discovery.py`、`dayu/runtime/config_loader.py`、`dayu/service/host_assembly.py`、Fins / Doc provider、Fins upload tool、Fins storage repository 与 OLD `/Users/leo/workspace/dayu-agent` 配置的代码核对。
 

@@ -42,7 +42,6 @@ from dayu.host.tooling import default_framework_tool_policy_view
 from dayu.runtime.tools_discovery import (
     PythonImportPathProvider,
     ToolsDiscovery,
-    ToolsDiscoveryError,
     ToolsDiscoveryProviderBinding,
     ToolsDiscoveryProviderSpec,
 )
@@ -249,17 +248,27 @@ def test_doc_tools_cancelled_before_work_return_host_cancelled(
     _assert_no_governance_text(f"{outcome.message} {outcome.hint or ''}")
 
 
-def test_provider_enabled_without_allowed_paths_fails_closed() -> None:
-    """启用 provider 但没有白名单时聚合阶段必须拒绝空工具输出。"""
+@pytest.mark.parametrize("config", ({"limits": {}}, {"limits": {}, "allowed_paths": []}))
+def test_provider_enabled_without_allowed_paths_fails_fast(
+    config: Mapping[str, JsonValue],
+) -> None:
+    """启用 provider 但没有白名单时必须在 Doc provider 边界失败。
 
-    spec = _spec_with_config({"limits": {}, "allowed_paths": []})
-    output = discover_tools(spec)
+    :param config: 缺失或空白名单的 provider 配置。
+    :returns: ``None``。
+    :raises AssertionError: provider 未按预期失败时抛出。
+    """
 
-    assert output.definitions == ()
-    with pytest.raises(ToolsDiscoveryError, match="returned empty tools"):
-        ToolsDiscovery().discover_from_bindings(
-            (ToolsDiscoveryProviderBinding(spec=spec, provider=discover_tools),)
-        )
+    spec = _spec_with_config(config)
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "doc provider config.allowed_paths must contain at least one path "
+            "when doc-tools is enabled"
+        ),
+    ):
+        discover_tools(spec)
 
 
 def test_disallowed_path_returns_failed_outcome(tmp_path: Path) -> None:
@@ -964,6 +973,73 @@ def test_read_tools_expose_current_truncate_spec_and_no_old_imports(
     assert "TruncationManager" not in doc_tools_source
 
 
+def test_doc_provider_explicit_limits_shape_schema_and_truncate_specs(tmp_path: Path) -> None:
+    """Doc provider 必须把显式完整 limits 配置投影到参数 schema 与截断声明。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 参数上限或截断声明未反映显式配置时抛出。
+    """
+
+    definitions = _definitions_by_name(
+        discover_tools(
+            _spec_with_config(
+                {
+                    "allowed_paths": [str(tmp_path)],
+                    "limits": {
+                        "list_files_max": 31,
+                        "get_sections_max": 32,
+                        "search_files_max_results": 33,
+                        "read_file_max_chars": 3400,
+                        "read_file_section_max_chars": 3500,
+                    },
+                }
+            )
+        ).definitions
+    )
+
+    assert _parameter_maximum(definitions["list_files"], "limit") == 31
+    assert _parameter_maximum(definitions["get_file_sections"], "limit") == 32
+    assert _parameter_maximum(definitions["search_files"], "limit") == 33
+    assert _truncate_limit(definitions["read_file"], "max_chars") == 3400
+    assert _truncate_limit(definitions["read_file_section"], "max_chars") == 3500
+
+
+def test_doc_provider_partial_limits_fall_back_to_defaults(tmp_path: Path) -> None:
+    """Doc provider 必须把缺失的单项 limits 回退到 dataclass 默认值。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 显式 limit 或默认 limit 投影不符合预期时抛出。
+    """
+
+    defaults = doc_tools.DocToolLimits()
+    definitions = _definitions_by_name(
+        discover_tools(
+            _spec_with_config(
+                {
+                    "allowed_paths": [str(tmp_path)],
+                    "limits": {
+                        "list_files_max": 99,
+                    },
+                }
+            )
+        ).definitions
+    )
+
+    assert _parameter_maximum(definitions["list_files"], "limit") == 99
+    assert _parameter_maximum(definitions["get_file_sections"], "limit") == (
+        defaults.get_sections_max
+    )
+    assert _parameter_maximum(definitions["search_files"], "limit") == (
+        defaults.search_files_max_results
+    )
+    assert _truncate_limit(definitions["read_file"], "max_chars") == defaults.read_file_max_chars
+    assert _truncate_limit(definitions["read_file_section"], "max_chars") == (
+        defaults.read_file_section_max_chars
+    )
+
+
 def test_toolruntime_executes_doc_tool_through_accept_barrier(tmp_path: Path) -> None:
     """当前 ToolRuntime 至少能通过 accept barrier 执行一个 Doc tool。"""
 
@@ -1066,6 +1142,38 @@ def _definitions_by_name(
     """
 
     return {definition.name: definition for definition in definitions}
+
+
+def _parameter_maximum(definition: ToolDefinition, parameter_name: str) -> int:
+    """读取工具参数 schema 的 maximum。
+
+    :param definition: 工具定义。
+    :param parameter_name: 参数名。
+    :returns: 参数 maximum。
+    :raises AssertionError: 参数 schema 不是 JSON object 或 maximum 不是整数时抛出。
+    """
+
+    parameter_schema = definition.schema.function.parameters.properties[parameter_name]
+    assert isinstance(parameter_schema, Mapping)
+    maximum = parameter_schema.get("maximum")
+    assert isinstance(maximum, int)
+    return maximum
+
+
+def _truncate_limit(definition: ToolDefinition, limit_name: str) -> int:
+    """读取工具截断声明中的限制值。
+
+    :param definition: 工具定义。
+    :param limit_name: limit 字段名。
+    :returns: 截断限制值。
+    :raises AssertionError: 工具没有截断声明或限制值不是整数时抛出。
+    """
+
+    truncate = definition.truncate
+    assert isinstance(truncate, ToolTruncateSpec)
+    limit = truncate.limits[limit_name]
+    assert isinstance(limit, int)
+    return limit
 
 
 def _copy_fixture(tmp_path: Path, fixture_name: str) -> Path:
