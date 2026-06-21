@@ -143,11 +143,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | accepted-slice |
-| implementation status | WU-TOOLS-01-F03-R4 Slice 6 implementation completed by AgentCodex and passed AgentMiMo / AgentDS code review with no blocking findings. Controller reran pyright, diff check, and active-doc grep classification successfully. Awaiting accepted slice commit. |
+| gate | aggregate deepreview |
+| implementation status | WU-TOOLS-01-F03-R4 Slice 7 final validation completed. Focused tests, affected broad suites excluding an unrelated web smoke logging assertion, pyright, and stale-field grep passed; final validation exposed one related scene migration fake catalog fixture update and one unrelated web smoke residual. |
 | active work unit | WU-TOOLS-01-F03-R4 |
 | default next work unit | WU-TOOLS-01-F03-R4 |
-| next entry point | Commit accepted WU-TOOLS-01-F03-R4 Slice 6 changes, then continue Slice 7 final validation and cleanup. WU-ENG-02-R1 remains final-closeout-pass with draft PR 159 awaiting user merge / PR disposition. |
+| next entry point | Dispatch WU-TOOLS-01-F03-R4 aggregate deepreview to AgentMiMo / AgentDS, then adjudicate findings. WU-ENG-02-R1 remains final-closeout-pass with draft PR 159 awaiting user merge / PR disposition. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | Active/backlog issue owners retained here: #63 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #20 / #89 / #90 / #92 / #80 / #115, plus residual-risk destinations #121 / #122 / #129 / #133. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`. |
 | blocking open questions | None after user confirmed the current goal direction, including upload `allowed_upload_roots` removal and deferring unified file-read permission governance to future Host / policy design. |
@@ -204,13 +204,13 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-S1-R1 | transferred-to-issue | GitHub Issues #121 and #122 | SEC/Fins CI pipeline / smoke 与 CN/HK Docling CI pipeline / smoke 改由对应 issue 直接追踪；不再作为本文档默认 next work unit。 |
 | WU-TOOLS-01-F01-02-R1 | transferred-to-issue | GitHub Issue #129 | 设计 awaiting 两阶段启动后，才能扩展 Host wait adapter 或 Fins runtime activation contract。 |
 | WU-TOOLS-01-F01-02-R2 | deferred-with-owner | WU-WAIT-03 / GitHub Issue #92；provider-specific adapter owners | 由 WU-WAIT-03 统一裁决 external job physical cancel / revoke / abandon；具体 provider/runtime 只在支持时实现物理中断，当前 WU 使用 cooperative checkpoint 与 bounded wait。 |
-| WU-TOOLS-01-F03-R4 | open | WU-TOOLS-01-F03-R4 / GitHub Issue #133 | 本轮作为独立 WU 处理 Tools Discovery spec 语义：移除 `allow_empty` / `include_read_tools`、`workspace_root` 默认值、Fins read / Doc OLD limits、upload allowlist 归属。 |
+| WU-TOOLS-01-F03-R4-WEB-SMOKE-R1 | deferred-with-owner | Web smoke / CI owner | `tests/tools/web/test_smoke_web_ci.py::test_default_run_executes_local_html_pdf_and_browser_cases` 当前断言日志必须进入 stdout，但实际日志进入 pytest captured log；该问题非 WU-TOOLS-01-F03-R4 引入，后续由 web smoke owner 单独裁决测试断言或日志输出通道。 |
 
 ## 当前 Work Units
 
 | Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|---|
-| WU-TOOLS-01-F03-R4 | accepted-slice | Tools Discovery spec semantics cleanup | GitHub Issue #133 | Active work unit. Slice 6 implementation and code review passed; accepted slice commit is next. |
+| WU-TOOLS-01-F03-R4 | aggregate-deepreview | Tools Discovery spec semantics cleanup | GitHub Issue #133 | Active work unit. Slice 7 final validation completed; aggregate deepreview is next. |
 | WU-ENG-02-R1 | final-closeout-pass | Provider debugging correlation default enablement and fallback diagnostics | GitHub Issue #63 reopened / draft PR 159 | Local gate chain is complete and draft PR 159 awaits user merge / PR disposition; not the active WU for this branch. |
 | WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
@@ -237,7 +237,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 ### 状态
 
-GitHub Issue #133 当前为 OPEN。本 WU 从 WU-TOOLS-01-F03 final closeout residual risk 转入独立实施入口，goal confirmation 已由用户确认，plan gate 已完成，plan review completed with blocking findings，plan-fix gate 已完成，plan re-review passed，accepted plan commit 已创建，Slice 1 implementation / code review / accepted slice commit 已完成，Slice 2 已由 controller 裁决为 covered by Slice 1，Slice 3 implementation / code review / accepted slice commit 已完成，Slice 4 implementation / code review / accepted slice commit 已完成，Slice 5 implementation / code review / fix / re-review / accepted slice commit 已完成，Slice 6 implementation / code review 已完成，当前进入 Slice 6 accepted slice commit gate。
+GitHub Issue #133 当前为 OPEN。本 WU 从 WU-TOOLS-01-F03 final closeout residual risk 转入独立实施入口，goal confirmation 已由用户确认，plan gate 已完成，plan review completed with blocking findings，plan-fix gate 已完成，plan re-review passed，accepted plan commit 已创建，Slice 1 implementation / code review / accepted slice commit 已完成，Slice 2 已由 controller 裁决为 covered by Slice 1，Slice 3 implementation / code review / accepted slice commit 已完成，Slice 4 implementation / code review / accepted slice commit 已完成，Slice 5 implementation / code review / fix / re-review / accepted slice commit 已完成，Slice 6 implementation / code review / accepted slice commit 已完成，Slice 7 final validation 已完成，当前进入 aggregate deepreview gate。
 
 Plan artifact:
 
@@ -521,6 +521,38 @@ Slice 6 controller validation:
 - `pyright dayu tests utils`: `0 errors, 0 warnings, 0 informations`
 - `git diff --check` on Slice 6 docs/review files: no output
 - Active docs grep for `allow_empty|include_read_tools|allowed_upload_roots`: remaining matches are allowed scene/test-rejection classifications only.
+
+Accepted Slice 6 commit:
+
+- `d8db0b49` (`gateflow: accept WU-TOOLS-01-F03-R4 slice 6`)
+
+Slice 7 final validation artifact:
+
+- `docs/reviews/wu-tools-01-f03-r4-slice7-final-validation-codex.md` by AgentCodex
+
+Slice 7 final validation changes:
+
+- `tests/runtime/test_scene_assets_migration.py` fake tool catalog updated to include the current explicit default-scene Fins read / download / preprocess tool names after Slice 4 removed broad `"fins"` / `"ingestion"` default selection.
+
+Slice 7 final validation:
+
+- `pytest tests/runtime/test_config_loader.py tests/runtime/test_tools_discovery.py tests/runtime/test_tools_discovery_digest.py -q`: `60 passed`
+- `pytest tests/service/test_host_assembly.py tests/runtime/test_smoke_host_public_multiturn_assembly.py -q`: `58 passed`, 3 upstream `edgar` deprecation warnings
+- `pytest tests/fins/test_fins_storage_provider.py tests/fins/test_fins_ingestion_tools.py -q`: `70 passed`, 3 upstream `edgar` deprecation warnings
+- `pytest tests/runtime/test_scene_prepare.py -q`: `31 passed`
+- `pytest tests/tools/test_doc_tools_provider.py tests/tools/test_combined_tools_acceptance.py -q`: `42 passed`, 3 upstream `edgar` deprecation warnings
+- `pytest tests/runtime/test_scene_assets_migration.py -q`: `7 passed`
+- `pytest tests/fins/test_sec_downloader.py::test_sec_request_debug_logs_success_response -q`: `1 passed`
+- `pytest tests/runtime tests/service tests/fins tests/tools -q --ignore=tests/tools/web/test_smoke_web_ci.py`: `866 passed, 1 skipped, 3 upstream edgar deprecation warnings`
+- `pytest tests/tools/web -q`: `75 passed, 1 failed, 3 upstream edgar deprecation warnings`; failing test is `tests/tools/web/test_smoke_web_ci.py::test_default_run_executes_local_html_pdf_and_browser_cases`, where log text is captured under pytest captured log rather than stdout. This is classified as non-WU residual `WU-TOOLS-01-F03-R4-WEB-SMOKE-R1`.
+- `pyright dayu tests utils`: `0 errors, 0 warnings, 0 informations`
+- `rg -n "include_read_tools|allowed_upload_roots" dayu tests README.md`: only `allowed_upload_roots` hit is the packaged config negative assertion in `tests/runtime/test_config_loader.py`; `include_read_tools` has no active production/test/README hits.
+- `rg -n "workspace_root\": null" dayu/config/tool_discovery.json tests`: no matches.
+- `rg -n "\"allow_empty\"|allow_empty" dayu/config dayu/runtime dayu/service dayu/fins dayu/tools tests README.md`: remaining hits are scene `tool_selection.allow_empty`, runtime internal `ToolBundle._allow_empty`, direct event string validation, and old provider-level field rejection tests / documentation.
+
+Slice 7 residual risk:
+
+- `deferred-with-owner`：`WU-TOOLS-01-F03-R4-WEB-SMOKE-R1` belongs to web smoke / CI owner. Current WU does not change `tests/tools/web/test_smoke_web_ci.py` or `utils/smoke_web_ci.py`, and the failure reproduces when running `tests/tools/web` directly.
 
 当前裁决来自 controller 对 `docs/host/design.md`、`docs/engine/design.md`、`dayu/config/tool_discovery.json`、`dayu/runtime/tools_discovery.py`、`dayu/runtime/config_loader.py`、`dayu/service/host_assembly.py`、Fins / Doc provider、Fins upload tool、Fins storage repository 与 OLD `/Users/leo/workspace/dayu-agent` 配置的代码核对。
 

@@ -184,7 +184,17 @@ def _fake_tool_catalog() -> SceneToolCatalog:
 
     return SceneToolCatalog(
         tools=(
-            SceneToolInfo(name="fake_fins_lookup", tags=frozenset({"fins"})),
+            SceneToolInfo(name="list_documents", tags=frozenset({"fins"})),
+            SceneToolInfo(name="get_document_sections", tags=frozenset({"fins"})),
+            SceneToolInfo(name="read_section", tags=frozenset({"fins"})),
+            SceneToolInfo(name="search_document", tags=frozenset({"fins"})),
+            SceneToolInfo(name="list_tables", tags=frozenset({"fins"})),
+            SceneToolInfo(name="get_table", tags=frozenset({"fins"})),
+            SceneToolInfo(name="get_page_content", tags=frozenset({"fins"})),
+            SceneToolInfo(name="get_financial_statement", tags=frozenset({"fins"})),
+            SceneToolInfo(name="query_xbrl_facts", tags=frozenset({"fins"})),
+            SceneToolInfo(name="start_fins_download", tags=frozenset({"fins"})),
+            SceneToolInfo(name="start_fins_preprocess", tags=frozenset({"fins"})),
             SceneToolInfo(name="fake_web_search", tags=frozenset({"web"})),
             SceneToolInfo(name="fake_ingestion", tags=frozenset({"ingestion"})),
             SceneToolInfo(
