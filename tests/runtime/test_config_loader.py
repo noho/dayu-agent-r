@@ -408,7 +408,7 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
     )
     assert preprocess_provider.enabled is True
     assert preprocess_provider.config["workspace_root"] == "workspace/"
-    assert upload_provider.enabled is False
+    assert upload_provider.enabled is True
     assert upload_provider.config["workspace_root"] == "workspace/"
     assert "allowed_upload_roots" not in upload_provider.config
     doc_provider = config.tool_discovery.providers["doc-tools"]

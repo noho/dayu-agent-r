@@ -47,7 +47,7 @@
       "entry_point": null,
       "source_kind": "explicit_provider",
       "source_id": "dayu.fins.tools.upload_provider",
-      "enabled": false,
+      "enabled": true,
       "config": {
         "workspace_root": "workspace/"
       }

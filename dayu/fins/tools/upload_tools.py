@@ -1,14 +1,13 @@
 """Fins 上传 awaiting tool 定义。
 
 本模块把 Fins shared ingestion runtime 的上传 observation 入口适配为当前
-``ToolDefinition``。工具只负责参数解析、本地上传路径 allowlist 校验和
-外部长事务启动，不复制 SEC/CN/HK 上传业务规则，也不等待 Docling 或仓储
-长事务完成。
+``ToolDefinition``。工具只负责参数解析、本地上传文件形态校验和外部长
+事务启动，不复制 SEC/CN/HK 上传业务规则，也不等待 Docling 或仓储长事务完成。
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -68,11 +67,9 @@ class FinsUploadToolCallable:
 
     Attributes:
         runtime: Fins shared ingestion runtime。
-        allowed_upload_roots: 允许读取上传文件的绝对目录集合。
     """
 
     runtime: FinsIngestionRuntime
-    allowed_upload_roots: tuple[Path, ...]
 
     async def __call__(
         self,
@@ -99,10 +96,7 @@ class FinsUploadToolCallable:
         if cancellation_token.is_cancelled():
             return _cancelled_outcome(started_at)
         try:
-            request = _upload_request_from_arguments(
-                call.arguments,
-                allowed_upload_roots=self.allowed_upload_roots,
-            )
+            request = _upload_request_from_arguments(call.arguments)
             handle = self.runtime.start_observed_upload(
                 request,
                 cancellation_token=cancellation_token,
@@ -136,25 +130,19 @@ class FinsUploadToolCallable:
         return _awaiting_outcome_from_observation_handle(handle)
 
 
-def build_fins_upload_tool(
-    runtime: FinsIngestionRuntime,
-    *,
-    allowed_upload_roots: Sequence[Path],
-) -> ToolDefinition:
+def build_fins_upload_tool(runtime: FinsIngestionRuntime) -> ToolDefinition:
     """构造 Fins 上传 awaiting tool 定义。
 
     Args:
         runtime: Fins shared ingestion runtime。
-        allowed_upload_roots: 允许读取上传文件的绝对目录集合。
 
     Returns:
         上传工具定义。
 
     Raises:
-        ValueError: allowlist 为空、路径不是绝对路径，或工具 schema 与名称不一致时抛出。
+        ValueError: 工具 schema 与名称不一致时由契约构造抛出。
     """
 
-    normalized_roots = _normalize_allowed_upload_roots(allowed_upload_roots)
     return ToolDefinition(
         name=UPLOAD_TOOL_NAME,
         schema=ToolSchema(
@@ -171,10 +159,7 @@ def build_fins_upload_tool(
                 parameters=_upload_parameters_schema(),
             ),
         ),
-        callable=FinsUploadToolCallable(
-            runtime=runtime,
-            allowed_upload_roots=normalized_roots,
-        ),
+        callable=FinsUploadToolCallable(runtime=runtime),
         truncate=None,
         display=ToolDisplayInfo(name="Start Fins Upload"),
         tags=("fins", "fins-upload"),
@@ -241,7 +226,7 @@ def _upload_parameters_schema() -> ToolParametersSchema:
         },
         "files": {
             "type": "array",
-            "description": "Local file paths to upload. Paths must be under the configured upload roots. Required for auto, create and update; forbidden for delete.",
+            "description": "Local file paths to upload. Each path must point to an existing non-empty regular file. Required for auto, create and update; forbidden for delete.",
             "items": string_items_schema,
         },
         "fiscal_year": {
@@ -304,16 +289,11 @@ def _upload_parameters_schema() -> ToolParametersSchema:
     )
 
 
-def _upload_request_from_arguments(
-    arguments: Mapping[str, JsonValue],
-    *,
-    allowed_upload_roots: Sequence[Path],
-) -> FinsUploadRequest:
+def _upload_request_from_arguments(arguments: Mapping[str, JsonValue]) -> FinsUploadRequest:
     """从工具参数构造上传请求。
 
     Args:
         arguments: 单次工具调用 JSON 参数。
-        allowed_upload_roots: 允许读取上传文件的绝对目录集合。
 
     Returns:
         Fins 上传请求。
@@ -324,11 +304,7 @@ def _upload_request_from_arguments(
 
     upload_kind = _required_upload_kind(arguments)
     action = _required_upload_action(arguments)
-    files = _upload_files_from_arguments(
-        arguments,
-        action=action,
-        allowed_upload_roots=allowed_upload_roots,
-    )
+    files = _upload_files_from_arguments(arguments, action=action)
     if upload_kind == _UPLOAD_KIND_FILING:
         return FinsUploadFilingRequest(
             ticker=_required_text(arguments, "ticker"),
@@ -406,23 +382,20 @@ def _upload_files_from_arguments(
     arguments: Mapping[str, JsonValue],
     *,
     action: str,
-    allowed_upload_roots: Sequence[Path],
 ) -> tuple[Path, ...]:
     """读取并校验上传文件路径。
 
     Args:
         arguments: 工具参数。
         action: 已规范化上传动作。
-        allowed_upload_roots: 允许读取上传文件的绝对目录集合。
 
     Returns:
         已 resolve 的上传文件路径元组。
 
     Raises:
-        ValueError: 文件参数类型、文件数量、路径位置或文件状态非法时抛出。
+        ValueError: 文件参数类型、文件数量或文件状态非法时抛出。
     """
 
-    roots = _normalize_allowed_upload_roots(allowed_upload_roots)
     raw_paths = _optional_text_tuple(arguments, "files")
     if action == _UPLOAD_ACTION_DELETE:
         if raw_paths:
@@ -430,54 +403,23 @@ def _upload_files_from_arguments(
         return ()
     if not raw_paths:
         raise ValueError("files must contain at least one path for auto, create or update uploads")
-    return tuple(_resolve_upload_path(raw_path, allowed_upload_roots=roots) for raw_path in raw_paths)
+    return tuple(_resolve_upload_file_path(raw_path) for raw_path in raw_paths)
 
 
-def _normalize_allowed_upload_roots(allowed_upload_roots: Sequence[Path]) -> tuple[Path, ...]:
-    """规范化 provider 配置的上传 allowlist 根目录。
-
-    Args:
-        allowed_upload_roots: 原始 allowlist 路径集合。
-
-    Returns:
-        已 resolve 的绝对路径元组。
-
-    Raises:
-        ValueError: allowlist 为空或含非绝对路径时抛出。
-    """
-
-    normalized: list[Path] = []
-    for root in allowed_upload_roots:
-        expanded = root.expanduser()
-        if not expanded.is_absolute():
-            raise ValueError("allowed_upload_roots must contain only absolute paths")
-        normalized.append(expanded.resolve(strict=False))
-    if not normalized:
-        raise ValueError("allowed_upload_roots must contain at least one absolute path")
-    return tuple(normalized)
-
-
-def _resolve_upload_path(
-    raw_path: str,
-    *,
-    allowed_upload_roots: Sequence[Path],
-) -> Path:
+def _resolve_upload_file_path(raw_path: str) -> Path:
     """解析并校验单个上传文件路径。
 
     Args:
         raw_path: 工具参数中的路径文本。
-        allowed_upload_roots: 已规范化的 allowlist 根目录。
 
     Returns:
         已 resolve 的文件路径。
 
     Raises:
-        ValueError: 路径不在 allowlist 内或不是普通文件时抛出。
+        ValueError: 路径不是普通文件或文件为空时抛出。
     """
 
     candidate = Path(raw_path).expanduser().resolve(strict=False)
-    if not any(candidate.is_relative_to(root) for root in allowed_upload_roots):
-        raise ValueError("upload file path is outside allowed upload roots")
     if not candidate.is_file():
         raise ValueError("upload file path must point to an existing file")
     if candidate.stat().st_size <= 0:

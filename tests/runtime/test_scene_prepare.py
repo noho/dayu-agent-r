@@ -6,7 +6,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from pathlib import Path
-from typing import cast
+from typing import Final, cast
 
 import pytest
 
@@ -21,6 +21,44 @@ from dayu.runtime.scene_prepare import (
     SceneToolCatalog,
     SceneToolInfo,
     prepare_scene,
+)
+
+_REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
+_PACKAGE_PROMPT_ROOT: Final[Path] = _REPO_ROOT / "dayu" / "config" / "prompts"
+_PACKAGE_MANIFEST_ROOT: Final[Path] = _PACKAGE_PROMPT_ROOT / "manifests"
+_START_FINS_UPLOAD_TOOL_NAME: Final[str] = "start_fins_upload"
+_DEFAULT_FINS_NON_UPLOAD_TOOL_NAMES: Final[frozenset[str]] = frozenset(
+    {
+        "list_documents",
+        "get_document_sections",
+        "read_section",
+        "search_document",
+        "list_tables",
+        "get_table",
+        "get_page_content",
+        "get_financial_statement",
+        "query_xbrl_facts",
+        "start_fins_download",
+        "start_fins_preprocess",
+    }
+)
+_DEFAULT_NON_UPLOAD_SCENE_IDS: Final[tuple[str, ...]] = (
+    "confirm",
+    "decision",
+    "fix",
+    "infer",
+    "interactive",
+    "prompt",
+    "regenerate",
+    "repair",
+    "wechat",
+    "write",
+)
+_DEFAULT_WEB_SCENE_IDS: Final[frozenset[str]] = frozenset(
+    scene_id for scene_id in _DEFAULT_NON_UPLOAD_SCENE_IDS if scene_id != "infer"
+)
+_DEFAULT_WEB_TOOL_NAMES: Final[frozenset[str]] = frozenset(
+    {"search_web", "fetch_web_page"}
 )
 
 
@@ -194,6 +232,35 @@ def _request(
     )
 
 
+def _default_manifest_tool_catalog() -> SceneToolCatalog:
+    """构造默认 manifest 选择测试用工具目录。
+
+    Returns:
+        覆盖 Fins read/download/preprocess/upload 与 Web 工具的目录。
+
+    Raises:
+        ValueError: 工具名或标签非法时由 SceneToolInfo 抛出。
+    """
+
+    tools = [
+        SceneToolInfo(name=tool_name, tags=frozenset({"fins"}))
+        for tool_name in sorted(_DEFAULT_FINS_NON_UPLOAD_TOOL_NAMES)
+    ]
+    tools.append(
+        SceneToolInfo(
+            name=_START_FINS_UPLOAD_TOOL_NAME,
+            tags=frozenset({"fins", "fins-upload"}),
+        )
+    )
+    tools.extend(
+        (
+            SceneToolInfo(name="search_web", tags=frozenset({"web"})),
+            SceneToolInfo(name="fetch_web_page", tags=frozenset({"web"})),
+        )
+    )
+    return SceneToolCatalog(tools=tuple(tools))
+
+
 def _prepare_single_scene(tmp_path: Path) -> PreparedSceneInputs:
     """准备单 scene 成功装配 fixture。
 
@@ -294,6 +361,31 @@ def test_model_runner_option_hint_id_is_preserved(tmp_path: Path) -> None:
     assert result.model_hints is not None
     assert result.model_hints.default_model_id == "analyst-model"
     assert result.model_hints.runner_option_hint_id == "low-variance"
+
+
+def test_default_non_upload_scenes_do_not_select_upload_tool() -> None:
+    """默认非上传 scene 不得通过 broad fins tag 选中 upload tool。"""
+
+    available_tools = _default_manifest_tool_catalog()
+    for scene_id in _DEFAULT_NON_UPLOAD_SCENE_IDS:
+        result = prepare_scene(
+            ScenePrepareRequest(
+                scene_id=scene_id,
+                scene_manifest_root=_PACKAGE_MANIFEST_ROOT,
+                prompt_asset_root=_PACKAGE_PROMPT_ROOT,
+                context_slot_values={
+                    "fins_default_subject": "测试财报主体",
+                    "base_user": "scene-prepare-test",
+                },
+                available_tools=available_tools,
+            )
+        )
+        selected = result.tool_selection.tool_names
+        assert selected is not None
+        assert _START_FINS_UPLOAD_TOOL_NAME not in selected
+        assert _DEFAULT_FINS_NON_UPLOAD_TOOL_NAMES.issubset(selected)
+        if scene_id in _DEFAULT_WEB_SCENE_IDS:
+            assert _DEFAULT_WEB_TOOL_NAMES.issubset(selected)
 
 
 def test_content_digest_changes_when_runner_option_hint_id_changes(

@@ -98,6 +98,7 @@ _FINS_TOOL_NAMES: Final[tuple[str, ...]] = (
 _FINS_AWAITING_TOOL_NAMES: Final[tuple[str, ...]] = (
     "start_fins_download",
     "start_fins_preprocess",
+    "start_fins_upload",
 )
 _WEB_TOOL_NAMES: Final[tuple[str, ...]] = ("search_web", "fetch_web_page")
 _FORBIDDEN_IMPORT_ROOTS: Final[tuple[str, ...]] = (
@@ -211,7 +212,7 @@ def test_combined_discovery_returns_single_bundle_without_reserved_names(
     )
     assert len(names) == len(set(names))
     assert FrameworkToolName.FETCH_MORE.value not in names
-    assert len(discovered_tools.source_refs) == 5
+    assert len(discovered_tools.source_refs) == 6
     for definition in discovered_tools.tool_bundle.definitions:
         properties = definition.schema.function.parameters.properties
         assert "execution_context" not in properties
