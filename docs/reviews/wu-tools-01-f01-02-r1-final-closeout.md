@@ -44,10 +44,10 @@
 
 ## Issue Handling
 
-- PR body uses `Refs #129`, not a closing keyword.
-- Merging PR #162 will not automatically close GitHub Issue #129.
+- PR body uses `Closes #129`.
+- Merging PR #162 will automatically close GitHub Issue #129.
 - Issue closeout comment was posted with the PR URL, validation summary, review status, and residual owners.
-- Issue #129 should be closed manually after merge only if the maintainer agrees PR #162 fully resolves it.
+- Issue #129 will close automatically on merge; maintainer should only reopen if post-merge validation shows the issue remains unresolved.
 
 ## Residual Risk
 
