@@ -83,7 +83,7 @@ class FinsDownloadToolCallable:
             return _cancelled_outcome(started_at)
         try:
             request = _download_request_from_arguments(call.arguments)
-            handle = self.runtime.start_observed_download(
+            handle = self.runtime.prepare_observed_download(
                 request,
                 cancellation_token=cancellation_token,
             )

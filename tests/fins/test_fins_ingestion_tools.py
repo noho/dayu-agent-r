@@ -15,7 +15,7 @@ import pytest
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
-from dayu.contracts.tool_await import ToolAwaitKind
+from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
 from dayu.contracts.tool_call import BatchToolExecutionContext, ToolCallRequest
 from dayu.contracts.tool_declaration import ToolDefinition
 from dayu.contracts.tool_outcome import (
@@ -48,7 +48,9 @@ from dayu.fins.ingestion import (
 from dayu.fins.ingestion.wait_adapter import (
     FINS_INGESTION_WAIT_ADAPTER_KEY,
     FINS_UPLOAD_AWAITING_TOOL_NAME,
+    FinsIngestionWaitActivationAdapter,
     FinsIngestionWaitPollAdapter,
+    build_fins_wait_activation_registry,
     build_fins_wait_adapter_registry,
 )
 from dayu.fins.direct_events import (
@@ -81,6 +83,8 @@ from dayu.host.durable.state import (
     WaitResumePolicy,
 )
 from dayu.host.wait_adapter import WaitPollLost, WaitPollNotReady, WaitPollReady
+from dayu.host.wait_adapter import WaitActivationRequest
+from dayu.host.waiting import ToolAwaitingAcceptedAck, ToolAwaitingEventRef
 from dayu.runtime.config_loader import ConfigLoader, RuntimeConfig
 from dayu.runtime.tools_discovery import (
     PythonImportPathProvider,
@@ -105,13 +109,6 @@ _PREPROCESS_TOOLS_PATH: Final[Path] = (
     _REPO_ROOT / "dayu" / "fins" / "tools" / "preprocess_tools.py"
 )
 _UPLOAD_TOOLS_PATH: Final[Path] = _REPO_ROOT / "dayu" / "fins" / "tools" / "upload_tools.py"
-_DOWNLOAD_START_FAILED_ERROR = "fins_download_start_failed"
-_PREPROCESS_START_FAILED_ERROR = "fins_preprocess_start_failed"
-_UPLOAD_START_FAILED_ERROR = "fins_upload_start_failed"
-_FORBIDDEN_LLM_ERROR_FRAGMENTS: Final[tuple[str, ...]] = (
-    "durable job " + "record",
-    "Fins ingestion " + "runtime",
-)
 _FORBIDDEN_CANCELLED_MESSAGE_FRAGMENTS: Final[tuple[str, ...]] = ("host", "Host")
 _WAIT_RECORD_TIME = "2026-01-01T00:00:00Z"
 _OBSERVATION_TIME: Final[datetime] = datetime(2026, 6, 16, tzinfo=timezone.utc)
@@ -433,6 +430,7 @@ class _FakeObservationRuntime(FinsObservationRuntime):
     poll_errors: dict[str, FinsObservationPollError] | None = None
     cancelled_handles: tuple[str, ...] = ()
     abandoned_handles: tuple[str, ...] = ()
+    activated_handles: tuple[str, ...] = ()
 
     def start_observed_download(
         self,
@@ -450,6 +448,22 @@ class _FakeObservationRuntime(FinsObservationRuntime):
         del request, cancellation_token
         raise NotImplementedError("fake runtime does not start download observations")
 
+    def prepare_observed_download(
+        self,
+        request: FinsDownloadRequest,
+        cancellation_token: CancellationToken,
+    ) -> FinsObservationHandle:
+        """登记下载 observation。
+
+        :param request: 下载请求。
+        :param cancellation_token: operation-scoped 取消 token。
+        :returns: observation handle。
+        :raises NotImplementedError: 本 fake 不覆盖 prepare 路径。
+        """
+
+        del request, cancellation_token
+        raise NotImplementedError("fake runtime does not prepare download observations")
+
     def start_observed_preprocess(
         self,
         request: FinsPreprocessRequest,
@@ -466,6 +480,22 @@ class _FakeObservationRuntime(FinsObservationRuntime):
         del request, cancellation_token
         raise NotImplementedError("fake runtime does not start preprocess observations")
 
+    def prepare_observed_preprocess(
+        self,
+        request: FinsPreprocessRequest,
+        cancellation_token: CancellationToken,
+    ) -> FinsObservationHandle:
+        """登记预处理 observation。
+
+        :param request: 预处理请求。
+        :param cancellation_token: operation-scoped 取消 token。
+        :returns: observation handle。
+        :raises NotImplementedError: 本 fake 不覆盖 prepare 路径。
+        """
+
+        del request, cancellation_token
+        raise NotImplementedError("fake runtime does not prepare preprocess observations")
+
     def start_observed_upload(
         self,
         request: FinsUploadRequest,
@@ -481,6 +511,32 @@ class _FakeObservationRuntime(FinsObservationRuntime):
 
         del request, cancellation_token
         raise NotImplementedError("fake runtime does not start upload observations")
+
+    def prepare_observed_upload(
+        self,
+        request: FinsUploadRequest,
+        cancellation_token: CancellationToken,
+    ) -> FinsObservationHandle:
+        """登记上传 observation。
+
+        :param request: 上传请求。
+        :param cancellation_token: operation-scoped 取消 token。
+        :returns: observation handle。
+        :raises NotImplementedError: 本 fake 不覆盖 prepare 路径。
+        """
+
+        del request, cancellation_token
+        raise NotImplementedError("fake runtime does not prepare upload observations")
+
+    def activate_observation(self, handle: FinsObservationHandle) -> None:
+        """记录 fake activation。
+
+        :param handle: observation handle。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.activated_handles = self.activated_handles + (handle.handle_id,)
 
     async def poll_observation(
         self,
@@ -761,11 +817,7 @@ def test_download_tool_returns_external_job_awaiting_outcome(tmp_path: Path) -> 
 
     assert isinstance(outcome, ToolAwaitingOutcome)
     assert outcome.await_spec.await_kind is ToolAwaitKind.EXTERNAL_JOB
-    assert parse_observation_handle_id_token(outcome.await_spec.resume_token)
-    assert outcome.await_spec.resume_token.startswith(FINS_OBSERVATION_HANDLE_ID_PREFIX)
-    assert "job" not in outcome.await_spec.resume_token
-    assert "cursor" not in outcome.await_spec.resume_token
-    assert "sidecar" not in outcome.await_spec.resume_token
+    _assert_resume_token_is_opaque(outcome.await_spec.resume_token)
     assert outcome.snapshot is not None
     assert "finsjob_" not in outcome.snapshot.snapshot_id
 
@@ -791,10 +843,7 @@ def test_preprocess_tool_returns_external_job_awaiting_outcome(tmp_path: Path) -
 
     assert isinstance(outcome, ToolAwaitingOutcome)
     assert outcome.await_spec.await_kind is ToolAwaitKind.EXTERNAL_JOB
-    assert parse_observation_handle_id_token(outcome.await_spec.resume_token)
-    assert outcome.await_spec.resume_token.startswith(FINS_OBSERVATION_HANDLE_ID_PREFIX)
-    assert "job" not in outcome.await_spec.resume_token
-    assert "cursor" not in outcome.await_spec.resume_token
+    _assert_resume_token_is_opaque(outcome.await_spec.resume_token)
     assert outcome.snapshot is not None
     assert "finsjob_" not in outcome.snapshot.snapshot_id
 
@@ -828,12 +877,50 @@ def test_upload_tool_returns_external_job_awaiting_outcome(tmp_path: Path) -> No
 
     assert isinstance(outcome, ToolAwaitingOutcome)
     assert outcome.await_spec.await_kind is ToolAwaitKind.EXTERNAL_JOB
-    assert parse_observation_handle_id_token(outcome.await_spec.resume_token)
-    assert outcome.await_spec.resume_token.startswith(FINS_OBSERVATION_HANDLE_ID_PREFIX)
-    assert "job" not in outcome.await_spec.resume_token
-    assert "cursor" not in outcome.await_spec.resume_token
+    _assert_resume_token_is_opaque(outcome.await_spec.resume_token)
     assert outcome.snapshot is not None
     assert "finsjob_" not in outcome.snapshot.snapshot_id
+
+
+def test_awaiting_tool_callables_prepare_without_executor_submit(tmp_path: Path) -> None:
+    """download/preprocess/upload callable 只 prepare observation，不提交 executor。"""
+
+    workspace_root = _build_workspace(tmp_path)
+    executor = _NoOpExecutor()
+    runtime = _runtime_with_executor(workspace_root=workspace_root, executor=executor)
+
+    download_outcome = asyncio.run(
+        FinsDownloadToolCallable(runtime=runtime)(
+            _call(DOWNLOAD_TOOL_NAME, {"ticker": "AAPL"}),
+            _context(),
+        )
+    )
+    preprocess_outcome = asyncio.run(
+        FinsPreprocessToolCallable(runtime=runtime)(
+            _call(PREPROCESS_TOOL_NAME, {"ticker": "AAPL"}),
+            _context(),
+        )
+    )
+    upload_outcome = asyncio.run(
+        FinsUploadToolCallable(runtime=runtime)(
+            _call(
+                UPLOAD_TOOL_NAME,
+                {
+                    "ticker": "AAPL",
+                    "upload_kind": "filing",
+                    "action": "delete",
+                    "fiscal_year": 2024,
+                    "fiscal_period": "FY",
+                },
+            ),
+            _context(),
+        )
+    )
+
+    assert isinstance(download_outcome, ToolAwaitingOutcome)
+    assert isinstance(preprocess_outcome, ToolAwaitingOutcome)
+    assert isinstance(upload_outcome, ToolAwaitingOutcome)
+    assert executor.submitted_job_ids == ()
 
 
 def test_tool_argument_error_returns_failed_outcome_before_observation_start(tmp_path: Path) -> None:
@@ -934,7 +1021,7 @@ def test_upload_tool_directory_returns_failed_outcome_before_observation_start(t
 def test_upload_tool_accepts_local_file_outside_workspace_without_source_side_effect(
     tmp_path: Path,
 ) -> None:
-    """上传工具接受 workspace 外本地文件，且不在源文件目录写治理状态。"""
+    """上传工具接受 workspace 外本地文件，prepare 阶段不提交且不写源侧治理状态。"""
 
     workspace_root = _build_workspace(tmp_path)
     outside_file = _write_upload_file(tmp_path / "outside-upload-source")
@@ -961,7 +1048,7 @@ def test_upload_tool_accepts_local_file_outside_workspace_without_source_side_ef
     )
 
     assert isinstance(outcome, ToolAwaitingOutcome)
-    assert executor.submitted_job_ids
+    assert executor.submitted_job_ids == ()
     assert all(str(outside_file.parent) not in job_id for job_id in executor.submitted_job_ids)
     assert not (outside_file.parent / ".dayu").exists()
 
@@ -1109,22 +1196,22 @@ def test_awaiting_tool_callables_consume_context_and_bridge_token_to_runtime() -
     _assert_context_token_bridge(
         source_path=_DOWNLOAD_TOOLS_PATH,
         class_name="FinsDownloadToolCallable",
-        start_method="start_observed_download",
+        start_method="prepare_observed_download",
     )
     _assert_context_token_bridge(
         source_path=_PREPROCESS_TOOLS_PATH,
         class_name="FinsPreprocessToolCallable",
-        start_method="start_observed_preprocess",
+        start_method="prepare_observed_preprocess",
     )
     _assert_context_token_bridge(
         source_path=_UPLOAD_TOOLS_PATH,
         class_name="FinsUploadToolCallable",
-        start_method="start_observed_upload",
+        start_method="prepare_observed_upload",
     )
 
 
-def test_download_tool_os_error_from_start_returns_start_failed_outcome(tmp_path: Path) -> None:
-    """下载工具遇到 observation start OSError 时应返回 start-failed 失败 outcome。"""
+def test_download_tool_os_error_executor_is_not_used_during_prepare(tmp_path: Path) -> None:
+    """下载工具 prepare 阶段不得触发 executor OSError。"""
 
     workspace_root = _build_workspace(tmp_path)
     runtime = _runtime_with_executor(
@@ -1139,13 +1226,13 @@ def test_download_tool_os_error_from_start_returns_start_failed_outcome(tmp_path
         )
     )
 
-    assert isinstance(outcome, ToolFailedOutcome)
-    assert outcome.result.error == _DOWNLOAD_START_FAILED_ERROR
-    _assert_failed_outcome_hides_internal_terms(outcome)
+    assert isinstance(outcome, ToolAwaitingOutcome)
 
 
-def test_download_tool_unexpected_start_exception_returns_start_failed_outcome(tmp_path: Path) -> None:
-    """下载工具遇到 start_download 非预期异常时应返回 start-failed 失败 outcome。"""
+def test_download_tool_unexpected_executor_error_is_not_used_during_prepare(
+    tmp_path: Path,
+) -> None:
+    """下载工具 prepare 阶段不得触发 executor 非预期异常。"""
 
     workspace_root = _build_workspace(tmp_path)
     runtime = _runtime_with_executor(
@@ -1160,13 +1247,13 @@ def test_download_tool_unexpected_start_exception_returns_start_failed_outcome(t
         )
     )
 
-    assert isinstance(outcome, ToolFailedOutcome)
-    assert outcome.result.error == _DOWNLOAD_START_FAILED_ERROR
-    _assert_failed_outcome_hides_internal_terms(outcome)
+    assert isinstance(outcome, ToolAwaitingOutcome)
 
 
-def test_preprocess_tool_os_error_from_start_returns_start_failed_outcome(tmp_path: Path) -> None:
-    """预处理工具遇到 observation start OSError 时应返回 start-failed 失败 outcome。"""
+def test_preprocess_tool_os_error_executor_is_not_used_during_prepare(
+    tmp_path: Path,
+) -> None:
+    """预处理工具 prepare 阶段不得触发 executor OSError。"""
 
     workspace_root = _build_workspace(tmp_path)
     runtime = _runtime_with_executor(
@@ -1181,13 +1268,13 @@ def test_preprocess_tool_os_error_from_start_returns_start_failed_outcome(tmp_pa
         )
     )
 
-    assert isinstance(outcome, ToolFailedOutcome)
-    assert outcome.result.error == _PREPROCESS_START_FAILED_ERROR
-    _assert_failed_outcome_hides_internal_terms(outcome)
+    assert isinstance(outcome, ToolAwaitingOutcome)
 
 
-def test_preprocess_tool_unexpected_start_exception_returns_start_failed_outcome(tmp_path: Path) -> None:
-    """预处理工具遇到 start_preprocess 非预期异常时应返回 start-failed 失败 outcome。"""
+def test_preprocess_tool_unexpected_executor_error_is_not_used_during_prepare(
+    tmp_path: Path,
+) -> None:
+    """预处理工具 prepare 阶段不得触发 executor 非预期异常。"""
 
     workspace_root = _build_workspace(tmp_path)
     runtime = _runtime_with_executor(
@@ -1202,13 +1289,11 @@ def test_preprocess_tool_unexpected_start_exception_returns_start_failed_outcome
         )
     )
 
-    assert isinstance(outcome, ToolFailedOutcome)
-    assert outcome.result.error == _PREPROCESS_START_FAILED_ERROR
-    _assert_failed_outcome_hides_internal_terms(outcome)
+    assert isinstance(outcome, ToolAwaitingOutcome)
 
 
-def test_upload_tool_os_error_from_start_returns_start_failed_outcome(tmp_path: Path) -> None:
-    """上传工具遇到 observation start OSError 时应返回 start-failed 失败 outcome。"""
+def test_upload_tool_os_error_executor_is_not_used_during_prepare(tmp_path: Path) -> None:
+    """上传工具 prepare 阶段不得触发 executor OSError。"""
 
     workspace_root = _build_workspace(tmp_path)
     runtime = _runtime_with_executor(
@@ -1232,13 +1317,13 @@ def test_upload_tool_os_error_from_start_returns_start_failed_outcome(tmp_path: 
         )
     )
 
-    assert isinstance(outcome, ToolFailedOutcome)
-    assert outcome.result.error == _UPLOAD_START_FAILED_ERROR
-    _assert_failed_outcome_hides_internal_terms(outcome)
+    assert isinstance(outcome, ToolAwaitingOutcome)
 
 
-def test_upload_tool_unexpected_start_exception_returns_start_failed_outcome(tmp_path: Path) -> None:
-    """上传工具遇到 start_upload 非预期异常时应返回 start-failed 失败 outcome。"""
+def test_upload_tool_unexpected_executor_error_is_not_used_during_prepare(
+    tmp_path: Path,
+) -> None:
+    """上传工具 prepare 阶段不得触发 executor 非预期异常。"""
 
     workspace_root = _build_workspace(tmp_path)
     runtime = _runtime_with_executor(
@@ -1262,27 +1347,7 @@ def test_upload_tool_unexpected_start_exception_returns_start_failed_outcome(tmp
         )
     )
 
-    assert isinstance(outcome, ToolFailedOutcome)
-    assert outcome.result.error == _UPLOAD_START_FAILED_ERROR
-    _assert_failed_outcome_hides_internal_terms(outcome)
-
-
-def _assert_failed_outcome_hides_internal_terms(outcome: ToolFailedOutcome) -> None:
-    """断言失败 outcome 的模型可见文案不泄漏内部实现术语。
-
-    Args:
-        outcome: 工具失败 outcome。
-
-    Returns:
-        无。
-
-    Raises:
-        AssertionError: message 或 hint 含内部实现术语时抛出。
-    """
-
-    visible_text = f"{outcome.result.message}\n{outcome.result.hint}"
-    for fragment in _FORBIDDEN_LLM_ERROR_FRAGMENTS:
-        assert fragment not in visible_text
+    assert isinstance(outcome, ToolAwaitingOutcome)
 
 
 def _assert_cancelled_outcome_hides_host_term(outcome: ToolCancelledOutcome) -> None:
@@ -1301,6 +1366,26 @@ def _assert_cancelled_outcome_hides_host_term(outcome: ToolCancelledOutcome) -> 
     visible_text = f"{outcome.message}\n{outcome.hint}"
     for fragment in _FORBIDDEN_CANCELLED_MESSAGE_FRAGMENTS:
         assert fragment not in visible_text
+
+
+def _assert_resume_token_is_opaque(resume_token: str) -> None:
+    """断言 Fins awaiting resume token 不泄露内部治理或路径语义。
+
+    Args:
+        resume_token: ToolAwaitSpec resume token。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: token 格式非法或包含禁止片段时抛出。
+    """
+
+    assert parse_observation_handle_id_token(resume_token)
+    assert resume_token.startswith(FINS_OBSERVATION_HANDLE_ID_PREFIX)
+    lowered = resume_token.lower()
+    for fragment in ("job", "cursor", "sidecar", "storage", ".dayu", "/", "\\"):
+        assert fragment not in lowered
 
 
 def test_ingestion_tool_schemas_hide_host_internal_fields(tmp_path: Path) -> None:
@@ -1395,6 +1480,53 @@ def test_fins_wait_adapter_registry_duplicate_binding_fails(tmp_path: Path) -> N
         assert "duplicate Fins wait adapter binding" in str(exc)
     else:
         raise AssertionError("重复 Fins wait adapter binding 未失败")
+
+
+def test_fins_wait_activation_registry_binds_fins_adapter_key(tmp_path: Path) -> None:
+    """Fins activation registry 应使用与 poll adapter 相同的稳定 key。"""
+
+    registry = build_fins_wait_activation_registry(
+        workspace_root=tmp_path.resolve(strict=False),
+        tool_names=(DOWNLOAD_TOOL_NAME, PREPROCESS_TOOL_NAME, UPLOAD_TOOL_NAME),
+    )
+
+    adapter = registry.resolve_adapter(FINS_INGESTION_WAIT_ADAPTER_KEY)
+
+    assert isinstance(adapter, FinsIngestionWaitActivationAdapter)
+
+
+def test_fins_wait_activation_adapter_activates_existing_resume_token() -> None:
+    """Fins activation adapter 应解析现有 resume token 并调用 runtime activation。"""
+
+    handle = _observation_handle_with_id("1234567890abcdef")
+    runtime = _FakeObservationRuntime(snapshots={})
+    adapter = FinsIngestionWaitActivationAdapter(runtime=runtime)
+
+    adapter.activate_accepted_wait(
+        _activation_request(
+            tool_name=DOWNLOAD_TOOL_NAME,
+            resume_token=handle.handle_id,
+        )
+    )
+
+    assert runtime.activated_handles == (handle.handle_id,)
+
+
+def test_fins_wait_activation_adapter_rejects_corrupt_resume_token() -> None:
+    """Fins activation adapter 遇到 corrupt token 不得调用 runtime。"""
+
+    runtime = _FakeObservationRuntime(snapshots={})
+    adapter = FinsIngestionWaitActivationAdapter(runtime=runtime)
+
+    with pytest.raises(ValueError):
+        adapter.activate_accepted_wait(
+            _activation_request(
+                tool_name=DOWNLOAD_TOOL_NAME,
+                resume_token="finsjob_00000000000000000000000000000007",
+            )
+        )
+
+    assert runtime.activated_handles == ()
 
 
 def test_fins_wait_poll_adapter_maps_observation_statuses() -> None:
@@ -1593,6 +1725,58 @@ def _wait_record(
         created_at=created_at,
         updated_at=_WAIT_RECORD_TIME,
         terminal_at=None,
+    )
+
+
+def _activation_request(tool_name: str, resume_token: str) -> WaitActivationRequest:
+    """构造测试用 accepted wait activation request。
+
+    Args:
+        tool_name: awaiting 工具名。
+        resume_token: awaiting resume token。
+
+    Returns:
+        typed activation request。
+
+    Raises:
+        ValueError: 字段非法时由 Host 契约抛出。
+    """
+
+    return WaitActivationRequest(
+        tool_name=tool_name,
+        await_spec=ToolAwaitSpec(
+            await_kind=ToolAwaitKind.EXTERNAL_JOB,
+            deadline=None,
+            resume_token=resume_token,
+        ),
+        accepted_ack=_accepted_ack(),
+    )
+
+
+def _accepted_ack() -> ToolAwaitingAcceptedAck:
+    """构造测试用 Host awaiting accepted ack。
+
+    Returns:
+        accepted ack。
+
+    Raises:
+        ValueError: ack 字段非法时由 Host 契约抛出。
+    """
+
+    tool_ref = ToolAwaitingEventRef(event_id="event-tool-awaiting-1", event_sequence=1)
+    run_ref = ToolAwaitingEventRef(event_id="event-run-waiting-1", event_sequence=2)
+    attempt_ref = ToolAwaitingEventRef(
+        event_id="event-attempt-suspended-1",
+        event_sequence=3,
+    )
+    return ToolAwaitingAcceptedAck(
+        accepted_event_refs=(tool_ref, run_ref, attempt_ref),
+        wait_id="wait-1",
+        tool_awaiting_event_ref=tool_ref,
+        run_waiting_event_ref=run_ref,
+        attempt_suspended_event_ref=attempt_ref,
+        result_digest="digest-1",
+        idempotency_record_ref="idempotency-1",
     )
 
 

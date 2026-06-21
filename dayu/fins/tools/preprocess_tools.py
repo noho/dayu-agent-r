@@ -82,7 +82,7 @@ class FinsPreprocessToolCallable:
             return _cancelled_outcome(started_at)
         try:
             request = _preprocess_request_from_arguments(call.arguments)
-            handle = self.runtime.start_observed_preprocess(
+            handle = self.runtime.prepare_observed_preprocess(
                 request,
                 cancellation_token=cancellation_token,
             )

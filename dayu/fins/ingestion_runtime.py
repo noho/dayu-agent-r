@@ -207,6 +207,15 @@ _TERMINAL_STATUSES = frozenset(
     }
 )
 
+_TERMINAL_OBSERVATION_STATUSES: Final[frozenset[FinsObservationStatus]] = frozenset(
+    {
+        FinsObservationStatus.SUCCEEDED,
+        FinsObservationStatus.FAILED,
+        FinsObservationStatus.CANCELLED,
+        FinsObservationStatus.LOST,
+    }
+)
+
 
 class _PreprocessNotSupportedError(RuntimeError):
     """源文档没有可用预处理器。"""
@@ -1217,18 +1226,24 @@ class _FinsObservedOperationRecord:
     Attributes:
         handle: tool awaiting 使用的轻量 observation handle。
         queue: 后台 producer 投递 direct progress/result 的本地队列。
+        context: 复用 direct stream producer 的执行上下文。
+        producer: 复用 direct path 的同步业务 producer。
         cancellation_state: operation-scoped best-effort 取消状态。
         status: 最近一次已归纳的 observation 状态。
         result: 终态业务摘要；未终态时为空。
         message: 最近一次业务可读 observation 消息。
+        submitted: 是否已经提交后台 executor。
     """
 
     handle: FinsObservationHandle
     queue: Queue[_DirectStreamQueueItem]
+    context: _FinsIngestionExecutionContext
+    producer: Callable[[_FinsIngestionExecutionContext], None]
     cancellation_state: _DirectStreamCancellationState
     status: FinsObservationStatus
     result: FinsResultSummary | None
     message: str
+    submitted: bool = False
 
 
 @dataclass(frozen=True)
@@ -2125,10 +2140,36 @@ class FinsIngestionRuntime:
             RuntimeError: 后台执行器无法启动 operation 时抛出。
         """
 
+        handle = self.prepare_observed_download(
+            request=request,
+            cancellation_token=cancellation_token,
+        )
+        self.activate_observation(handle)
+        return handle
+
+    def prepare_observed_download(
+        self,
+        request: FinsDownloadRequest,
+        cancellation_token: CancellationToken,
+    ) -> FinsObservationHandle:
+        """登记 process-local 可观察下载 operation，但不提交执行器。
+
+        Args:
+            request: 下载请求。
+            cancellation_token: operation-scoped 取消 token。
+
+        Returns:
+            只供 Host wait adapter 后续观察 completion 的 lightweight handle。
+
+        Raises:
+            FinsIngestionStartCancelledError: prepare 前观察到取消时抛出。
+            ValueError: ticker、来源或请求字段非法时抛出。
+        """
+
         _raise_if_start_cancelled(cancellation_token)
         normalized = ticker_normalization.normalize_ticker(request.ticker)
         source = _normalize_download_source(request.source)
-        return self._start_observed_stream(
+        return self._prepare_observed_stream(
             direct_operation_kind=FinsOperationKind.DOWNLOAD,
             operation_kind=FinsIngestionOperationKind.DOWNLOAD,
             normalized=normalized,
@@ -2162,9 +2203,35 @@ class FinsIngestionRuntime:
             RuntimeError: 后台执行器无法启动 operation 时抛出。
         """
 
+        handle = self.prepare_observed_preprocess(
+            request=request,
+            cancellation_token=cancellation_token,
+        )
+        self.activate_observation(handle)
+        return handle
+
+    def prepare_observed_preprocess(
+        self,
+        request: FinsPreprocessRequest,
+        cancellation_token: CancellationToken,
+    ) -> FinsObservationHandle:
+        """登记 process-local 可观察预处理 operation，但不提交执行器。
+
+        Args:
+            request: 预处理请求。
+            cancellation_token: operation-scoped 取消 token。
+
+        Returns:
+            只供 Host wait adapter 后续观察 completion 的 lightweight handle。
+
+        Raises:
+            FinsIngestionStartCancelledError: prepare 前观察到取消时抛出。
+            ValueError: ticker 或请求字段非法时抛出。
+        """
+
         _raise_if_start_cancelled(cancellation_token)
         normalized = ticker_normalization.normalize_ticker(request.ticker)
-        return self._start_observed_stream(
+        return self._prepare_observed_stream(
             direct_operation_kind=FinsOperationKind.PREPROCESS,
             operation_kind=FinsIngestionOperationKind.PREPROCESS,
             normalized=normalized,
@@ -2194,10 +2261,36 @@ class FinsIngestionRuntime:
             RuntimeError: 后台执行器无法启动 operation 时抛出。
         """
 
+        handle = self.prepare_observed_upload(
+            request=request,
+            cancellation_token=cancellation_token,
+        )
+        self.activate_observation(handle)
+        return handle
+
+    def prepare_observed_upload(
+        self,
+        request: FinsUploadRequest,
+        cancellation_token: CancellationToken,
+    ) -> FinsObservationHandle:
+        """登记 process-local 可观察上传 operation，但不提交执行器。
+
+        Args:
+            request: 上传请求。
+            cancellation_token: operation-scoped 取消 token。
+
+        Returns:
+            只供 Host wait adapter 后续观察 completion 的 lightweight handle。
+
+        Raises:
+            FinsIngestionStartCancelledError: prepare 前观察到取消时抛出。
+            ValueError: ticker、source_kind、action 或上传字段非法时抛出。
+        """
+
         _raise_if_start_cancelled(cancellation_token)
         normalized = ticker_normalization.normalize_ticker(request.ticker)
         normalized_request = _normalize_upload_request(request)
-        return self._start_observed_stream(
+        return self._prepare_observed_stream(
             direct_operation_kind=_direct_upload_operation_kind(normalized_request),
             operation_kind=FinsIngestionOperationKind.UPLOAD,
             normalized=normalized,
@@ -2245,14 +2338,14 @@ class FinsIngestionRuntime:
             record = self._observations.get(handle.handle_id)
             if record is None:
                 return _lost_observation_snapshot(handle)
-            if record.status not in {
-                FinsObservationStatus.SUCCEEDED,
-                FinsObservationStatus.FAILED,
-                FinsObservationStatus.CANCELLED,
-                FinsObservationStatus.LOST,
-            }:
+            if record.status not in _TERMINAL_OBSERVATION_STATUSES:
                 record.cancellation_state.request_cancel()
-                record.message = "Cancellation requested for this operation."
+                if record.submitted:
+                    record.message = "Cancellation requested for this operation."
+                else:
+                    record.status = FinsObservationStatus.CANCELLED
+                    record.message = "Observation was cancelled before activation."
+                    record.result = _observation_cancelled_result(record.message)
             return self._observation_snapshot_locked(record)
 
     async def abandon_observation(self, handle: FinsObservationHandle) -> None:
@@ -2274,7 +2367,53 @@ class FinsIngestionRuntime:
             if record is not None:
                 record.cancellation_state.request_cancel()
 
-    def _start_observed_stream(
+    def activate_observation(self, handle: FinsObservationHandle) -> None:
+        """激活已登记的 process-local observation 并提交后台执行器。
+
+        Args:
+            handle: lightweight observation handle。
+
+        Returns:
+            无。
+
+        Raises:
+            Exception: executor submit 或 activation 内部异常会在 observation
+                被收口为 failed 后按原异常抛出。
+        """
+
+        context: _FinsIngestionExecutionContext
+        producer: Callable[[_FinsIngestionExecutionContext], None]
+        try:
+            with self._observation_lock:
+                record = self._observations.get(handle.handle_id)
+                if record is None:
+                    return
+                self._drain_observation_queue(record)
+                if (
+                    record.submitted
+                    or record.cancellation_state.is_cancelled()
+                    or record.status in _TERMINAL_OBSERVATION_STATUSES
+                ):
+                    return
+                record.submitted = True
+                context = record.context
+                producer = record.producer
+            self.executor.submit(
+                handle.handle_id,
+                lambda: self._run_direct_stream_producer(context, producer),
+            )
+        except Exception as exc:
+            with self._observation_lock:
+                failed_record = self._observations.get(handle.handle_id)
+                if failed_record is not None:
+                    _mark_observation_failed(
+                        failed_record,
+                        "Observation activation failed.",
+                        FinsErrorKind.EXECUTION,
+                    )
+            raise
+
+    def _prepare_observed_stream(
         self,
         *,
         direct_operation_kind: FinsOperationKind,
@@ -2285,7 +2424,7 @@ class FinsIngestionRuntime:
         cancellation_token: CancellationToken,
         producer: Callable[[_FinsIngestionExecutionContext], None],
     ) -> FinsObservationHandle:
-        """启动 observed stream producer 并注册 process-local observation。
+        """注册 process-local observation，但不启动 observed stream producer。
 
         Args:
             direct_operation_kind: 用户可读 operation kind。
@@ -2300,7 +2439,7 @@ class FinsIngestionRuntime:
             lightweight observation handle。
 
         Raises:
-            RuntimeError: 后台执行器拒绝任务时抛出。
+            无。
         """
 
         handle = _new_observation_handle(direct_operation_kind)
@@ -2325,6 +2464,8 @@ class FinsIngestionRuntime:
         record = _FinsObservedOperationRecord(
             handle=handle,
             queue=queue,
+            context=context,
+            producer=producer,
             cancellation_state=cancellation_state,
             status=FinsObservationStatus.PENDING,
             result=None,
@@ -2332,15 +2473,6 @@ class FinsIngestionRuntime:
         )
         with self._observation_lock:
             self._observations[handle.handle_id] = record
-        try:
-            self.executor.submit(
-                handle.handle_id,
-                lambda: self._run_direct_stream_producer(context, producer),
-            )
-        except Exception:
-            with self._observation_lock:
-                self._observations.pop(handle.handle_id, None)
-            raise
         return handle
 
     def _observation_snapshot(
@@ -2410,11 +2542,7 @@ class FinsIngestionRuntime:
             except Empty:
                 break
             if isinstance(item, _DirectStreamProducerDone):
-                if record.result is None and record.status not in {
-                    FinsObservationStatus.FAILED,
-                    FinsObservationStatus.CANCELLED,
-                    FinsObservationStatus.SUCCEEDED,
-                }:
+                if record.result is None and record.status not in _TERMINAL_OBSERVATION_STATUSES:
                     record.status = FinsObservationStatus.FAILED
                     record.message = "Observation finished without a result."
                     record.result = _observation_failure_result(record.message)
@@ -4852,6 +4980,62 @@ def _observation_failure_result(message: str) -> FinsResultSummary:
         details=(),
         error_kind=FinsErrorKind.EXECUTION,
         error_message=message,
+    )
+
+
+def _observation_cancelled_result(message: str) -> FinsResultSummary:
+    """构造 observation prepare 阶段取消摘要。
+
+    Args:
+        message: 原始或有界取消说明。
+
+    Returns:
+        Fins result summary。
+
+    Raises:
+        ValueError: result 字段非法时由契约构造抛出。
+    """
+
+    safe_message = _safe_observation_message(message)
+    return FinsResultSummary(
+        status=FinsResultStatus.CANCELLED,
+        exit_code=FINS_RESULT_EXIT_CANCELLED,
+        title=_DIRECT_CANCELLED_MESSAGE,
+        details=(),
+        error_kind=FinsErrorKind.CANCELLED,
+        error_message=safe_message,
+    )
+
+
+def _mark_observation_failed(
+    record: _FinsObservedOperationRecord,
+    message: str,
+    error_kind: FinsErrorKind,
+) -> None:
+    """把 observation record 原地收口为 FAILED。
+
+    Args:
+        record: 已在 observation lock 内找到的记录。
+        message: 有界失败说明。
+        error_kind: 失败分类。
+
+    Returns:
+        无。
+
+    Raises:
+        ValueError: result 字段非法时由契约构造抛出。
+    """
+
+    safe_message = _safe_observation_message(message)
+    record.status = FinsObservationStatus.FAILED
+    record.message = safe_message
+    record.result = FinsResultSummary(
+        status=FinsResultStatus.FAILURE,
+        exit_code=FINS_RESULT_EXIT_FAILURE,
+        title=_DIRECT_FAILURE_TITLE,
+        details=(),
+        error_kind=error_kind,
+        error_message=safe_message,
     )
 
 
