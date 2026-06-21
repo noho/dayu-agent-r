@@ -84,6 +84,7 @@ from dayu.host.wait_adapter import (
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.errors import HostTransactionRetryExhaustedError
 from dayu.host.tool_duplicate_governance import (
+    DuplicateAwaitingAcceptedEntry,
     DuplicateDurableMissingReason,
     DuplicateGovernanceRequest,
     InMemoryAttemptDuplicateGovernance,
@@ -286,6 +287,47 @@ class _AwaitingCallable:
 
         del call, context
         self.call_count += 1
+        return ToolAwaitingOutcome(
+            await_spec=ToolAwaitSpec(
+                await_kind=ToolAwaitKind.EXTERNAL_JOB,
+                deadline=None,
+                resume_token="resume-token",
+            ),
+            snapshot=None,
+        )
+
+
+class _BlockingAwaitingCallable:
+    """等待测试事件释放后返回 awaiting outcome 的 fake 工具。"""
+
+    def __init__(self, *, entered: asyncio.Event, release: asyncio.Event) -> None:
+        """初始化阻塞 awaiting fake callable。
+
+        :param entered: callable 进入时置位的事件。
+        :param release: 允许返回 awaiting outcome 的事件。
+        :returns: ``None``。
+        """
+
+        self._entered = entered
+        self._release = release
+        self.call_count = 0
+
+    async def __call__(
+        self,
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+    ) -> ToolExecutionOutcome:
+        """等待 release 事件后返回 awaiting outcome。
+
+        :param call: 单次工具调用请求。
+        :param context: 批式工具执行上下文。
+        :returns: awaiting outcome。
+        """
+
+        del call, context
+        self.call_count += 1
+        self._entered.set()
+        await self._release.wait()
         return ToolAwaitingOutcome(
             await_spec=ToolAwaitSpec(
                 await_kind=ToolAwaitKind.EXTERNAL_JOB,
@@ -981,8 +1023,34 @@ async def test_tool_runtime_pre_cancelled_context_returns_governed_failure() -> 
 
 
 @pytest.mark.asyncio
-async def test_awaiting_outcome_returns_only_after_awaiting_accepted_ack() -> None:
-    """awaiting outcome 只有 Host awaiting accepted ack 后才返回给 Engine。"""
+async def test_awaiting_outcome_returns_only_after_awaiting_accepted_ack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """awaiting outcome accepted 后不执行 durable-missing cleanup。"""
+
+    recorded_reasons: list[DuplicateDurableMissingReason] = []
+
+    async def _record_durable_missing(
+        self: InMemoryAttemptDuplicateGovernance,
+        request: DuplicateGovernanceRequest,
+        reason: DuplicateDurableMissingReason,
+    ) -> None:
+        """记录测试观察到的 durable-missing cleanup。
+
+        :param self: duplicate governance 实例。
+        :param request: duplicate governance 查询。
+        :param reason: durable missing 原因。
+        :returns: ``None``。
+        """
+
+        del self, request
+        recorded_reasons.append(reason)
+
+    monkeypatch.setattr(
+        InMemoryAttemptDuplicateGovernance,
+        "record_durable_missing",
+        _record_durable_missing,
+    )
 
     callable_ = _AwaitingCallable()
     accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
@@ -1005,6 +1073,87 @@ async def test_awaiting_outcome_returns_only_after_awaiting_accepted_ack() -> No
     assert awaiting_accept_port.candidates[0].external_job_ref.external_job_id == (
         "resume-token"
     )
+    assert recorded_reasons == []
+
+
+@pytest.mark.asyncio
+async def test_awaiting_marker_failure_keeps_owner_outcome_and_suppresses_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """awaiting marker 写入失败不得覆盖 owner awaiting 返回或误记 cleanup。"""
+
+    marker_wait_ids: list[str] = []
+    recorded_reasons: list[DuplicateDurableMissingReason] = []
+
+    async def _record_awaiting_accepted(
+        self: InMemoryAttemptDuplicateGovernance,
+        request: DuplicateGovernanceRequest,
+        awaiting_entry: DuplicateAwaitingAcceptedEntry,
+    ) -> None:
+        """模拟 accepted awaiting marker 写入失败。
+
+        :param self: duplicate governance 实例。
+        :param request: duplicate governance 查询。
+        :param awaiting_entry: awaiting accepted marker 条目。
+        :returns: 不会正常返回。
+        :raises RuntimeError: 始终模拟 marker 写入失败。
+        """
+
+        del self, request
+        marker_wait_ids.append(awaiting_entry.wait_id)
+        raise RuntimeError("marker write failed")
+
+    async def _record_durable_missing(
+        self: InMemoryAttemptDuplicateGovernance,
+        request: DuplicateGovernanceRequest,
+        reason: DuplicateDurableMissingReason,
+    ) -> None:
+        """记录测试观察到的 durable-missing cleanup。
+
+        :param self: duplicate governance 实例。
+        :param request: duplicate governance 查询。
+        :param reason: durable missing 原因。
+        :returns: ``None``。
+        """
+
+        del self, request
+        recorded_reasons.append(reason)
+
+    monkeypatch.setattr(
+        InMemoryAttemptDuplicateGovernance,
+        "record_awaiting_accepted",
+        _record_awaiting_accepted,
+    )
+    monkeypatch.setattr(
+        InMemoryAttemptDuplicateGovernance,
+        "record_durable_missing",
+        _record_durable_missing,
+    )
+    callable_ = _AwaitingCallable()
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    awaiting_accept_port = _AwaitingAcceptPort()
+    diagnostics = InMemoryToolTraceDiagnosticEmitter()
+    executor = _executor(
+        callable_,
+        accept_port,
+        awaiting_accept_port=awaiting_accept_port,
+        wait_adapter_registry=_wait_adapter_registry(),
+        diagnostic_emitter=diagnostics,
+    )
+
+    outcome = await executor.execute(_request(_call("tool-call-1")))
+
+    record = outcome.records[0]
+    assert callable_.call_count == 1
+    assert accept_port.candidates == []
+    assert len(awaiting_accept_port.candidates) == 1
+    assert isinstance(record.outcome, ToolAwaitingOutcome)
+    assert marker_wait_ids == [awaiting_accept_port.candidates[0].wait_id]
+    assert recorded_reasons == []
+    assert len(diagnostics.records) == 1
+    assert diagnostics.records[0].reason_code == "duplicate_awaiting_marker_failed"
+    assert "marker write failed" not in diagnostics.records[0].message
+    assert awaiting_accept_port.candidates[0].wait_id not in diagnostics.records[0].message
 
 
 @pytest.mark.asyncio
@@ -1025,9 +1174,34 @@ async def test_awaiting_outcome_without_adapter_binding_is_governed_error() -> N
 
 
 @pytest.mark.asyncio
-async def test_awaiting_accept_rejected_returns_governed_error() -> None:
+async def test_awaiting_accept_rejected_returns_governed_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """awaiting accept rejected ack 不向 Engine 暴露 awaiting outcome。"""
 
+    recorded_reasons: list[DuplicateDurableMissingReason] = []
+
+    async def _record_durable_missing(
+        self: InMemoryAttemptDuplicateGovernance,
+        request: DuplicateGovernanceRequest,
+        reason: DuplicateDurableMissingReason,
+    ) -> None:
+        """记录测试观察到的 durable-missing cleanup。
+
+        :param self: duplicate governance 实例。
+        :param request: duplicate governance 查询。
+        :param reason: durable missing 原因。
+        :returns: ``None``。
+        """
+
+        del self, request
+        recorded_reasons.append(reason)
+
+    monkeypatch.setattr(
+        InMemoryAttemptDuplicateGovernance,
+        "record_durable_missing",
+        _record_durable_missing,
+    )
     callable_ = _AwaitingCallable()
     accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
     awaiting_accept_port = _SequencedAwaitingAcceptPort(
@@ -1052,12 +1226,38 @@ async def test_awaiting_accept_rejected_returns_governed_error() -> None:
     assert isinstance(record.outcome, ToolFailedOutcome)
     assert record.outcome.result.error == "tool_awaiting_accept_rejected"
     assert record.outcome.result.hint == "accept_rejected:idempotency_conflict"
+    assert recorded_reasons == [DuplicateDurableMissingReason.HOST_ACCEPT_REJECTED]
 
 
 @pytest.mark.asyncio
-async def test_awaiting_accept_timeout_returns_governed_error() -> None:
+async def test_awaiting_accept_timeout_returns_governed_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """awaiting accept timeout 不向 Engine 暴露 awaiting outcome。"""
 
+    recorded_reasons: list[DuplicateDurableMissingReason] = []
+
+    async def _record_durable_missing(
+        self: InMemoryAttemptDuplicateGovernance,
+        request: DuplicateGovernanceRequest,
+        reason: DuplicateDurableMissingReason,
+    ) -> None:
+        """记录测试观察到的 durable-missing cleanup。
+
+        :param self: duplicate governance 实例。
+        :param request: duplicate governance 查询。
+        :param reason: durable missing 原因。
+        :returns: ``None``。
+        """
+
+        del self, request
+        recorded_reasons.append(reason)
+
+    monkeypatch.setattr(
+        InMemoryAttemptDuplicateGovernance,
+        "record_durable_missing",
+        _record_durable_missing,
+    )
     callable_ = _AwaitingCallable()
     accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
     awaiting_accept_port = _SequencedAwaitingAcceptPort(
@@ -1083,6 +1283,7 @@ async def test_awaiting_accept_timeout_returns_governed_error() -> None:
     assert record.outcome.result.hint is not None
     assert record.outcome.result.hint.startswith("accept_ack_lost;diagnostic_refs=")
     assert "tool-diagnostic-" in record.outcome.result.hint
+    assert recorded_reasons == [DuplicateDurableMissingReason.HOST_ACCEPT_TIMEOUT]
 
 
 @pytest.mark.asyncio
@@ -1154,15 +1355,52 @@ async def test_poll_awaiting_without_external_job_ref_is_governed_error() -> Non
 
 
 @pytest.mark.asyncio
+async def test_concurrent_duplicate_awaiting_fanout_does_not_start_second_job() -> None:
+    """防御性 awaiting fanout 不启动第二个业务 callable 或 accept candidate。"""
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    callable_ = _BlockingAwaitingCallable(entered=entered, release=release)
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    awaiting_accept_port = _AwaitingAcceptPort()
+    executor = _executor(
+        callable_,
+        accept_port,
+        awaiting_accept_port=awaiting_accept_port,
+        wait_adapter_registry=_wait_adapter_registry(),
+    )
+
+    owner = asyncio.create_task(executor.execute(_request(_call("tool-call-1"))))
+    await entered.wait()
+    waiter = asyncio.create_task(executor.execute(_request(_call("tool-call-2"))))
+    await asyncio.sleep(0)
+    assert callable_.call_count == 1
+    assert not waiter.done()
+
+    release.set()
+    owner_outcome, waiter_outcome = await asyncio.gather(owner, waiter)
+
+    owner_record = owner_outcome.records[0]
+    waiter_record = waiter_outcome.records[0]
+    assert callable_.call_count == 1
+    assert accept_port.candidates == []
+    assert len(awaiting_accept_port.candidates) == 1
+    assert isinstance(owner_record.outcome, ToolAwaitingOutcome)
+    assert isinstance(waiter_record.outcome, ToolAwaitingOutcome)
+    assert waiter_record.tool_call_id == "tool-call-2"
+
+
+@pytest.mark.asyncio
 async def test_awaiting_outcome_stops_remaining_batch_calls() -> None:
     """批内首个 awaiting accepted 后不得继续调用后续业务工具。"""
 
     callable_ = _AwaitingCallable()
     accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    awaiting_accept_port = _AwaitingAcceptPort()
     executor = _executor(
         callable_,
         accept_port,
-        awaiting_accept_port=_AwaitingAcceptPort(),
+        awaiting_accept_port=awaiting_accept_port,
         wait_adapter_registry=_wait_adapter_registry(),
     )
 
@@ -1172,6 +1410,7 @@ async def test_awaiting_outcome_stops_remaining_batch_calls() -> None:
 
     first, second = (record.outcome for record in outcome.records)
     assert callable_.call_count == 1
+    assert len(awaiting_accept_port.candidates) == 1
     assert isinstance(first, ToolAwaitingOutcome)
     assert isinstance(second, ToolFailedOutcome)
     assert second.result.hint == "run_suspended_by_tool_awaiting"
@@ -1243,7 +1482,11 @@ async def test_batch_mixed_accept_outcomes_keep_accepted_visible() -> None:
 
 def _executor(
     callable_: (
-        _CountingCallable | _OutcomeCallable | _AwaitingCallable | _BlockingCallable
+        _CountingCallable
+        | _OutcomeCallable
+        | _AwaitingCallable
+        | _BlockingAwaitingCallable
+        | _BlockingCallable
     ),
     accept_port: HostToolFactAcceptPort,
     *,
@@ -1349,7 +1592,11 @@ def _call(tool_call_id: str, *, ticker: str = "DAYU") -> ToolCallRequest:
 def _definition(
     name: str,
     callable_: (
-        _CountingCallable | _OutcomeCallable | _AwaitingCallable | _BlockingCallable
+        _CountingCallable
+        | _OutcomeCallable
+        | _AwaitingCallable
+        | _BlockingAwaitingCallable
+        | _BlockingCallable
     ),
 ) -> ToolDefinition:
     """构造工具声明。

@@ -589,8 +589,9 @@ ToolRuntime 只有在 Host 接受工具事实后才向 Engine 返回 batch outco
 - `REQUIRE_JUSTIFICATION`：要求参数中给出重复调用理由。
 - `HARD_STOP`：拒绝本次重复调用，返回受治理工具失败。
 - `DURABLE_MISSING`：先前 in-flight owner 没有产生可复用 accepted fact 时的治理结果。
+- `AWAITING_FANOUT`：先前 in-flight owner 已被 Host accepted 为等待中间态时，后续重复请求共享同一个 owner awaiting outcome；这是 Host internal 防御分支，不是普通 completed result 复用。
 
-该机制会跟踪 attempt-local in-flight owner 与 waiter；owner 产生 accepted fact 后，后续重复请求可按策略复用或被治理。若 owner cancelled、工具异常、Host accept rejected / timeout 或调用在 accept 前被治理，则记录 durable-missing reason。steer、resume、recovery、retry、replay 都创建新 Attempt 或新 Run，因此不会继承旧 Attempt 的重复治理内存状态。
+该机制会跟踪 attempt-local in-flight owner 与 waiter；owner 产生 accepted fact 后，后续重复请求可按策略复用或被治理。owner 被 Host accepted 为等待中间态后，会记录 attempt-local terminal marker，避免 cleanup 把已 accepted awaiting 误标为 durable-missing。若 owner cancelled、工具异常、Host accept rejected / timeout 或调用在 accept 前被治理，则记录 durable-missing reason。steer、resume、recovery、retry、replay 都创建新 Attempt 或新 Run，因此不会继承旧 Attempt 的重复治理内存状态。
 
 ### Truncation 与 fetch_more
 

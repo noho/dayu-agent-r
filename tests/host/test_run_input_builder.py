@@ -135,6 +135,7 @@ from dayu.host.run_input import (
     _is_internal_evidence_source_part,
     _llm_facing_evidence_source_text,
     _normalize_ordinary_run_messages,
+    _resume_wait_message_from_current_start,
     _vnext_compact_candidate_semantic_lines,
     create_no_tool_run_input_builder,
     create_tool_enabled_run_input_builder,
@@ -379,6 +380,65 @@ def test_recovery_attempt_rebuilds_current_prompt_from_same_run_eventlog_descrip
         assert recovery.execution_id != old.execution_id
         assert isinstance(request.messages[-1], UserMessage)
         assert request.messages[-1].content == "descriptor recovery prompt"
+
+
+def test_resume_wait_message_appends_shared_duplicate_result_guidance(
+    tmp_path: Path,
+) -> None:
+    """resume wait result message 追加重复请求共享结果说明且不泄漏内部 ref。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("resume prompt"),
+        )
+        _append_resume_wait_projection_events(store.transaction_runner, seeded)
+        current_facts = DurableCurrentRunFactProvider(
+            store.transaction_runner
+        ).load_current_run_facts(_attempt_snapshot(seeded))
+        resume_started = _read_event_by_id(
+            store.transaction_runner,
+            "event-run-started-resume",
+        )
+
+        def operation(transaction: HostTransaction) -> SystemMessage:
+            """构造 resume wait result message。
+
+            :param transaction: Host durable transaction。
+            :returns: resume wait system message。
+            """
+
+            message = _resume_wait_message_from_current_start(
+                transaction,
+                replace(current_facts, run_started_event=resume_started),
+            )
+            assert message is not None
+            return message
+
+        message = store.transaction_runner.run_read(operation)
+
+        assert "A previous interrupted step has an accepted wait result." in (
+            message.content
+        )
+        assert "tool_name=fake_tool" in message.content
+        assert "resolution_kind=completed" in message.content
+        assert "tool_fact_kind=completed" in message.content
+        assert 'result={"ok":true,"value":{"answer":42}}' in message.content
+        assert "duplicate requests for the same tool with the same arguments" in (
+            message.content
+        )
+        assert "Do not call the same tool again only to obtain the same result." in (
+            message.content
+        )
+        assert "wait-resume-private" not in message.content
+        assert "tool-call-private" not in message.content
+        assert "event-tool-result-resume" not in message.content
+        assert "payload-ref-private" not in message.content
+        assert "sha256:" not in message.content
+        assert "attempt-current" not in message.content
+        assert "execution-current" not in message.content
 
 
 def test_build_is_deterministic_for_same_eventlog_and_policy(
@@ -5048,6 +5108,92 @@ def _seed_current_run_with_descriptor(
         )
 
     return store.transaction_runner.run_write(operation)
+
+
+def _append_resume_wait_projection_events(
+    transaction_runner: HostTransactionRunner, seeded: _SeededRun
+) -> None:
+    """追加 resume wait message 投影所需的最小事件。
+
+    :param transaction_runner: Host transaction runner。
+    :param seeded: 当前测试 Run 引用。
+    :returns: ``None``。
+    """
+
+    def operation(transaction: HostTransaction) -> None:
+        """追加 wait result 与 resume ``RUN_STARTED`` 事件。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        event_log = EventLogStore()
+        tool_result = event_log.append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id="event-tool-result-resume",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+                attempt_id=seeded.attempt_id,
+                execution_id=seeded.execution_id,
+                event_type="TOOL_RESULT_ACCEPTED",
+                occurred_at=_NOW,
+                actor="host",
+                source="pytest",
+                client_request_id=None,
+                idempotency_key="resolve-resume",
+                policy_decision=None,
+                reason=None,
+                payload_json={
+                    "wait_id": "wait-resume-private",
+                    "tool_call_id": "tool-call-private",
+                    "tool_name": "fake_tool",
+                    "resolution_kind": "completed",
+                    "tool_fact_kind": "completed",
+                    "result": {"ok": True, "value": {"answer": 42}},
+                    "payload_ref": "payload-ref-private",
+                    "result_digest": _DIGEST_A,
+                },
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        ).row
+        event_log.append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id="event-run-started-resume",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+                attempt_id=None,
+                execution_id=None,
+                event_type="RUN_STARTED",
+                occurred_at=_NOW,
+                actor="host",
+                source="pytest",
+                client_request_id=None,
+                idempotency_key="resolve-resume",
+                policy_decision=None,
+                reason={"start_reason": "resume"},
+                payload_json={
+                    "run_id": seeded.run_id,
+                    "start_reason": "resume",
+                    "wait_id": "wait-resume-private",
+                    "source_attempt_id": seeded.attempt_id,
+                    "attempt_id": "attempt-resume-private",
+                    "execution_id": "execution-resume-private",
+                    "tool_result_event_ref": {
+                        "event_id": tool_result.event_id,
+                        "event_sequence": tool_result.event_sequence,
+                    },
+                },
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        )
+
+    transaction_runner.run_write(operation)
 
 
 def _force_dispatch_snapshot_state(
