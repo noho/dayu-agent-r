@@ -142,6 +142,7 @@ from dayu.host.tooling import (
 )
 from dayu.host.tool_duplicate_governance import (
     DuplicateAcceptedEntry,
+    DuplicateAwaitingAcceptedEntry,
     DuplicateDecision,
     DuplicateDecisionKind,
     DuplicateDurableMissingReason,
@@ -233,6 +234,9 @@ _TOOL_RUNTIME_ACCEPT_TIMEOUT_REASON = "accept_timeout"
 _TOOL_RUNTIME_ACCEPT_REJECTED_REASON = "accept_rejected"
 _TOOL_RUNTIME_ACCEPT_EXCEPTION_REASON = "accept_ack_lost"
 _TOOL_RUNTIME_DUPLICATE_CLEANUP_FAILURE_REASON = "duplicate_cleanup_failed"
+_TOOL_RUNTIME_DUPLICATE_AWAITING_MARKER_FAILURE_REASON = (
+    "duplicate_awaiting_marker_failed"
+)
 _TOOL_RUNTIME_DIAGNOSTIC_REFS_HINT_KEY = "diagnostic_refs"
 _TOOL_RUNTIME_HINT_SECTION_SEPARATOR = ";"
 _TOOL_RUNTIME_DIAGNOSTIC_REF_SEPARATOR = ","
@@ -242,6 +246,7 @@ _TOOL_RUNTIME_DUPLICATE_REQUIRE_JUSTIFICATION_REASON = (
     "duplicate_requires_justification"
 )
 _TOOL_RUNTIME_DUPLICATE_HARD_STOP_REASON = "duplicate_hard_stop"
+_TOOL_RUNTIME_DUPLICATE_AWAITING_FANOUT_REASON = "duplicate_awaiting_fanout"
 _TOOL_RUNTIME_DIAGNOSTIC_NOOP_REF = "tool-diagnostic-noop"
 _FAILURE_SIGNAL_SOURCE_TOOL_RESULT_ACCEPTED = _EVENT_TYPE_TOOL_RESULT_ACCEPTED
 _ONE_MILLISECOND = timedelta(milliseconds=1)
@@ -1102,6 +1107,20 @@ class _InlineToolResultGovernance:
     outcome: ToolExecutionOutcome
     policy_decision: ToolPolicyDecision
     diagnostic_refs: tuple["ToolTraceDiagnosticRef", ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _AwaitingAcceptExecution:
+    """awaiting accept path 的内部返回值。
+
+    :param record: 返回给 Engine 的单次工具执行记录。
+    :param duplicate_terminal_recorded: duplicate terminal 是否已处理。
+    :param durable_missing_reason: awaiting accept 未 accepted 时的 duplicate cleanup 原因。
+    """
+
+    record: BatchToolExecutionRecord
+    duplicate_terminal_recorded: bool
+    durable_missing_reason: DuplicateDurableMissingReason | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2312,6 +2331,11 @@ class ToolRuntimeExecutor:
                     message="tool request context does not match execution scope",
                 )
             duplicate_refs = self._diagnostic_refs_for_duplicate(duplicate_decision)
+            if duplicate_decision.kind is DuplicateDecisionKind.AWAITING_FANOUT:
+                return self._awaiting_fanout_record(
+                    call=call,
+                    duplicate_decision=duplicate_decision,
+                )
             duplicate_governed = False
             if (
                 policy_decision.kind is ToolPolicyDecisionKind.ALLOW
@@ -2352,7 +2376,7 @@ class ToolRuntimeExecutor:
                         outcome=raw_outcome,
                     )
                 if isinstance(raw_outcome, ToolAwaitingOutcome):
-                    return await self._accept_awaiting(
+                    awaiting_result = await self._accept_awaiting(
                         call=call,
                         context=context,
                         normalized_arguments_digest=normalized_arguments_digest,
@@ -2364,6 +2388,14 @@ class ToolRuntimeExecutor:
                         policy_decision=policy_decision,
                         diagnostic_refs=duplicate_refs,
                     )
+                    duplicate_terminal_recorded = (
+                        awaiting_result.duplicate_terminal_recorded
+                    )
+                    if awaiting_result.durable_missing_reason is not None:
+                        durable_missing_reason = (
+                            awaiting_result.durable_missing_reason
+                        )
+                    return awaiting_result.record
                 outcome, policy_decision = self._normalize_runtime_outcome(
                     raw_outcome, policy_decision
                 )
@@ -2647,7 +2679,7 @@ class ToolRuntimeExecutor:
         duplicate_decision: DuplicateDecision,
         policy_decision: ToolPolicyDecision,
         diagnostic_refs: tuple[ToolTraceDiagnosticRef, ...],
-    ) -> BatchToolExecutionRecord:
+    ) -> _AwaitingAcceptExecution:
         """通过 Host awaiting accept path 接受等待型工具 outcome。
 
         :param call: 单次工具调用请求。
@@ -2660,34 +2692,46 @@ class ToolRuntimeExecutor:
         :param duplicate_decision: duplicate 决策。
         :param policy_decision: 工具治理决策。
         :param diagnostic_refs: 已发出的 duplicate 诊断 refs。
-        :returns: 单次工具调用记录。
+        :returns: awaiting accept 内部执行结果。
         """
 
         if (
             self._awaiting_accept_port is None
             or self._wait_adapter_registry is None
         ):
-            return BatchToolExecutionRecord(
-                tool_call_id=call.tool_call_id,
-                outcome=self._awaiting_configuration_failure(),
+            return _AwaitingAcceptExecution(
+                record=BatchToolExecutionRecord(
+                    tool_call_id=call.tool_call_id,
+                    outcome=self._awaiting_configuration_failure(),
+                ),
+                duplicate_terminal_recorded=False,
+                durable_missing_reason=None,
             )
         binding = self._wait_adapter_registry.resolve_binding(
             tool_name=call.name,
             await_kind=awaiting_outcome.await_spec.await_kind,
         )
         if binding is None:
-            return BatchToolExecutionRecord(
-                tool_call_id=call.tool_call_id,
-                outcome=self._awaiting_configuration_failure(),
+            return _AwaitingAcceptExecution(
+                record=BatchToolExecutionRecord(
+                    tool_call_id=call.tool_call_id,
+                    outcome=self._awaiting_configuration_failure(),
+                ),
+                duplicate_terminal_recorded=False,
+                durable_missing_reason=None,
             )
         external_job_ref = binding.external_job_ref(awaiting_outcome.await_spec)
         if (
             binding.resume_policy is WaitResumePolicy.POLL
             and external_job_ref is None
         ):
-            return BatchToolExecutionRecord(
-                tool_call_id=call.tool_call_id,
-                outcome=self._awaiting_external_job_failure(),
+            return _AwaitingAcceptExecution(
+                record=BatchToolExecutionRecord(
+                    tool_call_id=call.tool_call_id,
+                    outcome=self._awaiting_external_job_failure(),
+                ),
+                duplicate_terminal_recorded=False,
+                durable_missing_reason=None,
             )
         snapshot_ref = _wait_snapshot_ref(awaiting_outcome)
         candidate = _tool_awaiting_accept_candidate(
@@ -2706,16 +2750,53 @@ class ToolRuntimeExecutor:
         )
         accept_result = await self._accept_awaiting_with_retry(candidate)
         if isinstance(accept_result, ToolAwaitingAcceptedAck):
-            # Awaiting 是等待中间态，不写入 duplicate accepted index；等待
-            # 解析后的工具结果事实由 resolve_wait / resume path 负责。
-            del duplicate_request
-            return BatchToolExecutionRecord(
-                tool_call_id=call.tool_call_id,
-                outcome=awaiting_outcome,
+            # Awaiting durable truth 已由 Host accepted ack 成立。attempt-local
+            # marker 只是 cleanup/fanout 辅助状态，失败时不得覆盖 owner 返回。
+            duplicate_terminal_recorded = (
+                await self._record_duplicate_awaiting_accepted(
+                    duplicate_request=duplicate_request,
+                    accepted_ack=accept_result,
+                    awaiting_outcome=awaiting_outcome,
+                    duplicate_decision=duplicate_decision,
+                    policy_decision=policy_decision,
+                )
             )
+            return _AwaitingAcceptExecution(
+                record=BatchToolExecutionRecord(
+                    tool_call_id=call.tool_call_id,
+                    outcome=awaiting_outcome,
+                ),
+                duplicate_terminal_recorded=duplicate_terminal_recorded,
+                durable_missing_reason=None,
+            )
+        durable_missing_reason = _durable_missing_reason_for_awaiting_accept_result(
+            accept_result
+        )
+        return _AwaitingAcceptExecution(
+            record=BatchToolExecutionRecord(
+                tool_call_id=call.tool_call_id,
+                outcome=_awaiting_accept_failure_outcome(accept_result),
+            ),
+            duplicate_terminal_recorded=False,
+            durable_missing_reason=durable_missing_reason,
+        )
+
+    def _awaiting_fanout_record(
+        self, *, call: ToolCallRequest, duplicate_decision: DuplicateDecision
+    ) -> BatchToolExecutionRecord:
+        """返回防御性 awaiting fanout 的单次工具记录。
+
+        :param call: 当前重复工具调用。
+        :param duplicate_decision: awaiting fanout duplicate 决策。
+        :returns: 指向 owner awaiting outcome 的工具执行记录。
+        :raises RuntimeError: duplicate 决策缺少 awaiting outcome 时抛出。
+        """
+
+        if duplicate_decision.prior_awaiting_outcome is None:
+            raise RuntimeError("awaiting fanout requires prior awaiting outcome")
         return BatchToolExecutionRecord(
             tool_call_id=call.tool_call_id,
-            outcome=_awaiting_accept_failure_outcome(accept_result),
+            outcome=duplicate_decision.prior_awaiting_outcome,
         )
 
     def _awaiting_configuration_failure(self) -> ToolFailedOutcome:
@@ -2859,6 +2940,101 @@ class ToolRuntimeExecutor:
             ),
         )
         return True
+
+    async def _record_duplicate_awaiting_accepted(
+        self,
+        *,
+        duplicate_request: DuplicateGovernanceRequest,
+        accepted_ack: ToolAwaitingAcceptedAck,
+        awaiting_outcome: ToolAwaitingOutcome,
+        duplicate_decision: DuplicateDecision,
+        policy_decision: ToolPolicyDecision,
+    ) -> bool:
+        """在 awaiting accepted ack 后 best-effort 写入 terminal marker。
+
+        :param duplicate_request: duplicate 查询输入。
+        :param accepted_ack: Host awaiting accepted ack。
+        :param awaiting_outcome: 已被 Host 接受的 awaiting outcome。
+        :param duplicate_decision: 本次 duplicate 决策。
+        :param policy_decision: 本次工具治理决策。
+        :returns: terminal 已处理时返回 ``True``；不适用 marker 时返回 ``False``。
+        :raises: 不传播 marker 写入或诊断失败。
+        """
+
+        if (
+            policy_decision.kind is not ToolPolicyDecisionKind.ALLOW
+            or duplicate_decision.kind is not DuplicateDecisionKind.ALLOW
+        ):
+            return False
+        awaiting_entry = DuplicateAwaitingAcceptedEntry(
+            accepted_event_refs=tuple(
+                HostEventRef(
+                    event_id=event_ref.event_id,
+                    event_sequence=event_ref.event_sequence,
+                )
+                for event_ref in accepted_ack.accepted_event_refs
+            ),
+            wait_id=accepted_ack.wait_id,
+            awaiting_outcome=awaiting_outcome,
+            result_digest=accepted_ack.result_digest,
+        )
+        try:
+            await self._duplicate_governance.record_awaiting_accepted(
+                duplicate_request,
+                awaiting_entry,
+            )
+        except Exception as exc:
+            _LOGGER.warning(
+                "host.tool_runtime.duplicate_awaiting_marker_failed "
+                "session_id=%s run_id=%s attempt_id=%s tool_name=%s "
+                "wait_id=%s error_type=%s",
+                self._execution_scope.session_id,
+                self._execution_scope.run_id,
+                self._execution_scope.attempt_id,
+                duplicate_request.tool_name,
+                accepted_ack.wait_id,
+                exc.__class__.__name__,
+                exc_info=True,
+            )
+            self._emit_duplicate_awaiting_marker_diagnostic_best_effort(
+                exc,
+                accepted_ack.wait_id,
+            )
+        return True
+
+    def _emit_duplicate_awaiting_marker_diagnostic_best_effort(
+        self, exc: Exception, wait_id: str
+    ) -> None:
+        """best-effort 发出 awaiting marker 写入失败诊断。
+
+        :param exc: marker 写入抛出的异常。
+        :param wait_id: Host 已 accepted 的等待记录 id，仅用于诊断日志。
+        :returns: ``None``。
+        :raises: 不向调用方传播诊断失败。
+        """
+
+        try:
+            self._diagnostic_emitter.emit(
+                ToolTraceDiagnosticRecord(
+                    reason_code=(
+                        _TOOL_RUNTIME_DUPLICATE_AWAITING_MARKER_FAILURE_REASON
+                    ),
+                    message=(
+                        "duplicate awaiting accepted marker failed: "
+                        f"{exc.__class__.__name__}"
+                    ),
+                ),
+            )
+        except Exception:
+            _LOGGER.warning(
+                "host.tool_runtime.duplicate_awaiting_marker_diagnostic_failed "
+                "session_id=%s run_id=%s attempt_id=%s wait_id=%s",
+                self._execution_scope.session_id,
+                self._execution_scope.run_id,
+                self._execution_scope.attempt_id,
+                wait_id,
+                exc_info=True,
+            )
 
     def _normalize_runtime_outcome(
         self,
@@ -5539,6 +5715,20 @@ def _durable_missing_reason_for_accept_result(
     return DuplicateDurableMissingReason.HOST_ACCEPT_TIMEOUT
 
 
+def _durable_missing_reason_for_awaiting_accept_result(
+    result: ToolAwaitingRejectedAck | ToolAwaitingAcceptTimedOut,
+) -> DuplicateDurableMissingReason:
+    """根据 Host awaiting accept 结果推导 durable missing 原因。
+
+    :param result: Host awaiting accept rejected 或 timed out 结果。
+    :returns: duplicate owner 未产生 accepted awaiting marker 的原因。
+    """
+
+    if isinstance(result, ToolAwaitingRejectedAck):
+        return DuplicateDurableMissingReason.HOST_ACCEPT_REJECTED
+    return DuplicateDurableMissingReason.HOST_ACCEPT_TIMEOUT
+
+
 def _is_callable_exception_outcome(outcome: ToolExecutionOutcome) -> bool:
     """判断 outcome 是否来自业务工具 callable 异常。
 
@@ -5569,6 +5759,8 @@ def _duplicate_reason_code(kind: DuplicateDecisionKind) -> str:
         return _TOOL_RUNTIME_DUPLICATE_HARD_STOP_REASON
     if kind is DuplicateDecisionKind.DURABLE_MISSING:
         return "duplicate_prior_accept_missing"
+    if kind is DuplicateDecisionKind.AWAITING_FANOUT:
+        return _TOOL_RUNTIME_DUPLICATE_AWAITING_FANOUT_REASON
     return "duplicate_allowed"
 
 

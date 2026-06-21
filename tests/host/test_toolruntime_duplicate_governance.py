@@ -10,6 +10,7 @@ from datetime import datetime
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
 from dayu.contracts.tool_call import (
     BatchToolExecutionContext,
     BatchToolExecutionRequest,
@@ -18,6 +19,7 @@ from dayu.contracts.tool_call import (
 from dayu.contracts.tool_declaration import ToolBundle, ToolCallable, ToolDefinition
 from dayu.contracts.tool_executor import ToolExecutor
 from dayu.contracts.tool_outcome import (
+    ToolAwaitingOutcome,
     ToolCompletedOutcome,
     ToolExecutionOutcome,
     ToolFailedOutcome,
@@ -55,11 +57,16 @@ from dayu.host.tooling import (
     default_framework_tool_policy_view,
 )
 from dayu.host.tool_duplicate_governance import (
+    DuplicateAwaitingAcceptedEntry,
     DuplicateDecisionKind,
+    DuplicateDurableMissingReason,
     DuplicateGovernanceScope,
     DuplicateGovernanceMessages,
     DuplicateGovernancePolicy,
+    DuplicateGovernanceRequest,
+    InMemoryAttemptDuplicateGovernance,
 )
+from dayu.host.durable.codec import sha256_digest_json
 from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 
 _SESSION_ID = "session-duplicate"
@@ -1403,6 +1410,126 @@ async def test_allow_policy_post_owner_completion_executes_again() -> None:
     assert tool.call_count == 2
 
 
+@pytest.mark.asyncio
+async def test_record_awaiting_accepted_marks_terminal_without_ordinary_reuse() -> None:
+    """awaiting accepted marker 不污染普通 accepted index。"""
+
+    governance = InMemoryAttemptDuplicateGovernance(
+        DuplicateGovernancePolicy(
+            default_duplicate_decision=DuplicateDecisionKind.REUSE
+        )
+    )
+    request = _duplicate_request()
+    owner = await governance.decide_duplicate(request)
+    awaiting_outcome = _awaiting_outcome()
+    refs = (HostEventRef(event_id="event-awaiting-owner", event_sequence=1),)
+
+    await governance.record_awaiting_accepted(
+        request,
+        DuplicateAwaitingAcceptedEntry(
+            accepted_event_refs=refs,
+            wait_id="wait-owner",
+            awaiting_outcome=awaiting_outcome,
+            result_digest=sha256_digest_json({"awaiting": "owner"}),
+        ),
+    )
+    decision = await governance.decide_duplicate(request)
+
+    assert owner.kind is DuplicateDecisionKind.ALLOW
+    assert decision.kind is DuplicateDecisionKind.AWAITING_FANOUT
+    assert decision.prior_event_refs == refs
+    assert decision.prior_outcome is None
+    assert decision.prior_awaiting_outcome is awaiting_outcome
+    assert decision.prior_wait_id == "wait-owner"
+
+
+@pytest.mark.asyncio
+async def test_record_awaiting_accepted_fans_out_multiple_waiters() -> None:
+    """awaiting accepted marker 下多个 waiter 均共享同一 owner wait。"""
+
+    governance = InMemoryAttemptDuplicateGovernance()
+    request = _duplicate_request()
+    await governance.decide_duplicate(request)
+    awaiting_outcome = _awaiting_outcome()
+
+    await governance.record_awaiting_accepted(
+        request,
+        DuplicateAwaitingAcceptedEntry(
+            accepted_event_refs=(
+                HostEventRef(event_id="event-awaiting-owner", event_sequence=1),
+            ),
+            wait_id="wait-owner",
+            awaiting_outcome=awaiting_outcome,
+            result_digest=sha256_digest_json({"awaiting": "owner"}),
+        ),
+    )
+
+    first = await governance.decide_duplicate(request)
+    second = await governance.decide_duplicate(request)
+
+    assert first.kind is DuplicateDecisionKind.AWAITING_FANOUT
+    assert second.kind is DuplicateDecisionKind.AWAITING_FANOUT
+    assert first.prior_wait_id == "wait-owner"
+    assert second.prior_wait_id == "wait-owner"
+    assert first.prior_awaiting_outcome is awaiting_outcome
+    assert second.prior_awaiting_outcome is awaiting_outcome
+
+
+@pytest.mark.asyncio
+async def test_durable_missing_preserves_awaiting_accepted_marker() -> None:
+    """AWAITING_ACCEPTED guard 保留 owner wait，不重新竞争 owner。"""
+
+    governance = InMemoryAttemptDuplicateGovernance()
+    request = _duplicate_request()
+    owner = await governance.decide_duplicate(request)
+    awaiting_outcome = _awaiting_outcome()
+    refs = (HostEventRef(event_id="event-awaiting-owner", event_sequence=1),)
+
+    await governance.record_awaiting_accepted(
+        request,
+        DuplicateAwaitingAcceptedEntry(
+            accepted_event_refs=refs,
+            wait_id="wait-owner",
+            awaiting_outcome=awaiting_outcome,
+            result_digest=sha256_digest_json({"awaiting": "owner"}),
+        ),
+    )
+    await governance.record_durable_missing(
+        request,
+        DuplicateDurableMissingReason.GOVERNED_BEFORE_ACCEPT,
+    )
+    decision = await governance.decide_duplicate(request)
+
+    assert owner.kind is DuplicateDecisionKind.ALLOW
+    assert decision.kind is DuplicateDecisionKind.AWAITING_FANOUT
+    assert decision.prior_event_refs == refs
+    assert decision.prior_wait_id == "wait-owner"
+    assert decision.prior_awaiting_outcome is awaiting_outcome
+    assert decision.prior_outcome is None
+
+
+@pytest.mark.asyncio
+async def test_durable_missing_still_reopens_owner_competition() -> None:
+    """durable-missing 仍释放 waiter 重新竞争 owner。"""
+
+    governance = InMemoryAttemptDuplicateGovernance()
+    request = _duplicate_request()
+    owner = await governance.decide_duplicate(request)
+
+    await governance.record_durable_missing(
+        request,
+        DuplicateDurableMissingReason.HOST_ACCEPT_TIMEOUT,
+    )
+    replacement = await governance.decide_duplicate(request)
+
+    assert owner.kind is DuplicateDecisionKind.ALLOW
+    assert replacement.kind is DuplicateDecisionKind.ALLOW
+    assert replacement.prior_event_refs == ()
+    assert replacement.prior_outcome is None
+    assert replacement.prior_awaiting_outcome is None
+    assert replacement.prior_wait_id is None
+
+
 def test_duplicate_governance_messages_reject_empty_text() -> None:
     """duplicate governance messages 拒绝空白消息配置。"""
 
@@ -1542,6 +1669,38 @@ def _request(
             cancellation_token=token,
             correlation_id="correlation-duplicate",
         ),
+    )
+
+
+def _duplicate_request() -> DuplicateGovernanceRequest:
+    """构造 direct duplicate governance 测试请求。
+
+    :returns: duplicate governance 查询输入。
+    """
+
+    return DuplicateGovernanceRequest(
+        scope=DuplicateGovernanceScope(kind="attempt", attempt_id=_ATTEMPT_ID),
+        tool_name="fake_tool",
+        tool_identity_digest=sha256_digest_json({"identity": "fake_tool"}),
+        normalized_arguments_digest=sha256_digest_json({"ticker": "DAYU"}),
+        arguments={"ticker": "DAYU"},
+        semantic_duplicate_key=None,
+    )
+
+
+def _awaiting_outcome() -> ToolAwaitingOutcome:
+    """构造 direct duplicate governance 测试 awaiting outcome。
+
+    :returns: awaiting outcome。
+    """
+
+    return ToolAwaitingOutcome(
+        await_spec=ToolAwaitSpec(
+            await_kind=ToolAwaitKind.EXTERNAL_JOB,
+            deadline=None,
+            resume_token="resume-token",
+        ),
+        snapshot=None,
     )
 
 

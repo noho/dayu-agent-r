@@ -9,7 +9,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Literal, Protocol
 
 from dayu.contracts.json_value import JsonValue
-from dayu.contracts.tool_outcome import ToolExecutionOutcome
+from dayu.contracts.tool_outcome import ToolAwaitingOutcome, ToolExecutionOutcome
 from dayu.host.durable.codec import is_sha256_digest, sha256_digest_json
 
 if TYPE_CHECKING:
@@ -25,6 +25,7 @@ class DuplicateDecisionKind(StrEnum):
     REQUIRE_JUSTIFICATION = "require_justification"
     HARD_STOP = "hard_stop"
     DURABLE_MISSING = "durable_missing"
+    AWAITING_FANOUT = "awaiting_fanout"
 
 
 class DuplicateDurableMissingReason(StrEnum):
@@ -42,6 +43,7 @@ class _InFlightDuplicateState(StrEnum):
 
     OWNER_RUNNING = "owner_running"
     ACCEPTED = "accepted"
+    AWAITING_ACCEPTED = "awaiting_accepted"
     DURABLE_MISSING = "durable_missing"
 
 
@@ -79,6 +81,7 @@ class DuplicateGovernanceMessages:
     :param hard_stop: hard_stop 决策说明。
     :param attempt_scope_diagnostic: attempt-scoped duplicate 诊断说明。
     :param prior_accept_missing: owner 未产生 accepted fact 时的等待者说明。
+    :param awaiting_fanout: owner 已进入 Host waiting 后的防御性 fanout 说明。
     """
 
     allow: str = "本次重复工具调用已允许执行。"
@@ -102,6 +105,9 @@ class DuplicateGovernanceMessages:
         "上一次相同工具请求没有产生可用结果。请说明信息不足，"
         "或在改变证据范围后再调用工具。"
     )
+    awaiting_fanout: str = (
+        "相同工具请求已经进入等待状态；当前重复请求共享同一个等待结果。"
+    )
 
     def __post_init__(self) -> None:
         """校验所有消息均为非空文本。
@@ -118,6 +124,7 @@ class DuplicateGovernanceMessages:
             ("hard_stop", self.hard_stop),
             ("attempt_scope_diagnostic", self.attempt_scope_diagnostic),
             ("prior_accept_missing", self.prior_accept_missing),
+            ("awaiting_fanout", self.awaiting_fanout),
         ):
             _require_non_empty_text(value, field_name=field_name)
 
@@ -140,6 +147,8 @@ class DuplicateGovernanceMessages:
             return self.hard_stop
         if kind is DuplicateDecisionKind.DURABLE_MISSING:
             return self.prior_accept_missing
+        if kind is DuplicateDecisionKind.AWAITING_FANOUT:
+            return self.awaiting_fanout
         raise ValueError(f"unsupported duplicate decision kind: {kind}")
 
 
@@ -259,6 +268,36 @@ class DuplicateAcceptedEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class DuplicateAwaitingAcceptedEntry:
+    """重复治理 awaiting accepted marker 写入条目。
+
+    :param accepted_event_refs: Host awaiting accept ack 返回的 accepted refs。
+    :param wait_id: Host 已接受的 owner wait id。
+    :param awaiting_outcome: 已被 Host 接受的 awaiting outcome。
+    :param result_digest: awaiting accept ack 中的语义结果 digest。
+    """
+
+    accepted_event_refs: tuple["HostEventRef", ...]
+    wait_id: str
+    awaiting_outcome: ToolAwaitingOutcome
+    result_digest: str
+
+    def __post_init__(self) -> None:
+        """校验 awaiting accepted marker 写入条目。
+
+        :returns: ``None``。
+        :raises ValueError: refs、wait id、awaiting outcome 或 digest 非法时抛出。
+        """
+
+        if not self.accepted_event_refs:
+            raise ValueError("duplicate awaiting accepted entry requires event refs")
+        _require_non_empty_text(self.wait_id, field_name="wait_id")
+        if not isinstance(self.awaiting_outcome, ToolAwaitingOutcome):
+            raise ValueError("awaiting_outcome must be ToolAwaitingOutcome")
+        _require_sha256_digest(self.result_digest, field_name="result_digest")
+
+
+@dataclass(frozen=True, slots=True)
 class DuplicateDecision:
     """重复工具调用治理决策。
 
@@ -266,6 +305,8 @@ class DuplicateDecision:
     :param duplicate_key: 当前调用的重复键；未产生时为 ``None``。
     :param prior_event_refs: 可复用的既有事件引用；无复用时为空元组。
     :param prior_outcome: 可返回给 Engine 的既有 accepted outcome；无复用时为 ``None``。
+    :param prior_awaiting_outcome: 可返回给 Engine 的既有 awaiting outcome；无 fanout 时为 ``None``。
+    :param prior_wait_id: 既有 owner wait id；无 awaiting fanout 时为 ``None``。
     :param scope: 当前 duplicate governance 作用域。
     :param reason_code: 机器可读治理原因；无原因时为 ``None``。
     :param message: 面向模型或诊断的人类可读消息；无消息时为 ``None``。
@@ -277,6 +318,8 @@ class DuplicateDecision:
     duplicate_key: str | None
     prior_event_refs: tuple["HostEventRef", ...]
     prior_outcome: ToolExecutionOutcome | None
+    prior_awaiting_outcome: ToolAwaitingOutcome | None
+    prior_wait_id: str | None
     scope: DuplicateGovernanceScope
     reason_code: str | None
     message: str | None
@@ -316,6 +359,20 @@ class DuplicateGovernancePort(Protocol):
         """
         ...
 
+    async def record_awaiting_accepted(
+        self,
+        request: DuplicateGovernanceRequest,
+        awaiting_entry: DuplicateAwaitingAcceptedEntry,
+    ) -> None:
+        """记录 owner 已 accepted awaiting marker 供同 Attempt 后续治理。
+
+        :param request: duplicate governance 查询输入。
+        :param awaiting_entry: awaiting accepted marker 写入条目。
+        :returns: ``None``。
+        :raises ValueError: 实现可在记录字段非法时抛出。
+        """
+        ...
+
     async def record_durable_missing(
         self,
         request: DuplicateGovernanceRequest,
@@ -338,12 +395,14 @@ class _InFlightDuplicateRecord:
     :param duplicate_key: 当前 in-flight 窗口的 duplicate key。
     :param state: in-flight 当前状态。
     :param accepted_entry: owner accepted 后写入的条目。
+    :param awaiting_entry: owner awaiting accepted 后写入的 marker。
     :param durable_missing_reason: owner 未产生 accepted fact 的原因。
     """
 
     duplicate_key: str
     state: _InFlightDuplicateState
     accepted_entry: DuplicateAcceptedEntry | None = None
+    awaiting_entry: DuplicateAwaitingAcceptedEntry | None = None
     durable_missing_reason: DuplicateDurableMissingReason | None = None
 
 
@@ -421,6 +480,16 @@ class InMemoryAttemptDuplicateGovernance:
                         duplicate_key=duplicate_key,
                         accepted_entry=in_flight.accepted_entry,
                     )
+                if in_flight.state is _InFlightDuplicateState.AWAITING_ACCEPTED:
+                    if in_flight.awaiting_entry is None:
+                        raise RuntimeError(
+                            "awaiting accepted duplicate entry is missing"
+                        )
+                    return self._decision_for_awaiting_entry(
+                        request=request,
+                        duplicate_key=duplicate_key,
+                        awaiting_entry=in_flight.awaiting_entry,
+                    )
                 if in_flight.durable_missing_reason is None:
                     raise RuntimeError("durable-missing duplicate reason is missing")
                 # durable-missing 只说明上一任 owner 没有可复用 fact；等待者需要
@@ -448,6 +517,31 @@ class InMemoryAttemptDuplicateGovernance:
                 in_flight.accepted_entry = accepted_entry
             self._state.condition.notify_all()
 
+    async def record_awaiting_accepted(
+        self,
+        request: DuplicateGovernanceRequest,
+        awaiting_entry: DuplicateAwaitingAcceptedEntry,
+    ) -> None:
+        """记录 owner 已 accepted awaiting marker 并唤醒等待者。
+
+        :param request: 原始 duplicate governance 查询。
+        :param awaiting_entry: awaiting accepted marker 写入条目。
+        :returns: ``None``。
+        """
+
+        duplicate_key = duplicate_governance_key(request)
+        async with self._state.condition:
+            in_flight = self._state.in_flight_by_key.get(duplicate_key)
+            if in_flight is None:
+                in_flight = _InFlightDuplicateRecord(
+                    duplicate_key=duplicate_key,
+                    state=_InFlightDuplicateState.AWAITING_ACCEPTED,
+                )
+                self._state.in_flight_by_key[duplicate_key] = in_flight
+            in_flight.state = _InFlightDuplicateState.AWAITING_ACCEPTED
+            in_flight.awaiting_entry = awaiting_entry
+            self._state.condition.notify_all()
+
     async def record_durable_missing(
         self,
         request: DuplicateGovernanceRequest,
@@ -464,6 +558,10 @@ class InMemoryAttemptDuplicateGovernance:
         async with self._state.condition:
             in_flight = self._state.in_flight_by_key.pop(duplicate_key, None)
             if in_flight is not None:
+                if in_flight.state is _InFlightDuplicateState.AWAITING_ACCEPTED:
+                    self._state.in_flight_by_key[duplicate_key] = in_flight
+                    self._state.condition.notify_all()
+                    return
                 in_flight.state = _InFlightDuplicateState.DURABLE_MISSING
                 in_flight.durable_missing_reason = reason
             self._state.condition.notify_all()
@@ -495,9 +593,41 @@ class InMemoryAttemptDuplicateGovernance:
             duplicate_key=duplicate_key,
             prior_event_refs=accepted_entry.accepted_event_refs,
             prior_outcome=accepted_entry.accepted_outcome,
+            prior_awaiting_outcome=None,
+            prior_wait_id=None,
             scope=request.scope,
             reason_code=None,
             message=self._policy.messages.message_for(decision),
+            diagnostic_message=self._policy.messages.attempt_scope_diagnostic,
+        )
+
+    def _decision_for_awaiting_entry(
+        self,
+        *,
+        request: DuplicateGovernanceRequest,
+        duplicate_key: str,
+        awaiting_entry: DuplicateAwaitingAcceptedEntry,
+    ) -> DuplicateDecision:
+        """根据 awaiting accepted marker 生成防御性 fanout 决策。
+
+        :param request: duplicate governance 查询输入。
+        :param duplicate_key: 当前 duplicate key。
+        :param awaiting_entry: 命中的 awaiting accepted marker。
+        :returns: awaiting fanout 决策。
+        """
+
+        return DuplicateDecision(
+            kind=DuplicateDecisionKind.AWAITING_FANOUT,
+            duplicate_key=duplicate_key,
+            prior_event_refs=awaiting_entry.accepted_event_refs,
+            prior_outcome=None,
+            prior_awaiting_outcome=awaiting_entry.awaiting_outcome,
+            prior_wait_id=awaiting_entry.wait_id,
+            scope=request.scope,
+            reason_code="duplicate_awaiting_fanout",
+            message=self._policy.messages.message_for(
+                DuplicateDecisionKind.AWAITING_FANOUT
+            ),
             diagnostic_message=self._policy.messages.attempt_scope_diagnostic,
         )
 
@@ -547,6 +677,8 @@ class InMemoryAttemptDuplicateGovernance:
             duplicate_key=duplicate_key,
             prior_event_refs=prior_refs,
             prior_outcome=None,
+            prior_awaiting_outcome=None,
+            prior_wait_id=None,
             scope=request.scope,
             reason_code=None,
             message=self._policy.messages.allow,
@@ -618,6 +750,7 @@ def _require_sha256_digest(value: str | None, *, field_name: str) -> None:
 
 __all__ = [
     "DuplicateAcceptedEntry",
+    "DuplicateAwaitingAcceptedEntry",
     "DuplicateDecision",
     "DuplicateDecisionKind",
     "DuplicateDurableMissingReason",

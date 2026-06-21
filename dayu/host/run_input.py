@@ -4025,6 +4025,13 @@ def _resume_wait_message_from_current_start(
             "tool_fact_kind="
             f"{_required_payload_text(payload, field_name='tool_fact_kind')}",
             f"result={result_text}",
+            (
+                "This wait result is the accepted result for the interrupted "
+                "tool request. If the interrupted step made duplicate requests "
+                "for the same tool with the same arguments, treat this same "
+                "result as covering those duplicate requests. Do not call the "
+                "same tool again only to obtain the same result."
+            ),
         )
     )
     return SystemMessage(role=AgentMessageRole.SYSTEM, content=content)
