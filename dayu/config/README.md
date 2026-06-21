@@ -175,9 +175,9 @@ provider 字段：
 | `enabled` | 是否启用 provider |
 | `config` | provider 自身的层中立 JSON 配置；ConfigLoader 原样读取，不解释 Doc / Fins / Web 语义 |
 
-`import_path` 与 `entry_point` 必须二选一。provider id 来自 `providers` map key，不在 record 内重复配置。`config` 缺省等价空对象；需要业务含义时由调用方先把 raw config 与运行时参数装配为 effective provider spec，再交给对应 provider 解析，例如文档路径白名单、财报 workspace root、Web 请求限制等。
+`import_path` 与 `entry_point` 必须二选一。provider id 来自 `providers` map key，不在 record 内重复配置。`config` 缺省等价空对象；需要业务含义时由调用方先把 raw config 与运行时参数装配为 effective provider spec，再交给对应 provider 解析，例如文档路径白名单、财报 workspace root、Web 请求限制等。启用 provider 返回空工具集合是配置错误；不希望某个 provider 参与发现时使用 `enabled=false`。
 
-包内默认 Fins providers 分为四组，均为 `enabled=true` 且 `workspace_root="workspace/"`。Fins provider 默认参与工具发现；Service 会把相对 workspace root 解析为 absolute effective spec，scene manifest 再决定实际选择哪些 Fins tools：
+包内默认 Fins providers 分为四组，均为 `enabled=true` 且 raw config 中 `workspace_root="workspace/"`。这个值是 packaged relative default：当 Service runtime `workspace_root` 为 `/path/to/project` 时，Service effective config 会把它解析为 `/path/to/project/workspace`，再传给 Fins provider。Fins provider 默认参与工具发现；scene manifest 再决定实际选择哪些 Fins tools：
 
 | provider id | import path | 能力 |
 |---|---|---|
@@ -186,9 +186,9 @@ provider 字段：
 | `financial-preprocess-tools` | `dayu.fins.tools.preprocess_provider:discover_tools` | 财报 preprocess awaiting tool |
 | `financial-upload-tools` | `dayu.fins.tools.upload_provider:discover_tools` | 财报 upload awaiting tool |
 
-启用任一 Fins provider 时，传给 provider 的 effective spec 必须包含绝对 `workspace_root`；该值可以来自 workspace overlay 的 `config.workspace_root`，也可以由 Service 调用方用当前 runtime workspace 注入。provider 不从 cwd 或环境变量猜路径。`financial-read-tools` 可额外配置 `config.limits`，`config.limits` 可覆盖 `processor_cache_max_entries`、`list_documents_max_items`、`get_document_sections_max_items`、`search_document_max_items`、`list_tables_max_items`、`read_section_max_chars`、`get_page_content_max_chars`、`get_table_max_items`、`get_financial_statement_max_items` 与 `query_xbrl_facts_max_items`。`financial-upload-tools` 启用时注册 `start_fins_upload`；上传工具只校验本地路径必须指向存在的非空普通文件，财报写入仍通过 Fins workspace repository 完成。Download / preprocess / upload 能力通过独立 provider 启用，不通过 read provider 的布尔开关混合启用。
+启用任一 Fins provider 时，传给 provider 的 effective spec 必须包含绝对 `workspace_root`；该值可以来自 workspace overlay 的 `config.workspace_root`，也可以由 Service 调用方用当前 runtime workspace 注入。provider 不从 cwd 或环境变量猜路径。`financial-read-tools` 的 packaged `config.limits` 显式写入默认值：`processor_cache_max_entries=128`、`list_documents_max_items=300`、`get_document_sections_max_items=1200`、`search_document_max_items=20`、`list_tables_max_items=50`、`read_section_max_chars=80000`、`get_page_content_max_chars=80000`、`get_table_max_items=800`、`get_financial_statement_max_items=1200` 与 `query_xbrl_facts_max_items=1200`。workspace overlay 可用同名正整数字段覆盖这些 read limits。`financial-upload-tools` 启用时注册 `start_fins_upload`；上传工具只校验本地路径必须指向存在的非空普通文件，财报写入仍通过 Fins workspace repository 完成。Download / preprocess / upload 能力通过独立 provider 启用，不通过 read provider 的布尔开关混合启用。
 
-包内默认 `doc-tools` provider 指向 `dayu.tools.doc_provider:discover_tools`，默认 `enabled=false` 且 `allowed_paths=[]`。只有在 workspace overlay 启用并在 `config.allowed_paths` 中显式配置可访问文件或目录根时才注册可执行文档工具。白名单为空时 provider 会 fail fast。Doc provider 的 `config.limits` 可覆盖 `list_files_max`、`get_sections_max`、`search_files_max_results`、`read_file_max_chars` 与 `read_file_section_max_chars`，未配置字段使用 provider 默认值。
+包内默认 `doc-tools` provider 指向 `dayu.tools.doc_provider:discover_tools`，默认 `enabled=false` 且 `allowed_paths=[]`。只有在 workspace overlay 启用并在 `config.allowed_paths` 中显式配置可访问文件或目录根时才注册可执行文档工具。白名单为空时 provider 会 fail fast。Doc provider 的 packaged `config.limits` 显式写入默认值：`list_files_max=200`、`get_sections_max=200`、`search_files_max_results=50`、`read_file_max_chars=80000` 与 `read_file_section_max_chars=50000`；workspace overlay 可用同名正整数字段覆盖这些 Doc limits。
 
 包内默认 `web-tools` provider 指向 `dayu.tools.web:discover_tools`，默认 `enabled=true`，并默认拒绝 private / local network URL。Provider 只暴露 `search_web` 与 `fetch_web_page`；`config` 可设置 `provider`（`auto` / `tavily` / `serper` / `duckduckgo`）、`request_timeout_seconds`、`max_search_results`、`fetch_truncate_chars`、`allow_private_network_url`、`playwright_channel` 与 `playwright_storage_state_dir`。默认 `playwright_storage_state_dir` 指向 `workspace/.dayu/web_tools_storage_states`；只有该目录下存在目标 host 对应的 storage state 文件时，Playwright fallback 才会注入登录态。只有显式设置 `allow_private_network_url=true` 时，fetch/search URL safety 才允许内网或本地 URL。
 
@@ -205,6 +205,8 @@ provider 字段：
 Scene manifest 由 `dayu.runtime.scene_prepare` 解释；ConfigLoader 不读取、拼接或渲染 scene manifest。`prompts/tasks/`、contract 文件、workflow 产物和未被 scene manifest 直接引用的模板不属于当前包内默认资产范围。
 
 Scene manifest 第一版是单 Run 场景装配输入。允许的顶层字段固定为 `schema_version`、`scene`、`version`、`description`、`capability_tags`、`extends`、`model`、`agent_policy`、`tool_selection`、`defaults`、`fragments` 与 `context_slots`。调用方显式传入 manifest root、prompt asset root、typed context slot values 与可用工具目录；ScenePrepare 只读取 manifest 直接引用的 fragments，执行确定性的文本替换，并输出 system messages、已拼接的 system prompt、工具选择结果、model hints、typed agent policy override、fragment refs、source refs 与 content digest。
+
+默认非上传 scene 不使用 broad `"fins"` tag 选择 Fins 工具；它们显式列出 Fins read / download / preprocess 工具名，并在需要联网能力时继续用 `"web"` tag。这样即使 upload provider 默认注册 `start_fins_upload`，也不会被非上传 scene 通过泛化 Fins tag 意外选中。`tool_selection.allow_empty` 只控制 scene 工具选择空匹配语义，和 ToolsDiscovery provider 是否允许空输出无关。
 
 `conversation_compaction` 是会话压缩专用 scene。该 scene 使用一个 required fragment 作为 compactor system prompt，并在 scene 的 `agent_policy` block 中声明 compactor AgentPolicy。user prompt template 由 execution profile 的 `compactor_baseline.user_prompt_template_path` 指向 prompt asset；template 使用 `<<compaction_request>>` 作为运行期请求数据块占位符，该占位符不是 ScenePrepare context slot，不能写成 `{{...}}`。
 

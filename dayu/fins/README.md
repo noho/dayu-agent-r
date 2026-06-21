@@ -108,7 +108,7 @@ Fins 与其它层的稳定边界如下：
 - `get_financial_statement`
 - `query_xbrl_facts`
 
-`dayu.fins.tools.provider.discover_tools(spec)` 是 read tools 的 ToolsDiscovery provider 入口，provider id 为 `financial-read-tools`。启用时必须在 provider config 中提供绝对 `workspace_root`，并返回九个 read tools；read provider 是否参与发现只由 provider-level `enabled` 控制。
+`dayu.fins.tools.provider.discover_tools(spec)` 是 read tools 的 ToolsDiscovery provider 入口，provider id 为 `financial-read-tools`。启用时必须通过 effective spec 提供绝对 `workspace_root`，并返回九个 read tools；read provider 是否参与发现只由 provider-level `enabled` 控制。
 
 当前 read tools 名称为：
 
@@ -130,7 +130,7 @@ Fins ingestion 通过三个独立 awaiting provider 暴露 awaiting tools：
 - `dayu.fins.tools.preprocess_provider.discover_tools(spec)`：provider id 为 `financial-preprocess-tools`，返回 `start_fins_preprocess`。
 - `dayu.fins.tools.upload_provider.discover_tools(spec)`：provider id 为 `financial-upload-tools`，返回 `start_fins_upload`。
 
-三个 awaiting provider 都必须通过 effective spec 获得绝对 `workspace_root`。upload provider 启用时注册 `start_fins_upload`；上传工具只在工具边界校验本地路径存在、指向普通文件且文件非空。工具调用只注册 lightweight observation handle 并返回 `ToolAwaitingOutcome(EXTERNAL_JOB)`，不等待长事务完成、不直接 resolve Host wait，也不把 handle 当作业务事实返回给模型。上传后的 source/blob/processed 写入仍必须通过 Fins workspace repository 完成。
+三个 awaiting provider 都必须通过 effective spec 获得绝对 `workspace_root`。upload provider 启用时注册 `start_fins_upload`；上传工具只在工具边界校验本地路径存在、指向普通文件且文件非空。当前实现不把本地源文件授权建模为 upload provider 的配置职责；调用方仍需在进入工具前承担本地文件来源可信性与用户授权。工具调用只注册 lightweight observation handle 并返回 `ToolAwaitingOutcome(EXTERNAL_JOB)`，不等待长事务完成、不直接 resolve Host wait，也不把 handle 当作业务事实返回给模型。上传后的 source/blob/processed 写入仍必须通过 Fins workspace repository 完成。
 
 ### Batch upload plan
 
@@ -407,10 +407,11 @@ Fins 不负责：
 
 Fins workspace 规则固定如下：
 
-- Fins provider effective spec 的 `workspace_root` 必须是非空绝对路径；provider 不从 cwd 或环境变量推断。
+- 四个 Fins provider 的 effective spec 都必须提供非空绝对 `workspace_root`；provider 不从 cwd 或环境变量推断。
 - 包内默认 `financial-read-tools`、`financial-download-tools`、`financial-preprocess-tools`、`financial-upload-tools` 均为 enabled 且 raw config 中 `workspace_root="workspace/"`；Service assembly 会解析为当前运行时 workspace 下的绝对路径。upload provider 默认注册 `start_fins_upload`，默认非上传 scene 通过显式工具名选择 read/download/preprocess 工具，避免 broad Fins tag 误选 upload。
 - Service assembly 为 Fins awaiting providers 构造 wait adapter registry 时，要求同一 Host assembly 内启用的 Fins download / preprocess / upload provider 使用同一个绝对 `workspace_root`。
 - legacy ingestion job store 当前路径为 `<workspace_root>/.dayu/fins_ingestion/jobs`，保存 legacy job governance records 与每个 job 的 event sidecar，不保存财报正文、processed payload、raw download payload 或 upload 本地文件路径。Direct stream 和 lightweight observation handle 不以该目录作为公共观察真源。
+- upload provider 不拥有本地源文件 allowlist 或授权配置；它只注册工具并做普通文件、存在性与非空校验。仓储写入边界仍属于 `dayu.fins.storage`，工具 caller 不能指定 source/blob/processed 的仓储写入目录。
 
 ## 主要组件
 
@@ -438,9 +439,9 @@ Read、download、preprocess、upload 是四个独立 provider：
 - read provider 只暴露 9 个 read tools。
 - download provider 只暴露 `start_fins_download`。
 - preprocess provider 只暴露 `start_fins_preprocess`。
-- upload provider 只暴露 `start_fins_upload`，并在工具边界校验本地路径存在、指向普通文件且文件非空。
+- upload provider 只暴露 `start_fins_upload`，并在工具边界校验本地路径存在、指向普通文件且文件非空；本地源文件授权不是 provider-owned config。
 
-四者都通过 `DefaultFinsRuntime.create(workspace_root=...)` 获取共享 Fins 底座。
+四者都要求 effective spec 提供绝对 `workspace_root`，并通过 `DefaultFinsRuntime.create(workspace_root=...)` 获取共享 Fins 底座。
 
 ### Ingestion runtime
 
@@ -663,7 +664,7 @@ SecProcessor
 
 ### Workspace root 与 provider fail fast
 
-四个 Fins provider 都要求 effective spec 中存在绝对 `workspace_root`。read provider 启用时始终解析 workspace 并注册九个 read tools；upload provider 启用时始终注册 `start_fins_upload`，本地文件只在工具调用时校验存在、普通文件与非空。其它启用路径缺少、空字符串或相对路径都会 fail fast。Service assembly 对 Fins awaiting providers 还会校验 download / preprocess / upload 使用同一个绝对 workspace root，避免一个 Host assembly 把 wait adapter 绑定到不同 Fins workspace。
+四个 Fins provider 都要求 effective spec 中存在绝对 `workspace_root`。read provider 启用时始终解析 workspace 并注册九个 read tools；upload provider 启用时始终注册 `start_fins_upload`，本地文件只在工具调用时校验存在、普通文件与非空，本地源文件授权由调用方在 provider 外部承担。其它启用路径缺少、空字符串或相对路径都会 fail fast。Service assembly 对 Fins awaiting providers 还会校验 download / preprocess / upload 使用同一个绝对 workspace root，避免一个 Host assembly 把 wait adapter 绑定到不同 Fins workspace。
 
 ### Storage repository boundary
 
