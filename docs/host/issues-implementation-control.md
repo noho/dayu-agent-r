@@ -143,11 +143,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | aggregate deepreview |
-| implementation status | WU-TOOLS-01-F03-R4 Slice 7 final validation completed. Focused tests, affected broad suites excluding an unrelated web smoke logging assertion, pyright, and stale-field grep passed; final validation exposed one related scene migration fake catalog fixture update and one unrelated web smoke residual. |
+| gate | accepted deepreview commit |
+| implementation status | WU-TOOLS-01-F03-R4 aggregate deepreview completed. AgentMiMo verdict `pass`; AgentDS verdict `pass`. Controller found no blocking or actionable accepted findings; aggregate review artifacts are ready for accepted deepreview commit. |
 | active work unit | WU-TOOLS-01-F03-R4 |
 | default next work unit | WU-TOOLS-01-F03-R4 |
-| next entry point | Dispatch WU-TOOLS-01-F03-R4 aggregate deepreview to AgentMiMo / AgentDS, then adjudicate findings. WU-ENG-02-R1 remains final-closeout-pass with draft PR 159 awaiting user merge / PR disposition. |
+| next entry point | Commit WU-TOOLS-01-F03-R4 aggregate deepreview artifacts and controller judgment, then enter ready-to-open-draft-PR. WU-ENG-02-R1 remains final-closeout-pass with draft PR 159 awaiting user merge / PR disposition. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | Active/backlog issue owners retained here: #63 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #20 / #89 / #90 / #92 / #80 / #115, plus residual-risk destinations #121 / #122 / #129 / #133. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`. |
 | blocking open questions | None after user confirmed the current goal direction, including upload `allowed_upload_roots` removal and deferring unified file-read permission governance to future Host / policy design. |
@@ -204,13 +204,16 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-TOOLS-01-S1-R1 | transferred-to-issue | GitHub Issues #121 and #122 | SEC/Fins CI pipeline / smoke 与 CN/HK Docling CI pipeline / smoke 改由对应 issue 直接追踪；不再作为本文档默认 next work unit。 |
 | WU-TOOLS-01-F01-02-R1 | transferred-to-issue | GitHub Issue #129 | 设计 awaiting 两阶段启动后，才能扩展 Host wait adapter 或 Fins runtime activation contract。 |
 | WU-TOOLS-01-F01-02-R2 | deferred-with-owner | WU-WAIT-03 / GitHub Issue #92；provider-specific adapter owners | 由 WU-WAIT-03 统一裁决 external job physical cancel / revoke / abandon；具体 provider/runtime 只在支持时实现物理中断，当前 WU 使用 cooperative checkpoint 与 bounded wait。 |
+| WU-TOOLS-01-F03-R4-POLICY-R1 | deferred-with-owner | Future Host / policy design | 本 WU 删除 upload provider-local `allowed_upload_roots`，但不实现统一本地文件读取权限系统；未来若需要授权、审计或 sandbox，应由 Host / policy 统一设计处理。 |
+| WU-TOOLS-01-F03-R4-PATH-R1 | deferred-with-owner | Future provider path-boundary hardening | Doc / upload 等路径类工具当前按 `Path.resolve()` 语义处理 symlink；本 WU 不改变路径边界策略，后续如需更强 symlink policy 应统一在 provider path-boundary hardening 中裁决。 |
+| WU-TOOLS-01-F03-R4-SCENE-R1 | deferred-with-owner | Future scene manifest maintenance | 默认 scene upload exposure 已由当前 manifest 测试和 grep 覆盖；测试仍使用明确默认 scene id 列表，未来新增 packaged scene 时应同步测试或改为动态 manifest discovery。 |
 | WU-TOOLS-01-F03-R4-WEB-SMOKE-R1 | deferred-with-owner | Web smoke / CI owner | `tests/tools/web/test_smoke_web_ci.py::test_default_run_executes_local_html_pdf_and_browser_cases` 当前断言日志必须进入 stdout，但实际日志进入 pytest captured log；该问题非 WU-TOOLS-01-F03-R4 引入，后续由 web smoke owner 单独裁决测试断言或日志输出通道。 |
 
 ## 当前 Work Units
 
 | Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|---|
-| WU-TOOLS-01-F03-R4 | aggregate-deepreview | Tools Discovery spec semantics cleanup | GitHub Issue #133 | Active work unit. Slice 7 final validation completed; aggregate deepreview is next. |
+| WU-TOOLS-01-F03-R4 | accepted-deepreview-commit | Tools Discovery spec semantics cleanup | GitHub Issue #133 | Active work unit. Aggregate deepreview passed; accepted deepreview commit is next. |
 | WU-ENG-02-R1 | final-closeout-pass | Provider debugging correlation default enablement and fallback diagnostics | GitHub Issue #63 reopened / draft PR 159 | Local gate chain is complete and draft PR 159 awaits user merge / PR disposition; not the active WU for this branch. |
 | WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
@@ -237,7 +240,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 ### 状态
 
-GitHub Issue #133 当前为 OPEN。本 WU 从 WU-TOOLS-01-F03 final closeout residual risk 转入独立实施入口，goal confirmation 已由用户确认，plan gate 已完成，plan review completed with blocking findings，plan-fix gate 已完成，plan re-review passed，accepted plan commit 已创建，Slice 1 implementation / code review / accepted slice commit 已完成，Slice 2 已由 controller 裁决为 covered by Slice 1，Slice 3 implementation / code review / accepted slice commit 已完成，Slice 4 implementation / code review / accepted slice commit 已完成，Slice 5 implementation / code review / fix / re-review / accepted slice commit 已完成，Slice 6 implementation / code review / accepted slice commit 已完成，Slice 7 final validation 已完成，当前进入 aggregate deepreview gate。
+GitHub Issue #133 当前为 OPEN。本 WU 从 WU-TOOLS-01-F03 final closeout residual risk 转入独立实施入口，goal confirmation 已由用户确认，plan gate 已完成，plan review completed with blocking findings，plan-fix gate 已完成，plan re-review passed，accepted plan commit 已创建，Slice 1 implementation / code review / accepted slice commit 已完成，Slice 2 已由 controller 裁决为 covered by Slice 1，Slice 3 implementation / code review / accepted slice commit 已完成，Slice 4 implementation / code review / accepted slice commit 已完成，Slice 5 implementation / code review / fix / re-review / accepted slice commit 已完成，Slice 6 implementation / code review / accepted slice commit 已完成，Slice 7 final validation 已完成，aggregate deepreview 已完成且无阻塞 finding，当前进入 accepted deepreview commit gate。
 
 Plan artifact:
 
@@ -553,6 +556,26 @@ Slice 7 final validation:
 Slice 7 residual risk:
 
 - `deferred-with-owner`：`WU-TOOLS-01-F03-R4-WEB-SMOKE-R1` belongs to web smoke / CI owner. Current WU does not change `tests/tools/web/test_smoke_web_ci.py` or `utils/smoke_web_ci.py`, and the failure reproduces when running `tests/tools/web` directly.
+
+Aggregate deepreview artifacts:
+
+- `docs/reviews/wu-tools-01-f03-r4-aggregate-deepreview-mimo.md` by AgentMiMo, verdict `pass`, blocking findings `0`
+- `docs/reviews/wu-tools-01-f03-r4-aggregate-deepreview-ds.md` by AgentDS, verdict `pass`, blocking findings `0`
+
+Aggregate deepreview validation:
+
+- AgentMiMo reran focused tests, broad affected suite excluding the classified web smoke residual, pyright, and stale-field grep; result `pass`.
+- AgentDS reran focused tests, web smoke residual confirmation, broad affected suite excluding the classified web smoke residual, pyright, stale-field grep, and scene manifest grep; result `pass`.
+
+Controller aggregate deepreview judgment:
+
+- `accepted`：AgentMiMo found no substantive issues and confirmed all seven WU success dimensions: provider-level `allow_empty` removal, `include_read_tools` removal, Fins `workspace/` effective resolution, Doc/Fins packaged limits, upload `allowed_upload_roots` removal, default scene upload non-exposure, and docs/tests/control semantic consistency.
+- `rejected-with-reason`：AgentDS F-01 notes `ToolBundle._allow_empty=True` has insufficient semantic distinction. This is not a current defect: `_allow_empty=True` is only used to construct the legitimate zero-enabled-provider empty bundle, while enabled provider output still passes `_validate_provider_output(...)` and cannot return empty definitions. No code change is warranted in this WU.
+- `rejected-with-reason`：AgentDS F-02 notes double `enabled` filtering in `ToolsDiscovery.discover(...)` and `discover_from_bindings(...)`. This is an intentional defensive boundary for the public `discover_from_bindings(...)` method and does not create incorrect behavior or maintenance risk requiring a fix.
+- `deferred-with-owner`：`WU-TOOLS-01-F03-R4-POLICY-R1` tracks future Host / policy file-read authorization design; this is an explicit non-goal of the current WU.
+- `deferred-with-owner`：`WU-TOOLS-01-F03-R4-PATH-R1` tracks future provider path-boundary hardening if symlink policy needs to be stronger than current `Path.resolve()` semantics.
+- `deferred-with-owner`：`WU-TOOLS-01-F03-R4-SCENE-R1` tracks future scene manifest maintenance around dynamic default-scene discovery.
+- `deferred-with-owner`：`WU-TOOLS-01-F03-R4-WEB-SMOKE-R1` remains assigned to web smoke / CI owner and is not a current WU blocker.
 
 当前裁决来自 controller 对 `docs/host/design.md`、`docs/engine/design.md`、`dayu/config/tool_discovery.json`、`dayu/runtime/tools_discovery.py`、`dayu/runtime/config_loader.py`、`dayu/service/host_assembly.py`、Fins / Doc provider、Fins upload tool、Fins storage repository 与 OLD `/Users/leo/workspace/dayu-agent` 配置的代码核对。
 
