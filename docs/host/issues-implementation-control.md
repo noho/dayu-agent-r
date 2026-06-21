@@ -153,11 +153,11 @@ slice 不是按代码行数切，也不是只要不超过上下文窗口就算�
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | accepted PR review commit |
-| implementation status | WU-TOOLS-01-F03-R4 PR review completed. AgentMiMo verdict `pass`; AgentDS verdict `pass-with-findings` with one low finding deferred to existing Host / policy owner. No current PR fix or re-review is required. |
+| gate | final closeout |
+| implementation status | WU-TOOLS-01-F03-R4 draft-PR-pass achieved. Accepted PR review commit `ecf83c5f` was pushed to PR 160. Final closeout is blocked only on user authorization to post the required GitHub issue-133 closeout comment. |
 | active work unit | WU-TOOLS-01-F03-R4 |
 | default next work unit | WU-TOOLS-01-F03-R4 |
-| next entry point | Commit WU-TOOLS-01-F03-R4 PR review artifacts and controller judgment, then push final PR review pass commit. WU-ENG-02-R1 remains final-closeout-pass with draft PR 159 awaiting user merge / PR disposition. |
+| next entry point | Ask user for authorization to post the WU-TOOLS-01-F03-R4 closeout comment to GitHub issue-133; after comment is posted, record final-closeout-pass. WU-ENG-02-R1 remains final-closeout-pass with draft PR 159 awaiting user merge / PR disposition. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | Active/backlog issue owners retained here: #63 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #20 / #89 / #90 / #92 / #80 / #115, plus residual-risk destinations #121 / #122 / #129 / #133. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`. |
 | blocking open questions | None after user confirmed the current goal direction, including upload `allowed_upload_roots` removal and deferring unified file-read permission governance to future Host / policy design. |
@@ -223,7 +223,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 | Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|---|
-| WU-TOOLS-01-F03-R4 | accepted-PR-review-commit | Tools Discovery spec semantics cleanup | GitHub Issue #133 | Active work unit. PR review passed; accepted PR review commit is next. |
+| WU-TOOLS-01-F03-R4 | final-closeout | Tools Discovery spec semantics cleanup | GitHub Issue #133 | Active work unit. Draft-PR-pass achieved for PR 160; final closeout awaits issue closeout comment authorization. |
 | WU-ENG-02-R1 | final-closeout-pass | Provider debugging correlation default enablement and fallback diagnostics | GitHub Issue #63 reopened / draft PR 159 | Local gate chain is complete and draft PR 159 awaits user merge / PR disposition; not the active WU for this branch. |
 | WU-OBS-00 | pending | Tool Trace analyzer | GitHub Issue #70 | 前置 signal bundle 已完成；trace 文件 / 目录输入的 Host / Engine / Tool 分层诊断；WU-OBS-01 的诊断底座 |
 | WU-OBS-00A | pending-parent | Tool Trace analyzer integrity and large payload diagnostics | GitHub Issue #34 / #70 child | #70 analyzer 子项；不单独实现一套 analyzer |
@@ -250,7 +250,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 ### 状态
 
-GitHub Issue #133 当前为 OPEN。本 WU 从 WU-TOOLS-01-F03 final closeout residual risk 转入独立实施入口，goal confirmation 已由用户确认，plan gate 已完成，plan review completed with blocking findings，plan-fix gate 已完成，plan re-review passed，accepted plan commit 已创建，Slice 1 implementation / code review / accepted slice commit 已完成，Slice 2 已由 controller 裁决为 covered by Slice 1，Slice 3 implementation / code review / accepted slice commit 已完成，Slice 4 implementation / code review / accepted slice commit 已完成，Slice 5 implementation / code review / fix / re-review / accepted slice commit 已完成，Slice 6 implementation / code review / accepted slice commit 已完成，Slice 7 final validation 已完成，aggregate deepreview 已完成且无阻塞 finding，accepted deepreview commit 已创建，ready-to-open-draft-PR gate 已完成，push gate 已完成，draft PR 160 已创建，PR review 已完成且无需当前修复，当前进入 accepted PR review commit gate。
+GitHub Issue #133 当前为 OPEN。本 WU 从 WU-TOOLS-01-F03 final closeout residual risk 转入独立实施入口，goal confirmation 已由用户确认，plan gate 已完成，plan review completed with blocking findings，plan-fix gate 已完成，plan re-review passed，accepted plan commit 已创建，Slice 1 implementation / code review / accepted slice commit 已完成，Slice 2 已由 controller 裁决为 covered by Slice 1，Slice 3 implementation / code review / accepted slice commit 已完成，Slice 4 implementation / code review / accepted slice commit 已完成，Slice 5 implementation / code review / fix / re-review / accepted slice commit 已完成，Slice 6 implementation / code review / accepted slice commit 已完成，Slice 7 final validation 已完成，aggregate deepreview 已完成且无阻塞 finding，accepted deepreview commit 已创建，ready-to-open-draft-PR gate 已完成，push gate 已完成，draft PR 160 已创建，PR review 已完成且无需当前修复，accepted PR review commit 已创建并推送，draft-PR-pass 已达成，当前进入 final closeout gate；final closeout pass 仍需用户授权对 GitHub issue-133 发布 closeout comment。
 
 Plan artifact:
 
@@ -623,6 +623,21 @@ Controller PR review judgment:
 - `accepted`：PR body `Closes #133` is correct because all six issue-133 requested Tools Discovery spec changes are implemented, tested, and documented. Deferred risks are separately owned and do not leave issue-133 partially implemented.
 - `accepted`：`WU-TOOLS-01-F03-R4-WEB-SMOKE-R1` remains a non-WU residual owned by web smoke / CI; it is listed in PR body and control doc, and does not block PR 160.
 - `accepted`：User-requested process improvement was written into the Slice 切分原则 section: small cross-module cleanup work should default to 2-3 semantic slices and any plan exceeding 3 implementation slices must justify why the work cannot be merged into those verification loops.
+
+Accepted PR review commit and final push:
+
+- `ecf83c5f` (`gateflow: accept PR review for WU-TOOLS-01-F03-R4`)
+- Pushed to `github/phase/wu-tools-01-f03-r4`; PR 160 head after PR review pass was `ecf83c5f13d4b74d7f58f120c46bac3fa389c64f`.
+
+Final closeout artifact:
+
+- `docs/reviews/wu-tools-01-f03-r4-final-closeout-codex.md` by AgentCodex
+
+Final closeout status:
+
+- Draft PR URL: `https://github.com/noho/dayu-agent-r/pull/160`
+- Issue link status: PR body uses `Closes #133`, correctly closing issue-133 on merge because all six requested spec changes are complete.
+- Issue closeout comment status: pending user authorization. External GitHub issue comments require explicit authorization, so final-closeout-pass is blocked until the comment is posted.
 
 当前裁决来自 controller 对 `docs/host/design.md`、`docs/engine/design.md`、`dayu/config/tool_discovery.json`、`dayu/runtime/tools_discovery.py`、`dayu/runtime/config_loader.py`、`dayu/service/host_assembly.py`、Fins / Doc provider、Fins upload tool、Fins storage repository 与 OLD `/Users/leo/workspace/dayu-agent` 配置的代码核对。
 
