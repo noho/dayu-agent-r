@@ -155,11 +155,11 @@ git push -u github <branch>
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | discussion-ready |
-| implementation status | PR 160 merged on 2026-06-21 and GitHub Issue #133 is closed. PR 159 merged on 2026-06-20 and GitHub Issue #63 is closed. GitHub Issue #130 was closed after confirming PR 135 merged on 2026-06-11. Next execution-correctness entry is WU-TOOLS-AWAIT-FANOUT-01 / GitHub Issue #111. |
+| gate | planning |
+| implementation status | WU-TOOLS-AWAIT-FANOUT-01 / GitHub Issue #111 goal confirmed on branch `phase/wu-tools-await-fanout-01`; planning must preserve the current lightweight awaiting implementation and must not reintroduce a heavy durable await design. |
 | active work unit | WU-TOOLS-AWAIT-FANOUT-01 |
 | default next work unit | WU-TOOLS-AWAIT-FANOUT-01 |
-| next entry point | Start WU-TOOLS-AWAIT-FANOUT-01 discussion / design sufficiency check: inspect current ToolRuntime duplicate governance, awaiting accept barrier, wait record ownership, RunInputBuilder resume material, and GitHub Issue #111 scope before producing a code-generation-ready plan. |
+| next entry point | Dispatch WU-TOOLS-AWAIT-FANOUT-01 plan gate to AgentCodex: produce a code-generation-ready plan that fixes duplicate awaiting owner / waiter fanout while preserving the thin current wait record model and lightweight Fins observation-handle direction. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | Active/backlog issue owners retained here: #111 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #112 / #20 / #89 / #90 / #92 / #80 / #115, plus residual-risk destinations #121 / #122 / #129. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`; #63 / #130 / #133 are no longer active implementation owners. |
 | blocking open questions | None after user confirmed the current goal direction, including upload `allowed_upload_roots` removal and deferring unified file-read permission governance to future Host / policy design. |
@@ -270,6 +270,7 @@ GitHub Issue #111 当前为 OPEN。用户在 2026-06-21 裁决将本条作为工
 - 当前 attempt-scoped duplicate governance 已覆盖同一 Attempt 内重复工具调用的 in-flight owner / waiter 基本窗口，但 #111 指出 awaiting 路径缺少 fanout 设计。
 - 当前 Host waiting 状态迁移要求 awaiting canonical facts 由 ToolRuntime Host accept path 拥有；Engine `tool_awaiting` / `run_suspended` 只能作为 preview、diagnostic 或 idempotent confirmation，不能创建 wait record 或关闭 Attempt。
 - #111 的直接问题是：duplicate owner 返回 `ToolAwaitingOutcome` 并创建 durable wait record 后，重复 waiter 不能简单再创建第二个 wait record，也不能没有 durable owner 地返回 waiting；否则 external job、resolve、cancel、late result 和 idempotency conflict 语义都会分裂。
+- 2026-06-21 goal confirmation 补充约束：awaiting / Fins ingestion 方向刚从较重的 durable 设计收缩到当前薄 wait record + lightweight observation handle 实现。本 WU 的 plan 必须优先在 attempt-local duplicate governance、已有 awaiting accept ack、现有 wait record 与 RunInputBuilder resume material 上补齐 fanout 语义；不得重新引入重型 durable follower ledger、通用 wait alias schema、跨 Attempt durable duplicate table、外部 job activation 两阶段协议或新的 Host public await contract，除非代码直接证据证明没有轻量方案可满足 #111。
 
 ### 目标
 
@@ -287,6 +288,7 @@ GitHub Issue #111 当前为 OPEN。用户在 2026-06-21 裁决将本条作为工
 - 不让 Engine、wait adapter 或 provider runtime 直接拥有 Host durable truth。
 - 不在本条实现 #129 的 external job two-phase activation；本条只固定 duplicate awaiting fanout 语义。
 - 不在本条实现 #89 / #90 / #92 的 production callback、poller 或 physical cancel 能力。
+- 不重新扩大刚收缩过的 awaiting durable 设计；禁止以“未来通用 fanout”为理由新增重型 wait follower 表、durable duplicate ledger、跨进程等待者队列或新的 public await lifecycle contract。
 
 ### 依赖与后续
 
