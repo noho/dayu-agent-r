@@ -6,6 +6,7 @@
 - GitHub Issue: #129
 - Branch: `phase/wu-tools-01-f01-02-r1`
 - Draft PR: https://github.com/noho/dayu-agent-r/pull/162
+- Issue closeout comment: https://github.com/noho/dayu-agent-r/issues/129#issuecomment-4762165431
 
 ## Completed Work
 
@@ -21,7 +22,17 @@
 - `4f45f8de` — accepted Slice 2
 - `80ab56ab` — accepted Slice 3
 - `95f652de` — accepted aggregate deepreview
-- `a823ff26` — ready-to-open-draft-PR checkpoint
+- `50431ab2` — accepted PR review
+
+## PR Gate
+
+- Draft PR #162 is open and remains draft.
+- PR review artifacts:
+  - `docs/reviews/wu-tools-01-f01-02-r1-pr-review-mimo.md`
+  - `docs/reviews/wu-tools-01-f01-02-r1-pr-review-ds.md`
+  - `docs/reviews/wu-tools-01-f01-02-r1-pr-review-controller-adjudication.md`
+- PR review verdict: pass, with no accepted current fix.
+- Follow-up push after accepted PR review commit is complete.
 
 ## Validation
 
@@ -30,6 +41,13 @@
 - `pyright`: `0 errors, 0 warnings, 0 informations`.
 - `git diff --check`: clean.
 - `gh pr checks 162`: no checks reported on branch `phase/wu-tools-01-f01-02-r1`.
+
+## Issue Handling
+
+- PR body uses `Refs #129`, not a closing keyword.
+- Merging PR #162 will not automatically close GitHub Issue #129.
+- Issue closeout comment was posted with the PR URL, validation summary, review status, and residual owners.
+- Issue #129 should be closed manually after merge only if the maintainer agrees PR #162 fully resolves it.
 
 ## Residual Risk
 
@@ -45,3 +63,8 @@ No current WU residual risk remains without an owner.
 - Did not merge the PR.
 - Did not close GitHub Issue #129.
 - Did not request reviewers.
+- Did not delete the branch.
+
+## Next Entry Point
+
+After PR #162 is merged, sync the target base branch, then start the next phaseflow run from `docs/host/issues-implementation-control.md`. The next tool-call governance lane entry is production WAIT hardening, starting with `WU-WAIT-01` / GitHub Issue #89 unless the maintainer updates the control doc before then.
