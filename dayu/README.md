@@ -114,6 +114,12 @@ Engine 只看到调用方传入的 `tool_schemas` 与 `ToolExecutor`。Host Tool
 
 长事务工具返回 `ToolAwaitingOutcome` 时，Engine 以 `run_suspended` 结束本次 run。Host 接受 awaiting fact 后将 Run 推进为 `WAITING` 并创建 wait record。外部长事务完成后，调用方通过 `resolve_wait(...)` 把结果交回 Host；Host 写入 wait resolution facts，并为同一 Run 创建新的 resume Attempt。resume 不恢复旧 Agent、Runner、Engine generator 或工具调用栈。
 
+### Wait callback completion
+
+wait callback completion 是 wait-resume 的 transport-facing 入口形态。Service / Web 层负责把 HTTP-like callback 请求解析成 framework-neutral request，再映射为 Host callback typed contract；Host callback adapter 执行认证、digest 校验、stale / late 预分类，并把通过预检的 callback 转成 `ResolveWaitRequest(source=CALLBACK)` 进入既有 `resolve_wait` 管线。状态迁移、replay、same-key conflict、late result rejection 和 resume Attempt 创建仍由 Host durable command path 统一治理。
+
+当前代码提供的是 Service framework-neutral mapper 与 Host callback typed boundary，不是已经注册好的真实 HTTP route。secret backend、HMAC / bearer verifier、生产 poller、physical cancel、Engine contract 和 UI surface 不属于这个入口的当前实现范围。
+
 ### Context compaction
 
 proactive compact 由 Host context budget 在 Attempt 创建前触发；reactive compact 只由 EngineEvent `context_compaction_requested` 触发。该事件来自 provider 明确报告输入上下文溢出，不来自 final candidate 的 `finish_reason=LENGTH`。`LENGTH` 表示达到模型输出上限，属于 Engine length continuation / degraded answer 机制。Compact 执行、candidate 校验、artifact 写入、recovery Attempt 创建与 fallback / failure / cancel 收口都由 Host 治理。
