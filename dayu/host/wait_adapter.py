@@ -249,6 +249,8 @@ class WaitActivationAdapterRegistration:
 class WaitPollerRuntimePolicy:
     """wait poller runtime policy。
 
+    :param enabled: 是否启用 production wait poller；``False`` 表示 policy
+        对象可被校验但 ``open_host`` 不启动 poller。
     :param poll_interval_seconds: background loop idle poll 间隔秒数。
     :param claim_ttl_seconds: 单条 poll claim 有效秒数。
     :param claim_batch_size: 单轮最多 claim 的 wait record 数。
@@ -259,6 +261,7 @@ class WaitPollerRuntimePolicy:
         ``None`` 表示不做首次超时诊断，直接等待 in-flight poll 收口。
     """
 
+    enabled: bool = True
     poll_interval_seconds: float = 1.0
     claim_ttl_seconds: float = _POLL_CLAIM_TTL_SECONDS
     claim_batch_size: int = _DEFAULT_CLAIM_BATCH_SIZE
@@ -274,6 +277,8 @@ class WaitPollerRuntimePolicy:
         :raises ValueError: 任一 policy 数值不是正数时抛出。
         """
 
+        if not isinstance(self.enabled, bool):
+            raise TypeError("enabled must be bool")
         _require_positive_float(
             self.poll_interval_seconds, field_name="poll_interval_seconds"
         )

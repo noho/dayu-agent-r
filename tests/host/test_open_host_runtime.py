@@ -11,6 +11,7 @@ from typing import cast
 
 import pytest
 
+from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import (
@@ -33,6 +34,7 @@ from dayu.host import (
     HostEvent,
     HostEventKind,
     HostTerminalStatus,
+    HostToolingOptions,
     LocalEngineWorker,
     LocalEngineWorkerFactory,
     LocalWorkerHandle,
@@ -40,13 +42,15 @@ from dayu.host import (
     OperationContext,
     OrdinaryRunExecutionBaseline,
     PurgeSessionRequest,
+    ResolveWaitCompletedOutcome,
     RunSnapshot,
     RunStatus,
     SubmitFollowupRequest,
+    WaitAdapterKey,
     open_host,
 )
 from dayu.host.api import AuthorizationClaim, HostInput, HostLocalExecutionOptions
-from dayu.host.command import HostCommandHandle
+from dayu.host.command import HostCommandHandle, create_host_command_handle
 from dayu.host.dispatch import ActiveWorkerRegistry, HostDispatchScheduler
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.options import (
@@ -55,6 +59,7 @@ from dayu.host.durable.options import (
     PayloadStoragePolicy,
 )
 from dayu.host.durable.outbox import read_outbox_terminal_items_after
+from dayu.host.durable.state import WaitRecordRow
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.context_policy import default_context_budget_policy
 from dayu.host.memory import default_memory_projection_policy
@@ -67,6 +72,16 @@ from dayu.host.open_host import (
 from dayu.host.llm_compaction import LLMContextCompactor
 from dayu.host.projection import ProjectionCatchupPort
 from dayu.host.recovery import StartupRecoveryScanner
+from dayu.host.wait_adapter import (
+    WaitPollAdapterRegistration,
+    WaitPollAdapterRegistry,
+    WaitPollReady,
+    WaitPollResult,
+    WaitPollerRuntimePolicy,
+    WaitPollerSupervisor,
+)
+from tests.host.public_smoke_support import awaiting_tooling_options
+from tests.host.test_resolve_wait_command import _seed_waiting_run
 
 _SCHEDULER_CLOSE_FAILURE_MESSAGE = "scheduler close failed after cleanup"
 class _FinalAnswerHandle:
@@ -329,6 +344,52 @@ class _RaisingSchedulerClose:
         raise RuntimeError(_SCHEDULER_CLOSE_FAILURE_MESSAGE)
 
 
+class _RecordingSchedulerClose:
+    """测试用记录 close 顺序的 scheduler 替身。"""
+
+    def __init__(self, order: list[str]) -> None:
+        """初始化 scheduler 替身。
+
+        :param order: 共享 close 顺序记录。
+        :returns: ``None``。
+        """
+
+        self._order = order
+        self.close_count = 0
+
+    async def close(self) -> None:
+        """记录 scheduler close 调用。
+
+        :returns: ``None``。
+        """
+
+        self.close_count += 1
+        self._order.append("scheduler")
+
+
+class _RecordingWaitPollerClose:
+    """测试用记录 close 顺序的 wait poller 替身。"""
+
+    def __init__(self, order: list[str]) -> None:
+        """初始化 wait poller 替身。
+
+        :param order: 共享 close 顺序记录。
+        :returns: ``None``。
+        """
+
+        self._order = order
+        self.close_count = 0
+
+    def close(self) -> None:
+        """记录 wait poller close 调用。
+
+        :returns: ``None``。
+        """
+
+        self.close_count += 1
+        self._order.append("poller")
+
+
 class _RecordingCommandHandleClose:
     """测试用记录 close 次数的 command handle 替身。"""
 
@@ -367,6 +428,48 @@ class _RecordingProjectionCatchupPort(ProjectionCatchupPort):
         """
 
         self.catch_up_count += 1
+
+
+class _ReadyPollAdapter:
+    """测试用立即返回 ready 的 poll adapter。"""
+
+    def __init__(self) -> None:
+        """初始化调用记录。
+
+        :returns: ``None``。
+        """
+
+        self.poll_count = 0
+
+    def poll_wait(self, wait_record: WaitRecordRow) -> WaitPollResult:
+        """记录 poll 并返回 completed result。
+
+        :param wait_record: wait record。
+        :returns: ready poll result。
+        """
+
+        del wait_record
+        self.poll_count += 1
+        return WaitPollReady(
+            ResolveWaitCompletedOutcome(
+                result=ToolResultSuccess(
+                    ok=True,
+                    value={"poller": "ready"},
+                    meta=None,
+                ),
+                payload_ref=None,
+            )
+        )
+
+    def abandon_wait(self, wait_record: WaitRecordRow) -> None:
+        """本测试不处理 cancelled wait。
+
+        :param wait_record: wait record。
+        :returns: ``None``。
+        :raises AssertionError: 被错误调用时抛出。
+        """
+
+        raise AssertionError(f"unexpected abandon {wait_record.wait_id}")
 
 
 @pytest.mark.asyncio
@@ -522,6 +625,7 @@ async def test_public_host_close_closes_command_handle_when_scheduler_close_rais
         host_handle_id="host-open-runtime-test",
         scheduler=cast(HostDispatchScheduler, scheduler),
         projection_catchup_port=projection_catchup_port,
+        wait_poller=None,
     )
 
     with pytest.raises(RuntimeError, match=_SCHEDULER_CLOSE_FAILURE_MESSAGE):
@@ -531,6 +635,110 @@ async def test_public_host_close_closes_command_handle_when_scheduler_close_rais
     assert scheduler.close_count == 1
     assert projection_catchup_port.catch_up_count == 1
     assert command_handle.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_public_host_close_closes_wait_poller_before_scheduler() -> None:
+    """public Host close 先关闭 wait poller，再关闭 scheduler。"""
+
+    order: list[str] = []
+    wait_poller = _RecordingWaitPollerClose(order)
+    scheduler = _RecordingSchedulerClose(order)
+    command_handle = _RecordingCommandHandleClose()
+    projection_catchup_port = _RecordingProjectionCatchupPort()
+    host = _PublicHostHandle(
+        command_handle=cast(HostCommandHandle, command_handle),
+        host_handle_id="host-open-runtime-poller-close-test",
+        scheduler=cast(HostDispatchScheduler, scheduler),
+        projection_catchup_port=projection_catchup_port,
+        wait_poller=cast(WaitPollerSupervisor, wait_poller),
+    )
+
+    await host.close()
+    await host.close()
+
+    assert order == ["poller", "scheduler"]
+    assert wait_poller.close_count == 1
+    assert scheduler.close_count == 1
+    assert projection_catchup_port.catch_up_count == 1
+    assert command_handle.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_open_host_wait_poller_policy_without_poll_registry_fails_fast(
+    tmp_path: pathlib.Path,
+) -> None:
+    """启用 wait poller 但缺少 poll adapter registry 时 opener fail fast。"""
+
+    options = replace(
+        _options(tmp_path, _FinalAnswerWorkerFactory()),
+        wait_poller_policy=_wait_poller_policy(),
+    )
+
+    with pytest.raises(HostApiError) as exc_info:
+        async with open_host(options):
+            raise AssertionError("open_host must fail before yielding")
+
+    assert exc_info.value.code is HostApiErrorCode.INVALID_STATE
+    assert "wait_poll_adapter_registry" in exc_info.value.message
+
+
+@pytest.mark.asyncio
+async def test_open_host_disabled_wait_poller_policy_without_poll_registry_opens(
+    tmp_path: pathlib.Path,
+) -> None:
+    """policy.enabled=False 时不要求 poll adapter registry。"""
+
+    options = replace(
+        _options(tmp_path, _FinalAnswerWorkerFactory()),
+        wait_poller_policy=_wait_poller_policy(enabled=False),
+    )
+
+    async with open_host(options):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_open_host_wait_poller_resolves_waiting_run_in_background(
+    tmp_path: pathlib.Path,
+) -> None:
+    """open_host 启用 poller 后会通过 background loop resolve WAITING run。"""
+
+    factory = _FinalAnswerWorkerFactory()
+    base_options = _options(tmp_path, factory)
+    seed_command_options = replace(
+        _command_options_from_open_host_options(
+            base_options,
+            host_handle_id="host-open-runtime-poller-seed",
+        ),
+        local_execution=None,
+    )
+    seed_host = create_host_command_handle(seed_command_options)
+    try:
+        seeded = _seed_waiting_run(seed_host)
+    finally:
+        seed_host.close()
+
+    adapter = _ReadyPollAdapter()
+    options = replace(
+        base_options,
+        tooling_options=_tooling_options_with_poll_registry(
+            _poll_adapter_registry(adapter)
+        ),
+        wait_poller_policy=_wait_poller_policy(),
+    )
+
+    async with open_host(options) as host:
+        final_run = await _wait_for_run_status(
+            host,
+            seeded.run_id,
+            RunStatus.SUCCEEDED,
+        )
+
+    assert final_run.status is RunStatus.SUCCEEDED
+    assert adapter.poll_count == 1
+    assert len(factory.accepted_snapshots) == 1
+    assert factory.accepted_snapshots[0].run_id == seeded.run_id
 
 
 @pytest.mark.asyncio
@@ -584,6 +792,81 @@ async def test_open_host_startup_failure_flushes_projection_before_close(
             raise AssertionError("open_host must fail before yielding")
 
     assert catch_up_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_open_host_startup_failure_closes_poller_before_scheduler(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """open_host ready 前失败时先关闭已创建 poller，再关闭 scheduler。"""
+
+    order: list[str] = []
+    original_public_init = _PublicHostHandle.__init__
+    original_poller_close = WaitPollerSupervisor.close
+    original_scheduler_close = HostDispatchScheduler.close
+
+    def raise_public_handle_init(
+        self: _PublicHostHandle,
+        *,
+        command_handle: HostCommandHandle,
+        host_handle_id: str,
+        scheduler: HostDispatchScheduler,
+        projection_catchup_port: ProjectionCatchupPort,
+        wait_poller: WaitPollerSupervisor | None,
+    ) -> None:
+        """模拟 public handle 构造失败。
+
+        :param self: public handle。
+        :param command_handle: command handle。
+        :param host_handle_id: Host handle id。
+        :param scheduler: scheduler。
+        :param projection_catchup_port: projection catch-up port。
+        :param wait_poller: wait poller。
+        :returns: 不会返回。
+        :raises RuntimeError: 始终抛出测试错误。
+        """
+
+        del self, command_handle, host_handle_id, scheduler, projection_catchup_port
+        assert wait_poller is not None
+        raise RuntimeError("forced public handle init failure")
+
+    def record_poller_close(self: WaitPollerSupervisor) -> None:
+        """记录 poller cleanup。
+
+        :param self: wait poller supervisor。
+        :returns: ``None``。
+        """
+
+        order.append("poller")
+        original_poller_close(self)
+
+    async def record_scheduler_close(self: HostDispatchScheduler) -> None:
+        """记录 scheduler cleanup。
+
+        :param self: scheduler。
+        :returns: ``None``。
+        """
+
+        order.append("scheduler")
+        await original_scheduler_close(self)
+
+    monkeypatch.setattr(_PublicHostHandle, "__init__", raise_public_handle_init)
+    monkeypatch.setattr(WaitPollerSupervisor, "close", record_poller_close)
+    monkeypatch.setattr(HostDispatchScheduler, "close", record_scheduler_close)
+
+    options = replace(
+        _options(tmp_path, _FinalAnswerWorkerFactory()),
+        tooling_options=_tooling_options_with_poll_registry(WaitPollAdapterRegistry(())),
+        wait_poller_policy=_wait_poller_policy(),
+    )
+
+    with pytest.raises(RuntimeError, match="forced public handle init failure"):
+        async with open_host(options):
+            raise AssertionError("open_host must fail before yielding")
+
+    assert order[:2] == ["poller", "scheduler"]
+    monkeypatch.setattr(_PublicHostHandle, "__init__", original_public_init)
 
 
 @pytest.mark.asyncio
@@ -965,6 +1248,57 @@ def _options(
         memory_projection_policy=default_memory_projection_policy(),
         memory_projection_catchup_batch_size=128,
         enable_truncation_manager=True,
+    )
+
+
+def _tooling_options_with_poll_registry(
+    registry: WaitPollAdapterRegistry,
+) -> HostToolingOptions:
+    """构造带 production poll registry 的测试 tooling options。
+
+    :param registry: wait poll adapter registry。
+    :returns: Host tooling options。
+    """
+
+    return replace(
+        awaiting_tooling_options(),
+        wait_poll_adapter_registry=registry,
+    )
+
+
+def _poll_adapter_registry(adapter: _ReadyPollAdapter) -> WaitPollAdapterRegistry:
+    """构造匹配 resolve_wait seed helper 的 poll adapter registry。
+
+    :param adapter: ready poll adapter。
+    :returns: wait poll adapter registry。
+    """
+
+    return WaitPollAdapterRegistry(
+        (
+            WaitPollAdapterRegistration(
+                adapter_key=WaitAdapterKey("poll:long-tool"),
+                adapter=adapter,
+            ),
+        )
+    )
+
+
+def _wait_poller_policy(*, enabled: bool = True) -> WaitPollerRuntimePolicy:
+    """构造测试用 wait poller policy。
+
+    :param enabled: 是否启用 poller。
+    :returns: wait poller runtime policy。
+    """
+
+    return WaitPollerRuntimePolicy(
+        enabled=enabled,
+        poll_interval_seconds=0.01,
+        claim_ttl_seconds=0.5,
+        claim_batch_size=2,
+        backoff_initial_delay_seconds=0.01,
+        backoff_multiplier=2.0,
+        backoff_max_delay_seconds=0.05,
+        close_drain_timeout_seconds=0.2,
     )
 
 

@@ -1217,7 +1217,7 @@ Run 读取与结果边界：
 - `start_run` 不作为 Service-facing public API 暴露。内部 admission primitive 命名为 `_start_run`，用于表达“创建独立 Run”的低层语义，但普通 Service 不应依赖它；P10.5 必须把包根 public export、README 与 tests 调整到这一边界。
 - `retry_run`、`replay_run` 是 Host control API；UI / Service 可以暴露，但必须保留 `retry(run)` / `replay(run)` 的函数式语义、Host 幂等与状态机。
 - `resolve_wait` 是 Host 内部 / adapter API；poller、callback handler、manual admin 入口都必须走它，不能各自写 Run 状态。
-- P10.5 ordinary local multi-turn public contract 只冻结并验证 `WAITING` / wait record / `resolve_wait(...)` 的 public resume path：调用方或 tool adapter 已经通过 poll、callback 或 manual 操作拿到外部结果后，调用 Host public `resolve_wait(...)`，Host 通过 after-commit wakeup 创建 resume Attempt、推进 dispatch，并在 session-level `watch_session_events(...)` 中暴露后续 terminal HostEvent。生产级 callback endpoint、callback auth / replay、poller 后台 loop、backoff / in-flight fencing 与 external job physical cancel / revoke 不属于 P10.5 阻塞项；它们是后续生产集成 / scale owner，不能改变 `resolve_wait(...)` 作为唯一等待结果治理入口的边界。
+- P10.5 ordinary local multi-turn public contract 冻结并验证 `WAITING` / wait record / `resolve_wait(...)` 的 public resume path：调用方或 tool adapter 已经通过 poll、callback 或 manual 操作拿到外部结果后，调用 Host public `resolve_wait(...)`，Host 通过 after-commit wakeup 创建 resume Attempt、推进 dispatch，并在 session-level `watch_session_events(...)` 中暴露后续 terminal HostEvent。当前 production poller 可由 `open_host` 可选启动，并通过 durable claim / backoff 防止重复 poll 与 tight-loop；它仍只是在拿到外部结果后调用同一个 `resolve_wait(...)`。生产级 callback HTTP endpoint、callback auth / replay 与 external job physical cancel / revoke 是独立边界，不能改变 `resolve_wait(...)` 作为唯一等待结果治理入口的边界。
 - 读取 Session timeline 通过 `get_session` 的 snapshot、session-level Host event stream 或后续 read-model API 暴露；它必须从 EventLog / projection 读取，不触发执行。读取 Session 列表通过 `list_sessions` 暴露，它直接来自 durable Session / slot / Run state truth，不是 projection，也不触发 projection catch-up 或执行。离线 / 未 attach 客户端的 final answer 通知通过 Outbox terminal delivery queue 读取，不通过 session live watch 追补完整中间过程。
 
 Snapshot 最小语义：
@@ -2363,12 +2363,12 @@ resume policy 覆盖 internal / manual、poll、callback 三类入口。所有�
 - Engine 不读取 wait record，也不恢复旧 Agent / Runner。
 - Host recovery scan 遇到 `WAITING` Run 时不得创建新 Attempt；它只能恢复 wait record 的 adapter 状态。
 - wait record 的 `resume_policy` / `await_spec` / `external_job_id` 必须包含足以在 Host restart 后恢复 adapter observation 的 durable refs。adapter registry / lookup 由 Host composition root 提供 typed adapter binding；wait record 只保存 adapter key / policy ref / external job refs，不保存进程内 adapter 对象。
-- `poll` adapter 从 wait record 读取 `external_job_id` / `await_spec` 后继续轮询，并在完成时调用同一个 `resolve_wait`。
+- `poll` adapter 从 wait record 读取 `external_job_id` / `await_spec` 后继续轮询，并在完成时调用同一个 `resolve_wait`。生产 poller 由 `open_host` composition root 在显式配置 poll adapter registry 与 wait poller policy 后启动；默认不启动。poller 每轮通过 durable claim / expiry / backoff 字段判断 wait record 是否可观察，防止多个 poller 同时处理同一 wait，并在 not-ready、adapter error、missing adapter 或 shutdown-skipped 后写入可重试 backoff。claim / backoff 只约束 poll observation 资格，不是 Attempt ownership、EventLog truth 或外部 job ownership。
 - `callback` source 在 Phase 7 只保留 adapter contract 与 common pipeline 入口；专属 HTTP callback 服务、认证入口、复杂
   重放防护和外部系统专属 callback adapter 不属于第一版实现。后续 callback 产品化入口必须验证认证、重放防护和 idempotency
   key，然后调用同一个 `resolve_wait`。
 - `manual` resolve 只能由受控入口触发，并必须写 audit projection。
-- wait poller 是 background runtime 中的 trigger / adapter。它观察 wait record 与外部 job，但只能通过 `resolve_wait` command path 提交结果；不得持有 EventLog appender，不得直接更新 Run / Attempt / wait record terminal state。
+- wait poller 是 background runtime 中的 trigger / adapter。它观察 wait record 与外部 job，但只能通过 `resolve_wait` command path 提交结果；不得持有 EventLog appender，不得直接更新 Run / Attempt / wait record terminal state。poller runtime diagnostics 只描述本地 loop / close / retry 状态，不写 EventLog，也不能被解释为业务事实。
 - wait record resolution 与 `RESUME_REQUESTED`、tool terminal/result fact、`RUN_STARTED(start_reason=resume)`、new Attempt row、`ATTEMPT_STARTED`、dispatch record 创建必须在同一事务或等价原子流程中收口。
 - `resolve_wait` 幂等范围是 `(wait_id, idempotency_key)`。
 - `resolve_wait` 幂等判断只基于 committed durable state；如果事务未 commit，重试应重新执行完整 resolution chain。
