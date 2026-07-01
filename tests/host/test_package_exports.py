@@ -9,6 +9,7 @@ import dayu.host.api as api
 import dayu.host.context_fallback as context_fallback
 import dayu.host.memory as memory
 import dayu.host.read_api as read_api
+import dayu.host.wait_callback as wait_callback
 
 EXPECTED_API_EXPORTS: frozenset[str] = frozenset(
     {
@@ -127,6 +128,26 @@ EXPECTED_COMMAND_EXPORTS: frozenset[str] = frozenset(
     }
 )
 
+EXPECTED_WAIT_CALLBACK_EXPORTS: frozenset[str] = frozenset(
+    {
+        "CallbackWaitResolvePort",
+        "CallbackWaitResolveResult",
+        "DefaultWaitCallbackAdapter",
+        "WaitCallbackAdapterResult",
+        "WaitCallbackAdapterStatus",
+        "WaitCallbackAuthAccepted",
+        "WaitCallbackAuthInput",
+        "WaitCallbackAuthRejected",
+        "WaitCallbackAuthResult",
+        "WaitCallbackAuthenticator",
+        "WaitCallbackCompletionEnvelope",
+        "WaitCallbackStateReadPort",
+        "WaitCallbackStoredWaitState",
+        "WaitCallbackStoredWaitStatus",
+        "callback_payload_digest",
+    }
+)
+
 EXPECTED_STORAGE_MAINTENANCE_EXPORTS: frozenset[str] = frozenset(
     {
         "DEFAULT_ORPHAN_ARTIFACT_GRACE_SECONDS",
@@ -157,6 +178,7 @@ EXPECTED_HOST_EXPORTS: frozenset[str] = (
     (EXPECTED_API_EXPORTS - ROOT_INTERNAL_API_NAMES)
     | EXPECTED_TOOLING_EXPORTS
     | EXPECTED_COMMAND_EXPORTS
+    | EXPECTED_WAIT_CALLBACK_EXPORTS
     | EXPECTED_STORAGE_MAINTENANCE_EXPORTS
 )
 
@@ -434,6 +456,14 @@ def test_command_symbols_are_exported_from_package_root_only() -> None:
 
     for name in EXPECTED_COMMAND_EXPORTS:
         assert name in vars(host)
+        assert name not in vars(api)
+
+
+def test_wait_callback_symbols_are_exported_from_package_root_only() -> None:
+    """callback contract 从包根导出，但不进入 ``dayu.host.api``。"""
+
+    for name in EXPECTED_WAIT_CALLBACK_EXPORTS:
+        assert vars(host)[name] is vars(wait_callback)[name]
         assert name not in vars(api)
 
 

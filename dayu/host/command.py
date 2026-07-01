@@ -107,9 +107,12 @@ from dayu.host.durable.state import (
     DispatchRecordRow,
     DispatchRecordStatus,
     RunRow,
+    WaitRecordRow,
+    WaitRecordStatus,
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
     read_run_by_id,
+    read_wait_record_by_id,
     run_snapshot_from_row,
 )
 from dayu.host.durable.transaction import (
@@ -124,6 +127,13 @@ from dayu.host.dispatch import (
     ActiveWorkerRegistry,
 )
 from dayu.host.projection import catch_up_projection_best_effort
+from dayu.host.wait_callback import (
+    CallbackWaitResolveResult,
+    CallbackWaitResolvePort,
+    WaitCallbackStateReadPort,
+    WaitCallbackStoredWaitState,
+    WaitCallbackStoredWaitStatus,
+)
 from dayu.host.waiting import DefaultHostResolveWaitService
 from dayu.runtime.filelock import RuntimeFileLockError
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
@@ -781,6 +791,139 @@ def resolve_wait(host: HostCommandHandle, wait_id: str, request: ResolveWaitRequ
         None if result.dispatch_record is None else result.dispatch_record.dispatch_record_id,
     )
     return run_snapshot_from_row(result.run)
+
+
+@dataclass(frozen=True, slots=True)
+class HostCommandWaitCallbackPort(CallbackWaitResolvePort, WaitCallbackStateReadPort):
+    """Host command handle 上的 wait callback port 实现。
+
+    :param host: Host command handle。
+    """
+
+    host: HostCommandHandle
+
+    def read_wait_state(self, wait_id: str) -> WaitCallbackStoredWaitState | None:
+        """读取 wait record 的 callback 稳定状态投影。
+
+        :param wait_id: wait record id。
+        :returns: 找到时返回 callback wait state；不存在时返回 ``None``。
+        :raises HostApiError: handle 已关闭或 durable 读取失败时抛出。
+        """
+
+        self.host._raise_if_closed()
+        try:
+            return self.host._transaction_runner().run_read(
+                lambda transaction: _callback_wait_state_from_status(
+                    read_wait_record_by_id(transaction, wait_id)
+                )
+            )
+        except HostDurableError as exc:
+            raise _host_api_error_from_durable_error(exc) from exc
+
+    def resolve_callback_wait(
+        self,
+        wait_id: str,
+        request: ResolveWaitRequest,
+        context: HostCallContext,
+    ) -> CallbackWaitResolveResult:
+        """通过 command-layer 语义处理 callback wait resolve。
+
+        :param wait_id: wait record id。
+        :param request: callback 转换出的 resolve wait request。
+        :param context: Host 调用上下文；必须与 request.context 同一对象。
+        :returns: 最新 Run snapshot 与 replay 标志。
+        :raises HostApiError: handle 已关闭、wait 缺失、状态非法或幂等冲突时抛出。
+        """
+
+        self.host._raise_if_closed()
+        if context is not request.context:
+            raise HostApiError(
+                code=HostApiErrorCode.INVALID_STATE,
+                message="callback resolve context must match request context",
+                retryable=False,
+            )
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.command.accepted operation=resolve_callback_wait wait_id=%s",
+            wait_id,
+        )
+        try:
+            transaction_runner = self.host._transaction_runner()
+            service = DefaultHostResolveWaitService(
+                transaction_runner=transaction_runner,
+                event_log_store=self.host._admission_service.event_log_store,
+                idempotency_store=self.host._admission_service.idempotency_store,
+                projection_catchup_port=(
+                    self.host._admission_service.projection_catchup_port
+                ),
+            )
+            result = service.resolve_wait(wait_id, request)
+        except HostDurableError as exc:
+            raise _host_api_error_from_durable_error(exc) from exc
+        if result.dispatch_record is not None and not result.idempotent_replay:
+            self.host._admission_service.wakeup_port.wake_dispatch(
+                _pending_dispatch_from_row(result.dispatch_record)
+            )
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            (
+                "host.command.committed operation=resolve_callback_wait "
+                "session_id=%s run_id=%s run_status=%s wait_id=%s "
+                "dispatch_record_id=%s idempotent_replay=%s"
+            ),
+            result.run.session_id,
+            result.run.run_id,
+            result.run.status.value,
+            wait_id,
+            None
+            if result.dispatch_record is None
+            else result.dispatch_record.dispatch_record_id,
+            result.idempotent_replay,
+        )
+        return CallbackWaitResolveResult(
+            run=run_snapshot_from_row(result.run),
+            idempotent_replay=result.idempotent_replay,
+        )
+
+
+def _callback_wait_state_from_status(
+    row: WaitRecordRow | None,
+) -> WaitCallbackStoredWaitState | None:
+    """把 durable wait record row 投影为 callback wait state。
+
+    :param row: durable wait record row；不存在时为 ``None``。
+    :returns: callback wait state；不存在时返回 ``None``。
+    :raises ValueError: wait status 未被 callback contract 覆盖时抛出。
+    """
+
+    if row is None:
+        return None
+    return WaitCallbackStoredWaitState(
+        status=_callback_wait_status(row.status),
+        deadline_at=row.deadline_at,
+        expires_at=row.expires_at,
+    )
+
+
+def _callback_wait_status(status: WaitRecordStatus) -> WaitCallbackStoredWaitStatus:
+    """把 durable wait status 映射为 callback wait status。
+
+    :param status: durable wait status。
+    :returns: callback wait status。
+    :raises ValueError: 未知 durable wait status 时抛出。
+    """
+
+    if status is WaitRecordStatus.WAITING:
+        return WaitCallbackStoredWaitStatus.WAITING
+    if status is WaitRecordStatus.RESOLVED:
+        return WaitCallbackStoredWaitStatus.RESOLVED
+    if status is WaitRecordStatus.FAILED:
+        return WaitCallbackStoredWaitStatus.FAILED
+    if status is WaitRecordStatus.CANCELLED:
+        return WaitCallbackStoredWaitStatus.CANCELLED
+    if status is WaitRecordStatus.LOST:
+        return WaitCallbackStoredWaitStatus.LOST
+    raise ValueError("unsupported wait record status")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1592,6 +1735,7 @@ def _read_attempt_and_dispatch_for_run(
 
 __all__ = [
     "HostCommandHandle",
+    "HostCommandWaitCallbackPort",
     "cancel_run",
     "cancel_session_runs",
     "close_session",

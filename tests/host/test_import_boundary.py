@@ -51,6 +51,7 @@ ENGINE_FORBIDDEN_PREFIXES: tuple[str, ...] = ("dayu.host",)
 HOST_ENGINE_CONTRACT_ALLOWED_MODULES: tuple[str, ...] = (
     "_execution_config_projection.py",
     "api.py",
+    "compact_pipeline.py",
     "compaction_operation.py",
     "dispatch.py",
     "engine_ingest.py",
@@ -130,6 +131,15 @@ PURGE_DURABLE_FORBIDDEN_PREFIXES: tuple[str, ...] = (
     "dayu.host.dispatch",
     "dayu.host.open_host",
     "dayu.host.recovery",
+)
+WAIT_CALLBACK_FORBIDDEN_PREFIXES: tuple[str, ...] = (
+    "dayu.service",
+    "dayu.ui",
+    "fastapi",
+    "flask",
+    "starlette",
+    "django",
+    "aiohttp",
 )
 
 
@@ -383,6 +393,17 @@ def test_purge_durable_module_stays_low_level_host_owner() -> None:
             if _matches_prefix(module, PURGE_DURABLE_FORBIDDEN_PREFIXES):
                 violations.append((str(file_path), module))
     assert not violations, f"purge durable forbidden imports: {violations}"
+
+
+def test_wait_callback_adapter_has_no_service_ui_or_web_framework_dependency() -> None:
+    """wait callback Host adapter 不得依赖 Service/UI 或 Web framework。"""
+
+    file_path = _host_root() / "wait_callback.py"
+    violations: list[str] = []
+    for module in _imported_module_names(file_path.read_text(encoding="utf-8")):
+        if _matches_prefix(module, WAIT_CALLBACK_FORBIDDEN_PREFIXES):
+            violations.append(module)
+    assert not violations, f"wait callback forbidden imports: {violations}"
 
 
 def test_engine_does_not_import_host_layer() -> None:

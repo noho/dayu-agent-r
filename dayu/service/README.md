@@ -9,6 +9,7 @@
 - `dayu.service.host_assembly.compose_open_host_options(request)`：从 runtime config、locations、prepared scene、工具发现、显式 override 与 env/secret mapping 组合 `OpenHostOptions`。
 - `dayu.service.host_assembly.compose_submit_followup_request(...)`：把 prepared scene 的 `system_prompt` 与本轮用户输入组合为 `SubmitFollowupRequest`。
 - `dayu.service.host_assembly.compose_submit_followup_request_with_overrides(...)`：在同一 assembly 真源内把可映射的单次 Run override 合并为完整 `runner_options` 与 `agent_policy`。
+- `dayu.service.wait_callback_endpoint.handle_wait_callback_completion(...)`：framework-neutral wait callback completion transport mapper；真实 Web router 只把 path wait id、headers 与已解析 JSON body 传入该函数，mapper 负责 transport 校验、Host callback envelope 构造和 HTTP-like status/body 映射，不注册真实路由。
 - `dayu.service.entrypoint_runtime`：为 product entrypoint 提供 reusable Agent runtime helper，覆盖 runtime 准备、Session ensure/create、submit 前 live watcher attach、terminal observation outbox fallback、interactive existing-session startup reconnect、cancel request 构造与 watcher failure 诊断；该模块不解析 CLI 参数，不保存 CLI cursor，不处理 stdout/stderr，也不安装 signal handler。
 - `dayu.service.fins_direct`：为 product entrypoint 提供 reusable Fins direct stream helper，覆盖 download / preprocess / upload 的 typed request 构造、`AsyncIterator[FinsEvent]` 透传、terminal result 收口和 operation-scoped cancellation；该模块不解析 CLI 参数，不处理 stdout/stderr，也不读取 Fins storage。
 
@@ -24,6 +25,8 @@ Service 从模型配置构造 `RunnerSpec` 时默认启用 OpenAI-compatible cli
 `entrypoint_runtime` 的 interactive startup reconnect helper 只编排 Host public API：先 attach `watch_session_events(session_id)` 并缓存 live events，再用调用方提供的 terminal cursor 做 session-scoped Outbox backfill，随后处理 selected Session 的 active Run 与 queued-only bounded promotion barrier；进入输入态前会在 idle snapshot 后再做 tail outbox closure 并 drain watcher，避免 startup terminal 在 idle 边界丢失。Service 不保存 CLI cursor，不按单个 Run 过滤 startup backfill，不把 queued-only 状态静默视为 idle。
 
 `entrypoint_runtime` 的 submit / cancel wait helper 不持有内部 timeout。调用方负责通过 task cancellation、`asyncio.wait_for(...)` 或显式 cancel 请求控制等待生命周期。
+
+`wait_callback_endpoint` 只做 Service/Web transport 映射：method、content-type 与 path/body wait id 错误在 Service 层拒绝；JSON body 与 outcome shape 错误在 Service 层返回 malformed payload；认证结果、wait 状态、replay、digest 与 late callback 语义来自注入的 Host callback adapter。响应体只包含 typed status、diagnostic、retryable 与可选 Run 摘要，不回显 outcome payload。
 
 `fins_direct` 的 upload helper 只通过 `FinsIngestionRuntime.upload(...)` 提交 `FinsUploadFilingRequest` 或 `FinsUploadMaterialRequest` 并消费 direct event stream，不要求 runtime 存在 `upload_filing(...)` / `upload_material(...)` 方法。调用方通过 `async for` 消费 `PROGRESS` 与唯一 terminal `RESULT`；若 runtime stream 正常结束但未产出 `RESULT`，Service 会合成清晰 failure result，避免 UI 悬挂。调用方收到用户中断时关闭当前 stream / 取消当前 task，并通过 operation-scoped cancellation 传播；Service direct API 不暴露 job id、event sidecar、cursor 或 `request_cancel(job_id)`。
 

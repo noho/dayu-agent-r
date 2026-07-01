@@ -196,6 +196,33 @@ cancelled = await host.cancel_run(active_run_id, cancel_request)
 
 `cancelled` 是取消 command commit 后的最新 `RunSnapshot`。对于 active Run，Host 会写入 durable cancelling / cancelled 事实，并通过 active worker registry 传播取消；已 accepted 的事实不会被撤回。每个 steer / cancel command 都必须使用自己的 `client_request_id` 作为幂等边界。
 
+## Wait callback completion
+
+Wait callback completion 是外部长事务完成后回到 Host wait-resume 管线的 typed callback 边界。它是 Host wait API 体系的一部分，但不是 Host 直接注册的 HTTP route。Service / Web transport 层负责解析 HTTP 方法、路径、header 与 body，并把结果映射成 Host 可理解的强类型 callback completion；Host 只接收已经归一化的 typed envelope、认证输入和调用上下文。
+
+Host callback 路径的稳定链路如下：
+
+```text
+Service / Web transport
+  -> WaitCallbackCompletionEnvelope
+  -> DefaultWaitCallbackAdapter
+  -> CallbackWaitResolvePort
+  -> Host command-layer resolve_wait
+  -> wait resolution facts + resume Attempt
+```
+
+`DefaultWaitCallbackAdapter` 的职责是 callback 边界预处理，不拥有 durable state transition：
+
+- 先执行 callback authenticator；认证失败时不得读取 wait state，也不得调用 resolver。
+- 读取 wait state 只用于 unknown wait、stale、late cancel / lost 与 invalid wait state 的预分类。
+- 使用与 direct `resolve_wait` 相同的 wait resolution digest helper 校验 callback payload；request id、认证材料、correlation metadata、`observed_at` 和 `completed_at` 不参与 outcome digest。
+- 把通过预检的 callback completion 转成 `ResolveWaitRequest(source=CALLBACK)`，再通过 `CallbackWaitResolvePort` 进入 command-layer `resolve_wait`。
+- 只返回 typed `WaitCallbackAdapterResult` 与 stable status / diagnostic code；不回显 outcome payload 或 credential material。
+
+状态迁移仍由 Host 既有 `resolve_wait` 管线负责。同一 `(wait_id, idempotency_key)` 与相同 outcome digest 的重复 callback 是 replay；同 key 不同 outcome 是 idempotency conflict；已 cancel、已 terminal、已 resolved、failed 或 lost 的 late result 不恢复旧 Attempt。command-layer callback port 在非 replay 且创建 resume dispatch 时唤醒 dispatch，replay 不重复唤醒。
+
+这个边界当前不包含真实 HTTP route、secret backend、HMAC / bearer verifier、生产 poller、physical cancel、Engine contract 或 UI surface。需要暴露 Web endpoint 时，应在 Host 外部的 Service / Web composition root 中注册路由，构造 framework-neutral request，注入 callback adapter，然后让 Host 按上述 typed callback path 处理。
+
 ## 公共契约
 
 Host 公共契约分为 Host 专属契约、Dayu Agent 公共契约和 Engine 交互契约。
@@ -213,6 +240,8 @@ Host 公共契约分为 Host 专属契约、Dayu Agent 公共契约和 Engine �
 - `HostCallContext` / `OperationContext` / `AuthorizationClaim` / `HostMetadataEntry`：调用上下文、授权声明与稳定 metadata。
 - `HostToolingOptions` / `FrameworkToolName` / `FrameworkToolPolicyView`：业务 ToolBundle 与 Host framework tool 的 construction-time 输入边界。
 - `ContextBudgetPolicy` / `MemoryProjectionPolicy`：context governance 与 conversation memory projection 的 typed policy。
+- `WaitCallbackCompletionEnvelope` / `WaitCallbackAuthInput` / `WaitCallbackAuthAccepted` / `WaitCallbackAuthRejected` / `WaitCallbackAdapterResult` / `WaitCallbackAdapterStatus`：framework-independent wait callback completion 契约。调用方在 Service/Web transport 层完成请求解析后，把强类型 envelope 交给 `DefaultWaitCallbackAdapter`；adapter 只做认证、payload digest 校验、stale / late 预分类和 `ResolveWaitRequest(source=CALLBACK)` 转换，状态迁移仍进入 Host `resolve_wait` 管线。
+- `CallbackWaitResolvePort` / `CallbackWaitResolveResult` / `WaitCallbackStateReadPort`：callback adapter 接入 command-layer wait resolve 与 wait state 预读的端口契约。command-layer 实现必须保留现有 resolve wakeup 语义：非 replay 且创建 resume dispatch 时唤醒 dispatch，replay 不重复唤醒。
 
 ### Dayu Agent 公共契约
 
