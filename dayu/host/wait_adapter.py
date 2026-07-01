@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol, TypeAlias
+from uuid import uuid4
 
 from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
 from dayu.host.api import (
@@ -24,12 +25,18 @@ from dayu.host.api import (
     WaitResolutionSource,
 )
 from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.codec import format_utc_timestamp
 from dayu.host.durable.state import (
     ExternalJobRef,
+    StateMutationStatus,
+    WaitPollLastOutcome,
     WaitRecordRow,
     WaitRecordStatus,
     WaitResumePolicy,
-    read_wait_records_for_poll_observation,
+    claim_wait_record_for_poll,
+    mark_wait_record_poll_abandoned,
+    read_wait_record_by_id,
+    release_wait_record_poll_claim,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 
@@ -37,6 +44,25 @@ if TYPE_CHECKING:
     from dayu.host.waiting import ToolAwaitingAcceptedAck
 
 _LOGGER = logging.getLogger(__name__)
+_DEFAULT_CLAIM_BATCH_SIZE = 100
+"""单轮 poll 默认最多 claim 的 wait record 数。"""
+
+_POLL_CLAIM_TTL_SECONDS = 60.0
+"""单条 poll claim 默认有效秒数。"""
+
+_POLL_BACKOFF_INITIAL_DELAY_SECONDS = 30.0
+"""poll retry 初始退避秒数。"""
+
+_POLL_BACKOFF_MAX_DELAY_SECONDS = 300.0
+"""poll retry 最大退避秒数。"""
+
+_POLL_BACKOFF_MULTIPLIER = 2.0
+"""poll retry 指数退避倍率。"""
+
+_POLL_ERROR_CODE_ADAPTER_EXCEPTION = "adapter_exception"
+_POLL_ERROR_CODE_MISSING_ADAPTER = "missing_adapter"
+_POLL_ERROR_CODE_RESOLVE_EXCEPTION = "resolve_exception"
+_POLL_ERROR_CODE_ABANDON_EXCEPTION = "abandon_exception"
 
 
 class WaitExternalJobRefSource(StrEnum):
@@ -202,6 +228,7 @@ class WaitPollOnceResult:
     :param lost: 通过 ``resolve_wait`` 接收 lost 的数。
     :param abandoned: 因 wait 已取消而通知 adapter 放弃的数。
     :param adapter_errors: adapter 调用失败的数。
+    :param claim_conflicts: claim / release / abandon CAS 冲突数。
     """
 
     observed: int
@@ -210,6 +237,19 @@ class WaitPollOnceResult:
     lost: int
     abandoned: int
     adapter_errors: int
+    claim_conflicts: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _ClaimedWaitRecord:
+    """poller 已取得 claim 的 wait record。
+
+    :param record: claim 后读取到的 wait record。
+    :param claim_id: 本次取得的 claim id。
+    """
+
+    record: WaitRecordRow
+    claim_id: str
 
 
 class _SystemUtcClock:
@@ -222,6 +262,114 @@ class _SystemUtcClock:
         """
 
         return datetime.now(UTC)
+
+
+@dataclass(frozen=True, slots=True)
+class _ClaimWaitRecordOperation:
+    """claim wait record 的 transaction operation。"""
+
+    claim_id: str
+    owner_id: str
+    now: str
+    claim_expires_at: str
+
+    def __call__(
+        self, transaction: HostTransaction
+    ) -> tuple[StateMutationStatus, WaitRecordRow | None]:
+        """执行 claim CAS。
+
+        :param transaction: Host transaction。
+        :returns: mutation 状态与成功取得 claim 的 wait record。
+        """
+
+        result = claim_wait_record_for_poll(
+            transaction,
+            claim_id=self.claim_id,
+            owner_id=self.owner_id,
+            now=self.now,
+            claim_expires_at=self.claim_expires_at,
+        )
+        if result.status is StateMutationStatus.UPDATED:
+            if result.row is None:
+                raise RuntimeError("poll claim updated without row")
+            return result.status, result.row
+        return result.status, None
+
+
+@dataclass(frozen=True, slots=True)
+class _ReleaseWaitRecordClaimOperation:
+    """release wait record poll claim 的 transaction operation。"""
+
+    wait_id: str
+    claim_id: str
+    next_observe_at: str
+    backoff_attempt: int
+    last_outcome: WaitPollLastOutcome
+    last_error_code: str | None
+    last_error_message: str | None
+    updated_at: str
+
+    def __call__(self, transaction: HostTransaction) -> StateMutationStatus:
+        """执行 claim release CAS。
+
+        :param transaction: Host transaction。
+        :returns: mutation 状态。
+        """
+
+        result = release_wait_record_poll_claim(
+            transaction,
+            wait_id=self.wait_id,
+            claim_id=self.claim_id,
+            next_observe_at=self.next_observe_at,
+            backoff_attempt=self.backoff_attempt,
+            last_outcome=self.last_outcome,
+            last_error_code=self.last_error_code,
+            last_error_message=self.last_error_message,
+            updated_at=self.updated_at,
+        )
+        return result.status
+
+
+@dataclass(frozen=True, slots=True)
+class _MarkWaitRecordAbandonedOperation:
+    """mark wait record poll abandoned 的 transaction operation。"""
+
+    wait_id: str
+    claim_id: str
+    abandoned_at: str
+    updated_at: str
+
+    def __call__(self, transaction: HostTransaction) -> StateMutationStatus:
+        """执行 abandon success CAS。
+
+        :param transaction: Host transaction。
+        :returns: mutation 状态。
+        """
+
+        result = mark_wait_record_poll_abandoned(
+            transaction,
+            wait_id=self.wait_id,
+            claim_id=self.claim_id,
+            abandoned_at=self.abandoned_at,
+            updated_at=self.updated_at,
+        )
+        return result.status
+
+
+@dataclass(frozen=True, slots=True)
+class _ReadWaitRecordOperation:
+    """读取单条 wait record 的 transaction operation。"""
+
+    wait_id: str
+
+    def __call__(self, transaction: HostTransaction) -> WaitRecordRow | None:
+        """读取 wait record。
+
+        :param transaction: Host transaction。
+        :returns: wait record；不存在时为 ``None``。
+        """
+
+        return read_wait_record_by_id(transaction, self.wait_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -379,10 +527,10 @@ class WaitActivationRegistry:
 
 
 class WaitPoller:
-    """最小 wait poller。
+    """claim-aware wait poller。
 
-    poller 只读取 Host durable 中 active poll wait 快照；外部 adapter 调用发生
-    在 Host transaction 外，ready/lost 结果统一交回 ``resolve_wait``。
+    poller 先通过 Host durable wait row CAS claim 取得处理权；外部 adapter
+    调用发生在 Host transaction 外，ready/lost 结果统一交回 ``resolve_wait``。
     """
 
     def __init__(
@@ -393,6 +541,8 @@ class WaitPoller:
         resolver: WaitResolvePort,
         context: HostCallContext,
         clock: WaitPollClock | None = None,
+        claim_batch_size: int = _DEFAULT_CLAIM_BATCH_SIZE,
+        owner_id: str | None = None,
     ) -> None:
         """初始化 poller。
 
@@ -401,15 +551,24 @@ class WaitPoller:
         :param resolver: resolve_wait 端口。
         :param context: poller 调用上下文。
         :param clock: UTC 时钟；缺省使用系统 UTC 时间。
+        :param claim_batch_size: 单轮最多 claim 的 wait record 数。
+        :param owner_id: poller owner id；缺省为当前实例生成随机 id。
         :returns: ``None``。
+        :raises ValueError: claim batch size 非正或 owner id 为空时抛出。
         """
 
+        if claim_batch_size <= 0:
+            raise ValueError("claim_batch_size must be positive")
+        resolved_owner_id = owner_id if owner_id is not None else _new_poller_owner_id()
+        if resolved_owner_id.strip() == "":
+            raise ValueError("owner_id must be non-empty")
         self._transaction_runner = transaction_runner
         self._adapter_registry = adapter_registry
         self._resolver = resolver
         self._context = context
         self._clock = clock if clock is not None else _SystemUtcClock()
-        self._abandoned_cancelled_wait_ids: set[str] = set()
+        self._claim_batch_size = claim_batch_size
+        self._owner_id = resolved_owner_id
 
     def poll_once(self) -> WaitPollOnceResult:
         """执行单轮 poll。
@@ -417,46 +576,49 @@ class WaitPoller:
         :returns: 本轮 poll 摘要。
         """
 
-        records = self._transaction_runner.run_read(
-            _read_wait_records_for_poll_observation
-        )
+        claimed_records: list[_ClaimedWaitRecord] = []
+        claim_conflicts = 0
+        for _ in range(self._claim_batch_size):
+            claim = self._claim_next_wait_record()
+            if claim is None:
+                break
+            if isinstance(claim, StateMutationStatus):
+                claim_conflicts += 1
+                continue
+            claimed_records.append(claim)
+
         not_ready = 0
         resolved = 0
         lost = 0
         abandoned = 0
         adapter_errors = 0
-        retained_abandoned_cancelled_wait_ids: set[str] = set()
-        for record in records:
-            if (
-                record.status is WaitRecordStatus.CANCELLED
-                and record.wait_id in self._abandoned_cancelled_wait_ids
-            ):
-                retained_abandoned_cancelled_wait_ids.add(record.wait_id)
+        for claimed in claimed_records:
+            record = claimed.record
+            claim_id = claimed.claim_id
+            if record.status is WaitRecordStatus.CANCELLED:
+                abandoned_delta, adapter_error_delta, conflict_delta = (
+                    self._abandon_cancelled_wait(record, claim_id)
+                )
+                abandoned += abandoned_delta
+                adapter_errors += adapter_error_delta
+                claim_conflicts += conflict_delta
                 continue
             adapter = self._adapter_registry.resolve_adapter(record.adapter_key)
             if adapter is None:
                 _LOGGER.warning(
-                    "wait poll adapter not registered; skipping wait_id=%s "
+                    "wait poll adapter not registered; retrying wait_id=%s "
                     "adapter_key=%s",
                     record.wait_id,
                     record.adapter_key.value,
                 )
                 adapter_errors += 1
-                continue
-            if record.status is WaitRecordStatus.CANCELLED:
-                try:
-                    adapter.abandon_wait(record)
-                    retained_abandoned_cancelled_wait_ids.add(record.wait_id)
-                    abandoned += 1
-                except Exception as exc:
-                    _LOGGER.warning(
-                        "wait adapter abandon failed; continuing wait_id=%s "
-                        "adapter_key=%s error_type=%s",
-                        record.wait_id,
-                        record.adapter_key.value,
-                        exc.__class__.__name__,
-                    )
-                    adapter_errors += 1
+                claim_conflicts += self._release_with_backoff(
+                    record,
+                    claim_id,
+                    outcome=WaitPollLastOutcome.MISSING_ADAPTER,
+                    error_code=_POLL_ERROR_CODE_MISSING_ADAPTER,
+                    error_message=record.adapter_key.value,
+                )
                 continue
             try:
                 poll_result = adapter.poll_wait(record)
@@ -469,54 +631,218 @@ class WaitPoller:
                     exc.__class__.__name__,
                 )
                 adapter_errors += 1
+                claim_conflicts += self._release_with_backoff(
+                    record,
+                    claim_id,
+                    outcome=WaitPollLastOutcome.ADAPTER_ERROR,
+                    error_code=_POLL_ERROR_CODE_ADAPTER_EXCEPTION,
+                    error_message=exc.__class__.__name__,
+                )
                 continue
             if isinstance(poll_result, WaitPollNotReady):
                 not_ready += 1
-                continue
-            request = ResolveWaitRequest(
-                context=self._context,
-                idempotency_key=_poll_idempotency_key(record),
-                outcome=poll_result.outcome,
-                source=WaitResolutionSource.POLL,
-                observed_at=self._clock.now(),
-            )
-            try:
-                self._resolver.resolve_wait(record.wait_id, request)
-            except Exception as exc:
-                _LOGGER.warning(
-                    "wait poll resolve failed; continuing wait_id=%s "
-                    "adapter_key=%s error_type=%s",
-                    record.wait_id,
-                    record.adapter_key.value,
-                    exc.__class__.__name__,
+                claim_conflicts += self._release_with_backoff(
+                    record,
+                    claim_id,
+                    outcome=WaitPollLastOutcome.NOT_READY,
+                    error_code=None,
+                    error_message=None,
                 )
-                adapter_errors += 1
                 continue
-            if isinstance(poll_result, WaitPollLost):
-                lost += 1
-            else:
-                resolved += 1
-        self._abandoned_cancelled_wait_ids = retained_abandoned_cancelled_wait_ids
+            resolve_status = self._resolve_claimed_wait(record, poll_result)
+            if resolve_status is StateMutationStatus.UPDATED:
+                if isinstance(poll_result, WaitPollLost):
+                    lost += 1
+                else:
+                    resolved += 1
+                continue
+            adapter_errors += 1
+            if resolve_status is StateMutationStatus.CAS_LOST:
+                claim_conflicts += 1
+                continue
+            claim_conflicts += self._release_with_backoff(
+                record,
+                claim_id,
+                outcome=WaitPollLastOutcome.RESOLVE_ERROR,
+                error_code=_POLL_ERROR_CODE_RESOLVE_EXCEPTION,
+                error_message=resolve_status.value,
+            )
         return WaitPollOnceResult(
-            observed=len(records),
+            observed=len(claimed_records),
             not_ready=not_ready,
             resolved=resolved,
             lost=lost,
             abandoned=abandoned,
             adapter_errors=adapter_errors,
+            claim_conflicts=claim_conflicts,
         )
 
+    def _claim_next_wait_record(self) -> _ClaimedWaitRecord | StateMutationStatus | None:
+        """claim 下一条 eligible wait record。
 
-def _read_wait_records_for_poll_observation(
-    transaction: HostTransaction,
-) -> tuple[WaitRecordRow, ...]:
-    """读取 poller 可观察 wait records。
+        :returns: 成功时返回 claimed wait；无候选时返回 ``None``；CAS 冲突时返回状态。
+        """
 
-    :param transaction: Host transaction。
-    :returns: wait record 元组。
-    """
+        now = self._clock.now()
+        claim_id = _new_poll_claim_id()
+        status, record = self._transaction_runner.run_write(
+            _ClaimWaitRecordOperation(
+                claim_id=claim_id,
+                owner_id=self._owner_id,
+                now=format_utc_timestamp(now),
+                claim_expires_at=format_utc_timestamp(
+                    now + timedelta(seconds=_POLL_CLAIM_TTL_SECONDS)
+                ),
+            )
+        )
+        if status is StateMutationStatus.UPDATED:
+            if record is None:
+                raise RuntimeError("poll claim updated without row")
+            return _ClaimedWaitRecord(record=record, claim_id=claim_id)
+        if status is StateMutationStatus.NOT_FOUND:
+            return None
+        return status
 
-    return read_wait_records_for_poll_observation(transaction)
+    def _abandon_cancelled_wait(
+        self, record: WaitRecordRow, claim_id: str
+    ) -> tuple[int, int, int]:
+        """处理已取消 wait 的 best-effort abandon。
+
+        :param record: 已 claim 的 cancelled wait record。
+        :param claim_id: 当前 claim id。
+        :returns: abandoned、adapter_errors、claim_conflicts 三元组。
+        """
+
+        adapter = self._adapter_registry.resolve_adapter(record.adapter_key)
+        if adapter is None:
+            _LOGGER.warning(
+                "wait poll adapter not registered; retrying cancelled wait_id=%s "
+                "adapter_key=%s",
+                record.wait_id,
+                record.adapter_key.value,
+            )
+            return (
+                0,
+                1,
+                self._release_with_backoff(
+                    record,
+                    claim_id,
+                    outcome=WaitPollLastOutcome.MISSING_ADAPTER,
+                    error_code=_POLL_ERROR_CODE_MISSING_ADAPTER,
+                    error_message=record.adapter_key.value,
+                ),
+            )
+        try:
+            adapter.abandon_wait(record)
+        except Exception as exc:
+            _LOGGER.warning(
+                "wait adapter abandon failed; continuing wait_id=%s "
+                "adapter_key=%s error_type=%s",
+                record.wait_id,
+                record.adapter_key.value,
+                exc.__class__.__name__,
+            )
+            return (
+                0,
+                1,
+                self._release_with_backoff(
+                    record,
+                    claim_id,
+                    outcome=WaitPollLastOutcome.ABANDON_ERROR,
+                    error_code=_POLL_ERROR_CODE_ABANDON_EXCEPTION,
+                    error_message=exc.__class__.__name__,
+                ),
+            )
+        now = format_utc_timestamp(self._clock.now())
+        status = self._transaction_runner.run_write(
+            _MarkWaitRecordAbandonedOperation(
+                wait_id=record.wait_id,
+                claim_id=claim_id,
+                abandoned_at=now,
+                updated_at=now,
+            )
+        )
+        if status is StateMutationStatus.UPDATED:
+            return 1, 0, 0
+        return 0, 0, 1
+
+    def _resolve_claimed_wait(
+        self, record: WaitRecordRow, poll_result: WaitPollReady | WaitPollLost
+    ) -> StateMutationStatus:
+        """把 ready/lost poll 结果交给公共 ``resolve_wait`` pipeline。
+
+        :param record: 已 claim 的 wait record。
+        :param poll_result: ready 或 lost poll 结果。
+        :returns: ``UPDATED`` 表示 resolve 成功；``CAS_LOST`` 表示异常后已确认终态。
+        """
+
+        request = ResolveWaitRequest(
+            context=self._context,
+            idempotency_key=_poll_idempotency_key(record),
+            outcome=poll_result.outcome,
+            source=WaitResolutionSource.POLL,
+            observed_at=self._clock.now(),
+        )
+        try:
+            self._resolver.resolve_wait(record.wait_id, request)
+            return StateMutationStatus.UPDATED
+        except Exception as exc:
+            _LOGGER.warning(
+                "wait poll resolve failed; continuing wait_id=%s "
+                "adapter_key=%s error_type=%s",
+                record.wait_id,
+                record.adapter_key.value,
+                exc.__class__.__name__,
+            )
+            latest = self._transaction_runner.run_read(
+                _ReadWaitRecordOperation(record.wait_id)
+            )
+            if latest is not None and latest.status in (
+                WaitRecordStatus.RESOLVED,
+                WaitRecordStatus.FAILED,
+                WaitRecordStatus.LOST,
+            ):
+                return StateMutationStatus.CAS_LOST
+            return StateMutationStatus.INVALID_STATE
+
+    def _release_with_backoff(
+        self,
+        record: WaitRecordRow,
+        claim_id: str,
+        *,
+        outcome: WaitPollLastOutcome,
+        error_code: str | None,
+        error_message: str | None,
+    ) -> int:
+        """释放 claim 并写入 durable backoff。
+
+        :param record: 已 claim 的 wait record。
+        :param claim_id: 当前 claim id。
+        :param outcome: 最近一次 poller outcome。
+        :param error_code: 最近一次错误码。
+        :param error_message: 最近一次错误消息。
+        :returns: CAS 冲突计数。
+        """
+
+        now = self._clock.now()
+        next_attempt = record.poll_backoff_attempt + 1
+        status = self._transaction_runner.run_write(
+            _ReleaseWaitRecordClaimOperation(
+                wait_id=record.wait_id,
+                claim_id=claim_id,
+                next_observe_at=format_utc_timestamp(
+                    now + timedelta(seconds=_backoff_delay_seconds(next_attempt))
+                ),
+                backoff_attempt=next_attempt,
+                last_outcome=outcome,
+                last_error_code=error_code,
+                last_error_message=error_message,
+                updated_at=format_utc_timestamp(now),
+            )
+        )
+        if status is StateMutationStatus.UPDATED:
+            return 0
+        return 1
 
 
 def _poll_idempotency_key(wait_record: WaitRecordRow) -> str:
@@ -533,6 +859,40 @@ def _poll_idempotency_key(wait_record: WaitRecordRow) -> str:
         }
     ).removeprefix("sha256:")
     return f"poll-{digest}"
+
+
+def _backoff_delay_seconds(backoff_attempt: int) -> float:
+    """计算 poll retry backoff delay。
+
+    :param backoff_attempt: 即将写入的 backoff attempt 计数。
+    :returns: delay 秒数。
+    :raises ValueError: ``backoff_attempt`` 非正数时抛出。
+    """
+
+    if backoff_attempt <= 0:
+        raise ValueError("backoff_attempt must be positive")
+    delay = _POLL_BACKOFF_INITIAL_DELAY_SECONDS * (
+        _POLL_BACKOFF_MULTIPLIER ** (backoff_attempt - 1)
+    )
+    return min(delay, _POLL_BACKOFF_MAX_DELAY_SECONDS)
+
+
+def _new_poll_claim_id() -> str:
+    """生成 poll claim id。
+
+    :returns: poll claim id。
+    """
+
+    return f"poll-claim-{uuid4()}"
+
+
+def _new_poller_owner_id() -> str:
+    """生成 poller owner id。
+
+    :returns: poller owner id。
+    """
+
+    return f"poller-{uuid4()}"
 
 
 __all__ = [

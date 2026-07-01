@@ -25,8 +25,8 @@ from dayu.host import (
 from dayu.host.command import HostCommandHandle, create_host_command_handle
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.schema import TABLE_HOST_WAIT_RECORDS
-from dayu.host.durable.state import WaitRecordRow, WaitRecordStatus
-from dayu.host.durable.transaction import HostTransaction
+from dayu.host.durable.state import WaitPollLastOutcome, WaitRecordRow, WaitRecordStatus
+from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.wait_adapter import (
     WaitPollAdapter,
     WaitPollAdapterRegistration,
@@ -92,6 +92,7 @@ class _FailingResolveResolver:
         """
 
         self.calls: list[str] = []
+        self.idempotency_keys: list[str] = []
 
     def resolve_wait(self, wait_id: str, request: ResolveWaitRequest) -> RunSnapshot:
         """记录调用并模拟 resolve_wait 失败。
@@ -102,9 +103,34 @@ class _FailingResolveResolver:
         :raises RuntimeError: 始终抛出，用于验证 poller 异常隔离。
         """
 
-        del request
         self.calls.append(wait_id)
+        self.idempotency_keys.append(request.idempotency_key)
         raise RuntimeError("resolve wait failed")
+
+
+class _RecordingPublicCommandResolver:
+    """记录 idempotency key 后调用 public ``resolve_wait`` 的 resolver。"""
+
+    def __init__(self, host: HostCommandHandle) -> None:
+        """初始化 resolver。
+
+        :param host: Host command handle。
+        :returns: ``None``。
+        """
+
+        self._host = host
+        self.idempotency_keys: list[str] = []
+
+    def resolve_wait(self, wait_id: str, request: ResolveWaitRequest) -> RunSnapshot:
+        """记录调用并转发给 public resolve_wait。
+
+        :param wait_id: wait id。
+        :param request: resolve wait request。
+        :returns: Run snapshot。
+        """
+
+        self.idempotency_keys.append(request.idempotency_key)
+        return resolve_wait(self._host, wait_id, request)
 
 
 class _SequenceAdapter:
@@ -176,6 +202,66 @@ class _AbandonValueErrorThenNotReadyAdapter:
         raise ValueError("adapter abandon failed")
 
 
+class _AbandonClaimStealingAdapter:
+    """abandon 调用中制造 stale claim CAS 冲突的 adapter。"""
+
+    def __init__(self, transaction_runner: HostTransactionRunner) -> None:
+        """初始化 adapter。
+
+        :param transaction_runner: Host transaction runner。
+        :returns: ``None``。
+        """
+
+        self._transaction_runner = transaction_runner
+        self.abandoned: list[str] = []
+
+    def poll_wait(self, wait_record: WaitRecordRow) -> WaitPollResult:
+        """本 adapter 不应处理 waiting poll。
+
+        :param wait_record: wait record。
+        :returns: 永不返回。
+        :raises AssertionError: 被错误调用时抛出。
+        """
+
+        raise AssertionError(f"unexpected poll for {wait_record.wait_id}")
+
+    def abandon_wait(self, wait_record: WaitRecordRow) -> None:
+        """篡改当前 row claim，模拟另一路 poller 先写入。
+
+        :param wait_record: wait record。
+        :returns: ``None``。
+        """
+
+        self.abandoned.append(wait_record.wait_id)
+
+        def operation(transaction: HostTransaction) -> None:
+            """替换 wait row claim。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            transaction.execute(
+                f"""
+                UPDATE {TABLE_HOST_WAIT_RECORDS}
+                SET poll_claim_id = ?,
+                    poll_claim_owner_id = ?,
+                    poll_claimed_at = ?,
+                    poll_claim_expires_at = ?
+                WHERE wait_id = ?
+                """,
+                (
+                    "claim-stolen",
+                    "poller-stolen",
+                    "2026-05-16T02:00:00.000000Z",
+                    "2026-05-16T02:05:00.000000Z",
+                    wait_record.wait_id,
+                ),
+            )
+
+        self._transaction_runner.run_write(operation)
+
+
 def test_poll_adapter_ready_result_resolves_wait(
     tmp_path: Path,
 ) -> None:
@@ -209,7 +295,7 @@ def test_poll_adapter_ready_result_resolves_wait(
 def test_poll_adapter_not_ready_leaves_wait_active(
     tmp_path: Path,
 ) -> None:
-    """poll adapter not-ready 不调用 resolve_wait。"""
+    """poll adapter not-ready 不调用 resolve_wait，并写入 durable backoff。"""
 
     host = create_host_command_handle(_options(tmp_path))
     try:
@@ -220,9 +306,14 @@ def test_poll_adapter_not_ready_leaves_wait_active(
         result = poller.poll_once()
 
         wait_record = _read_wait(host._transaction_runner(), seeded.wait_id)
+        second = poller.poll_once()
         assert result.not_ready == 1
+        assert second.observed == 0
         assert adapter.poll_count == 1
         assert wait_record.status is WaitRecordStatus.WAITING
+        assert wait_record.poll_next_observe_at is not None
+        assert wait_record.poll_backoff_attempt == 1
+        assert wait_record.poll_last_outcome is WaitPollLastOutcome.NOT_READY
     finally:
         host.close()
 
@@ -272,7 +363,7 @@ def test_poll_adapter_lost_result_closes_run(
 def test_cancelled_poll_wait_is_abandoned_once_without_resolve(
     tmp_path: Path,
 ) -> None:
-    """cancelled poll wait 只通知 adapter abandon 一次，不调用 resolve_wait。"""
+    """cancelled poll wait durable abandon 后新 poller 不重复 abandon。"""
 
     host = create_host_command_handle(_options(tmp_path))
     try:
@@ -291,14 +382,16 @@ def test_cancelled_poll_wait_is_abandoned_once_without_resolve(
         poller = _poller(host, adapter, seeded.wait_id)
 
         result = poller.poll_once()
-        second = poller.poll_once()
+        second = _poller(host, adapter, seeded.wait_id).poll_once()
 
         wait_record = _read_wait(host._transaction_runner(), seeded.wait_id)
         assert result.abandoned == 1
         assert second.abandoned == 0
+        assert second.observed == 0
         assert adapter.poll_count == 0
         assert adapter.abandoned == [seeded.wait_id]
         assert wait_record.status is WaitRecordStatus.CANCELLED
+        assert wait_record.poll_abandoned_at is not None
     finally:
         host.close()
 
@@ -325,9 +418,14 @@ def test_missing_poll_adapter_registration_logs_warning(
 
         assert result.observed == 1
         assert result.adapter_errors == 1
-        assert "wait poll adapter not registered; skipping" in caplog.text
+        updated_wait_record = _read_wait(host._transaction_runner(), seeded.wait_id)
+        assert "wait poll adapter not registered; retrying" in caplog.text
         assert seeded.wait_id in caplog.text
         assert wait_record.adapter_key.value in caplog.text
+        assert updated_wait_record.poll_next_observe_at is not None
+        assert updated_wait_record.poll_backoff_attempt == 1
+        assert updated_wait_record.poll_last_outcome is WaitPollLastOutcome.MISSING_ADAPTER
+        assert updated_wait_record.poll_last_error_code == "missing_adapter"
     finally:
         host.close()
 
@@ -450,8 +548,161 @@ def test_failed_cancelled_wait_abandon_is_retried_next_poll(
         assert first.abandoned == 0
         assert second.abandoned == 0
         assert first.adapter_errors == 1
-        assert second.adapter_errors == 1
-        assert adapter.abandoned == [seeded.wait_id, seeded.wait_id]
+        assert second.adapter_errors == 0
+        assert second.observed == 0
+        assert adapter.abandoned == [seeded.wait_id]
+    finally:
+        host.close()
+
+
+def test_active_poll_claim_suppresses_second_poller_adapter_call(
+    tmp_path: Path,
+) -> None:
+    """未过期 poll claim 存在时，另一个 poller 不调用 adapter。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        _set_poll_claim(
+            host,
+            wait_id=seeded.wait_id,
+            claim_id="claim-active",
+            expires_at="2026-05-16T02:05:00.000000Z",
+        )
+        adapter = _SequenceAdapter((WaitPollNotReady(),))
+        poller = _poller(host, adapter, seeded.wait_id)
+
+        result = poller.poll_once()
+
+        assert result.observed == 0
+        assert adapter.poll_count == 0
+    finally:
+        host.close()
+
+
+def test_expired_poll_claim_allows_retry(tmp_path: Path) -> None:
+    """已过期 poll claim 可被新 poller 接管并调用 adapter。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        _set_poll_claim(
+            host,
+            wait_id=seeded.wait_id,
+            claim_id="claim-expired",
+            expires_at="2026-05-16T01:59:00.000000Z",
+        )
+        adapter = _SequenceAdapter((WaitPollNotReady(),))
+        poller = _poller(host, adapter, seeded.wait_id)
+
+        result = poller.poll_once()
+
+        assert result.observed == 1
+        assert result.not_ready == 1
+        assert adapter.poll_count == 1
+    finally:
+        host.close()
+
+
+def test_resolve_failure_releases_with_backoff_and_reuses_idempotency_key(
+    tmp_path: Path,
+) -> None:
+    """resolve 失败释放 claim；到期后重试使用同一 poll idempotency key。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        adapter = _SequenceAdapter(
+            (
+                WaitPollReady(
+                    ResolveWaitCompletedOutcome(
+                        result=ToolResultSuccess(ok=True, value={"ready": True}, meta=None),
+                        payload_ref=None,
+                    )
+                ),
+                WaitPollReady(
+                    ResolveWaitCompletedOutcome(
+                        result=ToolResultSuccess(ok=True, value={"ready": True}, meta=None),
+                        payload_ref=None,
+                    )
+                ),
+            )
+        )
+        failing_resolver = _FailingResolveResolver()
+        failing_poller = WaitPoller(
+            transaction_runner=host._transaction_runner(),
+            adapter_registry=WaitPollAdapterRegistry(
+                (
+                    WaitPollAdapterRegistration(
+                        adapter_key=_read_wait(host._transaction_runner(), seeded.wait_id).adapter_key,
+                        adapter=adapter,
+                    ),
+                )
+            ),
+            resolver=failing_resolver,
+            context=_context("poller-resolve-failure"),
+            clock=_FixedClock(),
+        )
+
+        failed = failing_poller.poll_once()
+        wait_after_failure = _read_wait(host._transaction_runner(), seeded.wait_id)
+        _force_wait_poll_due(host, seeded.wait_id)
+        recording_resolver = _RecordingPublicCommandResolver(host)
+        retry_poller = WaitPoller(
+            transaction_runner=host._transaction_runner(),
+            adapter_registry=WaitPollAdapterRegistry(
+                (
+                    WaitPollAdapterRegistration(
+                        adapter_key=wait_after_failure.adapter_key,
+                        adapter=adapter,
+                    ),
+                )
+            ),
+            resolver=recording_resolver,
+            context=_context("poller-resolve-retry"),
+            clock=_FixedClock(),
+        )
+        retried = retry_poller.poll_once()
+
+        assert failed.adapter_errors == 1
+        assert wait_after_failure.poll_claim_id is None
+        assert wait_after_failure.poll_next_observe_at is not None
+        assert wait_after_failure.poll_last_outcome is WaitPollLastOutcome.RESOLVE_ERROR
+        assert retried.resolved == 1
+        assert failing_resolver.idempotency_keys == recording_resolver.idempotency_keys
+    finally:
+        host.close()
+
+
+def test_abandon_cas_conflict_leaves_cancelled_wait_retryable(
+    tmp_path: Path,
+) -> None:
+    """abandon CAS 冲突不写 poll_abandoned_at，后续仍可重试 cancelled wait。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        cancel_run(
+            host,
+            seeded.run_id,
+            CancelRunRequest(
+                context=_context("poll-cancel-abandon-conflict"),
+                client_request_id="poll-cancel-abandon-conflict",
+                reason="user_cancel",
+                mode=CancelMode.GRACEFUL,
+            ),
+        )
+        adapter = _AbandonClaimStealingAdapter(host._transaction_runner())
+        poller = _poller(host, adapter, seeded.wait_id)
+
+        result = poller.poll_once()
+        wait_record = _read_wait(host._transaction_runner(), seeded.wait_id)
+
+        assert result.abandoned == 0
+        assert result.claim_conflicts == 1
+        assert adapter.abandoned == [seeded.wait_id]
+        assert wait_record.poll_abandoned_at is None
+        assert wait_record.poll_claim_id == "claim-stolen"
     finally:
         host.close()
 
@@ -572,6 +823,77 @@ def _insert_followup_wait_record(
                 WaitRecordStatus.WAITING.value,
                 source_wait_id,
             ),
+        )
+
+    host._transaction_runner().run_write(operation)
+
+
+def _set_poll_claim(
+    host: HostCommandHandle,
+    *,
+    wait_id: str,
+    claim_id: str,
+    expires_at: str,
+) -> None:
+    """直接设置 wait row poll claim，用于构造 claim takeover 场景。
+
+    :param host: Host command handle。
+    :param wait_id: wait record id。
+    :param claim_id: poll claim id。
+    :param expires_at: claim 过期时间。
+    :returns: ``None``。
+    """
+
+    def operation(transaction: HostTransaction) -> None:
+        """写入 poll claim 字段。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        transaction.execute(
+            f"""
+            UPDATE {TABLE_HOST_WAIT_RECORDS}
+            SET poll_claim_id = ?,
+                poll_claim_owner_id = ?,
+                poll_claimed_at = ?,
+                poll_claim_expires_at = ?
+            WHERE wait_id = ?
+            """,
+            (
+                claim_id,
+                "poller-test-owner",
+                "2026-05-16T02:00:00.000000Z",
+                expires_at,
+                wait_id,
+            ),
+        )
+
+    host._transaction_runner().run_write(operation)
+
+
+def _force_wait_poll_due(host: HostCommandHandle, wait_id: str) -> None:
+    """清理 poll_next_observe_at，让 wait 可立即重试。
+
+    :param host: Host command handle。
+    :param wait_id: wait record id。
+    :returns: ``None``。
+    """
+
+    def operation(transaction: HostTransaction) -> None:
+        """清理 next observe 时间。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        transaction.execute(
+            f"""
+            UPDATE {TABLE_HOST_WAIT_RECORDS}
+            SET poll_next_observe_at = NULL
+            WHERE wait_id = ?
+            """,
+            (wait_id,),
         )
 
     host._transaction_runner().run_write(operation)

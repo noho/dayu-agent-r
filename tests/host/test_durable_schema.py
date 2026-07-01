@@ -832,9 +832,9 @@ def test_normalize_schema_sql_only_strips_and_collapses_whitespace() -> None:
 
 
 def test_host_schema_version_is_query_index_version() -> None:
-    """当前 committed Host schema version 是 durable query index fresh schema 16。"""
+    """当前 committed Host schema version 是 wait poll claim fresh schema 17。"""
 
-    assert HOST_SCHEMA_VERSION == 16
+    assert HOST_SCHEMA_VERSION == 17
 
 
 def test_tool_call_request_payload_descriptor_kinds_are_stable() -> None:
@@ -1198,12 +1198,49 @@ def test_wait_record_table_and_indexes_are_created(tmp_path: Path) -> None:
             assert INDEX_HOST_WAIT_RECORDS_ONE_ACTIVE_PER_RUN in wait_index_names
             assert INDEX_HOST_WAIT_RECORDS_ACTIVE_POLL in wait_index_names
             assert INDEX_HOST_WAIT_RECORDS_EXTERNAL_JOB in wait_index_names
+            wait_columns = {
+                str(row[1]): str(row[2])
+                for row in connection.execute(
+                    f"PRAGMA table_info({TABLE_HOST_WAIT_RECORDS})"
+                ).fetchall()
+            }
+            for column_name in (
+                "poll_claim_id",
+                "poll_claim_owner_id",
+                "poll_claimed_at",
+                "poll_claim_expires_at",
+                "poll_next_observe_at",
+                "poll_last_outcome",
+                "poll_last_error_code",
+                "poll_last_error_message",
+                "poll_abandoned_at",
+            ):
+                assert wait_columns[column_name] == "TEXT"
+            assert wait_columns["poll_backoff_attempt"] == "INTEGER"
 
             active_index_row = next(
                 row for row in wait_indexes if str(row[1]) == INDEX_HOST_WAIT_RECORDS_ONE_ACTIVE_PER_RUN
             )
             assert int(active_index_row[2]) == 1
             assert int(active_index_row[4]) == 1
+            poll_index_columns = connection.execute(
+                f"PRAGMA index_info({INDEX_HOST_WAIT_RECORDS_ACTIVE_POLL})"
+            ).fetchall()
+            assert tuple(str(row[2]) for row in poll_index_columns) == (
+                "resume_policy",
+                "status",
+                "poll_next_observe_at",
+                "poll_claim_expires_at",
+                "created_event_sequence",
+                "wait_id",
+            )
+            table_sql = _schema_sql(
+                connection,
+                _SQLITE_OBJECT_TYPE_TABLE,
+                TABLE_HOST_WAIT_RECORDS,
+            )
+            assert "poll_claim_id IS NULL" in table_sql
+            assert "poll_abandoned_at IS NULL OR status = 'cancelled'" in table_sql
         finally:
             connection.close()
 

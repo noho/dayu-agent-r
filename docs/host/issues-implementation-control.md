@@ -155,11 +155,11 @@ git push -u github <branch>
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | implementation |
-| implementation status | WU-WAIT-01 / GitHub Issue #89 merged via PR #163 on 2026-07-01; WU-WAIT-02 / GitHub Issue #90 accepted plan commit created; entering implementation Slice 1. |
+| gate | accepted-slice |
+| implementation status | WU-WAIT-01 / GitHub Issue #89 merged via PR #163 on 2026-07-01; WU-WAIT-02 / GitHub Issue #90 implementation Slice 1 passed two-agent code review and is ready for accepted slice commit. |
 | active work unit | WU-WAIT-02 |
 | default next work unit | WU-WAIT-02 |
-| next entry point | Dispatch AgentCodex for WU-WAIT-02 implementation Slice 1: durable poll claim and backoff primitive. |
+| next entry point | Create accepted Slice 1 commit for WU-WAIT-02, then dispatch AgentCodex for implementation Slice 2: backoff-aware poller supervisor and lifecycle. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | Active/backlog issue owners retained here: #129 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #112 / #20 / #90 / #92 / #80 / #115, plus residual-risk destinations #121 / #122. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`; #63 / #89 / #111 / #130 / #133 are no longer active implementation owners. |
 | blocking open questions | None. |
@@ -252,7 +252,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CTX-04 | pending-low | Run-level compaction concurrency boundary | GitHub Issue #112 | 低优先级设计核对：不引入 EventLog fencing；证明当前状态机 / request 计数 / stale recheck 足够，或在未来并发模型需要时设计 EventLog 外的最小 pointer / CAS。 |
 | WU-CTX-01 | pending | Provider tokenizer / sizing adapter | GitHub Issue #20 | provider/model-aware context sizing；仍有效，需先收敛 budget policy 设计表述 |
 | WU-WAIT-01 | completed | Callback endpoint / auth / replay | GitHub Issue #89 / PR #163 | PR 163 merged on 2026-07-01; not an active implementation entry point. 当前实现提供 Host wait callback typed boundary 与 Service framework-neutral mapper；不包含真实 HTTP route、secret backend、HMAC / bearer verifier、production poller、physical cancel、Engine contract 或 UI surface。 |
-| WU-WAIT-02 | planning | Production poller loop / backoff / fencing / retry | GitHub Issue #90 | Plan artifact `docs/host/wu-wait-02-production-poller-plan.md` created; current gate is two-agent plan review. |
+| WU-WAIT-02 | accepted-slice | Production poller loop / backoff / fencing / retry | GitHub Issue #90 | Slice 1 code review passed; current gate is accepted Slice 1 commit. |
 | WU-WAIT-03 | pending | External job physical cancel / revoke / abandon | GitHub Issue #92 / #87 umbrella | WAITING external job lifecycle |
 | WU-WAIT-04 | pending-prerequisite | UI / Service production-grade awaiting E2E smoke | depends on #89 / #90 / #92 | dependent smoke，不独立实施 |
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
@@ -262,7 +262,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 
 ### 状态
 
-GitHub Issue #90 当前为 OPEN。WU-WAIT-01 / GitHub Issue #89 已通过 PR #163 于 2026-07-01 merge 到 `main`，本文档先前记录的 “等待 PR #163 后进入 WU-WAIT-02” 前置条件已满足。Goal confirmation 已由用户确认。Plan artifact 为 `docs/host/wu-wait-02-production-poller-plan.md`。Plan review artifacts 为 `docs/reviews/plan-review-20260701-135815.md` 与 `docs/reviews/plan-review-20260701-140124.md`，controller adjudication 为 `docs/reviews/wu-wait-02-plan-review-controller-adjudication.md`。Plan-fix artifact 为 `docs/reviews/wu-wait-02-plan-fix-codex.md`。Plan re-review artifacts 为 `docs/reviews/plan-review-20260701-141039.md` 与 `docs/reviews/plan-review-20260701-141200.md`，controller adjudication 为 `docs/reviews/wu-wait-02-plan-rereview-controller-adjudication.md`。两路 re-review 均通过，所有 accepted findings 已修复。Accepted plan commit 为 `350e1dbf`。当前进入 implementation Slice 1 gate。Review / implementation / fix / re-review artifact 放在 `docs/reviews/` 下。
+GitHub Issue #90 当前为 OPEN。WU-WAIT-01 / GitHub Issue #89 已通过 PR #163 于 2026-07-01 merge 到 `main`，本文档先前记录的 “等待 PR #163 后进入 WU-WAIT-02” 前置条件已满足。Goal confirmation 已由用户确认。Plan artifact 为 `docs/host/wu-wait-02-production-poller-plan.md`。Plan review artifacts 为 `docs/reviews/plan-review-20260701-135815.md` 与 `docs/reviews/plan-review-20260701-140124.md`，controller adjudication 为 `docs/reviews/wu-wait-02-plan-review-controller-adjudication.md`。Plan-fix artifact 为 `docs/reviews/wu-wait-02-plan-fix-codex.md`。Plan re-review artifacts 为 `docs/reviews/plan-review-20260701-141039.md` 与 `docs/reviews/plan-review-20260701-141200.md`，controller adjudication 为 `docs/reviews/wu-wait-02-plan-rereview-controller-adjudication.md`。两路 re-review 均通过，所有 accepted findings 已修复。Accepted plan commit 为 `350e1dbf`。Slice 1 implementation artifact 为 `docs/reviews/wu-wait-02-slice1-implementation-codex.md`；AgentCodex reported focused Host durable / wait adapter tests 102 passed, pyright 0 errors, and `git diff --check` passed. Controller reran the same focused tests with 102 passed, pyright with 0 errors, and `git diff --check` passed. Slice 1 code review artifacts 为 `docs/reviews/code-review-20260701-143921.md` 与 `docs/reviews/code-review-20260701-144036.md`；controller adjudication 为 `docs/reviews/wu-wait-02-slice1-code-review-controller-adjudication.md`。两路 code review 均通过，无 required current fix；DS low-severity items 已裁决为 non-blocking / Slice 2 optional coverage。当前进入 accepted Slice 1 commit gate。Review / implementation / fix / re-review artifact 放在 `docs/reviews/` 下。
 
 ### 设计与代码核对
 
