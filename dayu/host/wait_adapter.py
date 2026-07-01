@@ -918,8 +918,6 @@ class WaitPoller:
                 ),
                 0,
             )
-        if self._lifecycle_gate.is_closed():
-            return 0, 0, self._release_shutdown_skipped(record, claim_id), 1
         now = format_utc_timestamp(self._clock.now())
         status = self._transaction_runner.run_write(
             _MarkWaitRecordAbandonedOperation(

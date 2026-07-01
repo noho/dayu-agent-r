@@ -31,6 +31,7 @@ from dayu.host.wait_adapter import (
     WaitPollAdapter,
     WaitPollAdapterRegistration,
     WaitPollAdapterRegistry,
+    WaitPollLifecycleGate,
     WaitPollLost,
     WaitPollNotReady,
     WaitPollReady,
@@ -262,6 +263,60 @@ class _AbandonClaimStealingAdapter:
         self._transaction_runner.run_write(operation)
 
 
+class _MutableLifecycleGate:
+    """测试用可变 lifecycle gate。"""
+
+    def __init__(self) -> None:
+        """初始化为未关闭状态。
+
+        :returns: ``None``。
+        """
+
+        self.closed = False
+
+    def is_closed(self) -> bool:
+        """返回当前关闭状态。
+
+        :returns: 已关闭时返回 ``True``。
+        """
+
+        return self.closed
+
+
+class _CloseGateDuringAbandonAdapter:
+    """abandon 成功返回前关闭 lifecycle gate 的 adapter。"""
+
+    def __init__(self, lifecycle_gate: _MutableLifecycleGate) -> None:
+        """初始化 adapter。
+
+        :param lifecycle_gate: 将在 abandon 成功期间关闭的 gate。
+        :returns: ``None``。
+        """
+
+        self._lifecycle_gate = lifecycle_gate
+        self.abandoned: list[str] = []
+
+    def poll_wait(self, wait_record: WaitRecordRow) -> WaitPollResult:
+        """本 adapter 不应处理 waiting poll。
+
+        :param wait_record: wait record。
+        :returns: 永不返回。
+        :raises AssertionError: 被错误调用时抛出。
+        """
+
+        raise AssertionError(f"unexpected poll for {wait_record.wait_id}")
+
+    def abandon_wait(self, wait_record: WaitRecordRow) -> None:
+        """记录 abandon 成功并关闭 lifecycle gate。
+
+        :param wait_record: wait record。
+        :returns: ``None``。
+        """
+
+        self.abandoned.append(wait_record.wait_id)
+        self._lifecycle_gate.closed = True
+
+
 def test_poll_adapter_ready_result_resolves_wait(
     tmp_path: Path,
 ) -> None:
@@ -392,6 +447,48 @@ def test_cancelled_poll_wait_is_abandoned_once_without_resolve(
         assert adapter.abandoned == [seeded.wait_id]
         assert wait_record.status is WaitRecordStatus.CANCELLED
         assert wait_record.poll_abandoned_at is not None
+    finally:
+        host.close()
+
+
+def test_cancelled_abandon_success_marks_abandoned_when_close_gate_closes(
+    tmp_path: Path,
+) -> None:
+    """abandon 外部成功后 close gate 关闭也必须先写 durable abandoned mark。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        cancel_run(
+            host,
+            seeded.run_id,
+            CancelRunRequest(
+                context=_context("poll-cancel-close-after-abandon"),
+                client_request_id="poll-cancel-close-after-abandon",
+                reason="user_cancel",
+                mode=CancelMode.GRACEFUL,
+            ),
+        )
+        lifecycle_gate = _MutableLifecycleGate()
+        adapter = _CloseGateDuringAbandonAdapter(lifecycle_gate)
+        poller = _poller(
+            host,
+            adapter,
+            seeded.wait_id,
+            lifecycle_gate=lifecycle_gate,
+        )
+
+        result = poller.poll_once()
+        second = _poller(host, adapter, seeded.wait_id).poll_once()
+
+        wait_record = _read_wait(host._transaction_runner(), seeded.wait_id)
+        assert result.abandoned == 1
+        assert result.shutdown_skipped == 0
+        assert result.claim_conflicts == 0
+        assert second.observed == 0
+        assert adapter.abandoned == [seeded.wait_id]
+        assert wait_record.poll_abandoned_at is not None
+        assert wait_record.poll_claim_id is None
     finally:
         host.close()
 
@@ -708,13 +805,18 @@ def test_abandon_cas_conflict_leaves_cancelled_wait_retryable(
 
 
 def _poller(
-    host: HostCommandHandle, adapter: WaitPollAdapter, wait_id: str
+    host: HostCommandHandle,
+    adapter: WaitPollAdapter,
+    wait_id: str,
+    *,
+    lifecycle_gate: WaitPollLifecycleGate | None = None,
 ) -> WaitPoller:
     """构造测试 poller。
 
     :param host: Host command handle。
     :param adapter: poll adapter。
     :param wait_id: 测试 wait id。
+    :param lifecycle_gate: 可选 lifecycle gate。
     :returns: poller。
     """
 
@@ -733,6 +835,7 @@ def _poller(
         resolver=_PublicCommandResolver(host),
         context=_context("poller"),
         clock=_FixedClock(),
+        lifecycle_gate=lifecycle_gate,
     )
 
 
