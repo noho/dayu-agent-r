@@ -182,6 +182,7 @@ class WaitPollLastOutcome(StrEnum):
     MISSING_ADAPTER = "missing_adapter"
     RESOLVE_ERROR = "resolve_error"
     ABANDON_ERROR = "abandon_error"
+    SHUTDOWN_SKIPPED = "shutdown_skipped"
     ABANDONED = "abandoned"
 
 

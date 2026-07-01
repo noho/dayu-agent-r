@@ -832,9 +832,9 @@ def test_normalize_schema_sql_only_strips_and_collapses_whitespace() -> None:
 
 
 def test_host_schema_version_is_query_index_version() -> None:
-    """当前 committed Host schema version 是 wait poll claim fresh schema 17。"""
+    """当前 committed Host schema version 是 wait poll shutdown fresh schema 18。"""
 
-    assert HOST_SCHEMA_VERSION == 17
+    assert HOST_SCHEMA_VERSION == 18
 
 
 def test_tool_call_request_payload_descriptor_kinds_are_stable() -> None:

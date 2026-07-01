@@ -31,7 +31,7 @@ from dayu.host.api import (
 )
 from dayu.host.durable.errors import HostSchemaMismatchError
 
-HOST_SCHEMA_VERSION = 17
+HOST_SCHEMA_VERSION = 18
 """当前 Host durable SQLite schema version。"""
 
 TABLE_EVENT_LOG = "event_log"
@@ -720,6 +720,7 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_WAIT_RECORDS} (
         'missing_adapter',
         'resolve_error',
         'abandon_error',
+        'shutdown_skipped',
         'abandoned'
       )
   ),
