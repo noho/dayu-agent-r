@@ -86,7 +86,7 @@ flowchart TD
 - `dayu.config`：包内默认 `models`、`execution_profiles`、`host_runtime`、`runtime_lanes`、`tool_discovery` 和 prompt / scene 资产。
 - `dayu.service.host_assembly`：从 runtime config、prepared scene、工具发现和 secret mapping 组合 Host construction-time inputs 与 per-run request。
 - `dayu.service.fins_direct`：从 product entrypoint 显式参数构造 Fins download / preprocess / upload typed request，并把 Fins direct runtime events 以 `AsyncIterator[FinsEvent]` 形式交给调用方消费。
-- `dayu.host`：public Host handle、durable store、admission、dispatch、EngineEvent ingest、ToolRuntime、waiting、context compaction、Conversation Memory、projection、outbox、purge、startup recovery。
+- `dayu.host`：public Host handle、durable store、admission、dispatch、EngineEvent ingest、ToolRuntime、waiting、production wait poller、context compaction、Conversation Memory、projection、outbox、purge、startup recovery。
 - `dayu.engine`：`run_agent_messages`、`run_agent_and_wait`、Agent loop、Runner 协议归一、provider adapter、tool loop、length continuation、fallback、provider error classification 和 EngineEvent contract。
 - `dayu.tools`：业务工具 provider 与工具实现，输出 current `ToolDefinition` / `ToolBundle`。
 - `dayu.fins`：财报 storage repository、read runtime、ingestion runtime、download / preprocess / process / upload direct stream 与 awaiting observation foundation、processors、Fins tools provider。
@@ -96,7 +96,7 @@ flowchart TD
 
 ### Service 装配
 
-Service 从 `dayu.runtime.location` 解析 workspace 与包内资产位置，用 `ConfigLoader` 读取 typed config，用 `ToolsDiscovery` 聚合业务 `ToolBundle`，用 `ScenePrepare` 拼接 system prompt、工具选择和 AgentPolicy override，再通过 `compose_open_host_options(...)` / `compose_submit_followup_request(...)` 或 `compose_submit_followup_request_with_overrides(...)` 生成 Host public typed inputs。Host 不接收 raw config patch、profile id 或隐式 lookup。面向 product entrypoint 的共享 Service helper 在 submit 前 attach `watch_session_events(session_id)`；cancel helper 用 public `get_run(...)` 判断已终态 Run 并跳过取消，非终态则在 `cancel_run(...)` 前 attach watcher；terminal fallback 只使用 `get_run(...)` 与 `read_outbox_terminal_items(...)`。
+Service 从 `dayu.runtime.location` 解析 workspace 与包内资产位置，用 `ConfigLoader` 读取 typed config，用 `ToolsDiscovery` 聚合业务 `ToolBundle`，用 `ScenePrepare` 拼接 system prompt、工具选择和 AgentPolicy override，再通过 `compose_open_host_options(...)` / `compose_submit_followup_request(...)` 或 `compose_submit_followup_request_with_overrides(...)` 生成 Host public typed inputs。需要 production wait poller 时，Service / composition root 在 construction time 显式提供 wait poll adapter registry 与 wait poller policy；Host 不接收 raw config patch、profile id 或隐式 lookup。面向 product entrypoint 的共享 Service helper 在 submit 前 attach `watch_session_events(session_id)`；cancel helper 用 public `get_run(...)` 判断已终态 Run 并跳过取消，非终态则在 `cancel_run(...)` 前 attach watcher；terminal fallback 只使用 `get_run(...)` 与 `read_outbox_terminal_items(...)`。
 
 ### 普通 follow-up
 
@@ -112,13 +112,13 @@ Engine 只看到调用方传入的 `tool_schemas` 与 `ToolExecutor`。Host Tool
 
 ### Wait / resume
 
-长事务工具返回 `ToolAwaitingOutcome` 时，Engine 以 `run_suspended` 结束本次 run。Host 接受 awaiting fact 后将 Run 推进为 `WAITING` 并创建 wait record。外部长事务完成后，调用方通过 `resolve_wait(...)` 把结果交回 Host；Host 写入 wait resolution facts，并为同一 Run 创建新的 resume Attempt。resume 不恢复旧 Agent、Runner、Engine generator 或工具调用栈。
+长事务工具返回 `ToolAwaitingOutcome` 时，Engine 以 `run_suspended` 结束本次 run。Host 接受 awaiting fact 后将 Run 推进为 `WAITING` 并创建 wait record。外部长事务完成后，调用方通过 `resolve_wait(...)` 把结果交回 Host；启用 production wait poller 时，Host runtime 也可以通过 construction-time poll adapter registry 观察 wait record 指向的外部 job，并在完成或 lost 时进入同一个 `resolve_wait(...)` 管线。Host 写入 wait resolution facts，并为同一 Run 创建新的 resume Attempt。resume 不恢复旧 Agent、Runner、Engine generator 或工具调用栈。
 
 ### Wait callback completion
 
 wait callback completion 是 wait-resume 的 transport-facing 入口形态。Service / Web 层负责把 HTTP-like callback 请求解析成 framework-neutral request，再映射为 Host callback typed contract；Host callback adapter 执行认证、digest 校验、stale / late 预分类，并把通过预检的 callback 转成 `ResolveWaitRequest(source=CALLBACK)` 进入既有 `resolve_wait` 管线。状态迁移、replay、same-key conflict、late result rejection 和 resume Attempt 创建仍由 Host durable command path 统一治理。
 
-当前代码提供的是 Service framework-neutral mapper 与 Host callback typed boundary，不是已经注册好的真实 HTTP route。secret backend、HMAC / bearer verifier、生产 poller、physical cancel、Engine contract 和 UI surface 不属于这个入口的当前实现范围。
+当前代码提供的是 Service framework-neutral mapper 与 Host callback typed boundary，不是已经注册好的真实 HTTP route。secret backend、HMAC / bearer verifier、physical cancel、Engine contract 和 UI surface 不属于这个入口的当前实现范围；production wait poller 是独立的 Host opener runtime，不属于 callback endpoint 本身。
 
 ### Context compaction
 

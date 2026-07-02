@@ -34,6 +34,7 @@ Total affected local tests after PR review fix: 111 passed.
 ## Docs Updates
 
 - `docs/host/design.md` updated the Host wait poller design alignment.
+- `dayu/README.md` updated the package-level Service / Host wait poller boundary.
 - `dayu/host/README.md` updated Host public lifecycle / open_host assembly documentation.
 - `tests/README.md` updated the Host test file map.
 - `docs/host/issues-implementation-control.md` records final closeout pass and the next entry point.
