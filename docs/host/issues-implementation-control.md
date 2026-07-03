@@ -155,11 +155,11 @@ git push -u github <branch>
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | final-closeout-pass |
-| implementation status | WU-WAIT-01 / GitHub Issue #89 merged via PR #163 on 2026-07-01; WU-WAIT-02 / GitHub Issue #90 final closeout passed with draft PR #165. |
-| active work unit | WU-WAIT-02 |
+| gate | accepted-plan |
+| implementation status | WU-WAIT-01 / GitHub Issue #89 merged via PR #163 on 2026-07-01; WU-WAIT-02 / GitHub Issue #90 merged via PR #165 on 2026-07-03; WU-WAIT-03 / GitHub Issue #92 plan re-review passed; accepted plan commit gate in progress. |
+| active work unit | WU-WAIT-03 |
 | default next work unit | WU-WAIT-03 |
-| next entry point | After user / maintainer merges draft PR #165, pull latest `main` and enter WU-WAIT-03 / GitHub Issue #92; do not mark ready, merge, close issue, request reviewers, or delete branch without explicit authorization. |
+| next entry point | WU-WAIT-03 / GitHub Issue #92 accepted plan commit gate: create protected local commit for accepted plan artifacts; then update this document with the accepted plan commit hash and move next entry point to implementation. Do not push, create PR, close issue, request reviewers, or merge without the relevant gate. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | Active/backlog issue owners retained here: #129 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #112 / #20 / #90 / #92 / #80 / #115, plus residual-risk destinations #121 / #122. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`; #63 / #89 / #111 / #130 / #133 are no longer active implementation owners. |
 | blocking open questions | None. |
@@ -253,10 +253,46 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CTX-01 | pending | Provider tokenizer / sizing adapter | GitHub Issue #20 | provider/model-aware context sizing；仍有效，需先收敛 budget policy 设计表述 |
 | WU-WAIT-01 | completed | Callback endpoint / auth / replay | GitHub Issue #89 / PR #163 | PR 163 merged on 2026-07-01; not an active implementation entry point. 当前实现提供 Host wait callback typed boundary 与 Service framework-neutral mapper；不包含真实 HTTP route、secret backend、HMAC / bearer verifier、production poller、physical cancel、Engine contract 或 UI surface。 |
 | WU-WAIT-02 | final-closeout-pass | Production poller loop / backoff / fencing / retry | GitHub Issue #90 / draft PR #165 | Final closeout 已完成；等待 maintainer/user 处理 draft PR #165。PR body 使用 `Closes #90`，merge 会自动关闭 issue。 |
-| WU-WAIT-03 | pending | External job physical cancel / revoke / abandon | GitHub Issue #92 / #87 umbrella | WAITING external job lifecycle |
+| WU-WAIT-03 | planning | External job physical cancel / revoke / abandon | GitHub Issue #92 / #87 umbrella | Goal confirmation passed. Plan artifact is `docs/host/wu-wait-03-external-job-lifecycle-plan.md`; plan review gate in progress. |
 | WU-WAIT-04 | pending-prerequisite | UI / Service production-grade awaiting E2E smoke | depends on #89 / #90 / #92 | dependent smoke，不独立实施 |
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
+
+## WU-WAIT-03 External Job Physical Cancel / Revoke / Abandon
+
+### 状态
+
+GitHub Issue #92 当前为 OPEN，归属 #87 Host Lifecycle Watchdog / Supervisor umbrella。WU-WAIT-01 / GitHub Issue #89 已通过 PR #163 于 2026-07-01 merge 到 `main`；WU-WAIT-02 / GitHub Issue #90 已通过 PR #165 于 2026-07-03 merge 到 `main`。Goal confirmation 已由用户确认。Plan artifact 为 `docs/host/wu-wait-03-external-job-lifecycle-plan.md`。Plan review artifacts 为 `docs/reviews/wu-wait-03-plan-review-mimo.md` 与 `docs/reviews/wu-wait-03-plan-review-ds.md`，controller adjudication 为 `docs/reviews/wu-wait-03-plan-review-controller-adjudication.md`。Plan-fix artifact 为 `docs/reviews/wu-wait-03-plan-fix-codex.md`。Plan re-review artifacts 为 `docs/reviews/wu-wait-03-plan-rereview-mimo.md` 与 `docs/reviews/wu-wait-03-plan-rereview-ds.md`，controller adjudication 为 `docs/reviews/wu-wait-03-plan-rereview-controller-adjudication.md`。两路 plan re-review 均通过，所有 accepted findings 均已关闭，0 个未修复 finding，0 个 blocking open question。当前进入 accepted plan commit gate；不得进入 implementation、push、create PR、close issue、request reviewers 或 merge。
+
+### 设计与代码核对
+
+- Host 设计真源规定 Host 是 Session / Run / Attempt / EventLog / wait record 的治理真源；provider lifecycle 动作不得成为 Host cancellation correctness 的前置条件。
+- Engine 设计真源规定 Engine 不轮询外部长事务、不持久化 wait record、不恢复旧 Agent / Runner，也不拥有 external job lifecycle。
+- 代码核对显示 `cancel_run` / `cancel_session_runs` 取消 `WAITING` Run 时只走 Host durable cancel 收口；external job lifecycle 当前落点是 wait poller 对 cancelled wait 调用 `WaitPollAdapter.abandon_wait(...)`。
+- 当前 `WaitPollAdapter.abandon_wait(...)` 只能通过返回 `None` 或抛异常表达结果，尚不能区分 physical cancel / revoke / abandon、unsupported、noop、timeout 或 transient failure。
+
+### 目标
+
+- 固化 WAITING external job physical cancel / revoke / abandon 的 typed adapter capability 与 best-effort diagnostic 语义。
+- Host-side `RUN_CANCELLED` 正确性不得依赖外部 cancel 成功；external lifecycle failure / timeout 不得 reopen 或改写已 cancelled Run。
+- late callback / poll / manual result 仍必须通过 common `resolve_wait(...)` path，被 late-result diagnostic 拒绝，不创建 resume Attempt。
+
+### 非目标
+
+- 不修改 Engine awaiting public model。
+- 不让 Engine 拥有等待、取消、轮询、恢复或 external job lifecycle。
+- 不把 external job id 变成 Host durable primary key。
+- 不要求所有 provider 支持 physical cancel。
+- 不绕过 `resolve_wait(...)` / late-result rejection。
+- 不创建 #87 之外的第二套 watchdog/runtime。
+- 不做 WU-WAIT-04 UI / Service production-grade awaiting E2E smoke。
+
+### Plan Review Gate 约束
+
+- Review 必须审查 plan 是否 code-generation-ready，是否从直接代码证据定位 root cause，是否存在把 Host cancel correctness 绑定到 provider cancel 成功的设计错误。
+- Review 必须审查 Slice 切分是否符合本文档 Slice 切分原则；本 WU 当前 plan 为 2 个 implementation slices，超过 3 个 slices 的替代建议必须有明确上下文容量、失败/回滚风险或依赖顺序证据。
+- Review 必须审查 plan 是否误引入新的 public Host API、Engine contract、durable schema、provider capability registry、第二套 watchdog 或过度设计。
+- Review findings 必须能裁决为 `accepted`、`rejected-with-reason`、`deferred-with-owner` 或 `needs-more-evidence`。
 
 ## WU-WAIT-02 Production Poller Loop / Backoff / Fencing / Retry
 
