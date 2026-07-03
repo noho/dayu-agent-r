@@ -24,6 +24,9 @@ from dayu.host.api import HostCommandHandleOptions
 from dayu.host.command import HostCommandHandle, create_host_command_handle
 from dayu.host.durable.state import WaitPollLastOutcome, WaitRecordRow, WaitRecordStatus
 from dayu.host.wait_adapter import (
+    WaitExternalJobLifecycleAction,
+    WaitExternalJobLifecycleApplied,
+    WaitExternalJobLifecycleResult,
     WaitPollAdapter,
     WaitPollAdapterRegistration,
     WaitPollAdapterRegistry,
@@ -196,14 +199,20 @@ class _SequenceAdapter:
         self.poll_count += 1
         return self._results[index]
 
-    def abandon_wait(self, wait_record: WaitRecordRow) -> None:
+    def abandon_wait(
+        self, wait_record: WaitRecordRow
+    ) -> WaitExternalJobLifecycleResult:
         """记录 abandon wait。
 
         :param wait_record: wait record。
-        :returns: ``None``。
+        :returns: applied lifecycle result。
         """
 
         self.abandoned.append(wait_record.wait_id)
+        return WaitExternalJobLifecycleApplied(
+            action=WaitExternalJobLifecycleAction.ABANDON,
+            message="test_abandoned",
+        )
 
 
 class _BlockingReadyAdapter:
@@ -232,7 +241,9 @@ class _BlockingReadyAdapter:
         self.release.wait()
         return _ready_result()
 
-    def abandon_wait(self, wait_record: WaitRecordRow) -> None:
+    def abandon_wait(
+        self, wait_record: WaitRecordRow
+    ) -> WaitExternalJobLifecycleResult:
         """本测试 adapter 不处理 cancelled wait。
 
         :param wait_record: wait record。

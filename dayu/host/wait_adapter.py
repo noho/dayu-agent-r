@@ -74,6 +74,86 @@ class WaitExternalJobRefSource(StrEnum):
     RESUME_TOKEN = "resume_token"
 
 
+class WaitExternalJobLifecycleAction(StrEnum):
+    """cancelled wait 对外部 job 执行的 lifecycle 动作。"""
+
+    CANCEL = "cancel"
+    REVOKE = "revoke"
+    ABANDON = "abandon"
+
+
+@dataclass(frozen=True, slots=True)
+class WaitExternalJobLifecycleApplied:
+    """adapter 已执行外部 job lifecycle 动作。
+
+    :param action: adapter 实际执行的最强 lifecycle 动作。
+    :param message: 可选诊断消息；无补充诊断时为 ``None``。
+    """
+
+    action: WaitExternalJobLifecycleAction
+    message: str | None = None
+
+    def __post_init__(self) -> None:
+        """校验 lifecycle applied result 字段。
+
+        :returns: ``None``。
+        :raises ValueError: ``action`` 类型非法或 ``message`` 为空字符串时抛出。
+        """
+
+        if not isinstance(self.action, WaitExternalJobLifecycleAction):
+            raise ValueError("action must be WaitExternalJobLifecycleAction")
+        if self.message is not None and self.message.strip() == "":
+            raise ValueError("message must be non-empty when provided")
+
+
+@dataclass(frozen=True, slots=True)
+class WaitExternalJobLifecycleUnsupported:
+    """adapter 明确不支持当前 wait 的外部 job lifecycle 动作。
+
+    :param reason: 不支持的稳定诊断原因。
+    """
+
+    reason: str
+
+    def __post_init__(self) -> None:
+        """校验 unsupported result 字段。
+
+        :returns: ``None``。
+        :raises ValueError: ``reason`` 为空时抛出。
+        """
+
+        if self.reason.strip() == "":
+            raise ValueError("reason must be non-empty")
+
+
+@dataclass(frozen=True, slots=True)
+class WaitExternalJobLifecycleNoop:
+    """adapter 判断当前 wait 已无需或无法继续执行外部 lifecycle 动作。
+
+    :param reason: no-op 的稳定诊断原因。
+    """
+
+    reason: str
+
+    def __post_init__(self) -> None:
+        """校验 no-op result 字段。
+
+        :returns: ``None``。
+        :raises ValueError: ``reason`` 为空时抛出。
+        """
+
+        if self.reason.strip() == "":
+            raise ValueError("reason must be non-empty")
+
+
+WaitExternalJobLifecycleResult: TypeAlias = (
+    WaitExternalJobLifecycleApplied
+    | WaitExternalJobLifecycleUnsupported
+    | WaitExternalJobLifecycleNoop
+)
+"""cancelled wait 外部 job lifecycle 结果封闭联合。"""
+
+
 @dataclass(frozen=True, slots=True)
 class WaitPollNotReady:
     """poll adapter 观察到外部 job 尚未完成。"""
@@ -116,12 +196,14 @@ class WaitPollAdapter(Protocol):
 
         ...
 
-    def abandon_wait(self, wait_record: WaitRecordRow) -> None:
-        """在 wait 已取消时放弃外部 job。
+    def abandon_wait(
+        self, wait_record: WaitRecordRow
+    ) -> WaitExternalJobLifecycleResult:
+        """在 wait 已取消时执行 best-effort 外部 job lifecycle 动作。
 
         :param wait_record: 已取消 wait record 快照。
-        :returns: ``None``。
-        :raises Exception: adapter 可在外部系统调用失败时抛出普通异常。
+        :returns: typed lifecycle 结果；applied、unsupported 与 no-op 都是终态诊断。
+        :raises Exception: adapter 可在临时外部系统调用失败时抛出普通异常。
         """
 
         ...
@@ -482,6 +564,7 @@ class _MarkWaitRecordAbandonedOperation:
     claim_id: str
     abandoned_at: str
     updated_at: str
+    last_outcome: WaitPollLastOutcome
 
     def __call__(self, transaction: HostTransaction) -> StateMutationStatus:
         """执行 abandon success CAS。
@@ -496,6 +579,7 @@ class _MarkWaitRecordAbandonedOperation:
             claim_id=self.claim_id,
             abandoned_at=self.abandoned_at,
             updated_at=self.updated_at,
+            last_outcome=self.last_outcome,
         )
         return result.status
 
@@ -897,7 +981,7 @@ class WaitPoller:
                 0,
             )
         try:
-            adapter.abandon_wait(record)
+            lifecycle_result = adapter.abandon_wait(record)
         except Exception as exc:
             _LOGGER.warning(
                 "wait adapter abandon failed; continuing wait_id=%s "
@@ -918,6 +1002,7 @@ class WaitPoller:
                 ),
                 0,
             )
+        last_outcome = _last_outcome_for_lifecycle_result(lifecycle_result)
         now = format_utc_timestamp(self._clock.now())
         status = self._transaction_runner.run_write(
             _MarkWaitRecordAbandonedOperation(
@@ -925,6 +1010,7 @@ class WaitPoller:
                 claim_id=claim_id,
                 abandoned_at=now,
                 updated_at=now,
+                last_outcome=last_outcome,
             )
         )
         if status is StateMutationStatus.UPDATED:
@@ -1267,6 +1353,25 @@ def _backoff_delay_seconds(
     return min(delay, policy.backoff_max_delay_seconds)
 
 
+def _last_outcome_for_lifecycle_result(
+    lifecycle_result: WaitExternalJobLifecycleResult,
+) -> WaitPollLastOutcome:
+    """把 typed external lifecycle result 映射为 durable poll outcome。
+
+    :param lifecycle_result: adapter 返回的 cancelled wait lifecycle 结果。
+    :returns: durable poll outcome。
+    :raises TypeError: lifecycle result 类型不属于封闭联合时抛出。
+    """
+
+    if isinstance(lifecycle_result, WaitExternalJobLifecycleApplied):
+        return WaitPollLastOutcome.ABANDONED
+    if isinstance(lifecycle_result, WaitExternalJobLifecycleUnsupported):
+        return WaitPollLastOutcome.ABANDON_UNSUPPORTED
+    if isinstance(lifecycle_result, WaitExternalJobLifecycleNoop):
+        return WaitPollLastOutcome.ABANDON_NOOP
+    raise TypeError("unknown wait external job lifecycle result type")
+
+
 def _require_positive_float(value: float, *, field_name: str) -> None:
     """校验正浮点数 policy 字段。
 
@@ -1440,6 +1545,11 @@ __all__ = [
     "WaitActivationRequest",
     "WaitAdapterBinding",
     "WaitAdapterRegistry",
+    "WaitExternalJobLifecycleAction",
+    "WaitExternalJobLifecycleApplied",
+    "WaitExternalJobLifecycleNoop",
+    "WaitExternalJobLifecycleResult",
+    "WaitExternalJobLifecycleUnsupported",
     "WaitExternalJobRefSource",
     "WaitPollAdapter",
     "WaitPollAdapterRegistration",

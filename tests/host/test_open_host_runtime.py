@@ -73,6 +73,7 @@ from dayu.host.llm_compaction import LLMContextCompactor
 from dayu.host.projection import ProjectionCatchupPort
 from dayu.host.recovery import StartupRecoveryScanner
 from dayu.host.wait_adapter import (
+    WaitExternalJobLifecycleResult,
     WaitPollAdapterRegistration,
     WaitPollAdapterRegistry,
     WaitPollReady,
@@ -461,11 +462,13 @@ class _ReadyPollAdapter:
             )
         )
 
-    def abandon_wait(self, wait_record: WaitRecordRow) -> None:
+    def abandon_wait(
+        self, wait_record: WaitRecordRow
+    ) -> WaitExternalJobLifecycleResult:
         """本测试不处理 cancelled wait。
 
         :param wait_record: wait record。
-        :returns: ``None``。
+        :returns: applied lifecycle result。
         :raises AssertionError: 被错误调用时抛出。
         """
 

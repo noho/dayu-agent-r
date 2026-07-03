@@ -832,9 +832,9 @@ def test_normalize_schema_sql_only_strips_and_collapses_whitespace() -> None:
 
 
 def test_host_schema_version_is_query_index_version() -> None:
-    """当前 committed Host schema version 是 wait poll shutdown fresh schema 18。"""
+    """当前 committed Host schema version 是 wait lifecycle outcome fresh schema 19。"""
 
-    assert HOST_SCHEMA_VERSION == 18
+    assert HOST_SCHEMA_VERSION == 19
 
 
 def test_tool_call_request_payload_descriptor_kinds_are_stable() -> None:
@@ -1240,6 +1240,8 @@ def test_wait_record_table_and_indexes_are_created(tmp_path: Path) -> None:
                 TABLE_HOST_WAIT_RECORDS,
             )
             assert "poll_claim_id IS NULL" in table_sql
+            assert "'abandon_unsupported'" in table_sql
+            assert "'abandon_noop'" in table_sql
             assert "poll_abandoned_at IS NULL OR status = 'cancelled'" in table_sql
         finally:
             connection.close()

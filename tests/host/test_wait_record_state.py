@@ -30,6 +30,7 @@ from dayu.host.durable.state import (
     WaitSnapshotRef,
     cancel_active_wait_records_for_run,
     claim_wait_record_for_poll,
+    deserialize_wait_poll_last_outcome,
     deserialize_wait_record_status,
     deserialize_wait_resume_policy,
     insert_attempt,
@@ -43,6 +44,7 @@ from dayu.host.durable.state import (
     read_active_wait_records_for_run,
     read_wait_record_by_id,
     release_wait_record_poll_claim,
+    serialize_wait_poll_last_outcome,
     serialize_wait_record_status,
     serialize_wait_resume_policy,
     wait_record_row_from_host_row,
@@ -379,6 +381,27 @@ def test_wait_record_status_and_policy_codecs_are_closed() -> None:
     assert deserialize_wait_resume_policy("manual") == WaitResumePolicy.MANUAL
     with pytest.raises(HostDurableError, match="WaitRecordStatus"):
         deserialize_wait_record_status("pending")
+
+
+def test_wait_poll_terminal_outcome_codecs_roundtrip_new_values() -> None:
+    """新增 cancelled lifecycle terminal outcome 使用 StrEnum value roundtrip。"""
+
+    assert (
+        serialize_wait_poll_last_outcome(WaitPollLastOutcome.ABANDON_UNSUPPORTED)
+        == "abandon_unsupported"
+    )
+    assert (
+        deserialize_wait_poll_last_outcome("abandon_unsupported")
+        is WaitPollLastOutcome.ABANDON_UNSUPPORTED
+    )
+    assert (
+        serialize_wait_poll_last_outcome(WaitPollLastOutcome.ABANDON_NOOP)
+        == "abandon_noop"
+    )
+    assert (
+        deserialize_wait_poll_last_outcome("abandon_noop")
+        is WaitPollLastOutcome.ABANDON_NOOP
+    )
 
 
 def test_unique_active_wait_per_run_allows_terminal_history(
@@ -999,7 +1022,17 @@ def test_cancelled_poll_abandoned_row_is_not_eligible(tmp_path: Path) -> None:
         assert store.transaction_runner.run_write(operation) is StateMutationStatus.NOT_FOUND
 
 
-def test_poll_abandon_success_marks_row_and_clears_claim(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "last_outcome",
+    (
+        WaitPollLastOutcome.ABANDONED,
+        WaitPollLastOutcome.ABANDON_UNSUPPORTED,
+        WaitPollLastOutcome.ABANDON_NOOP,
+    ),
+)
+def test_poll_abandon_success_marks_row_and_clears_claim(
+    tmp_path: Path, last_outcome: WaitPollLastOutcome
+) -> None:
     """poll abandon success CAS 写入 durable marker 并清理 claim / backoff。"""
 
     options = _options(tmp_path)
@@ -1031,6 +1064,7 @@ def test_poll_abandon_success_marks_row_and_clears_claim(tmp_path: Path) -> None
                 claim_id="claim-abandon",
                 abandoned_at=_LATER_TIMESTAMP,
                 updated_at=_LATER_TIMESTAMP,
+                last_outcome=last_outcome,
             )
             assert abandoned.status is StateMutationStatus.UPDATED
             assert abandoned.row is not None
@@ -1039,7 +1073,7 @@ def test_poll_abandon_success_marks_row_and_clears_claim(tmp_path: Path) -> None
         row = store.transaction_runner.run_write(operation)
         assert row.poll_abandoned_at == _LATER_TIMESTAMP
         assert row.poll_claim_id is None
-        assert row.poll_last_outcome is WaitPollLastOutcome.ABANDONED
+        assert row.poll_last_outcome is last_outcome
 
 
 def test_wait_record_terminal_transition_clears_poll_claim(tmp_path: Path) -> None:
