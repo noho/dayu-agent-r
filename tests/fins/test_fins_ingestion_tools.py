@@ -82,7 +82,14 @@ from dayu.host.durable.state import (
     WaitRecordStatus,
     WaitResumePolicy,
 )
-from dayu.host.wait_adapter import WaitPollLost, WaitPollNotReady, WaitPollReady
+from dayu.host.wait_adapter import (
+    WaitExternalJobLifecycleAction,
+    WaitExternalJobLifecycleApplied,
+    WaitExternalJobLifecycleNoop,
+    WaitPollLost,
+    WaitPollNotReady,
+    WaitPollReady,
+)
 from dayu.host.wait_adapter import WaitActivationRequest
 from dayu.host.waiting import ToolAwaitingAcceptedAck, ToolAwaitingEventRef
 from dayu.runtime.config_loader import ConfigLoader, RuntimeConfig
@@ -428,6 +435,8 @@ class _FakeObservationRuntime(FinsObservationRuntime):
 
     snapshots: dict[str, FinsObservationSnapshot]
     poll_errors: dict[str, FinsObservationPollError] | None = None
+    cancel_errors: dict[str, FinsObservationPollError] | None = None
+    abandon_errors: dict[str, FinsObservationPollError] | None = None
     cancelled_handles: tuple[str, ...] = ()
     abandoned_handles: tuple[str, ...] = ()
     activated_handles: tuple[str, ...] = ()
@@ -571,6 +580,8 @@ class _FakeObservationRuntime(FinsObservationRuntime):
         """
 
         self.cancelled_handles = self.cancelled_handles + (handle.handle_id,)
+        if self.cancel_errors is not None and handle.handle_id in self.cancel_errors:
+            raise self.cancel_errors[handle.handle_id]
         return await self.poll_observation(handle)
 
     async def abandon_observation(self, handle: FinsObservationHandle) -> None:
@@ -582,6 +593,8 @@ class _FakeObservationRuntime(FinsObservationRuntime):
         """
 
         self.abandoned_handles = self.abandoned_handles + (handle.handle_id,)
+        if self.abandon_errors is not None and handle.handle_id in self.abandon_errors:
+            raise self.abandon_errors[handle.handle_id]
         self.snapshots.pop(handle.handle_id, None)
 
 
@@ -1651,9 +1664,13 @@ def test_fins_wait_poll_adapter_abandon_cancels_and_cleans_observation() -> None
     )
     adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
 
-    adapter.abandon_wait(_wait_record(handle.handle_id, DOWNLOAD_TOOL_NAME))
+    result = adapter.abandon_wait(_wait_record(handle.handle_id, DOWNLOAD_TOOL_NAME))
     poll = adapter.poll_wait(_wait_record(handle.handle_id, DOWNLOAD_TOOL_NAME))
 
+    assert isinstance(result, WaitExternalJobLifecycleApplied)
+    assert result.action is WaitExternalJobLifecycleAction.ABANDON
+    assert result.message is not None
+    assert "finsobs_" not in result.message
     assert runtime.cancelled_handles == (handle.handle_id,)
     assert runtime.abandoned_handles == (handle.handle_id,)
     assert isinstance(poll, WaitPollLost)
@@ -1665,9 +1682,122 @@ def test_fins_wait_poll_adapter_abandon_corrupt_token_is_noop() -> None:
     runtime = _FakeObservationRuntime(snapshots={})
     adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
 
-    adapter.abandon_wait(_wait_record("finsjob_00000000000000000000000000000009", DOWNLOAD_TOOL_NAME))
+    result = adapter.abandon_wait(
+        _wait_record("finsjob_00000000000000000000000000000009", DOWNLOAD_TOOL_NAME)
+    )
 
+    assert isinstance(result, WaitExternalJobLifecycleNoop)
+    assert result.reason == "invalid_observation_handle"
     assert runtime.cancelled_handles == ()
+    assert runtime.abandoned_handles == ()
+
+
+def test_fins_wait_poll_adapter_abandon_missing_observation_is_noop() -> None:
+    """abandon_wait 遇到缺失 observation 时应返回 missing no-op。"""
+
+    handle = _observation_handle_with_id("1212121212121212")
+    runtime = _FakeObservationRuntime(snapshots={})
+    adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
+
+    result = adapter.abandon_wait(_wait_record(handle.handle_id, DOWNLOAD_TOOL_NAME))
+
+    assert isinstance(result, WaitExternalJobLifecycleNoop)
+    assert result.reason == "observation_missing"
+    assert runtime.cancelled_handles == (handle.handle_id,)
+    assert runtime.abandoned_handles == ()
+
+
+def test_fins_wait_poll_adapter_abandon_lost_snapshot_is_noop() -> None:
+    """abandon_wait 遇到 LOST snapshot 时应返回 missing no-op。"""
+
+    handle = _observation_handle_with_id("3434343434343434")
+    runtime = _FakeObservationRuntime(
+        snapshots={
+            handle.handle_id: _observation_snapshot(handle, FinsObservationStatus.LOST)
+        }
+    )
+    adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
+
+    result = adapter.abandon_wait(_wait_record(handle.handle_id, DOWNLOAD_TOOL_NAME))
+
+    assert isinstance(result, WaitExternalJobLifecycleNoop)
+    assert result.reason == "observation_missing"
+    assert runtime.cancelled_handles == (handle.handle_id,)
+    assert runtime.abandoned_handles == ()
+
+
+def test_fins_wait_poll_adapter_abandon_non_transient_error_is_noop() -> None:
+    """abandon_wait 遇到非临时 observation 错误时应返回 error no-op。"""
+
+    handle = _observation_handle_with_id("5656565656565656")
+    runtime = _FakeObservationRuntime(
+        snapshots={
+            handle.handle_id: _observation_snapshot(handle, FinsObservationStatus.RUNNING)
+        },
+        abandon_errors={
+            handle.handle_id: FinsObservationPollError(
+                FinsObservationPollErrorKind.PERMANENT_CORRUPT_HANDLE,
+                "Observation handle is corrupt.",
+            )
+        },
+    )
+    adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
+
+    result = adapter.abandon_wait(_wait_record(handle.handle_id, DOWNLOAD_TOOL_NAME))
+
+    assert isinstance(result, WaitExternalJobLifecycleNoop)
+    assert result.reason == "observation_error:permanent_corrupt_handle"
+    assert runtime.cancelled_handles == (handle.handle_id,)
+    assert runtime.abandoned_handles == (handle.handle_id,)
+
+
+def test_fins_wait_poll_adapter_abandon_cancel_non_transient_error_is_noop() -> None:
+    """abandon_wait 遇到 cancel 非临时 observation 错误时应返回 error no-op。"""
+
+    handle = _observation_handle_with_id("6767676767676767")
+    runtime = _FakeObservationRuntime(
+        snapshots={
+            handle.handle_id: _observation_snapshot(handle, FinsObservationStatus.RUNNING)
+        },
+        cancel_errors={
+            handle.handle_id: FinsObservationPollError(
+                FinsObservationPollErrorKind.PERMANENT_CORRUPT_HANDLE,
+                "Observation handle is corrupt.",
+            )
+        },
+    )
+    adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
+
+    result = adapter.abandon_wait(_wait_record(handle.handle_id, DOWNLOAD_TOOL_NAME))
+
+    assert isinstance(result, WaitExternalJobLifecycleNoop)
+    assert result.reason == "observation_error:permanent_corrupt_handle"
+    assert runtime.cancelled_handles == (handle.handle_id,)
+    assert runtime.abandoned_handles == ()
+
+
+def test_fins_wait_poll_adapter_abandon_transient_unavailable_re_raises() -> None:
+    """abandon_wait 遇到 transient unavailable 时应抛出供 Host 重试。"""
+
+    handle = _observation_handle_with_id("7878787878787878")
+    runtime = _FakeObservationRuntime(
+        snapshots={
+            handle.handle_id: _observation_snapshot(handle, FinsObservationStatus.RUNNING)
+        },
+        cancel_errors={
+            handle.handle_id: FinsObservationPollError(
+                FinsObservationPollErrorKind.TRANSIENT_UNAVAILABLE,
+                "Observation temporarily unavailable.",
+            )
+        },
+    )
+    adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
+
+    with pytest.raises(FinsObservationPollError) as exc_info:
+        adapter.abandon_wait(_wait_record(handle.handle_id, DOWNLOAD_TOOL_NAME))
+
+    assert exc_info.value.error_kind is FinsObservationPollErrorKind.TRANSIENT_UNAVAILABLE
+    assert runtime.cancelled_handles == (handle.handle_id,)
     assert runtime.abandoned_handles == ()
 
 

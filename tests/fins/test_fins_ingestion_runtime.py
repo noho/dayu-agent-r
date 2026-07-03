@@ -86,6 +86,7 @@ from dayu.fins.storage import (
     FsCompanyMetaRepository,
     FsDocumentBlobRepository,
     FsSourceDocumentRepository,
+    SourceDocumentRepositoryProtocol,
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 from dayu.fins.ticker_normalization import NormalizedTicker
@@ -488,6 +489,84 @@ class _FakeUploadRunner(FinsUploadRunner):
         self.requests.append(request)
         self.cancellation_checks.append(cancellation_checker())
         return self.result_summary
+
+
+class _BlockingArtifactUploadRunner(FinsUploadRunner):
+    """写入源文档后阻塞的 observed upload runner。"""
+
+    def __init__(
+        self,
+        *,
+        source_repository: SourceDocumentRepositoryProtocol,
+        document_id: str,
+    ) -> None:
+        """初始化 runner。
+
+        Args:
+            source_repository: Fins 源文档仓储协议实现。
+            document_id: 测试写入的源文档 id。
+
+        Returns:
+            无。
+        """
+
+        self.source_repository = source_repository
+        self.document_id = document_id
+        self.artifact_written = Event()
+        self.allow_finish = Event()
+        self.cancellation_checks: tuple[bool, ...] = ()
+        self.requests: tuple[FinsUploadRequest, ...] = ()
+
+    def run_upload(
+        self,
+        request: FinsUploadRequest,
+        *,
+        cancellation_checker: FinsJobCancellationChecker,
+    ) -> FinsUploadResultSummary:
+        """写入源文档后等待测试释放，并记录取消检查结果。
+
+        Args:
+            request: runtime 传入的上传请求。
+            cancellation_checker: runtime 提供的取消检查器。
+
+        Returns:
+            fake 上传摘要。
+
+        Raises:
+            OSError: 仓储写入或取消检查失败时抛出。
+            ValueError: 源文档字段非法时抛出。
+        """
+
+        self.requests = self.requests + (request,)
+        self.source_repository.create_source_document(
+            SourceDocumentUpsertRequest(
+                ticker=request.ticker,
+                document_id=self.document_id,
+                internal_document_id=self.document_id,
+                form_type="10-K",
+                primary_document=f"{self.document_id}.md",
+                meta={
+                    "fiscal_year": 2024,
+                    "fiscal_period": "FY",
+                    "filing_date": "2024-11-01",
+                    "report_date": "2024-09-28",
+                    "amended": False,
+                    "ingest_method": "upload",
+                },
+            ),
+            SourceKind.FILING,
+        )
+        self.artifact_written.set()
+        self.allow_finish.wait(timeout=1.0)
+        self.cancellation_checks = self.cancellation_checks + (cancellation_checker(),)
+        return FinsUploadResultSummary(
+            source_kind=SourceKind.FILING,
+            document_id=self.document_id,
+            internal_document_id=self.document_id,
+            status="uploaded",
+            uploaded_files=(f"{self.document_id}.md",),
+            primary_document=f"{self.document_id}.md",
+        )
 
 
 def _upload_runtime_converter(raw_data: bytes, stream_name: str) -> dict[str, JsonValue]:
@@ -2134,6 +2213,78 @@ def test_cancel_prepared_observation_prevents_later_activation_submit(
     assert cancelled.result.error_message == "Observation was cancelled before activation."
     assert polled.status is FinsObservationStatus.CANCELLED
     assert executor.operations == []
+
+
+def test_abandon_cancelled_prepared_observation_releases_handle_before_activation(
+    tmp_path: Path,
+) -> None:
+    """prepared observation 取消并 abandon 后不得提交且 handle 应释放。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    runtime = _build_ingestion_runtime(workspace_root, executor=executor)
+    handle = runtime.prepare_observed_download(
+        FinsDownloadRequest(ticker="AAPL"),
+        cancellation_token=_NeverCancelledToken(),
+    )
+
+    cancelled = asyncio.run(runtime.cancel_observation(handle))
+    asyncio.run(runtime.abandon_observation(handle))
+    runtime.activate_observation(handle)
+    polled = asyncio.run(runtime.poll_observation(handle))
+
+    assert cancelled.status is FinsObservationStatus.CANCELLED
+    assert polled.status is FinsObservationStatus.LOST
+    assert executor.operations == []
+
+
+def test_abandon_submitted_observation_cancels_and_keeps_storage_artifacts(
+    tmp_path: Path,
+) -> None:
+    """submitted observation abandon 后应协作式取消并保留已写入仓储产物。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    default_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    executor = _HoldingExecutor()
+    document_id = "aapl-observed-upload"
+    runner = _BlockingArtifactUploadRunner(
+        source_repository=default_runtime.source_repository,
+        document_id=document_id,
+    )
+    runtime = ingestion_runtime.FinsIngestionRuntime.create(
+        source_repository=default_runtime.source_repository,
+        blob_repository=default_runtime.blob_repository,
+        filing_maintenance_repository=default_runtime.filing_maintenance_repository,
+        processed_repository=default_runtime.processed_repository,
+        processor_registry=default_runtime.processor_registry,
+        job_store=default_runtime.ingestion_job_store,
+        executor=executor,
+        upload_runner=runner,
+    )
+    handle = runtime.prepare_observed_upload(
+        FinsUploadFilingRequest(ticker="AAPL"),
+        cancellation_token=_NeverCancelledToken(),
+    )
+
+    runtime.activate_observation(handle)
+    operation_thread = Thread(target=executor.run_all)
+    operation_thread.start()
+    assert runner.artifact_written.wait(timeout=1.0)
+
+    asyncio.run(runtime.abandon_observation(handle))
+    runner.allow_finish.set()
+    operation_thread.join(timeout=1.0)
+    polled = asyncio.run(runtime.poll_observation(handle))
+    source_meta = default_runtime.source_repository.get_source_meta(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    )
+
+    assert not operation_thread.is_alive()
+    assert runner.cancellation_checks == (True,)
+    assert polled.status is FinsObservationStatus.LOST
+    assert source_meta["ingest_method"] == "upload"
 
 
 def test_cancel_and_activate_share_observation_lock_without_timing_sleep(
