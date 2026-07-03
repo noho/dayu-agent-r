@@ -103,6 +103,16 @@ SELECT
   resolve_semantic_digest,
   deadline_at,
   expires_at,
+  poll_claim_id,
+  poll_claim_owner_id,
+  poll_claimed_at,
+  poll_claim_expires_at,
+  poll_next_observe_at,
+  poll_backoff_attempt,
+  poll_last_outcome,
+  poll_last_error_code,
+  poll_last_error_message,
+  poll_abandoned_at,
   status,
   created_event_id,
   created_event_sequence,
@@ -162,6 +172,18 @@ class WaitResumePolicy(StrEnum):
     POLL = "poll"
     CALLBACK = "callback"
     MANUAL = "manual"
+
+
+class WaitPollLastOutcome(StrEnum):
+    """wait poller 最近一次 retry / diagnostic outcome。"""
+
+    NOT_READY = "not_ready"
+    ADAPTER_ERROR = "adapter_error"
+    MISSING_ADAPTER = "missing_adapter"
+    RESOLVE_ERROR = "resolve_error"
+    ABANDON_ERROR = "abandon_error"
+    SHUTDOWN_SKIPPED = "shutdown_skipped"
+    ABANDONED = "abandoned"
 
 
 class StateMutationStatus(StrEnum):
@@ -437,6 +459,16 @@ class WaitRecordRow:
     created_at: str
     updated_at: str
     terminal_at: str | None
+    poll_claim_id: str | None = None
+    poll_claim_owner_id: str | None = None
+    poll_claimed_at: str | None = None
+    poll_claim_expires_at: str | None = None
+    poll_next_observe_at: str | None = None
+    poll_backoff_attempt: int = 0
+    poll_last_outcome: WaitPollLastOutcome | None = None
+    poll_last_error_code: str | None = None
+    poll_last_error_message: str | None = None
+    poll_abandoned_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -641,6 +673,32 @@ def deserialize_wait_resume_policy(value: str) -> WaitResumePolicy:
     """
 
     return _deserialize_str_enum(value, enum_type=WaitResumePolicy, enum_name="WaitResumePolicy")
+
+
+def serialize_wait_poll_last_outcome(outcome: WaitPollLastOutcome | None) -> str | None:
+    """序列化 wait poller 最近一次 outcome。
+
+    :param outcome: 最近一次 outcome；无 outcome 时为 ``None``。
+    :returns: schema 中存储的文本值。
+    :raises HostDurableError: ``outcome`` 不是合法 ``WaitPollLastOutcome`` 时抛出。
+    """
+
+    if outcome is None:
+        return None
+    return _serialize_str_enum(outcome, enum_name="WaitPollLastOutcome")
+
+
+def deserialize_wait_poll_last_outcome(value: str) -> WaitPollLastOutcome:
+    """反序列化 wait poller 最近一次 outcome。
+
+    :param value: SQLite row 中读取的 outcome 文本。
+    :returns: ``WaitPollLastOutcome``。
+    :raises HostDurableError: 文本为空或不属于 ``WaitPollLastOutcome`` 时抛出。
+    """
+
+    return _deserialize_str_enum(
+        value, enum_type=WaitPollLastOutcome, enum_name="WaitPollLastOutcome"
+    )
 
 
 def serialize_wait_snapshot_ref(ref: WaitSnapshotRef | None) -> str | None:
@@ -1210,6 +1268,25 @@ def wait_record_row_from_host_row(row: HostRow) -> WaitRecordRow:
         ) from exc
     status = _decode_enum(row, row_name=row_name, column="status", deserializer=deserialize_wait_record_status)
     terminal_at = _decode_optional_text(row, row_name=row_name, column="terminal_at")
+    poll_last_outcome_text = _decode_optional_text(
+        row, row_name=row_name, column="poll_last_outcome"
+    )
+    try:
+        poll_last_outcome = (
+            None
+            if poll_last_outcome_text is None
+            else deserialize_wait_poll_last_outcome(poll_last_outcome_text)
+        )
+    except HostDurableError as exc:
+        raise HostRowDecodeError(
+            _format_row_decode_error(
+                row_name=row_name,
+                field_name="poll_last_outcome",
+                detail=str(exc),
+            ),
+            row_name=row_name,
+            field_name="poll_last_outcome",
+        ) from exc
     wait_row = WaitRecordRow(
         wait_id=_decode_required_text(row, row_name=row_name, column="wait_id"),
         session_id=_decode_required_text(row, row_name=row_name, column="session_id"),
@@ -1234,6 +1311,28 @@ def wait_record_row_from_host_row(row: HostRow) -> WaitRecordRow:
         resolve_semantic_digest=_decode_optional_text(row, row_name=row_name, column="resolve_semantic_digest"),
         deadline_at=_decode_optional_text(row, row_name=row_name, column="deadline_at"),
         expires_at=_decode_optional_text(row, row_name=row_name, column="expires_at"),
+        poll_claim_id=_decode_optional_text(row, row_name=row_name, column="poll_claim_id"),
+        poll_claim_owner_id=_decode_optional_text(
+            row, row_name=row_name, column="poll_claim_owner_id"
+        ),
+        poll_claimed_at=_decode_optional_text(row, row_name=row_name, column="poll_claimed_at"),
+        poll_claim_expires_at=_decode_optional_text(
+            row, row_name=row_name, column="poll_claim_expires_at"
+        ),
+        poll_next_observe_at=_decode_optional_text(
+            row, row_name=row_name, column="poll_next_observe_at"
+        ),
+        poll_backoff_attempt=_decode_required_int(
+            row, row_name=row_name, column="poll_backoff_attempt"
+        ),
+        poll_last_outcome=poll_last_outcome,
+        poll_last_error_code=_decode_optional_text(
+            row, row_name=row_name, column="poll_last_error_code"
+        ),
+        poll_last_error_message=_decode_optional_text(
+            row, row_name=row_name, column="poll_last_error_message"
+        ),
+        poll_abandoned_at=_decode_optional_text(row, row_name=row_name, column="poll_abandoned_at"),
         status=status,
         created_event_id=_decode_required_text(row, row_name=row_name, column="created_event_id"),
         created_event_sequence=_decode_required_int(row, row_name=row_name, column="created_event_sequence"),
@@ -1245,6 +1344,7 @@ def wait_record_row_from_host_row(row: HostRow) -> WaitRecordRow:
     )
     try:
         validate_wait_terminal_at_shape(status_value=wait_row.status.value, terminal_at=wait_row.terminal_at)
+        _validate_wait_poll_fields(wait_row)
     except HostDurableError as exc:
         raise _wrap_row_decode_shape_error(row_name=row_name, detail=str(exc)) from exc
     return wait_row
@@ -1937,6 +2037,229 @@ def read_wait_records_for_poll_observation(
     return tuple(wait_record_row_from_host_row(row) for row in rows)
 
 
+def claim_wait_record_for_poll(
+    transaction: HostTransaction,
+    *,
+    claim_id: str,
+    owner_id: str,
+    now: str,
+    claim_expires_at: str,
+) -> WaitRecordMutationResult:
+    """原子 claim 一条当前可 poll 的 wait record。
+
+    本 helper 允许先读取候选 wait id，但只有同一 write transaction 内随后
+    的 ``UPDATE ... WHERE`` 成功才表示 claim 已取得；调用方不得用候选读取
+    结果触发 adapter 调用。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param claim_id: 本次 claim 唯一 id。
+    :param owner_id: poller 实例 owner id。
+    :param now: 当前 UTC timestamp 文本。
+    :param claim_expires_at: claim 过期 UTC timestamp 文本。
+    :returns: wait record mutation 结果；无候选为 ``NOT_FOUND``。
+    :raises HostDurableError: 输入字段非法时抛出。
+    """
+
+    _validate_poll_claim_inputs(
+        claim_id=claim_id,
+        owner_id=owner_id,
+        now=now,
+        claim_expires_at=claim_expires_at,
+    )
+    candidate = transaction.fetchone(
+        f"""
+        SELECT wait_id
+        FROM {TABLE_HOST_WAIT_RECORDS}
+        WHERE resume_policy = ?
+          AND (
+            status = ?
+            OR (status = ? AND poll_abandoned_at IS NULL)
+          )
+          AND (poll_next_observe_at IS NULL OR poll_next_observe_at <= ?)
+          AND (poll_claim_id IS NULL OR poll_claim_expires_at <= ?)
+        ORDER BY created_event_sequence ASC, wait_id ASC
+        LIMIT 1
+        """,
+        (
+            serialize_wait_resume_policy(WaitResumePolicy.POLL),
+            serialize_wait_record_status(WaitRecordStatus.WAITING),
+            serialize_wait_record_status(WaitRecordStatus.CANCELLED),
+            now,
+            now,
+        ),
+    )
+    if candidate is None:
+        return WaitRecordMutationResult(status=StateMutationStatus.NOT_FOUND, row=None)
+    wait_id = _require_text(candidate.get("wait_id"), field_name="wait_id")
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_WAIT_RECORDS}
+        SET
+          poll_claim_id = ?,
+          poll_claim_owner_id = ?,
+          poll_claimed_at = ?,
+          poll_claim_expires_at = ?
+        WHERE wait_id = ?
+          AND resume_policy = ?
+          AND (
+            status = ?
+            OR (status = ? AND poll_abandoned_at IS NULL)
+          )
+          AND (poll_next_observe_at IS NULL OR poll_next_observe_at <= ?)
+          AND (poll_claim_id IS NULL OR poll_claim_expires_at <= ?)
+        """,
+        (
+            claim_id,
+            owner_id,
+            now,
+            claim_expires_at,
+            wait_id,
+            serialize_wait_resume_policy(WaitResumePolicy.POLL),
+            serialize_wait_record_status(WaitRecordStatus.WAITING),
+            serialize_wait_record_status(WaitRecordStatus.CANCELLED),
+            now,
+            now,
+        ),
+    )
+    return _wait_record_poll_mutation_result(
+        transaction, wait_id=wait_id, rowcount=result.rowcount
+    )
+
+
+def release_wait_record_poll_claim(
+    transaction: HostTransaction,
+    *,
+    wait_id: str,
+    claim_id: str,
+    next_observe_at: str,
+    backoff_attempt: int,
+    last_outcome: WaitPollLastOutcome,
+    last_error_code: str | None,
+    last_error_message: str | None,
+    updated_at: str,
+) -> WaitRecordMutationResult:
+    """释放匹配的 wait poll claim 并写入下一次观察时间。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param wait_id: wait record id。
+    :param claim_id: 调用方已取得的 claim id，必须与 row 当前 claim 匹配。
+    :param next_observe_at: 下次可观察 UTC timestamp 文本。
+    :param backoff_attempt: 写入的 backoff attempt 计数。
+    :param last_outcome: 最近一次 poller outcome。
+    :param last_error_code: 最近一次错误码；无错误时为 ``None``。
+    :param last_error_message: 最近一次错误消息；无错误时为 ``None``。
+    :param updated_at: 更新时间文本。
+    :returns: wait record mutation 结果。
+    :raises HostDurableError: 输入字段非法时抛出。
+    """
+
+    _validate_poll_release_inputs(
+        wait_id=wait_id,
+        claim_id=claim_id,
+        next_observe_at=next_observe_at,
+        backoff_attempt=backoff_attempt,
+        last_outcome=last_outcome,
+        last_error_code=last_error_code,
+        last_error_message=last_error_message,
+        updated_at=updated_at,
+    )
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_WAIT_RECORDS}
+        SET
+          poll_claim_id = NULL,
+          poll_claim_owner_id = NULL,
+          poll_claimed_at = NULL,
+          poll_claim_expires_at = NULL,
+          poll_next_observe_at = ?,
+          poll_backoff_attempt = ?,
+          poll_last_outcome = ?,
+          poll_last_error_code = ?,
+          poll_last_error_message = ?,
+          updated_at = ?
+        WHERE wait_id = ?
+          AND poll_claim_id = ?
+          AND status IN (?, ?)
+        """,
+        (
+            next_observe_at,
+            backoff_attempt,
+            serialize_wait_poll_last_outcome(last_outcome),
+            last_error_code,
+            last_error_message,
+            updated_at,
+            wait_id,
+            claim_id,
+            serialize_wait_record_status(WaitRecordStatus.WAITING),
+            serialize_wait_record_status(WaitRecordStatus.CANCELLED),
+        ),
+    )
+    return _wait_record_poll_mutation_result(
+        transaction, wait_id=wait_id, rowcount=result.rowcount
+    )
+
+
+def mark_wait_record_poll_abandoned(
+    transaction: HostTransaction,
+    *,
+    wait_id: str,
+    claim_id: str,
+    abandoned_at: str,
+    updated_at: str,
+) -> WaitRecordMutationResult:
+    """标记 cancelled wait 的外部 abandon 已完成并释放 claim。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param wait_id: wait record id。
+    :param claim_id: 调用方已取得的 claim id，必须与 row 当前 claim 匹配。
+    :param abandoned_at: abandon 完成 UTC timestamp 文本。
+    :param updated_at: 更新时间文本。
+    :returns: wait record mutation 结果。
+    :raises HostDurableError: 输入字段非法时抛出。
+    """
+
+    _require_text_max_length(wait_id, field_name="wait_id", max_length=HOST_WAIT_ID_MAX_LENGTH)
+    _require_text_max_length(
+        claim_id,
+        field_name="poll_claim_id",
+        max_length=HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH,
+    )
+    _require_non_empty_text(abandoned_at, field_name="poll_abandoned_at")
+    _require_non_empty_text(updated_at, field_name="updated_at")
+    result = transaction.execute(
+        f"""
+        UPDATE {TABLE_HOST_WAIT_RECORDS}
+        SET
+          poll_claim_id = NULL,
+          poll_claim_owner_id = NULL,
+          poll_claimed_at = NULL,
+          poll_claim_expires_at = NULL,
+          poll_next_observe_at = NULL,
+          poll_backoff_attempt = 0,
+          poll_last_outcome = ?,
+          poll_last_error_code = NULL,
+          poll_last_error_message = NULL,
+          poll_abandoned_at = ?,
+          updated_at = ?
+        WHERE wait_id = ?
+          AND poll_claim_id = ?
+          AND status = ?
+          AND poll_abandoned_at IS NULL
+        """,
+        (
+            serialize_wait_poll_last_outcome(WaitPollLastOutcome.ABANDONED),
+            abandoned_at,
+            updated_at,
+            wait_id,
+            claim_id,
+            serialize_wait_record_status(WaitRecordStatus.CANCELLED),
+        ),
+    )
+    return _wait_record_poll_mutation_result(
+        transaction, wait_id=wait_id, rowcount=result.rowcount
+    )
+
+
 def insert_session(transaction: HostTransaction, session: SessionRow) -> None:
     """插入 Session row。
 
@@ -2369,6 +2692,16 @@ def insert_wait_record(transaction: HostTransaction, row: WaitRecordRow) -> None
           resolve_semantic_digest,
           deadline_at,
           expires_at,
+          poll_claim_id,
+          poll_claim_owner_id,
+          poll_claimed_at,
+          poll_claim_expires_at,
+          poll_next_observe_at,
+          poll_backoff_attempt,
+          poll_last_outcome,
+          poll_last_error_code,
+          poll_last_error_message,
+          poll_abandoned_at,
           status,
           created_event_id,
           created_event_sequence,
@@ -2377,7 +2710,7 @@ def insert_wait_record(transaction: HostTransaction, row: WaitRecordRow) -> None
           created_at,
           updated_at,
           terminal_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             row.wait_id,
@@ -2400,6 +2733,16 @@ def insert_wait_record(transaction: HostTransaction, row: WaitRecordRow) -> None
             row.resolve_semantic_digest,
             row.deadline_at,
             row.expires_at,
+            row.poll_claim_id,
+            row.poll_claim_owner_id,
+            row.poll_claimed_at,
+            row.poll_claim_expires_at,
+            row.poll_next_observe_at,
+            row.poll_backoff_attempt,
+            serialize_wait_poll_last_outcome(row.poll_last_outcome),
+            row.poll_last_error_code,
+            row.poll_last_error_message,
+            row.poll_abandoned_at,
             serialize_wait_record_status(row.status),
             row.created_event_id,
             row.created_event_sequence,
@@ -5342,6 +5685,7 @@ def _validate_wait_record_for_insert(row: WaitRecordRow) -> None:
     _require_optional_non_empty_text(row.expires_at, field_name="expires_at")
     if not isinstance(row.status, WaitRecordStatus):
         raise HostDurableError("wait status is invalid")
+    _validate_wait_poll_fields(row)
     _require_non_empty_text(row.created_event_id, field_name="created_event_id")
     _require_positive_sequence(row.created_event_sequence, "created_event_sequence")
     _require_non_empty_text(row.updated_event_id, field_name="updated_event_id")
@@ -5350,6 +5694,60 @@ def _validate_wait_record_for_insert(row: WaitRecordRow) -> None:
     _require_non_empty_text(row.updated_at, field_name="updated_at")
     _require_optional_non_empty_text(row.terminal_at, field_name="terminal_at")
     validate_wait_terminal_at_shape(status_value=row.status.value, terminal_at=row.terminal_at)
+
+
+def _validate_wait_poll_fields(row: WaitRecordRow) -> None:
+    """校验 wait record poll claim / backoff 字段形状。
+
+    :param row: 待校验 wait record row。
+    :returns: ``None``。
+    :raises HostDurableError: poll 字段组合非法时抛出。
+    """
+
+    _require_optional_text_max_length(
+        row.poll_claim_id,
+        field_name="poll_claim_id",
+        max_length=HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH,
+    )
+    _require_optional_text_max_length(
+        row.poll_claim_owner_id,
+        field_name="poll_claim_owner_id",
+        max_length=HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH,
+    )
+    _require_optional_non_empty_text(row.poll_claimed_at, field_name="poll_claimed_at")
+    _require_optional_non_empty_text(
+        row.poll_claim_expires_at, field_name="poll_claim_expires_at"
+    )
+    _require_optional_non_empty_text(
+        row.poll_next_observe_at, field_name="poll_next_observe_at"
+    )
+    if row.poll_backoff_attempt < 0:
+        raise HostDurableError("poll_backoff_attempt must be non-negative")
+    if row.poll_last_outcome is not None and not isinstance(
+        row.poll_last_outcome, WaitPollLastOutcome
+    ):
+        raise HostDurableError("poll_last_outcome is invalid")
+    _require_optional_non_empty_text(
+        row.poll_last_error_code, field_name="poll_last_error_code"
+    )
+    _require_optional_non_empty_text(
+        row.poll_last_error_message, field_name="poll_last_error_message"
+    )
+    _require_optional_non_empty_text(
+        row.poll_abandoned_at, field_name="poll_abandoned_at"
+    )
+    claim_values = (
+        row.poll_claim_id,
+        row.poll_claim_owner_id,
+        row.poll_claimed_at,
+        row.poll_claim_expires_at,
+    )
+    if any(value is None for value in claim_values) and any(
+        value is not None for value in claim_values
+    ):
+        raise HostDurableError("poll claim fields must be all set or all unset")
+    if row.poll_abandoned_at is not None and row.status is not WaitRecordStatus.CANCELLED:
+        raise HostDurableError("poll_abandoned_at requires cancelled wait")
 
 
 def _validate_wait_external_job_ref(row: WaitRecordRow) -> None:
@@ -5453,7 +5851,13 @@ def _mark_wait_record_terminal_row(
           updated_event_id = ?,
           updated_event_sequence = ?,
           updated_at = ?,
-          terminal_at = ?
+          terminal_at = ?,
+          poll_claim_id = NULL,
+          poll_claim_owner_id = NULL,
+          poll_claimed_at = NULL,
+          poll_claim_expires_at = NULL,
+          poll_next_observe_at = NULL,
+          poll_backoff_attempt = 0
         WHERE wait_id = ? AND status = ?
 {_WAIT_TERMINAL_AT_UNSET_WHERE_SQL}
         """,
@@ -5552,6 +5956,103 @@ def _wait_record_mutation_result(
     if latest.status == WaitRecordStatus.WAITING:
         return WaitRecordMutationResult(status=StateMutationStatus.CAS_LOST, row=latest)
     return WaitRecordMutationResult(status=StateMutationStatus.INVALID_STATE, row=latest)
+
+
+def _wait_record_poll_mutation_result(
+    transaction: HostTransaction, *, wait_id: str, rowcount: int
+) -> WaitRecordMutationResult:
+    """构造 poll claim / release mutation 结果。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param wait_id: wait record id。
+    :param rowcount: UPDATE rowcount。
+    :returns: wait record mutation 结果。
+    """
+
+    latest = read_wait_record_by_id(transaction, wait_id)
+    if rowcount == 1:
+        return WaitRecordMutationResult(status=StateMutationStatus.UPDATED, row=latest)
+    if latest is None:
+        return WaitRecordMutationResult(status=StateMutationStatus.NOT_FOUND, row=None)
+    if latest.status in (WaitRecordStatus.WAITING, WaitRecordStatus.CANCELLED):
+        return WaitRecordMutationResult(status=StateMutationStatus.CAS_LOST, row=latest)
+    return WaitRecordMutationResult(status=StateMutationStatus.INVALID_STATE, row=latest)
+
+
+def _validate_poll_claim_inputs(
+    *,
+    claim_id: str,
+    owner_id: str,
+    now: str,
+    claim_expires_at: str,
+) -> None:
+    """校验 poll claim 输入。
+
+    :param claim_id: 本次 claim 唯一 id。
+    :param owner_id: poller 实例 owner id。
+    :param now: 当前 UTC timestamp 文本。
+    :param claim_expires_at: claim 过期 UTC timestamp 文本。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段非法时抛出。
+    """
+
+    _require_text_max_length(
+        claim_id,
+        field_name="poll_claim_id",
+        max_length=HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH,
+    )
+    _require_text_max_length(
+        owner_id,
+        field_name="poll_claim_owner_id",
+        max_length=HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH,
+    )
+    _require_non_empty_text(now, field_name="now")
+    _require_non_empty_text(claim_expires_at, field_name="poll_claim_expires_at")
+
+
+def _validate_poll_release_inputs(
+    *,
+    wait_id: str,
+    claim_id: str,
+    next_observe_at: str,
+    backoff_attempt: int,
+    last_outcome: WaitPollLastOutcome,
+    last_error_code: str | None,
+    last_error_message: str | None,
+    updated_at: str,
+) -> None:
+    """校验 poll claim release 输入。
+
+    :param wait_id: wait record id。
+    :param claim_id: claim id。
+    :param next_observe_at: 下次可观察时间。
+    :param backoff_attempt: backoff attempt 计数。
+    :param last_outcome: 最近一次 outcome。
+    :param last_error_code: 最近一次错误码。
+    :param last_error_message: 最近一次错误消息。
+    :param updated_at: 更新时间文本。
+    :returns: ``None``。
+    :raises HostDurableError: 任一字段非法时抛出。
+    """
+
+    _require_text_max_length(wait_id, field_name="wait_id", max_length=HOST_WAIT_ID_MAX_LENGTH)
+    _require_text_max_length(
+        claim_id,
+        field_name="poll_claim_id",
+        max_length=HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH,
+    )
+    _require_non_empty_text(next_observe_at, field_name="poll_next_observe_at")
+    if backoff_attempt < 0:
+        raise HostDurableError("poll_backoff_attempt must be non-negative")
+    if not isinstance(last_outcome, WaitPollLastOutcome):
+        raise HostDurableError("poll_last_outcome is invalid")
+    _require_optional_non_empty_text(
+        last_error_code, field_name="poll_last_error_code"
+    )
+    _require_optional_non_empty_text(
+        last_error_message, field_name="poll_last_error_message"
+    )
+    _require_non_empty_text(updated_at, field_name="updated_at")
 
 
 def _read_wait_record_count_for_run(transaction: HostTransaction, run_id: str) -> int:

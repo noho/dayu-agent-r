@@ -156,12 +156,12 @@ git push -u github <branch>
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
 | gate | final-closeout-pass |
-| implementation status | WU-WAIT-01 / GitHub Issue #89 final closeout recorded; draft PR #163 remains draft/open for user or maintainer handling. |
-| active work unit | WU-WAIT-01 |
-| default next work unit | WU-WAIT-01 |
-| next entry point | Await user / maintainer handling of draft PR #163. After merge, pull latest `main` before entering WU-WAIT-02 / GitHub Issue #90. |
+| implementation status | WU-WAIT-01 / GitHub Issue #89 merged via PR #163 on 2026-07-01; WU-WAIT-02 / GitHub Issue #90 final closeout passed with draft PR #165. |
+| active work unit | WU-WAIT-02 |
+| default next work unit | WU-WAIT-03 |
+| next entry point | After user / maintainer merges draft PR #165, pull latest `main` and enter WU-WAIT-03 / GitHub Issue #92; do not mark ready, merge, close issue, request reviewers, or delete branch without explicit authorization. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
-| issue status comments | Active/backlog issue owners retained here: #129 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #112 / #20 / #89 / #90 / #92 / #80 / #115, plus residual-risk destinations #121 / #122. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`; #63 / #111 / #130 / #133 are no longer active implementation owners. |
+| issue status comments | Active/backlog issue owners retained here: #129 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #112 / #20 / #90 / #92 / #80 / #115, plus residual-risk destinations #121 / #122. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`; #63 / #89 / #111 / #130 / #133 are no longer active implementation owners. |
 | blocking open questions | None. |
 
 状态约定：
@@ -251,12 +251,64 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-GOV-01 | pending | Host policy refusal terminal taxonomy | GitHub Issue #88 | 引入 `RunStatus.REJECTED` 表达权限、租户、额度、配额、速率限制、工具权限 / 审批等 Host policy refusal；compact failure 默认不迁移到 `REJECTED`。 |
 | WU-CTX-04 | pending-low | Run-level compaction concurrency boundary | GitHub Issue #112 | 低优先级设计核对：不引入 EventLog fencing；证明当前状态机 / request 计数 / stale recheck 足够，或在未来并发模型需要时设计 EventLog 外的最小 pointer / CAS。 |
 | WU-CTX-01 | pending | Provider tokenizer / sizing adapter | GitHub Issue #20 | provider/model-aware context sizing；仍有效，需先收敛 budget policy 设计表述 |
-| WU-WAIT-01 | final-closeout-pass | Callback endpoint / auth / replay | GitHub Issue #89 / draft PR #163 | Final closeout 已完成；等待 maintainer/user 处理 draft PR #163。PR body 使用 `Closes #89`，merge 会自动关闭 issue。当前实现提供 Host wait callback typed boundary 与 Service framework-neutral mapper；不包含真实 HTTP route、secret backend、HMAC / bearer verifier、production poller、physical cancel、Engine contract 或 UI surface。 |
-| WU-WAIT-02 | pending | Production poller loop / backoff / fencing / retry | GitHub Issue #90 | production poller loop |
+| WU-WAIT-01 | completed | Callback endpoint / auth / replay | GitHub Issue #89 / PR #163 | PR 163 merged on 2026-07-01; not an active implementation entry point. 当前实现提供 Host wait callback typed boundary 与 Service framework-neutral mapper；不包含真实 HTTP route、secret backend、HMAC / bearer verifier、production poller、physical cancel、Engine contract 或 UI surface。 |
+| WU-WAIT-02 | final-closeout-pass | Production poller loop / backoff / fencing / retry | GitHub Issue #90 / draft PR #165 | Final closeout 已完成；等待 maintainer/user 处理 draft PR #165。PR body 使用 `Closes #90`，merge 会自动关闭 issue。 |
 | WU-WAIT-03 | pending | External job physical cancel / revoke / abandon | GitHub Issue #92 / #87 umbrella | WAITING external job lifecycle |
 | WU-WAIT-04 | pending-prerequisite | UI / Service production-grade awaiting E2E smoke | depends on #89 / #90 / #92 | dependent smoke，不独立实施 |
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
+
+## WU-WAIT-02 Production Poller Loop / Backoff / Fencing / Retry
+
+### 状态
+
+GitHub Issue #90 当前为 OPEN。WU-WAIT-01 / GitHub Issue #89 已通过 PR #163 于 2026-07-01 merge 到 `main`，本文档先前记录的 “等待 PR #163 后进入 WU-WAIT-02” 前置条件已满足。Goal confirmation 已由用户确认。Plan artifact 为 `docs/host/wu-wait-02-production-poller-plan.md`。Plan review artifacts 为 `docs/reviews/plan-review-20260701-135815.md` 与 `docs/reviews/plan-review-20260701-140124.md`，controller adjudication 为 `docs/reviews/wu-wait-02-plan-review-controller-adjudication.md`。Plan-fix artifact 为 `docs/reviews/wu-wait-02-plan-fix-codex.md`。Plan re-review artifacts 为 `docs/reviews/plan-review-20260701-141039.md` 与 `docs/reviews/plan-review-20260701-141200.md`，controller adjudication 为 `docs/reviews/wu-wait-02-plan-rereview-controller-adjudication.md`。两路 re-review 均通过，所有 accepted findings 已修复。Accepted plan commit 为 `350e1dbf`。Slice 1 implementation artifact 为 `docs/reviews/wu-wait-02-slice1-implementation-codex.md`；AgentCodex reported focused Host durable / wait adapter tests 102 passed, pyright 0 errors, and `git diff --check` passed. Controller reran the same focused tests with 102 passed, pyright with 0 errors, and `git diff --check` passed. Slice 1 code review artifacts 为 `docs/reviews/code-review-20260701-143921.md` 与 `docs/reviews/code-review-20260701-144036.md`；controller adjudication 为 `docs/reviews/wu-wait-02-slice1-code-review-controller-adjudication.md`。两路 code review 均通过，无 required current fix；DS low-severity items 已裁决为 non-blocking / Slice 2 optional coverage。Accepted Slice 1 commit 为 `b7447316`。Slice 2 implementation artifact 为 `docs/reviews/wu-wait-02-slice2-implementation-codex.md`；AgentCodex reported wait poller runtime focused tests 20 passed, schema / wait record tests 57 passed, pyright 0 errors, and `git diff --check` passed. Controller reran the same focused test sets with 20 passed and 57 passed, pyright with 0 errors, and `git diff --check` passed. Slice 2 code review artifacts 为 `docs/reviews/code-review-20260701-150341.md` 与 `docs/reviews/code-review-20260701-150525.md`；controller adjudication 为 `docs/reviews/wu-wait-02-slice2-code-review-controller-adjudication.md`。Controller accepted S2-CR-F01 unsafe default direct factory, S2-CR-F02 constructor dead parameters, S2-CR-F03 self-close contract gap, S2-CR-F04 double-close transient state, and S2-CR-F05 close drain timeout `None` contract mismatch. Fix artifact 为 `docs/reviews/wu-wait-02-slice2-fix-codex.md`；AgentCodex reported wait poller runtime focused tests 24 passed, schema / wait record tests 57 passed, pyright 0 errors, and `git diff --check` passed. Controller reran the same focused test sets with 24 passed and 57 passed, pyright with 0 errors, and `git diff --check` passed. Slice 2 code re-review artifacts 为 `docs/reviews/code-review-20260701-151948.md` 与 `docs/reviews/code-review-20260701-152140.md`；controller adjudication 为 `docs/reviews/wu-wait-02-slice2-code-rereview-controller-adjudication.md`。两路 code re-review 均通过，S2-CR-F01 / F02 / F03 / F04 / F05 均已关闭，无新增 material defect。Accepted Slice 2 commit 为 `2974b5a2`。Slice 3 implementation artifact 为 `docs/reviews/wu-wait-02-slice3-implementation-codex.md`；AgentCodex reported open_host / poller / resolve focused tests 51 passed, public lifecycle smoke 2 passed, pyright 0 errors, and `git diff --check` passed. Controller reran the same validation with 51 passed, 2 passed, pyright 0 errors, and `git diff --check` passed. Slice 3 code review artifacts 为 `docs/reviews/code-review-20260701-154721.md` 与 `docs/reviews/code-review-20260701-154834.md`；controller adjudication 为 `docs/reviews/wu-wait-02-slice3-code-review-controller-adjudication.md`。两路 code review 均通过，无 required current fix。Accepted Slice 3 commit 为 `1486e5a9`。Aggregate deepreview artifacts 为 `docs/reviews/code-review-20260701-155500.md` 与 `docs/reviews/code-review-20260701-160040.md`；controller adjudication 为 `docs/reviews/wu-wait-02-aggregate-deepreview-controller-adjudication.md`。两路 aggregate deepreview 均通过，无 blocking finding；residual risks 已归属 Service composition / WU-WAIT-03 / WU-WAIT-04 或 accepted design tradeoff。Accepted aggregate deepreview commit 为 `346b5ae7`。Draft PR #165 已创建：https://github.com/noho/dayu-agent-r/pull/165。PR review artifacts 为 `docs/reviews/pr-165-review-20260701-164627.md` 与 `docs/reviews/pr-165-review-20260701-164858.md`；AgentCodex fix artifact 为 `docs/reviews/wu-wait-02-pr-review-fix-codex.md`；PR re-review artifacts 为 `docs/reviews/pr-165-re-review-20260701-170000.md` 与 `docs/reviews/pr-165-re-review-20260701-170022.md`；controller adjudication 为 `docs/reviews/wu-wait-02-pr-review-controller-adjudication.md`。DS Finding 01 已接受并修复，两路 re-review 均裁决已修复；DS Finding 02 已裁决为 rejected-with-reason；MiMo findings 均为 non-blocking notes / design confirmations。Accepted PR review commit 为 `0bfedacf`，并已 push 到 draft PR #165。`gh pr checks 165` reported no checks on branch `work/wu-wait-02-issue-90`。Final closeout artifact 为 `docs/reviews/wu-wait-02-final-closeout.md`。Issue closeout comment 已发布：https://github.com/noho/dayu-agent-r/issues/90#issuecomment-4852470129。PR body 使用 `Closes #90`，merge 会自动关闭 #90。当前进入 final-closeout-pass gate，等待用户 / maintainer 处理 draft PR #165；不得未经授权 mark ready、merge、close issue、request reviewers 或 delete branch。Merge PR #165 后，应从 `main` 拉取最新代码，再按本文档 next entry point 进入 WU-WAIT-03 / GitHub Issue #92。Review / implementation / fix / re-review artifact 放在 `docs/reviews/` 下。
+
+### 设计与代码核对
+
+- Host 设计真源规定：wait poller 是 background runtime 中的 trigger / adapter。它观察 wait record 与外部 job，但只能通过 `resolve_wait` command path 提交结果；不得持有 EventLog appender，不得直接更新 Run / Attempt / wait record terminal state。
+- Host 设计真源规定：`poll`、`callback`、`manual` 只是发现等待结果已经到达的 adapter；稳定核心是共同的 Host `resolve_wait` pipeline。
+- Host 设计真源规定：poll adapter 从 wait record 读取 `external_job_id` / `await_spec` 后继续轮询，并在完成时调用同一个 `resolve_wait`；`cancelled` / `lost` wait record 的迟到结果不得作为 canonical fact 进入 EventLog。
+- Engine 设计真源规定：Engine 不等待外部长事务完成，不轮询 job，不持久化 wait record，不保留可恢复的 Agent / Runner；长事务 awaiting、orphan cleanup 和工具级取消属于 Host / ToolRuntime。
+- GitHub Issue #90 明确当前已有最小 `WaitPoller.poll_once()`：读取 active poll / cancelled wait records，在 Host transaction 外调用 adapter，ready / lost 结果通过 `resolve_wait`，not-ready 不动作，cancelled 调用 `abandon_wait`，adapter 异常按单条 wait 隔离。
+- 代码核对显示 `dayu/host/wait_adapter.py` 当前 `WaitPoller` 是同步单轮 primitive，返回 `WaitPollOnceResult(observed, not_ready, resolved, lost, abandoned, adapter_errors)`；当前没有后台循环、生命周期 start / stop / close drain、退避策略、in-flight claim / fencing、运行状态诊断或 supervisor 集成。
+- 代码核对显示 `tests/host/test_wait_adapter_polling.py` 已覆盖 ready、not-ready、lost、cancelled abandon-once、missing adapter、adapter error isolation、resolve_wait error isolation 与 abandon failure retry；尚未覆盖 production loop lifecycle、backoff、concurrent poller claim conflict、resolve retry / idempotency 与 shutdown behavior。
+
+### 目标
+
+- 在 Host 层设计并实现 production wait poller loop，围绕现有 `poll_once` / batch poll 语义提供可启动、可停止、可关闭收尾的后台 runtime。
+- 引入 bounded backoff，覆盖 adapter exception、rate limit / provider busy、重复 not-ready、cancelled wait abandon failure 与 transient `resolve_wait` failure，避免 tight loop。
+- 引入最小 in-flight claim / fencing，防止多个 poller 或 Host 进程并发处理同一 wait record；claim 只防重复 polling / duplicate resolve，不表达 Attempt ownership、EventLog truth、外部 job ownership、旧 Attempt takeover 或重 lease。
+- poller ready / lost 结果必须继续走共同 Host `resolve_wait` pipeline；不得直接 append EventLog、更新 Run / Attempt / wait record terminal state、创建 resume Attempt 或绕过幂等检查。
+- 提供可测试、可观测的 poll loop diagnostics：running / stopped、observed / claimed / skipped、ready / lost / not-ready、adapter errors、resolve failures、backoff decisions、claim expiration / conflict。
+- 通过 existing `watch_session_events(...)` / outbox 观察 Host 状态推进，不把 poller 设计成 UI event iterator。
+
+### 非目标
+
+- 不实现 HTTP callback auth / replay；该能力已由 WU-WAIT-01 / GitHub Issue #89 处理。
+- 不实现 external job physical cancel / revoke / abandon 的完整 provider lifecycle；该能力归 WU-WAIT-03 / GitHub Issue #92。
+- 不实现 UI / Service production-grade awaiting E2E smoke；该验收归 WU-WAIT-04，必须等待 #89 / #90 / #92 完成。
+- 不把 poller 变成通用 scheduler、watcher、UI event iterator、lifecycle supervisor 或分布式 lease / Attempt takeover 系统。
+- 不让 backoff state 成为 Host durable truth，除非 plan 基于直接代码证据证明某个最小 durable 字段是 claim / multi-process correctness 必需。
+- 不改变 Engine awaiting 公共模型，不让 Engine 拥有 wait record、poller、activation 或 external job lifecycle truth。
+
+### Plan Gate 约束
+
+- Plan 必须先裁决 claim / fencing 放置位置：是扩展 wait record durable row、增加独立 poll claim 表，还是使用其它最小 Host durable primitive；必须说明为什么该选择不是 lease / takeover。
+- Plan 必须明确 poll loop 的 lifecycle API、Host opener / close 集成方式、sleep cancellation、in-flight adapter 调用边界、close drain 和异常上报。
+- Plan 必须明确 backoff policy 的 owner、状态存储位置、重试节奏、上限、诊断表达和测试注入点；不得用魔法数字散落实现。
+- Plan 必须明确 resolve retry / idempotency 语义：poller 失败重试不得 double-resolve，必须复用稳定 poll idempotency key 或明确新的幂等键策略。
+- Plan 必须明确 diagnostics 是否只是 runtime read view / log / result summary，还是需要进入 EventLog diagnostic；若进入 EventLog，必须先对齐 Host 设计真源。
+- Plan 必须按本文档 Slice 切分原则控制 gate 成本。当前属于中型 Host durable/runtime work，默认优先 2-3 个可验证 implementation slices；超过 3 个 slices 必须说明不能合并的独立失败 / 回滚风险。
+
+### 验收信号
+
+- Production poller loop 可以后台运行并在 Host close / explicit stop 时干净停止，不留下 sleep 或 in-flight wait 悬挂。
+- 多个 poller 不会并发 resolve 同一 wait；claim conflict / expiration 行为可测试。
+- Adapter 间歇失败、重复 not-ready、abandon failure 和 transient `resolve_wait` failure 不会丢失 wait，也不会 tight-loop。
+- Ready / lost outcomes 仍通过共同 `resolve_wait` 管线推进 Host EventLog、wait record、Run / Attempt 与 resume dispatch。
+- UI / Service 通过现有 Host event watch / outbox 能观察 poller 推进后的状态；poller 不直接返回 UI events。
+- 受影响 Host tests、Service assembly tests、pyright 通过；涉及 Host public contract、durable schema、状态机或 README 职责范围的变化必须同步设计真源与对应 README。
 
 ## WU-TOOLS-01-F01-02-R1 Awaiting External Job Two-Phase Activation
 

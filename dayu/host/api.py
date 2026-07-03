@@ -50,6 +50,7 @@ if TYPE_CHECKING:
         HostStorageMaintenanceResult,
         HostStorageUsageReport,
     )
+    from dayu.host.wait_adapter import WaitPollerRuntimePolicy
 
 _DEFAULT_COMMAND_MINIMUM_PROTECTION_TOKENS = 256
 
@@ -1015,6 +1016,8 @@ class OpenHostOptions:
         使用的 policy。
     :param memory_projection_catchup_batch_size: memory catch-up 单批最大 row 数。
     :param enable_truncation_manager: tool-enabled dispatch 是否启用截断治理。
+    :param wait_poller_policy: production wait poller runtime policy；``None``
+        表示不启动 background poller。
     """
 
     db_path: pathlib.Path
@@ -1042,6 +1045,7 @@ class OpenHostOptions:
     memory_projection_policy: MemoryProjectionPolicy
     memory_projection_catchup_batch_size: int
     enable_truncation_manager: bool
+    wait_poller_policy: WaitPollerRuntimePolicy | None = None
 
     def __post_init__(self) -> None:
         """校验 ``open_host`` 构造期选项。

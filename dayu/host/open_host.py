@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from concurrent.futures import Future
+from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import TracebackType
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from dayu.host.audit import (
@@ -33,11 +35,15 @@ from dayu.host.api import (
     EnsureSessionRequest,
     FollowupSnapshot,
     Host,
+    HostApiError,
+    HostApiErrorCode,
     HostClosedError,
     HostCommandHandleOptions,
     HostEvent,
     HostLocalExecutionOptions,
+    HostCallContext,
     ListSessionsResult,
+    OperationContext,
     OutboxTerminalItemsBatch,
     OpenHostOptions,
     PurgeSessionRequest,
@@ -106,7 +112,19 @@ from dayu.host.tool_trace import (
     ToolTraceSinkOptions,
     catch_up_tool_trace_projection,
 )
+from dayu.host.wait_adapter import (
+    WaitPollAdapterRegistry,
+    WaitPollLifecycleGate,
+    WaitPollOnceResult,
+    WaitPoller,
+    WaitPollerFactory,
+    WaitPollerRuntimePolicy,
+    WaitPollerSupervisor,
+)
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
+
+if TYPE_CHECKING:
+    from dayu.host.admission import PendingDispatchRecord
 
 _GENERATED_OPEN_HOST_ID_PREFIX = "open-host"
 _LOGGER = logging.getLogger(__name__)
@@ -127,6 +145,9 @@ _TOOL_TRACE_COLD_JSONL_FILE_NAME = "tool-trace-cold.jsonl"
 
 _TOOL_TRACE_LOCK_FILE_SUFFIX = ".lock"
 """默认 Tool Trace cold JSONL lock 文件名后缀。"""
+
+_WAIT_POLLER_COMMAND_HANDLE_ID_SUFFIX = "wait-poller"
+"""open_host wait poller 每轮 command handle id 后缀。"""
 
 @dataclass(frozen=True, slots=True)
 class _CommandContextBudgetFields:
@@ -236,6 +257,187 @@ class _CompositeProjectionCatchupPort(ProjectionCatchupPort):
             port.catch_up_projection()
 
 
+@dataclass(frozen=True, slots=True)
+class _ThreadsafeSchedulerWakeupPort:
+    """允许 poller thread 同步唤醒 asyncio scheduler 的端口。
+
+    :param loop: ``open_host`` 所属 asyncio event loop。
+    :param scheduler: 当前 Host dispatch scheduler。
+    """
+
+    loop: asyncio.AbstractEventLoop
+    scheduler: HostDispatchScheduler
+
+    def wake_dispatch(self, record: "PendingDispatchRecord") -> None:
+        """在线程安全边界唤醒 dispatch。
+
+        :param record: 已持久化的 pending dispatch 摘要。
+        :returns: ``None``。
+        :raises Exception: scheduler wakeup 失败时透传。
+        """
+
+        if _is_current_event_loop(self.loop):
+            self.scheduler.wake_dispatch(record)
+            return
+        self._run_on_loop(lambda: self.scheduler.wake_dispatch(record))
+
+    def wake_queue_promotion(self, session_id: str) -> None:
+        """在线程安全边界唤醒 queue promotion。
+
+        :param session_id: 目标 Session id。
+        :returns: ``None``。
+        :raises Exception: scheduler wakeup 失败时透传。
+        """
+
+        if _is_current_event_loop(self.loop):
+            self.scheduler.wake_queue_promotion(session_id)
+            return
+        self._run_on_loop(lambda: self.scheduler.wake_queue_promotion(session_id))
+
+    def _run_on_loop(self, callback: Callable[[], None]) -> None:
+        """在 opener event loop 上同步执行 callback。
+
+        :param callback: 要在 event loop thread 执行的回调。
+        :returns: ``None``。
+        :raises Exception: callback 抛出的异常。
+        """
+
+        future: Future[None] = Future()
+
+        def run_callback() -> None:
+            """执行 wakeup callback 并回填跨线程 future。
+
+            :returns: ``None``。
+            """
+
+            try:
+                callback()
+            except Exception as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(None)
+
+        self.loop.call_soon_threadsafe(run_callback)
+        future.result()
+
+
+class _CommandHandleWaitResolver:
+    """通过 Host command handle 调用 ``resolve_wait`` 的 poller resolver。"""
+
+    def __init__(self, command_handle: HostCommandHandle) -> None:
+        """初始化 resolver。
+
+        :param command_handle: 当前 poll round 私有 command handle。
+        :returns: ``None``。
+        """
+
+        self._command_handle = command_handle
+
+    def resolve_wait(self, wait_id: str, request: ResolveWaitRequest) -> RunSnapshot:
+        """转发 wait result 到 command path。
+
+        :param wait_id: wait id。
+        :param request: resolve wait request。
+        :returns: 最新 Run snapshot。
+        """
+
+        return _resolve_wait(self._command_handle, wait_id, request)
+
+
+class _ClosingWaitPoller(WaitPoller):
+    """poll_once 后关闭当前 poll round 私有 command handle。"""
+
+    def __init__(self, *, command_handle: HostCommandHandle, poller: WaitPoller) -> None:
+        """初始化 wrapper。
+
+        :param command_handle: 当前 poll round 私有 command handle。
+        :param poller: 实际 wait poller。
+        :returns: ``None``。
+        """
+
+        self._command_handle = command_handle
+        self._poller = poller
+
+    def poll_once(self) -> WaitPollOnceResult:
+        """执行单轮 poll 并释放当前 poll round durable connection。
+
+        :returns: 单轮 poll result。
+        """
+
+        try:
+            return self._poller.poll_once()
+        finally:
+            self._command_handle.close()
+
+
+@dataclass(frozen=True, slots=True)
+class _OpenHostWaitPollerFactory(WaitPollerFactory):
+    """为 open_host supervisor 创建线程内可用 wait poller 的 factory。
+
+    :param command_options: 派生自 opener options 的 command handle options。
+    :param adapter_registry: production poll adapter registry。
+    :param active_registry: 当前 open_host active worker registry。
+    :param wakeup_port: 线程安全 scheduler wakeup port。
+    :param policy: wait poller runtime policy。
+    :param owner_id: poller owner id。
+    """
+
+    command_options: HostCommandHandleOptions
+    adapter_registry: WaitPollAdapterRegistry
+    active_registry: ActiveWorkerRegistry
+    wakeup_port: _ThreadsafeSchedulerWakeupPort
+    policy: WaitPollerRuntimePolicy
+    owner_id: str
+
+    def create_wait_poller(self, lifecycle_gate: WaitPollLifecycleGate) -> WaitPoller:
+        """在调用线程内打开独立 durable store 并创建 wait poller。
+
+        :param lifecycle_gate: supervisor close gate。
+        :returns: 单轮 poller wrapper。
+        :raises Exception: durable store 或 poller 构造失败时透传。
+        """
+
+        durable_store = open_host_durable_store(
+            _durable_options_from_command_options(self.command_options)
+        )
+        try:
+            admission_service = create_host_admission_service(
+                durable_store.transaction_runner,
+                wakeup_port=self.wakeup_port,
+            )
+            command_handle = HostCommandHandle(
+                host_handle_id=self.owner_id,
+                durable_store=durable_store,
+                admission_service=admission_service,
+                active_registry=self.active_registry,
+            )
+            poller = WaitPoller(
+                transaction_runner=command_handle._transaction_runner(),
+                adapter_registry=self.adapter_registry,
+                resolver=_CommandHandleWaitResolver(command_handle),
+                context=_wait_poller_call_context(self.owner_id),
+                policy=self.policy,
+                lifecycle_gate=lifecycle_gate,
+                owner_id=self.owner_id,
+            )
+            return _ClosingWaitPoller(command_handle=command_handle, poller=poller)
+        except Exception:
+            durable_store.close()
+            raise
+
+
+@dataclass(frozen=True, slots=True)
+class _EnabledWaitPollerConfiguration:
+    """已启用 wait poller 的 construction 配置。
+
+    :param policy: wait poller runtime policy。
+    :param adapter_registry: production poll adapter registry。
+    """
+
+    policy: WaitPollerRuntimePolicy
+    adapter_registry: WaitPollAdapterRegistry
+
+
 class _PublicHostHandle:
     """``open_host`` 返回的 public async Host handle。
 
@@ -250,6 +452,7 @@ class _PublicHostHandle:
         "_host_handle_id",
         "_projection_catchup_port",
         "_scheduler",
+        "_wait_poller",
     )
 
     def __init__(
@@ -259,6 +462,7 @@ class _PublicHostHandle:
         host_handle_id: str,
         scheduler: HostDispatchScheduler,
         projection_catchup_port: ProjectionCatchupPort,
+        wait_poller: WaitPollerSupervisor | None,
     ) -> None:
         """初始化 public Host handle。
 
@@ -266,6 +470,7 @@ class _PublicHostHandle:
         :param host_handle_id: 当前 Host handle 诊断 id。
         :param scheduler: 内部 dispatch scheduler。
         :param projection_catchup_port: close 阶段使用的 projection flush 端口。
+        :param wait_poller: 可选 production wait poller supervisor。
         :returns: ``None``。
         """
 
@@ -273,6 +478,7 @@ class _PublicHostHandle:
         self._host_handle_id = host_handle_id
         self._scheduler = scheduler
         self._projection_catchup_port = projection_catchup_port
+        self._wait_poller = wait_poller
         self._closed: bool = False
 
     async def ensure_session(self, request: EnsureSessionRequest) -> SessionSnapshot:
@@ -545,9 +751,9 @@ class _PublicHostHandle:
     async def close(self) -> None:
         """关闭当前 Host handle lifecycle。
 
-        关闭顺序为 public gate、scheduler、projection flush、durable store。
-        scheduler close 失败时仍会尽力执行 projection flush 与 durable
-        store close；本方法幂等，不写 cancel / failed terminal facts。
+        关闭顺序为 public gate、wait poller、scheduler、projection flush、
+        durable store。poller / scheduler close 失败时仍会尽力执行后续
+        cleanup；本方法幂等，不写 cancel / failed terminal facts。
 
         :returns: ``None``。
         """
@@ -559,8 +765,32 @@ class _PublicHostHandle:
             "host.public_handle.close_start host_handle_id=%s",
             self._host_handle_id,
         )
+        close_error: BaseException | None = None
+        try:
+            if self._wait_poller is not None:
+                await asyncio.to_thread(self._wait_poller.close)
+        except Exception as exc:
+            close_error = exc
+            _LOGGER.error(
+                "host.public_handle.close_wait_poller_failed "
+                "host_handle_id=%s error_type=%s",
+                self._host_handle_id,
+                exc.__class__.__name__,
+                exc_info=True,
+            )
         try:
             await self._scheduler.close()
+        except Exception as exc:
+            if close_error is None:
+                close_error = exc
+            else:
+                _LOGGER.error(
+                    "host.public_handle.close_scheduler_failed "
+                    "host_handle_id=%s error_type=%s",
+                    self._host_handle_id,
+                    exc.__class__.__name__,
+                    exc_info=True,
+                )
         finally:
             try:
                 self._projection_catchup_port.catch_up_projection()
@@ -570,6 +800,8 @@ class _PublicHostHandle:
                     "host.public_handle.close_done host_handle_id=%s",
                     self._host_handle_id,
                 )
+        if close_error is not None:
+            raise close_error
 
     def _raise_if_closed(self) -> None:
         """校验 public handle 仍处于打开状态。
@@ -617,6 +849,7 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
             host_handle_id=host_handle_id,
         )
         local_execution = _local_execution_options_from_open_host_options(self._options)
+        _validate_wait_poller_configuration(self._options)
         _LOGGER.info(
             "host.open.start host_handle_id=%s",
             host_handle_id,
@@ -624,6 +857,7 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
         durable_store = open_host_durable_store(_durable_options_from_command_options(command_options))
         scheduler: HostDispatchScheduler | None = None
         close_projection_catchup_port: ProjectionCatchupPort | None = None
+        wait_poller: WaitPollerSupervisor | None = None
         try:
             active_registry = ActiveWorkerRegistry()
             audit_projection_catchup_port = _LogAuditProjectionCatchupPort(
@@ -673,11 +907,22 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                 admission_service=admission_service,
                 active_registry=active_registry,
             )
+            wait_poller = _wait_poller_supervisor_from_open_host_options(
+                self._options,
+                command_options=command_options,
+                active_registry=active_registry,
+                scheduler=scheduler,
+                loop=asyncio.get_running_loop(),
+                host_handle_id=host_handle_id,
+            )
+            if wait_poller is not None:
+                wait_poller.open()
             self._host = _PublicHostHandle(
                 command_handle=command_handle,
                 host_handle_id=host_handle_id,
                 scheduler=scheduler,
                 projection_catchup_port=close_projection_catchup_port,
+                wait_poller=wait_poller,
             )
             _LOGGER.info(
                 "host.open.ready host_handle_id=%s",
@@ -690,6 +935,17 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                 host_handle_id,
                 exc_info=True,
             )
+            if wait_poller is not None:
+                try:
+                    await asyncio.to_thread(wait_poller.close)
+                except Exception as cleanup_exc:
+                    _LOGGER.error(
+                        "host.open.cleanup_wait_poller_failed "
+                        "host_handle_id=%s error_type=%s",
+                        host_handle_id,
+                        cleanup_exc.__class__.__name__,
+                        exc_info=True,
+                    )
             if scheduler is not None:
                 try:
                     await scheduler.close()
@@ -770,6 +1026,141 @@ def _best_effort_catch_up_projection_on_open_failure(
             cleanup_exc.__class__.__name__,
             exc_info=True,
         )
+
+
+def _validate_wait_poller_configuration(options: OpenHostOptions) -> None:
+    """校验 wait poller opener 配置。
+
+    :param options: public opener options。
+    :returns: ``None``。
+    :raises TypeError: policy 或 poll adapter registry 类型非法时抛出。
+    :raises HostApiError: 启用 poller 但缺少 poll adapter registry 时抛出。
+    """
+
+    _enabled_wait_poller_configuration(options)
+
+
+def _enabled_wait_poller_configuration(
+    options: OpenHostOptions,
+) -> _EnabledWaitPollerConfiguration | None:
+    """读取已启用 wait poller 配置。
+
+    :param options: public opener options。
+    :returns: 已启用配置；未配置或 disabled policy 时返回 ``None``。
+    :raises TypeError: policy 或 poll adapter registry 类型非法时抛出。
+    :raises HostApiError: 启用 poller 但缺少 poll adapter registry 时抛出。
+    """
+
+    policy = options.wait_poller_policy
+    if policy is None:
+        return None
+    if not isinstance(policy, WaitPollerRuntimePolicy):
+        raise TypeError("OpenHostOptions.wait_poller_policy must be WaitPollerRuntimePolicy")
+    if not policy.enabled:
+        return None
+    tooling_options = options.tooling_options
+    if tooling_options is None or tooling_options.wait_poll_adapter_registry is None:
+        raise HostApiError(
+            code=HostApiErrorCode.INVALID_STATE,
+            message=(
+                "OpenHostOptions.wait_poller_policy requires "
+                "HostToolingOptions.wait_poll_adapter_registry"
+            ),
+            retryable=False,
+        )
+    adapter_registry = tooling_options.wait_poll_adapter_registry
+    if not isinstance(adapter_registry, WaitPollAdapterRegistry):
+        raise TypeError(
+            "HostToolingOptions.wait_poll_adapter_registry must be "
+            "WaitPollAdapterRegistry"
+        )
+    return _EnabledWaitPollerConfiguration(
+        policy=policy,
+        adapter_registry=adapter_registry,
+    )
+
+
+def _wait_poller_supervisor_from_open_host_options(
+    options: OpenHostOptions,
+    *,
+    command_options: HostCommandHandleOptions,
+    active_registry: ActiveWorkerRegistry,
+    scheduler: HostDispatchScheduler,
+    loop: asyncio.AbstractEventLoop,
+    host_handle_id: str,
+) -> WaitPollerSupervisor | None:
+    """从 opener options 构造 wait poller supervisor。
+
+    :param options: public opener options。
+    :param command_options: opener 派生 command options。
+    :param active_registry: 当前 Host active worker registry。
+    :param scheduler: 当前 dispatch scheduler。
+    :param loop: 当前 opener event loop。
+    :param host_handle_id: 当前 public Host handle id。
+    :returns: wait poller supervisor；未启用时返回 ``None``。
+    """
+
+    configuration = _enabled_wait_poller_configuration(options)
+    if configuration is None:
+        return None
+    owner_id = f"{host_handle_id}-{_WAIT_POLLER_COMMAND_HANDLE_ID_SUFFIX}"
+    poller_command_options = replace(
+        command_options,
+        host_handle_id=owner_id,
+        local_execution=None,
+    )
+    return WaitPollerSupervisor(
+        poller_factory=_OpenHostWaitPollerFactory(
+            command_options=poller_command_options,
+            adapter_registry=configuration.adapter_registry,
+            active_registry=active_registry,
+            wakeup_port=_ThreadsafeSchedulerWakeupPort(
+                loop=loop,
+                scheduler=scheduler,
+            ),
+            policy=configuration.policy,
+            owner_id=owner_id,
+        ),
+        policy=configuration.policy,
+        owner_id=owner_id,
+    )
+
+
+def _wait_poller_call_context(owner_id: str) -> HostCallContext:
+    """构造 wait poller 内部 resolve_wait 调用上下文。
+
+    :param owner_id: poller owner id。
+    :returns: Host call context。
+    """
+
+    return HostCallContext(
+        actor="host",
+        source="wait_poller",
+        request_id=owner_id,
+        authorization_claims=(),
+        operation_context=OperationContext(
+            operation_name="wait_poller",
+            operation_kind="host_runtime",
+            business_domain="host",
+            business_object_type=None,
+            business_object_id=None,
+            scenario="production_wait_poll",
+            correlation_id=owner_id,
+        ),
+    )
+
+
+def _is_current_event_loop(loop: asyncio.AbstractEventLoop) -> bool:
+    """判断当前线程是否正在运行指定 event loop。
+
+    :param loop: 目标 event loop。
+    :returns: 当前线程运行目标 loop 时返回 ``True``。
+    """
+
+    try:
+        return asyncio.get_running_loop() is loop
+    except RuntimeError:
+        return False
 
 
 def _command_options_from_open_host_options(

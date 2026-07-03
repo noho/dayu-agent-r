@@ -31,7 +31,7 @@ from dayu.host.api import (
 )
 from dayu.host.durable.errors import HostSchemaMismatchError
 
-HOST_SCHEMA_VERSION = 16
+HOST_SCHEMA_VERSION = 18
 """当前 Host durable SQLite schema version。"""
 
 TABLE_EVENT_LOG = "event_log"
@@ -700,6 +700,33 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_WAIT_RECORDS} (
   resolve_semantic_digest TEXT NULL,
   deadline_at TEXT NULL,
   expires_at TEXT NULL,
+  poll_claim_id TEXT NULL CHECK (
+    poll_claim_id IS NULL
+      OR length(poll_claim_id) BETWEEN 1 AND {HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH}
+  ),
+  poll_claim_owner_id TEXT NULL CHECK (
+    poll_claim_owner_id IS NULL
+      OR length(poll_claim_owner_id) BETWEEN 1 AND {HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH}
+  ),
+  poll_claimed_at TEXT NULL,
+  poll_claim_expires_at TEXT NULL,
+  poll_next_observe_at TEXT NULL,
+  poll_backoff_attempt INTEGER NOT NULL DEFAULT 0 CHECK (poll_backoff_attempt >= 0),
+  poll_last_outcome TEXT NULL CHECK (
+    poll_last_outcome IS NULL
+      OR poll_last_outcome IN (
+        'not_ready',
+        'adapter_error',
+        'missing_adapter',
+        'resolve_error',
+        'abandon_error',
+        'shutdown_skipped',
+        'abandoned'
+      )
+  ),
+  poll_last_error_code TEXT NULL,
+  poll_last_error_message TEXT NULL,
+  poll_abandoned_at TEXT NULL,
   status TEXT NOT NULL CHECK (
     status IN ('waiting', 'resolved', 'failed', 'cancelled', 'lost')
   ),
@@ -734,6 +761,20 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_WAIT_RECORDS} (
     (resolve_idempotency_key IS NULL AND resolve_semantic_digest IS NULL)
     OR
     (resolve_idempotency_key IS NOT NULL AND resolve_semantic_digest IS NOT NULL)
+  ),
+  CHECK (
+    (poll_claim_id IS NULL
+      AND poll_claim_owner_id IS NULL
+      AND poll_claimed_at IS NULL
+      AND poll_claim_expires_at IS NULL)
+    OR
+    (poll_claim_id IS NOT NULL
+      AND poll_claim_owner_id IS NOT NULL
+      AND poll_claimed_at IS NOT NULL
+      AND poll_claim_expires_at IS NOT NULL)
+  ),
+  CHECK (
+    poll_abandoned_at IS NULL OR status = 'cancelled'
   )
 )
 """
@@ -1103,7 +1144,14 @@ WHERE status = 'waiting'
 
 _HOST_WAIT_RECORDS_ACTIVE_POLL_INDEX_DDL = f"""
 CREATE INDEX IF NOT EXISTS {INDEX_HOST_WAIT_RECORDS_ACTIVE_POLL}
-ON {TABLE_HOST_WAIT_RECORDS}(resume_policy, status, deadline_at, expires_at)
+ON {TABLE_HOST_WAIT_RECORDS}(
+  resume_policy,
+  status,
+  poll_next_observe_at,
+  poll_claim_expires_at,
+  created_event_sequence,
+  wait_id
+)
 """
 
 _HOST_WAIT_RECORDS_EXTERNAL_JOB_INDEX_DDL = f"""

@@ -25,9 +25,11 @@ from dayu.host.durable.state import (
     StateMutationStatus,
     WaitRecordRow,
     WaitRecordStatus,
+    WaitPollLastOutcome,
     WaitResumePolicy,
     WaitSnapshotRef,
     cancel_active_wait_records_for_run,
+    claim_wait_record_for_poll,
     deserialize_wait_record_status,
     deserialize_wait_resume_policy,
     insert_attempt,
@@ -36,9 +38,11 @@ from dayu.host.durable.state import (
     insert_wait_record,
     mark_wait_record_failed_row,
     mark_wait_record_lost_row,
+    mark_wait_record_poll_abandoned,
     mark_wait_record_resolved_row,
     read_active_wait_records_for_run,
     read_wait_record_by_id,
+    release_wait_record_poll_claim,
     serialize_wait_record_status,
     serialize_wait_resume_policy,
     wait_record_row_from_host_row,
@@ -46,6 +50,9 @@ from dayu.host.durable.state import (
 from dayu.host.durable.transaction import HostRow, HostTransaction, SQLiteScalar
 
 _TIMESTAMP = "2026-05-16T00:00:00.000000Z"
+_EARLIER_TIMESTAMP = "2026-05-16T00:00:10.000000Z"
+_LATER_TIMESTAMP = "2026-05-16T00:01:00.000000Z"
+_FUTURE_TIMESTAMP = "2026-05-16T00:05:00.000000Z"
 _EVENT_DIGEST = "0" * 64
 _SNAPSHOT_AT = datetime(2026, 5, 16, tzinfo=UTC)
 _SNAPSHOT_DIGEST = "sha256:" + "1" * 64
@@ -351,6 +358,16 @@ def test_wait_record_codecs_round_trip_all_typed_fields(tmp_path: Path) -> None:
             adapter_key=WaitAdapterKey("poll.primary"),
             external_job_id="external-job-wait-1",
         )
+        assert row.poll_claim_id is None
+        assert row.poll_claim_owner_id is None
+        assert row.poll_claimed_at is None
+        assert row.poll_claim_expires_at is None
+        assert row.poll_next_observe_at is None
+        assert row.poll_backoff_attempt == 0
+        assert row.poll_last_outcome is None
+        assert row.poll_last_error_code is None
+        assert row.poll_last_error_message is None
+        assert row.poll_abandoned_at is None
 
 
 def test_wait_record_status_and_policy_codecs_are_closed() -> None:
@@ -760,6 +777,315 @@ def test_wait_record_cas_helpers_update_waiting_only(tmp_path: Path) -> None:
         )
 
 
+def test_poll_claim_acquires_eligible_waiting_row(tmp_path: Path) -> None:
+    """poll claim helper 原子 claim eligible waiting poll row。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(transaction: HostTransaction) -> WaitRecordRow:
+            """写入 waiting wait 并取得 poll claim。
+
+            :param transaction: Host transaction。
+            :returns: claim 后的 wait record。
+            """
+
+            _seed_run(transaction)
+            insert_wait_record(transaction, _wait_row(transaction))
+            result = claim_wait_record_for_poll(
+                transaction,
+                claim_id="claim-1",
+                owner_id="poller-1",
+                now=_TIMESTAMP,
+                claim_expires_at=_LATER_TIMESTAMP,
+            )
+            assert result.status is StateMutationStatus.UPDATED
+            assert result.row is not None
+            return result.row
+
+        row = store.transaction_runner.run_write(operation)
+        assert row.poll_claim_id == "claim-1"
+        assert row.poll_claim_owner_id == "poller-1"
+        assert row.poll_claimed_at == _TIMESTAMP
+        assert row.poll_claim_expires_at == _LATER_TIMESTAMP
+
+
+def test_poll_claim_skips_future_next_observe_and_active_claim(
+    tmp_path: Path,
+) -> None:
+    """poll claim helper 跳过未到期 backoff 与未过期 claim。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(transaction: HostTransaction) -> tuple[StateMutationStatus, StateMutationStatus]:
+            """构造未来 backoff 与 active claim 后尝试 claim。
+
+            :param transaction: Host transaction。
+            :returns: 两次 claim 状态。
+            """
+
+            _seed_run(transaction)
+            insert_wait_record(transaction, _wait_row(transaction))
+            transaction.execute(
+                f"""
+                UPDATE {TABLE_HOST_WAIT_RECORDS}
+                SET poll_next_observe_at = ?
+                WHERE wait_id = ?
+                """,
+                (_FUTURE_TIMESTAMP, "wait-1"),
+            )
+            future_backoff = claim_wait_record_for_poll(
+                transaction,
+                claim_id="claim-future",
+                owner_id="poller-1",
+                now=_TIMESTAMP,
+                claim_expires_at=_LATER_TIMESTAMP,
+            )
+            transaction.execute(
+                f"""
+                UPDATE {TABLE_HOST_WAIT_RECORDS}
+                SET poll_next_observe_at = NULL,
+                    poll_claim_id = ?,
+                    poll_claim_owner_id = ?,
+                    poll_claimed_at = ?,
+                    poll_claim_expires_at = ?
+                WHERE wait_id = ?
+                """,
+                ("claim-active", "poller-active", _TIMESTAMP, _FUTURE_TIMESTAMP, "wait-1"),
+            )
+            active_claim = claim_wait_record_for_poll(
+                transaction,
+                claim_id="claim-conflict",
+                owner_id="poller-2",
+                now=_LATER_TIMESTAMP,
+                claim_expires_at=_FUTURE_TIMESTAMP,
+            )
+            return future_backoff.status, active_claim.status
+
+        assert store.transaction_runner.run_write(operation) == (
+            StateMutationStatus.NOT_FOUND,
+            StateMutationStatus.NOT_FOUND,
+        )
+
+
+def test_poll_claim_acquires_expired_claim(tmp_path: Path) -> None:
+    """poll claim helper 可接管已过期 claim。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(transaction: HostTransaction) -> WaitRecordRow:
+            """构造过期 claim 后重新 claim。
+
+            :param transaction: Host transaction。
+            :returns: 接管后的 wait record。
+            """
+
+            _seed_run(transaction)
+            insert_wait_record(transaction, _wait_row(transaction))
+            transaction.execute(
+                f"""
+                UPDATE {TABLE_HOST_WAIT_RECORDS}
+                SET poll_claim_id = ?,
+                    poll_claim_owner_id = ?,
+                    poll_claimed_at = ?,
+                    poll_claim_expires_at = ?
+                WHERE wait_id = ?
+                """,
+                ("claim-old", "poller-old", _EARLIER_TIMESTAMP, _LATER_TIMESTAMP, "wait-1"),
+            )
+            result = claim_wait_record_for_poll(
+                transaction,
+                claim_id="claim-new",
+                owner_id="poller-new",
+                now=_FUTURE_TIMESTAMP,
+                claim_expires_at="2026-05-16T00:06:00.000000Z",
+            )
+            assert result.status is StateMutationStatus.UPDATED
+            assert result.row is not None
+            return result.row
+
+        row = store.transaction_runner.run_write(operation)
+        assert row.poll_claim_id == "claim-new"
+        assert row.poll_claim_owner_id == "poller-new"
+
+
+def test_stale_poll_release_cannot_clear_newer_claim(tmp_path: Path) -> None:
+    """旧 claim release 不能清除新的 poll claim。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(transaction: HostTransaction) -> tuple[StateMutationStatus, WaitRecordRow]:
+            """构造新 claim 后用旧 claim 尝试 release。
+
+            :param transaction: Host transaction。
+            :returns: release 状态与最新 wait row。
+            """
+
+            _seed_run(transaction)
+            insert_wait_record(transaction, _wait_row(transaction))
+            transaction.execute(
+                f"""
+                UPDATE {TABLE_HOST_WAIT_RECORDS}
+                SET poll_claim_id = ?,
+                    poll_claim_owner_id = ?,
+                    poll_claimed_at = ?,
+                    poll_claim_expires_at = ?
+                WHERE wait_id = ?
+                """,
+                ("claim-new", "poller-new", _TIMESTAMP, _FUTURE_TIMESTAMP, "wait-1"),
+            )
+            release = release_wait_record_poll_claim(
+                transaction,
+                wait_id="wait-1",
+                claim_id="claim-old",
+                next_observe_at=_FUTURE_TIMESTAMP,
+                backoff_attempt=1,
+                last_outcome=WaitPollLastOutcome.NOT_READY,
+                last_error_code=None,
+                last_error_message=None,
+                updated_at=_TIMESTAMP,
+            )
+            latest = read_wait_record_by_id(transaction, "wait-1")
+            assert latest is not None
+            return release.status, latest
+
+        status, row = store.transaction_runner.run_write(operation)
+        assert status is StateMutationStatus.CAS_LOST
+        assert row.poll_claim_id == "claim-new"
+        assert row.poll_next_observe_at is None
+
+
+def test_cancelled_poll_abandoned_row_is_not_eligible(tmp_path: Path) -> None:
+    """已标记 poll_abandoned_at 的 cancelled wait 不再 eligible。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(transaction: HostTransaction) -> StateMutationStatus:
+            """构造已 abandoned cancelled wait 后尝试 claim。
+
+            :param transaction: Host transaction。
+            :returns: claim 状态。
+            """
+
+            _seed_run(transaction)
+            insert_wait_record(
+                transaction,
+                _wait_row(
+                    transaction,
+                    status=WaitRecordStatus.CANCELLED,
+                ),
+            )
+            transaction.execute(
+                f"""
+                UPDATE {TABLE_HOST_WAIT_RECORDS}
+                SET poll_abandoned_at = ?
+                WHERE wait_id = ?
+                """,
+                (_TIMESTAMP, "wait-1"),
+            )
+            result = claim_wait_record_for_poll(
+                transaction,
+                claim_id="claim-after-abandon",
+                owner_id="poller-1",
+                now=_LATER_TIMESTAMP,
+                claim_expires_at=_FUTURE_TIMESTAMP,
+            )
+            return result.status
+
+        assert store.transaction_runner.run_write(operation) is StateMutationStatus.NOT_FOUND
+
+
+def test_poll_abandon_success_marks_row_and_clears_claim(tmp_path: Path) -> None:
+    """poll abandon success CAS 写入 durable marker 并清理 claim / backoff。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(transaction: HostTransaction) -> WaitRecordRow:
+            """claim cancelled wait 后标记 abandon success。
+
+            :param transaction: Host transaction。
+            :returns: abandon 后 wait row。
+            """
+
+            _seed_run(transaction)
+            insert_wait_record(
+                transaction,
+                _wait_row(transaction, status=WaitRecordStatus.CANCELLED),
+            )
+            claimed = claim_wait_record_for_poll(
+                transaction,
+                claim_id="claim-abandon",
+                owner_id="poller-1",
+                now=_TIMESTAMP,
+                claim_expires_at=_LATER_TIMESTAMP,
+            )
+            assert claimed.status is StateMutationStatus.UPDATED
+            abandoned = mark_wait_record_poll_abandoned(
+                transaction,
+                wait_id="wait-1",
+                claim_id="claim-abandon",
+                abandoned_at=_LATER_TIMESTAMP,
+                updated_at=_LATER_TIMESTAMP,
+            )
+            assert abandoned.status is StateMutationStatus.UPDATED
+            assert abandoned.row is not None
+            return abandoned.row
+
+        row = store.transaction_runner.run_write(operation)
+        assert row.poll_abandoned_at == _LATER_TIMESTAMP
+        assert row.poll_claim_id is None
+        assert row.poll_last_outcome is WaitPollLastOutcome.ABANDONED
+
+
+def test_wait_record_terminal_transition_clears_poll_claim(tmp_path: Path) -> None:
+    """wait terminal CAS 清除 poll claim 字段。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(transaction: HostTransaction) -> WaitRecordRow:
+            """claim waiting wait 后标记 resolved。
+
+            :param transaction: Host transaction。
+            :returns: terminal wait row。
+            """
+
+            _seed_run(transaction)
+            insert_wait_record(transaction, _wait_row(transaction))
+            claim_wait_record_for_poll(
+                transaction,
+                claim_id="claim-terminal",
+                owner_id="poller-1",
+                now=_TIMESTAMP,
+                claim_expires_at=_LATER_TIMESTAMP,
+            )
+            result = mark_wait_record_resolved_row(
+                transaction,
+                wait_id="wait-1",
+                resolve_idempotency_key="resolve-1",
+                resolve_semantic_digest=_RESOLVE_DIGEST,
+                updated_event_id="event-wait-updated-wait-1",
+                updated_event_sequence=4,
+                updated_at=_LATER_TIMESTAMP,
+                terminal_at=_LATER_TIMESTAMP,
+            )
+            assert result.status is StateMutationStatus.UPDATED
+            assert result.row is not None
+            return result.row
+
+        row = store.transaction_runner.run_write(operation)
+        assert row.status is WaitRecordStatus.RESOLVED
+        assert row.poll_claim_id is None
+        assert row.poll_claim_owner_id is None
+        assert row.poll_claimed_at is None
+        assert row.poll_claim_expires_at is None
+
+
 def test_wait_record_terminal_cas_rejects_corrupted_waiting_terminal_at(
     tmp_path: Path,
 ) -> None:
@@ -971,6 +1297,16 @@ def _wait_record_host_row(
         "resolve_semantic_digest",
         "deadline_at",
         "expires_at",
+        "poll_claim_id",
+        "poll_claim_owner_id",
+        "poll_claimed_at",
+        "poll_claim_expires_at",
+        "poll_next_observe_at",
+        "poll_backoff_attempt",
+        "poll_last_outcome",
+        "poll_last_error_code",
+        "poll_last_error_message",
+        "poll_abandoned_at",
         "status",
         "created_event_id",
         "created_event_sequence",
@@ -997,6 +1333,16 @@ def _wait_record_host_row(
         None,
         None,
         "accept-1",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
         None,
         None,
         None,
