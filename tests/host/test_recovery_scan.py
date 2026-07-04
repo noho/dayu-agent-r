@@ -67,6 +67,8 @@ _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "recovery-scan-test"})
 _INPUT_DIGEST = sha256_digest_json({"input": "hello"})
 _REASON_CANCEL_IN_FLIGHT_ATTEMPT_LOST = "cancel_in_flight_attempt_lost"
 _EVENT_TYPE_ATTEMPT_LOST = "ATTEMPT_LOST"
+_EVENT_TYPE_CANCEL_REQUESTED = "CANCEL_REQUESTED"
+_EVENT_TYPE_RUN_CANCELLING = "RUN_CANCELLING"
 _EVENT_TYPE_RUN_LOST = "RUN_LOST"
 _EVENT_TYPE_RUN_RECOVERING = "RUN_RECOVERING"
 _REASON_OWNER_HEARTBEAT_RECENT = "owner_heartbeat_recent"
@@ -680,6 +682,84 @@ def test_scan_cancelling_positive_orphan_loses_attempt_then_run(
         assert event_types[-2:] == (_EVENT_TYPE_ATTEMPT_LOST, _EVENT_TYPE_RUN_LOST)
         assert _EVENT_TYPE_RUN_RECOVERING not in event_types
         assert run_lost_reason == _REASON_CANCEL_IN_FLIGHT_ATTEMPT_LOST
+
+
+def test_scan_defers_accepted_cancel_cancelling_to_watchdog_when_enabled(
+    tmp_path: Path,
+) -> None:
+    """watchdog enabled 时 accepted-cancel CANCELLING 不被 recovery 标为 LOST。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        _seed_running_dispatching_run(store.transaction_runner, "run-1")
+        _mark_run_status(store.transaction_runner, "run-1", RunStatus.CANCELLING)
+        _append_accepted_cancel_facts(store.transaction_runner, "run-1")
+
+        result = StartupRecoveryScanner(
+            transaction_runner=store.transaction_runner,
+            event_log_store=EventLogStore(),
+            process_probe=_PidMissingProbe(),
+            defer_accepted_cancel_to_watchdog=True,
+        ).scan(_policy())
+
+        assert tuple(action.decision for action in result.actions) == (
+            StartupRecoveryDecision.DEFERRED_TO_ACTIVE_CANCEL_WATCHDOG,
+        )
+        assert tuple(action.reason for action in result.actions) == (
+            "accepted_cancel_watchdog_owner",
+        )
+        assert _run_status(store.transaction_runner, "run-1") == RunStatus.CANCELLING.value
+        assert _event_type_count(store.transaction_runner, _EVENT_TYPE_RUN_LOST) == 0
+
+
+def test_scan_malformed_cancelling_payload_uses_orphan_policy(
+    tmp_path: Path,
+) -> None:
+    """malformed RUN_CANCELLING payload 不应中断 startup recovery scan。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        _seed_running_dispatching_run(store.transaction_runner, "run-1")
+        _mark_run_status(store.transaction_runner, "run-1", RunStatus.CANCELLING)
+        _append_malformed_run_cancelling_payload(store.transaction_runner, "run-1")
+
+        result = StartupRecoveryScanner(
+            transaction_runner=store.transaction_runner,
+            event_log_store=EventLogStore(),
+            process_probe=_PidMissingProbe(),
+            defer_accepted_cancel_to_watchdog=True,
+        ).scan(_policy())
+
+        assert tuple(action.decision for action in result.actions) == (
+            StartupRecoveryDecision.RUN_LOST,
+        )
+        assert tuple(action.reason for action in result.actions) == (
+            _REASON_CANCEL_IN_FLIGHT_ATTEMPT_LOST,
+        )
+        assert _run_status(store.transaction_runner, "run-1") == RunStatus.LOST.value
+        assert _event_type_count(store.transaction_runner, _EVENT_TYPE_RUN_LOST) == 1
+
+
+def test_scan_watchdog_disabled_keeps_cancelling_orphan_policy(
+    tmp_path: Path,
+) -> None:
+    """watchdog disabled 时 accepted-cancel CANCELLING 仍按 recovery orphan 策略。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        _seed_running_dispatching_run(store.transaction_runner, "run-1")
+        _mark_run_status(store.transaction_runner, "run-1", RunStatus.CANCELLING)
+        _append_accepted_cancel_facts(store.transaction_runner, "run-1")
+
+        result = StartupRecoveryScanner(
+            transaction_runner=store.transaction_runner,
+            event_log_store=EventLogStore(),
+            process_probe=_PidMissingProbe(),
+            defer_accepted_cancel_to_watchdog=False,
+        ).scan(_policy())
+
+        assert tuple(action.decision for action in result.actions) == (
+            StartupRecoveryDecision.RUN_LOST,
+        )
+        assert _run_status(store.transaction_runner, "run-1") == RunStatus.LOST.value
+        assert _event_type_count(store.transaction_runner, _EVENT_TYPE_RUN_LOST) == 1
 
 
 def test_scan_accepted_does_not_mutate_or_create_attempt(tmp_path: Path) -> None:
@@ -1373,6 +1453,115 @@ def _append_recovery_started_event(
                     "attempt_id": f"attempt-recovery-{run_id}",
                     "dispatch_record_id": f"dispatch-recovery-{run_id}",
                 },
+            ),
+        )
+
+    transaction_runner.run_write(operation)
+
+
+def _append_accepted_cancel_facts(
+    transaction_runner: HostTransactionRunner,
+    run_id: str,
+) -> None:
+    """追加测试用 accepted active cancel facts。
+
+    :param transaction_runner: Host transaction runner。
+    :param run_id: Run id。
+    :returns: ``None``。
+    """
+
+    def operation(transaction: HostTransaction) -> None:
+        """追加 ``CANCEL_REQUESTED`` 与 ``RUN_CANCELLING``。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        session_row = transaction.fetchone(
+            "SELECT session_id FROM host_runs WHERE run_id = ?",
+            (run_id,),
+        )
+        assert session_row is not None
+        session_id = _required_text(session_row, "session_id")
+        cancel_requested_id = f"event-cancel-requested-{run_id}"
+        event_log_store = EventLogStore()
+        event_log_store.append_event(
+            transaction,
+            _event(
+                event_id=cancel_requested_id,
+                session_id=session_id,
+                run_id=run_id,
+                event_type=_EVENT_TYPE_CANCEL_REQUESTED,
+                payload={
+                    "run_id": run_id,
+                    "reason": "user_stop",
+                    "mode": "graceful",
+                },
+            ),
+        )
+        event_log_store.append_event(
+            transaction,
+            _event(
+                event_id=f"event-run-cancelling-{run_id}",
+                session_id=session_id,
+                run_id=run_id,
+                event_type=_EVENT_TYPE_RUN_CANCELLING,
+                payload={
+                    "run_id": run_id,
+                    "cancel_request_event_id": cancel_requested_id,
+                    "reason": "user_stop",
+                },
+            ),
+        )
+
+    transaction_runner.run_write(operation)
+
+
+def _append_malformed_run_cancelling_payload(
+    transaction_runner: HostTransactionRunner,
+    run_id: str,
+) -> None:
+    """追加测试用 malformed ``RUN_CANCELLING`` fact。
+
+    :param transaction_runner: Host transaction runner。
+    :param run_id: Run id。
+    :returns: ``None``。
+    """
+
+    def operation(transaction: HostTransaction) -> None:
+        """追加 payload 非 object 的 ``RUN_CANCELLING``。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        session_row = transaction.fetchone(
+            "SELECT session_id FROM host_runs WHERE run_id = ?",
+            (run_id,),
+        )
+        assert session_row is not None
+        session_id = _required_text(session_row, "session_id")
+        event_log_store = EventLogStore()
+        event_log_store.append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=f"event-run-cancelling-malformed-{run_id}",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id=run_id,
+                attempt_id=None,
+                execution_id=None,
+                event_type=_EVENT_TYPE_RUN_CANCELLING,
+                occurred_at=_NOW,
+                actor="analyst",
+                source="pytest",
+                client_request_id="client-request-malformed",
+                idempotency_key=f"client-request-malformed-{run_id}",
+                policy_decision=None,
+                reason=None,
+                payload_json="malformed-cancelling-payload",
+                payload_ref=None,
+                payload_digest=None,
             ),
         )
 

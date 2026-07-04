@@ -1941,6 +1941,47 @@ class _RetryExhaustedDrainLoopScheduler(HostDispatchScheduler):
         raise HostTransactionRetryExhaustedError("drain retry exhausted", attempts=3)
 
 
+class _TransientFailingActiveCancelWatchdogScheduler(HostDispatchScheduler):
+    """测试用 active cancel watchdog 单次 tick 失败 scheduler。"""
+
+    _tick_count: int
+    _second_tick_seen: asyncio.Event
+
+    def configure_transient_watchdog_failure(
+        self, second_tick_seen: asyncio.Event
+    ) -> None:
+        """配置 transient tick failure 测试观测点。
+
+        :param second_tick_seen: 第二次 tick 执行时置位的事件。
+        :returns: ``None``。
+        """
+
+        self._tick_count = 0
+        self._second_tick_seen = second_tick_seen
+
+    def tick_active_cancel_watchdog(
+        self, now: datetime
+    ) -> host_dispatch.ActiveCancelWatchdogTickResult:
+        """模拟第一次 tick 抛普通异常，第二次 tick 成功。
+
+        :param now: watchdog tick 的当前时间。
+        :returns: 空扫描 tick 结果。
+        :raises RuntimeError: 第一次 tick 固定抛出测试异常。
+        """
+
+        _ = now
+        self._tick_count += 1
+        if self._tick_count == 1:
+            raise RuntimeError("active cancel watchdog transient failure")
+        self._second_tick_seen.set()
+        return host_dispatch.ActiveCancelWatchdogTickResult(
+            scanned=0,
+            eligible=0,
+            closed=0,
+            ignored=0,
+        )
+
+
 class _CloseWorkerLostFailingIngestor:
     """测试用 close_worker_lost 失败 ingestor。"""
 
@@ -2668,6 +2709,69 @@ async def test_drain_loop_fail_closes_on_durable_retry_exhausted(
         await scheduler.close()
 
     assert any("dispatch drain loop durable retry exhausted" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_active_cancel_watchdog_loop_continues_after_transient_tick_failure(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """active cancel watchdog 单次 tick 普通异常后必须继续下一轮扫描。"""
+
+    caplog.set_level(logging.ERROR, logger="dayu.host.dispatch")
+    with open_host_durable_store(_options(tmp_path)) as store:
+        lane_controller = await LaneController.open(
+            [
+                LaneConfig(
+                    name=_LANE_NAME,
+                    capacity=1,
+                    default_timeout_seconds=0.1,
+                    claim_ttl_seconds=1.0,
+                    heartbeat_interval_seconds=0.1,
+                )
+            ],
+            coordinator=SQLiteLaneCoordinatorConfig(
+                db_path=tmp_path / "lane-active-cancel-watchdog.sqlite3"
+            ),
+        )
+        scheduler = _TransientFailingActiveCancelWatchdogScheduler(
+            transaction_runner=store.transaction_runner,
+            event_log_store=EventLogStore(),
+            local_execution=HostLocalExecutionOptions(
+                lane_db_path=tmp_path / "lane-active-cancel-watchdog.sqlite3",
+                lane_name=_LANE_NAME,
+                lane_capacity=1,
+                lane_default_timeout_seconds=0.1,
+                lane_claim_ttl_seconds=1.0,
+                lane_heartbeat_interval_seconds=0.1,
+                worker_startup_timeout_seconds=1.0,
+                dispatch_poll_interval_seconds=0.01,
+                runner_spec=_runner_spec(),
+                runner_options=RunnerCallOptions(
+                    temperature=None,
+                    max_tokens=None,
+                    top_p=None,
+                    stream=False,
+                ),
+                agent_policy=_agent_policy(False),
+                worker_factory=_FakeWorkerFactory(),
+                active_cancel_timeout_seconds=1.0,
+            ),
+            lane_controller=lane_controller,
+            host_handle_id="host-active-cancel-watchdog-transient",
+        )
+        second_tick_seen = asyncio.Event()
+        scheduler.configure_transient_watchdog_failure(second_tick_seen)
+        try:
+            scheduler.wake_active_cancel_watchdog()
+            await asyncio.wait_for(second_tick_seen.wait(), timeout=0.5)
+            assert scheduler._active_cancel_watchdog_task is not None
+            assert scheduler._active_cancel_watchdog_task.done() is False
+        finally:
+            await scheduler.close()
+
+    assert "dispatch.active_cancel_watchdog.tick_failed" in caplog.text
+    assert "error_type=RuntimeError" in caplog.text
 
 
 @pytest.mark.asyncio

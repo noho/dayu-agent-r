@@ -14,7 +14,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from sqlite3 import Connection
-from typing import NoReturn
+from typing import NoReturn, Protocol
 from uuid import uuid4
 
 from dayu.contracts.json_value import JsonValue
@@ -156,6 +156,21 @@ _PURGE_FAILURE_STAGE_IDEMPOTENCY_CONFLICT = "idempotency_conflict"
 _PURGE_FAILURE_STAGE_SQLITE_TRANSACTION = "sqlite_purge_transaction"
 
 
+class ActiveCancelWatchdogWakeupPort(Protocol):
+    """active cancel watchdog commit 后唤醒端口。
+
+    该端口只表达低延迟 wakeup，不拥有 durable cancel truth。
+    """
+
+    def wake_active_cancel_watchdog(self) -> None:
+        """唤醒 active cancel watchdog。
+
+        :returns: ``None``。
+        """
+
+        ...
+
+
 class HostCommandHandle:
     """Host public command handle。
 
@@ -163,11 +178,14 @@ class HostCommandHandle:
     :param durable_store: 当前 handle 私有持有的 durable store。
     :param admission_service: 当前 handle 私有持有的内部 admission service。
     :param active_registry: 当前 handle 用于 active worker cancel 传播的 registry。
+    :param active_cancel_watchdog_wakeup_port: active cancel commit 后的可选
+        watchdog wakeup 端口；无后台 scheduler 的低层组装可为 ``None``。
     """
 
     __slots__ = (
         "_admission_service",
         "_active_registry",
+        "_active_cancel_watchdog_wakeup_port",
         "_closed",
         "_durable_store",
         "_host_handle_id",
@@ -180,6 +198,7 @@ class HostCommandHandle:
         durable_store: HostDurableStore,
         admission_service: HostAdmissionService,
         active_registry: ActiveWorkerRegistry,
+        active_cancel_watchdog_wakeup_port: ActiveCancelWatchdogWakeupPort | None = None,
     ) -> None:
         """初始化 Host command handle。
 
@@ -187,6 +206,8 @@ class HostCommandHandle:
         :param durable_store: 已打开的 Host durable store。
         :param admission_service: 内部 admission service 依赖。
         :param active_registry: active worker cancel 传播 registry。
+        :param active_cancel_watchdog_wakeup_port: active cancel watchdog wakeup
+            端口；无后台 scheduler 时为 ``None``。
         :returns: 无返回值。
         :raises ValueError: ``host_handle_id`` 为空时抛出。
         """
@@ -197,6 +218,7 @@ class HostCommandHandle:
         self._durable_store = durable_store
         self._admission_service = admission_service
         self._active_registry = active_registry
+        self._active_cancel_watchdog_wakeup_port = active_cancel_watchdog_wakeup_port
         self._closed = False
 
     @property
@@ -1598,15 +1620,36 @@ def _propagate_active_cancel_targets(
     host: HostCommandHandle,
     targets: tuple[ActiveCancelMessage, ...],
 ) -> None:
-    """向 active worker registry best-effort 传播取消。
+    """向 active worker registry 传播取消并唤醒 watchdog。
 
     :param host: Host command handle。
     :param targets: durable commit 后需要传播的 active cancel 目标集合。
     :returns: ``None``。
     """
 
+    if targets:
+        _wake_active_cancel_watchdog(host)
     for target in targets:
         host._active_registry.cancel(target)
+
+
+def _wake_active_cancel_watchdog(host: HostCommandHandle) -> None:
+    """best-effort 唤醒 active cancel watchdog。
+
+    :param host: Host command handle。
+    :returns: ``None``。
+    """
+
+    wakeup_port = host._active_cancel_watchdog_wakeup_port
+    if wakeup_port is None:
+        return
+    try:
+        wakeup_port.wake_active_cancel_watchdog()
+    except RuntimeError:
+        _LOGGER.debug(
+            "command.active_cancel_watchdog_wakeup_closed host_handle_id=%s",
+            host.host_handle_id,
+        )
 
 
 def _is_deferred_cancel_state(host: HostCommandHandle, run_id: str) -> bool:

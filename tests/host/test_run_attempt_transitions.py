@@ -40,6 +40,8 @@ from dayu.host.durable.liveness import HostInstanceStatus
 from dayu.host.durable.schema import TABLE_HOST_ATTEMPTS, TABLE_HOST_RUNS
 from dayu.host.durable.run_transition import (
     AcceptWorkerRunningInput,
+    ActiveCancelCloseoutInput,
+    ActiveCancelTimeoutCloseoutInput,
     CancelActiveAttemptInput,
     CancelPredispatchStartingInput,
     CancelQueuedRunInput,
@@ -50,6 +52,8 @@ from dayu.host.durable.run_transition import (
     StartupOrphanCloseInput,
     TerminalCloseoutInput,
     accept_worker_running_in_transaction,
+    active_cancel_closeout_in_transaction,
+    active_cancel_timeout_closeout_in_transaction,
     cancel_predispatch_starting_in_transaction,
     cancel_queued_in_transaction,
     close_attempt_for_context_recovery_in_transaction,
@@ -1789,6 +1793,286 @@ def test_active_cancel_appends_run_cancelling_once(tmp_path: Path) -> None:
         )
 
 
+def test_active_cancel_timeout_closeout_writes_cancelled_terminal_facts(
+    tmp_path: Path,
+) -> None:
+    """active cancel timeout 写入唯一 ATTEMPT/RUN CANCELLED terminal facts。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def operation(transaction: HostTransaction) -> tuple[str, str, str, str]:
+            """执行 active cancel timeout closeout 并校验 payload。
+
+            :param transaction: Host transaction。
+            :returns: 首次和重放 transition 状态，以及 Run 与 Attempt 最新状态。
+            """
+
+            _accept_and_request_active_cancel(transaction, seeded)
+            result = active_cancel_timeout_closeout_in_transaction(
+                transaction,
+                EventLogStore(),
+                _active_timeout_input(
+                    seeded,
+                    last_observed_worker_event_index=7,
+                    last_accepted_event_id="event-worker-delta-7",
+                ),
+            )
+            assert result.status == StateMutationStatus.UPDATED
+            assert result.run is not None
+            assert result.attempt is not None
+            replay = active_cancel_timeout_closeout_in_transaction(
+                transaction,
+                EventLogStore(),
+                _active_timeout_input(
+                    seeded,
+                    last_observed_worker_event_index=7,
+                    last_accepted_event_id="event-worker-delta-7",
+                ),
+            )
+            assert replay.status == StateMutationStatus.UPDATED
+            assert _count_events(transaction, _EVENT_TYPE_ATTEMPT_CANCELLED) == 1
+            assert _count_events(transaction, _EVENT_TYPE_RUN_CANCELLED) == 1
+            attempt_payload = _event_payload(
+                transaction, event_id="event-active-timeout-attempt-cancelled"
+            )
+            run_payload = _event_payload(
+                transaction, event_id="event-active-timeout-run-cancelled"
+            )
+            for payload in (attempt_payload, run_payload):
+                assert payload["dispatch_record_id"] == "dispatch-run-1"
+                assert payload["cancel_request_event_id"] == (
+                    "event-active-cancel-requested-timeout"
+                )
+                assert payload["timeout_seconds"] == 30.0
+                assert payload["cancel_requested_at"] == (
+                    "2026-05-14T01:02:03.000000Z"
+                )
+                assert payload["timed_out_at"] == "2026-05-14T01:02:33.000000Z"
+                assert payload["watchdog_owner"] == "host.active_cancel_watchdog"
+                assert payload["worker_lifecycle_signal"] == (
+                    "active_cancel_timeout"
+                )
+                assert payload["last_observed_worker_event_index"] == 7
+                assert payload["last_accepted_event_id"] == "event-worker-delta-7"
+                assert payload["reason"] == "active_cancel_timeout"
+            assert run_payload["attempt_terminal_event_id"] == (
+                "event-active-timeout-attempt-cancelled"
+            )
+            return (
+                result.status.value,
+                replay.status.value,
+                result.run.status.value,
+                result.attempt.status.value,
+            )
+
+        assert store.transaction_runner.run_write(operation) == (
+            StateMutationStatus.UPDATED.value,
+            StateMutationStatus.UPDATED.value,
+            RunStatus.CANCELLED.value,
+            AttemptStatus.CANCELLED.value,
+        )
+
+
+def test_active_cancel_timeout_closeout_requires_cancelling_run(
+    tmp_path: Path,
+) -> None:
+    """RUNNING 且没有 cancel fact 时 timeout closeout 不写 terminal facts。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def operation(transaction: HostTransaction) -> tuple[str, int, int]:
+            """对 RUNNING Run 直接执行 timeout closeout。
+
+            :param transaction: Host transaction。
+            :returns: transition 状态与 terminal fact 计数。
+            """
+
+            _accept_active_attempt(transaction, seeded)
+            result = active_cancel_timeout_closeout_in_transaction(
+                transaction,
+                EventLogStore(),
+                _active_timeout_input(seeded),
+            )
+            return (
+                result.status.value,
+                _count_events(transaction, _EVENT_TYPE_ATTEMPT_CANCELLED),
+                _count_events(transaction, _EVENT_TYPE_RUN_CANCELLED),
+            )
+
+        assert store.transaction_runner.run_write(operation) == (
+            StateMutationStatus.INVALID_STATE.value,
+            0,
+            0,
+        )
+
+
+def test_active_cancel_timeout_closeout_rejects_malformed_cancelling_payload(
+    tmp_path: Path,
+) -> None:
+    """RUN_CANCELLING payload 缺少 cancel request id 时不写 terminal facts。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def operation(transaction: HostTransaction) -> tuple[str, int, int]:
+            """写入 malformed RUN_CANCELLING 后执行 timeout closeout。
+
+            :param transaction: Host transaction。
+            :returns: transition 状态与 terminal fact 计数。
+            """
+
+            _accept_and_request_active_cancel(transaction, seeded)
+            attempt = read_attempt_by_id(transaction, seeded.attempt_id)
+            assert attempt is not None
+            EventLogStore().append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id="event-run-cancelling-timeout-malformed",
+                    event_class=EventClass.CANONICAL_FACT,
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    execution_id=attempt.execution_id,
+                    event_type=_EVENT_TYPE_RUN_CANCELLING,
+                    occurred_at=_NOW + timedelta(microseconds=1),
+                    actor="analyst",
+                    source="pytest",
+                    client_request_id=None,
+                    idempotency_key=None,
+                    policy_decision=None,
+                    reason="malformed",
+                    payload_json={"reason": "malformed"},
+                    payload_ref=None,
+                    payload_digest=None,
+                ),
+            )
+            result = active_cancel_timeout_closeout_in_transaction(
+                transaction,
+                EventLogStore(),
+                _active_timeout_input(seeded),
+            )
+            return (
+                result.status.value,
+                _count_events(transaction, _EVENT_TYPE_ATTEMPT_CANCELLED),
+                _count_events(transaction, _EVENT_TYPE_RUN_CANCELLED),
+            )
+
+        assert store.transaction_runner.run_write(operation) == (
+            StateMutationStatus.INVALID_STATE.value,
+            0,
+            0,
+        )
+
+
+def test_active_cancel_timeout_closeout_first_committer_wins_after_cooperative_cancel(
+    tmp_path: Path,
+) -> None:
+    """cooperative cancel 先收口后 timeout 不追加第二组 terminal facts。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def operation(transaction: HostTransaction) -> tuple[str, int, int]:
+            """先 cooperative cancel，再调用 timeout closeout。
+
+            :param transaction: Host transaction。
+            :returns: timeout 状态与 terminal fact 计数。
+            """
+
+            _accept_and_request_active_cancel(transaction, seeded)
+            active_cancel_closeout_in_transaction(
+                transaction,
+                EventLogStore(),
+                ActiveCancelCloseoutInput(
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    attempt_cancelled_event_id="event-coop-attempt-cancelled",
+                    run_cancelled_event_id="event-coop-run-cancelled",
+                    occurred_at=_NOW + timedelta(seconds=1),
+                    actor="analyst",
+                    source="pytest",
+                    reason="user_cancel",
+                    cancel_request_event_id=(
+                        "event-active-cancel-requested-timeout"
+                    ),
+                    engine_event_ref="event-engine-run-cancelled",
+                    requested_at="2026-05-14T01:02:03Z",
+                    accepted_at="2026-05-14T01:02:04Z",
+                    finished_at="2026-05-14T01:02:05Z",
+                ),
+            )
+            timeout = active_cancel_timeout_closeout_in_transaction(
+                transaction,
+                EventLogStore(),
+                _active_timeout_input(seeded),
+            )
+            return (
+                timeout.status.value,
+                _count_events(transaction, _EVENT_TYPE_ATTEMPT_CANCELLED),
+                _count_events(transaction, _EVENT_TYPE_RUN_CANCELLED),
+            )
+
+        assert store.transaction_runner.run_write(operation) == (
+            StateMutationStatus.UPDATED.value,
+            1,
+            1,
+        )
+
+
+def test_active_cancel_timeout_closeout_rejects_after_succeeded_terminal(
+    tmp_path: Path,
+) -> None:
+    """成功终态先提交后 timeout closeout 不追加 cancel terminal facts。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def operation(transaction: HostTransaction) -> tuple[str, int, int]:
+            """先写 success terminal，再调用 timeout closeout。
+
+            :param transaction: Host transaction。
+            :returns: timeout 状态与 cancel terminal fact 计数。
+            """
+
+            _accept_active_attempt(transaction, seeded)
+            terminal_closeout_in_transaction(
+                transaction,
+                EventLogStore(),
+                TerminalCloseoutInput(
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    attempt_terminal_event_id="event-attempt-success-before-timeout",
+                    run_terminal_event_id="event-run-success-before-timeout",
+                    attempt_terminal_status=AttemptStatus.SUCCEEDED,
+                    run_terminal_status=RunStatus.SUCCEEDED,
+                    occurred_at=_NOW,
+                    actor="analyst",
+                    source="pytest",
+                    reason="final_answer",
+                    terminal_summary_ref=None,
+                    terminal_summary_digest=None,
+                ),
+            )
+            timeout = active_cancel_timeout_closeout_in_transaction(
+                transaction,
+                EventLogStore(),
+                _active_timeout_input(seeded),
+            )
+            return (
+                timeout.status.value,
+                _count_events(transaction, _EVENT_TYPE_ATTEMPT_CANCELLED),
+                _count_events(transaction, _EVENT_TYPE_RUN_CANCELLED),
+            )
+
+        assert store.transaction_runner.run_write(operation) == (
+            StateMutationStatus.INVALID_STATE.value,
+            0,
+            0,
+        )
+
+
 def test_cancel_queued_terminal_run_returns_invalid_state(
     tmp_path: Path,
 ) -> None:
@@ -2645,6 +2929,84 @@ def _cancel_active_input(
     )
 
 
+def _accept_active_attempt(
+    transaction: HostTransaction, seeded: _SeededRunningRun
+) -> None:
+    """将 seeded Attempt 推进到 worker accepted RUNNING。
+
+    :param transaction: Host transaction。
+    :param seeded: seeded running Run。
+    :returns: ``None``。
+    """
+
+    _mark_dispatching_tx(transaction, seeded.attempt_id)
+    accepted = accept_worker_running_in_transaction(
+        transaction,
+        EventLogStore(),
+        AcceptWorkerRunningInput(
+            run_id=seeded.run_id,
+            attempt_id=seeded.attempt_id,
+            attempt_running_event_id="event-active-timeout-attempt-running",
+            occurred_at=_NOW,
+            actor="analyst",
+            source="pytest",
+            worker_accept_reason="worker_accepted",
+            local_worker_id="local-worker-active",
+        ),
+    )
+    assert accepted.status == StateMutationStatus.UPDATED
+
+
+def _accept_and_request_active_cancel(
+    transaction: HostTransaction, seeded: _SeededRunningRun
+) -> None:
+    """将 seeded Attempt 推进到 active cancelling。
+
+    :param transaction: Host transaction。
+    :param seeded: seeded running Run。
+    :returns: ``None``。
+    """
+
+    _accept_active_attempt(transaction, seeded)
+    cancelled = request_active_attempt_cancel_in_transaction(
+        transaction,
+        EventLogStore(),
+        _cancel_active_input(run_id=seeded.run_id, event_suffix="timeout"),
+    )
+    assert cancelled.status == StateMutationStatus.UPDATED
+
+
+def _active_timeout_input(
+    seeded: _SeededRunningRun,
+    *,
+    last_observed_worker_event_index: int | None = None,
+    last_accepted_event_id: str | None = None,
+) -> ActiveCancelTimeoutCloseoutInput:
+    """构造 active cancel timeout closeout 输入。
+
+    :param seeded: seeded running Run。
+    :param last_observed_worker_event_index: 最后观察到的 worker event index。
+    :param last_accepted_event_id: 最后已接受 EventLog id。
+    :returns: active cancel timeout closeout 输入。
+    """
+
+    return ActiveCancelTimeoutCloseoutInput(
+        run_id=seeded.run_id,
+        attempt_id=seeded.attempt_id,
+        attempt_cancelled_event_id="event-active-timeout-attempt-cancelled",
+        run_cancelled_event_id="event-active-timeout-run-cancelled",
+        occurred_at=_NOW + timedelta(seconds=30),
+        actor="host.active_cancel_watchdog",
+        source="pytest",
+        timeout_seconds=30.0,
+        timed_out_at=_NOW + timedelta(seconds=30),
+        watchdog_owner="host.active_cancel_watchdog",
+        worker_lifecycle_signal="active_cancel_timeout",
+        last_observed_worker_event_index=last_observed_worker_event_index,
+        last_accepted_event_id=last_accepted_event_id,
+    )
+
+
 def _context_recovery_input(
     *,
     run_id: str,
@@ -2959,3 +3321,5 @@ _EVENT_TYPE_RUN_RECOVERING = "RUN_RECOVERING"
 _EVENT_TYPE_ATTEMPT_SUCCEEDED = "ATTEMPT_SUCCEEDED"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
 _EVENT_TYPE_RUN_CANCELLING = "RUN_CANCELLING"
+_EVENT_TYPE_ATTEMPT_CANCELLED = "ATTEMPT_CANCELLED"
+_EVENT_TYPE_RUN_CANCELLED = "RUN_CANCELLED"

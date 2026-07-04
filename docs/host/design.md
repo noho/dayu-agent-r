@@ -2490,7 +2490,7 @@ client requests cancel
 - `RECOVERING` 且新 Attempt 尚未 dispatch committed 时直接进入 `CANCELLED`；不创建新 Attempt，不进入 `CANCELLING`。
 - Attempt `STARTING` 且 dispatch record 仍为 `pending` / `waiting_for_lane` 时直接收口：append `CANCEL_REQUESTED`、`ATTEMPT_CANCELLED`、`RUN_CANCELLED`，标记 dispatch record cancelled，cancel lane wait / wake dispatch scheduler，释放 active slot 并触发 queue promotion check；不通知 EngineWorker。
 - dispatch record 已进入 `dispatching` 但 Attempt 仍为 `STARTING` 时，表示 lane 已 acquire 且 dispatching commit 已完成，但 WorkerProxy 尚未 accepted。该窗口仍按 pre-worker direct cancel 收口：append `CANCEL_REQUESTED`、`ATTEMPT_CANCELLED`、`RUN_CANCELLED`，标记 dispatch record `cancelled`，wake dispatch scheduler，释放 active slot 并触发 queue promotion check；不得进入 `CANCELLING`，不得等待不存在的 WorkerProxy。持有 lane token 的 dispatch scheduler 必须在 WorkerProxy 调用前做 final pre-call recheck；若看到 cancel / terminal 已提交或 dispatch record 已 `cancelled`，必须 release lane token 并跳过 WorkerProxy。
-- Attempt 已 `RUNNING` 时，必须 append `CANCEL_REQUESTED` + `RUN_CANCELLING` 并向 WorkerProxy 传播 cancel。`CANCEL_REQUESTED` 表达取消意图，`RUN_CANCELLING` 表达 Run 状态迁移。`dispatching` 本身不等于 active worker；只有 `ATTEMPT_RUNNING` 已 durable accepted 后才说明 WorkerProxy / EngineWorker 已接受执行。
+- Attempt 已 `RUNNING` 时，必须 append `CANCEL_REQUESTED` + `RUN_CANCELLING` 并向 WorkerProxy 传播 cancel。`CANCEL_REQUESTED` 表达取消意图，`RUN_CANCELLING` 表达 Run 状态迁移。`dispatching` 本身不等于 active worker；只有 `ATTEMPT_RUNNING` 已 durable accepted 后才说明 WorkerProxy / EngineWorker 已接受执行。`OpenHostOptions.active_cancel_timeout_seconds` 为有限正数时，Host active cancel watchdog 会按 durable `CANCEL_REQUESTED` / `RUN_CANCELLING` 时间扫描当前 `CANCELLING` Run；timeout 到期且当前 Attempt 仍为 `RUNNING`、dispatch 已 worker accepted 时，Host 写入 `ATTEMPT_CANCELLED` + `RUN_CANCELLED(reason=active_cancel_timeout)`，释放 Session active slot 并触发 queue promotion。该 timeout closeout 不表示 provider/tool 已物理停止，后续 physical cancel 属于执行环境治理。
 - terminal fact 已提交后，cancel 不能改写 terminal。
 - cancel 只阻止未来工作，不覆盖已接受事实。
 - 已接受 tool result、awaiting outcome、final decision、canonical facts 继续保留。
@@ -2499,7 +2499,7 @@ client requests cancel
   `canonical_fact` 进入 EventLog，并至少追加 `WAIT_LATE_RESULT_REJECTED` diagnostic EventLog event；完整 tool trace 可由
   后续 projection 消费该 diagnostic event 生成。
 - cancel 控制消息最小携带 `run_id`、`attempt_id`、`execution_id`。
-- 未引入 watchdog 强化治理前，cancel 请求发出后如果 active Attempt 超时仍无法确认，旧 Attempt 进入 `LOST`；若 `CANCEL_REQUESTED` 已 durable accepted 且 terminal fact 未抢先提交，Host 不得继续用户目标，Run 应按 policy 收口到 `CANCELLED` 或 `LOST`，不得创建新的正常执行 Attempt。
+- `active_cancel_timeout_seconds=None` 是特殊装配 opt-out；此时 startup recovery 继续拥有 orphan `CANCELLING` policy，positive orphan proof 可将 Run 收口为 `LOST`。默认生产装配应启用 active cancel watchdog，避免已接受 cancel 的 active slot 无界悬挂。
 - 同一 `(run_id, client_request_id)` cancel 重试必须返回既有结果，不重复 append `RUN_CANCELLING`。Run 已是 `CANCELLING` 时，新的不同 cancel 请求不能重复制造状态迁移；可按 policy 返回当前状态或记录 diagnostic。
 - 强制终止执行环境、后台 job reconcile、细粒度资源收口失败事实属于 cancel governance 扩展能力，不影响基础 Host 状态收口。
 
@@ -3446,14 +3446,15 @@ Host startup
 - `WAITING`：不创建 Attempt；只恢复 wait adapter observation。
 - `RUNNING` / `CANCELLING` 且存在当前 Host 可确认控制的 dispatch record：继续观察，不接管。
 - `RUNNING` / `CANCELLING` 且属于其它存活 Host instance：跳过 recovery，不 append `ATTEMPT_LOST`，不创建新 Attempt。
-- `RUNNING` / `CANCELLING` 且具备 positive orphan proof：通过 CAS 将旧 Attempt -> `LOST`；Run 按 policy 与事实完整性进入 `RECOVERING` 或 `LOST`。
+- `CANCELLING` 且存在已接受 active cancel facts、active cancel watchdog 已启用：defer 给 watchdog，不 append `ATTEMPT_LOST` / `RUN_LOST`。
+- `RUNNING` / `CANCELLING` 且具备 positive orphan proof：通过 CAS 将旧 Attempt -> `LOST`；Run 按 policy 与事实完整性进入 `RECOVERING` 或 `LOST`。启用 active cancel watchdog 时，带 accepted cancel facts 的 `CANCELLING` Run 先由 watchdog 处理，不走该 LOST 分支。
 - `RUNNING` / `CANCELLING` 且只能判断 owner heartbeat stale，但无法证明 owner 进程已死：记录 suspect / diagnostic，跳过 recovery。
 - `RECOVERING`：继续按 recovery policy 创建新 Attempt，或因超过上限进入 `LOST`。
 
 Phase 11 第一版 startup recovery policy：
 
 - `ACCEPTED`、`QUEUED` 与 `WAITING` 都不是 orphan Attempt，不得因 Host startup scan 被推进到 `RECOVERING`。
-- `RUNNING` / `CANCELLING` 的旧 Attempt 只有在 positive orphan proof 成立后才能写入 `ATTEMPT_LOST`；随后如果用户输入、payload descriptor、tool fact reuse policy、memory / compact input refs 等必要 canonical facts 足以重建 messages，则 Run 进入 `RECOVERING`，否则进入 `LOST`。
+- `RUNNING` / `CANCELLING` 的旧 Attempt 只有在 positive orphan proof 成立后才能写入 `ATTEMPT_LOST`；随后如果用户输入、payload descriptor、tool fact reuse policy、memory / compact input refs 等必要 canonical facts 足以重建 messages，则 Run 进入 `RECOVERING`，否则进入 `LOST`。启用 active cancel watchdog 时，startup 先执行一次 watchdog tick，再由 scanner defer 剩余 accepted-cancel `CANCELLING` Run，避免正常 close/reopen 把用户已取消的 Run 标为 `LOST`。
 - `RECOVERING` Run 在未被用户取消且未超过 recovery policy 上限时，创建新的 Attempt 与新的 `execution_id`，并以 `RUN_STARTED(start_reason=recovery)` 重新派发；不得恢复旧 Engine / Agent / Runner / provider request。
 - 第一版每个 Run 最多允许一次 automatic startup recovery dispatch。若再次 startup scan 发现同一 Run 已消耗该上限，必须以结构化 reason 将 Run 收口为 `LOST`，不得无限创建新 Attempt，也不得伪造 `FAILED` 或 successful final answer。
 - owner heartbeat stale 但 positive orphan proof 不成立时，只能追加或投递 suspect diagnostic，不得写 `ATTEMPT_LOST`、`RUN_RECOVERING`、`RUN_LOST`，也不得取消或接管旧 Attempt。

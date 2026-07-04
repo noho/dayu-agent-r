@@ -41,7 +41,12 @@ from dayu.host.api import (
     SessionStatus,
     SourceRunRelation,
 )
-from dayu.host.durable.codec import canonical_json_dumps, format_utc_timestamp, sha256_digest_json
+from dayu.host.durable.codec import (
+    canonical_json_dumps,
+    format_utc_timestamp,
+    parse_utc_timestamp,
+    sha256_digest_json,
+)
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
@@ -58,9 +63,11 @@ from dayu.host.durable.liveness import (
     register_current_instance,
 )
 from dayu.host.durable.run_transition import (
+    ActiveCancelTimeoutCloseoutInput,
     FailUnstartedRunInput,
     StartGovernedRunInput,
     TerminalCloseoutInput,
+    active_cancel_timeout_closeout_in_transaction,
     fail_unstarted_run_in_transaction,
     start_governed_run_with_starting_attempt_in_transaction,
     terminal_closeout_in_transaction,
@@ -85,6 +92,7 @@ from dayu.host.durable.state import (
     read_dispatch_record_by_id,
     read_dispatch_record_by_attempt_id,
     read_earliest_queued_run,
+    read_non_terminal_runs,
     read_run_by_id,
     read_session_by_id,
 )
@@ -211,7 +219,13 @@ from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 _EVENT_SOURCE = "host.dispatch"
 _EVENT_ACTOR = "host.dispatch"
 _EVENT_TYPE_ATTEMPT_RUNNING = "ATTEMPT_RUNNING"
+_EVENT_TYPE_CANCEL_REQUESTED = "CANCEL_REQUESTED"
+_EVENT_TYPE_RUN_CANCELLING = "RUN_CANCELLING"
 _WORKER_ACCEPT_REASON = "local_worker_accepted"
+_ACTIVE_CANCEL_WATCHDOG_ACTOR = "host.active_cancel_watchdog"
+_ACTIVE_CANCEL_WATCHDOG_SOURCE = "host.dispatch"
+_ACTIVE_CANCEL_WATCHDOG_OWNER = "host.active_cancel_watchdog"
+_ACTIVE_CANCEL_WORKER_LIFECYCLE_SIGNAL = "active_cancel_timeout"
 _WORKER_STARTUP_TIMEOUT_REASON = "worker_startup_timeout"
 _MEMORY_PROJECTION_REPAIR_REQUIRED_REASON = "memory_projection_repair_required"
 _LOCAL_POLICY_SNAPSHOT_REF = "host-local-no-tool-policy"
@@ -220,6 +234,8 @@ _PAYLOAD_FIELD_EFFECTIVE_TOOL_SET = "effective_tool_set"
 _EVENT_ID_ATTEMPT_RUNNING_PREFIX = "event-attempt-running"
 _EVENT_ID_ATTEMPT_FAILED_PREFIX = "event-attempt-failed"
 _EVENT_ID_RUN_FAILED_PREFIX = "event-run-failed"
+_EVENT_ID_ATTEMPT_CANCELLED_TIMEOUT_PREFIX = "event-attempt-cancelled-timeout"
+_EVENT_ID_RUN_CANCELLED_TIMEOUT_PREFIX = "event-run-cancelled-timeout"
 _EVENT_ID_CONTEXT_COMPACTION_REQUESTED_PREFIX = "event-context-compact-requested"
 _EVENT_ID_CONTEXT_COMPACTED_PREFIX = "event-context-compacted"
 _EVENT_ID_CONTEXT_COMPACTION_ATTEMPT_REJECTED_PREFIX = "event-context-compaction-attempt-rejected"
@@ -374,6 +390,55 @@ class DispatchDrainResult:
     dispatched: int
     skipped: int
     timed_out: int
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveCancelWatchdogTickResult:
+    """active cancel watchdog 单次 tick 摘要。
+
+    :param scanned: 本轮扫描到的 ``CANCELLING`` Run 数。
+    :param eligible: 本轮达到 timeout 条件的 Run 数。
+    :param closed: 本轮成功收口为 ``CANCELLED`` 的 Run 数。
+    :param ignored: 本轮因缺少 accepted cancel / current Attempt / dispatch
+        accepted 事实或 CAS 前置不满足而跳过的 Run 数。
+    """
+
+    scanned: int
+    eligible: int
+    closed: int
+    ignored: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ActiveCancelWatchdogCandidate:
+    """active cancel watchdog 可扫描候选。
+
+    :param run_id: 目标 Run id。
+    :param session_id: 目标 Session id。
+    :param attempt_id: 当前 Running Attempt id。
+    :param cancel_requested_at: durable ``CANCEL_REQUESTED`` 发生时间。
+    """
+
+    run_id: str
+    session_id: str
+    attempt_id: str
+    cancel_requested_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class _ActiveCancelWatchdogOperationResult:
+    """active cancel watchdog write transaction 结果。
+
+    :param scanned: 本轮扫描到的 ``CANCELLING`` Run 数。
+    :param eligible: 本轮达到 timeout 条件的 Run 数。
+    :param closed_session_ids: 本轮成功 timeout closeout 的 Session id。
+    :param ignored: 本轮跳过的 Run 数。
+    """
+
+    scanned: int
+    eligible: int
+    closed_session_ids: tuple[str, ...]
+    ignored: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -862,11 +927,13 @@ class HostDispatchScheduler:
         self._projection_catchup_port = projection_catchup_port
         self._queue: asyncio.Queue[PendingDispatchRecord] = asyncio.Queue()
         self._promotion_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._active_cancel_watchdog_queue: asyncio.Queue[None] = asyncio.Queue(maxsize=1)
         self._closed = False
         self._close_cleanup_done = False
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._drain_task: asyncio.Task[None] | None = None
         self._promotion_drain_task: asyncio.Task[None] | None = None
+        self._active_cancel_watchdog_task: asyncio.Task[None] | None = None
         self._active_tasks: set[asyncio.Task[None]] = set()
         self._active_handles: set[LocalWorkerHandle] = set()
 
@@ -929,6 +996,7 @@ class HostDispatchScheduler:
             projection_catchup_port=projection_catchup_port,
         )
         scheduler._start_host_instance_heartbeat()
+        scheduler._start_active_cancel_watchdog_loop()
         return scheduler
 
     @property
@@ -982,6 +1050,106 @@ class HostDispatchScheduler:
         )
         if self._promotion_drain_task is None or self._promotion_drain_task.done():
             self._promotion_drain_task = asyncio.create_task(self._promotion_drain_loop())
+
+    def wake_active_cancel_watchdog(self) -> None:
+        """唤醒 active cancel watchdog 执行一次扫描。
+
+        :returns: ``None``。
+        :raises RuntimeError: scheduler 已关闭时抛出。
+        """
+
+        if self._closed:
+            raise RuntimeError("HostDispatchScheduler is closed")
+        if self._local_execution.active_cancel_timeout_seconds is None:
+            return
+        try:
+            self._active_cancel_watchdog_queue.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
+        self._start_active_cancel_watchdog_loop()
+
+    def tick_active_cancel_watchdog(
+        self, now: datetime
+    ) -> ActiveCancelWatchdogTickResult:
+        """同步执行一次 active cancel timeout watchdog 扫描。
+
+        :param now: 本轮 watchdog 判定使用的 UTC aware 时间。
+        :returns: 单次 tick 摘要。
+        :raises ValueError: ``now`` 不是 UTC aware 时间时抛出。
+        :raises HostTransactionRetryExhaustedError: durable 写事务重试耗尽时抛出。
+        """
+
+        _validate_watchdog_now(now)
+        timeout_seconds = self._local_execution.active_cancel_timeout_seconds
+        if timeout_seconds is None:
+            return ActiveCancelWatchdogTickResult(
+                scanned=0,
+                eligible=0,
+                closed=0,
+                ignored=0,
+            )
+
+        def _operation(
+            transaction: HostTransaction,
+        ) -> _ActiveCancelWatchdogOperationResult:
+            candidates, scanned, ignored = _read_active_cancel_watchdog_candidates(
+                transaction,
+                self._event_log_store,
+            )
+            eligible = 0
+            closed_session_ids: list[str] = []
+            for candidate in candidates:
+                if (now - candidate.cancel_requested_at).total_seconds() < timeout_seconds:
+                    continue
+                eligible += 1
+                result = active_cancel_timeout_closeout_in_transaction(
+                    transaction,
+                    self._event_log_store,
+                    ActiveCancelTimeoutCloseoutInput(
+                        run_id=candidate.run_id,
+                        attempt_id=candidate.attempt_id,
+                        attempt_cancelled_event_id=_new_event_id(
+                            _EVENT_ID_ATTEMPT_CANCELLED_TIMEOUT_PREFIX
+                        ),
+                        run_cancelled_event_id=_new_event_id(
+                            _EVENT_ID_RUN_CANCELLED_TIMEOUT_PREFIX
+                        ),
+                        occurred_at=now,
+                        actor=_ACTIVE_CANCEL_WATCHDOG_ACTOR,
+                        source=_ACTIVE_CANCEL_WATCHDOG_SOURCE,
+                        timeout_seconds=timeout_seconds,
+                        timed_out_at=now,
+                        watchdog_owner=_ACTIVE_CANCEL_WATCHDOG_OWNER,
+                        worker_lifecycle_signal=(
+                            _ACTIVE_CANCEL_WORKER_LIFECYCLE_SIGNAL
+                        ),
+                    ),
+                )
+                if (
+                    result.status is StateMutationStatus.UPDATED
+                    and result.run is not None
+                ):
+                    closed_session_ids.append(candidate.session_id)
+                else:
+                    ignored += 1
+            return _ActiveCancelWatchdogOperationResult(
+                scanned=scanned,
+                eligible=eligible,
+                closed_session_ids=tuple(closed_session_ids),
+                ignored=ignored,
+            )
+
+        operation_result = self._transaction_runner.run_write(_operation)
+        if operation_result.closed_session_ids:
+            catch_up_projection_best_effort(self._projection_catchup_port)
+            for session_id in operation_result.closed_session_ids:
+                self.wake_queue_promotion(session_id)
+        return ActiveCancelWatchdogTickResult(
+            scanned=operation_result.scanned,
+            eligible=operation_result.eligible,
+            closed=len(operation_result.closed_session_ids),
+            ignored=operation_result.ignored,
+        )
 
     async def run_queue_promotion(self, session_id: str) -> None:
         """执行同 Session queued Run promotion。
@@ -2344,6 +2512,10 @@ class HostDispatchScheduler:
             if promotion_task is not None:
                 promotion_task.cancel()
                 await _suppress_task_cancel(promotion_task)
+            watchdog_task = self._active_cancel_watchdog_task
+            if watchdog_task is not None:
+                watchdog_task.cancel()
+                await _suppress_task_cancel(watchdog_task)
             self._active_registry.cancel_all(_SCHEDULER_CLOSE_REASON)
             for active_task in tuple(self._active_tasks):
                 active_task.cancel()
@@ -2372,6 +2544,79 @@ class HostDispatchScheduler:
 
         if self._heartbeat_task is None or self._heartbeat_task.done():
             self._heartbeat_task = asyncio.create_task(self._host_instance_heartbeat_loop())
+
+    def _start_active_cancel_watchdog_loop(self) -> None:
+        """按配置启动 active cancel watchdog 后台任务。
+
+        :returns: ``None``。
+        """
+
+        if self._local_execution.active_cancel_timeout_seconds is None:
+            return
+        if self._active_cancel_watchdog_task is None or self._active_cancel_watchdog_task.done():
+            self._active_cancel_watchdog_task = asyncio.create_task(
+                self._active_cancel_watchdog_loop()
+            )
+
+    async def _active_cancel_watchdog_loop(self) -> None:
+        """active cancel watchdog 后台循环。
+
+        循环通过 cancel commit wakeup 降低延迟，并通过 periodic fallback scan
+        覆盖丢失 wakeup 或重启后的剩余 ``CANCELLING`` 状态。
+
+        :returns: ``None``。
+        :raises asyncio.CancelledError: scheduler close 时透传取消。
+        """
+
+        interval = self._local_execution.dispatch_poll_interval_seconds
+        try:
+            while not self._closed:
+                try:
+                    await asyncio.wait_for(
+                        self._active_cancel_watchdog_queue.get(),
+                        timeout=interval,
+                    )
+                except TimeoutError:
+                    pass
+                if self._closed:
+                    break
+                try:
+                    result = self.tick_active_cancel_watchdog(datetime.now(UTC))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    _LOGGER.error(
+                        "dispatch.active_cancel_watchdog.tick_failed "
+                        "host_handle_id=%s error_type=%s",
+                        self._host_handle_id,
+                        exc.__class__.__name__,
+                        exc_info=True,
+                    )
+                    continue
+                if result.scanned > 0 or result.closed > 0:
+                    _LOGGER.log(
+                        VERBOSE_LOG_LEVEL,
+                        "dispatch.active_cancel_watchdog.tick scanned=%s "
+                        "eligible=%s closed=%s ignored=%s",
+                        result.scanned,
+                        result.eligible,
+                        result.closed,
+                        result.ignored,
+                    )
+        except asyncio.CancelledError:
+            _LOGGER.debug(
+                "dispatch.active_cancel_watchdog.cancelled host_handle_id=%s",
+                self._host_handle_id,
+            )
+            raise
+        except Exception as exc:
+            _LOGGER.error(
+                "dispatch.active_cancel_watchdog.fatal_exit host_handle_id=%s "
+                "error_type=%s",
+                self._host_handle_id,
+                exc.__class__.__name__,
+                exc_info=True,
+            )
 
     async def _host_instance_heartbeat_loop(self) -> None:
         """后台刷新当前 Host instance heartbeat。
@@ -3784,6 +4029,151 @@ def _cancelled_eof_candidate(
     )
 
 
+def _validate_watchdog_now(now: datetime) -> None:
+    """校验 watchdog tick 时间为 UTC aware。
+
+    :param now: 待校验时间。
+    :returns: ``None``。
+    :raises ValueError: ``now`` 不是 UTC aware 时间时抛出。
+    """
+
+    if now.tzinfo is None or now.utcoffset() != UTC.utcoffset(None):
+        raise ValueError("watchdog now must be timezone.utc aware")
+
+
+def _read_active_cancel_watchdog_candidates(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+) -> tuple[tuple[_ActiveCancelWatchdogCandidate, ...], int, int]:
+    """读取 active cancel watchdog 当前可评估候选。
+
+    :param transaction: Host transaction。
+    :param event_log_store: EventLog primitive。
+    :returns: 候选集合、扫描到的 ``CANCELLING`` Run 数和跳过数量。
+    """
+
+    candidates: list[_ActiveCancelWatchdogCandidate] = []
+    scanned = 0
+    ignored = 0
+    for run in read_non_terminal_runs(transaction):
+        if run.status is not RunStatus.CANCELLING:
+            continue
+        scanned += 1
+        candidate = _active_cancel_watchdog_candidate_from_run(
+            transaction,
+            event_log_store,
+            run,
+        )
+        if candidate is None:
+            ignored += 1
+        else:
+            candidates.append(candidate)
+    return tuple(candidates), scanned, ignored
+
+
+def _active_cancel_watchdog_candidate_from_run(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    run: RunRow,
+) -> _ActiveCancelWatchdogCandidate | None:
+    """从单个 Run 派生 active cancel watchdog 候选。
+
+    :param transaction: Host transaction。
+    :param event_log_store: EventLog primitive。
+    :param run: 当前 ``CANCELLING`` Run。
+    :returns: 满足 current running Attempt 与 accepted dispatch fact 时返回候选；
+        否则返回 ``None``。
+    """
+
+    if run.current_attempt_id is None:
+        return None
+    attempt = read_attempt_by_id(transaction, run.current_attempt_id)
+    if attempt is None or attempt.status is not AttemptStatus.RUNNING:
+        return None
+    dispatch_record = read_dispatch_record_by_attempt_id(
+        transaction,
+        attempt.attempt_id,
+    )
+    if not _dispatch_record_has_worker_accept(dispatch_record):
+        return None
+    cancel_requested = _read_linked_cancel_requested_event(
+        transaction,
+        event_log_store,
+        run.run_id,
+    )
+    if cancel_requested is None:
+        return None
+    return _ActiveCancelWatchdogCandidate(
+        run_id=run.run_id,
+        session_id=run.session_id,
+        attempt_id=attempt.attempt_id,
+        cancel_requested_at=parse_utc_timestamp(cancel_requested.occurred_at),
+    )
+
+
+def _dispatch_record_has_worker_accept(
+    dispatch_record: DispatchRecordRow | None,
+) -> bool:
+    """判断 dispatch record 是否已有 worker accepted durable fact。
+
+    :param dispatch_record: 目标 dispatch record；缺失时为 ``None``。
+    :returns: 已接受且未被 pre-accept cancel 时返回 ``True``。
+    """
+
+    return (
+        dispatch_record is not None
+        and dispatch_record.worker_accept_event_id is not None
+        and dispatch_record.worker_accept_event_sequence is not None
+        and dispatch_record.worker_accepted_at is not None
+        and dispatch_record.cancelled_event_id is None
+    )
+
+
+def _read_linked_cancel_requested_event(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    run_id: str,
+) -> EventLogRow | None:
+    """读取 ``RUN_CANCELLING`` 链接的 ``CANCEL_REQUESTED`` fact。
+
+    :param transaction: Host transaction。
+    :param event_log_store: EventLog primitive。
+    :param run_id: 目标 Run id。
+    :returns: 同 Run 的 ``CANCEL_REQUESTED`` event；缺失或 payload 非法时返回
+        ``None``。
+    """
+
+    cancelling = event_log_store.read_latest_run_event_by_type(
+        transaction,
+        run_id=run_id,
+        event_type=_EVENT_TYPE_RUN_CANCELLING,
+    )
+    if cancelling is None:
+        return None
+    try:
+        payload = event_payload_object(
+            transaction,
+            cancelling,
+            payload_label=_EVENT_TYPE_RUN_CANCELLING,
+        )
+    except HostDurableError:
+        return None
+    raw_cancel_request_event_id = payload.get("cancel_request_event_id")
+    if not isinstance(raw_cancel_request_event_id, str):
+        return None
+    cancel_requested = event_log_store.read_event_by_id(
+        transaction,
+        raw_cancel_request_event_id,
+    )
+    if (
+        cancel_requested is None
+        or cancel_requested.run_id != run_id
+        or cancel_requested.event_type != _EVENT_TYPE_CANCEL_REQUESTED
+    ):
+        return None
+    return cancel_requested
+
+
 def _read_startable_run(transaction: HostTransaction, session_id: str) -> RunRow | None:
     """读取当前可进入 pre-start governance 的 Run。
 
@@ -4323,6 +4713,7 @@ async def _suppress_task_cancel(task: asyncio.Task[None]) -> None:
 
 __all__ = [
     "ActiveCancelMessage",
+    "ActiveCancelWatchdogTickResult",
     "ActiveWorkerRegistry",
     "DispatchDrainResult",
     "HostDispatchScheduler",

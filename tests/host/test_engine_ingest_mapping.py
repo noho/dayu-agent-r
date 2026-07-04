@@ -66,6 +66,7 @@ from dayu.engine.contracts.tool_records import (
 from dayu.host.admission import PendingDispatchRecord
 from dayu.host.api import (
     AttemptStatus,
+    CancelMode,
     EnsureSessionRequest,
     HostCallContext,
     OperationContext,
@@ -119,11 +120,15 @@ from dayu.host.durable.options import (
 from dayu.host.durable.payload import PayloadStore
 from dayu.host.durable.run_transition import (
     AcceptWorkerRunningInput,
+    ActiveCancelTimeoutCloseoutInput,
+    CancelActiveAttemptInput,
     CreateRunningRunInput,
     FailRecoveringRunInput,
     RunTransitionResult,
     accept_worker_running_in_transaction,
+    active_cancel_timeout_closeout_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
+    request_active_attempt_cancel_in_transaction,
 )
 from dayu.host.payload_resolution import sqlite_payload_object
 from dayu.host.durable.schema import (
@@ -2424,6 +2429,160 @@ def test_run_cancelled_with_malformed_active_cancel_payload_is_rejected(
         assert attempt_status == AttemptStatus.RUNNING
 
 
+def test_late_worker_terminal_after_timeout_is_rejected_as_terminal_closed(
+    tmp_path: Path,
+) -> None:
+    """timeout terminal 后迟到 worker terminal 只写 terminal closed diagnostic。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        store.transaction_runner.run_write(_CloseActiveCancelTimeoutOperation(seeded))
+        candidate = _candidate(
+            seeded,
+            worker_event_index=17,
+            data=RunFailedData(
+                error_code="late_after_timeout",
+                message="late after timeout",
+                provider_request_id=None,
+                recoverable=False,
+            ),
+            event_type=EngineEventType.RUN_FAILED,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.REJECTED
+        assert _payload(result.events[0])["reason"] == "terminal_already_closed"
+        assert _event_count(store.transaction_runner, "RUN_FAILED") == 0
+        assert _event_count(store.transaction_runner, "ATTEMPT_FAILED") == 0
+        assert _event_count(store.transaction_runner, "RUN_CANCELLED") == 1
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.CANCELLED
+        assert attempt_status == AttemptStatus.CANCELLED
+
+
+def test_late_final_answer_after_run_cancelling_is_rejected_with_diagnostic(
+    tmp_path: Path,
+) -> None:
+    """RUN_CANCELLING 后迟到 final_answer 不写 success terminal。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        store.transaction_runner.run_write(_RequestActiveCancelOperation(seeded))
+        candidate = _candidate(
+            seeded,
+            worker_event_index=18,
+            data=FinalAnswerData(
+                content="late answer",
+                filtered=False,
+                degraded=False,
+                finish_reason=FinishReason.STOP,
+            ),
+            event_type=EngineEventType.FINAL_ANSWER,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.REJECTED
+        assert _payload(result.events[0])["reason"] == (
+            "late_terminal_after_active_cancel"
+        )
+        assert _event_count(store.transaction_runner, "RUN_SUCCEEDED") == 0
+        assert _event_count(store.transaction_runner, "ATTEMPT_SUCCEEDED") == 0
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.CANCELLING
+        assert attempt_status == AttemptStatus.RUNNING
+
+
+def test_late_run_failed_after_run_cancelling_is_rejected_with_diagnostic(
+    tmp_path: Path,
+) -> None:
+    """RUN_CANCELLING 后迟到 run_failed 不写 failure terminal。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        store.transaction_runner.run_write(_RequestActiveCancelOperation(seeded))
+        candidate = _candidate(
+            seeded,
+            worker_event_index=19,
+            data=RunFailedData(
+                error_code="late_failure",
+                message="late failure",
+                provider_request_id=None,
+                recoverable=False,
+            ),
+            event_type=EngineEventType.RUN_FAILED,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.REJECTED
+        assert _payload(result.events[0])["reason"] == (
+            "late_terminal_after_active_cancel"
+        )
+        assert _event_count(store.transaction_runner, "RUN_FAILED") == 0
+        assert _event_count(store.transaction_runner, "ATTEMPT_FAILED") == 0
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.CANCELLING
+        assert attempt_status == AttemptStatus.RUNNING
+
+
+def test_late_awaiting_after_cancel_does_not_move_to_waiting(
+    tmp_path: Path,
+) -> None:
+    """RUN_CANCELLING 后迟到 suspended/awaiting 不能把 Run 推入 WAITING。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        store.transaction_runner.run_write(_RequestActiveCancelOperation(seeded))
+        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
+        suspended = _candidate(
+            seeded,
+            worker_event_index=20,
+            data=RunSuspendedData(
+                reason="tool_awaiting",
+                resume_hint=None,
+                accepted_records=(_accepted_tool_record(),),
+                awaiting_records=(_awaiting_tool_record(),),
+            ),
+            event_type=EngineEventType.RUN_SUSPENDED,
+        )
+        awaiting = _candidate(
+            seeded,
+            worker_event_index=21,
+            data=ToolAwaitingData(
+                iteration_id="iter-late-await",
+                record=_awaiting_tool_record(),
+            ),
+            event_type=EngineEventType.TOOL_AWAITING,
+        )
+
+        suspended_result = ingestor.ingest(suspended)
+        awaiting_result = ingestor.ingest(awaiting)
+
+        assert suspended_result.status == EngineIngestStatus.ACCEPTED
+        assert awaiting_result.status == EngineIngestStatus.ACCEPTED
+        assert _payload(suspended_result.events[0])["reason"] == (
+            "tool_awaiting"
+        )
+        assert _payload(suspended_result.events[0])["run_status"] == "cancelling"
+        assert _payload(suspended_result.events[0])[
+            "waiting_confirmation_accepted"
+        ] is False
+        assert _payload(awaiting_result.events[0])["run_status"] == "cancelling"
+        assert _event_count(store.transaction_runner, "RUN_WAITING") == 0
+        assert _event_count(store.transaction_runner, "ATTEMPT_SUSPENDED") == 0
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.CANCELLING
+        assert attempt_status == AttemptStatus.RUNNING
+
+
 @dataclass(frozen=True, slots=True)
 class _AppendMalformedRunCancellingOperation:
     """写入缺少 ``cancel_request_event_id`` 的 RUN_CANCELLING fact。
@@ -2462,6 +2621,83 @@ class _AppendMalformedRunCancellingOperation:
                 payload_digest=None,
             ),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _RequestActiveCancelOperation:
+    """把 seeded active Run 推进到 ``RUN_CANCELLING``。
+
+    :param seeded: 已创建的 active run 测试数据。
+    """
+
+    seeded: _SeededRun
+
+    def __call__(self, transaction: HostTransaction) -> None:
+        """执行 active cancel request。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        result = request_active_attempt_cancel_in_transaction(
+            transaction,
+            EventLogStore(),
+            CancelActiveAttemptInput(
+                run_id=self.seeded.run_id,
+                cancel_request_event_id="event-active-cancel-requested-ingest",
+                run_cancelling_event_id="event-run-cancelling-ingest",
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                client_request_id="client-active-cancel-ingest",
+                idempotency_key="idem-active-cancel-ingest",
+                reason="user_cancel",
+                mode=CancelMode.GRACEFUL,
+                call_context_digest=_CALL_CONTEXT_DIGEST,
+            ),
+        )
+        assert result.status == StateMutationStatus.UPDATED
+
+
+@dataclass(frozen=True, slots=True)
+class _CloseActiveCancelTimeoutOperation:
+    """把 seeded active Run 经 active cancel timeout 收口为 cancelled。
+
+    :param seeded: 已创建的 active run 测试数据。
+    """
+
+    seeded: _SeededRun
+
+    def __call__(self, transaction: HostTransaction) -> None:
+        """执行 active cancel request 与 timeout closeout。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        _RequestActiveCancelOperation(self.seeded)(transaction)
+        result = active_cancel_timeout_closeout_in_transaction(
+            transaction,
+            EventLogStore(),
+            ActiveCancelTimeoutCloseoutInput(
+                run_id=self.seeded.run_id,
+                attempt_id=self.seeded.attempt_id,
+                attempt_cancelled_event_id=(
+                    "event-active-timeout-attempt-cancelled-ingest"
+                ),
+                run_cancelled_event_id="event-active-timeout-run-cancelled-ingest",
+                occurred_at=_NOW,
+                actor="host.active_cancel_watchdog",
+                source="pytest",
+                timeout_seconds=30.0,
+                timed_out_at=_NOW,
+                watchdog_owner="host.active_cancel_watchdog",
+                worker_lifecycle_signal="active_cancel_timeout",
+                last_observed_worker_event_index=None,
+                last_accepted_event_id=None,
+            ),
+        )
+        assert result.status == StateMutationStatus.UPDATED
 
 
 def test_worker_lost_closeout_uses_lost_event_ids_and_duplicate(
