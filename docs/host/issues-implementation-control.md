@@ -155,11 +155,11 @@ git push -u github <branch>
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | accepted plan commit |
+| gate | implementation |
 | implementation status | WU-WAIT-01 / GitHub Issue #89 merged via PR #163 on 2026-07-01; WU-WAIT-02 / GitHub Issue #90 merged via PR #165 on 2026-07-03 and issue #90 closed automatically; WU-WAIT-03 / GitHub Issue #92 merged via PR #166 on 2026-07-04 and issue #92 closed automatically. |
 | active work unit | WU-LIFE-03 |
 | default next work unit | WU-LIFE-03 is the current implementation entry point; after WU-LIFE-03 completes, WU-TOOLS-CANCEL-01 becomes the next entry point, followed by WU-WAIT-04. |
-| next entry point | WU-LIFE-03 / GitHub Issue #91 accepted plan commit: create protected local commit for the accepted plan, review, fix, and re-review artifacts. |
+| next entry point | WU-LIFE-03 / GitHub Issue #91 implementation: implement the accepted plan in `docs/host/wu-life-03-active-cancel-watchdog-plan.md`, starting with Slice 1 durable timeout closeout contract and race tests. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | Active/backlog issue owners retained here: #129 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #112 / #20 / #80 / #115, plus residual-risk destinations #121 / #122. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`; #63 / #89 / #90 / #92 / #111 / #130 / #133 are no longer active implementation owners. |
 | blocking open questions | None. |
@@ -1527,7 +1527,7 @@ GitHub Issue #38 当前为 OPEN，且 issue body 已对齐当前定位：代码�
 
 ### 状态
 
-已纳入 GitHub Issue #91；GitHub Issue #87 是 Host Lifecycle Watchdog / Supervisor umbrella。本条是 #87 下的 active Attempt cancel watchdog target，不单独引入第二套 watchdog runtime。PR #166 已于 2026-07-04 merge，GitHub Issue #92 已自动关闭，本条已进入当前 implementation entry point。Goal confirmation 已由用户确认。Plan artifact 为 `docs/host/wu-life-03-active-cancel-watchdog-plan.md`，plan decision 为 ready。Plan review artifacts 为 `docs/reviews/plan-review-20260704-105429.md` 与 `docs/reviews/plan-review-20260704-105503.md`；controller adjudication 为 `docs/reviews/wu-life-03-plan-review-controller-adjudication.md`。Controller accepted recovery scanner / watchdog ordering, late terminal race, watchdog scheduling, clock policy, diagnostic payload mapping, projection compatibility, and scan strategy findings。Plan fix artifact 为 `docs/reviews/wu-life-03-plan-fix-codex.md`；AgentCodex reported all accepted findings fixed and `git diff --check` passed。Plan re-review artifacts 为 `docs/reviews/plan-review-20260704-110623.md` 与 `docs/reviews/plan-review-20260704-110719.md`；controller adjudication 为 `docs/reviews/wu-life-03-plan-rereview-controller-adjudication.md`。两路 re-review 均通过，F01-F07 均已修复，无 blocking open question。当前进入 accepted plan commit gate。
+已纳入 GitHub Issue #91；GitHub Issue #87 是 Host Lifecycle Watchdog / Supervisor umbrella。本条是 #87 下的 active Attempt cancel watchdog target，不单独引入第二套 watchdog runtime。PR #166 已于 2026-07-04 merge，GitHub Issue #92 已自动关闭，本条已进入当前 implementation entry point。Goal confirmation 已由用户确认。Plan artifact 为 `docs/host/wu-life-03-active-cancel-watchdog-plan.md`，plan decision 为 ready。Plan review artifacts 为 `docs/reviews/plan-review-20260704-105429.md` 与 `docs/reviews/plan-review-20260704-105503.md`；controller adjudication 为 `docs/reviews/wu-life-03-plan-review-controller-adjudication.md`。Controller accepted recovery scanner / watchdog ordering, late terminal race, watchdog scheduling, clock policy, diagnostic payload mapping, projection compatibility, and scan strategy findings。Plan fix artifact 为 `docs/reviews/wu-life-03-plan-fix-codex.md`；AgentCodex reported all accepted findings fixed and `git diff --check` passed。Plan re-review artifacts 为 `docs/reviews/plan-review-20260704-110623.md` 与 `docs/reviews/plan-review-20260704-110719.md`；controller adjudication 为 `docs/reviews/wu-life-03-plan-rereview-controller-adjudication.md`。两路 re-review 均通过，F01-F07 均已修复，无 blocking open question。Accepted plan commit 为 `50d34e52`。当前进入 implementation gate，先实施 Slice 1 durable timeout closeout contract and race tests。
 
 ### 目标
 
