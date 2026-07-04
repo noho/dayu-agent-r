@@ -397,7 +397,7 @@ class ActiveCancelWatchdogTickResult:
     """active cancel watchdog 单次 tick 摘要。
 
     :param scanned: 本轮扫描到的 ``CANCELLING`` Run 数。
-    :param eligible: 本轮达到 timeout 条件的 Run 数。
+    :param eligible: 本轮满足 accepted-cancel 收口前置条件的 Run 数。
     :param closed: 本轮成功收口为 ``CANCELLED`` 的 Run 数。
     :param ignored: 本轮因缺少 accepted cancel / current Attempt / dispatch
         accepted 事实或 CAS 前置不满足而跳过的 Run 数。
