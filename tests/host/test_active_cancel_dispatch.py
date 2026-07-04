@@ -412,7 +412,7 @@ async def test_active_cancel_watchdog_times_out_non_cooperative_worker(
     options = _command_options(tmp_path)
     active_registry = ActiveWorkerRegistry()
     host = create_host_command_handle(options, active_registry=active_registry)
-    handle = _CancelAwareHandle(local_worker_id="worker-timeout", terminal="blocked")
+    handle = _CancelAwareHandle(local_worker_id="worker-watchdog", terminal="blocked")
     try:
         session_id = _session_id(host)
         with open_host_durable_store(_durable_options(tmp_path)) as store:
@@ -421,17 +421,16 @@ async def test_active_cancel_watchdog_times_out_non_cooperative_worker(
                 store,
                 handle,
                 active_registry=active_registry,
-                active_cancel_timeout_seconds=0.5,
             )
             try:
-                start_run(host, _start_request(session_id, "start-timeout"))
+                start_run(host, _start_request(session_id, "start-watchdog"))
                 refs = await _start_governed_refs(scheduler, session_id)
                 scheduler.wake_dispatch(_pending_dispatch(refs))
                 drain = await scheduler.drain_once()
                 assert drain.dispatched == 1
 
                 cancelling = cancel_run(
-                    host, refs.run_id, _cancel_request("cancel-timeout")
+                    host, refs.run_id, _cancel_request("cancel-watchdog")
                 )
                 assert cancelling.status == RunStatus.CANCELLING
 
@@ -452,13 +451,15 @@ async def test_active_cancel_watchdog_times_out_non_cooperative_worker(
 
 
 @pytest.mark.asyncio
-async def test_active_cancel_watchdog_noops_before_timeout(tmp_path: Path) -> None:
-    """timeout 到期前 watchdog tick 不写 terminal fact。"""
+async def test_active_cancel_watchdog_closes_on_first_tick_after_cancel(
+    tmp_path: Path,
+) -> None:
+    """cancel accepted 后第一轮 watchdog tick 即写 terminal fact。"""
 
     options = _command_options(tmp_path)
     active_registry = ActiveWorkerRegistry()
     host = create_host_command_handle(options, active_registry=active_registry)
-    handle = _CancelAwareHandle(local_worker_id="worker-before-timeout", terminal="blocked")
+    handle = _CancelAwareHandle(local_worker_id="worker-before-watchdog", terminal="blocked")
     try:
         session_id = _session_id(host)
         with open_host_durable_store(_durable_options(tmp_path)) as store:
@@ -467,20 +468,19 @@ async def test_active_cancel_watchdog_noops_before_timeout(tmp_path: Path) -> No
                 store,
                 handle,
                 active_registry=active_registry,
-                active_cancel_timeout_seconds=300.0,
             )
             try:
-                start_run(host, _start_request(session_id, "start-before-timeout"))
+                start_run(host, _start_request(session_id, "start-before-watchdog"))
                 refs = await _start_governed_refs(scheduler, session_id)
                 scheduler.wake_dispatch(_pending_dispatch(refs))
                 assert (await scheduler.drain_once()).dispatched == 1
 
-                cancel_run(host, refs.run_id, _cancel_request("cancel-before-timeout"))
+                cancel_run(host, refs.run_id, _cancel_request("cancel-before-watchdog"))
                 result = scheduler.tick_active_cancel_watchdog(datetime.now(UTC))
 
-                assert result.closed == 0
-                assert _run_status(options.db_path, refs.run_id) == RunStatus.CANCELLING
-                assert _event_type_count(options.db_path, "RUN_CANCELLED") == 0
+                assert result.closed == 1
+                assert _run_status(options.db_path, refs.run_id) == RunStatus.CANCELLED
+                assert _event_type_count(options.db_path, "RUN_CANCELLED") == 1
             finally:
                 await scheduler.close()
     finally:
@@ -498,7 +498,6 @@ async def test_active_cancel_watchdog_zero_cancelling_runs_noops(
             tmp_path,
             store,
             _CancelAwareHandle(local_worker_id="worker-zero", terminal="blocked"),
-            active_cancel_timeout_seconds=0.5,
         )
         try:
             result = scheduler.tick_active_cancel_watchdog(
@@ -543,7 +542,6 @@ async def test_active_cancel_watchdog_multiple_cancelling_runs_closes_each_eligi
                 worker_factory=worker_factory,
                 active_registry=active_registry,
                 lane_capacity=2,
-                active_cancel_timeout_seconds=0.5,
             )
             try:
                 first = start_run(
@@ -584,8 +582,8 @@ async def test_active_cancel_watchdog_multiple_cancelling_runs_closes_each_eligi
 
 
 @pytest.mark.asyncio
-async def test_active_cancel_timeout_promotes_queued_run(tmp_path: Path) -> None:
-    """timeout closeout 释放 Session active slot 并 promotion queued Run。"""
+async def test_active_cancel_watchdog_closeout_promotes_queued_run(tmp_path: Path) -> None:
+    """watchdog closeout 释放 Session active slot 并 promotion queued Run。"""
 
     options = _command_options(tmp_path)
     active_registry = ActiveWorkerRegistry()
@@ -605,7 +603,6 @@ async def test_active_cancel_timeout_promotes_queued_run(tmp_path: Path) -> None
                 worker_factory=worker_factory,
                 active_registry=active_registry,
                 lane_capacity=2,
-                active_cancel_timeout_seconds=0.5,
             )
             try:
                 refs = await _start_governed_refs(scheduler, session_id)
@@ -762,28 +759,27 @@ async def test_cancel_session_replay_repropagates_active_without_new_facts(
 
 
 @pytest.mark.asyncio
-async def test_cancel_session_replay_after_timeout_does_not_append_or_propagate(
+async def test_cancel_session_replay_after_watchdog_does_not_append_or_propagate(
     tmp_path: Path,
 ) -> None:
-    """timeout terminal 后 session cancel replay 不追加 facts 或传播 cancel。"""
+    """watchdog terminal 后 session cancel replay 不追加 facts 或传播 cancel。"""
 
     options = _command_options(tmp_path)
     active_registry = ActiveWorkerRegistry()
     host = create_host_command_handle(options, active_registry=active_registry)
-    handle = _CancelAwareHandle(local_worker_id="worker-replay-timeout", terminal="blocked")
+    handle = _CancelAwareHandle(local_worker_id="worker-replay-watchdog", terminal="blocked")
     try:
         session_id = _session_id(host)
-        request = _cancel_session_request("cancel-session-timeout")
+        request = _cancel_session_request("cancel-session-watchdog")
         with open_host_durable_store(_durable_options(tmp_path)) as store:
             scheduler = await _open_scheduler(
                 tmp_path,
                 store,
                 handle,
                 active_registry=active_registry,
-                active_cancel_timeout_seconds=0.5,
             )
             try:
-                start_run(host, _start_request(session_id, "start-session-timeout"))
+                start_run(host, _start_request(session_id, "start-session-watchdog"))
                 refs = await _start_governed_refs(scheduler, session_id)
                 scheduler.wake_dispatch(_pending_dispatch(refs))
                 assert (await scheduler.drain_once()).dispatched == 1
@@ -791,13 +787,13 @@ async def test_cancel_session_replay_after_timeout_does_not_append_or_propagate(
                 scheduler.tick_active_cancel_watchdog(
                     datetime(2030, 1, 1, tzinfo=UTC)
                 )
-                after_timeout_events = _event_count(options.db_path)
+                after_watchdog_events = _event_count(options.db_path)
 
                 replay = cancel_session_runs(host, session_id, request)
 
                 assert replay.active_run_id is None
                 assert _run_status(options.db_path, refs.run_id) == RunStatus.CANCELLED
-                assert _event_count(options.db_path) == after_timeout_events
+                assert _event_count(options.db_path) == after_watchdog_events
                 assert handle.cancel_reasons == ["user_stop_all"]
             finally:
                 await scheduler.close()
@@ -806,10 +802,10 @@ async def test_cancel_session_replay_after_timeout_does_not_append_or_propagate(
 
 
 @pytest.mark.asyncio
-async def test_scheduler_close_does_not_write_active_cancel_timeout_terminal(
+async def test_scheduler_close_does_not_write_active_cancel_watchdog_closeout_terminal(
     tmp_path: Path,
 ) -> None:
-    """scheduler close 只停止本地 runtime，不写 timeout terminal facts。"""
+    """scheduler close 只停止本地 runtime，不写 watchdog terminal facts。"""
 
     options = _command_options(tmp_path)
     active_registry = ActiveWorkerRegistry()
@@ -824,7 +820,6 @@ async def test_scheduler_close_does_not_write_active_cancel_timeout_terminal(
                 store,
                 handle,
                 active_registry=active_registry,
-                active_cancel_timeout_seconds=0.5,
             )
             start_run(host, _start_request(session_id, "start-close"))
             refs = await _start_governed_refs(scheduler, session_id)
@@ -894,7 +889,6 @@ async def _open_scheduler(
     lane_timeout_seconds: float | None = 0.01,
     active_registry: ActiveWorkerRegistry | None = None,
     lane_capacity: int = 1,
-    active_cancel_timeout_seconds: float | None = 300.0,
 ) -> HostDispatchScheduler:
     """打开测试 scheduler。
 
@@ -905,7 +899,6 @@ async def _open_scheduler(
     :param lane_timeout_seconds: lane acquire timeout 秒数。
     :param active_registry: 可选 active worker registry。
     :param lane_capacity: 测试 lane 容量。
-    :param active_cancel_timeout_seconds: active cancel watchdog timeout 秒数。
     :returns: scheduler。
     """
 
@@ -935,7 +928,6 @@ async def _open_scheduler(
                 if worker_factory is not None
                 else _FakeWorkerFactory(handle)
             ),
-            active_cancel_timeout_seconds=active_cancel_timeout_seconds,
         ),
         host_handle_id="host-active-cancel",
         active_registry=active_registry,

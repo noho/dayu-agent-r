@@ -88,7 +88,7 @@ Host 与其它层的稳定边界如下：
 
 包根还导出函数式 command / read facade：`ensure_session`、`create_session`、`get_session`、`list_sessions`、`get_run`、`submit_followup`、`retry_run`、`replay_run`、`cancel_run`、`cancel_session_runs`、`resolve_wait`、`close_session`、`purge_session`、`report_storage_usage`、`run_storage_maintenance`。普通 Service 优先使用 `open_host` 返回的异步 handle；低层 facade 不公开 durable store 或 scheduler 作为包根公共面。
 
-`OpenHostOptions` 是 construction-time boundary，显式接收 durable SQLite 路径、artifact root、SQLite busy / retry policy、payload inline threshold、runtime lane 参数、worker factory、ordinary run baseline、tooling options、context budget policy、compactor baseline、memory projection policy、memory catch-up page size、active cancel timeout 与 truncation manager 开关。
+`OpenHostOptions` 是 construction-time boundary，显式接收 durable SQLite 路径、artifact root、SQLite busy / retry policy、payload inline threshold、runtime lane 参数、worker factory、ordinary run baseline、tooling options、context budget policy、compactor baseline、memory projection policy、memory catch-up page size 与 truncation manager 开关。
 
 本地执行边界由 `LocalEngineWorkerFactory`、`LocalEngineWorker` 与 `LocalWorkerHandle` 表达。Host 创建 `AttemptDispatchSnapshot` 与 `AgentRunRequest`，worker 接住后返回 handle；Host 消费 handle 的 EngineEvent stream，并在 cancel 或 shutdown 时调用 handle 的关闭 / cancel hook。
 
@@ -565,7 +565,7 @@ Admission 是所有 Run 输入的 durable 入口。它在事务内判断 Session
 
 - `ACCEPTED` / `QUEUED` Run 可直接写入 cancel request 与 `RUN_CANCELLED` terminal，并释放 queue promotion 资格。
 - pre-worker `STARTING` Attempt 可在 worker accept 前直接写入 Attempt / Run cancelled。
-- active `RUNNING` / `CANCELLING` Run 会写入 `RUN_CANCELLING`，commit 后通过 `ActiveWorkerRegistry` 传播 cancel；Host 注入 Engine 的 cancellation token 是主通道，`LocalWorkerHandle.on_cancel(reason)` 只是补充 hook。`OpenHostOptions.active_cancel_timeout_seconds` 为有限正数时，Host active cancel watchdog 会在 post-cancel timeout 后把仍未收口的 active Attempt / Run 关闭为 `CANCELLED`，并触发 queued promotion；该收口不表示底层 provider / tool 已被物理杀停。
+- active `RUNNING` / `CANCELLING` Run 会写入 `RUN_CANCELLING`，commit 后通过 `ActiveWorkerRegistry` 传播 cancel；Host 注入 Engine 的 cancellation token 是主通道，`LocalWorkerHandle.on_cancel(reason)` 只是补充 hook。Host active cancel watchdog 是 accepted-cancel closeout supervisor，不提供 public post-cancel timeout budget；它可把仍未收口的 active Attempt / Run 关闭为 `CANCELLED`，并触发 queued promotion。该收口不表示底层 provider / tool 已被物理杀停。
 - `WAITING` Run 直接收口 wait 与 Run cancel，不恢复旧 Attempt。
 - `RECOVERING` Run 可在 recovery dispatch 前直接 cancel，释放 active slot。
 - 已 terminal Run 的 cancel 只记录幂等 ack 并返回当前 terminal snapshot，不改写 terminal truth。
@@ -589,7 +589,7 @@ resume 只来自 `resolve_wait`，不是旧 Agent / Runner 的继续执行。长
 
 Dispatch scheduler 不从内存队列恢复状态，只扫描 durable accepted / queued / pending dispatch facts。standard path 是 dispatch 前执行 context governance，写入 `RUN_STARTED` / `ATTEMPT_STARTED` / dispatch record，然后 acquire runtime lane、durable recheck、调用 `LocalEngineWorker.accept(...)`，最后写入 `ATTEMPT_RUNNING` 并消费 worker 的 EngineEvent stream。
 
-runtime lane 只表达资源容量，不能证明 worker ownership。lane acquire 成功后仍要重新读取 durable state；worker startup timeout、worker accept failure、worker stream crash、cancel 后 clean EOF、非 cancel clean EOF 都由 Host closeout 成结构化 terminal 或 diagnostic。active cancel watchdog 使用 durable `CANCEL_REQUESTED` / `RUN_CANCELLING` 时间和当前 `CANCELLING` Run / `RUNNING` Attempt / worker accepted dispatch record 做 deterministic tick；cancel commit 会唤醒 watchdog，scheduler 也会做 periodic fallback scan。terminal closeout 后，scheduler 唤醒同 Session queued promotion。
+runtime lane 只表达资源容量，不能证明 worker ownership。lane acquire 成功后仍要重新读取 durable state；worker startup timeout、worker accept failure、worker stream crash、cancel 后 clean EOF、非 cancel clean EOF 都由 Host closeout 成结构化 terminal 或 diagnostic。active cancel watchdog 使用当前 `CANCELLING` Run / `RUNNING` Attempt / worker accepted dispatch record 与已接受 cancel fact 做 deterministic tick；cancel commit 会唤醒 watchdog，scheduler 也会做 periodic fallback scan。terminal closeout 后，scheduler 唤醒同 Session queued promotion。
 
 ### Host 启动恢复
 
@@ -599,7 +599,7 @@ startup recovery 读取 durable Run / Attempt / dispatch / Host instance livenes
 
 - `ACCEPTED` 与 `QUEUED` 不被判 lost；scanner 只唤醒 dispatch 或 queue promotion。
 - `WAITING` 不自动恢复；等待外部 `resolve_wait` 或 cancel。
-- `RUNNING` / `CANCELLING` 只有在 positive orphan proof 成立并通过 CAS recheck 后才收口旧 Attempt；启用 active cancel watchdog 时，带 accepted cancel facts 的 `CANCELLING` Run 由 watchdog 收口为 `CANCELLED`，startup recovery 不先转为 `LOST`。
+- `RUNNING` / `CANCELLING` 只有在 positive orphan proof 成立并通过 CAS recheck 后才收口旧 Attempt；带 accepted cancel facts 的 `CANCELLING` Run 由 watchdog 收口为 `CANCELLED`，startup recovery 不先转为 `LOST`。
 - `RECOVERING` 若 recovery dispatch 次数未超过上限，会创建新的 recovery Attempt / execution / pending dispatch；超过上限或缺少可恢复事实时转为 `LOST`。
 
 positive orphan proof 需要 durable owner liveness 与本机进程证据支持，例如 owner 已 `STOPPED`、pid 缺失、pid 被复用且 start token / boot id 不匹配等。heartbeat stale 单独不构成 takeover proof；runtime lane TTL、projection lag 或 worker 没有返回也不构成 Host recovery truth。

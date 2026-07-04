@@ -895,9 +895,7 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                 event_log_store=EventLogStore(),
                 dispatch_wakeup_port=scheduler,
                 recovery_owner_host_instance_id=scheduler.host_instance_id,
-                defer_accepted_cancel_to_watchdog=(
-                    local_execution.active_cancel_timeout_seconds is not None
-                ),
+                defer_accepted_cancel_to_watchdog=True,
             ).scan()
             admission_service = create_host_admission_service(
                 durable_store.transaction_runner,
@@ -1302,7 +1300,6 @@ def _local_execution_options_from_open_host_options(
         memory_projection_catchup_batch_size=(options.memory_projection_catchup_batch_size),
         tooling_options=options.tooling_options,
         enable_truncation_manager=options.enable_truncation_manager,
-        active_cancel_timeout_seconds=options.active_cancel_timeout_seconds,
     )
 
 

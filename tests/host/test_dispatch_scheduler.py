@@ -2755,7 +2755,6 @@ async def test_active_cancel_watchdog_loop_continues_after_transient_tick_failur
                 ),
                 agent_policy=_agent_policy(False),
                 worker_factory=_FakeWorkerFactory(),
-                active_cancel_timeout_seconds=1.0,
             ),
             lane_controller=lane_controller,
             host_handle_id="host-active-cancel-watchdog-transient",
@@ -3646,6 +3645,14 @@ async def test_scheduler_close_cleans_active_handle_when_consumer_task_never_sta
             except asyncio.CancelledError:
                 pass
             scheduler._heartbeat_task = None
+        watchdog_task = scheduler._active_cancel_watchdog_task
+        if watchdog_task is not None:
+            watchdog_task.cancel()
+            try:
+                await watchdog_task
+            except asyncio.CancelledError:
+                pass
+            scheduler._active_cancel_watchdog_task = None
         registry.register(
             run_id=seeded.run_id,
             attempt_id=seeded.attempt_id,

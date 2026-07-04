@@ -120,13 +120,13 @@ from dayu.host.durable.options import (
 from dayu.host.durable.payload import PayloadStore
 from dayu.host.durable.run_transition import (
     AcceptWorkerRunningInput,
-    ActiveCancelTimeoutCloseoutInput,
+    ActiveCancelWatchdogCloseoutInput,
     CancelActiveAttemptInput,
     CreateRunningRunInput,
     FailRecoveringRunInput,
     RunTransitionResult,
     accept_worker_running_in_transaction,
-    active_cancel_timeout_closeout_in_transaction,
+    active_cancel_watchdog_closeout_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
     request_active_attempt_cancel_in_transaction,
 )
@@ -2432,11 +2432,11 @@ def test_run_cancelled_with_malformed_active_cancel_payload_is_rejected(
 def test_late_worker_terminal_after_timeout_is_rejected_as_terminal_closed(
     tmp_path: Path,
 ) -> None:
-    """timeout terminal 后迟到 worker terminal 只写 terminal closed diagnostic。"""
+    """watchdog terminal 后迟到 worker terminal 只写 terminal closed diagnostic。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
-        store.transaction_runner.run_write(_CloseActiveCancelTimeoutOperation(seeded))
+        store.transaction_runner.run_write(_CloseActiveCancelWatchdogOperation(seeded))
         candidate = _candidate(
             seeded,
             worker_event_index=17,
@@ -2660,8 +2660,8 @@ class _RequestActiveCancelOperation:
 
 
 @dataclass(frozen=True, slots=True)
-class _CloseActiveCancelTimeoutOperation:
-    """把 seeded active Run 经 active cancel timeout 收口为 cancelled。
+class _CloseActiveCancelWatchdogOperation:
+    """把 seeded active Run 经 accepted cancel watchdog 收口为 cancelled。
 
     :param seeded: 已创建的 active run 测试数据。
     """
@@ -2669,30 +2669,30 @@ class _CloseActiveCancelTimeoutOperation:
     seeded: _SeededRun
 
     def __call__(self, transaction: HostTransaction) -> None:
-        """执行 active cancel request 与 timeout closeout。
+        """执行 active cancel request 与 watchdog closeout。
 
         :param transaction: Host transaction。
         :returns: ``None``。
         """
 
         _RequestActiveCancelOperation(self.seeded)(transaction)
-        result = active_cancel_timeout_closeout_in_transaction(
+        result = active_cancel_watchdog_closeout_in_transaction(
             transaction,
             EventLogStore(),
-            ActiveCancelTimeoutCloseoutInput(
+            ActiveCancelWatchdogCloseoutInput(
                 run_id=self.seeded.run_id,
                 attempt_id=self.seeded.attempt_id,
                 attempt_cancelled_event_id=(
-                    "event-active-timeout-attempt-cancelled-ingest"
+                    "event-active-watchdog-attempt-cancelled-ingest"
                 ),
-                run_cancelled_event_id="event-active-timeout-run-cancelled-ingest",
+                run_cancelled_event_id="event-active-watchdog-run-cancelled-ingest",
                 occurred_at=_NOW,
                 actor="host.active_cancel_watchdog",
                 source="pytest",
-                timeout_seconds=30.0,
-                timed_out_at=_NOW,
+                cancel_requested_at="2026-05-14T01:02:03.000000Z",
+                closed_out_at=_NOW,
                 watchdog_owner="host.active_cancel_watchdog",
-                worker_lifecycle_signal="active_cancel_timeout",
+                worker_lifecycle_signal="active_cancel_watchdog_closeout",
                 last_observed_worker_event_index=None,
                 last_accepted_event_id=None,
             ),

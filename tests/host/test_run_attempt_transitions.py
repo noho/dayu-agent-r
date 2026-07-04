@@ -41,7 +41,7 @@ from dayu.host.durable.schema import TABLE_HOST_ATTEMPTS, TABLE_HOST_RUNS
 from dayu.host.durable.run_transition import (
     AcceptWorkerRunningInput,
     ActiveCancelCloseoutInput,
-    ActiveCancelTimeoutCloseoutInput,
+    ActiveCancelWatchdogCloseoutInput,
     CancelActiveAttemptInput,
     CancelPredispatchStartingInput,
     CancelQueuedRunInput,
@@ -53,7 +53,7 @@ from dayu.host.durable.run_transition import (
     TerminalCloseoutInput,
     accept_worker_running_in_transaction,
     active_cancel_closeout_in_transaction,
-    active_cancel_timeout_closeout_in_transaction,
+    active_cancel_watchdog_closeout_in_transaction,
     cancel_predispatch_starting_in_transaction,
     cancel_queued_in_transaction,
     close_attempt_for_context_recovery_in_transaction,
@@ -1793,26 +1793,26 @@ def test_active_cancel_appends_run_cancelling_once(tmp_path: Path) -> None:
         )
 
 
-def test_active_cancel_timeout_closeout_writes_cancelled_terminal_facts(
+def test_active_cancel_watchdog_closeout_writes_cancelled_terminal_facts(
     tmp_path: Path,
 ) -> None:
-    """active cancel timeout 写入唯一 ATTEMPT/RUN CANCELLED terminal facts。"""
+    """accepted cancel watchdog 写入唯一 ATTEMPT/RUN CANCELLED terminal facts。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_running_run(store, tmp_path)
 
         def operation(transaction: HostTransaction) -> tuple[str, str, str, str]:
-            """执行 active cancel timeout closeout 并校验 payload。
+            """执行 accepted cancel watchdog closeout 并校验 payload。
 
             :param transaction: Host transaction。
             :returns: 首次和重放 transition 状态，以及 Run 与 Attempt 最新状态。
             """
 
             _accept_and_request_active_cancel(transaction, seeded)
-            result = active_cancel_timeout_closeout_in_transaction(
+            result = active_cancel_watchdog_closeout_in_transaction(
                 transaction,
                 EventLogStore(),
-                _active_timeout_input(
+                _active_watchdog_input(
                     seeded,
                     last_observed_worker_event_index=7,
                     last_accepted_event_id="event-worker-delta-7",
@@ -1821,10 +1821,10 @@ def test_active_cancel_timeout_closeout_writes_cancelled_terminal_facts(
             assert result.status == StateMutationStatus.UPDATED
             assert result.run is not None
             assert result.attempt is not None
-            replay = active_cancel_timeout_closeout_in_transaction(
+            replay = active_cancel_watchdog_closeout_in_transaction(
                 transaction,
                 EventLogStore(),
-                _active_timeout_input(
+                _active_watchdog_input(
                     seeded,
                     last_observed_worker_event_index=7,
                     last_accepted_event_id="event-worker-delta-7",
@@ -1834,30 +1834,31 @@ def test_active_cancel_timeout_closeout_writes_cancelled_terminal_facts(
             assert _count_events(transaction, _EVENT_TYPE_ATTEMPT_CANCELLED) == 1
             assert _count_events(transaction, _EVENT_TYPE_RUN_CANCELLED) == 1
             attempt_payload = _event_payload(
-                transaction, event_id="event-active-timeout-attempt-cancelled"
+                transaction, event_id="event-active-watchdog-attempt-cancelled"
             )
             run_payload = _event_payload(
-                transaction, event_id="event-active-timeout-run-cancelled"
+                transaction, event_id="event-active-watchdog-run-cancelled"
             )
             for payload in (attempt_payload, run_payload):
                 assert payload["dispatch_record_id"] == "dispatch-run-1"
                 assert payload["cancel_request_event_id"] == (
-                    "event-active-cancel-requested-timeout"
+                    "event-active-cancel-requested-watchdog"
                 )
-                assert payload["timeout_seconds"] == 30.0
+                assert "timeout_seconds" not in payload
                 assert payload["cancel_requested_at"] == (
                     "2026-05-14T01:02:03.000000Z"
                 )
-                assert payload["timed_out_at"] == "2026-05-14T01:02:33.000000Z"
+                assert "timed_out_at" not in payload
+                assert payload["closed_out_at"] == "2026-05-14T01:02:33.000000Z"
                 assert payload["watchdog_owner"] == "host.active_cancel_watchdog"
                 assert payload["worker_lifecycle_signal"] == (
-                    "active_cancel_timeout"
+                    "active_cancel_watchdog_closeout"
                 )
                 assert payload["last_observed_worker_event_index"] == 7
                 assert payload["last_accepted_event_id"] == "event-worker-delta-7"
-                assert payload["reason"] == "active_cancel_timeout"
+                assert payload["reason"] == "active_cancel_watchdog_closeout"
             assert run_payload["attempt_terminal_event_id"] == (
-                "event-active-timeout-attempt-cancelled"
+                "event-active-watchdog-attempt-cancelled"
             )
             return (
                 result.status.value,
@@ -1874,26 +1875,26 @@ def test_active_cancel_timeout_closeout_writes_cancelled_terminal_facts(
         )
 
 
-def test_active_cancel_timeout_closeout_requires_cancelling_run(
+def test_active_cancel_watchdog_closeout_requires_cancelling_run(
     tmp_path: Path,
 ) -> None:
-    """RUNNING 且没有 cancel fact 时 timeout closeout 不写 terminal facts。"""
+    """RUNNING 且没有 cancel fact 时 watchdog closeout 不写 terminal facts。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_running_run(store, tmp_path)
 
         def operation(transaction: HostTransaction) -> tuple[str, int, int]:
-            """对 RUNNING Run 直接执行 timeout closeout。
+            """对 RUNNING Run 直接执行 watchdog closeout。
 
             :param transaction: Host transaction。
             :returns: transition 状态与 terminal fact 计数。
             """
 
             _accept_active_attempt(transaction, seeded)
-            result = active_cancel_timeout_closeout_in_transaction(
+            result = active_cancel_watchdog_closeout_in_transaction(
                 transaction,
                 EventLogStore(),
-                _active_timeout_input(seeded),
+                _active_watchdog_input(seeded),
             )
             return (
                 result.status.value,
@@ -1908,7 +1909,7 @@ def test_active_cancel_timeout_closeout_requires_cancelling_run(
         )
 
 
-def test_active_cancel_timeout_closeout_rejects_malformed_cancelling_payload(
+def test_active_cancel_watchdog_closeout_rejects_malformed_cancelling_payload(
     tmp_path: Path,
 ) -> None:
     """RUN_CANCELLING payload 缺少 cancel request id 时不写 terminal facts。"""
@@ -1917,7 +1918,7 @@ def test_active_cancel_timeout_closeout_rejects_malformed_cancelling_payload(
         seeded = _seed_running_run(store, tmp_path)
 
         def operation(transaction: HostTransaction) -> tuple[str, int, int]:
-            """写入 malformed RUN_CANCELLING 后执行 timeout closeout。
+            """写入 malformed RUN_CANCELLING 后执行 watchdog closeout。
 
             :param transaction: Host transaction。
             :returns: transition 状态与 terminal fact 计数。
@@ -1929,7 +1930,7 @@ def test_active_cancel_timeout_closeout_rejects_malformed_cancelling_payload(
             EventLogStore().append_event(
                 transaction,
                 EventLogAppendRequest(
-                    event_id="event-run-cancelling-timeout-malformed",
+                    event_id="event-run-cancelling-watchdog-malformed",
                     event_class=EventClass.CANONICAL_FACT,
                     session_id=seeded.session_id,
                     run_id=seeded.run_id,
@@ -1948,10 +1949,10 @@ def test_active_cancel_timeout_closeout_rejects_malformed_cancelling_payload(
                     payload_digest=None,
                 ),
             )
-            result = active_cancel_timeout_closeout_in_transaction(
+            result = active_cancel_watchdog_closeout_in_transaction(
                 transaction,
                 EventLogStore(),
-                _active_timeout_input(seeded),
+                _active_watchdog_input(seeded),
             )
             return (
                 result.status.value,
@@ -1966,19 +1967,19 @@ def test_active_cancel_timeout_closeout_rejects_malformed_cancelling_payload(
         )
 
 
-def test_active_cancel_timeout_closeout_first_committer_wins_after_cooperative_cancel(
+def test_active_cancel_watchdog_closeout_first_committer_wins_after_cooperative_cancel(
     tmp_path: Path,
 ) -> None:
-    """cooperative cancel 先收口后 timeout 不追加第二组 terminal facts。"""
+    """cooperative cancel 先收口后 watchdog 不追加第二组 terminal facts。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_running_run(store, tmp_path)
 
         def operation(transaction: HostTransaction) -> tuple[str, int, int]:
-            """先 cooperative cancel，再调用 timeout closeout。
+            """先 cooperative cancel，再调用 watchdog closeout。
 
             :param transaction: Host transaction。
-            :returns: timeout 状态与 terminal fact 计数。
+            :returns: watchdog 状态与 terminal fact 计数。
             """
 
             _accept_and_request_active_cancel(transaction, seeded)
@@ -1995,7 +1996,7 @@ def test_active_cancel_timeout_closeout_first_committer_wins_after_cooperative_c
                     source="pytest",
                     reason="user_cancel",
                     cancel_request_event_id=(
-                        "event-active-cancel-requested-timeout"
+                        "event-active-cancel-requested-watchdog"
                     ),
                     engine_event_ref="event-engine-run-cancelled",
                     requested_at="2026-05-14T01:02:03Z",
@@ -2003,13 +2004,13 @@ def test_active_cancel_timeout_closeout_first_committer_wins_after_cooperative_c
                     finished_at="2026-05-14T01:02:05Z",
                 ),
             )
-            timeout = active_cancel_timeout_closeout_in_transaction(
+            watchdog = active_cancel_watchdog_closeout_in_transaction(
                 transaction,
                 EventLogStore(),
-                _active_timeout_input(seeded),
+                _active_watchdog_input(seeded),
             )
             return (
-                timeout.status.value,
+                watchdog.status.value,
                 _count_events(transaction, _EVENT_TYPE_ATTEMPT_CANCELLED),
                 _count_events(transaction, _EVENT_TYPE_RUN_CANCELLED),
             )
@@ -2021,19 +2022,19 @@ def test_active_cancel_timeout_closeout_first_committer_wins_after_cooperative_c
         )
 
 
-def test_active_cancel_timeout_closeout_rejects_after_succeeded_terminal(
+def test_active_cancel_watchdog_closeout_rejects_after_succeeded_terminal(
     tmp_path: Path,
 ) -> None:
-    """成功终态先提交后 timeout closeout 不追加 cancel terminal facts。"""
+    """成功终态先提交后 watchdog closeout 不追加 cancel terminal facts。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_running_run(store, tmp_path)
 
         def operation(transaction: HostTransaction) -> tuple[str, int, int]:
-            """先写 success terminal，再调用 timeout closeout。
+            """先写 success terminal，再调用 watchdog closeout。
 
             :param transaction: Host transaction。
-            :returns: timeout 状态与 cancel terminal fact 计数。
+            :returns: watchdog 状态与 cancel terminal fact 计数。
             """
 
             _accept_active_attempt(transaction, seeded)
@@ -2043,8 +2044,8 @@ def test_active_cancel_timeout_closeout_rejects_after_succeeded_terminal(
                 TerminalCloseoutInput(
                     run_id=seeded.run_id,
                     attempt_id=seeded.attempt_id,
-                    attempt_terminal_event_id="event-attempt-success-before-timeout",
-                    run_terminal_event_id="event-run-success-before-timeout",
+                    attempt_terminal_event_id="event-attempt-success-before-watchdog",
+                    run_terminal_event_id="event-run-success-before-watchdog",
                     attempt_terminal_status=AttemptStatus.SUCCEEDED,
                     run_terminal_status=RunStatus.SUCCEEDED,
                     occurred_at=_NOW,
@@ -2055,13 +2056,13 @@ def test_active_cancel_timeout_closeout_rejects_after_succeeded_terminal(
                     terminal_summary_digest=None,
                 ),
             )
-            timeout = active_cancel_timeout_closeout_in_transaction(
+            watchdog = active_cancel_watchdog_closeout_in_transaction(
                 transaction,
                 EventLogStore(),
-                _active_timeout_input(seeded),
+                _active_watchdog_input(seeded),
             )
             return (
-                timeout.status.value,
+                watchdog.status.value,
                 _count_events(transaction, _EVENT_TYPE_ATTEMPT_CANCELLED),
                 _count_events(transaction, _EVENT_TYPE_RUN_CANCELLED),
             )
@@ -2946,7 +2947,7 @@ def _accept_active_attempt(
         AcceptWorkerRunningInput(
             run_id=seeded.run_id,
             attempt_id=seeded.attempt_id,
-            attempt_running_event_id="event-active-timeout-attempt-running",
+            attempt_running_event_id="event-active-watchdog-attempt-running",
             occurred_at=_NOW,
             actor="analyst",
             source="pytest",
@@ -2971,37 +2972,37 @@ def _accept_and_request_active_cancel(
     cancelled = request_active_attempt_cancel_in_transaction(
         transaction,
         EventLogStore(),
-        _cancel_active_input(run_id=seeded.run_id, event_suffix="timeout"),
+        _cancel_active_input(run_id=seeded.run_id, event_suffix="watchdog"),
     )
     assert cancelled.status == StateMutationStatus.UPDATED
 
 
-def _active_timeout_input(
+def _active_watchdog_input(
     seeded: _SeededRunningRun,
     *,
     last_observed_worker_event_index: int | None = None,
     last_accepted_event_id: str | None = None,
-) -> ActiveCancelTimeoutCloseoutInput:
-    """构造 active cancel timeout closeout 输入。
+) -> ActiveCancelWatchdogCloseoutInput:
+    """构造 accepted cancel watchdog closeout 输入。
 
     :param seeded: seeded running Run。
     :param last_observed_worker_event_index: 最后观察到的 worker event index。
     :param last_accepted_event_id: 最后已接受 EventLog id。
-    :returns: active cancel timeout closeout 输入。
+    :returns: accepted cancel watchdog closeout 输入。
     """
 
-    return ActiveCancelTimeoutCloseoutInput(
+    return ActiveCancelWatchdogCloseoutInput(
         run_id=seeded.run_id,
         attempt_id=seeded.attempt_id,
-        attempt_cancelled_event_id="event-active-timeout-attempt-cancelled",
-        run_cancelled_event_id="event-active-timeout-run-cancelled",
+        attempt_cancelled_event_id="event-active-watchdog-attempt-cancelled",
+        run_cancelled_event_id="event-active-watchdog-run-cancelled",
         occurred_at=_NOW + timedelta(seconds=30),
         actor="host.active_cancel_watchdog",
         source="pytest",
-        timeout_seconds=30.0,
-        timed_out_at=_NOW + timedelta(seconds=30),
+        cancel_requested_at="2026-05-14T01:02:03.000000Z",
+        closed_out_at=_NOW + timedelta(seconds=30),
         watchdog_owner="host.active_cancel_watchdog",
-        worker_lifecycle_signal="active_cancel_timeout",
+        worker_lifecycle_signal="active_cancel_watchdog_closeout",
         last_observed_worker_event_index=last_observed_worker_event_index,
         last_accepted_event_id=last_accepted_event_id,
     )

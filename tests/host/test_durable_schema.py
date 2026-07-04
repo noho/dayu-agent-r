@@ -832,9 +832,9 @@ def test_normalize_schema_sql_only_strips_and_collapses_whitespace() -> None:
 
 
 def test_host_schema_version_is_query_index_version() -> None:
-    """当前 committed Host schema version 是 wait lifecycle outcome fresh schema 19。"""
+    """当前 committed Host schema version 是 watchdog cancelling query fresh schema 20。"""
 
-    assert HOST_SCHEMA_VERSION == 19
+    assert HOST_SCHEMA_VERSION == 20
 
 
 def test_tool_call_request_payload_descriptor_kinds_are_stable() -> None:
