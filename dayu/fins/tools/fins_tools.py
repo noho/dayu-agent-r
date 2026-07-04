@@ -10,13 +10,19 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Final, cast
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import BatchToolExecutionContext, ToolCallRequest
 from dayu.contracts.tool_declaration import ToolDefinition, tool
+from dayu.contracts.tool_execution import (
+    ProcessBackedToolContext,
+    ProcessBackedToolExecutionCapability,
+)
 from dayu.contracts.tool_outcome import ToolExecutionOutcome
 from dayu.contracts.tool_schema import (
     ToolParametersSchema,
@@ -24,6 +30,7 @@ from dayu.contracts.tool_schema import (
     ToolTruncationStrategy,
 )
 from dayu.fins._log import Log
+from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.tools.fins_limits import FinsToolLimits
 from dayu.runtime.tool_call_projection import (
     ToolArgumentValidationFailure,
@@ -69,18 +76,27 @@ _INVALID_ARGUMENT_HINT: Final[str] = "Fix arguments to match the tool schema and
 _FILE_NOT_FOUND_HINT: Final[str] = "Verify the ticker, document_id, ref, or table_ref and retry."
 _UNEXPECTED_FAILURE_HINT: Final[str] = "Inspect provider diagnostics or retry with narrower arguments."
 _FINS_CANCELLED_HINT: Final[str] = "当前工具调用已停止；等待新的用户指令或后续调度。"
+_FINS_PROCESS_STATUS_FIELD: Final[str] = "status"
+_FINS_PROCESS_COMPLETED_STATUS: Final[str] = "completed"
+_FINS_PROCESS_FAILED_STATUS: Final[str] = "failed"
+_FINS_PROCESS_VALUE_FIELD: Final[str] = "value"
+_FINS_PROCESS_ERROR_TYPE_FIELD: Final[str] = "error_type"
+_FINS_PROCESS_MESSAGE_FIELD: Final[str] = "message"
 
 _BusinessCall = Callable[[CancellationToken], JsonValue]
 
 
 def build_fins_read_tool_definitions(
     read_runtime: FinsReadRuntime,
+    workspace_root: Path,
     limits: FinsToolLimits,
 ) -> tuple[ToolDefinition, ...]:
     """构造九个原生 Fins read 工具定义。
 
     Args:
         read_runtime: 通过 ``DefaultFinsRuntime`` 获取的 read runtime。
+        workspace_root: Fins workspace root；用于构造 process-backed 子进程
+            target factory，不得从 read runtime 私有仓储对象反推。
         limits: Fins read 工具限制配置。
 
     Returns:
@@ -91,16 +107,20 @@ def build_fins_read_tool_definitions(
     """
 
     provider_lock = asyncio.Lock()
+    process_target_factory = _FinsReadProcessTargetFactory(
+        workspace_root_locator=str(workspace_root.expanduser().resolve(strict=False)),
+        limits=limits,
+    )
     definitions = (
-        _build_list_documents_definition(read_runtime, limits, provider_lock),
-        _build_get_document_sections_definition(read_runtime, limits, provider_lock),
-        _build_read_section_definition(read_runtime, limits, provider_lock),
-        _build_search_document_definition(read_runtime, limits, provider_lock),
-        _build_list_tables_definition(read_runtime, limits, provider_lock),
-        _build_get_table_definition(read_runtime, limits, provider_lock),
-        _build_get_page_content_definition(read_runtime, limits, provider_lock),
-        _build_get_financial_statement_definition(read_runtime, limits, provider_lock),
-        _build_query_xbrl_facts_definition(read_runtime, limits, provider_lock),
+        _build_list_documents_definition(read_runtime, limits, provider_lock, process_target_factory),
+        _build_get_document_sections_definition(read_runtime, limits, provider_lock, process_target_factory),
+        _build_read_section_definition(read_runtime, limits, provider_lock, process_target_factory),
+        _build_search_document_definition(read_runtime, limits, provider_lock, process_target_factory),
+        _build_list_tables_definition(read_runtime, limits, provider_lock, process_target_factory),
+        _build_get_table_definition(read_runtime, limits, provider_lock, process_target_factory),
+        _build_get_page_content_definition(read_runtime, limits, provider_lock, process_target_factory),
+        _build_get_financial_statement_definition(read_runtime, limits, provider_lock, process_target_factory),
+        _build_query_xbrl_facts_definition(read_runtime, limits, provider_lock, process_target_factory),
     )
     names = tuple(definition.name for definition in definitions)
     if names != FINS_READ_TOOL_NAMES:
@@ -109,10 +129,226 @@ def build_fins_read_tool_definitions(
     return definitions
 
 
+class _FinsProcessCancellationToken:
+    """Fins process target 内部使用的不可取消 token。
+
+    子进程不共享 Host cancellation token；生产取消、超时和 hard kill 由父进程
+    ToolRuntime process capsule 独占治理。本 token 只满足 read runtime 的
+    类型边界，避免子进程伪造 host_cancelled / timeout 结果。
+    """
+
+    def is_cancelled(self) -> bool:
+        """返回当前是否已取消。
+
+        Args:
+            无。
+
+        Returns:
+            始终返回 ``False``。
+
+        Raises:
+            无。
+        """
+
+        return False
+
+    def cancel_reason(self) -> str | None:
+        """返回取消原因。
+
+        Args:
+            无。
+
+        Returns:
+            始终返回 ``None``。
+
+        Raises:
+            无。
+        """
+
+        return None
+
+    def requested_at(self) -> datetime | None:
+        """返回取消请求时间。
+
+        Args:
+            无。
+
+        Returns:
+            始终返回 ``None``。
+
+        Raises:
+            无。
+        """
+
+        return None
+
+
+class _FinsReadBusinessFailure(Exception):
+    """Fins read 同步业务路由的可恢复失败。
+
+    Args:
+        error: current failure 错误码。
+        message: 面向 LLM 的错误说明。
+        hint: 可选恢复提示。
+
+    Raises:
+        无。
+    """
+
+    def __init__(self, error: str, message: str, hint: str | None) -> None:
+        """初始化业务失败。
+
+        Args:
+            error: current failure 错误码。
+            message: 面向 LLM 的错误说明。
+            hint: 可选恢复提示。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.error = error
+        self.message = message
+        self.hint = hint
+        super().__init__(message)
+
+
+@dataclass(frozen=True, slots=True)
+class _FinsReadProcessTarget:
+    """Fins read process-backed 子进程目标。
+
+    本目标只保存 spawn 可序列化的 workspace locator、工具名、参数 JSON
+    副本、limit 配置和 timeout 标量；不得捕获 read runtime、repository、
+    processor cache、provider lock、CancellationToken、session 或 Host
+    内部对象。
+
+    Args:
+        workspace_root_locator: Fins workspace root 字符串 locator。
+        tool_name: 工具名。
+        arguments: 工具调用参数 JSON 副本。
+        limits: Fins 工具限制配置。
+        timeout_seconds: 父进程投影的批级 timeout 标量；真实 timeout 由父进程
+            Host capsule 独占治理。
+
+    Returns:
+        dataclass 实例。
+
+    Raises:
+        无。
+    """
+
+    workspace_root_locator: str
+    tool_name: str
+    arguments: dict[str, JsonValue]
+    limits: FinsToolLimits
+    timeout_seconds: float | None
+
+    def __call__(self) -> JsonValue:
+        """在子进程内重建 Fins runtime 并执行只读业务。
+
+        Args:
+            无。
+
+        Returns:
+            ``completed`` 或 ``failed`` JSON 信封；不会返回 awaiting、
+            cancelled、timeout 或 host_cancelled。
+
+        Raises:
+            无；未预期异常会被转换为 failed 信封。
+        """
+
+        _ = self.timeout_seconds
+        call = ToolCallRequest(
+            tool_call_id=f"process-{self.tool_name}",
+            name=self.tool_name,
+            arguments=self.arguments,
+            index_in_iteration=0,
+            provider_state=None,
+        )
+        try:
+            runtime = DefaultFinsRuntime.create(workspace_root=Path(self.workspace_root_locator))
+            read_runtime = runtime.get_read_runtime(processor_cache_max_entries=self.limits.processor_cache_max_entries)
+            value = _execute_fins_read_business_value(
+                tool_name=self.tool_name,
+                call=call,
+                parameters=_parameters_for_tool(self.tool_name),
+                read_runtime=read_runtime,
+                limits=self.limits,
+                cancellation_token=_FinsProcessCancellationToken(),
+            )
+        except _FinsReadBusinessFailure as failure:
+            return _process_failed_envelope(failure)
+        except Exception:
+            return {
+                _FINS_PROCESS_STATUS_FIELD: _FINS_PROCESS_FAILED_STATUS,
+                _FINS_PROCESS_ERROR_TYPE_FIELD: "execution_error",
+                _FINS_PROCESS_MESSAGE_FIELD: (
+                    f"Tool {self.tool_name!r} execution failed. Hint: {_UNEXPECTED_FAILURE_HINT}"
+                ),
+            }
+        return {
+            _FINS_PROCESS_STATUS_FIELD: _FINS_PROCESS_COMPLETED_STATUS,
+            _FINS_PROCESS_VALUE_FIELD: value,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _FinsReadProcessTargetFactory:
+    """Fins read process-backed target factory。
+
+    本 factory 只保存 spawn 可序列化的 workspace locator 与 limit 配置，不
+    捕获 read runtime、repository、processor cache、provider lock、
+    CancellationToken、session 或 Host 内部对象。
+
+    Args:
+        workspace_root_locator: Fins workspace root 字符串 locator。
+        limits: Fins 工具限制配置。
+
+    Returns:
+        dataclass 实例。
+
+    Raises:
+        无。
+    """
+
+    workspace_root_locator: str
+    limits: FinsToolLimits
+
+    def build_process_target(
+        self,
+        call: ToolCallRequest,
+        context: ProcessBackedToolContext,
+    ) -> _FinsReadProcessTarget:
+        """构造可序列化 Fins read 子进程目标。
+
+        Args:
+            call: 单次工具调用请求。
+            context: Host 投影出的可序列化 process-backed 上下文。
+
+        Returns:
+            Fins read 子进程目标。
+
+        Raises:
+            无。
+        """
+
+        return _FinsReadProcessTarget(
+            workspace_root_locator=self.workspace_root_locator,
+            tool_name=call.name,
+            arguments=dict(call.arguments),
+            limits=self.limits,
+            timeout_seconds=context.timeout_seconds,
+        )
+
+
 def _build_list_documents_definition(
     read_runtime: FinsReadRuntime,
     limits: FinsToolLimits,
     provider_lock: asyncio.Lock,
+    process_target_factory: _FinsReadProcessTargetFactory,
 ) -> ToolDefinition:
     """构造 ``list_documents`` 工具定义。
 
@@ -120,6 +356,7 @@ def _build_list_documents_definition(
         read_runtime: Fins read runtime。
         limits: 工具限制配置。
         provider_lock: provider 级共享执行锁。
+        process_target_factory: process-backed 目标工厂。
 
     Returns:
         current 工具定义。
@@ -134,6 +371,9 @@ def _build_list_documents_definition(
         name=LIST_DOCUMENTS_TOOL_NAME,
         description="列出公司可用文档。先用本工具拿到 document_id，再继续读章节、表格或财务数据。",
         parameters=parameters,
+        execution=ProcessBackedToolExecutionCapability(
+            target_factory=process_target_factory,
+        ),
         tags=FINS_TOOL_TAGS,
         display_name="列出文档",
         truncate=_list_truncate(limits.list_documents_max_items, "documents"),
@@ -156,24 +396,18 @@ def _build_list_documents_definition(
         """
 
         started_at = datetime.now(UTC)
-        validation = validate_and_project_arguments(call, LIST_DOCUMENTS_TOOL_NAME, parameters)
-        if isinstance(validation, ToolArgumentValidationFailure):
-            return _validation_failed_outcome(LIST_DOCUMENTS_TOOL_NAME, validation, started_at)
-        arguments = validation.arguments
         return await _invoke_fins_read_business(
             tool_name=LIST_DOCUMENTS_TOOL_NAME,
             context=context,
             provider_lock=provider_lock,
             started_at=started_at,
-            business_call=lambda token: cast(
-                JsonValue,
-                read_runtime.list_documents(
-                    ticker=_required_string(arguments, "ticker"),
-                    document_types=_optional_string_list(arguments, "document_types"),
-                    fiscal_years=_optional_int_list(arguments, "fiscal_years"),
-                    fiscal_periods=_optional_string_list(arguments, "fiscal_periods"),
-                    cancellation_token=token,
-                ),
+            business_call=lambda token: _execute_fins_read_business_value(
+                tool_name=LIST_DOCUMENTS_TOOL_NAME,
+                call=call,
+                parameters=parameters,
+                read_runtime=read_runtime,
+                limits=limits,
+                cancellation_token=token,
             ),
         )
 
@@ -184,6 +418,7 @@ def _build_get_document_sections_definition(
     read_runtime: FinsReadRuntime,
     limits: FinsToolLimits,
     provider_lock: asyncio.Lock,
+    process_target_factory: _FinsReadProcessTargetFactory,
 ) -> ToolDefinition:
     """构造 ``get_document_sections`` 工具定义。
 
@@ -191,6 +426,7 @@ def _build_get_document_sections_definition(
         read_runtime: Fins read runtime。
         limits: 工具限制配置。
         provider_lock: provider 级共享执行锁。
+        process_target_factory: process-backed 目标工厂。
 
     Returns:
         current 工具定义。
@@ -205,6 +441,9 @@ def _build_get_document_sections_definition(
         name=GET_DOCUMENT_SECTIONS_TOOL_NAME,
         description="读取文档章节结构，返回可定位的章节 ref 列表。",
         parameters=parameters,
+        execution=ProcessBackedToolExecutionCapability(
+            target_factory=process_target_factory,
+        ),
         tags=FINS_TOOL_TAGS,
         display_name="浏览财报结构",
         truncate=_list_truncate(limits.get_document_sections_max_items, "sections"),
@@ -227,22 +466,18 @@ def _build_get_document_sections_definition(
         """
 
         started_at = datetime.now(UTC)
-        validation = validate_and_project_arguments(call, GET_DOCUMENT_SECTIONS_TOOL_NAME, parameters)
-        if isinstance(validation, ToolArgumentValidationFailure):
-            return _validation_failed_outcome(GET_DOCUMENT_SECTIONS_TOOL_NAME, validation, started_at)
-        arguments = validation.arguments
         return await _invoke_fins_read_business(
             tool_name=GET_DOCUMENT_SECTIONS_TOOL_NAME,
             context=context,
             provider_lock=provider_lock,
             started_at=started_at,
-            business_call=lambda token: cast(
-                JsonValue,
-                read_runtime.get_document_sections(
-                    ticker=_required_string(arguments, "ticker"),
-                    document_id=_required_string(arguments, "document_id"),
-                    cancellation_token=token,
-                ),
+            business_call=lambda token: _execute_fins_read_business_value(
+                tool_name=GET_DOCUMENT_SECTIONS_TOOL_NAME,
+                call=call,
+                parameters=parameters,
+                read_runtime=read_runtime,
+                limits=limits,
+                cancellation_token=token,
             ),
         )
 
@@ -253,6 +488,7 @@ def _build_read_section_definition(
     read_runtime: FinsReadRuntime,
     limits: FinsToolLimits,
     provider_lock: asyncio.Lock,
+    process_target_factory: _FinsReadProcessTargetFactory,
 ) -> ToolDefinition:
     """构造 ``read_section`` 工具定义。
 
@@ -260,6 +496,7 @@ def _build_read_section_definition(
         read_runtime: Fins read runtime。
         limits: 工具限制配置。
         provider_lock: provider 级共享执行锁。
+        process_target_factory: process-backed 目标工厂。
 
     Returns:
         current 工具定义。
@@ -274,6 +511,9 @@ def _build_read_section_definition(
         name=READ_SECTION_TOOL_NAME,
         description="读取章节全文。若正文里出现 [[t_XXXX]]，可用 get_table(t_XXXX) 读取对应表格。",
         parameters=parameters,
+        execution=ProcessBackedToolExecutionCapability(
+            target_factory=process_target_factory,
+        ),
         tags=FINS_TOOL_TAGS,
         display_name="读取财报章节",
         truncate=_text_truncate(limits.read_section_max_chars, "content"),
@@ -296,23 +536,18 @@ def _build_read_section_definition(
         """
 
         started_at = datetime.now(UTC)
-        validation = validate_and_project_arguments(call, READ_SECTION_TOOL_NAME, parameters)
-        if isinstance(validation, ToolArgumentValidationFailure):
-            return _validation_failed_outcome(READ_SECTION_TOOL_NAME, validation, started_at)
-        arguments = validation.arguments
         return await _invoke_fins_read_business(
             tool_name=READ_SECTION_TOOL_NAME,
             context=context,
             provider_lock=provider_lock,
             started_at=started_at,
-            business_call=lambda token: cast(
-                JsonValue,
-                read_runtime.read_section(
-                    ticker=_required_string(arguments, "ticker"),
-                    document_id=_required_string(arguments, "document_id"),
-                    ref=_required_string(arguments, "ref"),
-                    cancellation_token=token,
-                ),
+            business_call=lambda token: _execute_fins_read_business_value(
+                tool_name=READ_SECTION_TOOL_NAME,
+                call=call,
+                parameters=parameters,
+                read_runtime=read_runtime,
+                limits=limits,
+                cancellation_token=token,
             ),
         )
 
@@ -323,6 +558,7 @@ def _build_search_document_definition(
     read_runtime: FinsReadRuntime,
     limits: FinsToolLimits,
     provider_lock: asyncio.Lock,
+    process_target_factory: _FinsReadProcessTargetFactory,
 ) -> ToolDefinition:
     """构造 ``search_document`` 工具定义。
 
@@ -330,6 +566,7 @@ def _build_search_document_definition(
         read_runtime: Fins read runtime。
         limits: 工具限制配置。
         provider_lock: provider 级共享执行锁。
+        process_target_factory: process-backed 目标工厂。
 
     Returns:
         current 工具定义。
@@ -344,6 +581,9 @@ def _build_search_document_definition(
         name=SEARCH_DOCUMENT_TOOL_NAME,
         description="在文档内搜索定位相关章节。先找最相关命中，再优先 read_section(top_match.ref) 精读；不要靠翻页继续猜。",
         parameters=parameters,
+        execution=ProcessBackedToolExecutionCapability(
+            target_factory=process_target_factory,
+        ),
         tags=FINS_TOOL_TAGS,
         display_name="检索文档",
         truncate=_list_truncate(limits.search_document_max_items, "matches"),
@@ -366,19 +606,17 @@ def _build_search_document_definition(
         """
 
         started_at = datetime.now(UTC)
-        validation = validate_and_project_arguments(call, SEARCH_DOCUMENT_TOOL_NAME, parameters)
-        if isinstance(validation, ToolArgumentValidationFailure):
-            return _validation_failed_outcome(SEARCH_DOCUMENT_TOOL_NAME, validation, started_at)
-        arguments = validation.arguments
         return await _invoke_fins_read_business(
             tool_name=SEARCH_DOCUMENT_TOOL_NAME,
             context=context,
             provider_lock=provider_lock,
             started_at=started_at,
-            business_call=lambda token: _search_document_business(
+            business_call=lambda token: _execute_fins_read_business_value(
+                tool_name=SEARCH_DOCUMENT_TOOL_NAME,
+                call=call,
+                parameters=parameters,
                 read_runtime=read_runtime,
-                arguments=arguments,
-                display_budget=limits.search_document_max_items,
+                limits=limits,
                 cancellation_token=token,
             ),
         )
@@ -390,6 +628,7 @@ def _build_list_tables_definition(
     read_runtime: FinsReadRuntime,
     limits: FinsToolLimits,
     provider_lock: asyncio.Lock,
+    process_target_factory: _FinsReadProcessTargetFactory,
 ) -> ToolDefinition:
     """构造 ``list_tables`` 工具定义。
 
@@ -397,6 +636,7 @@ def _build_list_tables_definition(
         read_runtime: Fins read runtime。
         limits: 工具限制配置。
         provider_lock: provider 级共享执行锁。
+        process_target_factory: process-backed 目标工厂。
 
     Returns:
         current 工具定义。
@@ -411,6 +651,9 @@ def _build_list_tables_definition(
         name=LIST_TABLES_TOOL_NAME,
         description="列出文档内表格，返回可定位的 table_ref 列表。",
         parameters=parameters,
+        execution=ProcessBackedToolExecutionCapability(
+            target_factory=process_target_factory,
+        ),
         tags=FINS_TOOL_TAGS,
         display_name="列出表格",
         truncate=_list_truncate(limits.list_tables_max_items, "tables"),
@@ -433,24 +676,18 @@ def _build_list_tables_definition(
         """
 
         started_at = datetime.now(UTC)
-        validation = validate_and_project_arguments(call, LIST_TABLES_TOOL_NAME, parameters)
-        if isinstance(validation, ToolArgumentValidationFailure):
-            return _validation_failed_outcome(LIST_TABLES_TOOL_NAME, validation, started_at)
-        arguments = validation.arguments
         return await _invoke_fins_read_business(
             tool_name=LIST_TABLES_TOOL_NAME,
             context=context,
             provider_lock=provider_lock,
             started_at=started_at,
-            business_call=lambda token: cast(
-                JsonValue,
-                read_runtime.list_tables(
-                    ticker=_required_string(arguments, "ticker"),
-                    document_id=_required_string(arguments, "document_id"),
-                    financial_only=_optional_bool(arguments, "financial_only", default=False),
-                    within_section_ref=_optional_string(arguments, "within_section_ref"),
-                    cancellation_token=token,
-                ),
+            business_call=lambda token: _execute_fins_read_business_value(
+                tool_name=LIST_TABLES_TOOL_NAME,
+                call=call,
+                parameters=parameters,
+                read_runtime=read_runtime,
+                limits=limits,
+                cancellation_token=token,
             ),
         )
 
@@ -461,6 +698,7 @@ def _build_get_table_definition(
     read_runtime: FinsReadRuntime,
     limits: FinsToolLimits,
     provider_lock: asyncio.Lock,
+    process_target_factory: _FinsReadProcessTargetFactory,
 ) -> ToolDefinition:
     """构造 ``get_table`` 工具定义。
 
@@ -468,6 +706,7 @@ def _build_get_table_definition(
         read_runtime: Fins read runtime。
         limits: 工具限制配置。
         provider_lock: provider 级共享执行锁。
+        process_target_factory: process-backed 目标工厂。
 
     Returns:
         current 工具定义。
@@ -482,6 +721,9 @@ def _build_get_table_definition(
         name=GET_TABLE_TOOL_NAME,
         description="按 table_ref 读取单个表格。",
         parameters=parameters,
+        execution=ProcessBackedToolExecutionCapability(
+            target_factory=process_target_factory,
+        ),
         tags=FINS_TOOL_TAGS,
         display_name="查看表格",
         truncate=_list_truncate(limits.get_table_max_items, None),
@@ -504,23 +746,18 @@ def _build_get_table_definition(
         """
 
         started_at = datetime.now(UTC)
-        validation = validate_and_project_arguments(call, GET_TABLE_TOOL_NAME, parameters)
-        if isinstance(validation, ToolArgumentValidationFailure):
-            return _validation_failed_outcome(GET_TABLE_TOOL_NAME, validation, started_at)
-        arguments = validation.arguments
         return await _invoke_fins_read_business(
             tool_name=GET_TABLE_TOOL_NAME,
             context=context,
             provider_lock=provider_lock,
             started_at=started_at,
-            business_call=lambda token: cast(
-                JsonValue,
-                read_runtime.get_table(
-                    ticker=_required_string(arguments, "ticker"),
-                    document_id=_required_string(arguments, "document_id"),
-                    table_ref=_required_string(arguments, "table_ref"),
-                    cancellation_token=token,
-                ),
+            business_call=lambda token: _execute_fins_read_business_value(
+                tool_name=GET_TABLE_TOOL_NAME,
+                call=call,
+                parameters=parameters,
+                read_runtime=read_runtime,
+                limits=limits,
+                cancellation_token=token,
             ),
         )
 
@@ -531,6 +768,7 @@ def _build_get_page_content_definition(
     read_runtime: FinsReadRuntime,
     limits: FinsToolLimits,
     provider_lock: asyncio.Lock,
+    process_target_factory: _FinsReadProcessTargetFactory,
 ) -> ToolDefinition:
     """构造 ``get_page_content`` 工具定义。
 
@@ -538,6 +776,7 @@ def _build_get_page_content_definition(
         read_runtime: Fins read runtime。
         limits: 工具限制配置。
         provider_lock: provider 级共享执行锁。
+        process_target_factory: process-backed 目标工厂。
 
     Returns:
         current 工具定义。
@@ -552,6 +791,9 @@ def _build_get_page_content_definition(
         name=GET_PAGE_CONTENT_TOOL_NAME,
         description="按页码读取同页内容。只有已有 page_range 且需要补同页上下文时才使用。",
         parameters=parameters,
+        execution=ProcessBackedToolExecutionCapability(
+            target_factory=process_target_factory,
+        ),
         tags=FINS_TOOL_TAGS,
         display_name="读取页面",
         truncate=_text_truncate(limits.get_page_content_max_chars, "text_preview"),
@@ -574,23 +816,18 @@ def _build_get_page_content_definition(
         """
 
         started_at = datetime.now(UTC)
-        validation = validate_and_project_arguments(call, GET_PAGE_CONTENT_TOOL_NAME, parameters)
-        if isinstance(validation, ToolArgumentValidationFailure):
-            return _validation_failed_outcome(GET_PAGE_CONTENT_TOOL_NAME, validation, started_at)
-        arguments = validation.arguments
         return await _invoke_fins_read_business(
             tool_name=GET_PAGE_CONTENT_TOOL_NAME,
             context=context,
             provider_lock=provider_lock,
             started_at=started_at,
-            business_call=lambda token: cast(
-                JsonValue,
-                read_runtime.get_page_content(
-                    ticker=_required_string(arguments, "ticker"),
-                    document_id=_required_string(arguments, "document_id"),
-                    page_no=_required_int(arguments, "page_no"),
-                    cancellation_token=token,
-                ),
+            business_call=lambda token: _execute_fins_read_business_value(
+                tool_name=GET_PAGE_CONTENT_TOOL_NAME,
+                call=call,
+                parameters=parameters,
+                read_runtime=read_runtime,
+                limits=limits,
+                cancellation_token=token,
             ),
         )
 
@@ -601,6 +838,7 @@ def _build_get_financial_statement_definition(
     read_runtime: FinsReadRuntime,
     limits: FinsToolLimits,
     provider_lock: asyncio.Lock,
+    process_target_factory: _FinsReadProcessTargetFactory,
 ) -> ToolDefinition:
     """构造 ``get_financial_statement`` 工具定义。
 
@@ -608,6 +846,7 @@ def _build_get_financial_statement_definition(
         read_runtime: Fins read runtime。
         limits: 工具限制配置。
         provider_lock: provider 级共享执行锁。
+        process_target_factory: process-backed 目标工厂。
 
     Returns:
         current 工具定义。
@@ -622,6 +861,9 @@ def _build_get_financial_statement_definition(
         name=GET_FINANCIAL_STATEMENT_TOOL_NAME,
         description="读取标准财务报表。",
         parameters=parameters,
+        execution=ProcessBackedToolExecutionCapability(
+            target_factory=process_target_factory,
+        ),
         tags=FINS_TOOL_TAGS,
         display_name="查看财务报表",
         truncate=_list_truncate(limits.get_financial_statement_max_items, "rows"),
@@ -644,23 +886,18 @@ def _build_get_financial_statement_definition(
         """
 
         started_at = datetime.now(UTC)
-        validation = validate_and_project_arguments(call, GET_FINANCIAL_STATEMENT_TOOL_NAME, parameters)
-        if isinstance(validation, ToolArgumentValidationFailure):
-            return _validation_failed_outcome(GET_FINANCIAL_STATEMENT_TOOL_NAME, validation, started_at)
-        arguments = validation.arguments
         return await _invoke_fins_read_business(
             tool_name=GET_FINANCIAL_STATEMENT_TOOL_NAME,
             context=context,
             provider_lock=provider_lock,
             started_at=started_at,
-            business_call=lambda token: cast(
-                JsonValue,
-                read_runtime.get_financial_statement(
-                    ticker=_required_string(arguments, "ticker"),
-                    document_id=_required_string(arguments, "document_id"),
-                    statement_type=_required_string(arguments, "statement_type"),
-                    cancellation_token=token,
-                ),
+            business_call=lambda token: _execute_fins_read_business_value(
+                tool_name=GET_FINANCIAL_STATEMENT_TOOL_NAME,
+                call=call,
+                parameters=parameters,
+                read_runtime=read_runtime,
+                limits=limits,
+                cancellation_token=token,
             ),
         )
 
@@ -671,6 +908,7 @@ def _build_query_xbrl_facts_definition(
     read_runtime: FinsReadRuntime,
     limits: FinsToolLimits,
     provider_lock: asyncio.Lock,
+    process_target_factory: _FinsReadProcessTargetFactory,
 ) -> ToolDefinition:
     """构造 ``query_xbrl_facts`` 工具定义。
 
@@ -678,6 +916,7 @@ def _build_query_xbrl_facts_definition(
         read_runtime: Fins read runtime。
         limits: 工具限制配置。
         provider_lock: provider 级共享执行锁。
+        process_target_factory: process-backed 目标工厂。
 
     Returns:
         current 工具定义。
@@ -692,6 +931,9 @@ def _build_query_xbrl_facts_definition(
         name=QUERY_XBRL_FACTS_TOOL_NAME,
         description="查询结构化 XBRL 数值 facts。",
         parameters=parameters,
+        execution=ProcessBackedToolExecutionCapability(
+            target_factory=process_target_factory,
+        ),
         tags=FINS_TOOL_TAGS,
         display_name="查询财务数据",
         truncate=_list_truncate(limits.query_xbrl_facts_max_items, "facts"),
@@ -714,29 +956,18 @@ def _build_query_xbrl_facts_definition(
         """
 
         started_at = datetime.now(UTC)
-        validation = validate_and_project_arguments(call, QUERY_XBRL_FACTS_TOOL_NAME, parameters)
-        if isinstance(validation, ToolArgumentValidationFailure):
-            return _validation_failed_outcome(QUERY_XBRL_FACTS_TOOL_NAME, validation, started_at)
-        arguments = validation.arguments
         return await _invoke_fins_read_business(
             tool_name=QUERY_XBRL_FACTS_TOOL_NAME,
             context=context,
             provider_lock=provider_lock,
             started_at=started_at,
-            business_call=lambda token: cast(
-                JsonValue,
-                read_runtime.query_xbrl_facts(
-                    ticker=_required_string(arguments, "ticker"),
-                    document_id=_required_string(arguments, "document_id"),
-                    concepts=_optional_string_list(arguments, "concepts"),
-                    statement_type=_optional_string(arguments, "statement_type"),
-                    period_end=_optional_string(arguments, "period_end"),
-                    fiscal_year=_optional_int(arguments, "fiscal_year"),
-                    fiscal_period=_optional_string(arguments, "fiscal_period"),
-                    min_value=_optional_number(arguments, "min_value"),
-                    max_value=_optional_number(arguments, "max_value"),
-                    cancellation_token=token,
-                ),
+            business_call=lambda token: _execute_fins_read_business_value(
+                tool_name=QUERY_XBRL_FACTS_TOOL_NAME,
+                call=call,
+                parameters=parameters,
+                read_runtime=read_runtime,
+                limits=limits,
+                cancellation_token=token,
             ),
         )
 
@@ -751,7 +982,13 @@ async def _invoke_fins_read_business(
     started_at: datetime,
     business_call: _BusinessCall,
 ) -> ToolExecutionOutcome:
-    """执行同步 Fins read 业务并投影 current outcome。
+    """在 fallback callable 边界执行同步 Fins read 业务并投影 outcome。
+
+    生产默认路径不再经过本函数；九个 Fins read ``ToolDefinition.execution``
+    均声明为 process-backed，由 Host ToolRuntime 在父进程治理取消与超时。
+    本函数只保留给直接调用 ``ToolDefinition.callable`` 的测试和非生产
+    fallback，避免把同进程 ``asyncio.to_thread`` 误作为生产取消 closeout
+    证据。
 
     Args:
         tool_name: 工具名。
@@ -769,12 +1006,21 @@ async def _invoke_fins_read_business(
 
     cancellation_token = context.cancellation_token
     if cancellation_token.is_cancelled():
-        return _cancelled_from_token(tool_name, cancellation_token, started_at)
+        return _build_fins_read_cancelled_outcome(tool_name, started_at)
     async with provider_lock:
         if cancellation_token.is_cancelled():
-            return _cancelled_from_token(tool_name, cancellation_token, started_at)
+            return _build_fins_read_cancelled_outcome(tool_name, started_at)
         try:
             value = await asyncio.to_thread(business_call, cancellation_token)
+        except _FinsReadBusinessFailure as exc:
+            return failed_outcome(
+                tool_name=tool_name,
+                error=exc.error,
+                message=exc.message,
+                hint=exc.hint,
+                started_at=started_at,
+                finished_at=datetime.now(UTC),
+            )
         except FinsReadCancelledError as exc:
             return host_cancelled_outcome(
                 tool_name=tool_name,
@@ -836,6 +1082,281 @@ async def _invoke_fins_read_business(
     )
 
 
+def _execute_fins_read_business_value(
+    *,
+    tool_name: str,
+    call: ToolCallRequest,
+    parameters: ToolParametersSchema,
+    read_runtime: FinsReadRuntime,
+    limits: FinsToolLimits,
+    cancellation_token: CancellationToken,
+) -> JsonValue:
+    """执行 Fins read 同步业务并返回成功 JSON 值。
+
+    本函数是 direct callable fallback 与 process-backed 子进程 target 共用的
+    同步业务路由真源。它负责参数 schema 校验、read runtime 调用和成功
+    载荷投影；失败通过 ``_FinsReadBusinessFailure`` 抛出，由调用边界投影
+    为 Tool outcome 或 process JSON 信封。
+
+    Args:
+        tool_name: 工具名。
+        call: 单次工具调用请求。
+        parameters: 当前工具的参数 schema。
+        read_runtime: 当前进程内重新构造或 provider 注入的 Fins read runtime。
+        limits: Fins 工具限制配置。
+        cancellation_token: 当前执行边界使用的取消观察 token。
+
+    Returns:
+        成功 JSON 值。
+
+    Raises:
+        _FinsReadBusinessFailure: 参数、仓储或业务访问失败时抛出。
+        FinsReadCancelledError: direct callable fallback 观察到 Host 取消时抛出。
+    """
+
+    validation = validate_and_project_arguments(call, tool_name, parameters)
+    if isinstance(validation, ToolArgumentValidationFailure):
+        raise _FinsReadBusinessFailure(validation.error, validation.message, validation.hint)
+    try:
+        return _route_fins_read_business(
+            tool_name=tool_name,
+            arguments=validation.arguments,
+            read_runtime=read_runtime,
+            limits=limits,
+            cancellation_token=cancellation_token,
+        )
+    except FinsReadCancelledError:
+        # direct callable fallback 仍需要投影 Host 取消；process target 使用不可取消
+        # token，真实取消由父进程 process capsule 独占治理。
+        raise
+    except FinsReadArgumentError as exc:
+        raise _FinsReadBusinessFailure(
+            "invalid_argument",
+            str(exc),
+            _INVALID_ARGUMENT_HINT,
+        ) from exc
+    except FinsReadBusinessError as exc:
+        raise _FinsReadBusinessFailure(exc.code, exc.message, exc.hint) from exc
+    except FileNotFoundError as exc:
+        raise _FinsReadBusinessFailure(
+            "file_not_found",
+            str(exc),
+            _FILE_NOT_FOUND_HINT,
+        ) from exc
+    except PermissionError as exc:
+        raise _FinsReadBusinessFailure(
+            "permission_denied",
+            str(exc),
+            "Use a workspace path allowed by the Fins storage configuration.",
+        ) from exc
+    except Exception as exc:
+        raise _FinsReadBusinessFailure(
+            "execution_error",
+            f"Tool {tool_name!r} execution failed.",
+            _UNEXPECTED_FAILURE_HINT,
+        ) from exc
+
+
+def _route_fins_read_business(
+    *,
+    tool_name: str,
+    arguments: Mapping[str, JsonValue],
+    read_runtime: FinsReadRuntime,
+    limits: FinsToolLimits,
+    cancellation_token: CancellationToken,
+) -> JsonValue:
+    """按工具名路由到对应 Fins read runtime 方法。
+
+    Args:
+        tool_name: 工具名。
+        arguments: 已通过 schema 校验并投影的参数。
+        read_runtime: Fins read runtime。
+        limits: Fins 工具限制配置。
+        cancellation_token: 当前执行边界使用的取消观察 token。
+
+    Returns:
+        原始业务 JSON 值。
+
+    Raises:
+        ValueError: 工具名未知时抛出。
+        FinsReadArgumentError: 业务参数非法时抛出。
+        FinsReadBusinessError: 业务失败时抛出。
+        FinsReadCancelledError: direct callable fallback 观察到 Host 取消时抛出。
+    """
+
+    if tool_name == LIST_DOCUMENTS_TOOL_NAME:
+        return cast(
+            JsonValue,
+            read_runtime.list_documents(
+                ticker=_required_string(arguments, "ticker"),
+                document_types=_optional_string_list(arguments, "document_types"),
+                fiscal_years=_optional_int_list(arguments, "fiscal_years"),
+                fiscal_periods=_optional_string_list(arguments, "fiscal_periods"),
+                cancellation_token=cancellation_token,
+            ),
+        )
+    if tool_name == GET_DOCUMENT_SECTIONS_TOOL_NAME:
+        return cast(
+            JsonValue,
+            read_runtime.get_document_sections(
+                ticker=_required_string(arguments, "ticker"),
+                document_id=_required_string(arguments, "document_id"),
+                cancellation_token=cancellation_token,
+            ),
+        )
+    if tool_name == READ_SECTION_TOOL_NAME:
+        return cast(
+            JsonValue,
+            read_runtime.read_section(
+                ticker=_required_string(arguments, "ticker"),
+                document_id=_required_string(arguments, "document_id"),
+                ref=_required_string(arguments, "ref"),
+                cancellation_token=cancellation_token,
+            ),
+        )
+    if tool_name == SEARCH_DOCUMENT_TOOL_NAME:
+        return _search_document_business(
+            read_runtime=read_runtime,
+            arguments=arguments,
+            display_budget=limits.search_document_max_items,
+            cancellation_token=cancellation_token,
+        )
+    if tool_name == LIST_TABLES_TOOL_NAME:
+        return cast(
+            JsonValue,
+            read_runtime.list_tables(
+                ticker=_required_string(arguments, "ticker"),
+                document_id=_required_string(arguments, "document_id"),
+                financial_only=_optional_bool(arguments, "financial_only", default=False),
+                within_section_ref=_optional_string(arguments, "within_section_ref"),
+                cancellation_token=cancellation_token,
+            ),
+        )
+    if tool_name == GET_TABLE_TOOL_NAME:
+        return cast(
+            JsonValue,
+            read_runtime.get_table(
+                ticker=_required_string(arguments, "ticker"),
+                document_id=_required_string(arguments, "document_id"),
+                table_ref=_required_string(arguments, "table_ref"),
+                cancellation_token=cancellation_token,
+            ),
+        )
+    if tool_name == GET_PAGE_CONTENT_TOOL_NAME:
+        return cast(
+            JsonValue,
+            read_runtime.get_page_content(
+                ticker=_required_string(arguments, "ticker"),
+                document_id=_required_string(arguments, "document_id"),
+                page_no=_required_int(arguments, "page_no"),
+                cancellation_token=cancellation_token,
+            ),
+        )
+    if tool_name == GET_FINANCIAL_STATEMENT_TOOL_NAME:
+        return cast(
+            JsonValue,
+            read_runtime.get_financial_statement(
+                ticker=_required_string(arguments, "ticker"),
+                document_id=_required_string(arguments, "document_id"),
+                statement_type=_required_string(arguments, "statement_type"),
+                cancellation_token=cancellation_token,
+            ),
+        )
+    if tool_name == QUERY_XBRL_FACTS_TOOL_NAME:
+        return cast(
+            JsonValue,
+            read_runtime.query_xbrl_facts(
+                ticker=_required_string(arguments, "ticker"),
+                document_id=_required_string(arguments, "document_id"),
+                concepts=_optional_string_list(arguments, "concepts"),
+                statement_type=_optional_string(arguments, "statement_type"),
+                period_end=_optional_string(arguments, "period_end"),
+                fiscal_year=_optional_int(arguments, "fiscal_year"),
+                fiscal_period=_optional_string(arguments, "fiscal_period"),
+                min_value=_optional_number(arguments, "min_value"),
+                max_value=_optional_number(arguments, "max_value"),
+                cancellation_token=cancellation_token,
+            ),
+        )
+    raise ValueError(f"unsupported fins read tool: {tool_name}")
+
+
+def _parameters_for_tool(tool_name: str) -> ToolParametersSchema:
+    """按工具名构造参数 schema。
+
+    Args:
+        tool_name: 工具名。
+
+    Returns:
+        参数 schema。
+
+    Raises:
+        ValueError: 工具名未知时抛出。
+    """
+
+    if tool_name == LIST_DOCUMENTS_TOOL_NAME:
+        return _list_documents_parameters()
+    if tool_name == GET_DOCUMENT_SECTIONS_TOOL_NAME:
+        return _ticker_document_parameters()
+    if tool_name == READ_SECTION_TOOL_NAME:
+        return _read_section_parameters()
+    if tool_name == SEARCH_DOCUMENT_TOOL_NAME:
+        return _search_document_parameters()
+    if tool_name == LIST_TABLES_TOOL_NAME:
+        return _list_tables_parameters()
+    if tool_name == GET_TABLE_TOOL_NAME:
+        return _get_table_parameters()
+    if tool_name == GET_PAGE_CONTENT_TOOL_NAME:
+        return _get_page_content_parameters()
+    if tool_name == GET_FINANCIAL_STATEMENT_TOOL_NAME:
+        return _get_financial_statement_parameters()
+    if tool_name == QUERY_XBRL_FACTS_TOOL_NAME:
+        return _query_xbrl_facts_parameters()
+    raise ValueError(f"unsupported fins read tool: {tool_name}")
+
+
+def _process_failed_envelope(failure: _FinsReadBusinessFailure) -> JsonValue:
+    """把 Fins read 业务失败转换为 process-backed failed 信封。
+
+    Args:
+        failure: 同步业务失败。
+
+    Returns:
+        Host process capsule 可解析的 failed JSON 信封。
+
+    Raises:
+        无。
+    """
+
+    return {
+        _FINS_PROCESS_STATUS_FIELD: _FINS_PROCESS_FAILED_STATUS,
+        _FINS_PROCESS_ERROR_TYPE_FIELD: failure.error,
+        _FINS_PROCESS_MESSAGE_FIELD: _process_failure_message(failure),
+    }
+
+
+def _process_failure_message(failure: _FinsReadBusinessFailure) -> str:
+    """生成 process-backed failed 信封消息。
+
+    Host process envelope 当前没有独立 hint 字段，因此把 hint 附在 message
+    内，避免 process-backed 生产路径丢失恢复提示，同时不修改 Host public
+    contract 或 runtime JSON 契约。
+
+    Args:
+        failure: 同步业务失败。
+
+    Returns:
+        非空失败消息。
+
+    Raises:
+        无。
+    """
+
+    if failure.hint is None or failure.hint.strip() == "":
+        return failure.message
+    return f"{failure.message} Hint: {failure.hint}"
+
+
 def _search_document_business(
     *,
     read_runtime: FinsReadRuntime,
@@ -874,45 +1395,17 @@ def _search_document_business(
     return cast(JsonValue, result)
 
 
-def _validation_failed_outcome(
+def _build_fins_read_cancelled_outcome(
     tool_name: str,
-    validation: ToolArgumentValidationFailure,
     started_at: datetime,
 ) -> ToolExecutionOutcome:
-    """把参数 schema 校验失败转为 failed outcome。
+    """构造 Fins read 已取消 outcome。
+
+    本函数不读取 Host token reason，避免把 run_id、session_id、digest 等
+    Host 治理信息泄漏到 LLM-facing message 或 hint。
 
     Args:
         tool_name: 工具名。
-        validation: 参数校验失败结果。
-        started_at: 工具调用开始时间。
-
-    Returns:
-        failed outcome。
-
-    Raises:
-        Exception: outcome 构造失败时透出。
-    """
-
-    return failed_outcome(
-        tool_name=tool_name,
-        error=validation.error,
-        message=validation.message,
-        hint=validation.hint,
-        started_at=started_at,
-        finished_at=datetime.now(UTC),
-    )
-
-
-def _cancelled_from_token(
-    tool_name: str,
-    cancellation_token: CancellationToken,
-    started_at: datetime,
-) -> ToolExecutionOutcome:
-    """根据已取消 token 构造 cancelled outcome。
-
-    Args:
-        tool_name: 工具名。
-        cancellation_token: 已取消的 Host token。
         started_at: 工具调用开始时间。
 
     Returns:
@@ -922,7 +1415,6 @@ def _cancelled_from_token(
         Exception: outcome 构造失败时透出。
     """
 
-    del cancellation_token
     return host_cancelled_outcome(
         tool_name=tool_name,
         message="财报读取工具调用已被取消。",

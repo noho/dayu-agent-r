@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import io
+import pickle
 import time
 from collections.abc import Mapping
 from datetime import datetime
@@ -22,6 +23,12 @@ from dayu.contracts.tool_call import (
     ToolCallRequest,
 )
 from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
+from dayu.contracts.tool_execution import (
+    ProcessBackedToolContext,
+    ProcessBackedToolExecutionCapability,
+    ProcessBackedToolTarget,
+    ProcessBackedToolTargetFactory,
+)
 from dayu.contracts.tool_outcome import (
     TOOL_CANCELLED_REASON_HOST_CANCELLED,
     ToolCancelledOutcome,
@@ -72,6 +79,7 @@ from dayu.host.tool_runtime import (
     ToolRuntimeHandle,
     ToolRuntimeBuildRequest,
     ToolRuntimeExecutionScope,
+    ProcessBackedToolExecutionCapsule,
 )
 from dayu.host.tooling import default_framework_tool_policy_view
 from dayu.runtime.tools_discovery import (
@@ -92,10 +100,11 @@ _FINS_READ_TOOL_NAMES = (
     "get_financial_statement",
     "query_xbrl_facts",
 )
+_FINANCIAL_HTML_DOCUMENT_ID: Final[str] = "aapl-html-2024-10k"
+_FINANCIAL_HTML_PRIMARY_DOCUMENT: Final[str] = "aapl-html-2024-10k.html"
+_INCOME_STATEMENT_TYPE: Final[str] = "income"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_FINS_WAIT_ADAPTER_PATH = (
-    _REPO_ROOT / "dayu" / "fins" / "ingestion" / "wait_adapter.py"
-).resolve(strict=False)
+_FINS_WAIT_ADAPTER_PATH = (_REPO_ROOT / "dayu" / "fins" / "ingestion" / "wait_adapter.py").resolve(strict=False)
 _FINS_DEFAULT_FORBIDDEN_IMPORT_ROOTS = ("dayu.engine", "dayu.host", "dayu.service", "dayu.ui")
 _FINS_WAIT_ADAPTER_FORBIDDEN_IMPORT_ROOTS = ("dayu.engine", "dayu.service", "dayu.ui")
 _HOST_GOVERNANCE_CANCEL_REASON: Final[str] = (
@@ -719,6 +728,173 @@ def test_fins_read_tool_schemas_do_not_expose_execution_context(tmp_path: Path) 
         assert "cancellation_token" not in required
 
 
+def test_fins_read_definitions_declare_process_backed_execution(tmp_path: Path) -> None:
+    """九个 Fins read definitions 必须声明 process-backed execution。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    definitions = _discover_definitions(workspace_root)
+
+    assert tuple(definition.name for definition in definitions) == _FINS_READ_TOOL_NAMES
+    for definition in definitions:
+        assert isinstance(definition.execution, ProcessBackedToolExecutionCapability)
+
+
+def test_fins_read_process_target_factory_pickle_round_trip(tmp_path: Path) -> None:
+    """Fins read process target factory / target 必须可 pickle 且不携带运行时对象。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    definitions = _definitions_by_name(_discover_definitions(workspace_root))
+    factory = _process_target_factory(definitions["list_documents"])
+
+    factory_payload = pickle.dumps(factory)
+    round_tripped_factory = cast(
+        ProcessBackedToolTargetFactory,
+        pickle.loads(factory_payload),
+    )
+    target = round_tripped_factory.build_process_target(
+        _call("list_documents", {"ticker": "AAPL"}),
+        _process_context(),
+    )
+    target_payload = pickle.dumps(target)
+    round_tripped_target = cast(ProcessBackedToolTarget, pickle.loads(target_payload))
+
+    forbidden_payload_fragments = (
+        b"FinsReadRuntime",
+        b"Repository",
+        b"provider_lock",
+        b"CancellationToken",
+        b"session-fins",
+        b"run-fins",
+    )
+    for fragment in forbidden_payload_fragments:
+        assert fragment not in factory_payload
+        assert fragment not in target_payload
+    assert callable(round_tripped_target)
+
+
+def test_fins_read_process_target_fast_path_uses_default_runtime(tmp_path: Path) -> None:
+    """process target 应能在当前进程重建 DefaultFinsRuntime 并执行 fast path。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    target = _build_process_target(
+        workspace_root,
+        "list_documents",
+        {"ticker": "AAPL"},
+    )
+
+    envelope = target()
+
+    value = _completed_envelope_value(envelope)
+    assert isinstance(value, Mapping)
+    assert value.get("matched") == 1
+
+
+def test_fins_read_process_target_processor_and_table_paths(tmp_path: Path) -> None:
+    """process target 应覆盖 processor search path 与 table path。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    search_envelope = _build_process_target(
+        workspace_root,
+        "search_document",
+        {
+            "ticker": "AAPL",
+            "document_id": "aapl-2024-10k",
+            "query": "annual recurring revenue",
+            "mode": "keyword",
+        },
+    )()
+    tables_envelope = _build_process_target(
+        workspace_root,
+        "list_tables",
+        {
+            "ticker": "AAPL",
+            "document_id": "aapl-2024-10k",
+        },
+    )()
+
+    search_value = _completed_envelope_value(search_envelope)
+    tables_value = _completed_envelope_value(tables_envelope)
+    assert isinstance(search_value, Mapping)
+    assert isinstance(search_value.get("matches"), list)
+    assert isinstance(tables_value, Mapping)
+    assert isinstance(tables_value.get("tables"), list)
+
+
+def test_fins_read_process_target_failure_envelope(tmp_path: Path) -> None:
+    """process target 参数失败应返回 failed JSON 信封而不是 Host-governed 状态。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    target = _build_process_target(workspace_root, "list_documents", {})
+
+    envelope = target()
+
+    assert isinstance(envelope, Mapping)
+    assert envelope.get("status") == "failed"
+    assert envelope.get("error_type") == "invalid_argument"
+    assert "host_cancelled" not in envelope.values()
+    assert "cancelled" not in envelope.values()
+    assert "timeout" not in envelope.values()
+    assert "awaiting" not in envelope.values()
+
+
+def test_fins_read_process_target_runs_in_spawned_child(tmp_path: Path) -> None:
+    """S2C pre-check：spawned child 能重建 DefaultFinsRuntime 并执行只读查询。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    target = _build_process_target(
+        workspace_root,
+        "list_documents",
+        {"ticker": "AAPL"},
+    )
+
+    outcome = asyncio.run(_run_process_capsule(target))
+
+    assert isinstance(outcome, ToolCompletedOutcome)
+    value = outcome.result.value
+    assert isinstance(value, Mapping)
+    assert value.get("matched") == 1
+
+
+def test_fins_read_financial_statement_runs_in_spawned_child(tmp_path: Path) -> None:
+    """spawned child 应能装配 FinancialDataProcessor 路径并执行财务工具。"""
+
+    workspace_root = _build_fins_financial_html_workspace(tmp_path)
+    target = _build_process_target(
+        workspace_root,
+        "get_financial_statement",
+        {
+            "ticker": "AAPL",
+            "document_id": _FINANCIAL_HTML_DOCUMENT_ID,
+            "statement_type": _INCOME_STATEMENT_TYPE,
+        },
+    )
+
+    outcome = asyncio.run(_run_process_capsule(target))
+
+    assert isinstance(outcome, ToolCompletedOutcome)
+    value = outcome.result.value
+    assert isinstance(value, Mapping)
+    assert value.get("document_id") == _FINANCIAL_HTML_DOCUMENT_ID
+    assert value.get("statement_type") == _INCOME_STATEMENT_TYPE
+    assert isinstance(value.get("rows"), list)
+    assert "supported" not in value
+    assert "error" not in value
+
+
+def test_fins_read_process_backed_cancel_drops_late_result(tmp_path: Path) -> None:
+    """ToolRuntime 取消真实 Fins process target 后不得接受子进程迟到结果。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    runtime, accepting_port = _tool_runtime(workspace_root)
+    token = _ManualCancellationToken()
+
+    outcome = asyncio.run(_run_fins_process_tool_and_cancel(runtime, token))
+
+    assert accepting_port.candidates
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.hint == "tool_runtime_cancelled"
+
+
 def test_fins_read_provider_requires_workspace_root_when_enabled(tmp_path: Path) -> None:
     """启用 read provider 时必须显式提供 workspace_root。"""
 
@@ -790,7 +966,7 @@ def test_cancelled_read_outcomes_hide_host_governance_reason(
 
     workspace_root = _build_fins_workspace(tmp_path)
     read_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_read_runtime()
-    definitions = _definitions_by_name(_definitions_for_read_runtime(read_runtime))
+    definitions = _definitions_by_name(_definitions_for_read_runtime(read_runtime, workspace_root))
 
     pre_cancel_token = _ManualCancellationToken(
         cancel_reason=_HOST_GOVERNANCE_CANCEL_REASON,
@@ -840,7 +1016,7 @@ def test_search_document_cancellation_during_search_stops_before_all_candidates(
     token = _ManualCancellationToken()
     processor = _SearchCancellingProcessor(token)
     _install_processor(read_runtime, cast(DocumentProcessor, processor), monkeypatch)
-    definition = _definitions_by_name(_definitions_for_read_runtime(read_runtime))["search_document"]
+    definition = _definitions_by_name(_definitions_for_read_runtime(read_runtime, workspace_root))["search_document"]
 
     outcome = asyncio.run(
         definition.callable(
@@ -877,7 +1053,7 @@ def test_search_document_semantic_enrichment_cancelled_error_is_not_swallowed(
         "_enrich_sections_with_semantic",
         _raise_fins_cancelled_during_semantic_enrichment,
     )
-    definition = _definitions_by_name(_definitions_for_read_runtime(read_runtime))["search_document"]
+    definition = _definitions_by_name(_definitions_for_read_runtime(read_runtime, workspace_root))["search_document"]
 
     outcome = asyncio.run(
         definition.callable(
@@ -914,7 +1090,7 @@ def test_read_section_cancelled_before_processor_read_returns_cancelled_outcome(
         monkeypatch,
         cancel_token_after_create=token,
     )
-    definition = _definitions_by_name(_definitions_for_read_runtime(read_runtime))["read_section"]
+    definition = _definitions_by_name(_definitions_for_read_runtime(read_runtime, workspace_root))["read_section"]
 
     outcome = asyncio.run(
         definition.callable(
@@ -945,7 +1121,7 @@ def test_read_section_parent_title_lookup_cancelled_error_is_not_swallowed(
     token = _ManualCancellationToken()
     processor = _ParentTitleLookupCancellingProcessor(token)
     _install_processor(read_runtime, cast(DocumentProcessor, processor), monkeypatch)
-    definition = _definitions_by_name(_definitions_for_read_runtime(read_runtime))["read_section"]
+    definition = _definitions_by_name(_definitions_for_read_runtime(read_runtime, workspace_root))["read_section"]
 
     outcome = asyncio.run(
         definition.callable(
@@ -976,7 +1152,7 @@ def test_query_xbrl_facts_cancellation_during_filtering_stops_promptly(
     token = _ManualCancellationToken()
     processor = _XbrlFactsProcessor(token)
     _install_processor(read_runtime, cast(DocumentProcessor, processor), monkeypatch)
-    definition = _definitions_by_name(_definitions_for_read_runtime(read_runtime))["query_xbrl_facts"]
+    definition = _definitions_by_name(_definitions_for_read_runtime(read_runtime, workspace_root))["query_xbrl_facts"]
 
     outcome = asyncio.run(
         definition.callable(
@@ -1007,7 +1183,7 @@ def test_same_provider_read_tools_do_not_enter_read_runtime_concurrently(
     probe = _ConcurrentReadRuntimeProbe()
     monkeypatch.setattr(read_runtime, "list_documents", probe.list_documents)
     monkeypatch.setattr(read_runtime, "get_document_sections", probe.get_document_sections)
-    definitions = _definitions_by_name(_definitions_for_read_runtime(read_runtime))
+    definitions = _definitions_by_name(_definitions_for_read_runtime(read_runtime, workspace_root))
 
     asyncio.run(_run_two_fins_read_tools_concurrently(definitions, probe.entered))
 
@@ -1198,9 +1374,7 @@ def test_fins_workspace_root_must_be_explicit_absolute_path() -> None:
 
     spec = ToolsDiscoveryProviderSpec(
         spec_id="financial-read-tools",
-        location=PythonImportPathProvider(
-            import_path="dayu.fins.tools.provider:discover_tools"
-        ),
+        location=PythonImportPathProvider(import_path="dayu.fins.tools.provider:discover_tools"),
         enabled=True,
         config={
             "workspace_root": "workspace/fins",
@@ -1321,6 +1495,89 @@ def _build_fins_workspace(tmp_path: Path) -> Path:
     return workspace_root
 
 
+def _build_fins_financial_html_workspace(tmp_path: Path) -> Path:
+    """构造包含 HTML 10-K 的 Fins fixture 工作区。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        Fins workspace root。
+
+    Raises:
+        OSError: 文件写入失败时抛出。
+    """
+
+    workspace_root = tmp_path / "fins-financial-html-workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    company_repository = FsCompanyMetaRepository(workspace_root, repository_set=repository_set)
+    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    company_repository.upsert_company_meta(
+        CompanyMeta(
+            company_id="0000320193",
+            company_name="Apple Inc.",
+            ticker="AAPL",
+            market="US",
+            resolver_version="test",
+            updated_at=now_iso8601(),
+            ticker_aliases=[],
+        )
+    )
+    token = batching_repository.begin_batch("AAPL")
+    try:
+        source_repository.create_source_document(
+            SourceDocumentUpsertRequest(
+                ticker="AAPL",
+                document_id=_FINANCIAL_HTML_DOCUMENT_ID,
+                internal_document_id=_FINANCIAL_HTML_DOCUMENT_ID,
+                form_type="10-K",
+                primary_document=_FINANCIAL_HTML_PRIMARY_DOCUMENT,
+                meta={
+                    "fiscal_year": 2024,
+                    "fiscal_period": "FY",
+                    "filing_date": "2024-11-01",
+                    "report_date": "2024-09-28",
+                    "amended": False,
+                    "ingest_method": "upload",
+                },
+            ),
+            SourceKind.FILING,
+        )
+        handle = source_repository.get_source_handle("AAPL", _FINANCIAL_HTML_DOCUMENT_ID, SourceKind.FILING)
+        file_meta = blob_repository.store_file(
+            handle,
+            _FINANCIAL_HTML_PRIMARY_DOCUMENT,
+            io.BytesIO(_fixture_financial_html().encode("utf-8")),
+            content_type="text/html",
+        )
+        source_repository.update_source_document(
+            SourceDocumentUpsertRequest(
+                ticker="AAPL",
+                document_id=_FINANCIAL_HTML_DOCUMENT_ID,
+                internal_document_id=_FINANCIAL_HTML_DOCUMENT_ID,
+                form_type="10-K",
+                primary_document=_FINANCIAL_HTML_PRIMARY_DOCUMENT,
+                meta={
+                    "fiscal_year": 2024,
+                    "fiscal_period": "FY",
+                    "filing_date": "2024-11-01",
+                    "report_date": "2024-09-28",
+                    "amended": False,
+                    "ingest_method": "upload",
+                },
+                files=[file_meta],
+            ),
+            SourceKind.FILING,
+        )
+        batching_repository.commit_batch(token)
+    except Exception:
+        batching_repository.rollback_batch(token)
+        raise
+    return workspace_root
+
+
 def _fixture_markdown() -> str:
     """返回测试财报 Markdown 内容。
 
@@ -1343,6 +1600,30 @@ Services margin improved as paid subscriptions grew across the installed base.
 | --- | ---: |
 | Revenue | 100 |
 | Services margin | 42 |
+"""
+
+
+def _fixture_financial_html() -> str:
+    """返回测试财报 HTML 内容。
+
+    Returns:
+        HTML 文本。
+
+    Raises:
+        无。
+    """
+
+    return """<html>
+<body>
+<h1>Apple Inc. 2024 Form 10-K</h1>
+<table>
+<caption>Consolidated Statements of Operations</caption>
+<tr><th>Metric</th><th>2024</th><th>2023</th></tr>
+<tr><td>Net sales</td><td>391035</td><td>383285</td></tr>
+<tr><td>Net income</td><td>93736</td><td>96995</td></tr>
+</table>
+</body>
+</html>
 """
 
 
@@ -1375,9 +1656,7 @@ def _spec(
         config.update(extra_config)
     return ToolsDiscoveryProviderSpec(
         spec_id="financial-read-tools",
-        location=PythonImportPathProvider(
-            import_path="dayu.fins.tools.provider:discover_tools"
-        ),
+        location=PythonImportPathProvider(import_path="dayu.fins.tools.provider:discover_tools"),
         enabled=True,
         config=config,
     )
@@ -1524,10 +1803,7 @@ def _is_forbidden_import(module_name: str, forbidden_roots: tuple[str, ...]) -> 
         无。
     """
 
-    return any(
-        module_name == root or module_name.startswith(f"{root}.")
-        for root in forbidden_roots
-    )
+    return any(module_name == root or module_name.startswith(f"{root}.") for root in forbidden_roots)
 
 
 def _fins_forbidden_import_roots(path: Path) -> tuple[str, ...]:
@@ -1548,6 +1824,158 @@ def _fins_forbidden_import_roots(path: Path) -> tuple[str, ...]:
     return _FINS_DEFAULT_FORBIDDEN_IMPORT_ROOTS
 
 
+def _build_process_target(
+    workspace_root: Path,
+    tool_name: str,
+    arguments: Mapping[str, JsonValue],
+) -> ProcessBackedToolTarget:
+    """从真实 Fins provider 定义构造 process-backed target。
+
+    Args:
+        workspace_root: Fins workspace root。
+        tool_name: 工具名。
+        arguments: 工具参数。
+
+    Returns:
+        可序列化 process-backed target。
+
+    Raises:
+        AssertionError: 工具未声明 process-backed execution 时抛出。
+    """
+
+    definitions = _definitions_by_name(_discover_definitions(workspace_root))
+    factory = _process_target_factory(definitions[tool_name])
+    return factory.build_process_target(
+        _call(tool_name, arguments),
+        _process_context(),
+    )
+
+
+def _process_target_factory(
+    definition: ToolDefinition,
+) -> ProcessBackedToolTargetFactory:
+    """读取工具定义中的 process-backed target factory。
+
+    Args:
+        definition: Fins read 工具定义。
+
+    Returns:
+        process-backed target factory。
+
+    Raises:
+        AssertionError: 工具未声明 process-backed execution 时抛出。
+    """
+
+    execution = definition.execution
+    assert isinstance(execution, ProcessBackedToolExecutionCapability)
+    return execution.target_factory
+
+
+def _process_context() -> ProcessBackedToolContext:
+    """构造 process-backed target factory 测试上下文。
+
+    Args:
+        无。
+
+    Returns:
+        可序列化 process-backed 上下文。
+
+    Raises:
+        无。
+    """
+
+    return ProcessBackedToolContext(
+        run_id="run-fins",
+        session_id="session-fins",
+        iteration_id="iteration-fins",
+        timeout_seconds=30.0,
+        correlation_id="correlation-fins",
+    )
+
+
+def _completed_envelope_value(envelope: JsonValue) -> JsonValue:
+    """读取 process-backed completed 信封的 value。
+
+    Args:
+        envelope: process target 返回的 JSON 信封。
+
+    Returns:
+        completed value。
+
+    Raises:
+        AssertionError: 信封不是 completed 形态时抛出。
+    """
+
+    assert isinstance(envelope, Mapping)
+    assert envelope.get("status") == "completed"
+    value = envelope.get("value")
+    assert value is not None
+    return value
+
+
+async def _run_process_capsule(
+    target: ProcessBackedToolTarget,
+) -> ToolExecutionOutcome:
+    """运行真实 process-backed capsule 并释放子进程资源。
+
+    Args:
+        target: 可序列化 process-backed target。
+
+    Returns:
+        工具 outcome。
+
+    Raises:
+        Exception: capsule run / close 失败时透出。
+    """
+
+    capsule = ProcessBackedToolExecutionCapsule(target)
+    try:
+        return await capsule.run()
+    finally:
+        await capsule.close()
+
+
+async def _run_fins_process_tool_and_cancel(
+    runtime: ToolRuntimeHandle,
+    token: _ManualCancellationToken,
+) -> ToolExecutionOutcome:
+    """启动真实 Fins read process-backed 调用并触发 Host 取消。
+
+    Args:
+        runtime: 由真实 Fins provider 构造的 ToolRuntime。
+        token: 可手动取消的测试 token。
+
+    Returns:
+        单条工具 outcome。
+
+    Raises:
+        asyncio.TimeoutError: 工具运行未在测试预算内完成时抛出。
+    """
+
+    task = asyncio.create_task(
+        runtime.tool_executor.execute(
+            BatchToolExecutionRequest(
+                calls=(
+                    _call(
+                        "search_document",
+                        {
+                            "ticker": "AAPL",
+                            "document_id": "aapl-2024-10k",
+                            "query": "annual recurring revenue",
+                            "mode": "keyword",
+                        },
+                    ),
+                ),
+                context=_context(cancellation_token=token),
+            )
+        )
+    )
+    await asyncio.sleep(0.01)
+    token.cancel()
+    response = await asyncio.wait_for(task, timeout=2.0)
+    return response.records[0].outcome
+
+
 def _tool_runtime(workspace_root: Path) -> tuple[ToolRuntimeHandle, _AcceptingPort]:
     """构造当前 ToolRuntime。
 
@@ -1563,9 +1991,7 @@ def _tool_runtime(workspace_root: Path) -> tuple[ToolRuntimeHandle, _AcceptingPo
 
     output = discover_tools(_spec(workspace_root))
     accepting_port = _AcceptingPort()
-    runtime = DefaultToolRuntimeFactory(
-        EffectiveToolBundleBuilder()
-    ).create_tool_runtime(
+    runtime = DefaultToolRuntimeFactory(EffectiveToolBundleBuilder()).create_tool_runtime(
         ToolRuntimeBuildRequest(
             effective_bundle_request=EffectiveToolBundleBuildRequest(
                 business_tool_bundle=ToolBundle(definitions=output.definitions),
@@ -1610,11 +2036,15 @@ def _call(name: str, arguments: Mapping[str, JsonValue]) -> ToolCallRequest:
     )
 
 
-def _definitions_for_read_runtime(read_runtime: FinsReadRuntime) -> tuple[ToolDefinition, ...]:
+def _definitions_for_read_runtime(
+    read_runtime: FinsReadRuntime,
+    workspace_root: Path,
+) -> tuple[ToolDefinition, ...]:
     """为指定 read runtime 构造 Fins read 工具定义。
 
     Args:
         read_runtime: 已构造的 Fins read runtime。
+        workspace_root: Fins workspace root。
 
     Returns:
         工具定义元组。
@@ -1625,6 +2055,7 @@ def _definitions_for_read_runtime(read_runtime: FinsReadRuntime) -> tuple[ToolDe
 
     return build_fins_read_tool_definitions(
         read_runtime=read_runtime,
+        workspace_root=workspace_root,
         limits=FinsToolLimits(),
     )
 
