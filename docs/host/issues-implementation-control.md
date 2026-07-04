@@ -155,14 +155,14 @@ git push -u github <branch>
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | final-closeout-pass |
-| implementation status | WU-WAIT-01 / GitHub Issue #89 merged via PR #163 on 2026-07-01; WU-WAIT-02 / GitHub Issue #90 merged via PR #165 on 2026-07-03 and issue #90 closed automatically; WU-WAIT-03 / GitHub Issue #92 merged via PR #166 on 2026-07-04 and issue #92 closed automatically. |
-| active work unit | WU-LIFE-03 |
-| default next work unit | WU-LIFE-03 is the current implementation entry point; after WU-LIFE-03 completes, WU-LIFE-04 becomes the next entry point, followed by WU-TOOLS-CANCEL-01 and WU-WAIT-04. |
-| next entry point | Wait for user / maintainer to handle draft PR #167; after merge, start WU-LIFE-04 from updated main. |
+| gate | accepted plan commit |
+| implementation status | WU-WAIT-01 / GitHub Issue #89 merged via PR #163 on 2026-07-01; WU-WAIT-02 / GitHub Issue #90 merged via PR #165 on 2026-07-03 and issue #90 closed automatically; WU-WAIT-03 / GitHub Issue #92 merged via PR #166 on 2026-07-04 and issue #92 closed automatically; WU-LIFE-03 / GitHub Issue #91 merged via PR #167 on 2026-07-04 and issue #91 closed automatically. WU-LIFE-04 goal confirmation completed on 2026-07-04; plan re-review passed and entered accepted plan commit gate. |
+| active work unit | WU-LIFE-04 |
+| default next work unit | WU-LIFE-04 is the current implementation entry point; after WU-LIFE-04 completes, WU-TOOLS-CANCEL-01 becomes the next entry point, followed by WU-WAIT-04. |
+| next entry point | WU-LIFE-04 accepted plan commit gate: create protected local accepted plan commit, then enter implementation gate. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | Active/backlog issue owners retained here: #129 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #168 / #88 / #112 / #20 / #80 / #115, plus residual-risk destinations #121 / #122. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`; #63 / #89 / #90 / #92 / #111 / #130 / #133 are no longer active implementation owners. |
-| blocking open questions | None. |
+| blocking open questions | None. User confirmed WU-LIFE-04 goal and explicitly prefers deleting `active_cancel_timeout_seconds`; if deletion is not justified by direct implementation evidence, it must at least stop being public API. |
 
 状态约定：
 
@@ -250,8 +250,8 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-RET-04 | pending-prerequisite | Compaction artifact retention | GitHub Issue #156 / #78 child | Retention lane 默认第 3 项；必须等待 WU-RET-03 / #78 固定 purge cleanup 边界后实施 |
 | WU-RET-02 | pending | Audit JSONL storage governance | GitHub Issue #96 / #43 child | Retention lane 默认第 4 项；Audit JSONL rotation / retention / compaction / size reporting；保留 purge tombstone 可验证关联 |
 | WU-STRESS-SQLITE-01 | pending | SQLite multiprocess high-spec stress | GitHub Issue #38 | 现有 SQLite 多进程压力测试链路的慢盘 / Docker Linux 高规格版本 |
-| WU-LIFE-03 | final-closeout-pass | Active cancel watchdog | GitHub Issue #91 / #87 umbrella | Draft PR #167 已创建并完成本地 review / final closeout；等待用户 / maintainer 处理 draft PR。固定 Host-level active cancel watchdog、post-cancel timeout closeout、late terminal race 和 diagnostic 语义。只负责 Host truth / timeout closeout，不负责 tool/provider hard interrupt。 |
-| WU-LIFE-04 | pending-next | Tool execution deadline and #87 watchdog closeout | GitHub Issue #168 / #87 umbrella | #87 umbrella follow-up；已确认 `tool_execution_timeout_seconds` 是单次工具调用最长运行时间，取消/收口机制不得覆盖或延长该 deadline。WU-LIFE-03 merge 后，本 WU 作为下一实施入口，先裁决 Host cancel watchdog 如何消费已有 execution deadlines、是否移除或降级独立 `active_cancel_timeout_seconds`、scan query optimization、clock skew、diagnostics / audit hooks 和 shared supervisor 验收；完成后再进入 `WU-TOOLS-CANCEL-01`。 |
+| WU-LIFE-03 | completed | Active cancel watchdog | GitHub Issue #91 / #87 umbrella / PR #167 | PR 167 merged on 2026-07-04 and issue #91 closed automatically; not an active implementation entry point. 固定 Host-level active cancel watchdog、post-cancel timeout closeout、late terminal race 和 diagnostic 语义。只负责 Host truth / timeout closeout，不负责 tool/provider hard interrupt。 |
+| WU-LIFE-04 | planning | Tool execution deadline and #87 watchdog closeout | GitHub Issue #168 / #87 umbrella | #87 umbrella follow-up；已确认 `tool_execution_timeout_seconds` 是单次工具调用最长运行时间，取消/收口机制不得覆盖或延长该 deadline。Goal confirmation 已由用户确认，用户裁决优先删除 `active_cancel_timeout_seconds`；若直接实现证据不支持删除，至少不得继续作为 public API 暴露。Plan artifact 为 `docs/host/wu-life-04-tool-execution-deadline-watchdog-plan.md`，plan review artifacts 为 `docs/reviews/wu-life-04-plan-review-mimo.md` 与 `docs/reviews/wu-life-04-plan-review-ds.md`；controller adjudication 为 `docs/reviews/wu-life-04-plan-review-controller-adjudication.md`。Plan fix artifact 为 `docs/reviews/wu-life-04-plan-fix-codex.md`；AgentCodex reported PLAN-F01 / F02 / F03 / F04 / F05 and PLAN-I01 fixed and `git diff --check` passed. Plan re-review artifacts 为 `docs/reviews/wu-life-04-plan-rereview-mimo.md` 与 `docs/reviews/wu-life-04-plan-rereview-ds.md`；controller adjudication 为 `docs/reviews/wu-life-04-plan-rereview-controller-adjudication.md`。两路 re-review 均通过，所有 accepted findings 已修复，无 blocking open question。当前进入 accepted plan commit gate。 |
 | WU-GOV-01 | pending | Host policy refusal terminal taxonomy | GitHub Issue #88 | 引入 `RunStatus.REJECTED` 表达权限、租户、额度、配额、速率限制、工具权限 / 审批等 Host policy refusal；compact failure 默认不迁移到 `REJECTED`。 |
 | WU-CTX-04 | pending-low | Run-level compaction concurrency boundary | GitHub Issue #112 | 低优先级设计核对：不引入 EventLog fencing；证明当前状态机 / request 计数 / stale recheck 足够，或在未来并发模型需要时设计 EventLog 外的最小 pointer / CAS。 |
 | WU-CTX-01 | pending | Provider tokenizer / sizing adapter | GitHub Issue #20 | provider/model-aware context sizing；仍有效，需先收敛 budget policy 设计表述 |
