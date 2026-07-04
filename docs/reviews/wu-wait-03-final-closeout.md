@@ -8,6 +8,7 @@
 - Accepted aggregate commit: `848839e9`
 - Draft PR pass commit: `2da254c4`
 - Issue closeout comment: https://github.com/noho/dayu-agent-r/issues/92#issuecomment-4880126795
+- Residual-risk reconciliation comment: https://github.com/noho/dayu-agent-r/issues/92#issuecomment-4880258099
 
 ## What Changed
 
@@ -52,13 +53,20 @@
   - MiMo: no blocking findings; PR can enter final closeout.
   - DS: no blocking findings; one low-severity stale total-control gate text issue accepted and fixed before final closeout.
 
-## Remaining Risks / Owners
+## Residual Risk Reconciliation
 
-- Provider lifecycle cleanup remains best-effort and provider-specific. Owner: provider-specific adapter owners under #92 / #87.
-- Poller-disabled deployments will not execute external lifecycle adapter actions until production polling is configured. Owner: Service composition / deployment configuration and WU-WAIT-04 validation.
-- Running Fins operations observe cancellation cooperatively at checkpoints. Owner: Fins provider/runtime owners.
-- Future provider adapters that implement `CANCEL` or `REVOKE` may need more granular durable diagnostics if operators require action-level distinction. Owner: future adapter/schema work.
-- GitHub PR checks are not configured for branch `phase/wu-wait-03-issue-92`. Owner: repo infrastructure; local validation is the current gate evidence.
+The residual-risk reconciliation artifact is `docs/reviews/wu-wait-03-residual-risk-reconciliation.md`.
+
+Items that remain active after WU-WAIT-03 are recorded in `docs/host/issues-implementation-control.md` / `Residual Risk / 遗留问题追踪`:
+
+- `WU-WAIT-03-R1`: production poller / adapter registry composition validation is deferred to WU-WAIT-04.
+- `WU-WAIT-03-R2`: stronger-than-cooperative Fins provider cancellation is deferred to Fins provider/runtime owners if operational evidence requires it.
+
+Items that are not active residual risks:
+
+- Provider lifecycle cleanup being best-effort and provider-specific is an accepted #92 design constraint, not an unresolved current-WU defect.
+- Future `CANCEL` / `REVOKE` durable diagnostic granularity is a future adapter guardrail because no current adapter returns those actions.
+- Missing GitHub checks are a repo infrastructure note; local validation is the current gate evidence.
 
 No unclassified blocking residual risk remains for WU-WAIT-03.
 
@@ -66,6 +74,7 @@ No unclassified blocking residual risk remains for WU-WAIT-03.
 
 - PR body uses `Closes #92`, so merging PR #166 is expected to close issue #92 automatically.
 - Issue closeout comment was published at https://github.com/noho/dayu-agent-r/issues/92#issuecomment-4880126795.
+- Residual-risk reconciliation comment was published at https://github.com/noho/dayu-agent-r/issues/92#issuecomment-4880258099.
 - Issue #92 remains open until PR #166 is merged.
 
 ## Next Entry Point
