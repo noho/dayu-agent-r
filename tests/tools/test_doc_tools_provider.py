@@ -7,16 +7,25 @@ import asyncio
 import builtins
 import inspect
 import io
+import os
+import pickle
 import shutil
+import time
 from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, ParamSpec, TextIO, TypeVar, cast
+from typing import Callable, TextIO, cast
 
 import pytest
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
+from dayu.contracts.tool_execution import (
+    ProcessBackedToolContext,
+    ProcessBackedToolExecutionCapability,
+    ProcessBackedToolTarget,
+)
 from dayu.contracts.tool_outcome import TOOL_CANCELLED_REASON_HOST_CANCELLED
 from dayu.contracts.tool_call import (
     BatchToolExecutionContext,
@@ -37,6 +46,7 @@ from dayu.host.tool_runtime import (
     ToolFactAcceptedAck,
     ToolRuntimeBuildRequest,
     ToolRuntimeExecutionScope,
+    ToolRuntimeHandle,
 )
 from dayu.host.tooling import default_framework_tool_policy_view
 from dayu.runtime.tools_discovery import (
@@ -64,8 +74,44 @@ _FORBIDDEN_CANCEL_MESSAGE_PARTS = (
     "correlation_id",
     "cancellation_token",
 )
-_P = ParamSpec("_P")
-_R = TypeVar("_R")
+
+
+@dataclass(frozen=True, slots=True)
+class _SlowCompletedProcessTarget:
+    """测试用慢 process-backed target。"""
+
+    sleep_seconds: float
+
+    def __call__(self) -> JsonValue:
+        """阻塞一段时间后返回 completed 信封。
+
+        :returns: process-backed completed JSON 信封。
+        """
+
+        time.sleep(self.sleep_seconds)
+        return {"status": "completed", "value": {"late": True}}
+
+
+@dataclass(frozen=True, slots=True)
+class _SlowProcessTargetFactory:
+    """测试用慢 process target factory。"""
+
+    sleep_seconds: float
+
+    def build_process_target(
+        self,
+        call: ToolCallRequest,
+        context: ProcessBackedToolContext,
+    ) -> ProcessBackedToolTarget:
+        """构造慢 process target。
+
+        :param call: 单次工具调用请求。
+        :param context: process-backed 投影上下文。
+        :returns: 慢 process-backed target。
+        """
+
+        del call, context
+        return _SlowCompletedProcessTarget(self.sleep_seconds)
 
 
 class _OpenCancellationToken:
@@ -222,6 +268,143 @@ def test_doc_provider_discovers_native_async_callables(tmp_path: Path) -> None:
 
     assert tuple(definition.name for definition in definitions) == _DOC_TOOL_NAMES
     assert all(inspect.iscoroutinefunction(definition.callable) for definition in definitions)
+
+
+def test_all_doc_tool_definitions_declare_process_backed_execution(tmp_path: Path) -> None:
+    """五个 Doc tool 的生产 execution 必须声明为 process-backed。"""
+
+    definitions = _discover_definitions(tmp_path)
+
+    assert tuple(definition.name for definition in definitions) == _DOC_TOOL_NAMES
+    for definition in definitions:
+        assert isinstance(definition.execution, ProcessBackedToolExecutionCapability)
+
+
+@pytest.mark.parametrize("tool_name", _DOC_TOOL_NAMES)
+def test_doc_process_target_factory_is_pickle_round_trippable(
+    tmp_path: Path,
+    tool_name: str,
+) -> None:
+    """Doc process target factory 和 target 必须可 pickle round-trip。"""
+
+    target = _copy_fixture(tmp_path, "sample.md")
+    definition = _definitions_by_name(_discover_definitions(tmp_path))[tool_name]
+    execution = cast(ProcessBackedToolExecutionCapability, definition.execution)
+    factory = cast(
+        doc_tools._DocProcessTargetFactory,
+        pickle.loads(pickle.dumps(execution.target_factory)),
+    )
+
+    process_target = factory.build_process_target(
+        _call(tool_name, _pre_cancel_arguments(tool_name, tmp_path, target)),
+        ProcessBackedToolContext(
+            run_id="run-doc",
+            session_id="session-doc",
+            iteration_id="iteration-doc",
+            timeout_seconds=10.0,
+            correlation_id="correlation-doc",
+        ),
+    )
+    round_tripped_target = cast(
+        doc_tools._DocProcessTarget,
+        pickle.loads(pickle.dumps(process_target)),
+    )
+
+    assert round_tripped_target.tool_name == tool_name
+    assert "provider_lock" not in repr(round_tripped_target)
+    assert "DocumentProcessor" not in repr(round_tripped_target)
+
+
+def test_doc_process_target_fast_path_matches_callable_baseline(tmp_path: Path) -> None:
+    """read_file process target 成功输出应与 callable fallback 成功值一致。"""
+
+    target = _copy_fixture(tmp_path, "sample.md")
+    definition = _definitions_by_name(_discover_definitions(tmp_path))["read_file"]
+    call = _call("read_file", {"file_path": str(target)})
+    baseline = asyncio.run(definition.callable(call, _context()))
+    assert isinstance(baseline, ToolCompletedOutcome)
+
+    envelope = _run_definition_process_target(definition, call)
+
+    assert isinstance(envelope, Mapping)
+    assert envelope["status"] == "completed"
+    assert envelope["value"] == baseline.result.value
+
+
+def test_doc_process_target_processor_path_supports_docling_sections(tmp_path: Path) -> None:
+    """get_file_sections process target 应在子进程内重新创建 processor。"""
+
+    target = _copy_fixture(tmp_path, "sample_docling.json")
+    definition = _definitions_by_name(_discover_definitions(tmp_path))["get_file_sections"]
+
+    envelope = _run_definition_process_target(
+        definition,
+        _call("get_file_sections", {"file_path": str(target)}),
+    )
+
+    assert isinstance(envelope, Mapping)
+    assert envelope["status"] == "completed"
+    value = cast(Mapping[str, JsonValue], envelope["value"])
+    sections = cast(list[JsonValue], value["sections"])
+    first_section = cast(Mapping[str, JsonValue], sections[0])
+    assert isinstance(first_section["ref"], str)
+
+
+def test_doc_process_target_path_denied_keeps_permission_semantics(tmp_path: Path) -> None:
+    """process target 必须在子进程内重新执行路径白名单校验。"""
+
+    allowed = tmp_path / "allowed"
+    blocked = tmp_path / "blocked"
+    allowed.mkdir()
+    blocked.mkdir()
+    target = blocked / "sample.md"
+    target.write_text("blocked", encoding="utf-8")
+    definition = _definitions_by_name(_discover_definitions(allowed))["read_file"]
+
+    envelope = _run_definition_process_target(
+        definition,
+        _call("read_file", {"file_path": str(target)}),
+    )
+
+    assert isinstance(envelope, Mapping)
+    assert envelope["status"] == "failed"
+    assert envelope["error_type"] == "permission_denied"
+
+
+def test_doc_process_target_nonexistent_allowed_path_keeps_file_not_found(
+    tmp_path: Path,
+) -> None:
+    """白名单内不存在路径在 process target 中仍返回 file_not_found。"""
+
+    definition = _definitions_by_name(_discover_definitions(tmp_path))["read_file"]
+
+    envelope = _run_definition_process_target(
+        definition,
+        _call("read_file", {"file_path": str(tmp_path / "missing.md")}),
+    )
+
+    assert isinstance(envelope, Mapping)
+    assert envelope["status"] == "failed"
+    assert envelope["error_type"] == "file_not_found"
+    assert "Verify the file path and retry." in str(envelope["message"])
+
+
+def test_doc_process_target_argument_validation_failure_embeds_hint(
+    tmp_path: Path,
+) -> None:
+    """process target 参数校验失败时 failed message 必须保留原 hint 文本。"""
+
+    definition = _definitions_by_name(_discover_definitions(tmp_path))["read_file"]
+
+    envelope = _run_definition_process_target(
+        definition,
+        _call("read_file", {}),
+    )
+
+    assert isinstance(envelope, Mapping)
+    assert envelope["status"] == "failed"
+    assert envelope["error_type"] == "invalid_argument"
+    assert "Add required fields and retry: file_path." in str(envelope["message"])
 
 
 @pytest.mark.parametrize("tool_name", _DOC_TOOL_NAMES)
@@ -387,132 +570,6 @@ def test_path_validation_failure_does_not_enter_migrated_function_body(
 
     assert isinstance(outcome, ToolFailedOutcome)
     assert calls == []
-
-
-def test_same_provider_different_doc_callables_are_serialized(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """同一 provider 的不同 Doc callable 不得并发进入同步业务体。"""
-
-    target = tmp_path / "sample.md"
-    target.write_text("Revenue grew quickly.", encoding="utf-8")
-    definitions = _definitions_by_name(_discover_definitions(tmp_path))
-    to_thread_entries: list[str] = []
-    business_entries: list[str] = []
-    active_business = False
-    observed_overlap = False
-
-    def fake_list_files_business(
-        *,
-        directory: str,
-        pattern: str | None,
-        recursive: bool,
-        limit: int,
-        max_files: int,
-        cancellation_token: CancellationToken,
-    ) -> JsonValue:
-        """记录 ``list_files`` 业务体进入。
-
-        :param directory: 目录路径。
-        :param pattern: 文件模式。
-        :param recursive: 是否递归。
-        :param limit: 返回限制。
-        :param max_files: 配置硬上限。
-        :param cancellation_token: 取消令牌。
-        :returns: list_files 成功载荷。
-        """
-
-        del pattern, recursive, limit, max_files, cancellation_token
-        business_entries.append("list_files")
-        return {"directory": directory, "files": [], "total": 0, "returned": 0}
-
-    def fake_read_file_business(
-        *,
-        file_path: str,
-        start_line: int | None,
-        end_line: int | None,
-        cancellation_token: CancellationToken,
-    ) -> JsonValue:
-        """记录 ``read_file`` 业务体进入。
-
-        :param file_path: 文件路径。
-        :param start_line: 起始行号。
-        :param end_line: 结束行号。
-        :param cancellation_token: 取消令牌。
-        :returns: read_file 成功载荷。
-        """
-
-        del start_line, end_line, cancellation_token
-        business_entries.append("read_file")
-        return {"file_path": file_path, "content": "ok", "total_lines": 1}
-
-    async def run_concurrent_calls() -> tuple[ToolCompletedOutcome, ToolCompletedOutcome]:
-        """并发执行两个不同 Doc callable。
-
-        :returns: 两个成功 outcome。
-        """
-
-        first_entered = asyncio.Event()
-        release_first = asyncio.Event()
-
-        async def fake_to_thread(
-            func: Callable[_P, _R],
-            /,
-            *args: _P.args,
-            **kwargs: _P.kwargs,
-        ) -> _R:
-            """模拟 ``asyncio.to_thread`` 并记录同步业务体重叠。
-
-            :param func: 待执行的同步 callable。
-            :param args: 位置参数。
-            :param kwargs: 关键字参数。
-            :returns: callable 返回值。
-            """
-
-            nonlocal active_business, observed_overlap
-            if active_business:
-                observed_overlap = True
-            active_business = True
-            to_thread_entries.append("enter")
-            if len(to_thread_entries) == 1:
-                first_entered.set()
-                await release_first.wait()
-            result = func(*args, **kwargs)
-            active_business = False
-            return result
-
-        monkeypatch.setattr(doc_tools.asyncio, "to_thread", fake_to_thread)
-        list_task = asyncio.create_task(
-            definitions["list_files"].callable(
-                _call("list_files", {"directory": str(tmp_path)}),
-                _context(),
-            )
-        )
-        await first_entered.wait()
-        read_task = asyncio.create_task(
-            definitions["read_file"].callable(
-                _call("read_file", {"file_path": str(target)}),
-                _context(),
-            )
-        )
-        await asyncio.sleep(0)
-        assert to_thread_entries == ["enter"]
-        release_first.set()
-        list_outcome, read_outcome = await asyncio.gather(list_task, read_task)
-        assert isinstance(list_outcome, ToolCompletedOutcome)
-        assert isinstance(read_outcome, ToolCompletedOutcome)
-        return list_outcome, read_outcome
-
-    monkeypatch.setattr(doc_tools, "_list_files_business", fake_list_files_business)
-    monkeypatch.setattr(doc_tools, "_read_file_business", fake_read_file_business)
-
-    outcomes = asyncio.run(run_concurrent_calls())
-
-    assert len(outcomes) == 2
-    assert observed_overlap is False
-    assert to_thread_entries == ["enter", "enter"]
-    assert business_entries == ["list_files", "read_file"]
 
 
 def test_native_doc_path_projection_accepts_allowed_absolute_paths(tmp_path: Path) -> None:
@@ -1086,6 +1143,120 @@ def test_toolruntime_executes_doc_tool_through_accept_barrier(tmp_path: Path) ->
     assert "Revenue grew quickly." in str(value["content"])
 
 
+def test_doc_toolruntime_cancel_returns_governed_failure_without_late_accept(
+    tmp_path: Path,
+) -> None:
+    """Doc process-backed 工具取消后不得接受旧子进程 late result。"""
+
+    markdown_path = _copy_fixture(tmp_path, "sample.md")
+    output = discover_tools(_spec(tmp_path))
+    definitions = tuple(
+        replace(
+            definition,
+            execution=ProcessBackedToolExecutionCapability(
+                target_factory=_SlowProcessTargetFactory(sleep_seconds=5.0)
+            ),
+        )
+        if definition.name == "read_file"
+        else definition
+        for definition in output.definitions
+    )
+    accept_port = _AcceptingPort()
+    token = _ManualCancellationToken()
+    tool_runtime = DefaultToolRuntimeFactory(
+        EffectiveToolBundleBuilder()
+    ).create_tool_runtime(
+        ToolRuntimeBuildRequest(
+            effective_bundle_request=EffectiveToolBundleBuildRequest(
+                business_tool_bundle=ToolBundle(definitions=definitions),
+                source_refs=output.source_refs,
+                framework_tool_policy=default_framework_tool_policy_view(),
+                policy_snapshot_digest="sha256:" + "2" * 64,
+                enable_truncation_manager=False,
+            ),
+            execution_scope=ToolRuntimeExecutionScope(
+                session_id="session-doc",
+                run_id="run-doc",
+                attempt_id="attempt-doc",
+                execution_id="execution-doc",
+                allow_tool_calls=True,
+            ),
+            accept_port=accept_port,
+        )
+    )
+
+    started_at = time.monotonic()
+    governed_outcome = asyncio.run(
+        _execute_doc_runtime_read_file_and_cancel(
+            tool_runtime,
+            markdown_path,
+            token,
+        )
+    )
+    elapsed = time.monotonic() - started_at
+    time.sleep(0.3)
+
+    assert elapsed < 2.0
+    assert governed_outcome.result.hint == "tool_runtime_cancelled"
+    assert len(accept_port.candidates) == 1
+    assert accept_port.candidates[0].governance.policy_decision.reason_code == (
+        "tool_runtime_cancelled"
+    )
+
+
+def test_doc_toolruntime_cancel_terminates_real_doc_target_blocked_on_fifo(
+    tmp_path: Path,
+) -> None:
+    """真实 Doc process target 阻塞在 FIFO 读取时取消应快速 governed closeout。"""
+
+    if os.name != "posix":
+        pytest.skip("POSIX FIFO is required for deterministic real Doc target blocking I/O")
+    fifo_path = tmp_path / "blocked.md"
+    os.mkfifo(fifo_path)
+    output = discover_tools(_spec(tmp_path))
+    accept_port = _AcceptingPort()
+    token = _ManualCancellationToken()
+    tool_runtime = DefaultToolRuntimeFactory(
+        EffectiveToolBundleBuilder()
+    ).create_tool_runtime(
+        ToolRuntimeBuildRequest(
+            effective_bundle_request=EffectiveToolBundleBuildRequest(
+                business_tool_bundle=ToolBundle(definitions=output.definitions),
+                source_refs=output.source_refs,
+                framework_tool_policy=default_framework_tool_policy_view(),
+                policy_snapshot_digest="sha256:" + "2" * 64,
+                enable_truncation_manager=False,
+            ),
+            execution_scope=ToolRuntimeExecutionScope(
+                session_id="session-doc",
+                run_id="run-doc",
+                attempt_id="attempt-doc",
+                execution_id="execution-doc",
+                allow_tool_calls=True,
+            ),
+            accept_port=accept_port,
+        )
+    )
+
+    started_at = time.monotonic()
+    governed_outcome = asyncio.run(
+        _execute_doc_runtime_read_file_and_cancel(
+            tool_runtime,
+            fifo_path,
+            token,
+        )
+    )
+    elapsed = time.monotonic() - started_at
+    time.sleep(0.3)
+
+    assert elapsed < 2.0
+    assert governed_outcome.result.hint == "tool_runtime_cancelled"
+    assert len(accept_port.candidates) == 1
+    assert accept_port.candidates[0].governance.policy_decision.reason_code == (
+        "tool_runtime_cancelled"
+    )
+
+
 def _spec(path: Path) -> ToolsDiscoveryProviderSpec:
     """构造启用 Doc provider 的 spec。
 
@@ -1174,6 +1345,64 @@ def _truncate_limit(definition: ToolDefinition, limit_name: str) -> int:
     limit = truncate.limits[limit_name]
     assert isinstance(limit, int)
     return limit
+
+
+def _run_definition_process_target(
+    definition: ToolDefinition,
+    call: ToolCallRequest,
+) -> JsonValue:
+    """构造并直接执行定义声明的 process target。
+
+    :param definition: Doc 工具定义。
+    :param call: 单次工具调用请求。
+    :returns: process target 返回的 JSON 信封。
+    :raises AssertionError: 定义未声明 process-backed execution 时抛出。
+    """
+
+    assert isinstance(definition.execution, ProcessBackedToolExecutionCapability)
+    target = definition.execution.target_factory.build_process_target(
+        call,
+        ProcessBackedToolContext(
+            run_id="run-doc",
+            session_id="session-doc",
+            iteration_id="iteration-doc",
+            timeout_seconds=10.0,
+            correlation_id="correlation-doc",
+        ),
+    )
+    return target()
+
+
+async def _execute_doc_runtime_read_file_and_cancel(
+    tool_runtime: ToolRuntimeHandle,
+    markdown_path: Path,
+    token: _ManualCancellationToken,
+) -> ToolFailedOutcome:
+    """启动 ToolRuntime read_file 执行并触发取消。
+
+    :param tool_runtime: 测试构造的 ToolRuntime handle。
+    :param markdown_path: 待读取文件。
+    :param token: 测试取消 token。
+    :returns: 受治理的取消失败 outcome。
+    :raises AssertionError: runtime 未返回失败 outcome 时抛出。
+    """
+
+    task = asyncio.create_task(
+        tool_runtime.tool_executor.execute(
+            BatchToolExecutionRequest(
+                calls=(
+                    _call("read_file", {"file_path": str(markdown_path)}),
+                ),
+                context=_context(token),
+            )
+        )
+    )
+    await asyncio.sleep(0.3)
+    token.cancel("doc process cancel")
+    outcome = await asyncio.wait_for(task, timeout=2.0)
+    record_outcome = outcome.records[0].outcome
+    assert isinstance(record_outcome, ToolFailedOutcome)
+    return record_outcome
 
 
 def _copy_fixture(tmp_path: Path, fixture_name: str) -> Path:

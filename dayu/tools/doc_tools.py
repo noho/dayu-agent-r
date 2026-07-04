@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import stat
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -21,7 +22,8 @@ from dayu.contracts import (
     BatchToolExecutionContext,
     CancellationToken,
     JsonValue,
-    AsyncDirectToolExecutionCapability,
+    ProcessBackedToolContext,
+    ProcessBackedToolExecutionCapability,
     ToolCallRequest,
     ToolCallable,
     ToolDefinition,
@@ -72,6 +74,12 @@ _READ_FILE_ENCODINGS: Final[tuple[str, ...]] = ("utf-8", "gbk", "latin1", "cp125
 _READ_LINES_ENCODINGS: Final[tuple[str, ...]] = ("utf-8", "gbk")
 _MARKDOWN_SUFFIXES: Final[frozenset[str]] = frozenset({".md", ".markdown"})
 _DOC_LOOP_CANCELLATION_CHECK_INTERVAL: Final[int] = 1_000
+_DOC_PROCESS_STATUS_FIELD: Final[str] = "status"
+_DOC_PROCESS_COMPLETED_STATUS: Final[str] = "completed"
+_DOC_PROCESS_FAILED_STATUS: Final[str] = "failed"
+_DOC_PROCESS_VALUE_FIELD: Final[str] = "value"
+_DOC_PROCESS_ERROR_TYPE_FIELD: Final[str] = "error_type"
+_DOC_PROCESS_MESSAGE_FIELD: Final[str] = "message"
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +126,39 @@ class _DocPathFailure:
     error: str
     message: str
     hint: str | None
+
+
+class _DocBusinessFailure(Exception):
+    """Doc 同步业务路由的可恢复失败。
+
+    Args:
+        error: current failure 错误码。
+        message: 面向 LLM 的错误说明。
+        hint: 可选恢复提示。
+
+    Raises:
+        无。
+    """
+
+    def __init__(self, error: str, message: str, hint: str | None) -> None:
+        """初始化业务失败。
+
+        Args:
+            error: current failure 错误码。
+            message: 面向 LLM 的错误说明。
+            hint: 可选恢复提示。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.error = error
+        self.message = message
+        self.hint = hint
+        super().__init__(message)
 
 
 class _DocToolArgumentError(Exception):
@@ -229,6 +270,178 @@ class _DocCancelledError(Exception):
         super().__init__(cancellation.message or "文档工具调用已被取消。")
 
 
+class _DocProcessCancellationToken:
+    """Doc 子进程内使用的不可取消 token。
+
+    process-backed 生产路径由父进程 Host capsule 负责 terminate / kill，子
+    进程目标不能返回 host_cancelled / timeout / cancelled 信封，因此子进程
+    内只使用永不取消的本地观察 token。
+    """
+
+    def is_cancelled(self) -> bool:
+        """返回是否已取消。
+
+        Args:
+            无。
+
+        Returns:
+            始终返回 ``False``。
+
+        Raises:
+            无。
+        """
+
+        return False
+
+    def cancel_reason(self) -> str | None:
+        """返回取消原因。
+
+        Args:
+            无。
+
+        Returns:
+            始终返回 ``None``。
+
+        Raises:
+            无。
+        """
+
+        return None
+
+    def requested_at(self) -> datetime | None:
+        """返回取消请求时间。
+
+        Args:
+            无。
+
+        Returns:
+            始终返回 ``None``。
+
+        Raises:
+            无。
+        """
+
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class _DocProcessTarget:
+    """Doc process-backed 子进程目标。
+
+    Args:
+        tool_name: 工具名。
+        arguments: 工具调用参数的 JSON 副本。
+        allowed_root_locators: 允许访问根路径的可序列化字符串 locator。
+        limits: Doc 工具 limit 配置。
+        timeout_seconds: 父进程投影的批级 timeout 标量；仅作为可序列化上下文
+            留痕，真实 timeout 仍由父进程 Host capsule 独占治理。
+
+    Returns:
+        dataclass 实例。
+
+    Raises:
+        无。
+    """
+
+    tool_name: str
+    arguments: dict[str, JsonValue]
+    allowed_root_locators: tuple[str, ...]
+    limits: DocToolLimits
+    timeout_seconds: float | None
+
+    def __call__(self) -> JsonValue:
+        """在子进程内执行 Doc 同步业务并返回 JSON 信封。
+
+        Args:
+            无。
+
+        Returns:
+            ``completed`` 或 ``failed`` JSON 信封；不会返回 awaiting、
+            cancelled、timeout 或 host_cancelled。
+
+        Raises:
+            无；未预期异常会被转换为 failed 信封。
+        """
+
+        call = ToolCallRequest(
+            tool_call_id=f"process-{self.tool_name}",
+            name=self.tool_name,
+            arguments=self.arguments,
+            index_in_iteration=0,
+            provider_state=None,
+        )
+        try:
+            value = _execute_doc_business_value(
+                tool_name=self.tool_name,
+                call=call,
+                parameters=_parameters_for_tool(self.tool_name, self.limits),
+                allowed_roots=_resolve_allowed_root_locators(self.allowed_root_locators),
+                limits=self.limits,
+                cancellation_token=_DocProcessCancellationToken(),
+            )
+        except _DocBusinessFailure as failure:
+            return _process_failed_envelope(failure)
+        except Exception:
+            return {
+                _DOC_PROCESS_STATUS_FIELD: _DOC_PROCESS_FAILED_STATUS,
+                _DOC_PROCESS_ERROR_TYPE_FIELD: "execution_error",
+                _DOC_PROCESS_MESSAGE_FIELD: f"Tool {self.tool_name!r} execution failed.",
+            }
+        return {
+            _DOC_PROCESS_STATUS_FIELD: _DOC_PROCESS_COMPLETED_STATUS,
+            _DOC_PROCESS_VALUE_FIELD: value,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _DocProcessTargetFactory:
+    """Doc process-backed target factory。
+
+    本 factory 只保存 spawn 可序列化的路径 locator 与 limit 配置，不捕获
+    provider lock、DocumentProcessor、repository、runtime、session、
+    CancellationToken 或 Host 内部对象。
+
+    Args:
+        allowed_root_locators: 允许访问根路径的可序列化字符串 locator。
+        limits: Doc 工具 limit 配置。
+
+    Returns:
+        dataclass 实例。
+
+    Raises:
+        无。
+    """
+
+    allowed_root_locators: tuple[str, ...]
+    limits: DocToolLimits
+
+    def build_process_target(
+        self,
+        call: ToolCallRequest,
+        context: ProcessBackedToolContext,
+    ) -> _DocProcessTarget:
+        """构造可序列化 Doc 子进程目标。
+
+        Args:
+            call: 单次工具调用请求。
+            context: Host 投影出的可序列化 process-backed 上下文。
+
+        Returns:
+            Doc 子进程目标。
+
+        Raises:
+            无。
+        """
+
+        return _DocProcessTarget(
+            tool_name=call.name,
+            arguments=dict(call.arguments),
+            allowed_root_locators=self.allowed_root_locators,
+            limits=self.limits,
+            timeout_seconds=context.timeout_seconds,
+        )
+
+
 class Log:
     """Doc 工具的窄日志适配器。
 
@@ -292,15 +505,20 @@ def build_doc_tool_definitions(
         return ()
     normalized_roots = tuple(root.expanduser().resolve(strict=False) for root in allowed_roots)
     provider_lock = asyncio.Lock()
+    process_target_factory = _DocProcessTargetFactory(
+        allowed_root_locators=tuple(str(root) for root in normalized_roots),
+        limits=limits,
+    )
     definitions = (
-        _build_list_files_definition(limits.list_files_max, normalized_roots, provider_lock),
-        _build_get_file_sections_definition(limits.get_sections_max, normalized_roots, provider_lock),
-        _build_search_files_definition(limits.search_files_max_results, normalized_roots, provider_lock),
-        _build_read_file_definition(limits.read_file_max_chars, normalized_roots, provider_lock),
+        _build_list_files_definition(limits, normalized_roots, provider_lock, process_target_factory),
+        _build_get_file_sections_definition(limits, normalized_roots, provider_lock, process_target_factory),
+        _build_search_files_definition(limits, normalized_roots, provider_lock, process_target_factory),
+        _build_read_file_definition(limits, normalized_roots, provider_lock, process_target_factory),
         _build_read_file_section_definition(
-            limits.read_file_section_max_chars,
+            limits,
             normalized_roots,
             provider_lock,
+            process_target_factory,
         ),
     )
     names = tuple(definition.name for definition in definitions)
@@ -310,16 +528,18 @@ def build_doc_tool_definitions(
 
 
 def _build_list_files_definition(
-    max_files: int,
+    limits: DocToolLimits,
     allowed_roots: tuple[Path, ...],
     provider_lock: asyncio.Lock,
+    process_target_factory: _DocProcessTargetFactory,
 ) -> ToolDefinition:
     """构造 ``list_files`` 工具定义。
 
     Args:
-        max_files: 最大返回文件数。
+        limits: Doc 工具限制配置。
         allowed_roots: 允许访问根路径。
         provider_lock: provider 级共享执行锁。
+        process_target_factory: process-backed 目标工厂。
 
     Returns:
         current 工具定义。
@@ -328,7 +548,7 @@ def _build_list_files_definition(
         Exception: ``ToolDefinition`` 契约构造失败时透出。
     """
 
-    parameters = _list_files_parameters(max_files)
+    parameters = _list_files_parameters(limits.list_files_max)
 
     async def list_files_callable(
         call: ToolCallRequest,
@@ -348,32 +568,17 @@ def _build_list_files_definition(
         """
 
         started_at = datetime.now(UTC)
-        validation = validate_and_project_arguments(call, LIST_FILES_TOOL_NAME, parameters)
-        if isinstance(validation, ToolArgumentValidationFailure):
-            return _argument_failed_outcome(LIST_FILES_TOOL_NAME, validation, started_at)
-        path_projection = _project_doc_paths(
-            tool_name=LIST_FILES_TOOL_NAME,
-            arguments=validation.arguments,
-            path_param_names=("directory",),
-            allowed_roots=allowed_roots,
-        )
-        if isinstance(path_projection, _DocPathFailure):
-            return _path_failed_outcome(LIST_FILES_TOOL_NAME, path_projection, started_at)
-        directory = _required_string(path_projection, "directory")
-        pattern = _optional_string(path_projection, "pattern")
-        recursive = _required_bool(path_projection, "recursive")
-        limit = _required_int(path_projection, "limit")
         return await _invoke_doc_business(
             tool_name=LIST_FILES_TOOL_NAME,
             context=context,
             provider_lock=provider_lock,
             started_at=started_at,
-            business_call=lambda token: _list_files_business(
-                directory=directory,
-                pattern=pattern,
-                recursive=recursive,
-                limit=limit,
-                max_files=max_files,
+            business_call=lambda token: _execute_doc_business_value(
+                tool_name=LIST_FILES_TOOL_NAME,
+                call=call,
+                parameters=parameters,
+                allowed_roots=allowed_roots,
+                limits=limits,
                 cancellation_token=token,
             ),
         )
@@ -387,20 +592,23 @@ def _build_list_files_definition(
         callable_=list_files_callable,
         display_name="列出文件",
         truncate=None,
+        process_target_factory=process_target_factory,
     )
 
 
 def _build_get_file_sections_definition(
-    max_sections: int,
+    limits: DocToolLimits,
     allowed_roots: tuple[Path, ...],
     provider_lock: asyncio.Lock,
+    process_target_factory: _DocProcessTargetFactory,
 ) -> ToolDefinition:
     """构造 ``get_file_sections`` 工具定义。
 
     Args:
-        max_sections: 最大返回章节数。
+        limits: Doc 工具限制配置。
         allowed_roots: 允许访问根路径。
         provider_lock: provider 级共享执行锁。
+        process_target_factory: process-backed 目标工厂。
 
     Returns:
         current 工具定义。
@@ -409,7 +617,7 @@ def _build_get_file_sections_definition(
         Exception: ``ToolDefinition`` 契约构造失败时透出。
     """
 
-    parameters = _get_file_sections_parameters(max_sections)
+    parameters = _get_file_sections_parameters(limits.get_sections_max)
 
     async def get_file_sections_callable(
         call: ToolCallRequest,
@@ -429,28 +637,17 @@ def _build_get_file_sections_definition(
         """
 
         started_at = datetime.now(UTC)
-        validation = validate_and_project_arguments(call, GET_FILE_SECTIONS_TOOL_NAME, parameters)
-        if isinstance(validation, ToolArgumentValidationFailure):
-            return _argument_failed_outcome(GET_FILE_SECTIONS_TOOL_NAME, validation, started_at)
-        path_projection = _project_doc_paths(
-            tool_name=GET_FILE_SECTIONS_TOOL_NAME,
-            arguments=validation.arguments,
-            path_param_names=("file_path",),
-            allowed_roots=allowed_roots,
-        )
-        if isinstance(path_projection, _DocPathFailure):
-            return _path_failed_outcome(GET_FILE_SECTIONS_TOOL_NAME, path_projection, started_at)
-        file_path = _required_string(path_projection, "file_path")
-        limit = _required_int(path_projection, "limit")
         return await _invoke_doc_business(
             tool_name=GET_FILE_SECTIONS_TOOL_NAME,
             context=context,
             provider_lock=provider_lock,
             started_at=started_at,
-            business_call=lambda token: _get_file_sections_business(
-                file_path=file_path,
-                limit=limit,
-                max_sections=max_sections,
+            business_call=lambda token: _execute_doc_business_value(
+                tool_name=GET_FILE_SECTIONS_TOOL_NAME,
+                call=call,
+                parameters=parameters,
+                allowed_roots=allowed_roots,
+                limits=limits,
                 cancellation_token=token,
             ),
         )
@@ -464,20 +661,23 @@ def _build_get_file_sections_definition(
         callable_=get_file_sections_callable,
         display_name="浏览文件结构",
         truncate=None,
+        process_target_factory=process_target_factory,
     )
 
 
 def _build_search_files_definition(
-    max_results: int,
+    limits: DocToolLimits,
     allowed_roots: tuple[Path, ...],
     provider_lock: asyncio.Lock,
+    process_target_factory: _DocProcessTargetFactory,
 ) -> ToolDefinition:
     """构造 ``search_files`` 工具定义。
 
     Args:
-        max_results: 最大返回命中数。
+        limits: Doc 工具限制配置。
         allowed_roots: 允许访问根路径。
         provider_lock: provider 级共享执行锁。
+        process_target_factory: process-backed 目标工厂。
 
     Returns:
         current 工具定义。
@@ -486,7 +686,7 @@ def _build_search_files_definition(
         Exception: ``ToolDefinition`` 契约构造失败时透出。
     """
 
-    parameters = _search_files_parameters(max_results)
+    parameters = _search_files_parameters(limits.search_files_max_results)
 
     async def search_files_callable(
         call: ToolCallRequest,
@@ -506,32 +706,17 @@ def _build_search_files_definition(
         """
 
         started_at = datetime.now(UTC)
-        validation = validate_and_project_arguments(call, SEARCH_FILES_TOOL_NAME, parameters)
-        if isinstance(validation, ToolArgumentValidationFailure):
-            return _argument_failed_outcome(SEARCH_FILES_TOOL_NAME, validation, started_at)
-        path_projection = _project_doc_paths(
-            tool_name=SEARCH_FILES_TOOL_NAME,
-            arguments=validation.arguments,
-            path_param_names=("directory",),
-            allowed_roots=allowed_roots,
-        )
-        if isinstance(path_projection, _DocPathFailure):
-            return _path_failed_outcome(SEARCH_FILES_TOOL_NAME, path_projection, started_at)
-        directory = _required_string(path_projection, "directory")
-        query = _required_string(path_projection, "query")
-        include_types = _optional_string_list(path_projection, "include_types")
-        limit = _required_int(path_projection, "limit")
         return await _invoke_doc_business(
             tool_name=SEARCH_FILES_TOOL_NAME,
             context=context,
             provider_lock=provider_lock,
             started_at=started_at,
-            business_call=lambda token: _search_files_business(
-                directory=directory,
-                query=query,
-                include_types=include_types,
-                limit=limit,
-                max_results=max_results,
+            business_call=lambda token: _execute_doc_business_value(
+                tool_name=SEARCH_FILES_TOOL_NAME,
+                call=call,
+                parameters=parameters,
+                allowed_roots=allowed_roots,
+                limits=limits,
                 cancellation_token=token,
             ),
         )
@@ -545,20 +730,23 @@ def _build_search_files_definition(
         callable_=search_files_callable,
         display_name="搜索文件",
         truncate=None,
+        process_target_factory=process_target_factory,
     )
 
 
 def _build_read_file_definition(
-    max_chars: int,
+    limits: DocToolLimits,
     allowed_roots: tuple[Path, ...],
     provider_lock: asyncio.Lock,
+    process_target_factory: _DocProcessTargetFactory,
 ) -> ToolDefinition:
     """构造 ``read_file`` 工具定义。
 
     Args:
-        max_chars: 截断声明中的最大字符数。
+        limits: Doc 工具限制配置。
         allowed_roots: 允许访问根路径。
         provider_lock: provider 级共享执行锁。
+        process_target_factory: process-backed 目标工厂。
 
     Returns:
         current 工具定义。
@@ -587,29 +775,17 @@ def _build_read_file_definition(
         """
 
         started_at = datetime.now(UTC)
-        validation = validate_and_project_arguments(call, READ_FILE_TOOL_NAME, parameters)
-        if isinstance(validation, ToolArgumentValidationFailure):
-            return _argument_failed_outcome(READ_FILE_TOOL_NAME, validation, started_at)
-        path_projection = _project_doc_paths(
-            tool_name=READ_FILE_TOOL_NAME,
-            arguments=validation.arguments,
-            path_param_names=("file_path",),
-            allowed_roots=allowed_roots,
-        )
-        if isinstance(path_projection, _DocPathFailure):
-            return _path_failed_outcome(READ_FILE_TOOL_NAME, path_projection, started_at)
-        file_path = _required_string(path_projection, "file_path")
-        start_line = _optional_int(path_projection, "start_line")
-        end_line = _optional_int(path_projection, "end_line")
         return await _invoke_doc_business(
             tool_name=READ_FILE_TOOL_NAME,
             context=context,
             provider_lock=provider_lock,
             started_at=started_at,
-            business_call=lambda token: _read_file_business(
-                file_path=file_path,
-                start_line=start_line,
-                end_line=end_line,
+            business_call=lambda token: _execute_doc_business_value(
+                tool_name=READ_FILE_TOOL_NAME,
+                call=call,
+                parameters=parameters,
+                allowed_roots=allowed_roots,
+                limits=limits,
                 cancellation_token=token,
             ),
         )
@@ -620,21 +796,24 @@ def _build_read_file_definition(
         parameters=parameters,
         callable_=read_file_callable,
         display_name="读取文件",
-        truncate=_text_content_truncate(max_chars),
+        truncate=_text_content_truncate(limits.read_file_max_chars),
+        process_target_factory=process_target_factory,
     )
 
 
 def _build_read_file_section_definition(
-    max_chars: int,
+    limits: DocToolLimits,
     allowed_roots: tuple[Path, ...],
     provider_lock: asyncio.Lock,
+    process_target_factory: _DocProcessTargetFactory,
 ) -> ToolDefinition:
     """构造 ``read_file_section`` 工具定义。
 
     Args:
-        max_chars: 截断声明中的最大字符数。
+        limits: Doc 工具限制配置。
         allowed_roots: 允许访问根路径。
         provider_lock: provider 级共享执行锁。
+        process_target_factory: process-backed 目标工厂。
 
     Returns:
         current 工具定义。
@@ -663,27 +842,17 @@ def _build_read_file_section_definition(
         """
 
         started_at = datetime.now(UTC)
-        validation = validate_and_project_arguments(call, READ_FILE_SECTION_TOOL_NAME, parameters)
-        if isinstance(validation, ToolArgumentValidationFailure):
-            return _argument_failed_outcome(READ_FILE_SECTION_TOOL_NAME, validation, started_at)
-        path_projection = _project_doc_paths(
-            tool_name=READ_FILE_SECTION_TOOL_NAME,
-            arguments=validation.arguments,
-            path_param_names=("file_path",),
-            allowed_roots=allowed_roots,
-        )
-        if isinstance(path_projection, _DocPathFailure):
-            return _path_failed_outcome(READ_FILE_SECTION_TOOL_NAME, path_projection, started_at)
-        file_path = _required_string(path_projection, "file_path")
-        ref = _required_string(path_projection, "ref")
         return await _invoke_doc_business(
             tool_name=READ_FILE_SECTION_TOOL_NAME,
             context=context,
             provider_lock=provider_lock,
             started_at=started_at,
-            business_call=lambda token: _read_file_section_business(
-                file_path=file_path,
-                ref=ref,
+            business_call=lambda token: _execute_doc_business_value(
+                tool_name=READ_FILE_SECTION_TOOL_NAME,
+                call=call,
+                parameters=parameters,
+                allowed_roots=allowed_roots,
+                limits=limits,
                 cancellation_token=token,
             ),
         )
@@ -696,7 +865,8 @@ def _build_read_file_section_definition(
         parameters=parameters,
         callable_=read_file_section_callable,
         display_name="读取文件段落",
-        truncate=_text_content_truncate(max_chars),
+        truncate=_text_content_truncate(limits.read_file_section_max_chars),
+        process_target_factory=process_target_factory,
     )
 
 
@@ -708,7 +878,13 @@ async def _invoke_doc_business(
     started_at: datetime,
     business_call: Callable[[CancellationToken], JsonValue],
 ) -> ToolExecutionOutcome:
-    """在 current callable 边界执行同步 Doc 业务并投影 outcome。
+    """在 fallback callable 边界执行同步 Doc 业务并投影 outcome。
+
+    生产默认路径不再经过本函数；五个 Doc ``ToolDefinition.execution`` 均
+    声明为 process-backed，由 Host ToolRuntime 在父进程治理取消与超时。
+    本函数只保留给直接调用 ``ToolDefinition.callable`` 的测试和非生产
+    fallback，避免把同进程 ``asyncio.to_thread`` 误作为生产取消 closeout
+    证据。
 
     Args:
         tool_name: 工具名。
@@ -732,6 +908,15 @@ async def _invoke_doc_business(
             return _cancelled_outcome(tool_name, started_at, _doc_cancelled())
         try:
             raw_value = await asyncio.to_thread(business_call, token)
+        except _DocBusinessFailure as error:
+            return failed_outcome(
+                tool_name=tool_name,
+                error=error.error,
+                message=error.message,
+                hint=error.hint,
+                started_at=started_at,
+                finished_at=datetime.now(UTC),
+            )
         except _DocCancelledError as error:
             return _cancelled_outcome(tool_name, started_at, error.cancellation)
         except _DocToolArgumentError as error:
@@ -781,10 +966,281 @@ async def _invoke_doc_business(
             )
     return completed_outcome(
         tool_name=tool_name,
-        value=_project_tool_response_paths(tool_name, raw_value),
+        value=raw_value,
         started_at=started_at,
         finished_at=datetime.now(UTC),
     )
+
+
+def _execute_doc_business_value(
+    *,
+    tool_name: str,
+    call: ToolCallRequest,
+    parameters: ToolParametersSchema,
+    allowed_roots: tuple[Path, ...],
+    limits: DocToolLimits,
+    cancellation_token: CancellationToken,
+) -> JsonValue:
+    """执行 Doc 工具同步业务并返回成功 JSON 值。
+
+    本函数是 fallback callable 与 process-backed 子进程 target 共用的同步
+    业务路由真源。它负责参数校验、路径白名单校验、业务 helper 调用和成功
+    响应路径投影；失败通过 ``_DocBusinessFailure`` 抛出，由调用边界投影
+    为 Tool outcome 或 process JSON 信封。
+
+    Args:
+        tool_name: 工具名。
+        call: 单次工具调用请求。
+        parameters: 当前工具的参数 schema。
+        allowed_roots: 已重新解析的允许访问根路径。
+        limits: Doc 工具限制配置。
+        cancellation_token: 当前执行边界使用的取消观察 token。
+
+    Returns:
+        成功 JSON 值。
+
+    Raises:
+        _DocBusinessFailure: 参数、路径或业务访问失败时抛出。
+        _DocCancelledError: fallback callable 观察到 Host 取消时抛出。
+    """
+
+    validation = validate_and_project_arguments(call, tool_name, parameters)
+    if isinstance(validation, ToolArgumentValidationFailure):
+        raise _DocBusinessFailure(validation.error, validation.message, validation.hint)
+    path_projection = _project_doc_paths(
+        tool_name=tool_name,
+        arguments=validation.arguments,
+        path_param_names=_path_param_names_for_tool(tool_name),
+        allowed_roots=allowed_roots,
+    )
+    if isinstance(path_projection, _DocPathFailure):
+        raise _DocBusinessFailure(
+            path_projection.error,
+            path_projection.message,
+            path_projection.hint,
+        )
+    try:
+        raw_value = _route_doc_business(
+            tool_name=tool_name,
+            arguments=path_projection,
+            limits=limits,
+            cancellation_token=cancellation_token,
+        )
+    except _DocCancelledError:
+        # 该分支服务 direct callable fallback；process target 使用不可取消 token，
+        # 真实取消由父进程 process capsule 独占治理。
+        raise
+    except _DocToolArgumentError as error:
+        raise _DocBusinessFailure(
+            "invalid_argument",
+            str(error),
+            _INVALID_ARGUMENT_HINT,
+        ) from error
+    except _DocFileAccessError as error:
+        raise _DocBusinessFailure(
+            "permission_denied",
+            str(error),
+            "Use a path allowed by the provider configuration.",
+        ) from error
+    except FileNotFoundError as error:
+        raise _DocBusinessFailure(
+            "file_not_found",
+            str(error),
+            "Verify the file path and retry.",
+        ) from error
+    except PermissionError as error:
+        raise _DocBusinessFailure(
+            "permission_denied",
+            str(error),
+            "Use a path allowed by the provider configuration.",
+        ) from error
+    except Exception as error:
+        raise _DocBusinessFailure(
+            "execution_error",
+            f"Tool {tool_name!r} execution failed.",
+            "Inspect provider diagnostics or retry with narrower arguments.",
+        ) from error
+    return _project_tool_response_paths(tool_name, raw_value)
+
+
+def _route_doc_business(
+    *,
+    tool_name: str,
+    arguments: Mapping[str, JsonValue],
+    limits: DocToolLimits,
+    cancellation_token: CancellationToken,
+) -> JsonValue:
+    """按工具名路由到对应 Doc 同步业务 helper。
+
+    Args:
+        tool_name: 工具名。
+        arguments: 已通过 schema 与路径白名单校验的参数。
+        limits: Doc 工具限制配置。
+        cancellation_token: 当前执行边界使用的取消观察 token。
+
+    Returns:
+        原始业务 JSON 值。
+
+    Raises:
+        ValueError: 工具名未知时抛出。
+        _DocToolArgumentError: 业务参数非法时抛出。
+        _DocFileAccessError: 文件访问失败时抛出。
+        _DocCancelledError: fallback callable 观察到 Host 取消时抛出。
+    """
+
+    if tool_name == LIST_FILES_TOOL_NAME:
+        return _list_files_business(
+            directory=_required_string(arguments, "directory"),
+            pattern=_optional_string(arguments, "pattern"),
+            recursive=_required_bool(arguments, "recursive"),
+            limit=_required_int(arguments, "limit"),
+            max_files=limits.list_files_max,
+            cancellation_token=cancellation_token,
+        )
+    if tool_name == GET_FILE_SECTIONS_TOOL_NAME:
+        return _get_file_sections_business(
+            file_path=_required_string(arguments, "file_path"),
+            limit=_required_int(arguments, "limit"),
+            max_sections=limits.get_sections_max,
+            cancellation_token=cancellation_token,
+        )
+    if tool_name == SEARCH_FILES_TOOL_NAME:
+        return _search_files_business(
+            directory=_required_string(arguments, "directory"),
+            query=_required_string(arguments, "query"),
+            include_types=_optional_string_list(arguments, "include_types"),
+            limit=_required_int(arguments, "limit"),
+            max_results=limits.search_files_max_results,
+            cancellation_token=cancellation_token,
+        )
+    if tool_name == READ_FILE_TOOL_NAME:
+        return _read_file_business(
+            file_path=_required_string(arguments, "file_path"),
+            start_line=_optional_int(arguments, "start_line"),
+            end_line=_optional_int(arguments, "end_line"),
+            cancellation_token=cancellation_token,
+        )
+    if tool_name == READ_FILE_SECTION_TOOL_NAME:
+        return _read_file_section_business(
+            file_path=_required_string(arguments, "file_path"),
+            ref=_required_string(arguments, "ref"),
+            cancellation_token=cancellation_token,
+        )
+    raise ValueError(f"unsupported doc tool: {tool_name}")
+
+
+def _path_param_names_for_tool(tool_name: str) -> tuple[str, ...]:
+    """返回工具需要路径白名单校验的参数名。
+
+    Args:
+        tool_name: 工具名。
+
+    Returns:
+        路径参数名元组。
+
+    Raises:
+        ValueError: 工具名未知时抛出。
+    """
+
+    if tool_name == LIST_FILES_TOOL_NAME:
+        return ("directory",)
+    if tool_name == GET_FILE_SECTIONS_TOOL_NAME:
+        return ("file_path",)
+    if tool_name == SEARCH_FILES_TOOL_NAME:
+        return ("directory",)
+    if tool_name == READ_FILE_TOOL_NAME:
+        return ("file_path",)
+    if tool_name == READ_FILE_SECTION_TOOL_NAME:
+        return ("file_path",)
+    raise ValueError(f"unsupported doc tool: {tool_name}")
+
+
+def _parameters_for_tool(
+    tool_name: str,
+    limits: DocToolLimits,
+) -> ToolParametersSchema:
+    """按工具名构造参数 schema。
+
+    Args:
+        tool_name: 工具名。
+        limits: Doc 工具限制配置。
+
+    Returns:
+        参数 schema。
+
+    Raises:
+        ValueError: 工具名未知时抛出。
+    """
+
+    if tool_name == LIST_FILES_TOOL_NAME:
+        return _list_files_parameters(limits.list_files_max)
+    if tool_name == GET_FILE_SECTIONS_TOOL_NAME:
+        return _get_file_sections_parameters(limits.get_sections_max)
+    if tool_name == SEARCH_FILES_TOOL_NAME:
+        return _search_files_parameters(limits.search_files_max_results)
+    if tool_name == READ_FILE_TOOL_NAME:
+        return _read_file_parameters()
+    if tool_name == READ_FILE_SECTION_TOOL_NAME:
+        return _read_file_section_parameters()
+    raise ValueError(f"unsupported doc tool: {tool_name}")
+
+
+def _resolve_allowed_root_locators(locators: tuple[str, ...]) -> tuple[Path, ...]:
+    """在当前进程重新解析 allowed roots locator。
+
+    Args:
+        locators: 父进程传入的路径字符串 locator。
+
+    Returns:
+        重新 expand / resolve 后的路径根元组。
+
+    Raises:
+        无。
+    """
+
+    return tuple(Path(locator).expanduser().resolve(strict=False) for locator in locators)
+
+
+def _process_failed_envelope(failure: _DocBusinessFailure) -> JsonValue:
+    """把 Doc 业务失败转换为 process-backed failed 信封。
+
+    Args:
+        failure: 同步业务失败。
+
+    Returns:
+        Host process capsule 可解析的 failed JSON 信封。
+
+    Raises:
+        无。
+    """
+
+    return {
+        _DOC_PROCESS_STATUS_FIELD: _DOC_PROCESS_FAILED_STATUS,
+        _DOC_PROCESS_ERROR_TYPE_FIELD: failure.error,
+        _DOC_PROCESS_MESSAGE_FIELD: _process_failure_message(failure),
+    }
+
+
+def _process_failure_message(failure: _DocBusinessFailure) -> str:
+    """生成 process-backed failed 信封消息。
+
+    当前 Host process envelope 契约没有独立 hint 字段，因此这里把 hint 附在
+    message 内，避免生产 process-backed 路径丢失恢复提示，同时不修改 Host
+    public contract 或 runtime JSON 契约。
+
+    Args:
+        failure: 同步业务失败。
+
+    Returns:
+        非空失败消息。
+
+    Raises:
+        无。
+    """
+
+    if failure.hint is None or failure.hint.strip() == "":
+        return failure.message
+    return f"{failure.message} Hint: {failure.hint}"
 
 
 def _project_doc_paths(
@@ -843,7 +1299,10 @@ def _project_doc_paths(
                 message=f"{candidate}: 路径不是目录",
                 hint="Use an existing directory under the provider configured allowed roots.",
             )
-        if parameter_name != "directory" and not candidate.is_file():
+        if parameter_name != "directory" and not _is_supported_doc_file_path(
+            tool_name,
+            candidate,
+        ):
             return _DocPathFailure(
                 error="invalid_argument",
                 message=f"Path argument {parameter_name!r} must point to a file: {value}",
@@ -868,6 +1327,32 @@ def _is_relative_to(candidate: Path, root: Path) -> bool:
     """
 
     return candidate == root or root in candidate.parents
+
+
+def _is_supported_doc_file_path(tool_name: str, candidate: Path) -> bool:
+    """判断 Doc file_path 是否是当前工具可读取的文件节点。
+
+    Args:
+        tool_name: 工具名。
+        candidate: 已通过白名单 containment 与存在性校验的路径。
+
+    Returns:
+        普通文件返回 ``True``；``read_file`` 额外允许 POSIX FIFO，以覆盖
+        process-backed 对真实阻塞 I/O 的父进程取消治理。其它工具仍只接受
+        普通文件。
+
+    Raises:
+        无；stat 失败时返回 ``False``。
+    """
+
+    if candidate.is_file():
+        return True
+    if tool_name != READ_FILE_TOOL_NAME:
+        return False
+    try:
+        return stat.S_ISFIFO(candidate.stat().st_mode)
+    except OSError:
+        return False
 
 
 def _list_files_business(
@@ -1676,6 +2161,7 @@ def _tool_definition(
     callable_: ToolCallable,
     display_name: str,
     truncate: ToolTruncateSpec | None,
+    process_target_factory: _DocProcessTargetFactory,
 ) -> ToolDefinition:
     """构造 current ``ToolDefinition``。
 
@@ -1686,6 +2172,7 @@ def _tool_definition(
         callable_: current 工具 callable。
         display_name: 展示名称。
         truncate: 截断声明。
+        process_target_factory: process-backed 目标工厂。
 
     Returns:
         工具定义。
@@ -1705,7 +2192,9 @@ def _tool_definition(
             ),
         ),
         callable=callable_,
-        execution=AsyncDirectToolExecutionCapability(),
+        execution=ProcessBackedToolExecutionCapability(
+            target_factory=process_target_factory,
+        ),
         truncate=truncate,
         display=ToolDisplayInfo(name=display_name),
         tags=_DOC_TOOL_TAGS,
@@ -1931,64 +2420,6 @@ def _text_content_truncate(max_chars: int) -> ToolTruncateSpec:
         target_field="content",
         field_path=None,
         ttl_seconds=None,
-    )
-
-
-def _argument_failed_outcome(
-    tool_name: str,
-    validation: ToolArgumentValidationFailure,
-    started_at: datetime,
-) -> ToolExecutionOutcome:
-    """把参数校验失败投影为 failed outcome。
-
-    Args:
-        tool_name: 工具名。
-        validation: 参数校验失败结果。
-        started_at: callable 开始时间。
-
-    Returns:
-        failed outcome。
-
-    Raises:
-        Exception: outcome 契约构造失败时透出。
-    """
-
-    return failed_outcome(
-        tool_name=tool_name,
-        error=validation.error,
-        message=validation.message,
-        hint=validation.hint,
-        started_at=started_at,
-        finished_at=datetime.now(UTC),
-    )
-
-
-def _path_failed_outcome(
-    tool_name: str,
-    failure: _DocPathFailure,
-    started_at: datetime,
-) -> ToolExecutionOutcome:
-    """把路径投影失败投影为 failed outcome。
-
-    Args:
-        tool_name: 工具名。
-        failure: 路径失败结果。
-        started_at: callable 开始时间。
-
-    Returns:
-        failed outcome。
-
-    Raises:
-        Exception: outcome 契约构造失败时透出。
-    """
-
-    return failed_outcome(
-        tool_name=tool_name,
-        error=failure.error,
-        message=failure.message,
-        hint=failure.hint,
-        started_at=started_at,
-        finished_at=datetime.now(UTC),
     )
 
 
