@@ -155,14 +155,14 @@ git push -u github <branch>
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | ready-to-open-draft-PR |
-| implementation status | WU-TOOLS-CANCEL-01 accepted plan / S1 / S2 partial hardening / typed execution plan are committed. S2A1 `contract / declaration / digest`, S2A2 `Host factory wiring`, S2B `Doc process-backed`, S2C `Fins read process-backed`, S2D `Web sync process-backed`, and S2E `aggregate validation` have passed implementation / validation, review / deepreview, controller validation, and controller adjudication. S2 aggregate is accepted; current entry point is draft PR gate for WU-TOOLS-CANCEL-01. |
+| gate | draft-PR-pass |
+| implementation status | WU-TOOLS-CANCEL-01 accepted plan / S1 / S2 partial hardening / typed execution plan are committed. S2A1 `contract / declaration / digest`, S2A2 `Host factory wiring`, S2B `Doc process-backed`, S2C `Fins read process-backed`, S2D `Web sync process-backed`, and S2E `aggregate validation` have passed implementation / validation, review / deepreview, controller validation, and controller adjudication. Draft PR #170 is open at https://github.com/noho/dayu-agent-r/pull/170. PR review passed after a PR body traceability / residual-risk structure fix and targeted re-review; current entry point is final closeout for WU-TOOLS-CANCEL-01. |
 | active work unit | WU-TOOLS-CANCEL-01 |
 | default next work unit | WU-TOOLS-CANCEL-01 remains the current implementation entry point; after WU-TOOLS-CANCEL-01 completes, WU-WAIT-04 becomes the next entry point. |
-| next entry point | Draft PR gate for WU-TOOLS-CANCEL-01 on branch `phase/wu-tools-cancel-01`. Create a draft PR against the appropriate base branch, include the accepted S2 plan / slice / aggregate evidence, and keep PR draft until maintainer review. Do not mark ready, merge, close issue, request reviewers, delete branch, or publish external closeout comments without explicit authorization. |
+| next entry point | Final closeout gate for WU-TOOLS-CANCEL-01 on branch `phase/wu-tools-cancel-01`. Keep PR #170 draft until maintainer review. Do not mark ready, merge, close #87 directly, request reviewers, delete branch, or publish external closeout comments without explicit authorization. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | Active/backlog issue owners retained here: #129 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #87 / #88 / #112 / #20 / #80 / #115, plus residual-risk destinations #121 / #122. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`; #63 / #89 / #90 / #91 / #92 / #111 / #130 / #133 / #168 are no longer active implementation owners. |
-| blocking open questions | None for draft PR entry. User confirmed WU-TOOLS-CANCEL-01 goal: #87 closeout requires Codex / Claude Code style Esc interrupt user experience, with WU-LIFE-03 / WU-LIFE-04 / WU-WAIT-03 consumed as completed prerequisites. |
+| blocking open questions | None for final closeout. User confirmed WU-TOOLS-CANCEL-01 goal: #87 closeout requires Codex / Claude Code style Esc interrupt user experience, with WU-LIFE-03 / WU-LIFE-04 / WU-WAIT-03 consumed as completed prerequisites. PR #170 body now makes that traceability explicit. |
 
 状态约定：
 
