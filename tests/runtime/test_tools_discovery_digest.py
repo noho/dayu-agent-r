@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import cast
 
 import pytest
 
 from dayu.contracts import (
+    AsyncDirectToolExecutionCapability,
     BatchToolExecutionContext,
     JsonValue,
+    ProcessBackedToolContext,
+    ProcessBackedToolExecutionCapability,
+    ProcessBackedToolTarget,
+    ProcessBackedToolTargetFactory,
     TOOL_CANCELLED_REASON_HOST_CANCELLED,
+    ThreadBackedToolExecutionCapability,
     ToolBundleSourceKind,
     ToolBundleSourceRef,
     ToolCallRequest,
@@ -19,6 +26,7 @@ from dayu.contracts import (
     ToolDefinition,
     ToolDisplayInfo,
     ToolExecutionOutcome,
+    ToolExecutionCapability,
     ToolFunctionSchema,
     ToolParametersSchema,
     ToolSchema,
@@ -79,6 +87,52 @@ async def _alternate_noop_tool(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _DigestProcessTarget:
+    """digest 测试用 process target。
+
+    :param value: 目标返回的 JSON 值。
+    """
+
+    value: JsonValue
+
+    def __call__(self) -> JsonValue:
+        """返回 completed JSON 信封。
+
+        :returns: process-backed completed 信封。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return {"status": "completed", "value": self.value}
+
+
+@dataclass(frozen=True, slots=True)
+class _DigestProcessTargetFactory:
+    """digest 测试用 process target factory。
+
+    :param factory_id: 仅用于区分对象身份的测试标签。
+    """
+
+    factory_id: str
+
+    def build_process_target(
+        self,
+        call: ToolCallRequest,
+        context: ProcessBackedToolContext,
+    ) -> ProcessBackedToolTarget:
+        """构造测试 process target。
+
+        :param call: 单次工具调用请求。
+        :param context: 可序列化 process-backed 上下文。
+        :returns: process-backed 目标。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        del call
+        del context
+        return _DigestProcessTarget(value={"factory_id": self.factory_id})
+
+
 def _parameters(*, property_description: str = "company id") -> ToolParametersSchema:
     """构造测试用参数 schema。
 
@@ -110,6 +164,7 @@ def _definition(
     display: ToolDisplayInfo | None = None,
     tags: tuple[str, ...] = (),
     callable_: ToolCallable = _noop_tool,
+    execution: ToolExecutionCapability | None = None,
 ) -> ToolDefinition:
     """构造测试用工具声明。
 
@@ -120,6 +175,8 @@ def _definition(
     :param display: 展示 metadata。
     :param tags: 工具标签。
     :param callable_: 测试 callable。
+    :param execution: 测试 execution capability；``None`` 表示默认
+        async_direct。
     :returns: 工具定义。
     :raises ValueError: 工具声明名称与 schema 名称不一致时抛出。
     """
@@ -137,6 +194,11 @@ def _definition(
             ),
         ),
         callable=callable_,
+        execution=(
+            execution
+            if execution is not None
+            else AsyncDirectToolExecutionCapability()
+        ),
         truncate=truncate,
         display=display,
         tags=tags,
@@ -301,6 +363,41 @@ def test_display_change_changes_digest() -> None:
     right = _definition(display=ToolDisplayInfo(name="Annual Filing Lookup"))
 
     assert _discover_digest((left,)) != _discover_digest((right,))
+
+
+def test_async_direct_execution_change_changes_digest() -> None:
+    """async_direct 的 request_abort_capable 变化必须改变 digest。"""
+
+    left = _definition(execution=AsyncDirectToolExecutionCapability(False))
+    right = _definition(execution=AsyncDirectToolExecutionCapability(True))
+
+    assert _discover_digest((left,)) != _discover_digest((right,))
+
+
+def test_thread_backed_execution_guard_changes_digest_shape() -> None:
+    """thread_backed guard 字段必须进入 digest 稳定声明。"""
+
+    left = _definition(execution=ThreadBackedToolExecutionCapability())
+    right = _definition(execution=AsyncDirectToolExecutionCapability())
+
+    assert _discover_digest((left,)) != _discover_digest((right,))
+
+
+def test_process_backed_factory_identity_does_not_change_digest() -> None:
+    """process_backed digest 不得 hash target factory 对象身份。"""
+
+    left = _definition(
+        execution=ProcessBackedToolExecutionCapability(
+            target_factory=_DigestProcessTargetFactory(factory_id="left")
+        )
+    )
+    right = _definition(
+        execution=ProcessBackedToolExecutionCapability(
+            target_factory=_DigestProcessTargetFactory(factory_id="right")
+        )
+    )
+
+    assert _discover_digest((left,)) == _discover_digest((right,))
 
 
 def test_schema_mapping_with_non_string_key_is_rejected() -> None:

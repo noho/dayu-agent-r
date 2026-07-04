@@ -13,6 +13,7 @@ import pytest
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts import (
+    AsyncDirectToolExecutionCapability,
     BatchToolExecutionContext,
     JsonValue,
     TOOL_CANCELLED_REASON_HOST_CANCELLED,
@@ -22,8 +23,8 @@ from dayu.contracts import (
     ToolCallRequest,
     ToolCancelledOutcome,
     ToolDefinition,
-    ToolExecutionOutcome,
     ToolAwaitingOutcome,
+    ToolExecutionOutcome,
     ToolFunctionSchema,
     ToolParametersSchema,
     ToolSchema,
@@ -2257,6 +2258,7 @@ def _tool_definition(name: str) -> ToolDefinition:
             ),
         ),
         callable=_noop_tool,
+        execution=AsyncDirectToolExecutionCapability(),
         truncate=None,
         display=None,
         tags=(),

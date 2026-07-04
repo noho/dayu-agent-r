@@ -22,6 +22,9 @@
 - :func:`tool` / :class:`ToolDisplayInfo` / :class:`ToolDefinition` /
   :class:`ToolBundle` 最小工具声明契约；definition / bundle 只能投影为
   ``ToolSchema`` 后进入 Engine。
+- :class:`ToolExecutionMode` / :data:`ToolExecutionCapability` 及其具体
+  capability 声明；只供 Host / ToolRuntime 选择执行边界，不进入
+  LLM-facing schema。
 - :class:`ToolBundleSourceKind` / :class:`ToolBundleSourceRef` 工具 bundle
   来源引用契约。
 
@@ -51,6 +54,16 @@ from dayu.contracts.tool_declaration import (
     ToolDefinition,
     ToolDisplayInfo,
     tool,
+)
+from dayu.contracts.tool_execution import (
+    AsyncDirectToolExecutionCapability,
+    ProcessBackedToolContext,
+    ProcessBackedToolExecutionCapability,
+    ProcessBackedToolTarget,
+    ProcessBackedToolTargetFactory,
+    ThreadBackedToolExecutionCapability,
+    ToolExecutionCapability,
+    ToolExecutionMode,
 )
 from dayu.contracts.tool_executor import ToolExecutor
 from dayu.contracts.tool_outcome import (
@@ -85,6 +98,7 @@ from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 
 __all__ = [
     "ALLOWED_TOOL_CANCELLED_REASONS",
+    "AsyncDirectToolExecutionCapability",
     "BatchToolExecutionContext",
     "BatchToolExecutionOutcome",
     "BatchToolExecutionRecord",
@@ -110,11 +124,17 @@ __all__ = [
     "ToolCompletedOutcome",
     "ToolDefinition",
     "ToolDisplayInfo",
+    "ToolExecutionCapability",
+    "ToolExecutionMode",
     "ToolExecutionOutcome",
     "ToolExecutor",
     "ToolFailedOutcome",
     "ToolFunctionSchema",
     "ToolParametersSchema",
+    "ProcessBackedToolContext",
+    "ProcessBackedToolExecutionCapability",
+    "ProcessBackedToolTarget",
+    "ProcessBackedToolTargetFactory",
     "ToolResultEnvelope",
     "ToolResultFailure",
     "ToolResultMeta",
@@ -122,6 +142,7 @@ __all__ = [
     "ToolSchema",
     "ToolTruncateSpec",
     "ToolTruncationStrategy",
+    "ThreadBackedToolExecutionCapability",
     "tool",
     "truncate_limit_key_for_strategy",
 ]

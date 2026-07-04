@@ -36,6 +36,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from dayu.contracts import (
+    AsyncDirectToolExecutionCapability,
     JsonValue,
     ToolBundle,
     ToolBundleSourceKind,
@@ -3429,6 +3430,7 @@ def _smoke_tool_definition(smoke_tool: MockFinanceMemoryTool) -> ToolDefinition:
             ),
         ),
         callable=smoke_tool,
+        execution=AsyncDirectToolExecutionCapability(),
         truncate=None,
         display=None,
         tags=(_TOOL_TAG,),

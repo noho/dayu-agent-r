@@ -30,6 +30,7 @@ from dayu.contracts.tool_call import (
     ToolCallRequest,
 )
 from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
+from dayu.contracts.tool_execution import AsyncDirectToolExecutionCapability
 from dayu.contracts.tool_executor import ToolExecutor
 from dayu.contracts.tool_outcome import (
     BatchToolExecutionOutcome,
@@ -5809,6 +5810,7 @@ def _fetch_more_tool_definition(callable_: FetchMoreToolCallable) -> ToolDefinit
         name=FrameworkToolName.FETCH_MORE.value,
         schema=schema,
         callable=callable_,
+        execution=AsyncDirectToolExecutionCapability(),
         truncate=None,
         display=None,
         tags=("framework",),

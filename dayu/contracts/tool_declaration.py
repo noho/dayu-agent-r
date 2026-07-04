@@ -18,13 +18,17 @@ Host / ToolRuntime 的职责，公共契约层不提供默认执行器或 callab
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import InitVar, dataclass
+from dataclasses import InitVar, dataclass, field
 from typing import Protocol, runtime_checkable
 
 from dayu.contracts._validation import require_non_empty_text as _require_non_empty_text
 from dayu.contracts.tool_call import (
     BatchToolExecutionContext,
     ToolCallRequest,
+)
+from dayu.contracts.tool_execution import (
+    AsyncDirectToolExecutionCapability,
+    ToolExecutionCapability,
 )
 from dayu.contracts.tool_outcome import ToolExecutionOutcome
 from dayu.contracts.tool_schema import (
@@ -97,6 +101,8 @@ class ToolDefinition:
     :param truncate: Host ToolRuntime 截断声明；为 ``None`` 表示不截断。
     :param display: 展示 metadata；不进入 LLM schema。
     :param tags: 展示或装配标签；不进入 LLM schema。
+    :param execution: Host ToolRuntime 执行能力声明；不进入 LLM schema，默认
+        为 ``async_direct``。
     """
 
     name: str
@@ -105,6 +111,9 @@ class ToolDefinition:
     truncate: ToolTruncateSpec | None
     display: ToolDisplayInfo | None
     tags: tuple[str, ...]
+    execution: ToolExecutionCapability = field(
+        default_factory=AsyncDirectToolExecutionCapability
+    )
 
     def __post_init__(self) -> None:
         """校验工具声明的 LLM schema 名称同源。
@@ -186,6 +195,8 @@ class _ToolDecorator:
     :param name: 工具名。
     :param description: LLM-facing 工具描述。
     :param parameters: LLM-facing 参数 schema。
+    :param execution: Host ToolRuntime 执行能力声明；为 ``None`` 时使用默认
+        ``async_direct``。该字段不进入 LLM schema。
     :param truncate: Host ToolRuntime 截断声明。
     :param display: 展示 metadata；为 ``None`` 表示不声明展示名。
     :param tags: 展示或装配标签元组。
@@ -194,6 +205,7 @@ class _ToolDecorator:
     name: str
     description: str
     parameters: ToolParametersSchema
+    execution: ToolExecutionCapability | None
     truncate: ToolTruncateSpec | None
     display: ToolDisplayInfo | None
     tags: tuple[str, ...]
@@ -218,6 +230,11 @@ class _ToolDecorator:
             name=self.name,
             schema=schema,
             callable=callable_,
+            execution=(
+                self.execution
+                if self.execution is not None
+                else AsyncDirectToolExecutionCapability()
+            ),
             truncate=self.truncate,
             display=self.display,
             tags=self.tags,
@@ -229,6 +246,7 @@ def tool(
     name: str,
     description: str,
     parameters: ToolParametersSchema,
+    execution: ToolExecutionCapability | None = None,
     truncate: ToolTruncateSpec | None = None,
     display_name: str | None = None,
     tags: Sequence[str] = (),
@@ -244,6 +262,8 @@ def tool(
     :param name: LLM-facing 工具名。
     :param description: LLM-facing 工具描述。
     :param parameters: LLM-facing 参数 schema。
+    :param execution: Host ToolRuntime 执行能力声明；为 ``None`` 时使用默认
+        ``async_direct``。该字段不进入 LLM schema，也不是模型可见事实。
     :param truncate: Host ToolRuntime 截断声明。
     :param display_name: 展示友好名称；内部会转换为 ``ToolDisplayInfo``，
         且不进入 schema。
@@ -257,6 +277,7 @@ def tool(
         name=name,
         description=description,
         parameters=parameters,
+        execution=execution,
         truncate=truncate,
         display=(ToolDisplayInfo(name=display_name) if display_name is not None else None),
         tags=tuple(tags),
@@ -268,5 +289,6 @@ __all__ = [
     "ToolCallable",
     "ToolDefinition",
     "ToolDisplayInfo",
+    "ToolExecutionCapability",
     "tool",
 ]

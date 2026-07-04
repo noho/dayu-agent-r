@@ -7,6 +7,7 @@ import importlib.metadata as importlib_metadata
 import pytest
 
 from dayu.contracts import (
+    AsyncDirectToolExecutionCapability,
     BatchToolExecutionContext,
     JsonValue,
     TOOL_CANCELLED_REASON_HOST_CANCELLED,
@@ -93,6 +94,7 @@ def _definition(name: str) -> ToolDefinition:
             ),
         ),
         callable=_noop_tool,
+        execution=AsyncDirectToolExecutionCapability(),
         truncate=None,
         display=None,
         tags=(),

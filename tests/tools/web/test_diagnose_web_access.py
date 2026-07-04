@@ -15,6 +15,7 @@ import pytest
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import BatchToolExecutionContext, ToolCallRequest
 from dayu.contracts.tool_declaration import ToolCallable, ToolDefinition
+from dayu.contracts.tool_execution import AsyncDirectToolExecutionCapability
 from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolFailedOutcome
 from dayu.contracts.tool_result import ToolResultFailure, ToolResultSuccess
 from dayu.contracts.tool_schema import ToolFunctionSchema, ToolParametersSchema, ToolSchema
@@ -1107,6 +1108,7 @@ def _tool_definition(callable_value: ToolCallable) -> ToolDefinition:
         name="fetch_web_page",
         schema=schema,
         callable=callable_value,
+        execution=AsyncDirectToolExecutionCapability(),
         truncate=None,
         display=None,
         tags=("web",),

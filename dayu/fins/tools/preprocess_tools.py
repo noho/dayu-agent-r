@@ -15,6 +15,7 @@ from typing import Final
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import BatchToolExecutionContext, ToolCallRequest
 from dayu.contracts.tool_declaration import ToolDefinition, ToolDisplayInfo
+from dayu.contracts.tool_execution import AsyncDirectToolExecutionCapability
 from dayu.contracts.tool_outcome import (
     TOOL_CANCELLED_REASON_HOST_CANCELLED,
     ToolCancelledOutcome,
@@ -170,6 +171,7 @@ def build_fins_preprocess_tool(runtime: FinsIngestionRuntime) -> ToolDefinition:
             ),
         ),
         callable=FinsPreprocessToolCallable(runtime=runtime),
+        execution=AsyncDirectToolExecutionCapability(),
         truncate=None,
         display=ToolDisplayInfo(name="Start Fins Preprocess"),
         tags=("fins", "fins-preprocess"),

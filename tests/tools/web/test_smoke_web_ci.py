@@ -13,6 +13,7 @@ import pytest
 
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_declaration import ToolCallable, ToolDefinition
+from dayu.contracts.tool_execution import AsyncDirectToolExecutionCapability
 from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolFailedOutcome
 from dayu.contracts.tool_result import ToolResultFailure, ToolResultSuccess
 from dayu.contracts.tool_schema import (
@@ -1642,6 +1643,7 @@ def _tool_definition(
             ),
         ),
         callable=callable_,
+        execution=AsyncDirectToolExecutionCapability(),
         truncate=truncate,
         display=None,
         tags=(),

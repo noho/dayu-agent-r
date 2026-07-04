@@ -36,6 +36,7 @@ from dayu.contracts.tool_call import (
     ToolCallRequest,
 )
 from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
+from dayu.contracts.tool_execution import AsyncDirectToolExecutionCapability
 from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolExecutionOutcome
 from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.contracts.tool_schema import (
@@ -6471,6 +6472,7 @@ def _tool_definition(name: str, tool: _CountingTool) -> ToolDefinition:
             ),
         ),
         callable=tool,
+        execution=AsyncDirectToolExecutionCapability(),
         truncate=None,
         display=None,
         tags=("dispatch",),

@@ -23,6 +23,7 @@ from dayu.contracts.tool_call import (
     ToolCallRequest,
 )
 from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
+from dayu.contracts.tool_execution import AsyncDirectToolExecutionCapability
 from dayu.contracts.tool_outcome import (
     ToolAwaitingOutcome,
     ToolCompletedOutcome,
@@ -1402,6 +1403,7 @@ def _mock_tool_definition() -> ToolDefinition:
             ),
         ),
         callable=MockFactTool(),
+        execution=AsyncDirectToolExecutionCapability(),
         truncate=None,
         display=None,
         tags=("slice6",),
@@ -1437,6 +1439,7 @@ def _awaiting_tool_definition() -> ToolDefinition:
             ),
         ),
         callable=AwaitingMockTool(),
+        execution=AsyncDirectToolExecutionCapability(),
         truncate=None,
         display=None,
         tags=("slice6",),
