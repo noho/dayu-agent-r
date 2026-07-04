@@ -61,7 +61,7 @@ The residual-risk reconciliation artifact is `docs/reviews/wu-wait-03-residual-r
 No active WU-WAIT-03 residual risk remains in `docs/host/issues-implementation-control.md`.
 
 - WU-WAIT-04 itself tracks production poller / adapter registry composition validation after #89 / #90 / #92 merge; this is not duplicated as a separate `WU-WAIT-03-R1` residual row.
-- Generic tool/provider blocking I/O hard interruption is tracked as ordinary deferred WU `WU-TOOLS-CANCEL-01`, not as a WU-WAIT-03 residual risk and not as a WU-WAIT-04 prerequisite.
+- Generic tool/provider blocking I/O hard interruption is tracked by `WU-TOOLS-CANCEL-01` after `WU-LIFE-03`; it is not a WU-WAIT-03 residual risk. The intended follow-up outcome is Codex / Claude Code style interrupt behavior where Host returns to an interactive state quickly and stale tool/provider results cannot pollute the cancelled Run.
 
 Items that are not active residual risks:
 
@@ -84,4 +84,4 @@ No unclassified or active blocking residual risk remains for WU-WAIT-03.
 
 WU-WAIT-03 is at `final-closeout-pass`. Do not mark ready, merge, close issue, request reviewers, or delete the branch without explicit authorization.
 
-After the user / maintainer merges PR #166, pull the latest `main` and resume phaseflow from `docs/host/issues-implementation-control.md` at WU-WAIT-04 only after all prerequisites remain satisfied.
+After the user / maintainer merges PR #166, pull the latest `main` and resume phaseflow from `docs/host/issues-implementation-control.md` at WU-LIFE-03. The ordered next lane is WU-LIFE-03, then WU-TOOLS-CANCEL-01, then WU-WAIT-04 production-grade awaiting E2E smoke. WU-LIFE-03 owns Host-level active cancel timeout closeout; WU-TOOLS-CANCEL-01 owns the tool/provider interruptible execution boundary required for immediate-cancel user experience.

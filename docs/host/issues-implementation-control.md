@@ -158,8 +158,8 @@ git push -u github <branch>
 | gate | final-closeout-pass |
 | implementation status | WU-WAIT-01 / GitHub Issue #89 merged via PR #163 on 2026-07-01; WU-WAIT-02 / GitHub Issue #90 merged via PR #165 on 2026-07-03; WU-WAIT-03 / GitHub Issue #92 final closeout completed; draft PR #166 awaits maintainer/user handling. |
 | active work unit | WU-WAIT-03 |
-| default next work unit | WU-WAIT-03 |
-| next entry point | WU-WAIT-03 / GitHub Issue #92 final-closeout-pass: wait for maintainer/user handling of draft PR #166. Do not mark ready for review, close issue manually, request reviewers, merge, or delete branch without explicit authorization. After PR #166 is merged, pull latest `main` before reassessing WU-WAIT-04 prerequisites. |
+| default next work unit | WU-WAIT-03 until draft PR #166 is handled; after PR #166 merge, WU-LIFE-03 becomes the next implementation entry point. |
+| next entry point | WU-WAIT-03 / GitHub Issue #92 final-closeout-pass: wait for maintainer/user handling of draft PR #166. Do not mark ready for review, close issue manually, request reviewers, merge, or delete branch without explicit authorization. After PR #166 is merged, pull latest `main` and resume phaseflow at WU-LIFE-03, then WU-TOOLS-CANCEL-01, then WU-WAIT-04. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | Active/backlog issue owners retained here: #129 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #112 / #20 / #90 / #92 / #80 / #115, plus residual-risk destinations #121 / #122. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`; #63 / #89 / #111 / #130 / #133 are no longer active implementation owners. |
 | blocking open questions | None. |
@@ -168,6 +168,7 @@ git push -u github <branch>
 
 - `not-started`：尚未进入 plan / implementation。
 - `discussion-ready`：已具备讨论和代码 / issue 核对入口，但还未形成 code-generation-ready plan。
+- `pending-next`：当前 final-closeout-pass work unit merge 后的下一个默认 implementation entry point。
 - `blocked-by-issue`：需要等待指定 GitHub Issue / umbrella / dependency 完成。
 - `obsolete`：已裁决过期失效，不作为实施入口。
 - `planning`：正在形成或 review code-generation-ready plan。
@@ -198,8 +199,10 @@ git push -u github <branch>
 2. 以执行正确性为默认下一步，优先推进 WU-TOOLS-AWAIT-FANOUT-01 / #111。目标是在现有 attempt-scoped duplicate governance 与 awaiting accept barrier 之上，先设计重复 awaiting owner / waiter 的单 wait owner 与 fanout follower 语义，再进入 implementation gate。
 3. #111 形成稳定设计和验收边界后，再推进 #129 的 awaiting external job two-phase activation。#129 需要修 submit-before-accept 窗口，不能用 Fins-only workaround 绕过 Host awaiting activation contract；如果 #111 改变 wait record alias / follower 表达，#129 plan 必须消费该结论。
 4. #129 之后推进 production WAIT hardening：#89 callback endpoint / auth / replay、#90 production poller loop / backoff / fencing / retry、#92 external job physical cancel / revoke / abandon。#92 继续归属 #87 lifecycle watchdog / supervisor umbrella，不另建第二套 watchdog runtime。
-5. #89 / #90 / #92 完成后，WU-WAIT-04 才能进入 implementation gate，用 UI / Service production-grade awaiting E2E smoke 验证 public watcher、WAITING 展示、production wait resolution、terminal event 和 outbox 补读。不得用 manual resolve 或测试私有 durable wait id 伪造 production-grade 验收。
-6. #70 / #34 / #119 / #71 作为 Tool Trace diagnostics lane 可以并行做 discussion / design，但不得替代 #111 / #129 / #89-#92 的 ToolRuntime 与 wait lifecycle root-cause 修复。诊断 lane 的输出可以反向补充验收信号，例如重复调用、awaiting fanout、late result、oversized payload 和 limited-signal report。
+5. #89 / #90 / #92 完成后，先推进 WU-LIFE-03 / GitHub Issue #91，固定 active cancel watchdog、post-cancel timeout、Run / Attempt closeout、late terminal race 和 diagnostic 语义。WU-LIFE-03 必须只定义 Host-level cancel governance 和 timeout closeout：cancel command 接受后 Host truth 不等待 worker / provider 配合，超时后有明确终态或 diagnostic，迟到 terminal first-committer-wins / rejection 可验证；不得把 provider-specific kill API 硬编码进 Host 核心。
+6. WU-LIFE-03 完成后，再推进 WU-TOOLS-CANCEL-01，补齐 tool/provider runtime 的实际 interrupt boundary 与 escalation 能力：cooperative token、request / stream abort、subprocess / process-group / sandbox termination、hard-kill diagnostic closeout。目标是获得 Codex / Claude Code 类似的用户体感：取消后 Host 迅速回到可交互状态，旧 tool/provider 结果不得污染已取消 Run。若 tool/provider 在 Host 不可抢占的同进程 blocking I/O 中执行，本 WU 必须迁移到可中断 execution capsule 或明确禁止该执行形态进入 production-grade cancel path。
+7. WU-LIFE-03 与 WU-TOOLS-CANCEL-01 完成后，WU-WAIT-04 才能进入 implementation gate，用 UI / Service production-grade awaiting E2E smoke 验证 public watcher、WAITING 展示、production wait resolution、terminal event、outbox 补读，以及取消后的可交互恢复体验。不得用 manual resolve、测试私有 durable wait id 或只靠 cooperative tool 配合伪造 production-grade 验收。
+8. #70 / #34 / #119 / #71 作为 Tool Trace diagnostics lane 可以并行做 discussion / design，但不得替代 #111 / #129 / #89-#92 / #91 / WU-TOOLS-CANCEL-01 的 ToolRuntime、wait lifecycle 与 cancel root-cause 修复。诊断 lane 的输出可以反向补充验收信号，例如重复调用、awaiting fanout、late result、oversized payload、limited-signal report 和 post-cancel stale output。
 
 ## Residual Risk / 遗留问题追踪
 
@@ -246,15 +249,15 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-RET-04 | pending-prerequisite | Compaction artifact retention | GitHub Issue #156 / #78 child | Retention lane 默认第 3 项；必须等待 WU-RET-03 / #78 固定 purge cleanup 边界后实施 |
 | WU-RET-02 | pending | Audit JSONL storage governance | GitHub Issue #96 / #43 child | Retention lane 默认第 4 项；Audit JSONL rotation / retention / compaction / size reporting；保留 purge tombstone 可验证关联 |
 | WU-STRESS-SQLITE-01 | pending | SQLite multiprocess high-spec stress | GitHub Issue #38 | 现有 SQLite 多进程压力测试链路的慢盘 / Docker Linux 高规格版本 |
-| WU-LIFE-03 | pending | Active cancel watchdog | GitHub Issue #91 / #87 umbrella | Host lifecycle watchdog target |
+| WU-LIFE-03 | pending-next | Active cancel watchdog | GitHub Issue #91 / #87 umbrella | PR #166 merge 后的下一个 implementation entry point；固定 Host-level active cancel watchdog、post-cancel timeout closeout、late terminal race 和 diagnostic 语义。只负责 Host truth / timeout closeout，不负责 tool/provider hard interrupt。 |
 | WU-GOV-01 | pending | Host policy refusal terminal taxonomy | GitHub Issue #88 | 引入 `RunStatus.REJECTED` 表达权限、租户、额度、配额、速率限制、工具权限 / 审批等 Host policy refusal；compact failure 默认不迁移到 `REJECTED`。 |
 | WU-CTX-04 | pending-low | Run-level compaction concurrency boundary | GitHub Issue #112 | 低优先级设计核对：不引入 EventLog fencing；证明当前状态机 / request 计数 / stale recheck 足够，或在未来并发模型需要时设计 EventLog 外的最小 pointer / CAS。 |
 | WU-CTX-01 | pending | Provider tokenizer / sizing adapter | GitHub Issue #20 | provider/model-aware context sizing；仍有效，需先收敛 budget policy 设计表述 |
 | WU-WAIT-01 | completed | Callback endpoint / auth / replay | GitHub Issue #89 / PR #163 | PR 163 merged on 2026-07-01; not an active implementation entry point. 当前实现提供 Host wait callback typed boundary 与 Service framework-neutral mapper；不包含真实 HTTP route、secret backend、HMAC / bearer verifier、production poller、physical cancel、Engine contract 或 UI surface。 |
 | WU-WAIT-02 | final-closeout-pass | Production poller loop / backoff / fencing / retry | GitHub Issue #90 / draft PR #165 | Final closeout 已完成；等待 maintainer/user 处理 draft PR #165。PR body 使用 `Closes #90`，merge 会自动关闭 issue。 |
 | WU-WAIT-03 | final-closeout-pass | External job physical cancel / revoke / abandon | GitHub Issue #92 / #87 umbrella | Final closeout completed. Draft PR #166 opened and PR body uses `Closes #92`; merge will automatically close the issue. Do not mark ready, merge, close issue, request reviewers, or delete branch without explicit authorization. |
-| WU-WAIT-04 | pending-prerequisite | UI / Service production-grade awaiting E2E smoke | depends on #89 / #90 / #92 | dependent smoke；#89 / #90 / #92 merge 后进入 implementation gate。覆盖原 WU-WAIT-03-R1：验证 Service / composition 在生产等待路径启用并装配 wait poller / adapter registry，使 cancelled WAITING external lifecycle action 能在 public workflow 中执行。 |
-| WU-TOOLS-CANCEL-01 | deferred | Tool/provider blocking I/O cancellation hardening | separate provider/runtime hardening WU | 后续任一 tool/provider runtime 若证明 cooperative cancellation checkpoint 延迟不可接受，再进入本 WU 设计 provider-specific preemption / timeout / process-boundary hardening。不是 #92 residual，不是 WU-WAIT-04 前置，也不影响 Host WAITING cancellation correctness；与 WU-LIFE-03 active cancel watchdog 的 Host-level timeout closeout 边界需保持一致。 |
+| WU-TOOLS-CANCEL-01 | pending-prerequisite | Tool/provider blocking I/O cancellation hardening | follows WU-LIFE-03 | WU-LIFE-03 完成后实施；设计 Host-owned tool/provider execution interrupt boundary 与 escalation：cooperative token、request / stream abort、subprocess / process-group / sandbox termination、hard-kill diagnostic closeout。生产级目标是 Codex / Claude Code 类似 interrupt 体感：取消后 Host 迅速回到可交互状态，旧结果不能污染已取消 Run；不可抢占 blocking I/O 必须迁移到可中断 capsule 或被禁止进入 production cancel path。 |
+| WU-WAIT-04 | pending-prerequisite | UI / Service production-grade awaiting E2E smoke | depends on #89 / #90 / #92 + WU-LIFE-03 + WU-TOOLS-CANCEL-01 | dependent smoke；等待 #89 / #90 / #92 merge，并完成 WU-LIFE-03 与 WU-TOOLS-CANCEL-01 后进入 implementation gate。覆盖原 WU-WAIT-03-R1：验证 Service / composition 在生产等待路径启用并装配 wait poller / adapter registry，使 cancelled WAITING external lifecycle action 能在 public workflow 中执行，并验证取消后的 public 可交互恢复体验。 |
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
 
@@ -1524,25 +1527,62 @@ GitHub Issue #38 当前为 OPEN，且 issue body 已对齐当前定位：代码�
 
 ### 状态
 
-已纳入 GitHub Issue #91；GitHub Issue #87 是 Host Lifecycle Watchdog / Supervisor umbrella。本条是 #87 下的 active Attempt cancel watchdog target，不单独引入第二套 watchdog runtime。
+已纳入 GitHub Issue #91；GitHub Issue #87 是 Host Lifecycle Watchdog / Supervisor umbrella。本条是 #87 下的 active Attempt cancel watchdog target，不单独引入第二套 watchdog runtime。PR #166 merge 后，本条是默认下一 implementation entry point。
 
 ### 目标
 
 - 复用 #87 的 Host lifecycle watchdog / supervisor，不另建 active cancel 专属 watchdog。
 - 裁决 active cancel watchdog owner、timeout policy、Run / Attempt 终态、diagnostic payload、late terminal race 与 session cancel replay 语义。
 - 明确 post-cancel timeout 后 Run / Attempt / diagnostic 的收敛路径，以及 first-committer-wins / late rejection 规则。
+- 保证 active cancel 被 Host 接受后，Host durable truth 不等待 worker / provider 配合；即使 worker stream 不结束、provider 不返回、worker task 不响应 token，也必须有可测试的 timeout closeout 或 diagnostic 收敛。
+- 为 WU-TOOLS-CANCEL-01 提供稳定输入契约：哪些状态进入 timeout closeout、哪些迟到事件被接受 / 拒绝 / quarantine、哪些 diagnostic 字段用于定位不配合的 execution boundary。
 
 ### 非目标
 
 - 不直接 kill 不属于 Host 管理的外部进程。
 - 不把 provider-specific cancel API 硬编码进 Host 核心。
 - 不把 scheduler close 设计成 active cancel timeout closeout。
+- 不设计 tool/provider execution capsule、不定义 subprocess / process-group / sandbox kill 策略；这些归 WU-TOOLS-CANCEL-01。
 
 ### 验收信号
 
-- provider 卡死、stream 不结束、worker task 不响应 cancellation 时都有可测试 closeout。
+- provider 卡死、stream 不结束、worker task 不响应 cancellation 时，Host truth 都有可测试 closeout 或 diagnostic 收敛。
 - terminal event 与 diagnostic 不重复、不互相矛盾。
+- active cancel command replay、session-scope cancel replay 与 late terminal race 都符合 first-committer-wins。
+- WU-TOOLS-CANCEL-01 可以直接消费本条输出的 timeout closeout / diagnostic contract，不需要重新裁决 Host terminal 语义。
 - GitHub Issue #87 明确跟踪设计问题、非目标和验收测试；实施前需要先回到 design gate。
+
+## WU-TOOLS-CANCEL-01 Tool/provider Blocking I/O Cancellation Hardening
+
+### 状态
+
+等待 WU-LIFE-03 固定 Host-level active cancel watchdog、post-cancel timeout closeout 和 diagnostic 语义后实施。本条是 tool/provider runtime 的实际 interrupt boundary 与 escalation 能力，不是 WU-WAIT-03 / GitHub Issue #92 residual，也不是 WU-WAIT-04 smoke。当前代码已有 Host cancellation token、部分工具 cooperative checkpoint、局部 Playwright process terminate / kill，但缺少通用 ToolRuntime / worker-owned interruptible capsule；本条必须补齐该通用边界。
+
+### 目标
+
+- 设计 Host-owned tool/provider execution interrupt boundary，使取消后 Host 能迅速回到可交互状态。
+- 定义取消升级链路：cooperative cancellation token、request / stream abort、subprocess / process-group / sandbox termination、hard-kill diagnostic closeout。
+- 固化旧 tool/provider 迟到结果的拒绝 / quarantine 语义，确保已取消 Run 不被旧结果污染。
+- 为不配合的 blocking tool/provider 提供可测试 fixture，验证取消体感接近 Codex / Claude Code interrupt：用户取消后不继续输出旧执行结果，且新输入可继续推进。
+- 明确哪些 tool/provider 必须进入 interruptible execution capsule；不可抢占的同进程 blocking I/O 不得作为 production-grade cancel path 的默认执行形态。
+- 复用 WU-LIFE-03 的 Host terminal / diagnostic contract，不重新定义 Run / Attempt 终态。
+
+### 非目标
+
+- 不把 provider-specific kill / cancel API 硬编码进 Host 核心。
+- 不承诺外部 provider 已接收的远端任务一定物理停止；若 provider 不支持 cancel API，本条只保证本地执行边界停止等待、迟到结果不污染 Host truth，并记录诊断。
+- 不替代 WU-LIFE-03 的 Host-level timeout closeout；本条消费 WU-LIFE-03 的 Run / Attempt / diagnostic 语义。
+- 不重新实现 WU-WAIT-03 的 WAITING external job lifecycle contract。
+- 不把“工具自愿检查 cancellation token”当作唯一 production 方案；cooperative checkpoint 只是升级链路第一层。
+
+### 验收信号
+
+- 至少一个不配合的 blocking tool/provider fixture 可被 cancel 后快速释放 Host 可交互路径。
+- cancellation escalation 的每个阶段都有 typed diagnostic 或明确 terminal closeout。
+- 被 hard interrupt 或迟到返回的 tool/provider 不得写入已取消 Run 的 terminal fact、final answer 或 accepted tool result。
+- smoke 必须证明 cancel 后可以提交并推进新的用户输入；旧执行即使稍后返回也只能进入 diagnostic / quarantine。
+- 对 subprocess / process-group / sandbox 型执行边界，测试覆盖 graceful interrupt、terminate 和 hard kill 至少两级升级。
+- WU-WAIT-04 可把本条能力作为 production-grade awaiting smoke 的前置取消体验能力。
 
 ## WU-GOV-01 Host Policy Refusal Terminal Taxonomy
 
