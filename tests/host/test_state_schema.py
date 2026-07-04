@@ -18,6 +18,7 @@ from dayu.host.durable.options import (
 from dayu.host.durable.schema import (
     INDEX_HOST_RUNS_ONE_ACTIVE_PER_SESSION,
     INDEX_HOST_RUNS_QUEUE_FIFO,
+    INDEX_HOST_RUNS_STATUS_SEQUENCE,
     TABLE_HOST_ATTEMPT_DISPATCH_RECORDS,
     TABLE_HOST_ATTEMPTS,
     TABLE_HOST_RUNS,
@@ -33,6 +34,7 @@ from dayu.host.durable.state import (
     deserialize_run_start_reason,
     deserialize_worker_kind,
     dispatch_record_row_from_host_row,
+    read_cancelling_runs,
     run_row_from_host_row,
     serialize_attempt_status,
     serialize_dispatch_record_status,
@@ -105,6 +107,27 @@ def test_active_run_partial_unique_index_shape(tmp_path: Path) -> None:
             assert "where status in" in normalized_sql
             for status in ("running", "waiting", "cancelling", "recovering"):
                 assert f"'{status}'" in normalized_sql
+        finally:
+            connection.close()
+
+
+def test_run_status_sequence_index_supports_status_ordered_scan(tmp_path: Path) -> None:
+    """Run status sequence index 支持按状态扫描并保持 accepted 顺序。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        connection = store.connect()
+        try:
+            index_rows = connection.execute(f"PRAGMA index_list({TABLE_HOST_RUNS})").fetchall()
+            matching = [row for row in index_rows if str(row[1]) == INDEX_HOST_RUNS_STATUS_SEQUENCE]
+            assert len(matching) == 1
+
+            column_rows = connection.execute(f"PRAGMA index_info({INDEX_HOST_RUNS_STATUS_SEQUENCE})").fetchall()
+            assert tuple(str(row[2]) for row in column_rows) == (
+                "status",
+                "accepted_event_sequence",
+                "run_id",
+            )
         finally:
             connection.close()
 
@@ -513,6 +536,59 @@ def test_multiple_queued_runs_for_one_session_succeed(tmp_path: Path) -> None:
             return _required_row_int(row, column="count")
 
         assert store.transaction_runner.run_write(operation) == 2
+
+
+def test_read_cancelling_runs_returns_only_cancelling_rows(tmp_path: Path) -> None:
+    """cancelling Run 专用查询只返回 watchdog 需要的状态。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(transaction: HostTransaction) -> tuple[str, ...]:
+            """写入多种非终态 Run 后读取 cancelling Run。
+
+            :param transaction: Host transaction。
+            :returns: cancelling Run id 序列。
+            """
+
+            _insert_session_tx(transaction, session_id="session-running")
+            _insert_run_tx(
+                transaction,
+                run_id="run-running",
+                session_id="session-running",
+                status=RunStatus.RUNNING,
+                client_request_id="request-running",
+            )
+            _insert_session_tx(transaction, session_id="session-waiting")
+            _insert_run_tx(
+                transaction,
+                run_id="run-waiting",
+                session_id="session-waiting",
+                status=RunStatus.WAITING,
+                client_request_id="request-waiting",
+            )
+            _insert_session_tx(transaction, session_id="session-cancelling-1")
+            _insert_run_tx(
+                transaction,
+                run_id="run-cancelling-1",
+                session_id="session-cancelling-1",
+                status=RunStatus.CANCELLING,
+                client_request_id="request-cancelling-1",
+            )
+            _insert_session_tx(transaction, session_id="session-cancelling-2")
+            _insert_run_tx(
+                transaction,
+                run_id="run-cancelling-2",
+                session_id="session-cancelling-2",
+                status=RunStatus.CANCELLING,
+                client_request_id="request-cancelling-2",
+            )
+            return tuple(row.run_id for row in read_cancelling_runs(transaction))
+
+        assert store.transaction_runner.run_write(operation) == (
+            "run-cancelling-1",
+            "run-cancelling-2",
+        )
 
 
 def test_dispatch_record_status_check_allows_phase5_statuses(

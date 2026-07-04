@@ -89,10 +89,10 @@ from dayu.host.durable.state import (
     read_active_run_for_session,
     read_accepted_run_for_session,
     read_attempt_by_id,
+    read_cancelling_runs,
     read_dispatch_record_by_id,
     read_dispatch_record_by_attempt_id,
     read_earliest_queued_run,
-    read_non_terminal_runs,
     read_run_by_id,
     read_session_by_id,
 )
@@ -4043,9 +4043,7 @@ def _read_active_cancel_watchdog_candidates(
     candidates: list[_ActiveCancelWatchdogCandidate] = []
     scanned = 0
     ignored = 0
-    for run in read_non_terminal_runs(transaction):
-        if run.status is not RunStatus.CANCELLING:
-            continue
+    for run in read_cancelling_runs(transaction):
         scanned += 1
         candidate = _active_cancel_watchdog_candidate_from_run(
             transaction,

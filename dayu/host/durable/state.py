@@ -1803,6 +1803,49 @@ def read_non_terminal_runs(transaction: HostTransaction) -> tuple[RunRow, ...]:
     return tuple(run_row_from_host_row(row) for row in rows)
 
 
+def read_cancelling_runs(transaction: HostTransaction) -> tuple[RunRow, ...]:
+    """读取全部 ``CANCELLING`` Run。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :returns: 按 accepted event sequence 升序排列的 cancelling Run row 元组。
+    :raises HostDurableError: row 字段无效时抛出。
+    :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
+    """
+
+    rows = transaction.fetchall(
+        f"""
+        SELECT
+          run_id,
+          session_id,
+          status,
+          client_request_id,
+          input_event_id,
+          input_event_sequence,
+          accepted_event_id,
+          accepted_event_sequence,
+          queued_event_id,
+          queued_event_sequence,
+          started_event_id,
+          started_event_sequence,
+          terminal_event_id,
+          terminal_event_sequence,
+          current_attempt_id,
+          source_run_id,
+          source_run_relation,
+          execution_target,
+          queue_policy,
+          created_at,
+          updated_at,
+          terminal_at
+        FROM {TABLE_HOST_RUNS}
+        WHERE status = ?
+        ORDER BY accepted_event_sequence ASC, run_id ASC
+        """,
+        (serialize_run_status(RunStatus.CANCELLING),),
+    )
+    return tuple(run_row_from_host_row(row) for row in rows)
+
+
 def count_runs_by_source_relation(
     transaction: HostTransaction,
     *,
