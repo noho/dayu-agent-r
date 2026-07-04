@@ -157,6 +157,7 @@ from dayu.host.durable.run_transition import (
     fail_recovering_run_in_transaction,
     start_recovery_run_with_starting_attempt_in_transaction,
     terminal_closeout_in_transaction,
+    _cancel_request_event_id_from_cancelling,
 )
 from dayu.host.durable.schema import (
     RUNNER_CALL_INPUT_MANIFEST_DESCRIPTOR_KIND,
@@ -243,6 +244,7 @@ _REASON_WORKER_LOST_BEFORE_TERMINAL = "worker_lost_before_terminal"
 _REASON_EMPTY_FINAL_ANSWER = "empty_final_answer"
 _REASON_STALE_EXECUTION_ID = "stale_execution_id"
 _REASON_TERMINAL_ALREADY_CLOSED = "terminal_already_closed"
+_REASON_LATE_TERMINAL_AFTER_ACTIVE_CANCEL = "late_terminal_after_active_cancel"
 _REASON_WAITING_EVENT_CONFIRMATION = "waiting_event_confirmation"
 _REASON_WAITING_EVENT_WITHOUT_HOST_ACCEPTED_REFS = (
     "waiting_event_without_host_accepted_refs"
@@ -3297,6 +3299,12 @@ def _late_rejection_reason(context: _ValidatedCandidate) -> str | None:
         or context.attempt.terminal_event_id is not None
     ):
         return _REASON_TERMINAL_ALREADY_CLOSED
+    if (
+        context.run.status is RunStatus.CANCELLING
+        and context.candidate.engine_event.type
+        in (EngineEventType.FINAL_ANSWER, EngineEventType.RUN_FAILED)
+    ):
+        return _REASON_LATE_TERMINAL_AFTER_ACTIVE_CANCEL
     return None
 
 
@@ -5902,26 +5910,6 @@ def _partial_tool_call_summary_payload(
         "arguments_sha256": summary.arguments_sha256,
         "arguments_present": arguments_present,
     }
-
-
-def _cancel_request_event_id_from_cancelling(event: EventLogRow) -> str | None:
-    """从 ``RUN_CANCELLING`` fact 读取 active cancel request event id。
-
-    durable 事件 payload 可能被外部写入或历史 bug 破坏；ingest 不能让该
-    结构错误逃逸出事务边界，而应把当前 Engine terminal candidate 收敛为
-    受治理 rejected diagnostic。
-
-    :param event: 最新 ``RUN_CANCELLING`` EventLog row。
-    :returns: cancel request event id；payload 缺失或非法时返回 ``None``。
-    """
-
-    try:
-        return _required_payload_text(
-            _payload_object(event),
-            field_name="cancel_request_event_id",
-        )
-    except HostDurableError:
-        return None
 
 
 def _single_event_result(row: EventLogRow) -> EngineIngestResult:
