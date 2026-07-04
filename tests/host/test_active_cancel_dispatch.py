@@ -195,10 +195,86 @@ class _CancelAwareHandle:
         return self._run_id
 
 
+class _CancelClosingHandle:
+    """收到 cancel 后让事件流以 CancelledError 收口的 fake handle。"""
+
+    def __init__(self, *, local_worker_id: str) -> None:
+        """初始化 fake handle。
+
+        :param local_worker_id: worker 诊断 id。
+        :returns: ``None``。
+        """
+
+        self._local_worker_id = local_worker_id
+        self._cancelled = asyncio.Event()
+        self.closed = asyncio.Event()
+        self.cancel_reasons: list[str] = []
+
+    @property
+    def local_worker_id(self) -> str:
+        """返回 worker 诊断 id。
+
+        :returns: worker id。
+        """
+
+        return self._local_worker_id
+
+    async def events(self) -> AsyncIterator[EngineEvent]:
+        """等待 cancel 后以 CancelledError 结束 active anext。
+
+        :returns: EngineEvent 异步迭代器。
+        :raises asyncio.CancelledError: cancel 到达后抛出。
+        """
+
+        await self._cancelled.wait()
+        raise asyncio.CancelledError
+        if False:
+            yield EngineEvent(
+                occurred_at=_NOW,
+                session_id="unused-session",
+                run_id="unused-run",
+                type=EngineEventType.FINAL_ANSWER,
+                data=FinalAnswerData(
+                    content="unused",
+                    filtered=False,
+                    degraded=False,
+                    finish_reason=FinishReason.STOP,
+                ),
+                metadata=None,
+            )
+
+    def on_cancel(self, reason: str) -> None:
+        """记录取消并唤醒事件流。
+
+        :param reason: 取消原因。
+        :returns: ``None``。
+        """
+
+        self.cancel_reasons.append(reason)
+        self._cancelled.set()
+
+    def bind_snapshot(self, snapshot: AttemptDispatchSnapshot) -> None:
+        """绑定 worker accept 快照。
+
+        :param snapshot: dispatch snapshot。
+        :returns: ``None``。
+        """
+
+        del snapshot
+
+    async def close(self) -> None:
+        """关闭 fake handle。
+
+        :returns: ``None``。
+        """
+
+        self.closed.set()
+
+
 class _FakeWorker:
     """返回固定 fake handle 的 worker。"""
 
-    def __init__(self, handle: _CancelAwareHandle) -> None:
+    def __init__(self, handle: _CancelAwareHandle | _CancelClosingHandle) -> None:
         """初始化 fake worker。
 
         :param handle: worker accept 返回的 handle。
@@ -225,7 +301,7 @@ class _FakeWorker:
 class _FakeWorkerFactory:
     """测试用 worker factory。"""
 
-    def __init__(self, handle: _CancelAwareHandle) -> None:
+    def __init__(self, handle: _CancelAwareHandle | _CancelClosingHandle) -> None:
         """初始化 worker factory。
 
         :param handle: worker accept 返回的 handle。
@@ -250,7 +326,9 @@ class _FakeWorkerFactory:
 class _SequencedWorkerFactory:
     """按顺序返回 fake handle 的 worker factory。"""
 
-    def __init__(self, handles: tuple[_CancelAwareHandle, ...]) -> None:
+    def __init__(
+        self, handles: tuple[_CancelAwareHandle | _CancelClosingHandle, ...]
+    ) -> None:
         """初始化 sequenced worker factory。
 
         :param handles: 每次 dispatch 依次使用的 fake handle。
@@ -629,6 +707,75 @@ async def test_active_cancel_watchdog_closeout_promotes_queued_run(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_cancelled_worker_event_stream_releases_lane_for_other_session(
+    tmp_path: Path,
+) -> None:
+    """active anext CancelledError 仍进入 finally 并释放 lane token。"""
+
+    options = _command_options(tmp_path)
+    active_registry = ActiveWorkerRegistry()
+    host = create_host_command_handle(options, active_registry=active_registry)
+    closing_handle = _CancelClosingHandle(local_worker_id="worker-cancel-closing")
+    next_handle = _CancelAwareHandle(local_worker_id="worker-after-cancel", terminal="final")
+    worker_factory = _SequencedWorkerFactory((closing_handle, next_handle))
+    try:
+        first_session_id = _session_id(host)
+        second_session_id = ensure_session(
+            host,
+            EnsureSessionRequest(
+                scope="workspace",
+                slot_key="slot-after-cancel-close",
+                metadata=(),
+            ),
+        ).session_id
+        with open_host_durable_store(_durable_options(tmp_path)) as store:
+            scheduler = await _open_scheduler(
+                tmp_path,
+                store,
+                closing_handle,
+                worker_factory=worker_factory,
+                active_registry=active_registry,
+                lane_capacity=1,
+                lane_timeout_seconds=0.5,
+            )
+            try:
+                first = start_run(host, _start_request(first_session_id, "start-closing"))
+                first_refs = await _start_governed_refs(scheduler, first_session_id)
+                scheduler.wake_dispatch(_pending_dispatch(first_refs))
+                assert (await scheduler.drain_once()).dispatched == 1
+                await _wait_for_attempt_status(
+                    options.db_path,
+                    first_refs.attempt_id,
+                    AttemptStatus.RUNNING,
+                )
+
+                cancel_run(host, first.run_id, _cancel_request("cancel-closing"))
+                await asyncio.wait_for(closing_handle.closed.wait(), timeout=1.0)
+
+                second = start_run(
+                    host,
+                    _start_request(second_session_id, "start-after-cancel-close"),
+                )
+                second_refs = await _start_governed_refs(
+                    scheduler, second_session_id
+                )
+                scheduler.wake_dispatch(_pending_dispatch(second_refs))
+
+                await _wait_for_run_status(
+                    options.db_path,
+                    second.run_id,
+                    RunStatus.SUCCEEDED,
+                )
+
+                assert closing_handle.cancel_reasons == ["user_stop"]
+                assert worker_factory.created == 2
+            finally:
+                await scheduler.close()
+    finally:
+        host.close()
+
+
+@pytest.mark.asyncio
 async def test_late_cancel_does_not_overwrite_terminal(tmp_path: Path) -> None:
     """terminal 已先提交时 late cancel 只返回当前终态。"""
 
@@ -883,7 +1030,7 @@ def _durable_options(tmp_path: Path) -> HostDurableStoreOptions:
 async def _open_scheduler(
     tmp_path: Path,
     store: HostDurableStore,
-    handle: _CancelAwareHandle,
+    handle: _CancelAwareHandle | _CancelClosingHandle,
     *,
     worker_factory: LocalEngineWorkerFactory | None = None,
     lane_timeout_seconds: float | None = 0.01,

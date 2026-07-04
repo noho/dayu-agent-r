@@ -251,6 +251,7 @@ _COMPACTION_CANCEL_REASON_STATUS_PREFIX = "run_status_changed"
 _COMPACTION_CANCEL_REASON_DURABLE_UNAVAILABLE = "durable_unavailable"
 _COMPACTION_PRECONDITION_OPERATION_PREFIX = "precondition"
 _HOST_INSTANCE_HEARTBEAT_INTERVAL_SECONDS = 1.0
+_LOCAL_WORKER_CLOSE_GRACE_SECONDS = 3.0
 _SCHEDULER_CLOSE_REASON = "scheduler_close"
 _DRAIN_LOOP_DURABLE_RETRY_EXHAUSTED_REASON = "drain_loop_durable_retry_exhausted"
 
@@ -4576,7 +4577,17 @@ async def _safe_close_worker_handle(handle: LocalWorkerHandle) -> None:
     """
 
     try:
-        await handle.close()
+        await asyncio.wait_for(
+            handle.close(),
+            timeout=_LOCAL_WORKER_CLOSE_GRACE_SECONDS,
+        )
+    except TimeoutError:
+        _LOGGER.warning(
+            "dispatch.worker_handle.close_timed_out local_worker_id=%s "
+            "timeout_seconds=%s",
+            _safe_worker_id_for_log(handle),
+            _LOCAL_WORKER_CLOSE_GRACE_SECONDS,
+        )
     except Exception as exc:
         _LOGGER.warning(
             "dispatch.worker_handle.close_failed error_type=%s",
@@ -4584,6 +4595,19 @@ async def _safe_close_worker_handle(handle: LocalWorkerHandle) -> None:
             exc_info=True,
         )
         return
+
+
+def _safe_worker_id_for_log(handle: LocalWorkerHandle) -> str:
+    """best-effort 读取 worker id 用于日志。
+
+    :param handle: worker handle。
+    :returns: worker id；读取失败时返回诊断占位文本。
+    """
+
+    try:
+        return handle.local_worker_id
+    except Exception:
+        return "<unavailable>"
 
 
 async def _safe_release_lane_token(token: LaneClaimToken) -> None:

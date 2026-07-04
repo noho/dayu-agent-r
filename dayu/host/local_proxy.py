@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncGenerator, AsyncIterator
+from functools import partial
 from uuid import uuid4
 
 from dayu.engine import run_agent_messages
@@ -101,6 +102,7 @@ class _DefaultLocalWorkerHandle:
         self._events_started = False
         self._closed = False
         self._close_lock = asyncio.Lock()
+        self._cancel_close_task: asyncio.Task[None] | None = None
 
     @property
     def local_worker_id(self) -> str:
@@ -136,14 +138,37 @@ class _DefaultLocalWorkerHandle:
     def on_cancel(self, reason: str) -> None:
         """接收 Host active cancel 已触发的通知。
 
-        默认本地 Engine 通过 ``AgentRunRequest.cancellation_token`` 观察取消；
-        handle hook 只为非默认 worker 的额外 transport 打断保留。
+        默认本地 Engine 除了观察 ``AgentRunRequest.cancellation_token``，还会
+        关闭 Engine event stream，以取消 active ``anext`` 并触发底层 async
+        generator ``aclose``，让 dispatch consumer 能进入 ``finally``。
 
         :param reason: 取消原因。
         :returns: ``None``。
         """
 
-        del reason
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.local_proxy.cancel_close_requested local_worker_id=%s reason=%s",
+            self._local_worker_id,
+            reason,
+        )
+        if self._cancel_close_task is not None and not self._cancel_close_task.done():
+            return
+        try:
+            self._cancel_close_task = asyncio.create_task(self.close())
+            self._cancel_close_task.add_done_callback(
+                partial(
+                    _log_cancel_close_task_exception,
+                    local_worker_id=self._local_worker_id,
+                    reason=reason,
+                )
+            )
+        except RuntimeError:
+            _LOGGER.warning(
+                "host.local_proxy.cancel_close_no_running_loop local_worker_id=%s",
+                self._local_worker_id,
+                exc_info=True,
+            )
 
     async def close(self) -> None:
         """关闭 Engine event stream。
@@ -162,6 +187,35 @@ class _DefaultLocalWorkerHandle:
             VERBOSE_LOG_LEVEL,
             "host.local_proxy.closed local_worker_id=%s",
             self._local_worker_id,
+        )
+
+
+def _log_cancel_close_task_exception(
+    task: asyncio.Task[None],
+    *,
+    local_worker_id: str,
+    reason: str,
+) -> None:
+    """记录 ``on_cancel`` 后台 close task 的异常。
+
+    :param task: 已完成的后台 close task。
+    :param local_worker_id: 本地 worker 诊断 id。
+    :param reason: 触发 cancel 的原因。
+    :returns: ``None``。
+    """
+
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:
+        _LOGGER.warning(
+            "host.local_proxy.cancel_close_failed local_worker_id=%s reason=%s "
+            "error_type=%s",
+            local_worker_id,
+            reason,
+            exc.__class__.__name__,
+            exc_info=True,
         )
 
 

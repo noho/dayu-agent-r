@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import signal
+import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from typing import cast
 
@@ -40,6 +43,7 @@ from dayu.host.api import WaitAdapterKey
 from dayu.host.durable.state import WaitResumePolicy
 from dayu.host.tool_runtime import (
     DefaultToolRuntimeFactory,
+    DefaultToolExecutionCapsuleFactory,
     EffectiveToolBundleBuildRequest,
     EffectiveToolBundleBuilder,
     FetchMoreRequest,
@@ -71,6 +75,13 @@ from dayu.host.tool_runtime import (
     ToolAwaitingRejectedAck,
     ToolPolicyDecision,
     ToolPolicyDecisionKind,
+    ProcessBackedToolExecutionCapsule,
+    ThreadBackedToolExecutionCapsule,
+    ToolDispatcher,
+    ToolExecutionCapsule,
+    ToolExecutionCapsuleFactory,
+    ToolExecutionMode,
+    ToolInterruptStepResult,
     ToolRuntimeBuildRequest,
     ToolRuntimeExecutionScope,
     ToolRuntimePolicyView,
@@ -385,6 +396,319 @@ class _BlockingAwaitingCallable:
                 resume_token="resume-token",
             ),
             snapshot=None,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _SleepingProcessTarget:
+    """测试用非协作子进程目标。"""
+
+    sleep_seconds: float
+
+    def __call__(self) -> JsonValue:
+        """阻塞到自然结束后返回结果。
+
+        :returns: JSON-like 结果。
+        """
+
+        time.sleep(self.sleep_seconds)
+        return {"late": True}
+
+
+@dataclass(frozen=True, slots=True)
+class _IgnoreTerminateProcessTarget:
+    """测试用忽略 SIGTERM 的非协作子进程目标。"""
+
+    sleep_seconds: float
+
+    def __call__(self) -> JsonValue:
+        """忽略 SIGTERM 并阻塞到自然结束。
+
+        :returns: JSON-like 结果。
+        """
+
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        time.sleep(self.sleep_seconds)
+        return {"late": True}
+
+
+_ProcessTargetForTest = _SleepingProcessTarget | _IgnoreTerminateProcessTarget
+
+
+class _ProcessCapsuleFactory:
+    """测试用 process-backed capsule factory。"""
+
+    def __init__(self, target: _ProcessTargetForTest) -> None:
+        """初始化 factory。
+
+        :param target: 子进程目标。
+        :returns: ``None``。
+        """
+
+        self._target = target
+
+    def create_capsule(
+        self,
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+        dispatcher: ToolDispatcher,
+    ) -> ToolExecutionCapsule:
+        """创建 process-backed capsule。
+
+        :param call: 单次工具调用请求。
+        :param context: 批式工具执行上下文。
+        :param dispatcher: 默认 dispatcher，本测试不使用。
+        :returns: process-backed capsule。
+        """
+
+        del call, context, dispatcher
+        return ProcessBackedToolExecutionCapsule(self._target)
+
+
+class _ObservedProcessBackedToolExecutionCapsule(ProcessBackedToolExecutionCapsule):
+    """记录 interrupt 步骤的 process-backed 测试 capsule。"""
+
+    def __init__(self, target: _ProcessTargetForTest) -> None:
+        """初始化观测型 process capsule。
+
+        :param target: 子进程目标。
+        :returns: ``None``。
+        """
+
+        super().__init__(target)
+        self.run_entered = asyncio.Event()
+        self.terminate_result: ToolInterruptStepResult | None = None
+        self.kill_result: ToolInterruptStepResult | None = None
+        self.close_calls = 0
+
+    async def run(self) -> ToolExecutionOutcome:
+        """记录 run 已进入并运行真实 process-backed capsule。
+
+        :returns: 工具执行 outcome。
+        """
+
+        self.run_entered.set()
+        return await super().run()
+
+    async def terminate(self, reason: str) -> ToolInterruptStepResult:
+        """记录 terminate 结果。
+
+        :param reason: interrupt 原因。
+        :returns: terminate 结果。
+        """
+
+        result = await super().terminate(reason)
+        self.terminate_result = result
+        return result
+
+    async def kill(self, reason: str) -> ToolInterruptStepResult:
+        """记录 kill 结果。
+
+        :param reason: interrupt 原因。
+        :returns: kill 结果。
+        """
+
+        result = await super().kill(reason)
+        self.kill_result = result
+        return result
+
+    async def close(self) -> None:
+        """记录 close 调用并释放真实 process 资源。
+
+        :returns: ``None``。
+        """
+
+        self.close_calls += 1
+        await super().close()
+
+
+class _ObservedProcessCapsuleFactory:
+    """创建可观测 process-backed capsule 的测试 factory。"""
+
+    def __init__(self, target: _ProcessTargetForTest) -> None:
+        """初始化 factory。
+
+        :param target: 子进程目标。
+        :returns: ``None``。
+        """
+
+        self._target = target
+        self._capsule: _ObservedProcessBackedToolExecutionCapsule | None = None
+
+    def create_capsule(
+        self,
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+        dispatcher: ToolDispatcher,
+    ) -> ToolExecutionCapsule:
+        """创建可观测 process-backed capsule。
+
+        :param call: 单次工具调用请求。
+        :param context: 批式工具执行上下文。
+        :param dispatcher: 默认 dispatcher，本测试不使用。
+        :returns: process-backed capsule。
+        """
+
+        del call, context, dispatcher
+        capsule = _ObservedProcessBackedToolExecutionCapsule(self._target)
+        self._capsule = capsule
+        return capsule
+
+    def created_capsule(self) -> _ObservedProcessBackedToolExecutionCapsule:
+        """返回已经创建的 capsule。
+
+        :returns: 可观测 process-backed capsule。
+        :raises AssertionError: 尚未创建 capsule 时抛出。
+        """
+
+        if self._capsule is None:
+            raise AssertionError("process capsule was not created")
+        return self._capsule
+
+
+class _CloseFailingInterruptCapsule:
+    """close 会失败的 interrupt 测试 capsule。"""
+
+    def __init__(self) -> None:
+        """初始化测试 capsule。
+
+        :returns: ``None``。
+        """
+
+        self.run_entered = asyncio.Event()
+        self.close_calls = 0
+
+    @property
+    def mode(self) -> ToolExecutionMode:
+        """返回执行模式。
+
+        :returns: ``async_direct``。
+        """
+
+        return ToolExecutionMode.ASYNC_DIRECT
+
+    async def run(self) -> ToolExecutionOutcome:
+        """保持运行直到外部 cancel。
+
+        :returns: 本测试不会正常返回。
+        :raises AssertionError: 若阻塞意外结束则抛出。
+        """
+
+        self.run_entered.set()
+        await asyncio.Event().wait()
+        raise AssertionError("close failing capsule should not complete")
+
+    def request_interrupt(self, reason: str) -> None:
+        """接收 interrupt 请求。
+
+        :param reason: interrupt 原因。
+        :returns: ``None``。
+        """
+
+        del reason
+
+    async def terminate(self, reason: str) -> ToolInterruptStepResult:
+        """返回 terminate 已完成。
+
+        :param reason: interrupt 原因。
+        :returns: terminate 结果。
+        """
+
+        del reason
+        return ToolInterruptStepResult(
+            supported=True,
+            completed=True,
+            message="test terminate completed",
+        )
+
+    async def kill(self, reason: str) -> ToolInterruptStepResult:
+        """返回无需 hard kill。
+
+        :param reason: interrupt 原因。
+        :returns: kill 结果。
+        """
+
+        del reason
+        return ToolInterruptStepResult(
+            supported=False,
+            completed=False,
+            message="test kill unsupported",
+        )
+
+    async def close(self) -> None:
+        """模拟 close 失败。
+
+        :returns: 不会正常返回。
+        :raises RuntimeError: 始终抛出 close 失败。
+        """
+
+        self.close_calls += 1
+        raise RuntimeError("test capsule close failed")
+
+
+class _CloseFailingCapsuleFactory:
+    """创建 close 失败 capsule 的测试 factory。"""
+
+    def __init__(self) -> None:
+        """初始化 factory。
+
+        :returns: ``None``。
+        """
+
+        self._capsule: _CloseFailingInterruptCapsule | None = None
+
+    def create_capsule(
+        self,
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+        dispatcher: ToolDispatcher,
+    ) -> ToolExecutionCapsule:
+        """创建 close 失败 capsule。
+
+        :param call: 单次工具调用请求。
+        :param context: 批式工具执行上下文。
+        :param dispatcher: 默认 dispatcher，本测试不使用。
+        :returns: close 失败 capsule。
+        """
+
+        del call, context, dispatcher
+        capsule = _CloseFailingInterruptCapsule()
+        self._capsule = capsule
+        return capsule
+
+    def created_capsule(self) -> _CloseFailingInterruptCapsule:
+        """返回已经创建的 capsule。
+
+        :returns: close 失败 capsule。
+        :raises AssertionError: 尚未创建 capsule 时抛出。
+        """
+
+        if self._capsule is None:
+            raise AssertionError("close failing capsule was not created")
+        return self._capsule
+
+
+class _ThreadBlockingTarget:
+    """测试用 thread-backed 非协作目标。"""
+
+    def __init__(self) -> None:
+        """初始化目标。
+
+        :returns: ``None``。
+        """
+
+        self.started = False
+
+    def __call__(self) -> ToolExecutionOutcome:
+        """阻塞一段时间后返回结果。
+
+        :returns: 工具成功 outcome。
+        """
+
+        self.started = True
+        time.sleep(0.5)
+        return ToolCompletedOutcome(
+            result=ToolResultSuccess(ok=True, value={"thread": "late"}, meta=None)
         )
 
 
@@ -1103,6 +1427,174 @@ async def test_tool_runtime_timeout_returns_governed_failure() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tool_runtime_process_backed_cancel_does_not_wait_for_natural_completion() -> None:
+    """process-backed 非协作工具取消后不等待自然 sleep 结束。"""
+
+    callable_ = _CountingCallable({"secret": "unused"})
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    token = _MutableCancellationToken()
+    executor = _executor(
+        callable_,
+        accept_port,
+        capsule_factory=_ProcessCapsuleFactory(
+            _SleepingProcessTarget(sleep_seconds=5.0)
+        ),
+    )
+
+    started_at = time.monotonic()
+    task = asyncio.create_task(
+        executor.execute(_request(_call("tool-call-1"), cancellation_token=token))
+    )
+    await asyncio.sleep(0.3)
+    token.cancel("test_process_cancel")
+    outcome = await asyncio.wait_for(task, timeout=2.0)
+    elapsed = time.monotonic() - started_at
+
+    record = outcome.records[0]
+    assert elapsed < 2.0
+    assert callable_.call_count == 0
+    assert len(accept_port.candidates) == 1
+    assert accept_port.candidates[0].governance.policy_decision.reason_code == (
+        "tool_runtime_cancelled"
+    )
+    assert isinstance(record.outcome, ToolFailedOutcome)
+    assert record.outcome.result.hint == "tool_runtime_cancelled"
+
+
+@pytest.mark.asyncio
+async def test_tool_runtime_outer_task_cancel_closes_process_capsule() -> None:
+    """外层 execute task 被取消时会 interrupt 并 close process capsule。"""
+
+    callable_ = _CountingCallable({"secret": "unused"})
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    factory = _ObservedProcessCapsuleFactory(
+        _IgnoreTerminateProcessTarget(sleep_seconds=5.0)
+    )
+    executor = _executor(
+        callable_,
+        accept_port,
+        capsule_factory=factory,
+    )
+
+    task = asyncio.create_task(executor.execute(_request(_call("tool-call-1"))))
+    await asyncio.sleep(0)
+    capsule = factory.created_capsule()
+    await asyncio.wait_for(capsule.run_entered.wait(), timeout=1.0)
+    await asyncio.sleep(0.8)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=2.0)
+
+    assert callable_.call_count == 0
+    assert capsule.close_calls == 1
+    assert capsule.terminate_result is not None
+    assert capsule.terminate_result.supported
+    assert not capsule.terminate_result.completed
+    assert capsule.kill_result is not None
+    assert capsule.kill_result.supported
+    assert capsule.kill_result.completed
+
+
+@pytest.mark.asyncio
+async def test_tool_runtime_process_backed_cancel_kills_when_terminate_is_ignored() -> None:
+    """executor 层 process-backed cancel 会从 terminate 升级到 kill。"""
+
+    callable_ = _CountingCallable({"secret": "unused"})
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    token = _MutableCancellationToken()
+    factory = _ObservedProcessCapsuleFactory(
+        _IgnoreTerminateProcessTarget(sleep_seconds=5.0)
+    )
+    executor = _executor(
+        callable_,
+        accept_port,
+        capsule_factory=factory,
+    )
+
+    task = asyncio.create_task(
+        executor.execute(_request(_call("tool-call-1"), cancellation_token=token))
+    )
+    await asyncio.sleep(0)
+    capsule = factory.created_capsule()
+    await asyncio.wait_for(capsule.run_entered.wait(), timeout=1.0)
+    await asyncio.sleep(0.8)
+    token.cancel("test_process_cancel_ignored_terminate")
+    outcome = await asyncio.wait_for(task, timeout=2.0)
+
+    record = outcome.records[0]
+    assert callable_.call_count == 0
+    assert capsule.close_calls == 1
+    assert capsule.terminate_result is not None
+    assert capsule.terminate_result.supported
+    assert not capsule.terminate_result.completed
+    assert capsule.kill_result is not None
+    assert capsule.kill_result.supported
+    assert capsule.kill_result.completed
+    assert isinstance(record.outcome, ToolFailedOutcome)
+    assert record.outcome.result.hint == "tool_runtime_cancelled"
+
+
+@pytest.mark.asyncio
+async def test_tool_runtime_interrupt_close_failure_keeps_governed_cancel_outcome(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """interrupt cleanup 的 close 失败不会遮蔽 governed cancel outcome。"""
+
+    callable_ = _CountingCallable({"secret": "unused"})
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    token = _MutableCancellationToken()
+    factory = _CloseFailingCapsuleFactory()
+    executor = _executor(
+        callable_,
+        accept_port,
+        capsule_factory=factory,
+    )
+
+    task = asyncio.create_task(
+        executor.execute(_request(_call("tool-call-1"), cancellation_token=token))
+    )
+    await asyncio.sleep(0)
+    capsule = factory.created_capsule()
+    await asyncio.wait_for(capsule.run_entered.wait(), timeout=1.0)
+    with caplog.at_level(logging.WARNING, logger="dayu.host.tool_runtime"):
+        token.cancel("test_close_failure")
+        outcome = await asyncio.wait_for(task, timeout=1.0)
+
+    record = outcome.records[0]
+    assert callable_.call_count == 0
+    assert capsule.close_calls == 1
+    assert isinstance(record.outcome, ToolFailedOutcome)
+    assert record.outcome.result.hint == "tool_runtime_cancelled"
+    assert "host.tool_runtime.capsule_close_failed" in caplog.text
+    assert "error_type=RuntimeError" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_thread_backed_capsule_does_not_claim_thread_termination() -> None:
+    """thread-backed capsule 的 terminate / kill 明确不支持 OS thread 中止。"""
+
+    target = _ThreadBlockingTarget()
+    capsule = ThreadBackedToolExecutionCapsule(target)
+    task = asyncio.create_task(capsule.run())
+    await asyncio.sleep(0.05)
+
+    assert capsule.mode is ToolExecutionMode.THREAD_BACKED
+    terminate = await capsule.terminate("test")
+    kill = await capsule.kill("test")
+    await capsule.close()
+
+    assert target.started
+    assert isinstance(terminate, ToolInterruptStepResult)
+    assert not terminate.supported
+    assert not terminate.completed
+    assert isinstance(kill, ToolInterruptStepResult)
+    assert not kill.supported
+    assert not kill.completed
+    assert task.cancelled() or task.done()
+
+
+@pytest.mark.asyncio
 async def test_tool_runtime_pre_cancelled_context_returns_governed_failure() -> None:
     """context token 已取消时不得调用业务工具，并返回受治理失败。"""
 
@@ -1790,6 +2282,7 @@ def _executor(
     policy_view: ToolRuntimePolicyView | None = None,
     allow_tool_calls: bool = True,
     diagnostic_emitter: InMemoryToolTraceDiagnosticEmitter | None = None,
+    capsule_factory: ToolExecutionCapsuleFactory | None = None,
 ) -> ToolExecutor:
     """构造测试用 ToolRuntime executor。
 
@@ -1802,6 +2295,7 @@ def _executor(
     :param policy_view: Host 内部工具 policy view。
     :param allow_tool_calls: ToolRuntime scope 是否允许工具调用。
     :param diagnostic_emitter: 可选内存诊断发射器。
+    :param capsule_factory: 可选内部 execution capsule factory。
     :returns: ToolExecutor protocol 实现。
     """
 
@@ -1833,6 +2327,11 @@ def _executor(
             ),
             policy_view=policy_view if policy_view is not None else ToolRuntimePolicyView(),
             diagnostic_emitter=diagnostic_emitter,
+            execution_capsule_factory=(
+                capsule_factory
+                if capsule_factory is not None
+                else DefaultToolExecutionCapsuleFactory()
+            ),
         )
     )
     return handle.tool_executor
