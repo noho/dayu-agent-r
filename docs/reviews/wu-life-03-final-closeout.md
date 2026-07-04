@@ -70,7 +70,7 @@ PR #167 body uses `Closes #91`; merging the PR should auto-close #91.
 ## Residual Owners
 
 - Provider/tool physical interruption and active worker cleanup remain `WU-TOOLS-CANCEL-01`.
-- Watchdog runtime tuning, timeout default tuning, scan-query optimization, and cross-instance clock skew remain under #87.
+- Watchdog runtime tuning, timeout default tuning, scan-query optimization, and cross-instance clock skew remain under #87 umbrella follow-up after #91 / WU-LIFE-03, and are not blockers for this closeout.
 - WU-WAIT-04 remains the downstream UI / Service production-grade awaiting E2E smoke after WU-LIFE-03 and WU-TOOLS-CANCEL-01.
 
 ## Non-actions

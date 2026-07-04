@@ -28,7 +28,7 @@ Both review lanes conclude that WU-LIFE-03 satisfies the plan:
 
 - Source: DS observation 01.
 - Status: deferred-with-owner.
-- Owner / destination: GitHub Issue #87 Host lifecycle watchdog runtime tuning.
+- Owner / destination: GitHub Issue #87 umbrella follow-up for Host lifecycle watchdog runtime tuning after #91 / WU-LIFE-03.
 - Reasoning: `read_non_terminal_runs(...)` plus Python filtering is correct for the current semantics. It may need query-level optimization under high non-terminal Run volume, but this is performance tuning, not correctness.
 
 ### AGG-OBS-02 timeout closeout does not clean active worker handles
