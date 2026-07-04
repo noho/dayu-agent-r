@@ -9,6 +9,7 @@
 - Draft PR pass commit: `2da254c4`
 - Issue closeout comment: https://github.com/noho/dayu-agent-r/issues/92#issuecomment-4880126795
 - Residual-risk reconciliation comment: https://github.com/noho/dayu-agent-r/issues/92#issuecomment-4880258099
+- Duplicate residual-row correction comment: https://github.com/noho/dayu-agent-r/issues/92#issuecomment-4880265997
 
 ## What Changed
 
@@ -57,10 +58,10 @@
 
 The residual-risk reconciliation artifact is `docs/reviews/wu-wait-03-residual-risk-reconciliation.md`.
 
-Items that remain active after WU-WAIT-03 are recorded in `docs/host/issues-implementation-control.md` / `Residual Risk / 遗留问题追踪`:
+Items that remain active after WU-WAIT-03 are recorded in `docs/host/issues-implementation-control.md`:
 
-- `WU-WAIT-03-R1`: production poller / adapter registry composition validation is deferred to WU-WAIT-04.
-- `WU-WAIT-03-R2`: stronger-than-cooperative Fins provider cancellation is deferred to Fins provider/runtime owners if operational evidence requires it.
+- `WU-WAIT-03-R2`: stronger-than-cooperative Fins provider cancellation is deferred to `WU-FINS-CANCEL-01` / Fins provider/runtime owners if operational evidence requires it.
+- WU-WAIT-04 itself tracks production poller / adapter registry composition validation after #89 / #90 / #92 merge; this is not duplicated as a separate `WU-WAIT-03-R1` residual row.
 
 Items that are not active residual risks:
 
@@ -75,6 +76,7 @@ No unclassified blocking residual risk remains for WU-WAIT-03.
 - PR body uses `Closes #92`, so merging PR #166 is expected to close issue #92 automatically.
 - Issue closeout comment was published at https://github.com/noho/dayu-agent-r/issues/92#issuecomment-4880126795.
 - Residual-risk reconciliation comment was published at https://github.com/noho/dayu-agent-r/issues/92#issuecomment-4880258099.
+- Duplicate residual-row correction comment was published at https://github.com/noho/dayu-agent-r/issues/92#issuecomment-4880265997.
 - Issue #92 remains open until PR #166 is merged.
 
 ## Next Entry Point

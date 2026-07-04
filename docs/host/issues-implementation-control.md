@@ -226,8 +226,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-ENG-02-S3-R1 | transferred-to-issue | WU-OBS-00B / GitHub Issue #119 under #70 analyzer | analyzer 实施时确认 usage observation projection signal 是否需要扩展 correlation fields。 |
 | WU-TOOLS-01-S1-R1 | transferred-to-issue | GitHub Issues #121 and #122 | SEC/Fins CI pipeline / smoke 与 CN/HK Docling CI pipeline / smoke 改由对应 issue 直接追踪；不再作为本文档默认 next work unit。 |
 | WU-TOOLS-01-F01-02-R1 | transferred-to-issue | GitHub Issue #129 | 设计 awaiting 两阶段启动后，才能扩展 Host wait adapter 或 Fins runtime activation contract。 |
-| WU-WAIT-03-R1 | deferred-with-owner | WU-WAIT-04 production-grade awaiting E2E smoke | 验证 Service / composition 在生产等待路径启用并装配 wait poller / adapter registry，使 cancelled WAITING external lifecycle action 能在 public workflow 中执行；当前 WU 已实现 Host/Fins contract，不在本 WU 强制所有部署启用 poller。 |
-| WU-WAIT-03-R2 | deferred-with-owner | Fins provider/runtime owners；future provider-specific cancellation hardening if operational evidence requires it | 当前 Fins cleanup 是 cooperative cancellation checkpoint + best-effort ABANDON。若后续真实 provider blocking I/O 证明 checkpoint 延迟不可接受，再设计 provider-specific preemption / cancellation hardening；Host cancellation correctness 不依赖该能力。 |
+| WU-WAIT-03-R2 | deferred-with-owner | WU-FINS-CANCEL-01 / Fins provider/runtime owners | 当前 Fins cleanup 是 cooperative cancellation checkpoint + best-effort ABANDON。若后续真实 provider blocking I/O 证明 checkpoint 延迟不可接受，再设计 provider-specific preemption / cancellation hardening；Host cancellation correctness 不依赖该能力。 |
 
 ## 当前 Work Units
 
@@ -255,7 +254,8 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-WAIT-01 | completed | Callback endpoint / auth / replay | GitHub Issue #89 / PR #163 | PR 163 merged on 2026-07-01; not an active implementation entry point. 当前实现提供 Host wait callback typed boundary 与 Service framework-neutral mapper；不包含真实 HTTP route、secret backend、HMAC / bearer verifier、production poller、physical cancel、Engine contract 或 UI surface。 |
 | WU-WAIT-02 | final-closeout-pass | Production poller loop / backoff / fencing / retry | GitHub Issue #90 / draft PR #165 | Final closeout 已完成；等待 maintainer/user 处理 draft PR #165。PR body 使用 `Closes #90`，merge 会自动关闭 issue。 |
 | WU-WAIT-03 | final-closeout-pass | External job physical cancel / revoke / abandon | GitHub Issue #92 / #87 umbrella | Final closeout completed. Draft PR #166 opened and PR body uses `Closes #92`; merge will automatically close the issue. Do not mark ready, merge, close issue, request reviewers, or delete branch without explicit authorization. |
-| WU-WAIT-04 | pending-prerequisite | UI / Service production-grade awaiting E2E smoke | depends on #89 / #90 / #92 | dependent smoke，不独立实施 |
+| WU-WAIT-04 | pending-prerequisite | UI / Service production-grade awaiting E2E smoke | depends on #89 / #90 / #92 | dependent smoke；#89 / #90 / #92 merge 后进入 implementation gate。覆盖原 WU-WAIT-03-R1：验证 Service / composition 在生产等待路径启用并装配 wait poller / adapter registry，使 cancelled WAITING external lifecycle action 能在 public workflow 中执行。 |
+| WU-FINS-CANCEL-01 | deferred | Fins provider cancellation hardening for blocking I/O | owner for WU-WAIT-03-R2 | 后续真实 Fins provider 若证明 cooperative cancellation checkpoint 延迟不可接受，再进入本 WU 设计 provider-specific preemption / timeout / process-boundary hardening。不是 WU-WAIT-04 前置，也不影响 Host WAITING cancellation correctness。 |
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
 
