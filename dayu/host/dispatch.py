@@ -63,11 +63,11 @@ from dayu.host.durable.liveness import (
     register_current_instance,
 )
 from dayu.host.durable.run_transition import (
-    ActiveCancelTimeoutCloseoutInput,
+    ActiveCancelWatchdogCloseoutInput,
     FailUnstartedRunInput,
     StartGovernedRunInput,
     TerminalCloseoutInput,
-    active_cancel_timeout_closeout_in_transaction,
+    active_cancel_watchdog_closeout_in_transaction,
     fail_unstarted_run_in_transaction,
     start_governed_run_with_starting_attempt_in_transaction,
     terminal_closeout_in_transaction,
@@ -225,7 +225,7 @@ _WORKER_ACCEPT_REASON = "local_worker_accepted"
 _ACTIVE_CANCEL_WATCHDOG_ACTOR = "host.active_cancel_watchdog"
 _ACTIVE_CANCEL_WATCHDOG_SOURCE = "host.dispatch"
 _ACTIVE_CANCEL_WATCHDOG_OWNER = "host.active_cancel_watchdog"
-_ACTIVE_CANCEL_WORKER_LIFECYCLE_SIGNAL = "active_cancel_timeout"
+_ACTIVE_CANCEL_WORKER_LIFECYCLE_SIGNAL = "active_cancel_watchdog_closeout"
 _WORKER_STARTUP_TIMEOUT_REASON = "worker_startup_timeout"
 _MEMORY_PROJECTION_REPAIR_REQUIRED_REASON = "memory_projection_repair_required"
 _LOCAL_POLICY_SNAPSHOT_REF = "host-local-no-tool-policy"
@@ -234,8 +234,8 @@ _PAYLOAD_FIELD_EFFECTIVE_TOOL_SET = "effective_tool_set"
 _EVENT_ID_ATTEMPT_RUNNING_PREFIX = "event-attempt-running"
 _EVENT_ID_ATTEMPT_FAILED_PREFIX = "event-attempt-failed"
 _EVENT_ID_RUN_FAILED_PREFIX = "event-run-failed"
-_EVENT_ID_ATTEMPT_CANCELLED_TIMEOUT_PREFIX = "event-attempt-cancelled-timeout"
-_EVENT_ID_RUN_CANCELLED_TIMEOUT_PREFIX = "event-run-cancelled-timeout"
+_EVENT_ID_ATTEMPT_CANCELLED_WATCHDOG_PREFIX = "event-attempt-cancelled-watchdog"
+_EVENT_ID_RUN_CANCELLED_WATCHDOG_PREFIX = "event-run-cancelled-watchdog"
 _EVENT_ID_CONTEXT_COMPACTION_REQUESTED_PREFIX = "event-context-compact-requested"
 _EVENT_ID_CONTEXT_COMPACTED_PREFIX = "event-context-compacted"
 _EVENT_ID_CONTEXT_COMPACTION_ATTEMPT_REJECTED_PREFIX = "event-context-compaction-attempt-rejected"
@@ -430,8 +430,8 @@ class _ActiveCancelWatchdogOperationResult:
     """active cancel watchdog write transaction 结果。
 
     :param scanned: 本轮扫描到的 ``CANCELLING`` Run 数。
-    :param eligible: 本轮达到 timeout 条件的 Run 数。
-    :param closed_session_ids: 本轮成功 timeout closeout 的 Session id。
+    :param eligible: 本轮满足 accepted-cancel 收口前置条件的 Run 数。
+    :param closed_session_ids: 本轮成功 watchdog closeout 的 Session id。
     :param ignored: 本轮跳过的 Run 数。
     """
 
@@ -1052,7 +1052,7 @@ class HostDispatchScheduler:
             self._promotion_drain_task = asyncio.create_task(self._promotion_drain_loop())
 
     def wake_active_cancel_watchdog(self) -> None:
-        """唤醒 active cancel watchdog 执行一次扫描。
+        """唤醒 active cancel watchdog 执行一次 accepted-cancel 收口扫描。
 
         :returns: ``None``。
         :raises RuntimeError: scheduler 已关闭时抛出。
@@ -1060,8 +1060,6 @@ class HostDispatchScheduler:
 
         if self._closed:
             raise RuntimeError("HostDispatchScheduler is closed")
-        if self._local_execution.active_cancel_timeout_seconds is None:
-            return
         try:
             self._active_cancel_watchdog_queue.put_nowait(None)
         except asyncio.QueueFull:
@@ -1071,7 +1069,7 @@ class HostDispatchScheduler:
     def tick_active_cancel_watchdog(
         self, now: datetime
     ) -> ActiveCancelWatchdogTickResult:
-        """同步执行一次 active cancel timeout watchdog 扫描。
+        """同步执行一次 accepted-cancel watchdog 收口扫描。
 
         :param now: 本轮 watchdog 判定使用的 UTC aware 时间。
         :returns: 单次 tick 摘要。
@@ -1080,14 +1078,6 @@ class HostDispatchScheduler:
         """
 
         _validate_watchdog_now(now)
-        timeout_seconds = self._local_execution.active_cancel_timeout_seconds
-        if timeout_seconds is None:
-            return ActiveCancelWatchdogTickResult(
-                scanned=0,
-                eligible=0,
-                closed=0,
-                ignored=0,
-            )
 
         def _operation(
             transaction: HostTransaction,
@@ -1099,26 +1089,26 @@ class HostDispatchScheduler:
             eligible = 0
             closed_session_ids: list[str] = []
             for candidate in candidates:
-                if (now - candidate.cancel_requested_at).total_seconds() < timeout_seconds:
-                    continue
                 eligible += 1
-                result = active_cancel_timeout_closeout_in_transaction(
+                result = active_cancel_watchdog_closeout_in_transaction(
                     transaction,
                     self._event_log_store,
-                    ActiveCancelTimeoutCloseoutInput(
+                    ActiveCancelWatchdogCloseoutInput(
                         run_id=candidate.run_id,
                         attempt_id=candidate.attempt_id,
                         attempt_cancelled_event_id=_new_event_id(
-                            _EVENT_ID_ATTEMPT_CANCELLED_TIMEOUT_PREFIX
+                            _EVENT_ID_ATTEMPT_CANCELLED_WATCHDOG_PREFIX
                         ),
                         run_cancelled_event_id=_new_event_id(
-                            _EVENT_ID_RUN_CANCELLED_TIMEOUT_PREFIX
+                            _EVENT_ID_RUN_CANCELLED_WATCHDOG_PREFIX
                         ),
                         occurred_at=now,
                         actor=_ACTIVE_CANCEL_WATCHDOG_ACTOR,
                         source=_ACTIVE_CANCEL_WATCHDOG_SOURCE,
-                        timeout_seconds=timeout_seconds,
-                        timed_out_at=now,
+                        cancel_requested_at=format_utc_timestamp(
+                            candidate.cancel_requested_at
+                        ),
+                        closed_out_at=now,
                         watchdog_owner=_ACTIVE_CANCEL_WATCHDOG_OWNER,
                         worker_lifecycle_signal=(
                             _ACTIVE_CANCEL_WORKER_LIFECYCLE_SIGNAL
@@ -2546,13 +2536,11 @@ class HostDispatchScheduler:
             self._heartbeat_task = asyncio.create_task(self._host_instance_heartbeat_loop())
 
     def _start_active_cancel_watchdog_loop(self) -> None:
-        """按配置启动 active cancel watchdog 后台任务。
+        """启动 active cancel watchdog 后台任务。
 
         :returns: ``None``。
         """
 
-        if self._local_execution.active_cancel_timeout_seconds is None:
-            return
         if self._active_cancel_watchdog_task is None or self._active_cancel_watchdog_task.done():
             self._active_cancel_watchdog_task = asyncio.create_task(
                 self._active_cancel_watchdog_loop()

@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import pathlib
 import re
-from math import isfinite
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -54,7 +53,6 @@ if TYPE_CHECKING:
     from dayu.host.wait_adapter import WaitPollerRuntimePolicy
 
 _DEFAULT_COMMAND_MINIMUM_PROTECTION_TOKENS = 256
-_DEFAULT_ACTIVE_CANCEL_TIMEOUT_SECONDS = 300.0
 
 
 HOST_EVENT_STREAM_DEFAULT_LIMIT = 100
@@ -134,26 +132,6 @@ def _require_positive_float(value: float, *, field_name: str) -> None:
         raise TypeError(f"{field_name} must be float")
     if value <= 0:
         raise ValueError(f"{field_name} must be positive")
-
-
-def _require_optional_positive_finite_float(
-    value: float | None, *, field_name: str
-) -> None:
-    """校验可选浮点配置值为 ``None`` 或有限正数。
-
-    :param value: 待校验的浮点值或 ``None``。
-    :param field_name: 错误消息中使用的字段名。
-    :returns: 无返回值。
-    :raises TypeError: ``value`` 不是严格数值时抛出。
-    :raises ValueError: ``value`` 不是有限正数时抛出。
-    """
-
-    if value is None:
-        return
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        raise TypeError(f"{field_name} must be float")
-    if value <= 0 or not isfinite(value):
-        raise ValueError(f"{field_name} must be positive finite")
 
 
 def _require_path(value: pathlib.Path, *, field_name: str) -> None:
@@ -735,8 +713,6 @@ class HostLocalExecutionOptions:
     :param lane_heartbeat_interval_seconds: lane heartbeat 秒数。
     :param worker_startup_timeout_seconds: worker accept timeout 秒数。
     :param dispatch_poll_interval_seconds: dispatch 后台循环空闲轮询秒数。
-    :param active_cancel_timeout_seconds: active cancel 被接受后由 Host watchdog
-        收口为 cancelled 的超时秒数；``None`` 表示禁用该 watchdog。
     :param runner_spec: Engine Runner 规约。
     :param runner_options: Engine Runner 调用参数。
     :param agent_policy: Engine Agent policy。
@@ -789,7 +765,6 @@ class HostLocalExecutionOptions:
     memory_projection_catchup_batch_size: int = 128
     tooling_options: _HostToolingOptions | None = None
     enable_truncation_manager: bool = True
-    active_cancel_timeout_seconds: float | None = None
 
     def __post_init__(self) -> None:
         """校验本地执行配置。
@@ -838,10 +813,6 @@ class HostLocalExecutionOptions:
         _require_positive_float(
             self.dispatch_poll_interval_seconds,
             field_name=("HostLocalExecutionOptions.dispatch_poll_interval_seconds"),
-        )
-        _require_optional_positive_finite_float(
-            self.active_cancel_timeout_seconds,
-            field_name=("HostLocalExecutionOptions.active_cancel_timeout_seconds"),
         )
         if not isinstance(self.runner_spec, RunnerSpec):
             raise TypeError("HostLocalExecutionOptions.runner_spec must be RunnerSpec")
@@ -1033,8 +1004,6 @@ class OpenHostOptions:
     :param lane_heartbeat_interval_seconds: lane heartbeat 秒数。
     :param worker_startup_timeout_seconds: worker accept timeout 秒数。
     :param dispatch_poll_interval_seconds: dispatch 后台循环空闲轮询秒数。
-    :param active_cancel_timeout_seconds: active cancel 被接受后由 Host watchdog
-        收口为 cancelled 的超时秒数；``None`` 表示禁用该 watchdog。
     :param ordinary_run_baseline: 普通 Run 执行基线。
     :param worker_factory: 本地 worker factory typed port。
     :param tooling_options: construction-time 工具治理选项；无工具时为
@@ -1077,7 +1046,6 @@ class OpenHostOptions:
     memory_projection_catchup_batch_size: int
     enable_truncation_manager: bool
     wait_poller_policy: WaitPollerRuntimePolicy | None = None
-    active_cancel_timeout_seconds: float | None = _DEFAULT_ACTIVE_CANCEL_TIMEOUT_SECONDS
 
     def __post_init__(self) -> None:
         """校验 ``open_host`` 构造期选项。
@@ -1155,10 +1123,6 @@ class OpenHostOptions:
         _require_positive_float(
             self.dispatch_poll_interval_seconds,
             field_name="OpenHostOptions.dispatch_poll_interval_seconds",
-        )
-        _require_optional_positive_finite_float(
-            self.active_cancel_timeout_seconds,
-            field_name="OpenHostOptions.active_cancel_timeout_seconds",
         )
         if not isinstance(self.ordinary_run_baseline, OrdinaryRunExecutionBaseline):
             raise TypeError(

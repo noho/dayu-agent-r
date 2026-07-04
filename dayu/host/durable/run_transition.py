@@ -10,7 +10,6 @@ orchestration、WorkerProxy、Engine dispatch 或 public facade。
 from __future__ import annotations
 
 import json
-import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -105,6 +104,7 @@ _EVENT_TYPE_RUN_FAILED = "RUN_FAILED"
 _EVENT_TYPE_RUN_LOST = "RUN_LOST"
 _EVENT_TYPE_RESUME_REQUESTED = "RESUME_REQUESTED"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
+_ACTIVE_CANCEL_WATCHDOG_CLOSEOUT_REASON = "active_cancel_watchdog_closeout"
 _TERMINAL_STATUS_PAIRS: tuple[tuple[AttemptStatus, RunStatus], ...] = (
     (AttemptStatus.SUCCEEDED, RunStatus.SUCCEEDED),
     (AttemptStatus.FAILED, RunStatus.FAILED),
@@ -872,8 +872,8 @@ class ActiveCancelCloseoutInput:
 
 
 @dataclass(frozen=True, slots=True)
-class ActiveCancelTimeoutCloseoutInput:
-    """active cancel 超时后的 Host-owned terminal closeout 输入。
+class ActiveCancelWatchdogCloseoutInput:
+    """accepted cancel watchdog 的 Host-owned terminal closeout 输入。
 
     :param run_id: 目标 Run id。
     :param attempt_id: 目标 Attempt id。
@@ -882,8 +882,8 @@ class ActiveCancelTimeoutCloseoutInput:
     :param occurred_at: canonical facts 的发生时间。
     :param actor: 事件 actor。
     :param source: 事件 source。
-    :param timeout_seconds: active cancel 接受后的超时秒数，必须为有限正数。
-    :param timed_out_at: watchdog 判定超时的 UTC aware 时间。
+    :param cancel_requested_at: Host durable 观察到的取消请求时间文本。
+    :param closed_out_at: watchdog 收口的 UTC aware 时间。
     :param watchdog_owner: watchdog owner 诊断标识。
     :param worker_lifecycle_signal: worker lifecycle 诊断信号。
     :param last_observed_worker_event_index: 最后观察到的 worker event index；未知时为
@@ -898,8 +898,8 @@ class ActiveCancelTimeoutCloseoutInput:
     occurred_at: datetime
     actor: str
     source: str
-    timeout_seconds: float
-    timed_out_at: datetime
+    cancel_requested_at: str
+    closed_out_at: datetime
     watchdog_owner: str
     worker_lifecycle_signal: str
     last_observed_worker_event_index: int | None = None
@@ -2245,27 +2245,27 @@ def active_cancel_closeout_in_transaction(
     )
 
 
-def active_cancel_timeout_closeout_in_transaction(
+def active_cancel_watchdog_closeout_in_transaction(
     transaction: HostTransaction,
     event_log_store: EventLogStore,
-    request: ActiveCancelTimeoutCloseoutInput,
+    request: ActiveCancelWatchdogCloseoutInput,
 ) -> RunTransitionResult:
-    """active cancel 超时后由 Host watchdog 关闭 Attempt / Run 到 cancelled。
+    """accepted cancel 后由 Host watchdog 关闭 Attempt / Run 到 cancelled。
 
     :param transaction: 调用方提供的 Host transaction。
     :param event_log_store: EventLog append primitive。
-    :param request: active cancel timeout closeout 输入。
+    :param request: accepted cancel watchdog closeout 输入。
     :returns: transition 结果，前置状态不满足时返回 not_found/invalid_state/cas_lost。
     :raises HostDurableError: 输入字段、durable cancel fact 或 SQLite 写入无效时由底层抛出。
     """
 
-    _validate_active_cancel_timeout_closeout_input(request)
+    _validate_active_cancel_watchdog_closeout_input(request)
     run = read_run_by_id(transaction, request.run_id)
     attempt = read_attempt_by_id(transaction, request.attempt_id)
     dispatch_record = read_dispatch_record_by_attempt_id(
         transaction, request.attempt_id
     )
-    replay_result = _active_cancel_timeout_replay_result(
+    replay_result = _active_cancel_watchdog_replay_result(
         run=run,
         attempt=attempt,
         dispatch_record=dispatch_record,
@@ -2273,7 +2273,7 @@ def active_cancel_timeout_closeout_in_transaction(
     )
     if replay_result is not None:
         return replay_result
-    invalid = _invalid_active_cancel_timeout_closeout_precondition(
+    invalid = _invalid_active_cancel_watchdog_closeout_precondition(
         run=run,
         attempt=attempt,
         dispatch_record=dispatch_record,
@@ -2295,11 +2295,11 @@ def active_cancel_timeout_closeout_in_transaction(
             dispatch_record=dispatch_record,
         )
     if run is None or attempt is None or dispatch_record is None:
-        raise HostDurableError("active cancel timeout closeout narrowing failed")
+        raise HostDurableError("active cancel watchdog closeout narrowing failed")
 
     attempt_event = event_log_store.append_event(
         transaction,
-        _active_timeout_attempt_cancelled_event_request(
+        _active_watchdog_attempt_cancelled_event_request(
             request=request,
             run=run,
             attempt=attempt,
@@ -2310,7 +2310,7 @@ def active_cancel_timeout_closeout_in_transaction(
     ).row
     run_event = event_log_store.append_event(
         transaction,
-        _active_timeout_run_cancelled_event_request(
+        _active_watchdog_run_cancelled_event_request(
             request=request,
             run=run,
             attempt=attempt,
@@ -2330,7 +2330,7 @@ def active_cancel_timeout_closeout_in_transaction(
     )
     attempt_result = _require_attempt_mutation_updated(
         attempt_result,
-        mutation_name="cancel active timeout Attempt",
+        mutation_name="cancel active watchdog Attempt",
     )
     run_result = cancel_cancelling_run_row(
         transaction,
@@ -2342,7 +2342,7 @@ def active_cancel_timeout_closeout_in_transaction(
     )
     run_result = _require_run_mutation_updated(
         run_result,
-        mutation_name="cancel active timeout Run",
+        mutation_name="cancel active watchdog Run",
     )
     return RunTransitionResult(
         status=run_result.status,
@@ -4302,18 +4302,18 @@ def _active_run_cancelled_event_request(
     )
 
 
-def _active_timeout_attempt_cancelled_event_request(
+def _active_watchdog_attempt_cancelled_event_request(
     *,
-    request: ActiveCancelTimeoutCloseoutInput,
+    request: ActiveCancelWatchdogCloseoutInput,
     run: RunRow,
     attempt: AttemptRow,
     dispatch_record: DispatchRecordRow,
     cancelling: EventLogRow,
     cancel_request_event_id: str,
 ) -> EventLogAppendRequest:
-    """构造 active cancel timeout ``ATTEMPT_CANCELLED`` 事件。
+    """构造 accepted cancel watchdog ``ATTEMPT_CANCELLED`` 事件。
 
-    :param request: active cancel timeout closeout 输入。
+    :param request: accepted cancel watchdog closeout 输入。
     :param run: 目标 Run row。
     :param attempt: 目标 Attempt row。
     :param dispatch_record: 目标 dispatch record。
@@ -4336,8 +4336,8 @@ def _active_timeout_attempt_cancelled_event_request(
         client_request_id=None,
         idempotency_key=None,
         policy_decision=None,
-        reason={"reason": "active_cancel_timeout"},
-        payload_json=_active_timeout_cancelled_payload(
+        reason={"reason": _ACTIVE_CANCEL_WATCHDOG_CLOSEOUT_REASON},
+        payload_json=_active_watchdog_cancelled_payload(
             request=request,
             run=run,
             attempt=attempt,
@@ -4351,9 +4351,9 @@ def _active_timeout_attempt_cancelled_event_request(
     )
 
 
-def _active_timeout_run_cancelled_event_request(
+def _active_watchdog_run_cancelled_event_request(
     *,
-    request: ActiveCancelTimeoutCloseoutInput,
+    request: ActiveCancelWatchdogCloseoutInput,
     run: RunRow,
     attempt: AttemptRow,
     attempt_cancelled_event_id: str,
@@ -4361,9 +4361,9 @@ def _active_timeout_run_cancelled_event_request(
     cancelling: EventLogRow,
     cancel_request_event_id: str,
 ) -> EventLogAppendRequest:
-    """构造 active cancel timeout ``RUN_CANCELLED`` 事件。
+    """构造 accepted cancel watchdog ``RUN_CANCELLED`` 事件。
 
-    :param request: active cancel timeout closeout 输入。
+    :param request: accepted cancel watchdog closeout 输入。
     :param run: 目标 Run row。
     :param attempt: 目标 Attempt row。
     :param attempt_cancelled_event_id: ``ATTEMPT_CANCELLED`` event id。
@@ -4387,8 +4387,8 @@ def _active_timeout_run_cancelled_event_request(
         client_request_id=None,
         idempotency_key=None,
         policy_decision=None,
-        reason={"reason": "active_cancel_timeout"},
-        payload_json=_active_timeout_cancelled_payload(
+        reason={"reason": _ACTIVE_CANCEL_WATCHDOG_CLOSEOUT_REASON},
+        payload_json=_active_watchdog_cancelled_payload(
             request=request,
             run=run,
             attempt=attempt,
@@ -4402,9 +4402,9 @@ def _active_timeout_run_cancelled_event_request(
     )
 
 
-def _active_timeout_cancelled_payload(
+def _active_watchdog_cancelled_payload(
     *,
-    request: ActiveCancelTimeoutCloseoutInput,
+    request: ActiveCancelWatchdogCloseoutInput,
     run: RunRow,
     attempt: AttemptRow,
     dispatch_record: DispatchRecordRow,
@@ -4412,9 +4412,9 @@ def _active_timeout_cancelled_payload(
     cancel_request_event_id: str,
     attempt_cancelled_event_id: str | None,
 ) -> Mapping[str, JsonValue]:
-    """构造 active cancel timeout cancelled payload。
+    """构造 accepted cancel watchdog cancelled payload。
 
-    :param request: active cancel timeout closeout 输入。
+    :param request: accepted cancel watchdog closeout 输入。
     :param run: 目标 Run row。
     :param attempt: 目标 Attempt row。
     :param dispatch_record: 目标 dispatch record。
@@ -4422,7 +4422,7 @@ def _active_timeout_cancelled_payload(
     :param cancel_request_event_id: 从 ``RUN_CANCELLING`` payload 读取的 cancel request id。
     :param attempt_cancelled_event_id: Run terminal 引用的 Attempt terminal event id；
         Attempt terminal payload 中为 ``None``。
-    :returns: timeout cancelled payload。
+    :returns: watchdog closeout cancelled payload。
     """
 
     payload: dict[str, JsonValue] = {
@@ -4433,10 +4433,9 @@ def _active_timeout_cancelled_payload(
         "dispatch_record_id": dispatch_record.dispatch_record_id,
         "cancel_request_event_id": cancel_request_event_id,
         "run_cancelling_event_id": cancelling.event_id,
-        "reason": "active_cancel_timeout",
-        "timeout_seconds": request.timeout_seconds,
-        "cancel_requested_at": _normalized_event_occurred_at(cancelling),
-        "timed_out_at": format_utc_timestamp(request.timed_out_at),
+        "reason": _ACTIVE_CANCEL_WATCHDOG_CLOSEOUT_REASON,
+        "cancel_requested_at": request.cancel_requested_at,
+        "closed_out_at": format_utc_timestamp(request.closed_out_at),
         "watchdog_owner": request.watchdog_owner,
         "worker_lifecycle_signal": request.worker_lifecycle_signal,
         "last_observed_worker_event_index": (
@@ -5027,19 +5026,19 @@ def _terminal_closeout_replay_result(
     return None
 
 
-def _active_cancel_timeout_replay_result(
+def _active_cancel_watchdog_replay_result(
     *,
     run: RunRow | None,
     attempt: AttemptRow | None,
     dispatch_record: DispatchRecordRow | None,
-    request: ActiveCancelTimeoutCloseoutInput,
+    request: ActiveCancelWatchdogCloseoutInput,
 ) -> RunTransitionResult | None:
-    """识别 active cancel timeout closeout 的同终态 replay。
+    """识别 accepted cancel watchdog closeout 的同终态 replay。
 
     :param run: 最新 Run row。
     :param attempt: 最新 Attempt row。
     :param dispatch_record: 最新 dispatch record row；缺失时为 ``None``。
-    :param request: active cancel timeout closeout 输入。
+    :param request: accepted cancel watchdog closeout 输入。
     :returns: 已处于同种 cancelled terminal 时返回 ``UPDATED``，否则返回 ``None``。
     """
 
@@ -5060,14 +5059,14 @@ def _active_cancel_timeout_replay_result(
     return None
 
 
-def _invalid_active_cancel_timeout_closeout_precondition(
+def _invalid_active_cancel_watchdog_closeout_precondition(
     *,
     run: RunRow | None,
     attempt: AttemptRow | None,
     dispatch_record: DispatchRecordRow | None,
     attempt_id: str,
 ) -> RunTransitionResult | None:
-    """检查 active cancel timeout closeout 前置状态。
+    """检查 accepted cancel watchdog closeout 前置状态。
 
     :param run: 目标 Run row。
     :param attempt: 目标 Attempt row。
@@ -6256,12 +6255,12 @@ def _validate_active_cancel_closeout_input(
     _require_non_empty_text(request.finished_at, field_name="finished_at")
 
 
-def _validate_active_cancel_timeout_closeout_input(
-    request: ActiveCancelTimeoutCloseoutInput,
+def _validate_active_cancel_watchdog_closeout_input(
+    request: ActiveCancelWatchdogCloseoutInput,
 ) -> None:
-    """校验 active cancel timeout closeout 输入。
+    """校验 accepted cancel watchdog closeout 输入。
 
-    :param request: active cancel timeout closeout 输入。
+    :param request: accepted cancel watchdog closeout 输入。
     :returns: ``None``。
     :raises HostDurableError: 任一字段无效时抛出。
     """
@@ -6278,8 +6277,10 @@ def _validate_active_cancel_timeout_closeout_input(
     )
     _require_non_empty_text(request.actor, field_name="actor")
     _require_non_empty_text(request.source, field_name="source")
-    if not math.isfinite(request.timeout_seconds) or request.timeout_seconds <= 0:
-        raise HostDurableError("timeout_seconds must be finite and positive")
+    _require_non_empty_text(
+        request.cancel_requested_at,
+        field_name="cancel_requested_at",
+    )
     _require_non_empty_text(request.watchdog_owner, field_name="watchdog_owner")
     _require_non_empty_text(
         request.worker_lifecycle_signal,
@@ -6317,20 +6318,6 @@ def _cancel_request_event_id_from_cancelling(event: EventLogRow | None) -> str |
     if not isinstance(raw, str) or raw.strip() == "":
         return None
     return raw
-
-
-def _normalized_event_occurred_at(event: EventLogRow) -> str:
-    """把 EventLog occurred_at 规范化为 Host UTC timestamp。
-
-    :param event: EventLog row。
-    :returns: 固定微秒精度 UTC timestamp 文本。
-    :raises HostDurableError: occurred_at 不是 Host durable timestamp 时抛出。
-    """
-
-    try:
-        return format_utc_timestamp(parse_utc_timestamp(event.occurred_at))
-    except ValueError as exc:
-        raise HostDurableError("event occurred_at must be canonical UTC") from exc
 
 
 def _validate_common_cancel_input(

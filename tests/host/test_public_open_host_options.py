@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import pathlib
 from collections.abc import AsyncIterator
 from dataclasses import fields, is_dataclass, replace
@@ -248,6 +249,17 @@ def test_open_host_option_types_are_frozen_slots_dataclasses() -> None:
         assert dataclass_type.__slots__ == tuple(
             field.name for field in fields(dataclass_type)
         )
+
+
+def test_open_host_options_do_not_accept_removed_active_cancel_budget() -> None:
+    """OpenHostOptions 不再暴露或接受已删除的 active cancel 等待预算字段。"""
+
+    field_names = {field.name for field in fields(OpenHostOptions)}
+    constructor_parameters = inspect.signature(OpenHostOptions).parameters
+    removed_field_name = "active_cancel" + "_timeout_seconds"
+
+    assert removed_field_name not in field_names
+    assert removed_field_name not in constructor_parameters
 
 
 def test_open_host_options_validate_lane_and_baseline(
