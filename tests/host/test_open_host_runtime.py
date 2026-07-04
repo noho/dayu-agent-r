@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import pathlib
+import sqlite3
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -23,6 +24,8 @@ from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.host import (
     AttemptDispatchSnapshot,
+    CancelMode,
+    CancelRunRequest,
     CloseSessionRequest,
     CompactorRunnerBaseline,
     EnsureSessionRequest,
@@ -617,6 +620,109 @@ async def test_open_host_startup_recovery_dispatches_gracefully_closed_run(
 
 
 @pytest.mark.asyncio
+async def test_open_host_active_cancel_watchdog_public_watch_observes_cancelled(
+    tmp_path: pathlib.Path,
+) -> None:
+    """timeout closeout 后 public watch 与 get_run 观察到 cancelled 终态。"""
+
+    factory = _ControlledFinalAnswerWorkerFactory()
+    options = replace(
+        _options(tmp_path, factory),
+        active_cancel_timeout_seconds=0.5,
+    )
+    async with open_host(options) as host:
+        session = await host.ensure_session(_ensure_request())
+        followup = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "followup-active-cancel-timeout"),
+        )
+        await asyncio.wait_for(factory.accepted_event.wait(), timeout=1)
+        cancelling = await host.cancel_run(
+            followup.accepted_run_id,
+            _cancel_request("cancel-active-timeout"),
+        )
+        watcher = host.watch_session_events(session.session_id)
+        terminal_task = asyncio.create_task(_next_terminal(watcher))
+        cast(_PublicHostHandle, host)._scheduler.tick_active_cancel_watchdog(
+            datetime(2030, 1, 1, tzinfo=UTC)
+        )
+        terminal = await asyncio.wait_for(terminal_task, timeout=1)
+        await _close_iterator(watcher)
+        final_run = await host.get_run(followup.accepted_run_id)
+
+    assert cancelling.status is RunStatus.CANCELLING
+    assert terminal.kind is HostEventKind.CANCELLED
+    assert terminal.run_id == followup.accepted_run_id
+    assert final_run.status is RunStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_open_host_reopen_closes_existing_cancelling_run_as_cancelled(
+    tmp_path: pathlib.Path,
+) -> None:
+    """clean-close/reopen 后已超时 accepted cancel 关闭为 CANCELLED 而非 LOST。"""
+
+    factory = _ControlledFinalAnswerWorkerFactory()
+    options = replace(
+        _options(tmp_path, factory),
+        active_cancel_timeout_seconds=0.5,
+    )
+    async with open_host(options) as host:
+        session = await host.ensure_session(_ensure_request())
+        followup = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "followup-reopen-timeout"),
+        )
+        await asyncio.wait_for(factory.accepted_event.wait(), timeout=1)
+        await host.cancel_run(
+            followup.accepted_run_id,
+            _cancel_request("cancel-reopen-timeout"),
+        )
+        run_id = followup.accepted_run_id
+
+    _force_cancel_requested_at(options.db_path, run_id, "2020-01-01T00:00:00.000000Z")
+
+    async with open_host(replace(options, worker_factory=_FinalAnswerWorkerFactory())) as host:
+        final_run = await host.get_run(run_id)
+
+    assert final_run.status is RunStatus.CANCELLED
+    assert _event_type_count(options.db_path, "RUN_CANCELLED") == 1
+    assert _event_type_count(options.db_path, "RUN_LOST") == 0
+
+
+@pytest.mark.asyncio
+async def test_open_host_reopen_before_timeout_defers_cancelling_to_watchdog(
+    tmp_path: pathlib.Path,
+) -> None:
+    """reopen 未超时时 recovery defer accepted-cancel CANCELLING 且不写 RUN_LOST。"""
+
+    factory = _ControlledFinalAnswerWorkerFactory()
+    options = replace(
+        _options(tmp_path, factory),
+        active_cancel_timeout_seconds=300.0,
+    )
+    async with open_host(options) as host:
+        session = await host.ensure_session(_ensure_request())
+        followup = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "followup-reopen-before-timeout"),
+        )
+        await asyncio.wait_for(factory.accepted_event.wait(), timeout=1)
+        await host.cancel_run(
+            followup.accepted_run_id,
+            _cancel_request("cancel-reopen-before-timeout"),
+        )
+        run_id = followup.accepted_run_id
+
+    async with open_host(replace(options, worker_factory=_FinalAnswerWorkerFactory())) as host:
+        snapshot = await host.get_run(run_id)
+
+    assert snapshot.status is RunStatus.CANCELLING
+    assert _event_type_count(options.db_path, "RUN_LOST") == 0
+    assert _event_type_count(options.db_path, "RUN_CANCELLED") == 0
+
+
+@pytest.mark.asyncio
 async def test_public_host_close_closes_command_handle_when_scheduler_close_raises() -> None:
     """scheduler close 抛错时仍会追平 projection 并关闭 command handle。"""
 
@@ -1200,6 +1306,47 @@ def _durable_options_from_open_options(
     )
 
 
+def _force_cancel_requested_at(
+    db_path: pathlib.Path,
+    run_id: str,
+    occurred_at: str,
+) -> None:
+    """把测试 Run 的 cancel facts 发生时间改到指定 UTC 文本。
+
+    :param db_path: Host durable SQLite DB 路径。
+    :param run_id: 目标 Run id。
+    :param occurred_at: UTC timestamp 文本。
+    :returns: ``None``。
+    """
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            UPDATE event_log
+            SET occurred_at = ?
+            WHERE run_id = ? AND event_type IN ('CANCEL_REQUESTED', 'RUN_CANCELLING')
+            """,
+            (occurred_at, run_id),
+        )
+
+
+def _event_type_count(db_path: pathlib.Path, event_type: str) -> int:
+    """统计指定 EventLog 类型数量。
+
+    :param db_path: Host durable SQLite DB 路径。
+    :param event_type: event type。
+    :returns: 匹配事件数。
+    """
+
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) FROM event_log WHERE event_type = ?",
+            (event_type,),
+        ).fetchone()
+    assert row is not None
+    return int(row[0])
+
+
 def _options(
     tmp_path: pathlib.Path,
     worker_factory: LocalEngineWorkerFactory,
@@ -1391,6 +1538,21 @@ def _followup_request(
         agent_policy=None,
         behavior=FollowupBehavior.QUEUE,
         target_run_id=None,
+    )
+
+
+def _cancel_request(client_request_id: str) -> CancelRunRequest:
+    """构造 cancel_run 请求。
+
+    :param client_request_id: 幂等请求 id。
+    :returns: CancelRunRequest。
+    """
+
+    return CancelRunRequest(
+        context=_context(client_request_id),
+        client_request_id=client_request_id,
+        reason="open_host_runtime_cancel",
+        mode=CancelMode.GRACEFUL,
     )
 
 

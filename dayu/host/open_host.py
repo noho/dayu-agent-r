@@ -14,6 +14,7 @@ from concurrent.futures import Future
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
 from typing import TYPE_CHECKING
@@ -888,11 +889,15 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                 active_registry=active_registry,
                 projection_catchup_port=None,
             )
+            scheduler.tick_active_cancel_watchdog(datetime.now(UTC))
             StartupRecoveryScanner(
                 transaction_runner=durable_store.transaction_runner,
                 event_log_store=EventLogStore(),
                 dispatch_wakeup_port=scheduler,
                 recovery_owner_host_instance_id=scheduler.host_instance_id,
+                defer_accepted_cancel_to_watchdog=(
+                    local_execution.active_cancel_timeout_seconds is not None
+                ),
             ).scan()
             admission_service = create_host_admission_service(
                 durable_store.transaction_runner,
@@ -906,6 +911,7 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                 durable_store=durable_store,
                 admission_service=admission_service,
                 active_registry=active_registry,
+                active_cancel_watchdog_wakeup_port=scheduler,
             )
             wait_poller = _wait_poller_supervisor_from_open_host_options(
                 self._options,
@@ -1296,6 +1302,7 @@ def _local_execution_options_from_open_host_options(
         memory_projection_catchup_batch_size=(options.memory_projection_catchup_batch_size),
         tooling_options=options.tooling_options,
         enable_truncation_manager=options.enable_truncation_manager,
+        active_cancel_timeout_seconds=options.active_cancel_timeout_seconds,
     )
 
 
