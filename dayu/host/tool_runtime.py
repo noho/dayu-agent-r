@@ -30,7 +30,14 @@ from dayu.contracts.tool_call import (
     ToolCallRequest,
 )
 from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
-from dayu.contracts.tool_execution import AsyncDirectToolExecutionCapability
+from dayu.contracts.tool_execution import (
+    AsyncDirectToolExecutionCapability,
+    ProcessBackedToolContext,
+    ProcessBackedToolExecutionCapability,
+    ThreadBackedToolExecutionCapability,
+    ToolExecutionCapability,
+    ToolExecutionMode,
+)
 from dayu.contracts.tool_executor import ToolExecutor
 from dayu.contracts.tool_outcome import (
     BatchToolExecutionOutcome,
@@ -235,6 +242,20 @@ _TOOL_RUNTIME_AWAITING_ACCEPT_REJECTED_ERROR = "tool_awaiting_accept_rejected"
 _TOOL_RUNTIME_AWAITING_ACCEPT_TIMEOUT_ERROR = "tool_awaiting_accept_timeout"
 _TOOL_RUNTIME_UNKNOWN_TOOL_ERROR = "tool_not_found"
 _TOOL_RUNTIME_CALLABLE_FAILED_ERROR = "tool_callable_failed"
+_TOOL_RUNTIME_CAPSULE_BUILD_FAILED_ERROR = "tool_capsule_build_failed"
+_PROCESS_BACKED_TOOL_FAILED_ERROR = "process_backed_tool_failed"
+_PROCESS_BACKED_TOOL_MALFORMED_ENVELOPE_ERROR = "process_backed_tool_malformed_envelope"
+_PROCESS_BACKED_TOOL_UNSUPPORTED_ENVELOPE_ERROR = "process_backed_tool_unsupported_envelope"
+_PROCESS_BACKED_TOOL_UNEXPECTED_PENDING_ERROR = "process_backed_tool_unexpected_pending"
+_PROCESS_ENVELOPE_STATUS_FIELD = "status"
+_PROCESS_ENVELOPE_COMPLETED_STATUS = "completed"
+_PROCESS_ENVELOPE_FAILED_STATUS = "failed"
+_PROCESS_ENVELOPE_COMPLETED_VALUE_FIELD = "value"
+_PROCESS_ENVELOPE_FAILED_ERROR_TYPE_FIELD = "error_type"
+_PROCESS_ENVELOPE_FAILED_MESSAGE_FIELD = "message"
+_PROCESS_ENVELOPE_RESERVED_STATUSES = frozenset(
+    ("awaiting", "cancelled", "timeout", "host_cancelled")
+)
 _TOOL_RUNTIME_NO_TOOL_REASON = "tool_call_not_allowed_in_scope"
 _TOOL_RUNTIME_IDEMPOTENCY_REASON = "tool_idempotency_key_required"
 _TOOL_RUNTIME_UNSUPPORTED_AWAITING_REASON = "unsupported_awaiting"
@@ -352,14 +373,6 @@ class ToolSideEffectKind(StrEnum):
     READ_ONLY = "read_only"
     SIDE_EFFECT = "side_effect"
     PAID = "paid"
-
-
-class ToolExecutionMode(StrEnum):
-    """工具执行 capsule 模式。"""
-
-    ASYNC_DIRECT = "async_direct"
-    THREAD_BACKED = "thread_backed"
-    PROCESS_BACKED = "process_backed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1510,6 +1523,130 @@ class DefaultToolExecutionCapsuleFactory:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _ThreadBackedDispatchTarget:
+    """在线程中运行默认工具 dispatcher 的同步目标。"""
+
+    call: ToolCallRequest
+    context: BatchToolExecutionContext
+    dispatcher: ToolDispatcher
+
+    def __call__(self) -> ToolExecutionOutcome:
+        """在当前线程的新事件循环中运行工具 dispatcher。
+
+        :returns: 工具执行 outcome。
+        :raises Exception: dispatcher 抛出的异常透传给 capsule 外层归一。
+        """
+
+        return asyncio.run(self.dispatcher.dispatch_tool_call(self.call, self.context))
+
+
+class DeclaredToolExecutionCapsuleFactory:
+    """基于工具声明 execution capability 创建执行 capsule 的 factory。"""
+
+    def __init__(self, effective_bundle: "EffectiveToolBundle") -> None:
+        """初始化 declaration-backed factory。
+
+        :param effective_bundle: attempt-local effective 工具集合。
+        :returns: ``None``。
+        """
+
+        self._definitions_by_name = effective_bundle.definitions_by_name
+
+    def create_capsule(
+        self,
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+        dispatcher: ToolDispatcher,
+    ) -> ToolExecutionCapsule:
+        """按 ``ToolDefinition.execution`` 创建单工具 execution capsule。
+
+        :param call: 单次工具调用请求。
+        :param context: 批式工具执行上下文。
+        :param dispatcher: 当前 ToolRuntime dispatcher。
+        :returns: 与工具声明匹配的 execution capsule。
+        :raises ValueError: 工具声明缺失时抛出。
+        :raises TypeError: execution capability 类型未知时抛出。
+        :raises Exception: process target factory 构造目标失败时透传。
+        """
+
+        definition = self._definitions_by_name.get(call.name)
+        if definition is None:
+            raise ValueError(f"tool is not available: {call.name}")
+        return _declared_capsule_for_execution(
+            execution=definition.execution,
+            call=call,
+            context=context,
+            dispatcher=dispatcher,
+        )
+
+
+def _declared_capsule_for_execution(
+    *,
+    execution: ToolExecutionCapability,
+    call: ToolCallRequest,
+    context: BatchToolExecutionContext,
+    dispatcher: ToolDispatcher,
+) -> ToolExecutionCapsule:
+    """把声明式 execution capability 映射为 Host execution capsule。
+
+    :param execution: 工具声明中的执行能力。
+    :param call: 单次工具调用请求。
+    :param context: 批式工具执行上下文。
+    :param dispatcher: 当前 ToolRuntime dispatcher。
+    :returns: 对应的 execution capsule。
+    :raises TypeError: 遇到未知 execution capability 类型时抛出。
+    :raises Exception: process target factory 构造目标失败时透传。
+    """
+
+    if isinstance(execution, AsyncDirectToolExecutionCapability):
+        return AsyncDirectToolExecutionCapsule(
+            call=call,
+            context=context,
+            dispatcher=dispatcher,
+        )
+    if isinstance(execution, ThreadBackedToolExecutionCapability):
+        return ThreadBackedToolExecutionCapsule(
+            _ThreadBackedDispatchTarget(
+                call=call,
+                context=context,
+                dispatcher=dispatcher,
+            )
+        )
+    if isinstance(execution, ProcessBackedToolExecutionCapability):
+        target = execution.target_factory.build_process_target(
+            call,
+            _process_backed_context_from_batch_context(context),
+        )
+        return ProcessBackedToolExecutionCapsule(target)
+    raise TypeError(
+        f"unsupported tool execution capability: {type(execution).__name__}"
+    )
+
+
+def _process_backed_context_from_batch_context(
+    context: BatchToolExecutionContext,
+) -> ProcessBackedToolContext:
+    """把批式执行上下文投影为子进程可序列化上下文。
+
+    投影只保留 run_id、session_id、iteration_id、timeout_seconds 与
+    correlation_id，不携带 cancellation_token、locks、runtime、repository、
+    session 对象或 Host 内部对象。
+
+    :param context: 批式工具执行上下文。
+    :returns: process-backed 工具目标构造上下文。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return ProcessBackedToolContext(
+        run_id=context.run_id,
+        session_id=context.session_id,
+        iteration_id=context.iteration_id,
+        timeout_seconds=context.timeout_seconds,
+        correlation_id=context.correlation_id,
+    )
+
+
 class ThreadBackedToolCallable(Protocol):
     """thread-backed 测试 callable 协议。"""
 
@@ -1619,7 +1756,7 @@ class ProcessBackedToolExecutionCapsule:
     def __init__(self, target: InterruptibleProcessTarget) -> None:
         """初始化 process-backed capsule。
 
-        :param target: 可序列化子进程目标；返回值会作为工具成功 value。
+        :param target: 可序列化子进程目标；返回值必须是工具 JSON 信封。
         :returns: ``None``。
         """
 
@@ -1647,12 +1784,10 @@ class ProcessBackedToolExecutionCapsule:
         self._handle.start()
         result = await self._handle.wait(timeout_seconds=None)
         if isinstance(result, InterruptibleProcessCompleted):
-            return ToolCompletedOutcome(
-                result=ToolResultSuccess(ok=True, value=result.value, meta=None)
-            )
+            return _tool_outcome_from_process_envelope(result.value)
         if isinstance(result, InterruptibleProcessFailed):
             return _tool_failed_outcome(
-                error="process_backed_tool_failed",
+                error=_PROCESS_BACKED_TOOL_FAILED_ERROR,
                 message=(
                     f"process-backed tool failed: {result.error_type}: "
                     f"{result.message}"
@@ -1661,7 +1796,7 @@ class ProcessBackedToolExecutionCapsule:
             )
         if isinstance(result, InterruptibleProcessStillRunning):
             return _tool_failed_outcome(
-                error="process_backed_tool_unexpected_pending",
+                error=_PROCESS_BACKED_TOOL_UNEXPECTED_PENDING_ERROR,
                 message="process-backed tool wait returned pending without timeout",
                 hint=None,
             )
@@ -2584,8 +2719,8 @@ class ToolRuntimeBuildRequest:
     :param duplicate_governance_policy: ToolRuntime 使用的 duplicate governance
         策略。
     :param diagnostic_emitter: 诊断 emitter；无则使用确定性内存引用实现。
-    :param execution_capsule_factory: 内部 execution capsule factory；无则使用
-        默认 async direct capsule。
+    :param execution_capsule_factory: 测试用内部 execution capsule factory
+        override；无则按 effective ``ToolDefinition.execution`` 创建 capsule。
     """
 
     effective_bundle_request: EffectiveToolBundleBuildRequest
@@ -2604,9 +2739,7 @@ class ToolRuntimeBuildRequest:
         default_factory=DuplicateGovernancePolicy
     )
     diagnostic_emitter: ToolTraceDiagnosticEmitter | None = None
-    execution_capsule_factory: ToolExecutionCapsuleFactory = field(
-        default_factory=DefaultToolExecutionCapsuleFactory
-    )
+    execution_capsule_factory: ToolExecutionCapsuleFactory | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2833,7 +2966,7 @@ class ToolRuntimeExecutor:
                     durable_missing_reason = _durable_missing_reason_for_policy(
                         policy_decision
                     )
-                if _is_callable_exception_outcome(raw_outcome):
+                if _is_runtime_dispatch_exception_outcome(raw_outcome):
                     durable_missing_reason = DuplicateDurableMissingReason.TOOL_EXCEPTION
                     return BatchToolExecutionRecord(
                         tool_call_id=call.tool_call_id,
@@ -3062,11 +3195,24 @@ class ToolRuntimeExecutor:
                 context.cancellation_token.cancel_reason()
             )
             return _governed_failure_outcome(decision), decision
-        capsule = self._execution_capsule_factory.create_capsule(
-            call,
-            context,
-            self._dispatcher,
-        )
+        try:
+            capsule = self._execution_capsule_factory.create_capsule(
+                call,
+                context,
+                self._dispatcher,
+            )
+        except Exception as exc:
+            return (
+                _tool_failed_outcome(
+                    error=_TOOL_RUNTIME_CAPSULE_BUILD_FAILED_ERROR,
+                    message=(
+                        "tool execution capsule build failed: "
+                        f"{exc.__class__.__name__}: {exc}"
+                    ),
+                    hint=None,
+                ),
+                None,
+            )
         capsule_task = asyncio.create_task(capsule.run())
         try:
             wait_result = await wait_for_or_cancel(
@@ -3835,6 +3981,11 @@ class DefaultToolRuntimeFactory:
             duplicate_governance = InMemoryAttemptDuplicateGovernance(
                 request.duplicate_governance_policy
             )
+            execution_capsule_factory = (
+                request.execution_capsule_factory
+                if request.execution_capsule_factory is not None
+                else DeclaredToolExecutionCapsuleFactory(effective_bundle)
+            )
             executor: ToolExecutor = ToolRuntimeExecutor(
                 effective_bundle=effective_bundle,
                 execution_scope=request.execution_scope,
@@ -3849,7 +4000,7 @@ class DefaultToolRuntimeFactory:
                 retry_policy=request.retry_policy,
                 policy_view=request.policy_view,
                 diagnostic_emitter=diagnostic_emitter,
-                execution_capsule_factory=request.execution_capsule_factory,
+                execution_capsule_factory=execution_capsule_factory,
             )
         else:
             executor = ToolRuntimeUnsupportedExecutor(effective_bundle)
@@ -6361,16 +6512,128 @@ def _durable_missing_reason_for_awaiting_accept_result(
     return DuplicateDurableMissingReason.HOST_ACCEPT_TIMEOUT
 
 
-def _is_callable_exception_outcome(outcome: ToolExecutionOutcome) -> bool:
-    """判断 outcome 是否来自业务工具 callable 异常。
+def _is_runtime_dispatch_exception_outcome(outcome: ToolExecutionOutcome) -> bool:
+    """判断 outcome 是否来自工具 dispatch / capsule 构造异常。
 
     :param outcome: 工具执行 outcome。
-    :returns: callable 异常被 ToolRuntime 归一化时返回 ``True``。
+    :returns: dispatch 或 capsule 构造异常被 ToolRuntime 归一化时返回 ``True``。
     """
 
     return (
         isinstance(outcome, ToolFailedOutcome)
-        and outcome.result.error == _TOOL_RUNTIME_CALLABLE_FAILED_ERROR
+        and outcome.result.error
+        in {
+            _TOOL_RUNTIME_CALLABLE_FAILED_ERROR,
+            _TOOL_RUNTIME_CAPSULE_BUILD_FAILED_ERROR,
+        }
+    )
+
+
+def _tool_outcome_from_process_envelope(envelope: JsonValue) -> ToolExecutionOutcome:
+    """把 process-backed 子进程 JSON 信封解析为工具 outcome。
+
+    只有 ``completed`` 与 ``failed`` 是子进程允许表达的业务结果；未知、
+    malformed、awaiting、cancelled、timeout 与 host_cancelled 信封均
+    fail closed。父进程 cancel / timeout 由 Host capsule 外层独占治理。
+
+    :param envelope: 子进程返回的 JSON 值。
+    :returns: 工具 outcome。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if not isinstance(envelope, Mapping):
+        return _malformed_process_envelope_outcome("process envelope must be object")
+    status = envelope.get(_PROCESS_ENVELOPE_STATUS_FIELD)
+    if not isinstance(status, str):
+        return _malformed_process_envelope_outcome(
+            "process envelope status must be text"
+        )
+    if status == _PROCESS_ENVELOPE_COMPLETED_STATUS:
+        return _completed_outcome_from_process_envelope(envelope)
+    if status == _PROCESS_ENVELOPE_FAILED_STATUS:
+        return _failed_outcome_from_process_envelope(envelope)
+    if status in _PROCESS_ENVELOPE_RESERVED_STATUSES:
+        return _unsupported_process_envelope_outcome(status)
+    return _unsupported_process_envelope_outcome(status)
+
+
+def _completed_outcome_from_process_envelope(
+    envelope: Mapping[str, JsonValue],
+) -> ToolExecutionOutcome:
+    """解析 process-backed completed 信封。
+
+    :param envelope: 已确认 status 为 completed 的 JSON 对象。
+    :returns: 工具成功 outcome 或 fail-closed 失败 outcome。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if _PROCESS_ENVELOPE_COMPLETED_VALUE_FIELD not in envelope:
+        return _malformed_process_envelope_outcome(
+            "process completed envelope must contain value"
+        )
+    return ToolCompletedOutcome(
+        result=ToolResultSuccess(
+            ok=True,
+            value=envelope[_PROCESS_ENVELOPE_COMPLETED_VALUE_FIELD],
+            meta=None,
+        )
+    )
+
+
+def _failed_outcome_from_process_envelope(
+    envelope: Mapping[str, JsonValue],
+) -> ToolExecutionOutcome:
+    """解析 process-backed failed 信封。
+
+    :param envelope: 已确认 status 为 failed 的 JSON 对象。
+    :returns: 工具失败 outcome 或 fail-closed 失败 outcome。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    error_type = envelope.get(_PROCESS_ENVELOPE_FAILED_ERROR_TYPE_FIELD)
+    message = envelope.get(_PROCESS_ENVELOPE_FAILED_MESSAGE_FIELD)
+    if not isinstance(error_type, str) or error_type.strip() == "":
+        return _malformed_process_envelope_outcome(
+            "process failed envelope error_type must be non-empty text"
+        )
+    if not isinstance(message, str) or message.strip() == "":
+        return _malformed_process_envelope_outcome(
+            "process failed envelope message must be non-empty text"
+        )
+    return _tool_failed_outcome(
+        error=error_type,
+        message=message,
+        hint=None,
+    )
+
+
+def _malformed_process_envelope_outcome(message: str) -> ToolFailedOutcome:
+    """构造 process-backed malformed envelope 失败 outcome。
+
+    :param message: 失败诊断说明。
+    :returns: 工具失败 outcome。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return _tool_failed_outcome(
+        error=_PROCESS_BACKED_TOOL_MALFORMED_ENVELOPE_ERROR,
+        message=message,
+        hint=None,
+    )
+
+
+def _unsupported_process_envelope_outcome(status: str) -> ToolFailedOutcome:
+    """构造 process-backed unsupported envelope 失败 outcome。
+
+    :param status: 子进程返回的 unsupported status。
+    :returns: 工具失败 outcome。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return _tool_failed_outcome(
+        error=_PROCESS_BACKED_TOOL_UNSUPPORTED_ENVELOPE_ERROR,
+        message=f"process envelope status is not supported: {status}",
+        hint=None,
     )
 
 
@@ -7298,6 +7561,7 @@ def _awaiting_accept_failure_outcome(
 
 __all__ = [
     "AsyncDirectToolExecutionCapsule",
+    "DeclaredToolExecutionCapsuleFactory",
     "DefaultToolDispatcher",
     "DefaultToolExecutionCapsuleFactory",
     "DefaultToolRuntimeFactory",
