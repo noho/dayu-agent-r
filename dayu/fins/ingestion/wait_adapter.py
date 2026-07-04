@@ -55,6 +55,10 @@ from dayu.host.wait_adapter import (
     WaitActivationRequest,
     WaitAdapterBinding,
     WaitAdapterRegistry,
+    WaitExternalJobLifecycleAction,
+    WaitExternalJobLifecycleApplied,
+    WaitExternalJobLifecycleNoop,
+    WaitExternalJobLifecycleResult,
     WaitExternalJobRefSource,
     WaitPollLost,
     WaitPollNotReady,
@@ -89,6 +93,12 @@ _ERROR_FINS_OBSERVATION_FAILED: Final[str] = "fins_observation_failed"
 _ERROR_FINS_OBSERVATION_LOST: Final[str] = "fins_observation_lost"
 _MESSAGE_FINS_OBSERVATION_LOST: Final[str] = (
     "Fins observation is no longer available."
+)
+_ABANDON_REASON_INVALID_OBSERVATION_HANDLE: Final[str] = "invalid_observation_handle"
+_ABANDON_REASON_OBSERVATION_MISSING: Final[str] = "observation_missing"
+_ABANDON_REASON_OBSERVATION_ERROR_PREFIX: Final[str] = "observation_error"
+_ABANDON_APPLIED_MESSAGE: Final[str] = (
+    "Fins observation cancellation was requested and local observation tracking was released."
 )
 _TRANSIENT_PENDING_MAX_SECONDS: Final[float] = 300.0
 _ASYNC_RESULT_T = TypeVar("_ASYNC_RESULT_T")
@@ -137,24 +147,46 @@ class FinsIngestionWaitPollAdapter:
             return _poll_error_result(wait_record, exc)
         return _poll_snapshot_result(wait_record, snapshot)
 
-    def abandon_wait(self, wait_record: WaitRecordRow) -> None:
+    def abandon_wait(
+        self,
+        wait_record: WaitRecordRow,
+    ) -> WaitExternalJobLifecycleResult:
         """Host 放弃 wait 后 best-effort 取消并释放 Fins observation。
 
         :param wait_record: 已取消的 Host wait record 快照。
-        :returns: ``None``。
-        :raises Exception: 非 observation 缺失、损坏类异常会按 Host poller
-            约定向外抛出并计入 adapter error。
+        :returns: Host 外部 job lifecycle typed 结果；Fins 当前只在释放本地
+            observation handle 后返回 ``ABANDON`` applied，无法继续处理时返回
+            no-op。
+        :raises FinsObservationPollError: runtime 临时不可用时按原异常抛出，
+            交给 Host poller 退避重试。
         """
 
         handle = _handle_from_wait_record(wait_record)
         if handle is None:
-            return
+            return WaitExternalJobLifecycleNoop(
+                reason=_ABANDON_REASON_INVALID_OBSERVATION_HANDLE
+            )
         try:
-            _run_async_observation(self.runtime.cancel_observation(handle))
+            snapshot = _run_async_observation(self.runtime.cancel_observation(handle))
+            if snapshot.status is FinsObservationStatus.LOST:
+                return WaitExternalJobLifecycleNoop(
+                    reason=_ABANDON_REASON_OBSERVATION_MISSING
+                )
             _run_async_observation(self.runtime.abandon_observation(handle))
+            return WaitExternalJobLifecycleApplied(
+                action=WaitExternalJobLifecycleAction.ABANDON,
+                message=_ABANDON_APPLIED_MESSAGE,
+            )
         except FinsObservationPollError as exc:
             if exc.error_kind is FinsObservationPollErrorKind.TRANSIENT_UNAVAILABLE:
                 raise
+            if exc.error_kind is FinsObservationPollErrorKind.PERMANENT_NOT_FOUND:
+                return WaitExternalJobLifecycleNoop(
+                    reason=_ABANDON_REASON_OBSERVATION_MISSING
+                )
+            return WaitExternalJobLifecycleNoop(
+                reason=_observation_error_reason(exc.error_kind)
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -341,6 +373,17 @@ def _poll_error_result(
             return WaitPollLost(_lost_outcome())
         return WaitPollNotReady()
     return WaitPollLost(_lost_outcome())
+
+
+def _observation_error_reason(error_kind: FinsObservationPollErrorKind) -> str:
+    """把 observation 非临时错误分类映射为稳定 no-op reason。
+
+    :param error_kind: observation 错误分类。
+    :returns: Host lifecycle no-op 稳定原因。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return f"{_ABANDON_REASON_OBSERVATION_ERROR_PREFIX}:{error_kind.value}"
 
 
 def _poll_snapshot_result(

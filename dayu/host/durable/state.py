@@ -184,6 +184,8 @@ class WaitPollLastOutcome(StrEnum):
     ABANDON_ERROR = "abandon_error"
     SHUTDOWN_SKIPPED = "shutdown_skipped"
     ABANDONED = "abandoned"
+    ABANDON_UNSUPPORTED = "abandon_unsupported"
+    ABANDON_NOOP = "abandon_noop"
 
 
 class StateMutationStatus(StrEnum):
@@ -2206,6 +2208,7 @@ def mark_wait_record_poll_abandoned(
     claim_id: str,
     abandoned_at: str,
     updated_at: str,
+    last_outcome: WaitPollLastOutcome = WaitPollLastOutcome.ABANDONED,
 ) -> WaitRecordMutationResult:
     """标记 cancelled wait 的外部 abandon 已完成并释放 claim。
 
@@ -2214,6 +2217,7 @@ def mark_wait_record_poll_abandoned(
     :param claim_id: 调用方已取得的 claim id，必须与 row 当前 claim 匹配。
     :param abandoned_at: abandon 完成 UTC timestamp 文本。
     :param updated_at: 更新时间文本。
+    :param last_outcome: 写入的 terminal lifecycle diagnostic outcome。
     :returns: wait record mutation 结果。
     :raises HostDurableError: 输入字段非法时抛出。
     """
@@ -2226,6 +2230,8 @@ def mark_wait_record_poll_abandoned(
     )
     _require_non_empty_text(abandoned_at, field_name="poll_abandoned_at")
     _require_non_empty_text(updated_at, field_name="updated_at")
+    if not isinstance(last_outcome, WaitPollLastOutcome):
+        raise HostDurableError("poll_last_outcome is invalid")
     result = transaction.execute(
         f"""
         UPDATE {TABLE_HOST_WAIT_RECORDS}
@@ -2247,7 +2253,7 @@ def mark_wait_record_poll_abandoned(
           AND poll_abandoned_at IS NULL
         """,
         (
-            serialize_wait_poll_last_outcome(WaitPollLastOutcome.ABANDONED),
+            serialize_wait_poll_last_outcome(last_outcome),
             abandoned_at,
             updated_at,
             wait_id,
