@@ -58,18 +58,19 @@
 
 The residual-risk reconciliation artifact is `docs/reviews/wu-wait-03-residual-risk-reconciliation.md`.
 
-Items that remain active after WU-WAIT-03 are recorded in `docs/host/issues-implementation-control.md`:
+No active WU-WAIT-03 residual risk remains in `docs/host/issues-implementation-control.md`.
 
-- `WU-WAIT-03-R2`: stronger-than-cooperative Fins provider cancellation is deferred to `WU-FINS-CANCEL-01` / Fins provider/runtime owners if operational evidence requires it.
 - WU-WAIT-04 itself tracks production poller / adapter registry composition validation after #89 / #90 / #92 merge; this is not duplicated as a separate `WU-WAIT-03-R1` residual row.
+- Generic tool/provider blocking I/O hard interruption is tracked as ordinary deferred WU `WU-TOOLS-CANCEL-01`, not as a WU-WAIT-03 residual risk and not as a WU-WAIT-04 prerequisite.
 
 Items that are not active residual risks:
 
 - Provider lifecycle cleanup being best-effort and provider-specific is an accepted #92 design constraint, not an unresolved current-WU defect.
 - Future `CANCEL` / `REVOKE` durable diagnostic granularity is a future adapter guardrail because no current adapter returns those actions.
+- Stronger-than-cooperative interruption for blocking tool/provider runtime calls is a cross-tool provider/runtime hardening topic, not a Fins-only #92 remainder.
 - Missing GitHub checks are a repo infrastructure note; local validation is the current gate evidence.
 
-No unclassified blocking residual risk remains for WU-WAIT-03.
+No unclassified or active blocking residual risk remains for WU-WAIT-03.
 
 ## Issue Link And Closeout Status
 
