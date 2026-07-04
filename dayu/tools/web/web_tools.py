@@ -1177,7 +1177,7 @@ async def _call_search_web(
                 recency_days=recency_days,
                 max_results=max_results,
                 config=config,
-                timeout_budget=None,
+                timeout_budget=context.timeout_seconds,
                 cancellation_token=cancellation_token,
             )
     except WebSearchCancelledError as exc:
@@ -1271,7 +1271,7 @@ async def _call_fetch_web_page(
                 _fetch_web_page_business,
                 url=url,
                 config=config,
-                timeout_budget=None,
+                timeout_budget=context.timeout_seconds,
                 cancellation_token=cancellation_token,
             )
     except WebToolCancelledError as exc:
@@ -1323,7 +1323,7 @@ def _search_web_business(
     :param recency_days: 可选最近天数过滤。
     :param max_results: 返回结果上限。
     :param config: Web provider 配置。
-    :param timeout_budget: 单次工具调用预算；当前保持旧行为传 ``None``。
+    :param timeout_budget: 单次工具调用预算，用于约束下游 HTTP 请求预算。
     :param cancellation_token: Host 取消令牌。
     :returns: 搜索结果字典。
     :raises WebSearchCancelledError: Host 取消时抛出。
@@ -1507,7 +1507,7 @@ def _fetch_web_page_business(
 
     :param url: 目标网页 URL。
     :param config: Web provider 配置。
-    :param timeout_budget: 单次工具调用预算；当前保持旧行为传 ``None``。
+    :param timeout_budget: 单次工具调用预算，用于约束下游 HTTP 请求预算。
     :param cancellation_token: Host 取消令牌。
     :returns: 抓取成功载荷。
     :raises WebToolCancelledError: Host 取消时抛出。

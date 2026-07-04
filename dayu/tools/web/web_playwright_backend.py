@@ -1101,13 +1101,14 @@ def _fetch_and_convert_with_playwright(
                 cancellation_token=cancellation_token,
             )
         else:
-            result = playwright_sync_worker(
-                url=url,
-                timeout_seconds=effective_timeout,
-                headers=headers,
-                playwright_channel=playwright_channel,
-                playwright_storage_state_path=playwright_storage_state_path,
+            Log.warning(
+                "Playwright worker 不可序列化，已拒绝同进程 fallback。", module=MODULE
             )
+            return {
+                "ok": False,
+                "availability": "unprocessable",
+                "reason": "playwright_worker_not_picklable",
+            }
     except TimeoutError:
         Log.debug(f"Playwright 浏览器回退在 {total_timeout}s 内未返回结果: {url}", module=MODULE)
         return {

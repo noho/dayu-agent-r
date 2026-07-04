@@ -7,7 +7,7 @@ import asyncio
 from collections.abc import Callable, Mapping
 from datetime import datetime
 from pathlib import Path
-from typing import ParamSpec, TypeVar
+from typing import ParamSpec, TypeVar, cast
 
 import pytest
 
@@ -798,7 +798,7 @@ def test_fetch_playwright_cancel_projects_to_host_cancelled(
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
         cancellation_token: CancellationToken | None = None,
-    ) -> Mapping[str, JsonValue]:
+    ) -> dict[str, JsonValue]:
         """模拟 Playwright worker 在 fallback 内部收到取消。
 
         :param url: 目标 URL。
@@ -850,6 +850,77 @@ def test_fetch_playwright_cancel_projects_to_host_cancelled(
     assert received_playwright_tokens == [token]
 
 
+def test_search_and_fetch_pass_tool_timeout_budget_to_business(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """search/fetch 主路径必须把工具剩余预算传入 HTTP 预算边界。"""
+
+    budgets: list[float | None] = []
+
+    async def fake_to_thread(
+        func: Callable[_P, _R],
+        /,
+        *args: _P.args,
+        **kwargs: _P.kwargs,
+    ) -> _R:
+        """同步执行业务函数，保留 ``asyncio.to_thread`` 调用形状。"""
+
+        return func(*args, **kwargs)
+
+    def fake_search_business(**kwargs: JsonValue) -> Mapping[str, JsonValue]:
+        """记录 search_web 传入的 timeout budget。"""
+
+        budgets.append(cast(float | None, kwargs.get("timeout_budget")))
+        return {
+            "query": "revenue",
+            "domains": [],
+            "total": 0,
+            "preferred_result": None,
+            "preferred_result_summary": "",
+            "next_action": "refine_query",
+            "next_action_args": {},
+            "hint": "refine query",
+            "results": [],
+        }
+
+    def fake_fetch_business(**kwargs: JsonValue) -> Mapping[str, JsonValue]:
+        """记录 fetch_web_page 传入的 timeout budget。"""
+
+        budgets.append(cast(float | None, kwargs.get("timeout_budget")))
+        return {
+            "url": kwargs["url"],
+            "final_url": kwargs["url"],
+            "title": "Example",
+            "content": "budgeted content",
+            "fetch_backend": "requests",
+        }
+
+    monkeypatch.setattr(web_tools.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(web_tools, "_search_web_business", fake_search_business)
+    monkeypatch.setattr(web_tools, "_fetch_web_page_business", fake_fetch_business)
+    definitions = _definitions_by_name(
+        _discover_definitions({"allow_private_network_url": True})
+    )
+    context = _context(timeout_seconds=2.5)
+
+    search_outcome = asyncio.run(
+        definitions["search_web"].callable(
+            _call("search_web", {"query": "revenue"}),
+            context,
+        )
+    )
+    fetch_outcome = asyncio.run(
+        definitions["fetch_web_page"].callable(
+            _call("fetch_web_page", {"url": "http://127.0.0.1/internal"}),
+            context,
+        )
+    )
+
+    assert isinstance(search_outcome, ToolCompletedOutcome)
+    assert isinstance(fetch_outcome, ToolCompletedOutcome)
+    assert budgets == [2.5, 2.5]
+
+
 def test_try_playwright_fallback_pre_cancel_does_not_start_playwright(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -869,7 +940,7 @@ def test_try_playwright_fallback_pre_cancel_does_not_start_playwright(
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
         cancellation_token: CancellationToken | None = None,
-    ) -> Mapping[str, JsonValue]:
+    ) -> dict[str, JsonValue]:
         """记录非预期 Playwright worker 调用。
 
         :param url: 目标 URL。
@@ -914,6 +985,54 @@ def test_try_playwright_fallback_pre_cancel_does_not_start_playwright(
 
     assert playwright_calls == []
     _assert_no_governance_text(f"{captured.value.message} {captured.value.hint}")
+
+
+def test_playwright_unpicklable_worker_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """不可序列化 Playwright worker 不得回落到同进程执行。"""
+
+    monkeypatch.setattr(
+        web_playwright_backend,
+        "_is_picklable_worker",
+        lambda worker: False,
+    )
+    worker_calls: list[str] = []
+
+    def fake_worker(
+        *,
+        url: str,
+        timeout_seconds: float,
+        headers: Mapping[str, str] | None = None,
+        playwright_channel: str | None = None,
+        playwright_storage_state_path: str = "",
+    ) -> dict[str, JsonValue]:
+        """记录不应发生的同进程 Playwright 调用。"""
+
+        del timeout_seconds, headers, playwright_channel, playwright_storage_state_path
+        worker_calls.append(url)
+        return {"ok": True, "content": "unexpected"}
+
+    result = web_playwright_backend._fetch_and_convert_with_playwright(
+        url="https://example.com/report",
+        timeout_seconds=1.0,
+        headers={},
+        timeout_budget=1.0,
+        deadline_monotonic=None,
+        playwright_channel=None,
+        playwright_storage_state_path="",
+        cancellation_token=_OpenCancellationToken(),
+        resolve_timeout_budget=lambda timeout_seconds, **kwargs: timeout_seconds,
+        playwright_sync_worker=fake_worker,
+        detect_bot_challenge=lambda **kwargs: web_tools.BotChallengeDetectionResult(
+            challenge_detected=False,
+            challenge_signals=(),
+        ),
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "playwright_worker_not_picklable"
+    assert worker_calls == []
 
 
 def test_fetch_playwright_fallback_receives_channel_and_storage_state_path(
@@ -1448,10 +1567,12 @@ def _call(name: str, arguments: Mapping[str, JsonValue]) -> ToolCallRequest:
 
 def _context(
     cancellation_token: CancellationToken | None = None,
+    timeout_seconds: float | None = 10.0,
 ) -> BatchToolExecutionContext:
     """构造测试工具执行上下文。
 
     :param cancellation_token: 可选取消令牌。
+    :param timeout_seconds: 可选工具执行预算秒数。
     :returns: 批式执行上下文。
     """
 
@@ -1459,7 +1580,7 @@ def _context(
         run_id="run-web",
         session_id="session-web",
         iteration_id="iteration-web",
-        timeout_seconds=10.0,
+        timeout_seconds=timeout_seconds,
         cancellation_token=cancellation_token or _OpenCancellationToken(),
         correlation_id="run-web:iteration-web:tool_batch",
     )
