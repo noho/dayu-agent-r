@@ -155,13 +155,13 @@ git push -u github <branch>
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | final-closeout-pass |
-| implementation status | WU-WAIT-01 / GitHub Issue #89 merged via PR #163 on 2026-07-01; WU-WAIT-02 / GitHub Issue #90 merged via PR #165 on 2026-07-03; WU-WAIT-03 / GitHub Issue #92 final closeout completed; draft PR #166 awaits maintainer/user handling. |
-| active work unit | WU-WAIT-03 |
-| default next work unit | WU-WAIT-03 until draft PR #166 is handled; after PR #166 merge, WU-LIFE-03 becomes the next implementation entry point. |
-| next entry point | WU-WAIT-03 / GitHub Issue #92 final-closeout-pass: wait for maintainer/user handling of draft PR #166. Do not mark ready for review, close issue manually, request reviewers, merge, or delete branch without explicit authorization. After PR #166 is merged, pull latest `main` and resume phaseflow at WU-LIFE-03, then WU-TOOLS-CANCEL-01, then WU-WAIT-04. |
+| gate | accepted plan commit |
+| implementation status | WU-WAIT-01 / GitHub Issue #89 merged via PR #163 on 2026-07-01; WU-WAIT-02 / GitHub Issue #90 merged via PR #165 on 2026-07-03 and issue #90 closed automatically; WU-WAIT-03 / GitHub Issue #92 merged via PR #166 on 2026-07-04 and issue #92 closed automatically. |
+| active work unit | WU-LIFE-03 |
+| default next work unit | WU-LIFE-03 is the current implementation entry point; after WU-LIFE-03 completes, WU-TOOLS-CANCEL-01 becomes the next entry point, followed by WU-WAIT-04. |
+| next entry point | WU-LIFE-03 / GitHub Issue #91 accepted plan commit: create protected local commit for the accepted plan, review, fix, and re-review artifacts. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
-| issue status comments | Active/backlog issue owners retained here: #129 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #112 / #20 / #90 / #92 / #80 / #115, plus residual-risk destinations #121 / #122. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`; #63 / #89 / #111 / #130 / #133 are no longer active implementation owners. |
+| issue status comments | Active/backlog issue owners retained here: #129 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #91 / #87 / #88 / #112 / #20 / #80 / #115, plus residual-risk destinations #121 / #122. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`; #63 / #89 / #90 / #92 / #111 / #130 / #133 are no longer active implementation owners. |
 | blocking open questions | None. |
 
 状态约定：
@@ -254,8 +254,8 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-CTX-04 | pending-low | Run-level compaction concurrency boundary | GitHub Issue #112 | 低优先级设计核对：不引入 EventLog fencing；证明当前状态机 / request 计数 / stale recheck 足够，或在未来并发模型需要时设计 EventLog 外的最小 pointer / CAS。 |
 | WU-CTX-01 | pending | Provider tokenizer / sizing adapter | GitHub Issue #20 | provider/model-aware context sizing；仍有效，需先收敛 budget policy 设计表述 |
 | WU-WAIT-01 | completed | Callback endpoint / auth / replay | GitHub Issue #89 / PR #163 | PR 163 merged on 2026-07-01; not an active implementation entry point. 当前实现提供 Host wait callback typed boundary 与 Service framework-neutral mapper；不包含真实 HTTP route、secret backend、HMAC / bearer verifier、production poller、physical cancel、Engine contract 或 UI surface。 |
-| WU-WAIT-02 | final-closeout-pass | Production poller loop / backoff / fencing / retry | GitHub Issue #90 / draft PR #165 | Final closeout 已完成；等待 maintainer/user 处理 draft PR #165。PR body 使用 `Closes #90`，merge 会自动关闭 issue。 |
-| WU-WAIT-03 | final-closeout-pass | External job physical cancel / revoke / abandon | GitHub Issue #92 / #87 umbrella | Final closeout completed. Draft PR #166 opened and PR body uses `Closes #92`; merge will automatically close the issue. Do not mark ready, merge, close issue, request reviewers, or delete branch without explicit authorization. |
+| WU-WAIT-02 | completed | Production poller loop / backoff / fencing / retry | GitHub Issue #90 / PR #165 | PR 165 merged on 2026-07-03 and issue #90 closed automatically; not an active implementation entry point. |
+| WU-WAIT-03 | completed | External job physical cancel / revoke / abandon | GitHub Issue #92 / #87 umbrella / PR #166 | PR 166 merged on 2026-07-04 and issue #92 closed automatically; not an active implementation entry point. |
 | WU-TOOLS-CANCEL-01 | pending-prerequisite | Tool/provider blocking I/O cancellation hardening | follows WU-LIFE-03 | WU-LIFE-03 完成后实施；设计 Host-owned tool/provider execution interrupt boundary 与 escalation：cooperative token、request / stream abort、subprocess / process-group / sandbox termination、hard-kill diagnostic closeout。生产级目标是 Codex / Claude Code 类似 interrupt 体感：取消后 Host 迅速回到可交互状态，旧结果不能污染已取消 Run；不可抢占 blocking I/O 必须迁移到可中断 capsule 或被禁止进入 production cancel path。 |
 | WU-WAIT-04 | pending-prerequisite | UI / Service production-grade awaiting E2E smoke | depends on #89 / #90 / #92 + WU-LIFE-03 + WU-TOOLS-CANCEL-01 | dependent smoke；等待 #89 / #90 / #92 merge，并完成 WU-LIFE-03 与 WU-TOOLS-CANCEL-01 后进入 implementation gate。覆盖原 WU-WAIT-03-R1：验证 Service / composition 在生产等待路径启用并装配 wait poller / adapter registry，使 cancelled WAITING external lifecycle action 能在 public workflow 中执行，并验证取消后的 public 可交互恢复体验。 |
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
@@ -1527,7 +1527,7 @@ GitHub Issue #38 当前为 OPEN，且 issue body 已对齐当前定位：代码�
 
 ### 状态
 
-已纳入 GitHub Issue #91；GitHub Issue #87 是 Host Lifecycle Watchdog / Supervisor umbrella。本条是 #87 下的 active Attempt cancel watchdog target，不单独引入第二套 watchdog runtime。PR #166 merge 后，本条是默认下一 implementation entry point。
+已纳入 GitHub Issue #91；GitHub Issue #87 是 Host Lifecycle Watchdog / Supervisor umbrella。本条是 #87 下的 active Attempt cancel watchdog target，不单独引入第二套 watchdog runtime。PR #166 已于 2026-07-04 merge，GitHub Issue #92 已自动关闭，本条已进入当前 implementation entry point。Goal confirmation 已由用户确认。Plan artifact 为 `docs/host/wu-life-03-active-cancel-watchdog-plan.md`，plan decision 为 ready。Plan review artifacts 为 `docs/reviews/plan-review-20260704-105429.md` 与 `docs/reviews/plan-review-20260704-105503.md`；controller adjudication 为 `docs/reviews/wu-life-03-plan-review-controller-adjudication.md`。Controller accepted recovery scanner / watchdog ordering, late terminal race, watchdog scheduling, clock policy, diagnostic payload mapping, projection compatibility, and scan strategy findings。Plan fix artifact 为 `docs/reviews/wu-life-03-plan-fix-codex.md`；AgentCodex reported all accepted findings fixed and `git diff --check` passed。Plan re-review artifacts 为 `docs/reviews/plan-review-20260704-110623.md` 与 `docs/reviews/plan-review-20260704-110719.md`；controller adjudication 为 `docs/reviews/wu-life-03-plan-rereview-controller-adjudication.md`。两路 re-review 均通过，F01-F07 均已修复，无 blocking open question。当前进入 accepted plan commit gate。
 
 ### 目标
 
