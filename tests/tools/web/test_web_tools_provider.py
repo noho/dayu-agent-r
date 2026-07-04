@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import pickle
+import socket
+import threading
+import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import ParamSpec, TypeVar, cast
@@ -13,8 +18,16 @@ import pytest
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
-from dayu.contracts.tool_call import BatchToolExecutionContext, ToolCallRequest
-from dayu.contracts.tool_declaration import ToolDefinition
+from dayu.contracts.tool_call import (
+    BatchToolExecutionContext,
+    BatchToolExecutionRequest,
+    ToolCallRequest,
+)
+from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
+from dayu.contracts.tool_execution import (
+    ProcessBackedToolContext,
+    ProcessBackedToolExecutionCapability,
+)
 from dayu.contracts.tool_outcome import (
     TOOL_CANCELLED_REASON_HOST_CANCELLED,
     ToolCancelledOutcome,
@@ -22,6 +35,21 @@ from dayu.contracts.tool_outcome import (
     ToolFailedOutcome,
 )
 from dayu.contracts.tool_schema import ToolTruncateSpec, ToolTruncationStrategy
+from dayu.host.tool_runtime import (
+    DefaultToolRuntimeFactory,
+    EffectiveToolBundleBuildRequest,
+    EffectiveToolBundleBuilder,
+    HostEventRef,
+    HostToolFactAcceptPort,
+    ProcessBackedToolExecutionCapsule,
+    ToolFactAcceptCandidate,
+    ToolFactAcceptResult,
+    ToolFactAcceptedAck,
+    ToolRuntimeBuildRequest,
+    ToolRuntimeExecutionScope,
+    ToolRuntimeHandle,
+)
+from dayu.host.tooling import default_framework_tool_policy_view
 from dayu.runtime.tools_discovery import (
     PythonImportPathProvider,
     ToolsDiscovery,
@@ -137,6 +165,179 @@ class _ManualCancellationToken:
         return self._requested_at
 
 
+class _AcceptingPort(HostToolFactAcceptPort):
+    """测试用 Host accept barrier。"""
+
+    def __init__(self) -> None:
+        """初始化记录列表。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.candidates: list[ToolFactAcceptCandidate] = []
+
+    def accept_tool_fact(
+        self,
+        candidate: ToolFactAcceptCandidate,
+    ) -> ToolFactAcceptResult:
+        """接受工具事实候选。
+
+        :param candidate: ToolRuntime 构造的工具事实候选。
+        :returns: accepted ack。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.candidates.append(candidate)
+        requested_ref = HostEventRef(
+            event_id=f"event-requested-{len(self.candidates)}",
+            event_sequence=len(self.candidates) * 2 - 1,
+        )
+        result_ref = HostEventRef(
+            event_id=f"event-result-{len(self.candidates)}",
+            event_sequence=len(self.candidates) * 2,
+        )
+        return ToolFactAcceptedAck(
+            accepted_event_refs=(requested_ref, result_ref),
+            tool_fact_id=f"tool-fact-{len(self.candidates)}",
+            tool_call_requested_event_ref=requested_ref,
+            tool_call_governed_event_ref=None,
+            tool_result_event_ref=result_ref,
+            result_payload_ref=None,
+            result_digest=f"sha256:{'1' * 64}",
+            reuse_prior_event_refs=(),
+            diagnostic_refs=(),
+            idempotency_record_ref=f"idempotency-{len(self.candidates)}",
+        )
+
+
+@dataclass(slots=True)
+class _SocketWebServer:
+    """测试用最小本地 HTTP server。
+
+    Args:
+        response_body: 响应正文。
+        delay_seconds: 每个连接发送响应前等待的秒数。
+        max_connections: 最多处理的连接数。
+
+    Returns:
+        dataclass 实例。
+
+    Raises:
+        OSError: 监听 socket 创建失败时抛出。
+    """
+
+    response_body: bytes
+    delay_seconds: float
+    max_connections: int
+    _socket: socket.socket
+    _thread: threading.Thread
+    _stop_requested: threading.Event
+
+    @classmethod
+    def start(
+        cls,
+        *,
+        response_body: bytes,
+        delay_seconds: float = 0.0,
+        max_connections: int = 8,
+    ) -> "_SocketWebServer":
+        """启动本地 HTTP server。
+
+        :param response_body: 响应正文。
+        :param delay_seconds: 每个连接发送响应前等待的秒数。
+        :param max_connections: 最多处理的连接数。
+        :returns: 已启动的 server。
+        :raises OSError: socket 监听失败时抛出。
+        """
+
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.bind(("127.0.0.1", 0))
+        server_socket.listen()
+        server_socket.settimeout(0.2)
+        stop_requested = threading.Event()
+        server = cls(
+            response_body=response_body,
+            delay_seconds=delay_seconds,
+            max_connections=max_connections,
+            _socket=server_socket,
+            _thread=threading.Thread(),
+            _stop_requested=stop_requested,
+        )
+        server._thread = threading.Thread(
+            target=server._serve,
+            name="web-tool-test-server",
+            daemon=True,
+        )
+        server._thread.start()
+        return server
+
+    @property
+    def url(self) -> str:
+        """返回本地 server URL。
+
+        :returns: ``http://127.0.0.1:<port>/page``。
+        :raises OSError: socket 地址读取失败时抛出。
+        """
+
+        host, port = self._socket.getsockname()
+        return f"http://{host}:{port}/page"
+
+    def close(self) -> None:
+        """停止 server 并释放 socket。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._stop_requested.set()
+        self._socket.close()
+        self._thread.join(timeout=1.0)
+
+    def _serve(self) -> None:
+        """处理有限数量的测试 HTTP 连接。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        handled = 0
+        while handled < self.max_connections and not self._stop_requested.is_set():
+            try:
+                connection, _address = self._socket.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            handled += 1
+            with connection:
+                self._handle_connection(connection)
+
+    def _handle_connection(self, connection: socket.socket) -> None:
+        """处理单个 HTTP 连接。
+
+        :param connection: 已接受的 socket 连接。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        try:
+            request = connection.recv(4096)
+            if self.delay_seconds > 0:
+                time.sleep(self.delay_seconds)
+            body = b"" if request.startswith(b"HEAD ") else self.response_body
+            header = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/html; charset=utf-8\r\n"
+                + f"Content-Length: {len(body)}\r\n".encode("ascii")
+                + b"Connection: close\r\n\r\n"
+            )
+            connection.sendall(header + body)
+        except OSError:
+            return
+
+
 def test_web_provider_discovers_search_and_fetch() -> None:
     """ToolsDiscovery 应发现两个 Web tools。"""
 
@@ -168,6 +369,245 @@ def test_web_audit_matrix_context_injection_and_schema_no_leak() -> None:
         assert "execution_context" not in required
         assert "cancellation_token" not in required
         assert "correlation_id" not in required
+
+
+def test_web_tool_definitions_declare_process_backed_execution() -> None:
+    """两个 Web tool 的生产 execution 必须声明为 process-backed。"""
+
+    definitions = _definitions_by_name(_discover_definitions({}))
+
+    for tool_name in _WEB_TOOL_NAMES:
+        definition = definitions[tool_name]
+        assert isinstance(definition.execution, ProcessBackedToolExecutionCapability)
+
+
+def test_web_process_target_factory_is_pickle_round_trippable() -> None:
+    """Web process target factory 和 target 必须可 pickle round-trip。"""
+
+    definitions = _definitions_by_name(
+        _discover_definitions(
+            {
+                "provider": "duckduckgo",
+                "request_timeout_seconds": 1.25,
+                "allow_private_network_url": True,
+                "playwright_channel": "chrome",
+                "playwright_storage_state_dir": "/tmp/dayu-web-state",
+            }
+        )
+    )
+    definition = definitions["fetch_web_page"]
+    execution = cast(ProcessBackedToolExecutionCapability, definition.execution)
+    factory = cast(
+        web_tools._WebProcessTargetFactory,
+        pickle.loads(pickle.dumps(execution.target_factory)),
+    )
+
+    process_target = factory.build_process_target(
+        _call("fetch_web_page", {"url": "http://127.0.0.1/page"}),
+        ProcessBackedToolContext(
+            run_id="run-web",
+            session_id="session-web",
+            iteration_id="iteration-web",
+            timeout_seconds=3.5,
+            correlation_id="correlation-web",
+        ),
+    )
+    round_tripped_target = cast(
+        web_tools._WebProcessTarget,
+        pickle.loads(pickle.dumps(process_target)),
+    )
+
+    assert round_tripped_target.tool_name == "fetch_web_page"
+    assert round_tripped_target.timeout_seconds == 3.5
+    target_repr = repr(round_tripped_target)
+    assert "Session" not in target_repr
+    assert "provider_lock" not in target_repr
+    assert "CancellationToken" not in target_repr
+    assert "Host" not in target_repr
+    assert "Browser" not in target_repr
+    assert "Playwright" not in target_repr
+
+
+def test_web_process_target_fast_search_success_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """search_web process target 成功路径应返回 completed JSON 信封。"""
+
+    budgets: list[float | None] = []
+
+    def fake_search_business(**kwargs: JsonValue) -> Mapping[str, JsonValue]:
+        """记录 timeout budget 并返回确定性搜索结果。
+
+        :param kwargs: process target 传入的业务参数。
+        :returns: 搜索成功载荷。
+        """
+
+        budgets.append(cast(float | None, kwargs.get("timeout_budget")))
+        return {
+            "query": "revenue",
+            "domains": [],
+            "total": 1,
+            "preferred_result": None,
+            "preferred_result_summary": "",
+            "next_action": "refine_query",
+            "next_action_args": {},
+            "hint": "ok",
+            "results": [],
+        }
+
+    monkeypatch.setattr(web_tools, "_search_web_business", fake_search_business)
+    definition = _definitions_by_name(_discover_definitions({}))["search_web"]
+
+    envelope = _run_definition_process_target(
+        definition,
+        _call("search_web", {"query": "revenue"}),
+        timeout_seconds=4.25,
+    )
+
+    assert isinstance(envelope, Mapping)
+    assert envelope["status"] == "completed"
+    value = cast(Mapping[str, JsonValue], envelope["value"])
+    assert value["total"] == 1
+    assert budgets == [4.25]
+
+
+def test_web_process_target_failed_json_envelope_preserves_code_and_hint() -> None:
+    """process target 参数失败时应返回 failed JSON 信封。"""
+
+    definition = _definitions_by_name(_discover_definitions({}))["fetch_web_page"]
+
+    envelope = _run_definition_process_target(
+        definition,
+        _call("fetch_web_page", {}),
+    )
+
+    assert isinstance(envelope, Mapping)
+    assert envelope["status"] == "failed"
+    assert envelope["error_type"] == "invalid_argument"
+    assert "url" in str(envelope["message"])
+    assert "Hint:" in str(envelope["message"])
+
+
+@pytest.mark.parametrize("tool_name", _WEB_TOOL_NAMES)
+def test_web_process_target_timeout_budget_is_serialized_to_target(
+    tool_name: str,
+) -> None:
+    """process target 必须携带父进程投影的 timeout 标量。"""
+
+    definition = _definitions_by_name(
+        _discover_definitions({"allow_private_network_url": True})
+    )[tool_name]
+    execution = cast(ProcessBackedToolExecutionCapability, definition.execution)
+    target = execution.target_factory.build_process_target(
+        _call(tool_name, _process_arguments_for_tool(tool_name)),
+        ProcessBackedToolContext(
+            run_id="run-web",
+            session_id="session-web",
+            iteration_id="iteration-web",
+            timeout_seconds=6.75,
+            correlation_id="correlation-web",
+        ),
+    )
+
+    assert isinstance(target, web_tools._WebProcessTarget)
+    assert target.timeout_seconds == 6.75
+
+
+def test_web_process_backed_capsule_spawns_child_success() -> None:
+    """真实 ProcessBackedToolExecutionCapsule 应能运行 Web 子进程成功路径。"""
+
+    server = _SocketWebServer.start(
+        response_body=b"<html><head><title>Example</title></head><body>Revenue grew quickly.</body></html>",
+        max_connections=8,
+    )
+    try:
+        definition = _definitions_by_name(
+            _discover_definitions({"allow_private_network_url": True})
+        )["fetch_web_page"]
+        execution = cast(ProcessBackedToolExecutionCapability, definition.execution)
+        target = execution.target_factory.build_process_target(
+            _call("fetch_web_page", {"url": server.url}),
+            ProcessBackedToolContext(
+                run_id="run-web",
+                session_id="session-web",
+                iteration_id="iteration-web",
+                timeout_seconds=10.0,
+                correlation_id="correlation-web",
+            ),
+        )
+        capsule = ProcessBackedToolExecutionCapsule(target)
+
+        outcome = asyncio.run(capsule.run())
+        asyncio.run(capsule.close())
+    finally:
+        server.close()
+
+    assert isinstance(outcome, ToolCompletedOutcome)
+    value = _mapping_value(outcome.result.value)
+    assert value["fetch_backend"] == "requests"
+    assert "Revenue grew quickly" in str(value["content"])
+
+
+def test_web_toolruntime_cancel_real_process_target_has_no_late_accept() -> None:
+    """真实 Web process target 取消后不得接受旧子进程 late result。"""
+
+    server = _SocketWebServer.start(
+        response_body=b"<html><body>late web content</body></html>",
+        delay_seconds=5.0,
+        max_connections=4,
+    )
+    try:
+        output = discover_tools(
+            _spec(
+                {
+                    "allow_private_network_url": True,
+                    "request_timeout_seconds": 20.0,
+                }
+            )
+        )
+        accept_port = _AcceptingPort()
+        token = _ManualCancellationToken()
+        tool_runtime = DefaultToolRuntimeFactory(
+            EffectiveToolBundleBuilder()
+        ).create_tool_runtime(
+            ToolRuntimeBuildRequest(
+                effective_bundle_request=EffectiveToolBundleBuildRequest(
+                    business_tool_bundle=ToolBundle(definitions=output.definitions),
+                    source_refs=output.source_refs,
+                    framework_tool_policy=default_framework_tool_policy_view(),
+                    policy_snapshot_digest="sha256:" + "2" * 64,
+                    enable_truncation_manager=False,
+                ),
+                execution_scope=ToolRuntimeExecutionScope(
+                    session_id="session-web",
+                    run_id="run-web",
+                    attempt_id="attempt-web",
+                    execution_id="execution-web",
+                    allow_tool_calls=True,
+                ),
+                accept_port=accept_port,
+            )
+        )
+
+        started_at = time.monotonic()
+        governed_outcome = asyncio.run(
+            _execute_web_runtime_fetch_and_cancel(
+                tool_runtime,
+                server.url,
+                token,
+            )
+        )
+        elapsed = time.monotonic() - started_at
+        time.sleep(0.3)
+    finally:
+        server.close()
+
+    assert elapsed < 2.0
+    assert governed_outcome.result.hint == "tool_runtime_cancelled"
+    assert len(accept_port.candidates) == 1
+    assert accept_port.candidates[0].governance.policy_decision.reason_code == (
+        "tool_runtime_cancelled"
+    )
 
 
 def test_search_web_projects_optional_arguments_and_success(
@@ -1531,6 +1971,80 @@ def _assert_no_governance_text(text: str) -> None:
 
     for forbidden in _FORBIDDEN_CANCEL_MESSAGE_PARTS:
         assert forbidden not in text
+
+
+def _run_definition_process_target(
+    definition: ToolDefinition,
+    call: ToolCallRequest,
+    *,
+    timeout_seconds: float | None = 10.0,
+) -> JsonValue:
+    """构造并直接执行定义声明的 Web process target。
+
+    :param definition: Web 工具定义。
+    :param call: 工具调用请求。
+    :param timeout_seconds: process-backed 上下文 timeout 标量。
+    :returns: process target 返回的 JSON 信封。
+    :raises AssertionError: 工具未声明 process-backed execution 时抛出。
+    """
+
+    assert isinstance(definition.execution, ProcessBackedToolExecutionCapability)
+    target = definition.execution.target_factory.build_process_target(
+        call,
+        ProcessBackedToolContext(
+            run_id="run-web",
+            session_id="session-web",
+            iteration_id="iteration-web",
+            timeout_seconds=timeout_seconds,
+            correlation_id="correlation-web",
+        ),
+    )
+    return target()
+
+
+def _process_arguments_for_tool(tool_name: str) -> Mapping[str, JsonValue]:
+    """返回 process target 构造测试所需的最小参数。
+
+    :param tool_name: Web 工具名。
+    :returns: 对应工具的参数。
+    :raises ValueError: 工具名未知时抛出。
+    """
+
+    if tool_name == "search_web":
+        return {"query": "revenue"}
+    if tool_name == "fetch_web_page":
+        return {"url": "http://127.0.0.1/page"}
+    raise ValueError(f"unknown web tool: {tool_name}")
+
+
+async def _execute_web_runtime_fetch_and_cancel(
+    tool_runtime: ToolRuntimeHandle,
+    url: str,
+    token: _ManualCancellationToken,
+) -> ToolFailedOutcome:
+    """启动 fetch_web_page 后触发取消并返回 governed outcome。
+
+    :param tool_runtime: 已装配的 ToolRuntime。
+    :param url: 本地测试 URL。
+    :param token: 可手动取消的 token。
+    :returns: ToolRuntime 返回的受治理失败 outcome。
+    :raises AssertionError: 结果不是受治理失败 outcome 时抛出。
+    """
+
+    task = asyncio.create_task(
+        tool_runtime.tool_executor.execute(
+            BatchToolExecutionRequest(
+                calls=(_call("fetch_web_page", {"url": url}),),
+                context=_context(cancellation_token=token, timeout_seconds=20.0),
+            )
+        )
+    )
+    await asyncio.sleep(0.4)
+    token.cancel("cancel-real-web-process")
+    result = await asyncio.wait_for(task, timeout=2.0)
+    outcome = result.records[0].outcome
+    assert isinstance(outcome, ToolFailedOutcome)
+    return outcome
 
 
 def _spec(config: Mapping[str, JsonValue]) -> ToolsDiscoveryProviderSpec:
