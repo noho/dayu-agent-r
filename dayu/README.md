@@ -27,6 +27,7 @@ Dayu 是生产级通用 Agent，具备买方财报分析能力，核心范式是
 - Host durable EventLog 与同事务状态索引是治理事实真源；projection、memory、tool trace、outbox、audit 和 diagnostic 都是派生视图或观察记录。
 - 同一 Session 的 active Run 由 Host admission 约束；queued Run 是 durable state，不是内存队列。
 - Agent、Runner、Attempt 和 Engine worker 都是一次执行边界；steer、resume、recovery、retry、replay 都创建新的 Attempt 或新关联 Run，不恢复旧实例。
+- 用户取消动作，例如 UI / CLI 把 Esc 映射成 Host cancel command 后，Host 的公开承诺是 Codex / Claude Code 类体感：快速停止等待当前模型 / 工具执行并恢复可交互路径；旧模型输出、旧工具结果或旧 wait result 不能污染已取消 Run。该承诺不表示远端 LLM provider、外部 job 或第三方服务一定已经物理停止。
 - 工具调用必须经过 Host-owned ToolRuntime、accept barrier、截断治理、等待治理和重复调用治理；assistant final answer 和普通工具证据不会自动成为 evidence-backed fact。
 - Context compaction 治理由 Host 负责；Engine 只在 provider 明确报告输入上下文溢出时发出 `context_compaction_requested`。
 - 财报 read、download、preprocess / process 与 upload 的业务底座收敛到共享 Fins service/runtime 与 `dayu.fins.storage` 仓储协议；Host 和 Engine 不直接读取财报原文或仓储文件。
@@ -104,7 +105,7 @@ UI / Service 调用 `open_host(options)` 得到 Host handle，先 ensure / creat
 
 ### Steer 与 cancel
 
-`submit_followup(behavior=STEER, target_run_id=...)` 是同一 Run 内的改向机制，只允许目标为同一 Session 当前 active 的 `RUNNING` 或 `WAITING` Run。Host 在同一 Run 下收口旧 Attempt 并创建新的 Attempt / execution。`cancel_run(...)` 和 `cancel_session_runs(...)` 是 durable command，不是直接杀 worker；active worker cancel 是 commit 后的 best-effort 传播，已 accepted 的事实不会被撤回。
+`submit_followup(behavior=STEER, target_run_id=...)` 是同一 Run 内的改向机制，只允许目标为同一 Session 当前 active 的 `RUNNING` 或 `WAITING` Run。Host 在同一 Run 下收口旧 Attempt 并创建新的 Attempt / execution。`cancel_run(...)` 和 `cancel_session_runs(...)` 是 durable command；active worker cancel 是 commit 后的 Host-owned interrupt path：Host 关闭 / 取消本地 Engine worker event stream，向 Engine 注入 cancellation token，并由 ToolRuntime 对可抢占工具执行边界执行取消 / 超时治理。Doc、Fins read 与 Web blocking 工具生产路径使用 process-backed execution，使 Host 在取消或超时时不等待同进程 blocking I/O 自然结束；WAITING 外部长事务走 wait cancel / abandon / late-result rejection。已 accepted 的事实不会被撤回，迟到的模型、工具或 wait 结果只能进入 rejected / diagnostic 路径，不能恢复旧 Attempt 或污染已取消 Run。
 
 ### 工具与 Fins
 
