@@ -9,6 +9,7 @@ scene manifest，不读取财报仓储，也不 import 业务层。
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Container, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -473,6 +474,18 @@ class SQLiteRuntimeConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ProcessCapsuleInterruptPolicyConfig:
+    """process-backed capsule cleanup interrupt 配置片段。
+
+    :param terminate_grace_seconds: terminate 后等待子进程退出的秒数。
+    :param kill_grace_seconds: kill 后等待子进程退出的秒数。
+    """
+
+    terminate_grace_seconds: float
+    kill_grace_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
 class HostRuntimeProfileConfig:
     """Host opener 部署默认值配置。
 
@@ -486,6 +499,8 @@ class HostRuntimeProfileConfig:
     :param payload_inline_threshold_bytes: payload 内联存储阈值字节数。
     :param worker_startup_timeout_seconds: worker accept timeout 秒数。
     :param memory_projection_catch_up_batch_size: memory catch-up 批次大小。
+    :param process_capsule_interrupt_policy: process-backed capsule cleanup
+        interrupt 配置；缺省时由 Host typed policy 默认值决定。
     """
 
     host_runtime_id: str
@@ -498,6 +513,7 @@ class HostRuntimeProfileConfig:
     payload_inline_threshold_bytes: int
     worker_startup_timeout_seconds: float
     memory_projection_catch_up_batch_size: int
+    process_capsule_interrupt_policy: ProcessCapsuleInterruptPolicyConfig | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1844,9 +1860,9 @@ def _parse_host_runtime_profile(
 
     context = f"host_runtime.runtimes.{record_id}"
     _require_no_forbidden_id_fields(record, context=context)
-    _require_exact_fields(
+    _require_required_and_optional_fields(
         record,
-        allowed=frozenset(
+        required=frozenset(
             {
                 "store_root",
                 "artifact_root",
@@ -1859,6 +1875,7 @@ def _parse_host_runtime_profile(
                 "memory_projection_catch_up_batch_size",
             }
         ),
+        optional=frozenset({"process_capsule_interrupt_policy"}),
         context=context,
     )
     return HostRuntimeProfileConfig(
@@ -1879,6 +1896,46 @@ def _parse_host_runtime_profile(
         payload_inline_threshold_bytes=_require_positive_int_field(record, field_name="payload_inline_threshold_bytes", context=context),
         worker_startup_timeout_seconds=_require_positive_float_field(record, field_name="worker_startup_timeout_seconds", context=context),
         memory_projection_catch_up_batch_size=_require_positive_int_field(record, field_name="memory_projection_catch_up_batch_size", context=context),
+        process_capsule_interrupt_policy=_optional_process_capsule_interrupt_policy(
+            record,
+            field_name="process_capsule_interrupt_policy",
+            context=context,
+        ),
+    )
+
+
+def _optional_process_capsule_interrupt_policy(
+    record: JsonObject, *, field_name: str, context: str
+) -> ProcessCapsuleInterruptPolicyConfig | None:
+    """解析可选 process capsule cleanup interrupt 策略配置。
+
+    :param record: Host runtime profile JSON object。
+    :param field_name: 字段名。
+    :param context: 错误消息上下文。
+    :returns: typed 配置；字段缺省或为 ``null`` 时返回 ``None``。
+    :raises ConfigFieldError: 字段类型、字段集合或数值非法时抛出。
+    """
+
+    if field_name not in record or record[field_name] is None:
+        return None
+    policy = _require_mapping_field(record, field_name=field_name, context=context)
+    policy_context = f"{context}.{field_name}"
+    _require_exact_fields(
+        policy,
+        allowed=frozenset({"terminate_grace_seconds", "kill_grace_seconds"}),
+        context=policy_context,
+    )
+    return ProcessCapsuleInterruptPolicyConfig(
+        terminate_grace_seconds=_require_non_negative_finite_float_field(
+            policy,
+            field_name="terminate_grace_seconds",
+            context=policy_context,
+        ),
+        kill_grace_seconds=_require_non_negative_finite_float_field(
+            policy,
+            field_name="kill_grace_seconds",
+            context=policy_context,
+        ),
     )
 
 
@@ -2468,6 +2525,26 @@ def _require_positive_float_field(
     value = _require_float_field(record, field_name=field_name, context=context)
     if value <= 0:
         raise ConfigFieldError(f"{context}.{field_name} must be > 0")
+    return value
+
+
+def _require_non_negative_finite_float_field(
+    record: JsonObject, *, field_name: str, context: str
+) -> float:
+    """读取必填有限非负数值字段。
+
+    :param record: JSON object。
+    :param field_name: 字段名。
+    :param context: 错误消息上下文。
+    :returns: 有限非负 float 字段值。
+    :raises ConfigFieldError: 字段缺失、bool、非数值、NaN、无穷或负数时抛出。
+    """
+
+    value = _require_float_field(record, field_name=field_name, context=context)
+    if not math.isfinite(value):
+        raise ConfigFieldError(f"{context}.{field_name} must be finite")
+    if value < 0:
+        raise ConfigFieldError(f"{context}.{field_name} must be >= 0")
     return value
 
 

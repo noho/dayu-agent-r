@@ -137,6 +137,7 @@ from dayu.host.tooling import (
     FrameworkToolName,
     FrameworkToolPolicyView,
     HostToolingOptions,
+    ProcessCapsuleInterruptPolicy,
     default_framework_tool_policy_view,
 )
 
@@ -214,6 +215,7 @@ __all__ = [
     "PurgeSessionRequest",
     "PurgeSessionResult",
     "CompactorRunnerBaseline",
+    "ProcessCapsuleInterruptPolicy",
     "ReadOutboxTerminalItemsRequest",
     "ReplayRunRequest",
     "ResolveWaitCancelledOutcome",

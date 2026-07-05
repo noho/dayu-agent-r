@@ -10,6 +10,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -29,6 +30,8 @@ from dayu.contracts.tool_execution import (
     ProcessBackedToolExecutionCapability,
     ThreadBackedToolExecutionCapability,
     ToolExecutionCapability,
+    process_tool_completed_envelope,
+    process_tool_failed_envelope,
 )
 from dayu.contracts.tool_executor import ToolExecutor
 from dayu.contracts.tool_outcome import (
@@ -112,8 +115,10 @@ from dayu.host.tool_duplicate_governance import (
     InMemoryAttemptDuplicateGovernance,
 )
 from dayu.host.tooling import (
+    ProcessCapsuleInterruptPolicy,
     default_framework_tool_policy_view,
 )
+from dayu.runtime.interruptible_process import InterruptibleProcessHandle
 from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 
 _SESSION_ID = "session-toolruntime"
@@ -126,6 +131,8 @@ _DEFAULT_TOOL_TIMEOUT_SECONDS = 10.0
 _FAST_TOOL_TIMEOUT_SECONDS = 0.001
 _OVERSIZED_INLINE_TEXT_LENGTH = 70010
 _OVERSIZED_TRUNCATED_TEXT_LIMIT = 70000
+_TEST_PROCESS_CLOSE_DEFAULT_GRACE_SECONDS = 1.0
+_CUSTOM_PROCESS_CLOSE_GRACE_SECONDS = 0.73
 
 
 class _OpenCancellationToken:
@@ -616,6 +623,31 @@ class _ObservedProcessCapsuleFactory:
         if self._capsule is None:
             raise AssertionError("process capsule was not created")
         return self._capsule
+
+
+class _RecordingInterruptibleProcessHandle:
+    """记录 close grace 参数的测试 process handle。"""
+
+    def __init__(self) -> None:
+        """初始化记录型 handle。
+
+        :returns: ``None``。
+        """
+
+        self.close_kill_grace_seconds: float | None = None
+
+    async def close(
+        self,
+        *,
+        kill_grace_seconds: float = _TEST_PROCESS_CLOSE_DEFAULT_GRACE_SECONDS,
+    ) -> None:
+        """记录 close 使用的 kill grace。
+
+        :param kill_grace_seconds: close best-effort kill 等待秒数。
+        :returns: ``None``。
+        """
+
+        self.close_kill_grace_seconds = kill_grace_seconds
 
 
 class _RaisingCapsuleFactory:
@@ -1615,7 +1647,7 @@ async def test_tool_runtime_default_factory_uses_declared_process_backed_executi
     callable_ = _CountingCallable({"secret": "must-not-run"})
     accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
     target_factory = _RecordingProcessTargetFactory(
-        {"status": "completed", "value": {"from_process": True}}
+        process_tool_completed_envelope({"from_process": True})
     )
     executor = _executor(
         callable_,
@@ -1647,7 +1679,7 @@ async def test_tool_runtime_default_factory_uses_declared_process_backed_executi
 
 @pytest.mark.asyncio
 async def test_tool_runtime_process_backed_failed_envelope_returns_tool_failure() -> None:
-    """process-backed failed 信封映射为工具失败 outcome。"""
+    """process-backed failed 信封缺省 hint 时映射为工具失败 outcome。"""
 
     callable_ = _CountingCallable({"secret": "must-not-run"})
     accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
@@ -1674,6 +1706,39 @@ async def test_tool_runtime_process_backed_failed_envelope_returns_tool_failure(
     assert isinstance(record.outcome, ToolFailedOutcome)
     assert record.outcome.result.error == "business_failed"
     assert record.outcome.result.message == "business failure"
+    assert record.outcome.result.hint is None
+
+
+@pytest.mark.asyncio
+async def test_tool_runtime_process_backed_failed_envelope_maps_hint() -> None:
+    """process-backed failed 信封的结构化 hint 必须映射为工具失败 hint。"""
+
+    callable_ = _CountingCallable({"secret": "must-not-run"})
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    target_factory = _RecordingProcessTargetFactory(
+        process_tool_failed_envelope(
+            error_type="business_failed",
+            message="business failure",
+            hint="retry with a narrower filing range",
+        )
+    )
+    executor = _executor(
+        callable_,
+        accept_port,
+        execution=ProcessBackedToolExecutionCapability(
+            target_factory=target_factory
+        ),
+    )
+
+    outcome = await executor.execute(_request(_call("tool-call-1")))
+
+    record = outcome.records[0]
+    assert callable_.call_count == 0
+    assert len(accept_port.candidates) == 1
+    assert isinstance(record.outcome, ToolFailedOutcome)
+    assert record.outcome.result.error == "business_failed"
+    assert record.outcome.result.message == "business failure"
+    assert record.outcome.result.hint == "retry with a narrower filing range"
 
 
 @pytest.mark.asyncio
@@ -1688,6 +1753,15 @@ async def test_tool_runtime_process_backed_failed_envelope_returns_tool_failure(
         ({"status": "unknown"}, "process_backed_tool_unsupported_envelope"),
         (
             {"status": "failed", "error_type": "", "message": "missing"},
+            "process_backed_tool_malformed_envelope",
+        ),
+        (
+            {
+                "status": "failed",
+                "error_type": "err",
+                "message": "msg",
+                "hint": 123,
+            },
             "process_backed_tool_malformed_envelope",
         ),
     ),
@@ -1705,6 +1779,24 @@ async def test_process_backed_capsule_fail_closes_unsupported_envelopes(
 
     assert isinstance(outcome, ToolFailedOutcome)
     assert outcome.result.error == expected_error
+
+
+@pytest.mark.asyncio
+async def test_process_backed_capsule_close_uses_interrupt_policy_kill_grace() -> None:
+    """process-backed capsule close 必须使用 Host policy 中的 kill grace。"""
+
+    capsule = ProcessBackedToolExecutionCapsule(
+        _EnvelopeProcessTarget(process_tool_completed_envelope({"ok": True})),
+        interrupt_policy=ProcessCapsuleInterruptPolicy(
+            kill_grace_seconds=_CUSTOM_PROCESS_CLOSE_GRACE_SECONDS,
+        ),
+    )
+    handle = _RecordingInterruptibleProcessHandle()
+    capsule._handle = cast(InterruptibleProcessHandle, handle)
+
+    await capsule.close()
+
+    assert handle.close_kill_grace_seconds == _CUSTOM_PROCESS_CLOSE_GRACE_SECONDS
 
 
 def test_engine_facing_tool_schema_projection_excludes_execution_capability() -> None:
@@ -1756,6 +1848,17 @@ def test_engine_facing_tool_schema_projection_excludes_execution_capability() ->
     function_json = schema_json["function"]
     assert isinstance(function_json, dict)
     assert "execution" not in function_json
+
+
+def test_active_toolruntime_path_has_no_process_capsule_grace_constants() -> None:
+    """active ToolRuntime 路径不得保留旧 process capsule grace 常量。"""
+
+    source = (
+        Path(__file__).resolve().parents[2] / "dayu" / "host" / "tool_runtime.py"
+    ).read_text(encoding="utf-8")
+
+    assert "_PROCESS_CAPSULE_TERMINATE_GRACE_SECONDS" not in source
+    assert "_PROCESS_CAPSULE_KILL_GRACE_SECONDS" not in source
 
 
 @pytest.mark.asyncio

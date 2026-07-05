@@ -144,6 +144,7 @@ dayu/config/
 - `payload_inline_threshold_bytes`，包内默认值为 `65535` bytes。
 - `worker_startup_timeout_seconds`。
 - `memory_projection_catch_up_batch_size`。
+- 可选 `process_capsule_interrupt_policy`：process-backed 工具子进程取消 / 超时后的 cleanup interrupt 策略，只包含 `terminate_grace_seconds` 与 `kill_grace_seconds`。字段缺省时由 Host typed 默认值决定；显式配置必须是有限非负数，不能使用 boolean、NaN 或正负无穷。该策略只约束 cleanup grace，不是单次工具业务执行 deadline，不能替代 execution profile 中的 `agent_policy.tool_execution_timeout_seconds`。
 
 这些配置都是 `open_host(options)` construction-time assembly inputs 的来源，不是单个 Run 的 override。prompt asset root 与 scene manifest root 不在 `host_runtime.json` 中配置，由 runtime location resolver 解析。
 

@@ -217,6 +217,10 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
     assert result.options.payload_inline_threshold_bytes == 2048
     assert result.options.worker_startup_timeout_seconds == 4.5
     assert result.options.enable_truncation_manager is True
+    assert result.options.tooling_options is not None
+    process_policy = result.options.tooling_options.process_capsule_interrupt_policy
+    assert process_policy.terminate_grace_seconds == 0.35
+    assert process_policy.kill_grace_seconds == 0.75
     assert result.options.memory_projection_policy.evidence_fact_item_cap == 256
     context_budget_policy = result.options.context_budget_policy
     assert context_budget_policy is not None
@@ -1951,6 +1955,10 @@ def _write_host_runtime_overlay(workspace_root: Path) -> None:
                     "payload_inline_threshold_bytes": 2048,
                     "worker_startup_timeout_seconds": 4.5,
                     "memory_projection_catch_up_batch_size": 100,
+                    "process_capsule_interrupt_policy": {
+                        "terminate_grace_seconds": 0.35,
+                        "kill_grace_seconds": 0.75,
+                    },
                 }
             },
         },

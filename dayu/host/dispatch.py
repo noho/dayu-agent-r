@@ -3346,6 +3346,9 @@ class HostDispatchScheduler:
                 duplicate_governance_policy=(
                     tooling_options.duplicate_governance_policy
                 ),
+                process_capsule_interrupt_policy=(
+                    tooling_options.process_capsule_interrupt_policy
+                ),
             )
         )
         return create_tool_enabled_run_input_builder(

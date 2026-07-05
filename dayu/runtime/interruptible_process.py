@@ -7,16 +7,18 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import multiprocessing
 import multiprocessing.queues
 import queue
 import time
 from dataclasses import dataclass
-from typing import Protocol, TypeAlias, cast
+from typing import Final, Protocol, TypeAlias, cast
 
 from dayu.contracts.json_value import JsonValue
 
 _DEFAULT_PROCESS_POLL_INTERVAL_SECONDS = 0.02
+_DEFAULT_CLOSE_KILL_GRACE_SECONDS: Final[float] = 0.2
 
 
 class InterruptibleProcessTarget(Protocol):
@@ -184,7 +186,8 @@ class InterruptibleProcessHandle:
 
         :param grace_seconds: terminate 后最多等待的秒数。
         :returns: interrupt 操作结果。
-        :raises ValueError: ``grace_seconds`` 为负数时抛出。
+        :raises TypeError: ``grace_seconds`` 是 bool 或非数值时抛出。
+        :raises ValueError: ``grace_seconds`` 为负数、NaN 或无穷时抛出。
         """
 
         _validate_grace_seconds(grace_seconds)
@@ -211,7 +214,8 @@ class InterruptibleProcessHandle:
 
         :param grace_seconds: kill 后最多等待的秒数。
         :returns: interrupt 操作结果。
-        :raises ValueError: ``grace_seconds`` 为负数时抛出。
+        :raises TypeError: ``grace_seconds`` 是 bool 或非数值时抛出。
+        :raises ValueError: ``grace_seconds`` 为负数、NaN 或无穷时抛出。
         """
 
         _validate_grace_seconds(grace_seconds)
@@ -233,20 +237,28 @@ class InterruptibleProcessHandle:
             elapsed_seconds=time.monotonic() - started_at,
         )
 
-    async def close(self) -> None:
+    async def close(
+        self,
+        *,
+        kill_grace_seconds: float = _DEFAULT_CLOSE_KILL_GRACE_SECONDS,
+    ) -> None:
         """关闭本地进程 handle 与队列资源。
 
         若进程仍存活，本方法会先 best-effort kill；调用方不应把这个结果解释
         为业务事实。
 
+        :param kill_grace_seconds: best-effort kill 后最多等待的秒数。
         :returns: ``None``。
+        :raises TypeError: ``kill_grace_seconds`` 是 bool 或非数值时抛出。
+        :raises ValueError: ``kill_grace_seconds`` 为负数、NaN 或无穷时抛出。
         """
 
+        _validate_grace_seconds(kill_grace_seconds)
         if self._closed:
             return
         self._closed = True
         if self._started and self._process.is_alive():
-            await self.kill(grace_seconds=0.2)
+            await self.kill(grace_seconds=kill_grace_seconds)
         if self._started:
             await asyncio.to_thread(self._process.join, 0)
             self._process.close()
@@ -321,9 +333,14 @@ def _validate_grace_seconds(grace_seconds: float) -> None:
 
     :param grace_seconds: grace 秒数。
     :returns: ``None``。
+    :raises TypeError: ``grace_seconds`` 是 bool 或非数值时抛出。
     :raises ValueError: 非有限非负数时抛出。
     """
 
+    if isinstance(grace_seconds, bool) or not isinstance(grace_seconds, int | float):
+        raise TypeError("grace_seconds must be a finite number")
+    if not math.isfinite(grace_seconds):
+        raise ValueError("grace_seconds must be finite")
     if grace_seconds < 0:
         raise ValueError("grace_seconds must be non-negative")
 

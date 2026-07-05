@@ -6,6 +6,7 @@ import asyncio
 import signal
 import time
 from dataclasses import dataclass
+from typing import cast
 
 import pytest
 
@@ -111,3 +112,32 @@ async def test_interruptible_process_hard_kill_exits_when_terminate_is_ignored()
     assert not terminate.exited
     assert kill.supported
     assert kill.exited
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("value", "expected_error"),
+    (
+        (cast(float, True), TypeError),
+        (-0.1, ValueError),
+        (float("nan"), ValueError),
+        (float("inf"), ValueError),
+        (float("-inf"), ValueError),
+    ),
+)
+async def test_interruptible_process_rejects_invalid_grace_seconds(
+    value: float,
+    expected_error: type[Exception],
+) -> None:
+    """terminate / kill / close cleanup grace 必须拒绝 bool、负数、NaN 与无穷。"""
+
+    handle = InterruptibleProcessHandle(_ReturnTarget({"ok": True}))
+    try:
+        with pytest.raises(expected_error):
+            await handle.terminate(grace_seconds=value)
+        with pytest.raises(expected_error):
+            await handle.kill(grace_seconds=value)
+        with pytest.raises(expected_error):
+            await handle.close(kill_grace_seconds=value)
+    finally:
+        await handle.close()

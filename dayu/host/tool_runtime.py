@@ -37,6 +37,11 @@ from dayu.contracts.tool_execution import (
     ThreadBackedToolExecutionCapability,
     ToolExecutionCapability,
     ToolExecutionMode,
+    ProcessToolCompletedEnvelope,
+    ProcessToolFailedEnvelope,
+    ProcessToolMalformedEnvelope,
+    ProcessToolUnsupportedEnvelope,
+    parse_process_tool_envelope,
 )
 from dayu.contracts.tool_executor import ToolExecutor
 from dayu.contracts.tool_outcome import (
@@ -154,6 +159,7 @@ from dayu.runtime.tool_truncation import effective_tool_truncate_spec
 from dayu.host.tooling import (
     FrameworkToolName,
     FrameworkToolPolicyView,
+    ProcessCapsuleInterruptPolicy,
 )
 from dayu.host.tool_duplicate_governance import (
     DuplicateAcceptedEntry,
@@ -247,15 +253,6 @@ _PROCESS_BACKED_TOOL_FAILED_ERROR = "process_backed_tool_failed"
 _PROCESS_BACKED_TOOL_MALFORMED_ENVELOPE_ERROR = "process_backed_tool_malformed_envelope"
 _PROCESS_BACKED_TOOL_UNSUPPORTED_ENVELOPE_ERROR = "process_backed_tool_unsupported_envelope"
 _PROCESS_BACKED_TOOL_UNEXPECTED_PENDING_ERROR = "process_backed_tool_unexpected_pending"
-_PROCESS_ENVELOPE_STATUS_FIELD = "status"
-_PROCESS_ENVELOPE_COMPLETED_STATUS = "completed"
-_PROCESS_ENVELOPE_FAILED_STATUS = "failed"
-_PROCESS_ENVELOPE_COMPLETED_VALUE_FIELD = "value"
-_PROCESS_ENVELOPE_FAILED_ERROR_TYPE_FIELD = "error_type"
-_PROCESS_ENVELOPE_FAILED_MESSAGE_FIELD = "message"
-_PROCESS_ENVELOPE_RESERVED_STATUSES = frozenset(
-    ("awaiting", "cancelled", "timeout", "host_cancelled")
-)
 _TOOL_RUNTIME_NO_TOOL_REASON = "tool_call_not_allowed_in_scope"
 _TOOL_RUNTIME_IDEMPOTENCY_REASON = "tool_idempotency_key_required"
 _TOOL_RUNTIME_UNSUPPORTED_AWAITING_REASON = "unsupported_awaiting"
@@ -322,10 +319,6 @@ _TEXT_CHARS_LIMIT_KEY = "max_chars"
 _TEXT_LINES_LIMIT_KEY = "max_lines"
 _LIST_ITEMS_LIMIT_KEY = "max_items"
 _BINARY_BYTES_LIMIT_KEY = "max_bytes"
-_PROCESS_CAPSULE_TERMINATE_GRACE_SECONDS = 0.2
-_PROCESS_CAPSULE_KILL_GRACE_SECONDS = 0.2
-
-
 class ToolPolicyDecisionKind(StrEnum):
     """工具治理决策类别。
 
@@ -1544,14 +1537,21 @@ class _ThreadBackedDispatchTarget:
 class DeclaredToolExecutionCapsuleFactory:
     """基于工具声明 execution capability 创建执行 capsule 的 factory。"""
 
-    def __init__(self, effective_bundle: "EffectiveToolBundle") -> None:
+    def __init__(
+        self,
+        effective_bundle: "EffectiveToolBundle",
+        process_capsule_interrupt_policy: ProcessCapsuleInterruptPolicy,
+    ) -> None:
         """初始化 declaration-backed factory。
 
         :param effective_bundle: attempt-local effective 工具集合。
+        :param process_capsule_interrupt_policy: process-backed capsule cleanup
+            interrupt 策略。
         :returns: ``None``。
         """
 
         self._definitions_by_name = effective_bundle.definitions_by_name
+        self._process_capsule_interrupt_policy = process_capsule_interrupt_policy
 
     def create_capsule(
         self,
@@ -1578,6 +1578,7 @@ class DeclaredToolExecutionCapsuleFactory:
             call=call,
             context=context,
             dispatcher=dispatcher,
+            process_capsule_interrupt_policy=self._process_capsule_interrupt_policy,
         )
 
 
@@ -1587,6 +1588,7 @@ def _declared_capsule_for_execution(
     call: ToolCallRequest,
     context: BatchToolExecutionContext,
     dispatcher: ToolDispatcher,
+    process_capsule_interrupt_policy: ProcessCapsuleInterruptPolicy,
 ) -> ToolExecutionCapsule:
     """把声明式 execution capability 映射为 Host execution capsule。
 
@@ -1594,6 +1596,8 @@ def _declared_capsule_for_execution(
     :param call: 单次工具调用请求。
     :param context: 批式工具执行上下文。
     :param dispatcher: 当前 ToolRuntime dispatcher。
+    :param process_capsule_interrupt_policy: process-backed capsule cleanup
+        interrupt 策略。
     :returns: 对应的 execution capsule。
     :raises TypeError: 遇到未知 execution capability 类型时抛出。
     :raises Exception: process target factory 构造目标失败时透传。
@@ -1618,7 +1622,10 @@ def _declared_capsule_for_execution(
             call,
             _process_backed_context_from_batch_context(context),
         )
-        return ProcessBackedToolExecutionCapsule(target)
+        return ProcessBackedToolExecutionCapsule(
+            target,
+            interrupt_policy=process_capsule_interrupt_policy,
+        )
     raise TypeError(
         f"unsupported tool execution capability: {type(execution).__name__}"
     )
@@ -1753,14 +1760,26 @@ class ThreadBackedToolExecutionCapsule:
 class ProcessBackedToolExecutionCapsule:
     """process-backed 工具执行 capsule。"""
 
-    def __init__(self, target: InterruptibleProcessTarget) -> None:
+    def __init__(
+        self,
+        target: InterruptibleProcessTarget,
+        *,
+        interrupt_policy: ProcessCapsuleInterruptPolicy | None = None,
+    ) -> None:
         """初始化 process-backed capsule。
 
         :param target: 可序列化子进程目标；返回值必须是工具 JSON 信封。
+        :param interrupt_policy: terminate / kill cleanup grace 策略；``None``
+            表示使用 Host tooling typed 默认值。
         :returns: ``None``。
         """
 
         self._handle = InterruptibleProcessHandle(target)
+        self._interrupt_policy = (
+            interrupt_policy
+            if interrupt_policy is not None
+            else ProcessCapsuleInterruptPolicy()
+        )
         self._started = False
 
     @property
@@ -1823,7 +1842,7 @@ class ProcessBackedToolExecutionCapsule:
 
         del reason
         result = await self._handle.terminate(
-            grace_seconds=_PROCESS_CAPSULE_TERMINATE_GRACE_SECONDS
+            grace_seconds=self._interrupt_policy.terminate_grace_seconds
         )
         return _tool_interrupt_result_from_process(
             result,
@@ -1840,7 +1859,7 @@ class ProcessBackedToolExecutionCapsule:
 
         del reason
         result = await self._handle.kill(
-            grace_seconds=_PROCESS_CAPSULE_KILL_GRACE_SECONDS
+            grace_seconds=self._interrupt_policy.kill_grace_seconds
         )
         return _tool_interrupt_result_from_process(
             result,
@@ -1854,7 +1873,9 @@ class ProcessBackedToolExecutionCapsule:
         :returns: ``None``。
         """
 
-        await self._handle.close()
+        await self._handle.close(
+            kill_grace_seconds=self._interrupt_policy.kill_grace_seconds
+        )
 
 
 class DefaultToolRuntimePolicyPort:
@@ -2718,6 +2739,8 @@ class ToolRuntimeBuildRequest:
     :param policy_view: Host 内部工具 policy view。
     :param duplicate_governance_policy: ToolRuntime 使用的 duplicate governance
         策略。
+    :param process_capsule_interrupt_policy: process-backed capsule terminate /
+        kill cleanup grace 策略。
     :param diagnostic_emitter: 诊断 emitter；无则使用确定性内存引用实现。
     :param execution_capsule_factory: 测试用内部 execution capsule factory
         override；无则按 effective ``ToolDefinition.execution`` 创建 capsule。
@@ -2737,6 +2760,9 @@ class ToolRuntimeBuildRequest:
     )
     duplicate_governance_policy: DuplicateGovernancePolicy = field(
         default_factory=DuplicateGovernancePolicy
+    )
+    process_capsule_interrupt_policy: ProcessCapsuleInterruptPolicy = field(
+        default_factory=ProcessCapsuleInterruptPolicy
     )
     diagnostic_emitter: ToolTraceDiagnosticEmitter | None = None
     execution_capsule_factory: ToolExecutionCapsuleFactory | None = None
@@ -3984,7 +4010,10 @@ class DefaultToolRuntimeFactory:
             execution_capsule_factory = (
                 request.execution_capsule_factory
                 if request.execution_capsule_factory is not None
-                else DeclaredToolExecutionCapsuleFactory(effective_bundle)
+                else DeclaredToolExecutionCapsuleFactory(
+                    effective_bundle,
+                    request.process_capsule_interrupt_policy,
+                )
             )
             executor: ToolExecutor = ToolRuntimeExecutor(
                 effective_bundle=effective_bundle,
@@ -6541,70 +6570,26 @@ def _tool_outcome_from_process_envelope(envelope: JsonValue) -> ToolExecutionOut
     :raises Exception: 不主动抛出异常。
     """
 
-    if not isinstance(envelope, Mapping):
-        return _malformed_process_envelope_outcome("process envelope must be object")
-    status = envelope.get(_PROCESS_ENVELOPE_STATUS_FIELD)
-    if not isinstance(status, str):
-        return _malformed_process_envelope_outcome(
-            "process envelope status must be text"
+    parsed = parse_process_tool_envelope(envelope)
+    if isinstance(parsed, ProcessToolCompletedEnvelope):
+        return ToolCompletedOutcome(
+            result=ToolResultSuccess(
+                ok=True,
+                value=parsed.value,
+                meta=None,
+            )
         )
-    if status == _PROCESS_ENVELOPE_COMPLETED_STATUS:
-        return _completed_outcome_from_process_envelope(envelope)
-    if status == _PROCESS_ENVELOPE_FAILED_STATUS:
-        return _failed_outcome_from_process_envelope(envelope)
-    if status in _PROCESS_ENVELOPE_RESERVED_STATUSES:
-        return _unsupported_process_envelope_outcome(status)
-    return _unsupported_process_envelope_outcome(status)
-
-
-def _completed_outcome_from_process_envelope(
-    envelope: Mapping[str, JsonValue],
-) -> ToolExecutionOutcome:
-    """解析 process-backed completed 信封。
-
-    :param envelope: 已确认 status 为 completed 的 JSON 对象。
-    :returns: 工具成功 outcome 或 fail-closed 失败 outcome。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    if _PROCESS_ENVELOPE_COMPLETED_VALUE_FIELD not in envelope:
-        return _malformed_process_envelope_outcome(
-            "process completed envelope must contain value"
+    if isinstance(parsed, ProcessToolFailedEnvelope):
+        return _tool_failed_outcome(
+            error=parsed.error_type,
+            message=parsed.message,
+            hint=parsed.hint,
         )
-    return ToolCompletedOutcome(
-        result=ToolResultSuccess(
-            ok=True,
-            value=envelope[_PROCESS_ENVELOPE_COMPLETED_VALUE_FIELD],
-            meta=None,
-        )
-    )
-
-
-def _failed_outcome_from_process_envelope(
-    envelope: Mapping[str, JsonValue],
-) -> ToolExecutionOutcome:
-    """解析 process-backed failed 信封。
-
-    :param envelope: 已确认 status 为 failed 的 JSON 对象。
-    :returns: 工具失败 outcome 或 fail-closed 失败 outcome。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    error_type = envelope.get(_PROCESS_ENVELOPE_FAILED_ERROR_TYPE_FIELD)
-    message = envelope.get(_PROCESS_ENVELOPE_FAILED_MESSAGE_FIELD)
-    if not isinstance(error_type, str) or error_type.strip() == "":
-        return _malformed_process_envelope_outcome(
-            "process failed envelope error_type must be non-empty text"
-        )
-    if not isinstance(message, str) or message.strip() == "":
-        return _malformed_process_envelope_outcome(
-            "process failed envelope message must be non-empty text"
-        )
-    return _tool_failed_outcome(
-        error=error_type,
-        message=message,
-        hint=None,
-    )
+    if isinstance(parsed, ProcessToolMalformedEnvelope):
+        return _malformed_process_envelope_outcome(parsed.message)
+    if isinstance(parsed, ProcessToolUnsupportedEnvelope):
+        return _unsupported_process_envelope_outcome(parsed.status)
+    raise TypeError("unsupported process tool envelope parse result")
 
 
 def _malformed_process_envelope_outcome(message: str) -> ToolFailedOutcome:

@@ -217,6 +217,52 @@ def _agent_policy_record() -> dict[str, JsonValue]:
     }
 
 
+def _host_runtime_config_record(
+    *,
+    include_process_capsule_interrupt_policy: bool = False,
+    process_capsule_interrupt_policy: JsonValue = None,
+) -> dict[str, JsonValue]:
+    """构造完整 host_runtime.json fixture。
+
+    :param include_process_capsule_interrupt_policy: 是否写入 process capsule
+        cleanup interrupt policy block。
+    :param process_capsule_interrupt_policy: 可选 process capsule cleanup
+        interrupt policy JSON 值。
+    :returns: host_runtime.json 顶层 JSON object。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    runtime_record: dict[str, JsonValue] = {
+        "extends": None,
+        "store_root": "workspace/.dayu/host",
+        "artifact_root": "workspace/.dayu/artifacts",
+        "sqlite": {
+            "path": "workspace/.dayu/host/dayu.sqlite3",
+            "busy_timeout_seconds": 5.0,
+            "write_busy_retry_count": 8,
+            "write_retry_initial_delay_seconds": 0.005,
+            "write_retry_backoff_multiplier": 1.5,
+            "write_retry_max_delay_seconds": 0.05,
+        },
+        "host_execution_lane_name": "llm_api",
+        "worker_backend": "local",
+        "dispatch_poll_interval_seconds": 0.1,
+        "payload_inline_threshold_bytes": 4096,
+        "worker_startup_timeout_seconds": 10.0,
+        "memory_projection_catch_up_batch_size": 10,
+    }
+    if include_process_capsule_interrupt_policy:
+        runtime_record["process_capsule_interrupt_policy"] = (
+            process_capsule_interrupt_policy
+        )
+    return {
+        "default_host_runtime_id": "local",
+        "runtimes": {
+            "local": runtime_record,
+        },
+    }
+
+
 def _minimal_package_config(root: Path) -> None:
     """写入一套最小完整包内配置 fixture。
 
@@ -255,30 +301,7 @@ def _minimal_package_config(root: Path) -> None:
     )
     _write_json(
         root / "host_runtime.json",
-        {
-            "default_host_runtime_id": "local",
-            "runtimes": {
-                "local": {
-                    "extends": None,
-                    "store_root": "workspace/.dayu/host",
-                    "artifact_root": "workspace/.dayu/artifacts",
-                    "sqlite": {
-                        "path": "workspace/.dayu/host/dayu.sqlite3",
-                        "busy_timeout_seconds": 5.0,
-                        "write_busy_retry_count": 8,
-                        "write_retry_initial_delay_seconds": 0.005,
-                        "write_retry_backoff_multiplier": 1.5,
-                        "write_retry_max_delay_seconds": 0.05,
-                    },
-                    "host_execution_lane_name": "llm_api",
-                    "worker_backend": "local",
-                    "dispatch_poll_interval_seconds": 0.1,
-                    "payload_inline_threshold_bytes": 4096,
-                    "worker_startup_timeout_seconds": 10.0,
-                    "memory_projection_catch_up_batch_size": 10,
-                }
-            },
-        },
+        _host_runtime_config_record(),
     )
     _write_json(
         root / "runtime_lanes.json",
@@ -376,6 +399,7 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
     assert host_runtime.sqlite.write_retry_initial_delay_seconds == 0.005
     assert host_runtime.payload_inline_threshold_bytes == 65535
     assert host_runtime.worker_startup_timeout_seconds == 10.0
+    assert host_runtime.process_capsule_interrupt_policy is None
     assert config.runtime_lanes.lanes["llm_api"].capacity == 4
     read_provider = config.tool_discovery.providers["financial-read-tools"]
     download_provider = config.tool_discovery.providers["financial-download-tools"]
@@ -432,6 +456,88 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
         == "workspace/.dayu/web_tools_storage_states"
     )
     assert web_provider.config["allow_private_network_url"] is False
+
+
+def test_host_runtime_process_capsule_policy_missing_block_is_valid(
+    tmp_path: Path,
+) -> None:
+    """host_runtime 缺省 process capsule policy block 时 typed config 为 None。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+
+    config = ConfigLoader(package_config_dir=package_root).load_host_runtime()
+
+    assert (
+        config.runtimes["local"].process_capsule_interrupt_policy is None
+    )
+
+
+def test_host_runtime_process_capsule_policy_valid_block_parses(
+    tmp_path: Path,
+) -> None:
+    """host_runtime process capsule cleanup policy 显式配置必须被解析。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    _write_json(
+        package_root / "host_runtime.json",
+        _host_runtime_config_record(
+            include_process_capsule_interrupt_policy=True,
+            process_capsule_interrupt_policy={
+                "terminate_grace_seconds": 0.35,
+                "kill_grace_seconds": 0.75,
+            },
+        ),
+    )
+
+    config = ConfigLoader(package_config_dir=package_root).load_host_runtime()
+    policy = config.runtimes["local"].process_capsule_interrupt_policy
+
+    assert policy is not None
+    assert policy.terminate_grace_seconds == 0.35
+    assert policy.kill_grace_seconds == 0.75
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    (
+        ("terminate_grace_seconds", True),
+        ("terminate_grace_seconds", -0.1),
+        ("terminate_grace_seconds", float("nan")),
+        ("terminate_grace_seconds", float("inf")),
+        ("terminate_grace_seconds", float("-inf")),
+        ("kill_grace_seconds", True),
+        ("kill_grace_seconds", -0.1),
+        ("kill_grace_seconds", float("nan")),
+        ("kill_grace_seconds", float("inf")),
+        ("kill_grace_seconds", float("-inf")),
+    ),
+)
+def test_host_runtime_process_capsule_policy_invalid_grace_fails_fast(
+    tmp_path: Path,
+    field_name: str,
+    value: JsonValue,
+) -> None:
+    """host_runtime process capsule cleanup grace 拒绝 bool、负数、NaN 与无穷。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    policy: dict[str, JsonValue] = {
+        "terminate_grace_seconds": 0.35,
+        "kill_grace_seconds": 0.75,
+    }
+    policy[field_name] = value
+    _write_json(
+        package_root / "host_runtime.json",
+        _host_runtime_config_record(
+            include_process_capsule_interrupt_policy=True,
+            process_capsule_interrupt_policy=policy,
+        ),
+    )
+
+    with pytest.raises(ConfigFieldError, match=field_name):
+        ConfigLoader(package_config_dir=package_root).load_host_runtime()
 
 
 def test_workspace_record_replaces_package_record_without_deep_merge(

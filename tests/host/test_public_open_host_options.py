@@ -262,6 +262,16 @@ def test_open_host_options_do_not_accept_removed_active_cancel_budget() -> None:
     assert removed_field_name not in constructor_parameters
 
 
+def test_open_host_options_do_not_expose_process_capsule_policy_directly() -> None:
+    """process capsule cleanup policy 只能通过 HostToolingOptions 进入。"""
+
+    field_names = {field.name for field in fields(OpenHostOptions)}
+    constructor_parameters = inspect.signature(OpenHostOptions).parameters
+
+    assert "process_capsule_interrupt_policy" not in field_names
+    assert "process_capsule_interrupt_policy" not in constructor_parameters
+
+
 def test_open_host_options_validate_lane_and_baseline(
     tmp_path: pathlib.Path,
 ) -> None:
