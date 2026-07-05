@@ -689,7 +689,7 @@ SecProcessor
 
 ### Read tool 结果与截断
 
-Read tools 的 schema、错误和结果字段必须面向 LLM 自解释。工具可以声明 `ToolTruncateSpec`，但截断执行、cursor 生命周期和 `fetch_more` 都由 Host ToolRuntime 处理。Fins read 工具的 direct callable 只作为测试和非生产 fallback；生产默认执行由 ToolRuntime 根据 `ToolDefinition.execution` 进入 process-backed 边界。Fins 工具不得自行模拟 Host truncation manager，也不得把内部 ref / digest 当成业务事实返回给模型。
+Read tools 的 schema、错误和结果字段必须面向 LLM 自解释。工具可以声明 `ToolTruncateSpec`，但截断执行、cursor 生命周期和 `fetch_more` 都由 Host ToolRuntime 处理。Fins read 工具的 direct callable 只作为测试和非生产 fallback；生产默认执行由 ToolRuntime 根据 `ToolDefinition.execution` 进入 process-backed 边界。Fins process target 使用 `dayu.contracts` 的 process-backed envelope helper 构造 completed / failed 信封；failed 信封的 `hint` 是结构化字段，由 Host 映射为 `ToolResultFailure.hint`，不得拼接进 `message`。Fins 工具不得自行模拟 Host truncation manager，也不得把内部 ref / digest 当成业务事实返回给模型。
 
 ### Download adapter 与 unsupported source
 

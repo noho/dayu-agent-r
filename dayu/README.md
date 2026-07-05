@@ -172,6 +172,7 @@ HostEvent、outbox、Conversation Memory、tool trace、audit、diagnostic 和 p
 - `CancellationToken`：跨层取消观察协议，不导出取消异常。
 - `ToolSchema`、`ToolFunctionSchema`、`ToolParametersSchema`、`ToolTruncateSpec`、`ToolTruncationStrategy`：工具 schema 与截断声明。
 - `ToolDefinition`、`ToolDisplayInfo`、`ToolBundle`、`ToolCallable`、`tool(...)`、`ToolExecutionCapability`：最小工具声明契约。execution capability 只声明 Host / ToolRuntime 选择执行边界所需的运行期能力，不进入 LLM-facing tool schema；具体工具实现、工具发现、权限与执行治理不属于公共包。
+- `process_tool_completed_envelope(...)`、`process_tool_failed_envelope(...)`、`parse_process_tool_envelope(...)` 与 process-backed target 类型：工具子进程和 Host / ToolRuntime 共享的 process-backed 执行信封契约；它只表达子进程完成或失败结果，不进入 LLM-facing tool schema，也不承载 Host cancel / timeout / awaiting 状态机。
 - `ToolCallRequest`、`BatchToolExecutionContext`、`BatchToolExecutionRequest`：Engine 到 ToolExecutor 的批式工具调用输入。
 - `ToolCompletedOutcome`、`ToolFailedOutcome`、`ToolAwaitingOutcome`、`ToolCancelledOutcome`、`BatchToolExecutionRecord`、`BatchToolExecutionOutcome`：工具执行结果与批次结果。
 - `ToolAwaitKind`、`ToolAwaitSpec`、`ToolAwaitSnapshot`：长事务等待契约。

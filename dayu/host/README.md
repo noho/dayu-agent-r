@@ -370,7 +370,7 @@ EngineEvent ingest 校验 run / attempt / execution identity、当前 durable st
 
 ToolRuntime 把 construction-time `HostToolingOptions` 中的业务工具 bundle 与 Host framework tools 组合成 effective tool bundle，并向 Engine 提供受治理的 `ToolExecutor`。工具结果只有通过 Host accept barrier 后才会返回给 Engine；side-effect / paid tool 必须携带工具幂等键；attempt-local duplicate governance、run-scoped truncation cursor 和 optional `fetch_more` 都在 ToolRuntime 内治理。
 
-ToolRuntime 默认从 effective `ToolDefinition.execution` 选择执行 capsule：`async_direct` 直接运行 async callable，`thread_backed` 只表示可取消 wrapper awaitable、不承诺停止 OS thread，`process_backed` 通过可序列化 target factory 构造子进程目标。process-backed 子进程只返回 JSON 信封，Host capsule 将 `completed` / `failed` 信封映射为工具 outcome；取消和超时仍由父进程 Host 治理独占处理。execution capability 不进入 Engine-facing `ToolSchema` 或 LLM-facing schema。
+ToolRuntime 默认从 effective `ToolDefinition.execution` 选择执行 capsule：`async_direct` 直接运行 async callable，`thread_backed` 只表示可取消 wrapper awaitable、不承诺停止 OS thread，`process_backed` 通过可序列化 target factory 构造子进程目标。process-backed 子进程只返回 `dayu.contracts` 定义的 JSON 信封，Host capsule 将 `completed` / `failed` 信封映射为工具 outcome；failed 信封的 `hint` 会映射到结构化 `ToolResultFailure.hint`，不拼入 `message`。取消和超时仍由父进程 Host 治理独占处理。execution capability 与 process-backed 信封字段不进入 Engine-facing `ToolSchema` 或 LLM-facing schema。
 
 长事务工具需要启动外部工作时，业务 callable 先返回 awaiting outcome；ToolRuntime 只在 Host awaiting accept ack 已 durable 成立后，才通过 construction-time activation registry 调用 provider 内部 activation adapter。该 adapter 不进入 Engine contract，也不暴露给 LLM-facing tool schema。
 
