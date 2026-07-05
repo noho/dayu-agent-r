@@ -155,14 +155,14 @@ git push -u github <branch>
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | accepted-slice-commit |
-| implementation status | WU-TOOLS-CANCEL-01 residual hardening reached final-closeout-pass and PR #170 was merged on 2026-07-05, closing GitHub Issue #87. Its final closeout artifact remains `docs/reviews/wu-tools-cancel-01-residual-hardening-final-closeout.md`, and final accepted commit remains `ddbcef5b`. WU-WAIT-04 goal confirmation was accepted by the user with the hard constraint that smoke can only use public contracts. Plan artifact `docs/host/wu-wait-04-production-awaiting-e2e-smoke-plan.md` passed plan review / fix / re-review. Accepted plan commit is `35d947ea`. Slice S1 `Service production poller assembly gap` accepted commit is `503b2cf5`. Slice S2 `Public-only entrypoint awaiting E2E smoke` implementation, controller validation, code review, and controller adjudication passed with no accepted findings. |
+| gate | final-closeout-pass |
+| implementation status | WU-TOOLS-CANCEL-01 residual hardening reached final-closeout-pass and PR #170 was merged on 2026-07-05, closing GitHub Issue #87. Its final closeout artifact remains `docs/reviews/wu-tools-cancel-01-residual-hardening-final-closeout.md`, and final accepted commit remains `ddbcef5b`. WU-WAIT-04 goal confirmation was accepted by the user with the hard constraint that smoke can only use public contracts. Plan artifact `docs/host/wu-wait-04-production-awaiting-e2e-smoke-plan.md` passed plan review / fix / re-review. Accepted plan commit is `35d947ea`. Slice S1 `Service production poller assembly gap` accepted commit is `503b2cf5`. Slice S2 `Public-only entrypoint awaiting E2E smoke` accepted commit is `d3bdb2c3`. Final closeout artifact is `docs/reviews/wu-wait-04-final-closeout.md`. Draft PR #171 is open at https://github.com/noho/dayu-agent-r/pull/171. |
 | active work unit | WU-WAIT-04 |
-| default next work unit | WU-WAIT-04 is the next implementation entry point after PR #170 merge. |
-| next entry point | Create accepted slice commit for WU-WAIT-04 S2, then enter final closeout gate for WU-WAIT-04. |
+| default next work unit | Pending selection after WU-WAIT-04 PR #171 is handled by the user / maintainer. |
+| next entry point | Wait for user / maintainer handling of draft PR #171. Do not mark ready, merge, close issues, request reviewers, or delete the branch without explicit authorization. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | Active/backlog issue owners retained here: #129 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #88 / #112 / #20 / #80 / #115, plus residual-risk destinations #121 / #122. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`; #63 / #87 / #89 / #90 / #91 / #92 / #111 / #130 / #133 / #168 are no longer active implementation owners. |
-| blocking open questions | None for WU-WAIT-04 plan gate. |
+| blocking open questions | None for WU-WAIT-04 final closeout. |
 
 状态约定：
 
@@ -259,7 +259,7 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-WAIT-02 | completed | Production poller loop / backoff / fencing / retry | GitHub Issue #90 / PR #165 | PR 165 merged on 2026-07-03 and issue #90 closed automatically; not an active implementation entry point. |
 | WU-WAIT-03 | completed | External job physical cancel / revoke / abandon | GitHub Issue #92 / #87 umbrella / PR #166 | PR 166 merged on 2026-07-04 and issue #92 closed automatically; not an active implementation entry point. |
 | WU-TOOLS-CANCEL-01 | completed | Tool/provider blocking I/O cancellation hardening | follows WU-LIFE-04 / PR #170 | WU-LIFE-04 已完成；accepted plan commit 为 `4723ec61`，S1 accepted slice commit 为 `eda4be1a`，S2 partial hardening commit 为 `29003541`，typed execution capability plan commit 为 `8eddd26b`。S2A1 `contract / declaration / digest`、S2A2 `Host factory wiring`、S2B `Doc process-backed`、S2C `Fins read process-backed`、S2D `Web sync process-backed` 和 S2E `aggregate validation` 均已通过 implementation / validation、AgentMiMo / AgentDS review 或 aggregate deepreview、controller validation 与 controller adjudication。2026-07-05 用户裁决升级的五项必修 hardening：process envelope hint 结构化、Playwright cleanup smoke、Fins XBRL fixture breadth、process envelope contract single-source、process capsule grace tuning，均已通过 residual hardening plan、S1/S2A/S2B/S3/S4、aggregate review、accepted fix、re-review 与 controller adjudication 闭环。Final closeout artifact 为 `docs/reviews/wu-tools-cancel-01-residual-hardening-final-closeout.md`；final accepted commit 为 `ddbcef5b`。PR #170 已于 2026-07-05 merge，GitHub Issue #87 已关闭；WU-WAIT-04 成为下一 implementation entry point。 |
-| WU-WAIT-04 | discussion-ready | UI / Service production-grade awaiting E2E smoke | depends on #89 / #90 / #92 + WU-LIFE-03 + WU-LIFE-04 + WU-TOOLS-CANCEL-01 | dependent smoke；#89 / #90 / #92、WU-LIFE-03、WU-LIFE-04 与 WU-TOOLS-CANCEL-01 均已完成，当前进入 goal confirmation。覆盖原 WU-WAIT-03-R1：验证 Service / composition 在生产等待路径启用并装配 wait poller / adapter registry，使 cancelled WAITING external lifecycle action 能在 public workflow 中执行，并验证取消后的 public 可交互恢复体验。 |
+| WU-WAIT-04 | final-closeout-pass | UI / Service production-grade awaiting E2E smoke | depends on #89 / #90 / #92 + WU-LIFE-03 + WU-LIFE-04 + WU-TOOLS-CANCEL-01 / draft PR #171 | dependent smoke；#89 / #90 / #92、WU-LIFE-03、WU-LIFE-04 与 WU-TOOLS-CANCEL-01 均已完成。Plan commit `35d947ea`、S1 accepted commit `503b2cf5`、S2 accepted commit `d3bdb2c3`。Final closeout artifact 为 `docs/reviews/wu-wait-04-final-closeout.md`。Draft PR #171 已创建：https://github.com/noho/dayu-agent-r/pull/171。PR body 无 `Closes` footer，因为本 WU 不是独立 GitHub issue owner。等待用户 / maintainer 处理 draft PR；不得未经授权 mark ready、merge、close issue、request reviewers 或 delete branch。 |
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
 
@@ -1818,7 +1818,7 @@ Goal confirmation 已由用户确认。Plan artifact 为 `docs/host/wu-wait-03-e
 
 ### 状态
 
-依赖 WU-WAIT-01 / GitHub Issue #89、WU-WAIT-02 / GitHub Issue #90、WU-WAIT-03 / GitHub Issue #92、WU-LIFE-03、WU-LIFE-04 与 WU-TOOLS-CANCEL-01；不是可独立实施的 work unit。前置能力完成后，本条才作为 production-grade end-to-end smoke 进入 implementation gate。
+已达 final-closeout-pass。依赖 WU-WAIT-01 / GitHub Issue #89、WU-WAIT-02 / GitHub Issue #90、WU-WAIT-03 / GitHub Issue #92、WU-LIFE-03、WU-LIFE-04 与 WU-TOOLS-CANCEL-01 均已满足。Goal confirmation 明确要求 smoke 只能使用 public contracts；Plan commit 为 `35d947ea`，S1 accepted commit 为 `503b2cf5`，S2 accepted commit 为 `d3bdb2c3`。Final closeout artifact 为 `docs/reviews/wu-wait-04-final-closeout.md`。Draft PR #171 已创建：https://github.com/noho/dayu-agent-r/pull/171。
 
 ### 目标
 
