@@ -1057,7 +1057,18 @@ python utils/smoke_host_public_conversation_memory_scenarios.py --suite memory-c
 
 `memory-core` 只通过 public Host handle 观察行为，不读取 durable DB、EventLog、memory 表或 compact payload 内容。`memory-compact` 会额外读取本次 session 的 compact EventLog 摘要，只审计 compact event type、trigger source、operation timeline、rejected attempt histogram、proposal manifest ref 有无、fallback action 和失败阶段标记，不读取 memory / compact material 正文。脚本只注入 `manual-smoke` mock finance tool，不调用真实 Fins 工具；stdout 输出每个 scenario 的 terminal 摘要、final answer 预览、工具调用次数、pressure 计划、compact audit 摘要、compact operation 诊断和 compact artifact 路径。compact suite 通过时会先输出 `SMOKE COMPACT_ACCEPTANCE status=pass ...`，再输出 `SMOKE PASS public Host conversation memory scenario smoke`；若出现 `CONTEXT_COMPACTION_FAILED`，即使 fallback dispatch 让当前回答完成，`memory-compact` 仍会失败。当前 smoke 不覆盖 conversation memory correctness 的全量验证。
 
-### 5.4 Engine provider smoke
+### 5.4 Host public awaiting entrypoint smoke
+
+`utils/smoke_host_public_awaiting_entrypoint.py` 用于人工确认一次等待型任务可以先进入等待态，再由后台轮询恢复并产出最终结果。脚本默认使用 `workspace/tmp/` 下的 fresh smoke workspace；显式传 `--workspace-root` 时才复用指定 workspace。该脚本不调用真实外部财报系统，只使用内置的确定性 smoke 工具和轮询结果。
+
+```bash
+source .venv/bin/activate
+python utils/smoke_host_public_awaiting_entrypoint.py --keep-workspace
+```
+
+通过时输出 `SMOKE PASS Host public awaiting entrypoint`，并打印 run id、terminal event id、worker accept count、poll ready count 和 outbox terminal match，便于排查等待态恢复链路是否正常。
+
+### 5.5 Engine provider smoke
 
 `utils/smoke_async_agent_providers.py` 用于人工验证 OpenAI-compatible provider 的基础 Agent 主链路。它不属于生产入口，也不读取 Host 配置。
 

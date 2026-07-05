@@ -6,7 +6,8 @@
 
 ## Changed Files
 
-- `tests/service/test_entrypoint_runtime_awaiting_smoke.py`
+- `utils/smoke_host_public_awaiting_entrypoint.py`
+- `README.md`
 - `tests/README.md`
 - `docs/reviews/wu-wait-04-s2-implementation-codex.md`
 
@@ -15,7 +16,7 @@
 ## Behavior Implemented
 
 - 新增 production-grade Service entrypoint awaiting smoke。
-- 测试直接构造 public `OpenHostOptions`，包含 deterministic worker factory、等待型业务工具 bundle、wait binding registry、wait poll adapter registry，以及显式启用的短间隔 `WaitPollerRuntimePolicy`；未改变生产默认值。
+- smoke 脚本直接构造 public `OpenHostOptions`，包含 deterministic worker factory、等待型业务工具 bundle、wait binding registry、wait poll adapter registry，以及显式启用的短间隔 `WaitPollerRuntimePolicy`；未改变生产默认值。
 - 第一轮 worker 通过 public `AgentRunRequest.tool_executor.execute(BatchToolExecutionRequest(...))` 发起工具执行握手；Host 工具治理真实执行等待型业务工具并接受 awaiting outcome，使 Run 进入 `WAITING`。
 - 第一轮 worker 只用 public `LocalWorkerHandle.events() -> AsyncIterator[EngineEvent]` 协议把 public `TOOL_AWAITING` / `RUN_SUSPENDED` 事件载荷交回 Host；未导入或调用 private Engine agent implementation。
 - 恢复后的第二轮 worker 通过同一 public worker event 协议返回 public final answer event。
@@ -35,25 +36,24 @@
 
 ## Validation
 
-- `source .venv/bin/activate && pytest tests/service/test_entrypoint_runtime_awaiting_smoke.py -q`
-  - Result: passed, `1 passed, 3 warnings`.
-  - Warnings: third-party `edgar` deprecation warnings only.
-- `source .venv/bin/activate && pytest tests/service/test_host_assembly.py tests/service/test_entrypoint_runtime_awaiting_smoke.py -q`
-  - Result: passed, `55 passed, 3 warnings`.
+- `source .venv/bin/activate && python utils/smoke_host_public_awaiting_entrypoint.py --keep-workspace`
+  - Result: passed with `SMOKE PASS Host public awaiting entrypoint`.
+- `source .venv/bin/activate && pytest tests/service/test_host_assembly.py -q`
+  - Result: passed, `54 passed, 3 warnings`.
   - Warnings: third-party `edgar` deprecation warnings only.
 - `source .venv/bin/activate && pyright`
   - Result: passed, `0 errors, 0 warnings, 0 informations`.
 - Forbidden-path grep:
-  - Command: `rg -n "from dayu\.host\.durable|import dayu\.host\.durable|from dayu\.host\.tool_runtime|import dayu\.host\.tool_runtime|open_host_durable_store|read_active_wait_records_for_run|read_wait_record_by_id|ResolveWaitRequest|WaitResolutionSource\.MANUAL|resolve_wait\(|ToolRuntime|dispatch row|scheduler|dayu\.engine\.agent|_AsyncAgent" tests/service/test_entrypoint_runtime_awaiting_smoke.py`
+  - Command: `rg -n "from dayu\.host\.durable|import dayu\.host\.durable|from dayu\.host\.tool_runtime|import dayu\.host\.tool_runtime|open_host_durable_store|read_active_wait_records_for_run|read_wait_record_by_id|ResolveWaitRequest|WaitResolutionSource\.MANUAL|resolve_wait\(|ToolRuntime|dispatch row|scheduler|dayu\.engine\.agent|_AsyncAgent" utils/smoke_host_public_awaiting_entrypoint.py`
   - Result: no matches.
 - `git diff --check`
   - Result: passed.
 
 ## README Decision
 
-已读取 `tests/README.md` 的 Agent 更新约束。新增 `tests/service/test_entrypoint_runtime_awaiting_smoke.py` 改变了 `tests/service/` entrypoint runtime 覆盖事实，因此已在 `tests/README.md` 的 Service 分层条目中最小追加 production awaiting smoke 覆盖说明。
+已读取 README 更新约束。smoke 迁移为 `utils/` 下的手工脚本后，已在根 `README.md` 的手工 smoke 章节新增运行说明，并从 `tests/README.md` 移除 pytest 覆盖描述。
 
-未更新其它 README。S2 未修改生产代码、用户可见 CLI/Web/WeChat workflow、命令参数、默认输出通道、分层关系或 durable schema。
+S2 未修改生产代码、用户可见 CLI/Web/WeChat workflow、默认输出通道、分层关系或 durable schema。
 
 ## Public-contract-only Enforcement
 

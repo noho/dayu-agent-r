@@ -4,7 +4,7 @@
 
 - Slice: S2 `Public-only entrypoint awaiting E2E smoke`
 - Implementation report: `docs/reviews/wu-wait-04-s2-implementation-codex.md`
-- New smoke: `tests/service/test_entrypoint_runtime_awaiting_smoke.py`
+- New smoke: `utils/smoke_host_public_awaiting_entrypoint.py`
 
 ## Boundary Check
 
@@ -19,24 +19,25 @@
 
 ## Controller Validation
 
-- `source .venv/bin/activate && pytest tests/service/test_entrypoint_runtime_awaiting_smoke.py -q`
-  - Result: passed, `1 passed, 3 warnings`.
-- `source .venv/bin/activate && pytest tests/service/test_host_assembly.py tests/service/test_entrypoint_runtime_awaiting_smoke.py -q`
-  - Result: passed, `55 passed, 3 warnings`.
+- `source .venv/bin/activate && python utils/smoke_host_public_awaiting_entrypoint.py --keep-workspace`
+  - Result: passed with `SMOKE PASS Host public awaiting entrypoint`.
+- `source .venv/bin/activate && pytest tests/service/test_host_assembly.py -q`
+  - Result: passed, `54 passed, 3 warnings`.
 - `source .venv/bin/activate && pyright`
   - Result: passed, `0 errors, 0 warnings, 0 informations`.
 - Forbidden-path guard:
-  - Command: `rg -n "from dayu\.host\.durable|import dayu\.host\.durable|from dayu\.host\.tool_runtime|import dayu\.host\.tool_runtime|open_host_durable_store|read_active_wait_records_for_run|read_wait_record_by_id|ResolveWaitRequest|WaitResolutionSource\.MANUAL|resolve_wait\(|ToolRuntime|dispatch row|scheduler|dayu\.engine\.agent|_AsyncAgent" tests/service/test_entrypoint_runtime_awaiting_smoke.py`
+  - Command: `rg -n "from dayu\.host\.durable|import dayu\.host\.durable|from dayu\.host\.tool_runtime|import dayu\.host\.tool_runtime|open_host_durable_store|read_active_wait_records_for_run|read_wait_record_by_id|ResolveWaitRequest|WaitResolutionSource\.MANUAL|resolve_wait\(|ToolRuntime|dispatch row|scheduler|dayu\.engine\.agent|_AsyncAgent" utils/smoke_host_public_awaiting_entrypoint.py`
   - Result: no matches.
 - Weak typing / private bypass guard:
-  - Command: `rg -n "\bAny\b|\bobject\b|type: ignore|# pyright|hasattr\(|getattr\(" tests/service/test_entrypoint_runtime_awaiting_smoke.py`
+  - Command: `rg -n "\bAny\b|\bobject\b|type: ignore|# pyright|hasattr\(|getattr\(" utils/smoke_host_public_awaiting_entrypoint.py`
   - Result: only JSON tool schema `"type": "object"` matched, which is allowed by AGENTS tool schema exception.
 - `git diff --check`
   - Result: passed.
 
 ## README Decision
 
-- `tests/README.md` was updated because S2 adds a new `tests/service/` entrypoint runtime smoke coverage fact.
+- `README.md` was updated because S2 now adds a new `utils/` manual smoke command.
+- `tests/README.md` was updated to remove the obsolete pytest coverage statement after the smoke moved out of `tests/`.
 - No production code changed in S2, so no layer README or user-facing README update is required for this slice.
 
 ## Controller Decision

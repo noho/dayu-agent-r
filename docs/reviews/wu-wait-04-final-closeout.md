@@ -12,13 +12,13 @@
 ## What Changed
 
 - Added Service / Fins assembly support for production wait poll adapter registry wiring from enabled awaiting provider configs.
-- Added a public-contract-only Service entrypoint awaiting smoke:
+- Added `utils/smoke_host_public_awaiting_entrypoint.py`, a public-contract-only Service entrypoint awaiting smoke:
   - submits through `submit_entrypoint_turn_and_wait`;
   - observes `WAITING` via Service activity and public `host.get_run(...)`;
   - releases wait recovery through production wait poller policy and public wait poll adapter registry;
   - receives the same Run terminal through the Service live terminal path;
   - verifies public outbox terminal backfill with `host.read_outbox_terminal_items(...)`.
-- Updated `tests/README.md` to document the new Service entrypoint awaiting smoke coverage.
+- Updated `README.md` to document the new manual smoke command, and updated `tests/README.md` to remove the obsolete pytest coverage statement after the smoke moved out of `tests/`.
 - Recorded plan, implementation, controller validation, code review, and controller adjudication artifacts under `docs/reviews/`.
 
 ## Public Contract Boundary
@@ -29,10 +29,10 @@
 
 ## What Was Verified
 
-- `source .venv/bin/activate && pytest tests/service/test_entrypoint_runtime_awaiting_smoke.py -q`
-  - Result: `1 passed, 3 warnings`.
-- `source .venv/bin/activate && pytest tests/service/test_host_assembly.py tests/service/test_entrypoint_runtime_awaiting_smoke.py -q`
-  - Result: `55 passed, 3 warnings`.
+- `source .venv/bin/activate && python utils/smoke_host_public_awaiting_entrypoint.py --keep-workspace`
+  - Result: passed with `SMOKE PASS Host public awaiting entrypoint`.
+- `source .venv/bin/activate && pytest tests/service/test_host_assembly.py -q`
+  - Result: `54 passed, 3 warnings`.
 - `source .venv/bin/activate && pyright`
   - Result: `0 errors, 0 warnings, 0 informations`.
 - Forbidden-path grep for durable wait rows, dispatch rows, scheduler internals, ToolRuntime internals, manual resolve, `dayu.engine.agent`, and `_AsyncAgent`
@@ -44,7 +44,7 @@
 - `gh pr checks 171 --repo noho/dayu-agent-r`
   - Result: no checks reported on branch `phaseflow/host-issues-control`.
 
-Warnings are existing third-party `edgar` deprecation warnings.
+Warnings are existing third-party `edgar` deprecation warnings from the focused pytest run.
 
 ## Review And Finding Status
 

@@ -1,14 +1,17 @@
-"""Service entrypoint 等待态 public smoke 测试。"""
+"""Host public entrypoint 等待态 smoke 脚本。"""
 
 from __future__ import annotations
 
+import argparse
 import asyncio
-from collections.abc import AsyncIterator
+import os
+import sys
+from collections.abc import AsyncIterator, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
-
-import pytest
+from uuid import uuid4
 
 from dayu.contracts import (
     AsyncDirectToolExecutionCapability,
@@ -137,37 +140,61 @@ _FINAL_ANSWER = "等待任务已完成，已收到轮询恢复结果。"
 _RESUME_TOKEN = "service-awaiting-smoke-token"
 _SOURCE_REF = ToolBundleSourceRef(
     source_kind=ToolBundleSourceKind.SERVICE_COMPOSITION,
-    source_id="tests.service.awaiting_smoke",
+    source_id="utils.smoke_host_public_awaiting_entrypoint",
     version_ref=None,
 )
+_DEFAULT_WORKSPACE_PARENT = Path("workspace/tmp")
+_DEFAULT_WORKSPACE_PREFIX = "host-public-awaiting-entrypoint-smoke"
+_DEFAULT_SLOT_KEY_PREFIX = "manual-smoke-awaiting-entrypoint"
+_TERMINAL_TIMEOUT_SECONDS = 5.0
+_POLL_INTERVAL_SECONDS = 0.01
 
 
-@pytest.mark.asyncio
-async def test_entrypoint_runtime_waits_then_reads_terminal_outbox(tmp_path: Path) -> None:
-    """验证 entrypoint 通过 public Host/Service 契约观察等待态、终态和补读项。
+@dataclass(frozen=True, slots=True)
+class SmokeArgs:
+    """解析后的 smoke 参数。"""
 
-    :param tmp_path: pytest 临时 workspace。
-    :returns: ``None``。
-    :raises AssertionError: public 行为不符合预期时抛出。
+    workspace_root: Path
+    keep_workspace: bool
+
+
+async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
+    """运行 public entrypoint awaiting smoke。
+
+    :param args: smoke 参数。
+    :param env: 环境变量映射。
+    :returns: 进程退出码。
+    :raises RuntimeError: public 行为不符合预期时抛出。
     """
 
+    del env
     poll_adapter = _GatedReadyPollAdapter()
     worker_factory = _AwaitingThenAnswerWorkerFactory()
-    options = _open_options(tmp_path, worker_factory=worker_factory, poll_adapter=poll_adapter)
+    options = _open_options(
+        args.workspace_root,
+        worker_factory=worker_factory,
+        poll_adapter=poll_adapter,
+    )
     scene_inputs = _scene_inputs()
     host_assembly = _host_assembly(options=options, effective_tool_bundle=_tool_bundle())
     accepted_run_ids: list[str] = []
     activities: list[EntrypointActivity] = []
     waiting_activity_seen = asyncio.Event()
 
+    print("SMOKE START Host public awaiting entrypoint")
+    print(f"SMOKE WORKSPACE_ROOT {args.workspace_root}")
+    print("SMOKE CONTRACT open_host -> ensure_session -> submit_entrypoint_turn_and_wait")
+    print("SMOKE WAIT_RECOVERY production poller via public wait poll adapter registry")
+
     async with open_host(options) as host:
         session = await host.ensure_session(
             EnsureSessionRequest(
                 scope="workspace",
-                slot_key="awaiting-smoke",
+                slot_key=f"{_DEFAULT_SLOT_KEY_PREFIX}-{uuid4().hex[:12]}",
                 metadata=(),
             )
         )
+        print(f"SMOKE SESSION_ID {session.session_id}")
 
         def on_activity(activity: EntrypointActivity) -> None:
             """记录 Service activity 并在等待态出现时释放测试检查。
@@ -189,30 +216,61 @@ async def test_entrypoint_runtime_waits_then_reads_terminal_outbox(tmp_path: Pat
                 host_assembly=host_assembly,
                 on_run_accepted=accepted_run_ids.append,
                 on_activity=on_activity,
-                poll_interval_seconds=0.01,
+                poll_interval_seconds=_POLL_INTERVAL_SECONDS,
             )
         )
         try:
-            await asyncio.wait_for(waiting_activity_seen.wait(), timeout=5.0)
-            assert accepted_run_ids
+            await asyncio.wait_for(
+                waiting_activity_seen.wait(), timeout=_TERMINAL_TIMEOUT_SECONDS
+            )
+            _require(len(accepted_run_ids) > 0, message="run was not accepted")
             accepted_run_id = accepted_run_ids[0]
+            print(f"SMOKE ACCEPTED_RUN_ID {accepted_run_id}")
             waiting_snapshot = await host.get_run(accepted_run_id)
-            assert waiting_snapshot.status is RunStatus.WAITING
+            _require(
+                waiting_snapshot.status is RunStatus.WAITING,
+                message=f"run did not enter WAITING: {waiting_snapshot.status}",
+            )
+            print("SMOKE OBSERVED_WAITING true")
 
             poll_adapter.open_gate()
-            result = await asyncio.wait_for(submit_task, timeout=5.0)
-
-            assert result.source is EntrypointTerminalSource.LIVE_EVENT
-            assert result.run_id == accepted_run_id
-            assert result.terminal_status is HostTerminalStatus.SUCCEEDED
-            assert result.final_answer is not None
-            assert result.final_answer.content.strip()
-            assert worker_factory.accept_count == 2
-            assert poll_adapter.ready_count == 1
-            assert any(
-                activity.status is EntrypointActivityStatus.WAITING
-                for activity in activities
+            result = await asyncio.wait_for(
+                submit_task, timeout=_TERMINAL_TIMEOUT_SECONDS
             )
+
+            _require(
+                result.source is EntrypointTerminalSource.LIVE_EVENT,
+                message=f"terminal source mismatch: {result.source}",
+            )
+            _require(
+                result.run_id == accepted_run_id,
+                message=f"terminal run id mismatch: {result.run_id}",
+            )
+            _require(
+                result.terminal_status is HostTerminalStatus.SUCCEEDED,
+                message=f"terminal status mismatch: {result.terminal_status}",
+            )
+            final_answer = result.final_answer
+            if final_answer is None:
+                raise RuntimeError("missing final answer")
+            _require(final_answer.content.strip() != "", message="blank final answer")
+            _require(
+                worker_factory.accept_count == 2,
+                message=f"worker accept count mismatch: {worker_factory.accept_count}",
+            )
+            _require(
+                poll_adapter.ready_count == 1,
+                message=f"poll ready count mismatch: {poll_adapter.ready_count}",
+            )
+            _require(
+                any(
+                    activity.status is EntrypointActivityStatus.WAITING
+                    for activity in activities
+                ),
+                message="WAITING activity was not recorded",
+            )
+            print(f"SMOKE TERMINAL_EVENT_ID {result.terminal_event_id}")
+            print("SMOKE TERMINAL_STATUS SUCCEEDED")
 
             batch = await host.read_outbox_terminal_items(
                 session.session_id,
@@ -228,13 +286,91 @@ async def test_entrypoint_runtime_waits_then_reads_terminal_outbox(tmp_path: Pat
                 if item.run_id == accepted_run_id
                 and item.terminal_status is HostTerminalStatus.SUCCEEDED
             )
-            assert len(matching_items) == 1
-            assert matching_items[0].terminal_event_id == result.terminal_event_id
+            _require(
+                len(matching_items) == 1,
+                message=f"terminal outbox match count mismatch: {len(matching_items)}",
+            )
+            _require(
+                matching_items[0].terminal_event_id == result.terminal_event_id,
+                message="terminal outbox event id mismatch",
+            )
+            print("SMOKE OUTBOX_TERMINAL_MATCH true")
+            print(f"SMOKE WORKER_ACCEPT_COUNT {worker_factory.accept_count}")
+            print(f"SMOKE POLL_READY_COUNT {poll_adapter.ready_count}")
+            print("SMOKE PASS Host public awaiting entrypoint")
+            if args.keep_workspace:
+                print("SMOKE WORKSPACE_KEPT true  # smoke never deletes Host artifacts")
+            return 0
         finally:
             if not submit_task.done():
                 submit_task.cancel()
-                with pytest.raises(asyncio.CancelledError):
+                try:
                     await submit_task
+                except asyncio.CancelledError:
+                    pass
+
+
+def parse_args(argv: Sequence[str]) -> SmokeArgs:
+    """解析命令行参数。
+
+    :param argv: 不含程序名的参数序列。
+    :returns: 解析后的 smoke 参数。
+    :raises SystemExit: argparse 在参数非法时抛出。
+    """
+
+    parser = argparse.ArgumentParser(
+        description="Run Host public awaiting entrypoint smoke."
+    )
+    parser.add_argument(
+        "--workspace-root",
+        default=None,
+        help=(
+            "workspace / project root；默认使用 workspace/tmp 下的 fresh smoke "
+            "workspace，避免历史 durable DB schema 污染。"
+        ),
+    )
+    parser.add_argument(
+        "--keep-workspace",
+        action="store_true",
+        help="输出中标记保留 workspace；脚本不会删除 Host/runtime artifacts。",
+    )
+    namespace = parser.parse_args(list(argv))
+    workspace_root_text: str | None = namespace.workspace_root
+    keep_workspace: bool = namespace.keep_workspace
+    return SmokeArgs(
+        workspace_root=_resolve_workspace_root(workspace_root_text),
+        keep_workspace=keep_workspace,
+    )
+
+
+def _resolve_workspace_root(workspace_root_text: str | None) -> Path:
+    """解析 smoke workspace root。
+
+    :param workspace_root_text: CLI 显式传入的 workspace root；为 ``None`` 时
+        生成 fresh smoke workspace root。
+    :returns: 归一化后的 workspace root。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if workspace_root_text is not None:
+        return Path(workspace_root_text).resolve()
+    return (
+        _DEFAULT_WORKSPACE_PARENT
+        / f"{_DEFAULT_WORKSPACE_PREFIX}-{uuid4().hex[:12]}"
+    ).resolve()
+
+
+def _require(condition: bool, *, message: str) -> None:
+    """校验 smoke 条件成立。
+
+    :param condition: 待校验条件。
+    :param message: 条件不成立时的错误消息。
+    :returns: ``None``。
+    :raises RuntimeError: 条件不成立时抛出。
+    """
+
+    if not condition:
+        raise RuntimeError(message)
 
 
 class _GatedReadyPollAdapter:
@@ -423,15 +559,21 @@ class _AwaitingHandle:
                 ),
             )
         )
-        assert len(outcome.records) == 1
+        if len(outcome.records) != 1:
+            raise RuntimeError(f"tool execution record count mismatch: {len(outcome.records)}")
         record = outcome.records[0]
-        assert record.tool_call_id == tool_call.tool_call_id
-        assert isinstance(record.outcome, ToolAwaitingOutcome)
+        if record.tool_call_id != tool_call.tool_call_id:
+            raise RuntimeError(f"tool call id mismatch: {record.tool_call_id}")
+        record_outcome = record.outcome
+        if not isinstance(record_outcome, ToolAwaitingOutcome):
+            raise RuntimeError(
+                f"tool outcome type mismatch: {type(record_outcome).__name__}"
+            )
         awaiting_record = AwaitingToolExecutionRecord(
             batch_snapshot=batch_snapshot,
             call=tool_call,
-            await_spec=record.outcome.await_spec,
-            snapshot=record.outcome.snapshot,
+            await_spec=record_outcome.await_spec,
+            snapshot=record_outcome.snapshot,
         )
         yield EngineEvent(
             occurred_at=_NOW,
@@ -588,14 +730,14 @@ def _awaiting_tool_call() -> ToolCallRequest:
 
 
 def _open_options(
-    tmp_path: Path,
+    workspace_root: Path,
     *,
     worker_factory: _AwaitingThenAnswerWorkerFactory,
     poll_adapter: _GatedReadyPollAdapter,
 ) -> OpenHostOptions:
     """构造 public Host opener options。
 
-    :param tmp_path: pytest 临时目录。
+    :param workspace_root: smoke workspace root。
     :param worker_factory: deterministic worker factory。
     :param poll_adapter: deterministic poll adapter。
     :returns: Host opener options。
@@ -604,8 +746,8 @@ def _open_options(
 
     agent_policy = _agent_policy(allow_tool_calls=True)
     return OpenHostOptions(
-        db_path=tmp_path / "host.sqlite3",
-        artifact_root=tmp_path / "artifacts",
+        db_path=workspace_root / "host.sqlite3",
+        artifact_root=workspace_root / "artifacts",
         create_parent_dirs=True,
         sqlite_busy_timeout_seconds=1.0,
         sqlite_write_busy_retry_count=8,
@@ -613,7 +755,7 @@ def _open_options(
         sqlite_write_retry_backoff_multiplier=1.2,
         sqlite_write_retry_max_delay_seconds=0.02,
         payload_inline_threshold_bytes=4096,
-        lane_db_path=tmp_path / "lane.sqlite3",
+        lane_db_path=workspace_root / "lane.sqlite3",
         lane_name="service-awaiting-smoke",
         lane_capacity=1,
         lane_default_timeout_seconds=1.0,
@@ -767,12 +909,12 @@ def _host_context(request_id: str) -> HostCallContext:
 
     return HostCallContext(
         actor="analyst",
-        source="pytest",
+        source="utils.smoke_host_public_awaiting_entrypoint",
         request_id=request_id,
         authorization_claims=(AuthorizationClaim(name="role", value="tester"),),
         operation_context=OperationContext(
             operation_name="service_entrypoint_awaiting_smoke",
-            operation_kind="test",
+            operation_kind="manual_smoke",
             business_domain="service",
             business_object_type=None,
             business_object_id=None,
@@ -1085,3 +1227,23 @@ def _execution_profile_config() -> ExecutionProfileConfig:
             max_consecutive_failed_tool_batches=1,
         ),
     )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """脚本入口。
+
+    :param argv: 命令行参数；为 ``None`` 时读取 ``sys.argv[1:]``。
+    :returns: 进程退出码。
+    :raises Exception: 不主动抛出；异常会被转换为退出码 1。
+    """
+
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        return asyncio.run(run_smoke(args, os.environ))
+    except Exception as exc:
+        print(f"SMOKE FAIL {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
