@@ -113,6 +113,9 @@ CLI 测试不得启动真实 Host / Fins 业务路径；涉及 Host 状态机时
 - import boundary：阻止 runtime 反向依赖 Engine、Host、Service、UI、Fins 或引入运行期 HTTP 客户端，并显式确认
   `config_loader.py`、`location.py`、`scene_prepare.py`、`tools_discovery.py`、`assembly.py` 与 `tool_truncation.py` 被边界扫描覆盖。
 - cancellation：覆盖取消等待 helper 的完成、取消与异常传播语义。
+- interruptible process：覆盖 process-backed 子进程完成、terminate / kill、cleanup grace 校验、POSIX 安全进程组
+  cleanup 清理嵌套子进程，以及 unsupported、PID / pgid 不可用、pgid unsafe、group signal 失败与 direct signal 失败时的
+  direct-child fallback 诊断。
 - lane：覆盖 cross-process named semaphore / capacity guard 的配置校验、独立 SQLite runtime lane DB schema、acquire /
   heartbeat / release、timeout、协作式 cancellation、`Task.cancel()` 透传、controller close、跨进程 capacity invariant、
   close/acquire 并发下 pending acquire 唤醒、新 claim 拒绝、active claim count invariant、shielded claim / refresh / release
