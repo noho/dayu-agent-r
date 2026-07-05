@@ -540,6 +540,35 @@ def test_host_runtime_process_capsule_policy_invalid_grace_fails_fast(
         ConfigLoader(package_config_dir=package_root).load_host_runtime()
 
 
+def test_host_runtime_process_capsule_policy_rejects_unknown_fields(
+    tmp_path: Path,
+) -> None:
+    """host_runtime process capsule cleanup policy block 拒绝未知字段。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    _write_json(
+        package_root / "host_runtime.json",
+        _host_runtime_config_record(
+            include_process_capsule_interrupt_policy=True,
+            process_capsule_interrupt_policy={
+                "terminate_grace_seconds": 0.35,
+                "kill_grace_seconds": 0.75,
+                "cleanup_deadline_seconds": 2.0,
+            },
+        ),
+    )
+
+    with pytest.raises(
+        ConfigFieldError,
+        match=(
+            "host_runtime.runtimes.local.process_capsule_interrupt_policy "
+            "has unknown fields"
+        ),
+    ):
+        ConfigLoader(package_config_dir=package_root).load_host_runtime()
+
+
 def test_workspace_record_replaces_package_record_without_deep_merge(
     tmp_path: Path,
 ) -> None:

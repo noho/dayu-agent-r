@@ -133,6 +133,27 @@ _OVERSIZED_INLINE_TEXT_LENGTH = 70010
 _OVERSIZED_TRUNCATED_TEXT_LIMIT = 70000
 _TEST_PROCESS_CLOSE_DEFAULT_GRACE_SECONDS = 1.0
 _CUSTOM_PROCESS_CLOSE_GRACE_SECONDS = 0.73
+_RECORDED_PROCESS_HANDLE_CLOSE_KILL_GRACES: list[float] = []
+_ORIGINAL_INTERRUPTIBLE_PROCESS_HANDLE_CLOSE = InterruptibleProcessHandle.close
+
+
+async def _recording_interruptible_process_handle_close(
+    handle: InterruptibleProcessHandle,
+    *,
+    kill_grace_seconds: float = _TEST_PROCESS_CLOSE_DEFAULT_GRACE_SECONDS,
+) -> None:
+    """记录 InterruptibleProcessHandle.close 收到的 kill grace 后继续真实关闭。
+
+    :param handle: 当前 process handle。
+    :param kill_grace_seconds: close best-effort kill 等待秒数。
+    :returns: ``None``。
+    """
+
+    _RECORDED_PROCESS_HANDLE_CLOSE_KILL_GRACES.append(kill_grace_seconds)
+    await _ORIGINAL_INTERRUPTIBLE_PROCESS_HANDLE_CLOSE(
+        handle,
+        kill_grace_seconds=kill_grace_seconds,
+    )
 
 
 class _OpenCancellationToken:
@@ -1675,6 +1696,70 @@ async def test_tool_runtime_default_factory_uses_declared_process_backed_executi
     assert len(accept_port.candidates) == 1
     assert isinstance(record.outcome, ToolCompletedOutcome)
     assert record.outcome.result.value == {"from_process": True}
+
+
+@pytest.mark.asyncio
+async def test_tool_runtime_default_factory_wires_process_capsule_interrupt_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """默认 factory 必须把 HostToolingOptions 的 process policy 传到 capsule。"""
+
+    _RECORDED_PROCESS_HANDLE_CLOSE_KILL_GRACES.clear()
+    monkeypatch.setattr(
+        InterruptibleProcessHandle,
+        "close",
+        _recording_interruptible_process_handle_close,
+    )
+    callable_ = _CountingCallable({"secret": "must-not-run"})
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    target_factory = _RecordingProcessTargetFactory(
+        process_tool_completed_envelope({"from_process": True})
+    )
+    policy = ProcessCapsuleInterruptPolicy(
+        kill_grace_seconds=_CUSTOM_PROCESS_CLOSE_GRACE_SECONDS
+    )
+    definition = _definition(
+        "fake_tool",
+        callable_,
+        execution=ProcessBackedToolExecutionCapability(
+            target_factory=target_factory
+        ),
+    )
+    handle = DefaultToolRuntimeFactory(EffectiveToolBundleBuilder()).create_tool_runtime(
+        ToolRuntimeBuildRequest(
+            effective_bundle_request=EffectiveToolBundleBuildRequest(
+                business_tool_bundle=ToolBundle(definitions=(definition,)),
+                source_refs=(_source_ref(),),
+                framework_tool_policy=default_framework_tool_policy_view(),
+                policy_snapshot_digest=_POLICY_DIGEST,
+            ),
+            execution_scope=ToolRuntimeExecutionScope(
+                session_id=_SESSION_ID,
+                run_id=_RUN_ID,
+                attempt_id=_ATTEMPT_ID,
+                execution_id=_EXECUTION_ID,
+                allow_tool_calls=True,
+            ),
+            accept_port=accept_port,
+            retry_policy=ToolAcceptRetryPolicy(
+                max_attempts=1,
+                backoff_seconds=0.0,
+            ),
+            process_capsule_interrupt_policy=policy,
+        )
+    )
+
+    outcome = await handle.tool_executor.execute(_request(_call("tool-call-1")))
+
+    record = outcome.records[0]
+    assert callable_.call_count == 0
+    assert len(target_factory.calls) == 1
+    assert len(accept_port.candidates) == 1
+    assert isinstance(record.outcome, ToolCompletedOutcome)
+    assert record.outcome.result.value == {"from_process": True}
+    assert _RECORDED_PROCESS_HANDLE_CLOSE_KILL_GRACES == [
+        _CUSTOM_PROCESS_CLOSE_GRACE_SECONDS
+    ]
 
 
 @pytest.mark.asyncio
