@@ -180,7 +180,7 @@ dayu.fins.tools.provider.discover_tools(spec)
   -> parse_fins_workspace_root_config(spec.config)
   -> DefaultFinsRuntime.create(workspace_root=...)
   -> runtime.get_read_runtime(...)
-  -> build_fins_read_tool_definitions(read_runtime=...)
+  -> build_fins_read_tool_definitions(read_runtime=..., workspace_root=...)
 ```
 
 其它直接调用 read runtime 的入口也应走同一装配根：
@@ -487,9 +487,10 @@ ToolsDiscovery
   -> parse explicit absolute workspace_root
   -> DefaultFinsRuntime.create(workspace_root=...)
   -> get_read_runtime(...)
-  -> build_fins_read_tool_definitions(...)
-  -> current ToolDefinition bundle
+  -> build_fins_read_tool_definitions(..., workspace_root=...)
+  -> current ToolDefinition bundle with process-backed execution
   -> Host ToolRuntime
+  -> process-backed target reconstructs DefaultFinsRuntime from workspace_root
   -> FinsReadRuntime method
   -> storage repositories
   -> ProcessorRegistry.create_with_fallback(...)
@@ -497,7 +498,7 @@ ToolsDiscovery
   -> tool result accepted by Host ToolRuntime
 ```
 
-Read path 只读取 Fins workspace 中已经存在的财报材料。需要截断的 read tools 声明 `ToolTruncateSpec`；实际截断、cursor、`fetch_more` 与工具结果 accept 由 Host ToolRuntime 负责。
+Read path 只读取 Fins workspace 中已经存在的财报材料。九个 read tools 的生产执行形态为 `process_backed`：父进程只把 `workspace_root` 字符串、工具名、参数 JSON 副本、limits 和 timeout 标量放入可序列化 target；子进程通过 `DefaultFinsRuntime.create(workspace_root=Path(...))` 重新打开只读仓储并创建 `FinsReadRuntime`。read tool process target 不跨进程序列化 `FinsReadRuntime`、仓储对象、processor cache、provider lock、Host cancellation token 或 Host 内部对象。需要截断的 read tools 声明 `ToolTruncateSpec`；实际截断、cursor、`fetch_more` 与工具结果 accept 由 Host ToolRuntime 负责。
 
 ### Download / preprocess / upload awaiting tool 路径
 
@@ -688,7 +689,7 @@ SecProcessor
 
 ### Read tool 结果与截断
 
-Read tools 的 schema、错误和结果字段必须面向 LLM 自解释。工具可以声明 `ToolTruncateSpec`，但截断执行、cursor 生命周期和 `fetch_more` 都由 Host ToolRuntime 处理。Fins 工具不得自行模拟 Host truncation manager，也不得把内部 ref / digest 当成业务事实返回给模型。
+Read tools 的 schema、错误和结果字段必须面向 LLM 自解释。工具可以声明 `ToolTruncateSpec`，但截断执行、cursor 生命周期和 `fetch_more` 都由 Host ToolRuntime 处理。Fins read 工具的 direct callable 只作为测试和非生产 fallback；生产默认执行由 ToolRuntime 根据 `ToolDefinition.execution` 进入 process-backed 边界。Fins process target 使用 `dayu.contracts` 的 process-backed envelope helper 构造 completed / failed 信封；failed 信封的 `hint` 是结构化字段，由 Host 映射为 `ToolResultFailure.hint`，不得拼接进 `message`。Fins 工具不得自行模拟 Host truncation manager，也不得把内部 ref / digest 当成业务事实返回给模型。
 
 ### Download adapter 与 unsupported source
 
@@ -712,7 +713,7 @@ Fins read 与 ingestion 都通过 `ticker_normalization.normalize_ticker(...)` �
 
 ## 扩展点
 
-扩展 read tool 时，先在 storage protocol、processor 或 `FinsReadRuntime` 中建立稳定业务语义，再通过 `build_fins_read_tool_definitions(...)` 暴露工具 schema。不要把仓储装配、Host 状态或 ToolRuntime 治理写进工具函数。
+扩展 read tool 时，先在 storage protocol、processor 或 `FinsReadRuntime` 中建立稳定业务语义，再通过 `build_fins_read_tool_definitions(..., workspace_root=...)` 暴露工具 schema 与 process-backed execution 声明。process target / factory 只能保存可序列化 locator、工具名、参数 JSON 副本、limits 或必要标量；不要把仓储装配、Host 状态、ToolRuntime 治理、runtime 实例、repository、processor cache 或 provider lock 写进工具函数。
 
 扩展财报存储后端时，实现 `dayu.fins.storage` 的窄仓储协议，并保持 source / processed / blob / filing maintenance / batching 职责分离。调用方仍通过 `DefaultFinsRuntime` 或等价 assembly root 注入仓储实现。
 

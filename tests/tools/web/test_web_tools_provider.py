@@ -4,17 +4,37 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import logging
+import multiprocessing
+import os
+import pickle
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
+from multiprocessing.process import BaseProcess
 from pathlib import Path
-from typing import ParamSpec, TypeVar
+from typing import ParamSpec, TypeVar, cast
 
 import pytest
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
-from dayu.contracts.tool_call import BatchToolExecutionContext, ToolCallRequest
-from dayu.contracts.tool_declaration import ToolDefinition
+from dayu.contracts.tool_call import (
+    BatchToolExecutionContext,
+    BatchToolExecutionRequest,
+    ToolCallRequest,
+)
+from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
+from dayu.contracts.tool_execution import (
+    ProcessBackedToolContext,
+    ProcessBackedToolExecutionCapability,
+)
 from dayu.contracts.tool_outcome import (
     TOOL_CANCELLED_REASON_HOST_CANCELLED,
     ToolCancelledOutcome,
@@ -22,6 +42,22 @@ from dayu.contracts.tool_outcome import (
     ToolFailedOutcome,
 )
 from dayu.contracts.tool_schema import ToolTruncateSpec, ToolTruncationStrategy
+from dayu.host.tool_runtime import (
+    DefaultToolRuntimeFactory,
+    EffectiveToolBundleBuildRequest,
+    EffectiveToolBundleBuilder,
+    HostEventRef,
+    HostToolFactAcceptPort,
+    ProcessBackedToolExecutionCapsule,
+    ToolFactAcceptCandidate,
+    ToolFactAcceptResult,
+    ToolFactAcceptedAck,
+    ToolRuntimeBuildRequest,
+    ToolRuntimeExecutionScope,
+    ToolRuntimeHandle,
+)
+from dayu.host.tooling import default_framework_tool_policy_view
+from dayu.runtime.interruptible_process import ProcessGroupCleanupReason
 from dayu.runtime.tools_discovery import (
     PythonImportPathProvider,
     ToolsDiscovery,
@@ -46,6 +82,8 @@ _FORBIDDEN_CANCEL_MESSAGE_PARTS = (
 )
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
+_LIVE_BROWSER_CLEANUP_SMOKE_ENV = "DAYU_RUN_LIVE_BROWSER_CLEANUP_SMOKE"
+_PROCESS_DESCENDANT_WAIT_SECONDS = 3.0
 _FORBIDDEN_IMPORTS = (
     "dayu.engine.tool_registry",
     "dayu.engine.truncation_manager",
@@ -137,6 +175,264 @@ class _ManualCancellationToken:
         return self._requested_at
 
 
+class _AcceptingPort(HostToolFactAcceptPort):
+    """测试用 Host accept barrier。"""
+
+    def __init__(self) -> None:
+        """初始化记录列表。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.candidates: list[ToolFactAcceptCandidate] = []
+
+    def accept_tool_fact(
+        self,
+        candidate: ToolFactAcceptCandidate,
+    ) -> ToolFactAcceptResult:
+        """接受工具事实候选。
+
+        :param candidate: ToolRuntime 构造的工具事实候选。
+        :returns: accepted ack。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.candidates.append(candidate)
+        requested_ref = HostEventRef(
+            event_id=f"event-requested-{len(self.candidates)}",
+            event_sequence=len(self.candidates) * 2 - 1,
+        )
+        result_ref = HostEventRef(
+            event_id=f"event-result-{len(self.candidates)}",
+            event_sequence=len(self.candidates) * 2,
+        )
+        return ToolFactAcceptedAck(
+            accepted_event_refs=(requested_ref, result_ref),
+            tool_fact_id=f"tool-fact-{len(self.candidates)}",
+            tool_call_requested_event_ref=requested_ref,
+            tool_call_governed_event_ref=None,
+            tool_result_event_ref=result_ref,
+            result_payload_ref=None,
+            result_digest=f"sha256:{'1' * 64}",
+            reuse_prior_event_refs=(),
+            diagnostic_refs=(),
+            idempotency_record_ref=f"idempotency-{len(self.candidates)}",
+        )
+
+
+@dataclass(slots=True)
+class _SocketWebServer:
+    """测试用最小本地 HTTP server。
+
+    Args:
+        response_body: 响应正文。
+        delay_seconds: 每个连接发送响应前等待的秒数。
+        max_connections: 最多处理的连接数。
+
+    Returns:
+        dataclass 实例。
+
+    Raises:
+        OSError: 监听 socket 创建失败时抛出。
+    """
+
+    response_body: bytes
+    delay_seconds: float
+    max_connections: int
+    _socket: socket.socket
+    _thread: threading.Thread
+    _stop_requested: threading.Event
+
+    @classmethod
+    def start(
+        cls,
+        *,
+        response_body: bytes,
+        delay_seconds: float = 0.0,
+        max_connections: int = 8,
+    ) -> "_SocketWebServer":
+        """启动本地 HTTP server。
+
+        :param response_body: 响应正文。
+        :param delay_seconds: 每个连接发送响应前等待的秒数。
+        :param max_connections: 最多处理的连接数。
+        :returns: 已启动的 server。
+        :raises OSError: socket 监听失败时抛出。
+        """
+
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.bind(("127.0.0.1", 0))
+        server_socket.listen()
+        server_socket.settimeout(0.2)
+        stop_requested = threading.Event()
+        server = cls(
+            response_body=response_body,
+            delay_seconds=delay_seconds,
+            max_connections=max_connections,
+            _socket=server_socket,
+            _thread=threading.Thread(),
+            _stop_requested=stop_requested,
+        )
+        server._thread = threading.Thread(
+            target=server._serve,
+            name="web-tool-test-server",
+            daemon=True,
+        )
+        server._thread.start()
+        return server
+
+    @property
+    def url(self) -> str:
+        """返回本地 server URL。
+
+        :returns: ``http://127.0.0.1:<port>/page``。
+        :raises OSError: socket 地址读取失败时抛出。
+        """
+
+        host, port = self._socket.getsockname()
+        return f"http://{host}:{port}/page"
+
+    def close(self) -> None:
+        """停止 server 并释放 socket。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._stop_requested.set()
+        self._socket.close()
+        self._thread.join(timeout=1.0)
+
+    def _serve(self) -> None:
+        """处理有限数量的测试 HTTP 连接。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        handled = 0
+        while handled < self.max_connections and not self._stop_requested.is_set():
+            try:
+                connection, _address = self._socket.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            handled += 1
+            with connection:
+                self._handle_connection(connection)
+
+    def _handle_connection(self, connection: socket.socket) -> None:
+        """处理单个 HTTP 连接。
+
+        :param connection: 已接受的 socket 连接。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        try:
+            request = connection.recv(4096)
+            if self.delay_seconds > 0:
+                time.sleep(self.delay_seconds)
+            body = b"" if request.startswith(b"HEAD ") else self.response_body
+            header = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/html; charset=utf-8\r\n"
+                + f"Content-Length: {len(body)}\r\n".encode("ascii")
+                + b"Connection: close\r\n\r\n"
+            )
+            connection.sendall(header + body)
+        except OSError:
+            return
+
+
+@dataclass(frozen=True, slots=True)
+class _SyntheticNestedPlaywrightWorker:
+    """测试用可 pickle Playwright worker，负责启动 synthetic nested child。"""
+
+    def __call__(
+        self,
+        *,
+        url: str,
+        timeout_seconds: float,
+        headers: Mapping[str, str] | None = None,
+        playwright_channel: str | None = None,
+        playwright_storage_state_path: str = "",
+    ) -> web_playwright_backend.WebPayload:
+        """启动长生命周期 nested child 后保持 worker 存活。
+
+        :param url: 测试 URL。
+        :param timeout_seconds: worker 总预算。
+        :param headers: 可选请求头。
+        :param playwright_channel: 可选浏览器 channel。
+        :param playwright_storage_state_path: 用作 nested child PID 文件路径。
+        :returns: 理论成功载荷；测试会在返回前中断 worker。
+        :raises RuntimeError: PID 文件路径为空时抛出。
+        """
+
+        del url, timeout_seconds, headers, playwright_channel
+        if not playwright_storage_state_path:
+            raise RuntimeError("synthetic nested child pid path is required")
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import time\n"
+                "time.sleep(60)\n",
+            ],
+        )
+        Path(playwright_storage_state_path).write_text(
+            str(child.pid),
+            encoding="utf-8",
+        )
+        time.sleep(60)
+        return {"ok": True, "content": "unexpected synthetic result"}
+
+
+@dataclass(frozen=True, slots=True)
+class _LiveBrowserLongRunningWorker:
+    """测试用可 pickle Playwright worker，负责启动真实 Chromium 子进程。"""
+
+    def __call__(
+        self,
+        *,
+        url: str,
+        timeout_seconds: float,
+        headers: Mapping[str, str] | None = None,
+        playwright_channel: str | None = None,
+        playwright_storage_state_path: str = "",
+    ) -> web_playwright_backend.WebPayload:
+        """启动真实浏览器并保持 worker 存活。
+
+        :param url: 本地 fixture URL。
+        :param timeout_seconds: worker 总预算。
+        :param headers: 可选请求头。
+        :param playwright_channel: 可选浏览器 channel。
+        :param playwright_storage_state_path: 用作 ready marker 文件路径。
+        :returns: 理论成功载荷；测试会在返回前中断 worker。
+        :raises RuntimeError: ready marker 路径为空时抛出。
+        """
+
+        del timeout_seconds, headers, playwright_channel
+        if not playwright_storage_state_path:
+            raise RuntimeError("live browser ready marker path is required")
+        from playwright.sync_api import sync_playwright
+
+        playwright = sync_playwright().start()
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context()
+        page = context.new_page()
+        page.goto(url, wait_until="domcontentloaded", timeout=5000)
+        Path(playwright_storage_state_path).write_text("ready", encoding="utf-8")
+        time.sleep(60)
+        context.close()
+        browser.close()
+        playwright.stop()
+        return {"ok": True, "content": "unexpected live browser result"}
+
+
 def test_web_provider_discovers_search_and_fetch() -> None:
     """ToolsDiscovery 应发现两个 Web tools。"""
 
@@ -168,6 +464,254 @@ def test_web_audit_matrix_context_injection_and_schema_no_leak() -> None:
         assert "execution_context" not in required
         assert "cancellation_token" not in required
         assert "correlation_id" not in required
+
+
+def test_web_tool_definitions_declare_process_backed_execution() -> None:
+    """两个 Web tool 的生产 execution 必须声明为 process-backed。"""
+
+    definitions = _definitions_by_name(_discover_definitions({}))
+
+    for tool_name in _WEB_TOOL_NAMES:
+        definition = definitions[tool_name]
+        assert isinstance(definition.execution, ProcessBackedToolExecutionCapability)
+
+
+def test_web_tools_do_not_redeclare_process_envelope_constants() -> None:
+    """Web 工具不得重新声明本地 process envelope 常量。"""
+
+    source = Path(web_tools.__file__).read_text(encoding="utf-8")
+
+    assert "_WEB_PROCESS_" not in source
+
+
+def test_web_process_target_factory_is_pickle_round_trippable() -> None:
+    """Web process target factory 和 target 必须可 pickle round-trip。"""
+
+    definitions = _definitions_by_name(
+        _discover_definitions(
+            {
+                "provider": "duckduckgo",
+                "request_timeout_seconds": 1.25,
+                "allow_private_network_url": True,
+                "playwright_channel": "chrome",
+                "playwright_storage_state_dir": "/tmp/dayu-web-state",
+            }
+        )
+    )
+    definition = definitions["fetch_web_page"]
+    execution = cast(ProcessBackedToolExecutionCapability, definition.execution)
+    factory = cast(
+        web_tools._WebProcessTargetFactory,
+        pickle.loads(pickle.dumps(execution.target_factory)),
+    )
+
+    process_target = factory.build_process_target(
+        _call("fetch_web_page", {"url": "http://127.0.0.1/page"}),
+        ProcessBackedToolContext(
+            run_id="run-web",
+            session_id="session-web",
+            iteration_id="iteration-web",
+            timeout_seconds=3.5,
+            correlation_id="correlation-web",
+        ),
+    )
+    round_tripped_target = cast(
+        web_tools._WebProcessTarget,
+        pickle.loads(pickle.dumps(process_target)),
+    )
+
+    assert round_tripped_target.tool_name == "fetch_web_page"
+    assert round_tripped_target.timeout_seconds == 3.5
+    target_repr = repr(round_tripped_target)
+    assert "Session" not in target_repr
+    assert "provider_lock" not in target_repr
+    assert "CancellationToken" not in target_repr
+    assert "Host" not in target_repr
+    assert "Browser" not in target_repr
+    assert "Playwright" not in target_repr
+
+
+def test_web_process_target_fast_search_success_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """search_web process target 成功路径应返回 completed JSON 信封。"""
+
+    budgets: list[float | None] = []
+
+    def fake_search_business(**kwargs: JsonValue) -> Mapping[str, JsonValue]:
+        """记录 timeout budget 并返回确定性搜索结果。
+
+        :param kwargs: process target 传入的业务参数。
+        :returns: 搜索成功载荷。
+        """
+
+        budgets.append(cast(float | None, kwargs.get("timeout_budget")))
+        return {
+            "query": "revenue",
+            "domains": [],
+            "total": 1,
+            "preferred_result": None,
+            "preferred_result_summary": "",
+            "next_action": "refine_query",
+            "next_action_args": {},
+            "hint": "ok",
+            "results": [],
+        }
+
+    monkeypatch.setattr(web_tools, "_search_web_business", fake_search_business)
+    definition = _definitions_by_name(_discover_definitions({}))["search_web"]
+
+    envelope = _run_definition_process_target(
+        definition,
+        _call("search_web", {"query": "revenue"}),
+        timeout_seconds=4.25,
+    )
+
+    assert isinstance(envelope, Mapping)
+    assert envelope["status"] == "completed"
+    value = cast(Mapping[str, JsonValue], envelope["value"])
+    assert value["total"] == 1
+    assert budgets == [4.25]
+
+
+def test_web_process_target_failed_json_envelope_preserves_code_and_hint() -> None:
+    """process target 参数失败时应分离 failed message 与 hint。"""
+
+    definition = _definitions_by_name(_discover_definitions({}))["fetch_web_page"]
+
+    envelope = _run_definition_process_target(
+        definition,
+        _call("fetch_web_page", {}),
+    )
+
+    assert isinstance(envelope, Mapping)
+    assert envelope["status"] == "failed"
+    assert envelope["error_type"] == "invalid_argument"
+    assert "url" in str(envelope["message"])
+    assert "Hint:" not in str(envelope["message"])
+    assert envelope["hint"] == "Add required fields and retry: url."
+
+
+@pytest.mark.parametrize("tool_name", _WEB_TOOL_NAMES)
+def test_web_process_target_timeout_budget_is_serialized_to_target(
+    tool_name: str,
+) -> None:
+    """process target 必须携带父进程投影的 timeout 标量。"""
+
+    definition = _definitions_by_name(
+        _discover_definitions({"allow_private_network_url": True})
+    )[tool_name]
+    execution = cast(ProcessBackedToolExecutionCapability, definition.execution)
+    target = execution.target_factory.build_process_target(
+        _call(tool_name, _process_arguments_for_tool(tool_name)),
+        ProcessBackedToolContext(
+            run_id="run-web",
+            session_id="session-web",
+            iteration_id="iteration-web",
+            timeout_seconds=6.75,
+            correlation_id="correlation-web",
+        ),
+    )
+
+    assert isinstance(target, web_tools._WebProcessTarget)
+    assert target.timeout_seconds == 6.75
+
+
+def test_web_process_backed_capsule_spawns_child_success() -> None:
+    """真实 ProcessBackedToolExecutionCapsule 应能运行 Web 子进程成功路径。"""
+
+    server = _SocketWebServer.start(
+        response_body=b"<html><head><title>Example</title></head><body>Revenue grew quickly.</body></html>",
+        max_connections=8,
+    )
+    try:
+        definition = _definitions_by_name(
+            _discover_definitions({"allow_private_network_url": True})
+        )["fetch_web_page"]
+        execution = cast(ProcessBackedToolExecutionCapability, definition.execution)
+        target = execution.target_factory.build_process_target(
+            _call("fetch_web_page", {"url": server.url}),
+            ProcessBackedToolContext(
+                run_id="run-web",
+                session_id="session-web",
+                iteration_id="iteration-web",
+                timeout_seconds=10.0,
+                correlation_id="correlation-web",
+            ),
+        )
+        capsule = ProcessBackedToolExecutionCapsule(target)
+
+        outcome = asyncio.run(capsule.run())
+        asyncio.run(capsule.close())
+    finally:
+        server.close()
+
+    assert isinstance(outcome, ToolCompletedOutcome)
+    value = _mapping_value(outcome.result.value)
+    assert value["fetch_backend"] == "requests"
+    assert "Revenue grew quickly" in str(value["content"])
+
+
+def test_web_toolruntime_cancel_real_process_target_has_no_late_accept() -> None:
+    """真实 Web process target 取消后不得接受旧子进程 late result。"""
+
+    server = _SocketWebServer.start(
+        response_body=b"<html><body>late web content</body></html>",
+        delay_seconds=5.0,
+        max_connections=4,
+    )
+    try:
+        output = discover_tools(
+            _spec(
+                {
+                    "allow_private_network_url": True,
+                    "request_timeout_seconds": 20.0,
+                }
+            )
+        )
+        accept_port = _AcceptingPort()
+        token = _ManualCancellationToken()
+        tool_runtime = DefaultToolRuntimeFactory(
+            EffectiveToolBundleBuilder()
+        ).create_tool_runtime(
+            ToolRuntimeBuildRequest(
+                effective_bundle_request=EffectiveToolBundleBuildRequest(
+                    business_tool_bundle=ToolBundle(definitions=output.definitions),
+                    source_refs=output.source_refs,
+                    framework_tool_policy=default_framework_tool_policy_view(),
+                    policy_snapshot_digest="sha256:" + "2" * 64,
+                    enable_truncation_manager=False,
+                ),
+                execution_scope=ToolRuntimeExecutionScope(
+                    session_id="session-web",
+                    run_id="run-web",
+                    attempt_id="attempt-web",
+                    execution_id="execution-web",
+                    allow_tool_calls=True,
+                ),
+                accept_port=accept_port,
+            )
+        )
+
+        started_at = time.monotonic()
+        governed_outcome = asyncio.run(
+            _execute_web_runtime_fetch_and_cancel(
+                tool_runtime,
+                server.url,
+                token,
+            )
+        )
+        elapsed = time.monotonic() - started_at
+        time.sleep(0.3)
+    finally:
+        server.close()
+
+    assert elapsed < 2.0
+    assert governed_outcome.result.hint == "tool_runtime_cancelled"
+    assert len(accept_port.candidates) == 1
+    assert accept_port.candidates[0].governance.policy_decision.reason_code == (
+        "tool_runtime_cancelled"
+    )
 
 
 def test_search_web_projects_optional_arguments_and_success(
@@ -798,7 +1342,7 @@ def test_fetch_playwright_cancel_projects_to_host_cancelled(
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
         cancellation_token: CancellationToken | None = None,
-    ) -> Mapping[str, JsonValue]:
+    ) -> dict[str, JsonValue]:
         """模拟 Playwright worker 在 fallback 内部收到取消。
 
         :param url: 目标 URL。
@@ -850,6 +1394,77 @@ def test_fetch_playwright_cancel_projects_to_host_cancelled(
     assert received_playwright_tokens == [token]
 
 
+def test_search_and_fetch_pass_tool_timeout_budget_to_business(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """search/fetch 主路径必须把工具剩余预算传入 HTTP 预算边界。"""
+
+    budgets: list[float | None] = []
+
+    async def fake_to_thread(
+        func: Callable[_P, _R],
+        /,
+        *args: _P.args,
+        **kwargs: _P.kwargs,
+    ) -> _R:
+        """同步执行业务函数，保留 ``asyncio.to_thread`` 调用形状。"""
+
+        return func(*args, **kwargs)
+
+    def fake_search_business(**kwargs: JsonValue) -> Mapping[str, JsonValue]:
+        """记录 search_web 传入的 timeout budget。"""
+
+        budgets.append(cast(float | None, kwargs.get("timeout_budget")))
+        return {
+            "query": "revenue",
+            "domains": [],
+            "total": 0,
+            "preferred_result": None,
+            "preferred_result_summary": "",
+            "next_action": "refine_query",
+            "next_action_args": {},
+            "hint": "refine query",
+            "results": [],
+        }
+
+    def fake_fetch_business(**kwargs: JsonValue) -> Mapping[str, JsonValue]:
+        """记录 fetch_web_page 传入的 timeout budget。"""
+
+        budgets.append(cast(float | None, kwargs.get("timeout_budget")))
+        return {
+            "url": kwargs["url"],
+            "final_url": kwargs["url"],
+            "title": "Example",
+            "content": "budgeted content",
+            "fetch_backend": "requests",
+        }
+
+    monkeypatch.setattr(web_tools.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(web_tools, "_search_web_business", fake_search_business)
+    monkeypatch.setattr(web_tools, "_fetch_web_page_business", fake_fetch_business)
+    definitions = _definitions_by_name(
+        _discover_definitions({"allow_private_network_url": True})
+    )
+    context = _context(timeout_seconds=2.5)
+
+    search_outcome = asyncio.run(
+        definitions["search_web"].callable(
+            _call("search_web", {"query": "revenue"}),
+            context,
+        )
+    )
+    fetch_outcome = asyncio.run(
+        definitions["fetch_web_page"].callable(
+            _call("fetch_web_page", {"url": "http://127.0.0.1/internal"}),
+            context,
+        )
+    )
+
+    assert isinstance(search_outcome, ToolCompletedOutcome)
+    assert isinstance(fetch_outcome, ToolCompletedOutcome)
+    assert budgets == [2.5, 2.5]
+
+
 def test_try_playwright_fallback_pre_cancel_does_not_start_playwright(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -869,7 +1484,7 @@ def test_try_playwright_fallback_pre_cancel_does_not_start_playwright(
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
         cancellation_token: CancellationToken | None = None,
-    ) -> Mapping[str, JsonValue]:
+    ) -> dict[str, JsonValue]:
         """记录非预期 Playwright worker 调用。
 
         :param url: 目标 URL。
@@ -914,6 +1529,228 @@ def test_try_playwright_fallback_pre_cancel_does_not_start_playwright(
 
     assert playwright_calls == []
     _assert_no_governance_text(f"{captured.value.message} {captured.value.hint}")
+
+
+def test_playwright_unpicklable_worker_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """不可序列化 Playwright worker 不得回落到同进程执行。"""
+
+    monkeypatch.setattr(
+        web_playwright_backend,
+        "_is_picklable_worker",
+        lambda worker: False,
+    )
+    worker_calls: list[str] = []
+
+    def fake_worker(
+        *,
+        url: str,
+        timeout_seconds: float,
+        headers: Mapping[str, str] | None = None,
+        playwright_channel: str | None = None,
+        playwright_storage_state_path: str = "",
+    ) -> dict[str, JsonValue]:
+        """记录不应发生的同进程 Playwright 调用。"""
+
+        del timeout_seconds, headers, playwright_channel, playwright_storage_state_path
+        worker_calls.append(url)
+        return {"ok": True, "content": "unexpected"}
+
+    result = web_playwright_backend._fetch_and_convert_with_playwright(
+        url="https://example.com/report",
+        timeout_seconds=1.0,
+        headers={},
+        timeout_budget=1.0,
+        deadline_monotonic=None,
+        playwright_channel=None,
+        playwright_storage_state_path="",
+        cancellation_token=_OpenCancellationToken(),
+        resolve_timeout_budget=lambda timeout_seconds, **kwargs: timeout_seconds,
+        playwright_sync_worker=fake_worker,
+        detect_bot_challenge=lambda **kwargs: web_tools.BotChallengeDetectionResult(
+            challenge_detected=False,
+            challenge_signals=(),
+        ),
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "playwright_worker_not_picklable"
+    assert worker_calls == []
+
+
+def test_playwright_worker_process_cleanup_kills_synthetic_nested_child_on_posix(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Playwright raw worker cleanup 应通过共享 primitive 清理 synthetic nested child。"""
+
+    if os.name != "posix":
+        pytest.skip("process-group cleanup smoke only applies to POSIX")
+    caplog.set_level(logging.DEBUG, logger=web_playwright_backend.__name__)
+    pid_path = tmp_path / "synthetic-nested-child.pid"
+    worker_kwargs: web_playwright_backend._WorkerKwargs = {
+        "url": "https://example.com/synthetic",
+        "timeout_seconds": 30.0,
+        "headers": None,
+        "playwright_channel": None,
+        "playwright_storage_state_path": str(pid_path),
+    }
+    process, result_queue = _start_playwright_worker_process(
+        worker_callable=_SyntheticNestedPlaywrightWorker(),
+        worker_kwargs=worker_kwargs,
+    )
+    nested_pid: int | None = None
+    try:
+        nested_pid = _read_pid_file(pid_path, timeout_seconds=3.0)
+        assert _pid_exists(nested_pid)
+
+        started_at = time.monotonic()
+        cleanup = web_playwright_backend._terminate_playwright_process(process)
+        cleanup_elapsed_seconds = time.monotonic() - started_at
+        terminate_result = cleanup["terminate"]
+
+        assert terminate_result is not None
+        diagnostic = terminate_result.cleanup
+        if not diagnostic.group_signal_sent:
+            assert diagnostic.reason in {
+                ProcessGroupCleanupReason.UNSUPPORTED,
+                ProcessGroupCleanupReason.CHILD_PID_UNAVAILABLE,
+                ProcessGroupCleanupReason.CHILD_ALREADY_EXITED,
+                ProcessGroupCleanupReason.PGID_UNAVAILABLE,
+                ProcessGroupCleanupReason.CURRENT_PGID_UNAVAILABLE,
+                ProcessGroupCleanupReason.PARENT_PGID_UNAVAILABLE,
+                ProcessGroupCleanupReason.PGID_MATCHES_CURRENT_PROCESS_GROUP,
+                ProcessGroupCleanupReason.PGID_MATCHES_PARENT_PROCESS_GROUP,
+                ProcessGroupCleanupReason.GROUP_SIGNAL_FAILED,
+            }
+            pytest.skip(f"process-group cleanup fallback: {diagnostic.reason.value}")
+        assert diagnostic.reason is ProcessGroupCleanupReason.GROUP_SIGNALED
+        assert diagnostic.group_signal_sent is True
+        assert "reason=group_signaled" in caplog.text
+        assert "group_signal_sent=True" in caplog.text
+        assert _wait_for_pid_absent(nested_pid, timeout_seconds=1.0)
+        assert cleanup["kill"] is None
+        assert terminate_result.elapsed_seconds <= (
+            web_playwright_backend._PW_PROCESS_TERMINATE_GRACE_SECONDS
+        )
+        assert cleanup_elapsed_seconds <= (
+            web_playwright_backend._PW_PROCESS_TERMINATE_GRACE_SECONDS
+        )
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=1.0)
+        if nested_pid is not None and _pid_exists(nested_pid):
+            os.kill(nested_pid, signal.SIGKILL)
+            _wait_for_pid_absent(nested_pid, timeout_seconds=1.0)
+        result_queue.close()
+        result_queue.join_thread()
+
+
+def test_playwright_worker_process_cleanup_supports_running_event_loop(
+    tmp_path: Path,
+) -> None:
+    """Playwright cleanup 在当前线程已有 running loop 时仍应完成。"""
+
+    if os.name != "posix":
+        pytest.skip("process-group cleanup bridge smoke only applies to POSIX")
+    pid_path = tmp_path / "synthetic-nested-child-loop.pid"
+    worker_kwargs: web_playwright_backend._WorkerKwargs = {
+        "url": "https://example.com/synthetic-loop",
+        "timeout_seconds": 30.0,
+        "headers": None,
+        "playwright_channel": None,
+        "playwright_storage_state_path": str(pid_path),
+    }
+    process, result_queue = _start_playwright_worker_process(
+        worker_callable=_SyntheticNestedPlaywrightWorker(),
+        worker_kwargs=worker_kwargs,
+    )
+    nested_pid: int | None = None
+    try:
+        nested_pid = _read_pid_file(pid_path, timeout_seconds=3.0)
+        cleanup = asyncio.run(_terminate_process_inside_running_loop(process))
+        terminate_result = cleanup["terminate"]
+        assert terminate_result is not None
+        if not terminate_result.cleanup.group_signal_sent:
+            pytest.skip(
+                "process-group cleanup fallback: "
+                f"{terminate_result.cleanup.reason.value}"
+            )
+        assert terminate_result.cleanup.reason is ProcessGroupCleanupReason.GROUP_SIGNALED
+        assert _wait_for_pid_absent(nested_pid, timeout_seconds=1.0)
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=1.0)
+        if nested_pid is not None and _pid_exists(nested_pid):
+            os.kill(nested_pid, signal.SIGKILL)
+            _wait_for_pid_absent(nested_pid, timeout_seconds=1.0)
+        result_queue.close()
+        result_queue.join_thread()
+
+
+def test_playwright_live_browser_cleanup_smoke_is_manual_and_best_effort(
+    tmp_path: Path,
+) -> None:
+    """可选 live browser cleanup smoke 默认跳过，显式开启后验证 descendants。"""
+
+    if os.environ.get(_LIVE_BROWSER_CLEANUP_SMOKE_ENV) != "1":
+        pytest.skip(f"set {_LIVE_BROWSER_CLEANUP_SMOKE_ENV}=1 to run live smoke")
+    if os.name != "posix":
+        pytest.skip("live browser descendant inspection requires POSIX ps")
+    if not _live_playwright_chromium_available():
+        pytest.skip("Playwright Chromium binary is not available")
+    process_table = _process_table_from_ps()
+    if process_table is None:
+        pytest.skip("process descendant inspection via ps is unavailable")
+    server = _SocketWebServer.start(
+        response_body=(
+            b"<html><head><title>Live Browser Cleanup</title></head>"
+            b"<body>browser cleanup fixture</body></html>"
+        ),
+        max_connections=8,
+    )
+    marker_path = tmp_path / "live-browser-ready.txt"
+    worker_kwargs: web_playwright_backend._WorkerKwargs = {
+        "url": server.url,
+        "timeout_seconds": 10.0,
+        "headers": None,
+        "playwright_channel": None,
+        "playwright_storage_state_path": str(marker_path),
+    }
+    process, result_queue = _start_playwright_worker_process(
+        worker_callable=_LiveBrowserLongRunningWorker(),
+        worker_kwargs=worker_kwargs,
+    )
+    descendant_pids: set[int] = set()
+    try:
+        _wait_for_file(marker_path, timeout_seconds=10.0)
+        assert process.pid is not None
+        descendant_pids = _descendant_pids(process.pid)
+        if not descendant_pids:
+            pytest.skip("no live browser descendants were observable")
+        cleanup = web_playwright_backend._terminate_playwright_process(process)
+        terminate_result = cleanup["terminate"]
+        assert terminate_result is not None
+        if not terminate_result.cleanup.group_signal_sent:
+            pytest.skip(
+                "process-group cleanup fallback: "
+                f"{terminate_result.cleanup.reason.value}"
+            )
+        assert _wait_for_pids_absent(
+            descendant_pids,
+            timeout_seconds=_PROCESS_DESCENDANT_WAIT_SECONDS,
+        )
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=1.0)
+        _kill_remaining_pids(descendant_pids)
+        result_queue.close()
+        result_queue.join_thread()
+        server.close()
 
 
 def test_fetch_playwright_fallback_receives_channel_and_storage_state_path(
@@ -1414,6 +2251,294 @@ def _assert_no_governance_text(text: str) -> None:
         assert forbidden not in text
 
 
+def _run_definition_process_target(
+    definition: ToolDefinition,
+    call: ToolCallRequest,
+    *,
+    timeout_seconds: float | None = 10.0,
+) -> JsonValue:
+    """构造并直接执行定义声明的 Web process target。
+
+    :param definition: Web 工具定义。
+    :param call: 工具调用请求。
+    :param timeout_seconds: process-backed 上下文 timeout 标量。
+    :returns: process target 返回的 JSON 信封。
+    :raises AssertionError: 工具未声明 process-backed execution 时抛出。
+    """
+
+    assert isinstance(definition.execution, ProcessBackedToolExecutionCapability)
+    target = definition.execution.target_factory.build_process_target(
+        call,
+        ProcessBackedToolContext(
+            run_id="run-web",
+            session_id="session-web",
+            iteration_id="iteration-web",
+            timeout_seconds=timeout_seconds,
+            correlation_id="correlation-web",
+        ),
+    )
+    return target()
+
+
+def _process_arguments_for_tool(tool_name: str) -> Mapping[str, JsonValue]:
+    """返回 process target 构造测试所需的最小参数。
+
+    :param tool_name: Web 工具名。
+    :returns: 对应工具的参数。
+    :raises ValueError: 工具名未知时抛出。
+    """
+
+    if tool_name == "search_web":
+        return {"query": "revenue"}
+    if tool_name == "fetch_web_page":
+        return {"url": "http://127.0.0.1/page"}
+    raise ValueError(f"unknown web tool: {tool_name}")
+
+
+def _start_playwright_worker_process(
+    *,
+    worker_callable: web_playwright_backend._PlaywrightWorkerProtocol,
+    worker_kwargs: web_playwright_backend._WorkerKwargs,
+) -> tuple[BaseProcess, web_playwright_backend._ResultQueueProtocol]:
+    """通过生产 Playwright worker entrypoint 启动测试 worker。
+
+    :param worker_callable: 可 pickle 的 worker callable。
+    :param worker_kwargs: worker 关键字参数。
+    :returns: 已启动进程与父进程侧结果队列。
+    """
+
+    ctx = multiprocessing.get_context("spawn")
+    result_queue = cast(
+        web_playwright_backend._ResultQueueProtocol,
+        ctx.Queue(maxsize=1),
+    )
+    process = ctx.Process(
+        target=web_playwright_backend._playwright_process_entry,
+        args=(result_queue, worker_callable, worker_kwargs),
+    )
+    process.daemon = True
+    process.start()
+    return process, result_queue
+
+
+async def _terminate_process_inside_running_loop(
+    process: BaseProcess,
+) -> web_playwright_backend._PlaywrightProcessCleanup:
+    """在已有 running event loop 的线程中调用同步 cleanup helper。
+
+    :param process: 待 cleanup 的 Playwright worker 进程。
+    :returns: cleanup 诊断。
+    """
+
+    return web_playwright_backend._terminate_playwright_process(process)
+
+
+def _live_playwright_chromium_available() -> bool:
+    """探测当前环境是否可启动 Playwright Chromium。
+
+    :returns: 可启动返回 ``True``，缺少依赖或 browser binary 时返回 ``False``。
+    """
+
+    try:
+        from playwright.sync_api import sync_playwright
+
+        playwright = sync_playwright().start()
+        browser = playwright.chromium.launch(headless=True)
+        browser.close()
+        playwright.stop()
+    except Exception:
+        return False
+    return True
+
+
+def _wait_for_file(path: Path, *, timeout_seconds: float) -> None:
+    """等待文件出现。
+
+    :param path: 待等待文件路径。
+    :param timeout_seconds: 最多等待秒数。
+    :returns: 无返回值。
+    :raises AssertionError: 超时仍未出现时抛出。
+    """
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if path.is_file():
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"file was not written: {path}")
+
+
+def _process_table_from_ps() -> dict[int, int] | None:
+    """通过 POSIX ``ps`` 读取 PID 到 PPID 的映射。
+
+    :returns: PID 到 PPID 的映射；``ps`` 不可用时返回 ``None``。
+    """
+
+    try:
+        completed = subprocess.run(
+            ["ps", "-axo", "pid=,ppid="],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    table: dict[int, int] = {}
+    for line in completed.stdout.splitlines():
+        parts = line.strip().split()
+        if len(parts) != 2:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        table[pid] = ppid
+    return table
+
+
+def _descendant_pids(root_pid: int) -> set[int]:
+    """读取某个 PID 当前可观察到的后代 PID 集合。
+
+    :param root_pid: 根进程 PID。
+    :returns: 当前进程表中可观察到的后代 PID 集合。
+    """
+
+    process_table = _process_table_from_ps()
+    if process_table is None:
+        return set()
+    children_by_parent: dict[int, set[int]] = {}
+    for pid, ppid in process_table.items():
+        children_by_parent.setdefault(ppid, set()).add(pid)
+    descendants: set[int] = set()
+    pending = list(children_by_parent.get(root_pid, set()))
+    while pending:
+        pid = pending.pop()
+        if pid in descendants:
+            continue
+        descendants.add(pid)
+        pending.extend(children_by_parent.get(pid, set()))
+    return descendants
+
+
+def _wait_for_pids_absent(pids: set[int], *, timeout_seconds: float) -> bool:
+    """等待一组 PID 全部消失。
+
+    :param pids: 待检查 PID 集合。
+    :param timeout_seconds: 最多等待秒数。
+    :returns: 全部消失返回 ``True``。
+    """
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if all(not _pid_exists(pid) for pid in pids):
+            return True
+        time.sleep(0.05)
+    return all(not _pid_exists(pid) for pid in pids)
+
+
+def _kill_remaining_pids(pids: set[int]) -> None:
+    """清理 optional live smoke 中仍可见的后代 PID。
+
+    :param pids: 待清理 PID 集合。
+    :returns: 无返回值。
+    """
+
+    for pid in pids:
+        if not _pid_exists(pid):
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            continue
+    _wait_for_pids_absent(pids, timeout_seconds=1.0)
+
+
+def _read_pid_file(path: Path, *, timeout_seconds: float) -> int:
+    """在限定时间内读取 PID 文件。
+
+    :param path: PID 文件路径。
+    :param timeout_seconds: 最多等待秒数。
+    :returns: 文件中记录的 PID。
+    :raises AssertionError: 超时仍未读到合法 PID 时抛出。
+    """
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            raw_pid = path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            time.sleep(0.02)
+            continue
+        if raw_pid:
+            return int(raw_pid)
+        time.sleep(0.02)
+    raise AssertionError(f"pid file was not written: {path}")
+
+
+def _pid_exists(pid: int) -> bool:
+    """判断 PID 是否仍存在。
+
+    :param pid: 待检查 PID。
+    :returns: PID 仍存在返回 ``True``。
+    """
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_for_pid_absent(pid: int, *, timeout_seconds: float) -> bool:
+    """等待 PID 消失。
+
+    :param pid: 待检查 PID。
+    :param timeout_seconds: 最多等待秒数。
+    :returns: PID 在时限内消失返回 ``True``。
+    """
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if not _pid_exists(pid):
+            return True
+        time.sleep(0.02)
+    return not _pid_exists(pid)
+
+
+async def _execute_web_runtime_fetch_and_cancel(
+    tool_runtime: ToolRuntimeHandle,
+    url: str,
+    token: _ManualCancellationToken,
+) -> ToolFailedOutcome:
+    """启动 fetch_web_page 后触发取消并返回 governed outcome。
+
+    :param tool_runtime: 已装配的 ToolRuntime。
+    :param url: 本地测试 URL。
+    :param token: 可手动取消的 token。
+    :returns: ToolRuntime 返回的受治理失败 outcome。
+    :raises AssertionError: 结果不是受治理失败 outcome 时抛出。
+    """
+
+    task = asyncio.create_task(
+        tool_runtime.tool_executor.execute(
+            BatchToolExecutionRequest(
+                calls=(_call("fetch_web_page", {"url": url}),),
+                context=_context(cancellation_token=token, timeout_seconds=20.0),
+            )
+        )
+    )
+    await asyncio.sleep(0.4)
+    token.cancel("cancel-real-web-process")
+    result = await asyncio.wait_for(task, timeout=2.0)
+    outcome = result.records[0].outcome
+    assert isinstance(outcome, ToolFailedOutcome)
+    return outcome
+
+
 def _spec(config: Mapping[str, JsonValue]) -> ToolsDiscoveryProviderSpec:
     """构造 Web provider spec。
 
@@ -1448,10 +2573,12 @@ def _call(name: str, arguments: Mapping[str, JsonValue]) -> ToolCallRequest:
 
 def _context(
     cancellation_token: CancellationToken | None = None,
+    timeout_seconds: float | None = 10.0,
 ) -> BatchToolExecutionContext:
     """构造测试工具执行上下文。
 
     :param cancellation_token: 可选取消令牌。
+    :param timeout_seconds: 可选工具执行预算秒数。
     :returns: 批式执行上下文。
     """
 
@@ -1459,7 +2586,7 @@ def _context(
         run_id="run-web",
         session_id="session-web",
         iteration_id="iteration-web",
-        timeout_seconds=10.0,
+        timeout_seconds=timeout_seconds,
         cancellation_token=cancellation_token or _OpenCancellationToken(),
         correlation_id="run-web:iteration-web:tool_batch",
     )

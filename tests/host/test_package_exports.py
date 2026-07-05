@@ -103,6 +103,7 @@ EXPECTED_TOOLING_EXPORTS: frozenset[str] = frozenset(
         "FrameworkToolName",
         "FrameworkToolPolicyView",
         "HostToolingOptions",
+        "ProcessCapsuleInterruptPolicy",
         "default_framework_tool_policy_view",
     }
 )

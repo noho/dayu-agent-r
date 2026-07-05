@@ -8,6 +8,7 @@ import pathlib
 import pytest
 
 from dayu.contracts import (
+    AsyncDirectToolExecutionCapability,
     BatchToolExecutionContext,
     ToolBundle,
     ToolCallRequest,
@@ -228,6 +229,7 @@ def test_find_smoke_tool_only_inspects_passed_tool_bundle() -> None:
                 name=provider_output.definitions[0].name,
                 schema=provider_output.definitions[0].schema,
                 callable=_not_smoke_tool,
+                execution=AsyncDirectToolExecutionCapability(),
                 truncate=None,
                 display=None,
                 tags=(),

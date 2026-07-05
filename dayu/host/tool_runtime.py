@@ -30,6 +30,19 @@ from dayu.contracts.tool_call import (
     ToolCallRequest,
 )
 from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
+from dayu.contracts.tool_execution import (
+    AsyncDirectToolExecutionCapability,
+    ProcessBackedToolContext,
+    ProcessBackedToolExecutionCapability,
+    ThreadBackedToolExecutionCapability,
+    ToolExecutionCapability,
+    ToolExecutionMode,
+    ProcessToolCompletedEnvelope,
+    ProcessToolFailedEnvelope,
+    ProcessToolMalformedEnvelope,
+    ProcessToolUnsupportedEnvelope,
+    parse_process_tool_envelope,
+)
 from dayu.contracts.tool_executor import ToolExecutor
 from dayu.contracts.tool_outcome import (
     BatchToolExecutionOutcome,
@@ -132,13 +145,21 @@ from dayu.runtime.cancellation import (
     WaitCancelled,
     WaitCompleted,
     WaitTimedOut,
-    await_or_cancel,
-    await_or_cancel_or_timeout,
+    wait_for_or_cancel,
+)
+from dayu.runtime.interruptible_process import (
+    InterruptibleProcessCompleted,
+    InterruptibleProcessFailed,
+    InterruptibleProcessHandle,
+    InterruptibleProcessStillRunning,
+    InterruptibleProcessTarget,
+    ProcessInterruptResult,
 )
 from dayu.runtime.tool_truncation import effective_tool_truncate_spec
 from dayu.host.tooling import (
     FrameworkToolName,
     FrameworkToolPolicyView,
+    ProcessCapsuleInterruptPolicy,
 )
 from dayu.host.tool_duplicate_governance import (
     DuplicateAcceptedEntry,
@@ -227,6 +248,11 @@ _TOOL_RUNTIME_AWAITING_ACCEPT_REJECTED_ERROR = "tool_awaiting_accept_rejected"
 _TOOL_RUNTIME_AWAITING_ACCEPT_TIMEOUT_ERROR = "tool_awaiting_accept_timeout"
 _TOOL_RUNTIME_UNKNOWN_TOOL_ERROR = "tool_not_found"
 _TOOL_RUNTIME_CALLABLE_FAILED_ERROR = "tool_callable_failed"
+_TOOL_RUNTIME_CAPSULE_BUILD_FAILED_ERROR = "tool_capsule_build_failed"
+_PROCESS_BACKED_TOOL_FAILED_ERROR = "process_backed_tool_failed"
+_PROCESS_BACKED_TOOL_MALFORMED_ENVELOPE_ERROR = "process_backed_tool_malformed_envelope"
+_PROCESS_BACKED_TOOL_UNSUPPORTED_ENVELOPE_ERROR = "process_backed_tool_unsupported_envelope"
+_PROCESS_BACKED_TOOL_UNEXPECTED_PENDING_ERROR = "process_backed_tool_unexpected_pending"
 _TOOL_RUNTIME_NO_TOOL_REASON = "tool_call_not_allowed_in_scope"
 _TOOL_RUNTIME_IDEMPOTENCY_REASON = "tool_idempotency_key_required"
 _TOOL_RUNTIME_UNSUPPORTED_AWAITING_REASON = "unsupported_awaiting"
@@ -293,8 +319,6 @@ _TEXT_CHARS_LIMIT_KEY = "max_chars"
 _TEXT_LINES_LIMIT_KEY = "max_lines"
 _LIST_ITEMS_LIMIT_KEY = "max_items"
 _BINARY_BYTES_LIMIT_KEY = "max_bytes"
-
-
 class ToolPolicyDecisionKind(StrEnum):
     """工具治理决策类别。
 
@@ -356,6 +380,20 @@ class ToolPolicyDecision:
     kind: ToolPolicyDecisionKind
     reason_code: str | None
     message: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ToolInterruptStepResult:
+    """单个 interrupt 步骤结果。
+
+    :param supported: 当前 capsule 是否支持该步骤。
+    :param completed: 步骤是否完成了对应资源中止。
+    :param message: 诊断说明。
+    """
+
+    supported: bool
+    completed: bool
+    message: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -1180,6 +1218,82 @@ class ToolDispatcher(Protocol):
         ...
 
 
+class ToolExecutionCapsule(Protocol):
+    """单工具调用执行资源 capsule 协议。"""
+
+    @property
+    def mode(self) -> ToolExecutionMode:
+        """返回 capsule 执行模式。
+
+        :returns: 执行模式。
+        """
+
+        ...
+
+    async def run(self) -> ToolExecutionOutcome:
+        """运行工具调用。
+
+        :returns: 工具执行 outcome。
+        """
+
+        ...
+
+    def request_interrupt(self, reason: str) -> None:
+        """请求协作式 interrupt。
+
+        :param reason: 诊断原因。
+        :returns: ``None``。
+        """
+
+        ...
+
+    async def terminate(self, reason: str) -> ToolInterruptStepResult:
+        """请求 graceful terminate。
+
+        :param reason: 诊断原因。
+        :returns: terminate 步骤结果。
+        """
+
+        ...
+
+    async def kill(self, reason: str) -> ToolInterruptStepResult:
+        """请求 hard kill。
+
+        :param reason: 诊断原因。
+        :returns: kill 步骤结果。
+        """
+
+        ...
+
+    async def close(self) -> None:
+        """幂等释放 capsule 本地资源。
+
+        :returns: ``None``。
+        """
+
+        ...
+
+
+class ToolExecutionCapsuleFactory(Protocol):
+    """单工具调用 execution capsule factory 协议。"""
+
+    def create_capsule(
+        self,
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+        dispatcher: ToolDispatcher,
+    ) -> ToolExecutionCapsule:
+        """为单次工具调用创建 execution capsule。
+
+        :param call: 单次工具调用请求。
+        :param context: 批式工具执行上下文。
+        :param dispatcher: 当前 ToolRuntime dispatcher。
+        :returns: execution capsule。
+        """
+
+        ...
+
+
 class ToolRuntimePolicyPort(Protocol):
     """ToolRuntime 治理决策端口协议。"""
 
@@ -1276,6 +1390,492 @@ class DefaultToolDispatcher:
                 message=f"{exc.__class__.__name__}: {exc}",
                 hint=None,
             )
+
+
+class AsyncDirectToolExecutionCapsule:
+    """直接 async 工具执行 capsule。"""
+
+    def __init__(
+        self,
+        *,
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+        dispatcher: ToolDispatcher,
+    ) -> None:
+        """初始化 async direct capsule。
+
+        :param call: 单次工具调用请求。
+        :param context: 批式工具执行上下文。
+        :param dispatcher: 当前 ToolRuntime dispatcher。
+        :returns: ``None``。
+        """
+
+        self._call = call
+        self._context = context
+        self._dispatcher = dispatcher
+        self._task: asyncio.Task[ToolExecutionOutcome] | None = None
+
+    @property
+    def mode(self) -> ToolExecutionMode:
+        """返回执行模式。
+
+        :returns: ``async_direct``。
+        """
+
+        return ToolExecutionMode.ASYNC_DIRECT
+
+    async def run(self) -> ToolExecutionOutcome:
+        """启动并等待 async 工具 callable。
+
+        :returns: 工具执行 outcome。
+        """
+
+        if self._task is not None:
+            raise RuntimeError("async direct capsule has already started")
+        self._task = asyncio.create_task(
+            self._dispatcher.dispatch_tool_call(self._call, self._context)
+        )
+        return await self._task
+
+    def request_interrupt(self, reason: str) -> None:
+        """取消正在等待的 async 工具 task。
+
+        :param reason: 诊断原因。
+        :returns: ``None``。
+        """
+
+        del reason
+        task = self._task
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def terminate(self, reason: str) -> ToolInterruptStepResult:
+        """async direct terminate 等价于取消当前 task。
+
+        :param reason: 诊断原因。
+        :returns: terminate 结果。
+        """
+
+        self.request_interrupt(reason)
+        return ToolInterruptStepResult(
+            supported=True,
+            completed=True,
+            message="async direct task cancellation requested",
+        )
+
+    async def kill(self, reason: str) -> ToolInterruptStepResult:
+        """async direct 不支持 hard kill。
+
+        :param reason: 诊断原因。
+        :returns: unsupported kill 结果。
+        """
+
+        del reason
+        return ToolInterruptStepResult(
+            supported=False,
+            completed=False,
+            message="async direct capsule does not support hard kill",
+        )
+
+    async def close(self) -> None:
+        """释放 async task 资源。
+
+        :returns: ``None``。
+        """
+
+        task = self._task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                return
+
+
+class DefaultToolExecutionCapsuleFactory:
+    """默认 async direct capsule factory。"""
+
+    def create_capsule(
+        self,
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+        dispatcher: ToolDispatcher,
+    ) -> ToolExecutionCapsule:
+        """创建默认 async direct capsule。
+
+        :param call: 单次工具调用请求。
+        :param context: 批式工具执行上下文。
+        :param dispatcher: 当前 ToolRuntime dispatcher。
+        :returns: async direct capsule。
+        """
+
+        return AsyncDirectToolExecutionCapsule(
+            call=call,
+            context=context,
+            dispatcher=dispatcher,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _ThreadBackedDispatchTarget:
+    """在线程中运行默认工具 dispatcher 的同步目标。"""
+
+    call: ToolCallRequest
+    context: BatchToolExecutionContext
+    dispatcher: ToolDispatcher
+
+    def __call__(self) -> ToolExecutionOutcome:
+        """在当前线程的新事件循环中运行工具 dispatcher。
+
+        :returns: 工具执行 outcome。
+        :raises Exception: dispatcher 抛出的异常透传给 capsule 外层归一。
+        """
+
+        return asyncio.run(self.dispatcher.dispatch_tool_call(self.call, self.context))
+
+
+class DeclaredToolExecutionCapsuleFactory:
+    """基于工具声明 execution capability 创建执行 capsule 的 factory。"""
+
+    def __init__(
+        self,
+        effective_bundle: "EffectiveToolBundle",
+        process_capsule_interrupt_policy: ProcessCapsuleInterruptPolicy,
+    ) -> None:
+        """初始化 declaration-backed factory。
+
+        :param effective_bundle: attempt-local effective 工具集合。
+        :param process_capsule_interrupt_policy: process-backed capsule cleanup
+            interrupt 策略。
+        :returns: ``None``。
+        """
+
+        self._definitions_by_name = effective_bundle.definitions_by_name
+        self._process_capsule_interrupt_policy = process_capsule_interrupt_policy
+
+    def create_capsule(
+        self,
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+        dispatcher: ToolDispatcher,
+    ) -> ToolExecutionCapsule:
+        """按 ``ToolDefinition.execution`` 创建单工具 execution capsule。
+
+        :param call: 单次工具调用请求。
+        :param context: 批式工具执行上下文。
+        :param dispatcher: 当前 ToolRuntime dispatcher。
+        :returns: 与工具声明匹配的 execution capsule。
+        :raises ValueError: 工具声明缺失时抛出。
+        :raises TypeError: execution capability 类型未知时抛出。
+        :raises Exception: process target factory 构造目标失败时透传。
+        """
+
+        definition = self._definitions_by_name.get(call.name)
+        if definition is None:
+            raise ValueError(f"tool is not available: {call.name}")
+        return _declared_capsule_for_execution(
+            execution=definition.execution,
+            call=call,
+            context=context,
+            dispatcher=dispatcher,
+            process_capsule_interrupt_policy=self._process_capsule_interrupt_policy,
+        )
+
+
+def _declared_capsule_for_execution(
+    *,
+    execution: ToolExecutionCapability,
+    call: ToolCallRequest,
+    context: BatchToolExecutionContext,
+    dispatcher: ToolDispatcher,
+    process_capsule_interrupt_policy: ProcessCapsuleInterruptPolicy,
+) -> ToolExecutionCapsule:
+    """把声明式 execution capability 映射为 Host execution capsule。
+
+    :param execution: 工具声明中的执行能力。
+    :param call: 单次工具调用请求。
+    :param context: 批式工具执行上下文。
+    :param dispatcher: 当前 ToolRuntime dispatcher。
+    :param process_capsule_interrupt_policy: process-backed capsule cleanup
+        interrupt 策略。
+    :returns: 对应的 execution capsule。
+    :raises TypeError: 遇到未知 execution capability 类型时抛出。
+    :raises Exception: process target factory 构造目标失败时透传。
+    """
+
+    if isinstance(execution, AsyncDirectToolExecutionCapability):
+        return AsyncDirectToolExecutionCapsule(
+            call=call,
+            context=context,
+            dispatcher=dispatcher,
+        )
+    if isinstance(execution, ThreadBackedToolExecutionCapability):
+        return ThreadBackedToolExecutionCapsule(
+            _ThreadBackedDispatchTarget(
+                call=call,
+                context=context,
+                dispatcher=dispatcher,
+            )
+        )
+    if isinstance(execution, ProcessBackedToolExecutionCapability):
+        target = execution.target_factory.build_process_target(
+            call,
+            _process_backed_context_from_batch_context(context),
+        )
+        return ProcessBackedToolExecutionCapsule(
+            target,
+            interrupt_policy=process_capsule_interrupt_policy,
+        )
+    raise TypeError(
+        f"unsupported tool execution capability: {type(execution).__name__}"
+    )
+
+
+def _process_backed_context_from_batch_context(
+    context: BatchToolExecutionContext,
+) -> ProcessBackedToolContext:
+    """把批式执行上下文投影为子进程可序列化上下文。
+
+    投影只保留 run_id、session_id、iteration_id、timeout_seconds 与
+    correlation_id，不携带 cancellation_token、locks、runtime、repository、
+    session 对象或 Host 内部对象。
+
+    :param context: 批式工具执行上下文。
+    :returns: process-backed 工具目标构造上下文。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return ProcessBackedToolContext(
+        run_id=context.run_id,
+        session_id=context.session_id,
+        iteration_id=context.iteration_id,
+        timeout_seconds=context.timeout_seconds,
+        correlation_id=context.correlation_id,
+    )
+
+
+class ThreadBackedToolCallable(Protocol):
+    """thread-backed 测试 callable 协议。"""
+
+    def __call__(self) -> ToolExecutionOutcome:
+        """在线程中执行并返回工具 outcome。
+
+        :returns: 工具执行 outcome。
+        """
+
+        ...
+
+
+class ThreadBackedToolExecutionCapsule:
+    """thread-backed 工具执行 capsule。
+
+    该模式只能取消 wrapper awaitable，不承诺停止底层 OS thread。
+    """
+
+    def __init__(self, target: ThreadBackedToolCallable) -> None:
+        """初始化 thread-backed capsule。
+
+        :param target: 将在线程中执行的同步目标。
+        :returns: ``None``。
+        """
+
+        self._target = target
+        self._task: asyncio.Task[ToolExecutionOutcome] | None = None
+
+    @property
+    def mode(self) -> ToolExecutionMode:
+        """返回执行模式。
+
+        :returns: ``thread_backed``。
+        """
+
+        return ToolExecutionMode.THREAD_BACKED
+
+    async def run(self) -> ToolExecutionOutcome:
+        """在线程中运行目标。
+
+        :returns: 工具执行 outcome。
+        """
+
+        if self._task is not None:
+            raise RuntimeError("thread-backed capsule has already started")
+        self._task = asyncio.create_task(asyncio.to_thread(self._target))
+        return await self._task
+
+    def request_interrupt(self, reason: str) -> None:
+        """取消 wrapper task，但不声称停止 OS thread。
+
+        :param reason: 诊断原因。
+        :returns: ``None``。
+        """
+
+        del reason
+        task = self._task
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def terminate(self, reason: str) -> ToolInterruptStepResult:
+        """返回 thread terminate unsupported。
+
+        :param reason: 诊断原因。
+        :returns: unsupported terminate 结果。
+        """
+
+        del reason
+        return ToolInterruptStepResult(
+            supported=False,
+            completed=False,
+            message="thread-backed capsule cannot terminate OS thread",
+        )
+
+    async def kill(self, reason: str) -> ToolInterruptStepResult:
+        """返回 thread hard kill unsupported。
+
+        :param reason: 诊断原因。
+        :returns: unsupported kill 结果。
+        """
+
+        del reason
+        return ToolInterruptStepResult(
+            supported=False,
+            completed=False,
+            message="thread-backed capsule cannot hard kill OS thread",
+        )
+
+    async def close(self) -> None:
+        """释放 wrapper task。
+
+        :returns: ``None``。
+        """
+
+        task = self._task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                return
+
+
+class ProcessBackedToolExecutionCapsule:
+    """process-backed 工具执行 capsule。"""
+
+    def __init__(
+        self,
+        target: InterruptibleProcessTarget,
+        *,
+        interrupt_policy: ProcessCapsuleInterruptPolicy | None = None,
+    ) -> None:
+        """初始化 process-backed capsule。
+
+        :param target: 可序列化子进程目标；返回值必须是工具 JSON 信封。
+        :param interrupt_policy: terminate / kill cleanup grace 策略；``None``
+            表示使用 Host tooling typed 默认值。
+        :returns: ``None``。
+        """
+
+        self._handle = InterruptibleProcessHandle(target)
+        self._interrupt_policy = (
+            interrupt_policy
+            if interrupt_policy is not None
+            else ProcessCapsuleInterruptPolicy()
+        )
+        self._started = False
+
+    @property
+    def mode(self) -> ToolExecutionMode:
+        """返回执行模式。
+
+        :returns: ``process_backed``。
+        """
+
+        return ToolExecutionMode.PROCESS_BACKED
+
+    async def run(self) -> ToolExecutionOutcome:
+        """在子进程中运行目标。
+
+        :returns: 工具执行 outcome。
+        """
+
+        if self._started:
+            raise RuntimeError("process-backed capsule has already started")
+        self._started = True
+        self._handle.start()
+        result = await self._handle.wait(timeout_seconds=None)
+        if isinstance(result, InterruptibleProcessCompleted):
+            return _tool_outcome_from_process_envelope(result.value)
+        if isinstance(result, InterruptibleProcessFailed):
+            return _tool_failed_outcome(
+                error=_PROCESS_BACKED_TOOL_FAILED_ERROR,
+                message=(
+                    f"process-backed tool failed: {result.error_type}: "
+                    f"{result.message}"
+                ),
+                hint=None,
+            )
+        if isinstance(result, InterruptibleProcessStillRunning):
+            return _tool_failed_outcome(
+                error=_PROCESS_BACKED_TOOL_UNEXPECTED_PENDING_ERROR,
+                message="process-backed tool wait returned pending without timeout",
+                hint=None,
+            )
+        raise TypeError("unsupported interruptible process wait result")
+
+    def request_interrupt(self, reason: str) -> None:
+        """记录 cooperative interrupt 请求。
+
+        子进程目标不共享当前 Host cancellation token；真实中止由
+        ``terminate`` / ``kill`` 执行。
+
+        :param reason: 诊断原因。
+        :returns: ``None``。
+        """
+
+        del reason
+
+    async def terminate(self, reason: str) -> ToolInterruptStepResult:
+        """terminate 子进程并等待短 cleanup grace。
+
+        :param reason: 诊断原因。
+        :returns: terminate 结果。
+        """
+
+        del reason
+        result = await self._handle.terminate(
+            grace_seconds=self._interrupt_policy.terminate_grace_seconds
+        )
+        return _tool_interrupt_result_from_process(
+            result,
+            success_message="process-backed capsule terminated process",
+            pending_message="process-backed capsule terminate did not exit process",
+        )
+
+    async def kill(self, reason: str) -> ToolInterruptStepResult:
+        """kill 子进程并等待短 cleanup grace。
+
+        :param reason: 诊断原因。
+        :returns: kill 结果。
+        """
+
+        del reason
+        result = await self._handle.kill(
+            grace_seconds=self._interrupt_policy.kill_grace_seconds
+        )
+        return _tool_interrupt_result_from_process(
+            result,
+            success_message="process-backed capsule killed process",
+            pending_message="process-backed capsule kill did not exit process",
+        )
+
+    async def close(self) -> None:
+        """关闭 process handle。
+
+        :returns: ``None``。
+        """
+
+        await self._handle.close(
+            kill_grace_seconds=self._interrupt_policy.kill_grace_seconds
+        )
 
 
 class DefaultToolRuntimePolicyPort:
@@ -2139,7 +2739,11 @@ class ToolRuntimeBuildRequest:
     :param policy_view: Host 内部工具 policy view。
     :param duplicate_governance_policy: ToolRuntime 使用的 duplicate governance
         策略。
+    :param process_capsule_interrupt_policy: process-backed capsule terminate /
+        kill cleanup grace 策略。
     :param diagnostic_emitter: 诊断 emitter；无则使用确定性内存引用实现。
+    :param execution_capsule_factory: 测试用内部 execution capsule factory
+        override；无则按 effective ``ToolDefinition.execution`` 创建 capsule。
     """
 
     effective_bundle_request: EffectiveToolBundleBuildRequest
@@ -2157,7 +2761,11 @@ class ToolRuntimeBuildRequest:
     duplicate_governance_policy: DuplicateGovernancePolicy = field(
         default_factory=DuplicateGovernancePolicy
     )
+    process_capsule_interrupt_policy: ProcessCapsuleInterruptPolicy = field(
+        default_factory=ProcessCapsuleInterruptPolicy
+    )
     diagnostic_emitter: ToolTraceDiagnosticEmitter | None = None
+    execution_capsule_factory: ToolExecutionCapsuleFactory | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2222,6 +2830,7 @@ class ToolRuntimeExecutor:
         retry_policy: ToolAcceptRetryPolicy,
         policy_view: ToolRuntimePolicyView,
         diagnostic_emitter: ToolTraceDiagnosticEmitter,
+        execution_capsule_factory: ToolExecutionCapsuleFactory,
     ) -> None:
         """初始化 ToolRuntimeExecutor。
 
@@ -2238,6 +2847,7 @@ class ToolRuntimeExecutor:
         :param retry_policy: accept ack 有限重试策略。
         :param policy_view: Host 内部工具 policy view。
         :param diagnostic_emitter: 诊断 emitter。
+        :param execution_capsule_factory: 单工具执行 capsule factory。
         :returns: ``None``。
         """
 
@@ -2254,6 +2864,7 @@ class ToolRuntimeExecutor:
         self._retry_policy = retry_policy
         self._policy_view = policy_view
         self._diagnostic_emitter = diagnostic_emitter
+        self._execution_capsule_factory = execution_capsule_factory
 
     async def execute(
         self, request: BatchToolExecutionRequest
@@ -2381,7 +2992,7 @@ class ToolRuntimeExecutor:
                     durable_missing_reason = _durable_missing_reason_for_policy(
                         policy_decision
                     )
-                if _is_callable_exception_outcome(raw_outcome):
+                if _is_runtime_dispatch_exception_outcome(raw_outcome):
                     durable_missing_reason = DuplicateDurableMissingReason.TOOL_EXCEPTION
                     return BatchToolExecutionRecord(
                         tool_call_id=call.tool_call_id,
@@ -2605,29 +3216,126 @@ class ToolRuntimeExecutor:
         if timeout_seconds is not None and timeout_seconds <= 0:
             decision = _runtime_timeout_policy_decision(elapsed_seconds=0.0)
             return _governed_failure_outcome(decision), decision
-        awaitable = self._dispatcher.dispatch_tool_call(call, context)
-        if timeout_seconds is None:
-            wait_result = await await_or_cancel(
-                awaitable,
-                token=context.cancellation_token,
+        if context.cancellation_token.is_cancelled():
+            decision = _runtime_cancelled_policy_decision(
+                context.cancellation_token.cancel_reason()
             )
-        else:
-            wait_result = await await_or_cancel_or_timeout(
-                awaitable,
+            return _governed_failure_outcome(decision), decision
+        try:
+            capsule = self._execution_capsule_factory.create_capsule(
+                call,
+                context,
+                self._dispatcher,
+            )
+        except Exception as exc:
+            return (
+                _tool_failed_outcome(
+                    error=_TOOL_RUNTIME_CAPSULE_BUILD_FAILED_ERROR,
+                    message=(
+                        "tool execution capsule build failed: "
+                        f"{exc.__class__.__name__}: {exc}"
+                    ),
+                    hint=None,
+                ),
+                None,
+            )
+        capsule_task = asyncio.create_task(capsule.run())
+        try:
+            wait_result = await wait_for_or_cancel(
+                capsule_task,
                 token=context.cancellation_token,
                 timeout_seconds=timeout_seconds,
             )
+        except asyncio.CancelledError:
+            await self._interrupt_capsule_after_wait(
+                capsule=capsule,
+                capsule_task=capsule_task,
+                reason="tool execution task cancelled",
+            )
+            raise
         if isinstance(wait_result, WaitCompleted):
-            return wait_result.value, None
+            try:
+                return wait_result.value, None
+            finally:
+                await capsule.close()
         if isinstance(wait_result, WaitCancelled):
+            await self._interrupt_capsule_after_wait(
+                capsule=capsule,
+                capsule_task=capsule_task,
+                reason=wait_result.reason or "tool execution cancelled",
+            )
             decision = _runtime_cancelled_policy_decision(wait_result.reason)
             return _governed_failure_outcome(decision), decision
         if isinstance(wait_result, WaitTimedOut):
+            await self._interrupt_capsule_after_wait(
+                capsule=capsule,
+                capsule_task=capsule_task,
+                reason="tool execution timed out",
+            )
             decision = _runtime_timeout_policy_decision(
                 elapsed_seconds=wait_result.elapsed_seconds
             )
             return _governed_failure_outcome(decision), decision
         raise TypeError("unsupported ToolRuntime wait outcome")
+
+    async def _interrupt_capsule_after_wait(
+        self,
+        *,
+        capsule: ToolExecutionCapsule,
+        capsule_task: asyncio.Task[ToolExecutionOutcome],
+        reason: str,
+    ) -> None:
+        """在 cancel / timeout 后中止 capsule 并释放资源。
+
+        :param capsule: 当前工具调用 capsule。
+        :param capsule_task: 正在等待的 capsule task。
+        :param reason: interrupt 诊断原因。
+        :returns: ``None``。
+        """
+
+        capsule.request_interrupt(reason)
+        terminate_result = await capsule.terminate(reason)
+        kill_result: ToolInterruptStepResult | None = None
+        if terminate_result.supported and not terminate_result.completed:
+            kill_result = await capsule.kill(reason)
+        if not capsule_task.done():
+            capsule_task.cancel()
+            try:
+                await capsule_task
+            except asyncio.CancelledError:
+                pass
+        try:
+            await capsule.close()
+        except Exception as exc:
+            _LOGGER.warning(
+                "host.tool_runtime.capsule_close_failed session_id=%s run_id=%s "
+                "attempt_id=%s execution_id=%s mode=%s reason=%s error_type=%s",
+                self._execution_scope.session_id,
+                self._execution_scope.run_id,
+                self._execution_scope.attempt_id,
+                self._execution_scope.execution_id,
+                capsule.mode.value,
+                reason,
+                exc.__class__.__name__,
+                exc_info=True,
+            )
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.tool_runtime.capsule_interrupted session_id=%s run_id=%s "
+            "attempt_id=%s execution_id=%s mode=%s reason=%s "
+            "terminate_supported=%s terminate_completed=%s "
+            "kill_supported=%s kill_completed=%s",
+            self._execution_scope.session_id,
+            self._execution_scope.run_id,
+            self._execution_scope.attempt_id,
+            self._execution_scope.execution_id,
+            capsule.mode.value,
+            reason,
+            terminate_result.supported,
+            terminate_result.completed,
+            kill_result.supported if kill_result is not None else False,
+            kill_result.completed if kill_result is not None else False,
+        )
 
     async def _accept_reuse(
         self,
@@ -3299,6 +4007,14 @@ class DefaultToolRuntimeFactory:
             duplicate_governance = InMemoryAttemptDuplicateGovernance(
                 request.duplicate_governance_policy
             )
+            execution_capsule_factory = (
+                request.execution_capsule_factory
+                if request.execution_capsule_factory is not None
+                else DeclaredToolExecutionCapsuleFactory(
+                    effective_bundle,
+                    request.process_capsule_interrupt_policy,
+                )
+            )
             executor: ToolExecutor = ToolRuntimeExecutor(
                 effective_bundle=effective_bundle,
                 execution_scope=request.execution_scope,
@@ -3313,6 +4029,7 @@ class DefaultToolRuntimeFactory:
                 retry_policy=request.retry_policy,
                 policy_view=request.policy_view,
                 diagnostic_emitter=diagnostic_emitter,
+                execution_capsule_factory=execution_capsule_factory,
             )
         else:
             executor = ToolRuntimeUnsupportedExecutor(effective_bundle)
@@ -5273,6 +5990,7 @@ def _fetch_more_tool_definition(callable_: FetchMoreToolCallable) -> ToolDefinit
         name=FrameworkToolName.FETCH_MORE.value,
         schema=schema,
         callable=callable_,
+        execution=AsyncDirectToolExecutionCapability(),
         truncate=None,
         display=None,
         tags=("framework",),
@@ -5823,16 +6541,84 @@ def _durable_missing_reason_for_awaiting_accept_result(
     return DuplicateDurableMissingReason.HOST_ACCEPT_TIMEOUT
 
 
-def _is_callable_exception_outcome(outcome: ToolExecutionOutcome) -> bool:
-    """判断 outcome 是否来自业务工具 callable 异常。
+def _is_runtime_dispatch_exception_outcome(outcome: ToolExecutionOutcome) -> bool:
+    """判断 outcome 是否来自工具 dispatch / capsule 构造异常。
 
     :param outcome: 工具执行 outcome。
-    :returns: callable 异常被 ToolRuntime 归一化时返回 ``True``。
+    :returns: dispatch 或 capsule 构造异常被 ToolRuntime 归一化时返回 ``True``。
     """
 
     return (
         isinstance(outcome, ToolFailedOutcome)
-        and outcome.result.error == _TOOL_RUNTIME_CALLABLE_FAILED_ERROR
+        and outcome.result.error
+        in {
+            _TOOL_RUNTIME_CALLABLE_FAILED_ERROR,
+            _TOOL_RUNTIME_CAPSULE_BUILD_FAILED_ERROR,
+        }
+    )
+
+
+def _tool_outcome_from_process_envelope(envelope: JsonValue) -> ToolExecutionOutcome:
+    """把 process-backed 子进程 JSON 信封解析为工具 outcome。
+
+    只有 ``completed`` 与 ``failed`` 是子进程允许表达的业务结果；未知、
+    malformed、awaiting、cancelled、timeout 与 host_cancelled 信封均
+    fail closed。父进程 cancel / timeout 由 Host capsule 外层独占治理。
+
+    :param envelope: 子进程返回的 JSON 值。
+    :returns: 工具 outcome。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    parsed = parse_process_tool_envelope(envelope)
+    if isinstance(parsed, ProcessToolCompletedEnvelope):
+        return ToolCompletedOutcome(
+            result=ToolResultSuccess(
+                ok=True,
+                value=parsed.value,
+                meta=None,
+            )
+        )
+    if isinstance(parsed, ProcessToolFailedEnvelope):
+        return _tool_failed_outcome(
+            error=parsed.error_type,
+            message=parsed.message,
+            hint=parsed.hint,
+        )
+    if isinstance(parsed, ProcessToolMalformedEnvelope):
+        return _malformed_process_envelope_outcome(parsed.message)
+    if isinstance(parsed, ProcessToolUnsupportedEnvelope):
+        return _unsupported_process_envelope_outcome(parsed.status)
+    raise TypeError("unsupported process tool envelope parse result")
+
+
+def _malformed_process_envelope_outcome(message: str) -> ToolFailedOutcome:
+    """构造 process-backed malformed envelope 失败 outcome。
+
+    :param message: 失败诊断说明。
+    :returns: 工具失败 outcome。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return _tool_failed_outcome(
+        error=_PROCESS_BACKED_TOOL_MALFORMED_ENVELOPE_ERROR,
+        message=message,
+        hint=None,
+    )
+
+
+def _unsupported_process_envelope_outcome(status: str) -> ToolFailedOutcome:
+    """构造 process-backed unsupported envelope 失败 outcome。
+
+    :param status: 子进程返回的 unsupported status。
+    :returns: 工具失败 outcome。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return _tool_failed_outcome(
+        error=_PROCESS_BACKED_TOOL_UNSUPPORTED_ENVELOPE_ERROR,
+        message=f"process envelope status is not supported: {status}",
+        hint=None,
     )
 
 
@@ -6631,6 +7417,33 @@ def _runtime_timeout_policy_decision(elapsed_seconds: float) -> ToolPolicyDecisi
     )
 
 
+def _tool_interrupt_result_from_process(
+    result: ProcessInterruptResult,
+    *,
+    success_message: str,
+    pending_message: str,
+) -> ToolInterruptStepResult:
+    """把 runtime process interrupt 结果映射为 ToolRuntime 结果。
+
+    :param result: runtime process interrupt 结果。
+    :param success_message: 进程已退出时的诊断说明。
+    :param pending_message: 进程仍未退出时的诊断说明。
+    :returns: ToolRuntime interrupt 步骤结果。
+    """
+
+    if result.exited:
+        return ToolInterruptStepResult(
+            supported=result.supported,
+            completed=True,
+            message=success_message,
+        )
+    return ToolInterruptStepResult(
+        supported=result.supported,
+        completed=False,
+        message=pending_message,
+    )
+
+
 def _truncation_failure(reason_code: str, message: str) -> ToolFailedOutcome:
     """构造截断 / 补读失败工具 outcome。
 
@@ -6732,7 +7545,10 @@ def _awaiting_accept_failure_outcome(
 
 
 __all__ = [
+    "AsyncDirectToolExecutionCapsule",
+    "DeclaredToolExecutionCapsuleFactory",
     "DefaultToolDispatcher",
+    "DefaultToolExecutionCapsuleFactory",
     "DefaultToolRuntimeFactory",
     "DefaultHostToolFactAcceptPort",
     "DefaultToolRuntimePolicyPort",
@@ -6751,6 +7567,13 @@ __all__ = [
     "InMemoryToolTraceDiagnosticEmitter",
     "NoopToolTraceDiagnosticEmitter",
     "NoopTruncationPort",
+    "ProcessBackedToolExecutionCapsule",
+    "ThreadBackedToolCallable",
+    "ThreadBackedToolExecutionCapsule",
+    "ToolExecutionCapsule",
+    "ToolExecutionCapsuleFactory",
+    "ToolExecutionMode",
+    "ToolInterruptStepResult",
     "ToolSideEffectKind",
     "ToolAcceptRejectReason",
     "ToolAcceptRetryPolicy",

@@ -16,7 +16,10 @@ from types import ModuleType
 from typing import Final, Protocol, TypeAlias, cast
 
 from dayu.contracts import (
+    AsyncDirectToolExecutionCapability,
     JsonValue,
+    ProcessBackedToolExecutionCapability,
+    ThreadBackedToolExecutionCapability,
     ToolBundle,
     ToolBundleSourceRef,
     ToolDefinition,
@@ -394,10 +397,11 @@ def _require_callable(candidate: _ProviderCandidate, *, source: str) -> ToolsDis
 def _tool_definitions_digest(definitions: tuple[ToolDefinition, ...]) -> str:
     """计算 provider 工具声明内容摘要。
 
-    摘要只覆盖工具声明内容：工具名、LLM-facing schema、截断声明、标签与
-    展示 metadata。它不包含 callable 引用、模块路径对象身份、权限、lease、
-    fencing、Host truth 或 owner 信息；仅用于解释、诊断、trace、audit 与
-    后续 snapshot refs。
+    摘要只覆盖工具声明内容：工具名、LLM-facing schema、执行能力稳定
+    声明、截断声明、标签与展示 metadata。它不包含 callable 引用、
+    process target factory 对象身份、模块路径对象身份、权限、lease、
+    fencing、Host truth 或 owner 信息；仅用于解释、诊断、trace、audit
+    与后续 snapshot refs。
 
     :param definitions: provider 按声明顺序返回的工具定义。
     :returns: ``sha256:<hex>`` 形式的稳定内容摘要。
@@ -448,11 +452,37 @@ def _tool_definition_json_value(definition: ToolDefinition) -> JsonValue:
     value: dict[str, JsonValue] = {
         "name": definition.name,
         "schema": _tool_schema_json_value(definition),
+        "execution": _tool_execution_json_value(definition),
         "truncate": _tool_truncate_json_value(definition),
         "tags": list(definition.tags),
         "display": (definition.display.name if definition.display is not None else None),
     }
     return value
+
+
+def _tool_execution_json_value(definition: ToolDefinition) -> JsonValue:
+    """把执行能力声明投影为用于 digest 的 JSON 值。
+
+    :param definition: 工具定义。
+    :returns: 稳定执行能力 JSON 投影；不包含 callable 或 target factory
+        对象身份。
+    :raises TypeError: 遇到未知 execution capability 类型时抛出。
+    """
+
+    execution = definition.execution
+    if isinstance(execution, AsyncDirectToolExecutionCapability):
+        return {
+            "mode": "async_direct",
+            "request_abort_capable": execution.request_abort_capable,
+        }
+    if isinstance(execution, ThreadBackedToolExecutionCapability):
+        return {
+            "mode": "thread_backed",
+            "production_safe_non_cooperative_cancel": execution.production_safe_non_cooperative_cancel,
+        }
+    if isinstance(execution, ProcessBackedToolExecutionCapability):
+        return {"mode": "process_backed"}
+    raise TypeError(f"unsupported tool execution capability: {type(execution).__name__}")
 
 
 def _tool_schema_json_value(definition: ToolDefinition) -> JsonValue:

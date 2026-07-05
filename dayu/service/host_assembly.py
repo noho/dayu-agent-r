@@ -59,6 +59,7 @@ from dayu.host.tool_duplicate_governance import (
     DuplicateGovernancePolicy,
 )
 from dayu.host.tooling import HostToolingOptions
+from dayu.host.tooling import ProcessCapsuleInterruptPolicy
 from dayu.runtime.assembly import (
     AgentPolicyDefaults,
     ExecutionProfileCompatibilityDiagnostic,
@@ -78,6 +79,7 @@ from dayu.runtime.config_loader import (
     ExecutionProfileConfig,
     HostRuntimeProfileConfig,
     ModelConfig,
+    ProcessCapsuleInterruptPolicyConfig,
     RuntimeConfig,
     RuntimeLaneConfig,
     RunnerOptionHintConfig,
@@ -789,6 +791,9 @@ def _compose_options(
             fins_awaiting_runtime=request.discovered_tools.fins_awaiting_runtime,
             duplicate_governance_policy_config=(
                 execution_profile.tool_duplicate_governance_policy
+            ),
+            process_capsule_interrupt_policy_config=(
+                host_runtime.process_capsule_interrupt_policy
             ),
         ),
         context_budget_policy=default_context_budget_policy(
@@ -1686,6 +1691,9 @@ def _tooling_options_from_discovery(
     provider_configs: tuple[ToolDiscoveryProviderConfig, ...],
     fins_awaiting_runtime: FinsObservationRuntime | None,
     duplicate_governance_policy_config: ToolDuplicateGovernancePolicyConfig,
+    process_capsule_interrupt_policy_config: (
+        ProcessCapsuleInterruptPolicyConfig | None
+    ) = None,
 ) -> HostToolingOptions | None:
     """把 ToolsDiscovery 输出映射为 HostToolingOptions。
 
@@ -1695,6 +1703,8 @@ def _tooling_options_from_discovery(
     :param fins_awaiting_runtime: Service discovery 为 Fins awaiting providers
         创建的共享 runtime；没有 Fins awaiting provider 时显式传 ``None``。
     :param duplicate_governance_policy_config: execution profile 中的重复调用治理配置。
+    :param process_capsule_interrupt_policy_config: host runtime 中的
+        process-backed cleanup interrupt 配置；``None`` 表示使用 Host typed 默认值。
     :returns: HostToolingOptions；没有业务工具时为 ``None``。
     :raises ValueError: source refs 缺失但工具非空时抛出。
     """
@@ -1724,6 +1734,29 @@ def _tooling_options_from_discovery(
         duplicate_governance_policy=_duplicate_governance_policy_from_config(
             duplicate_governance_policy_config
         ),
+        process_capsule_interrupt_policy=(
+            _process_capsule_interrupt_policy_from_config(
+                process_capsule_interrupt_policy_config
+            )
+        ),
+    )
+
+
+def _process_capsule_interrupt_policy_from_config(
+    config: ProcessCapsuleInterruptPolicyConfig | None,
+) -> ProcessCapsuleInterruptPolicy:
+    """把 runtime config 映射为 Host process capsule interrupt policy。
+
+    :param config: ConfigLoader 输出的可选 cleanup interrupt 配置。
+    :returns: Host typed process capsule interrupt policy。
+    :raises ValueError: Host typed policy 校验失败时抛出。
+    """
+
+    if config is None:
+        return ProcessCapsuleInterruptPolicy()
+    return ProcessCapsuleInterruptPolicy(
+        terminate_grace_seconds=config.terminate_grace_seconds,
+        kill_grace_seconds=config.kill_grace_seconds,
     )
 
 

@@ -42,6 +42,12 @@ from urllib3.exceptions import ReadTimeoutError as Urllib3ReadTimeoutError
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import BatchToolExecutionContext, ToolCallRequest
+from dayu.contracts.tool_execution import (
+    ProcessBackedToolContext,
+    ProcessBackedToolExecutionCapability,
+    process_tool_completed_envelope,
+    process_tool_failed_envelope,
+)
 from dayu.contracts.tool_declaration import ToolDefinition, tool
 from dayu.contracts.tool_outcome import ToolExecutionOutcome
 from dayu.contracts.tool_schema import ToolParametersSchema, ToolTruncateSpec, ToolTruncationStrategy
@@ -370,6 +376,190 @@ class WebToolCancelledError(Exception):
         super().__init__(message)
         self.message = message
         self.hint = hint
+
+
+class _WebProcessCancellationToken:
+    """Web process target 内部使用的不可取消 token。
+
+    子进程不共享 Host cancellation token；生产取消、超时和 hard kill 由
+    父进程 ToolRuntime process capsule 独占治理。本 token 只满足 Web
+    同步业务 helper 的类型边界，避免子进程伪造 host_cancelled / timeout
+    结果。
+    """
+
+    def is_cancelled(self) -> bool:
+        """返回当前是否已取消。
+
+        Args:
+            无。
+
+        Returns:
+            始终返回 ``False``。
+
+        Raises:
+            无。
+        """
+
+        return False
+
+    def cancel_reason(self) -> str | None:
+        """返回取消原因。
+
+        Args:
+            无。
+
+        Returns:
+            始终返回 ``None``。
+
+        Raises:
+            无。
+        """
+
+        return None
+
+    def requested_at(self) -> datetime | None:
+        """返回取消请求时间。
+
+        Args:
+            无。
+
+        Returns:
+            始终返回 ``None``。
+
+        Raises:
+            无。
+        """
+
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class _WebProcessTarget:
+    """Web process-backed 子进程目标。
+
+    本目标只保存 spawn 可序列化的工具名、参数 JSON 副本、Web provider
+    配置和 timeout 标量；不得捕获 requests Session、provider lock、
+    CancellationToken、Host / Run / Session 对象或 Playwright runtime /
+    browser 对象。
+
+    Args:
+        tool_name: 工具名。
+        arguments: 工具调用参数 JSON 副本。
+        config: Web provider 可序列化配置。
+        timeout_seconds: 父进程投影的批级 timeout 标量；真实超时 closeout
+            由父进程 Host capsule 独占治理，同时该值继续传入 HTTP /
+            browser 阶段作为预算。
+
+    Returns:
+        dataclass 实例。
+
+    Raises:
+        无。
+    """
+
+    tool_name: str
+    arguments: dict[str, JsonValue]
+    config: WebToolsConfig
+    timeout_seconds: float | None
+
+    def __call__(self) -> JsonValue:
+        """在子进程内重建 Web runtime 并执行同步业务。
+
+        Args:
+            无。
+
+        Returns:
+            ``completed`` 或 ``failed`` JSON 信封；不会返回 awaiting、
+            cancelled、timeout 或 host_cancelled。
+
+        Raises:
+            无；未预期异常会被转换为 failed 信封。
+        """
+
+        call = ToolCallRequest(
+            tool_call_id=f"process-{self.tool_name}",
+            name=self.tool_name,
+            arguments=self.arguments,
+            index_in_iteration=0,
+            provider_state=None,
+        )
+        try:
+            value = _execute_web_process_business_value(
+                tool_name=self.tool_name,
+                call=call,
+                config=self.config,
+                timeout_budget=self.timeout_seconds,
+            )
+        except ToolBusinessError as failure:
+            return _web_process_failed_envelope(
+                error_type=failure.code,
+                message=failure.message,
+                hint=failure.hint,
+            )
+        except WebSearchProviderUnavailableError as failure:
+            return _web_process_failed_envelope(
+                error_type=_SEARCH_PROVIDER_UNAVAILABLE_ERROR,
+                message=failure.message,
+                hint=_SEARCH_PROVIDER_UNAVAILABLE_HINT,
+            )
+        except (WebToolCancelledError, WebSearchCancelledError):
+            return _web_process_failed_envelope(
+                error_type="execution_error",
+                message=f"Tool {self.tool_name!r} execution was interrupted inside child process.",
+                hint="Parent ToolRuntime owns cancellation and timeout closeout.",
+            )
+        except Exception:
+            return process_tool_failed_envelope(
+                error_type="execution_error",
+                message=f"Tool {self.tool_name!r} execution failed.",
+            )
+        return process_tool_completed_envelope(value)
+
+
+@dataclass(frozen=True, slots=True)
+class _WebProcessTargetFactory:
+    """Web process-backed target factory。
+
+    本 factory 只保存 spawn 可序列化的 Web provider 配置，不捕获
+    requests Session、provider lock、CancellationToken、Host / Run /
+    Session 对象或 Playwright runtime / browser 对象。
+
+    Args:
+        config: Web provider 可序列化配置。
+
+    Returns:
+        dataclass 实例。
+
+    Raises:
+        无。
+    """
+
+    config: WebToolsConfig
+
+    def build_process_target(
+        self,
+        call: ToolCallRequest,
+        context: ProcessBackedToolContext,
+    ) -> _WebProcessTarget:
+        """构造可序列化 Web 子进程目标。
+
+        Args:
+            call: 单次工具调用请求。
+            context: Host 投影出的可序列化 process-backed 上下文。
+
+        Returns:
+            Web 子进程目标。
+
+        Raises:
+            无。
+        """
+
+        return _WebProcessTarget(
+            tool_name=call.name,
+            arguments=dict(call.arguments),
+            config=self.config,
+            timeout_seconds=context.timeout_seconds,
+        )
 
 
 _FetchContentConversionError = _web_fetch_orchestrator._FetchContentConversionError
@@ -995,6 +1185,7 @@ def build_web_tool_definitions(config: WebToolsConfig) -> tuple[ToolDefinition, 
     """
 
     provider_lock = asyncio.Lock()
+    process_target_factory = _WebProcessTargetFactory(config=config)
 
     @tool(
         name=_SEARCH_WEB_TOOL_NAME,
@@ -1002,6 +1193,9 @@ def build_web_tool_definitions(config: WebToolsConfig) -> tuple[ToolDefinition, 
         parameters=_build_search_web_parameters(config.max_search_results),
         tags=_WEB_TOOL_TAGS,
         display_name="联网搜索",
+        execution=ProcessBackedToolExecutionCapability(
+            target_factory=process_target_factory
+        ),
         truncate=ToolTruncateSpec(
             enabled=True,
             strategy=ToolTruncationStrategy.LIST_ITEMS,
@@ -1038,6 +1232,9 @@ def build_web_tool_definitions(config: WebToolsConfig) -> tuple[ToolDefinition, 
         parameters=_FETCH_WEB_PAGE_PARAMETERS,
         tags=_WEB_TOOL_TAGS,
         display_name="抓取网页",
+        execution=ProcessBackedToolExecutionCapability(
+            target_factory=process_target_factory
+        ),
         truncate=ToolTruncateSpec(
             enabled=True,
             strategy=ToolTruncationStrategy.TEXT_CHARS,
@@ -1177,7 +1374,7 @@ async def _call_search_web(
                 recency_days=recency_days,
                 max_results=max_results,
                 config=config,
-                timeout_budget=None,
+                timeout_budget=context.timeout_seconds,
                 cancellation_token=cancellation_token,
             )
     except WebSearchCancelledError as exc:
@@ -1271,7 +1468,7 @@ async def _call_fetch_web_page(
                 _fetch_web_page_business,
                 url=url,
                 config=config,
-                timeout_budget=None,
+                timeout_budget=context.timeout_seconds,
                 cancellation_token=cancellation_token,
             )
     except WebToolCancelledError as exc:
@@ -1323,7 +1520,7 @@ def _search_web_business(
     :param recency_days: 可选最近天数过滤。
     :param max_results: 返回结果上限。
     :param config: Web provider 配置。
-    :param timeout_budget: 单次工具调用预算；当前保持旧行为传 ``None``。
+    :param timeout_budget: 单次工具调用预算，用于约束下游 HTTP 请求预算。
     :param cancellation_token: Host 取消令牌。
     :returns: 搜索结果字典。
     :raises WebSearchCancelledError: Host 取消时抛出。
@@ -1347,6 +1544,111 @@ def _search_web_business(
         normalize_whitespace=_normalize_whitespace,
         resolve_timeout_budget=_resolve_timeout_budget,
         cancellation_token=cancellation_token,
+    )
+
+
+def _execute_web_process_business_value(
+    *,
+    tool_name: str,
+    call: ToolCallRequest,
+    config: WebToolsConfig,
+    timeout_budget: float | None,
+) -> JsonValue:
+    """执行 Web process target 内的同步业务并返回成功载荷。
+
+    Args:
+        tool_name: 工具名。
+        call: 子进程内重建的工具调用请求。
+        config: Web provider 配置。
+        timeout_budget: 父进程投影的工具执行预算，会继续传入 HTTP /
+            browser 阶段。
+
+    Returns:
+        工具成功载荷。
+
+    Raises:
+        ToolBusinessError: 参数校验、URL 安全或抓取业务失败时抛出。
+        WebSearchProviderUnavailableError: 搜索 provider 不可用时抛出。
+        WebToolCancelledError: 子进程内部意外观察到取消时抛出。
+        WebSearchCancelledError: 搜索 provider 意外返回取消时抛出。
+        ValueError: 工具名未知时抛出。
+        Exception: 未预期业务异常透出给 process target 统一 fail closed。
+    """
+
+    process_token = _WebProcessCancellationToken()
+    if tool_name == _SEARCH_WEB_TOOL_NAME:
+        validation = validate_and_project_arguments(
+            call=call,
+            tool_name=_SEARCH_WEB_TOOL_NAME,
+            schema=_build_search_web_parameters(config.max_search_results),
+        )
+        if isinstance(validation, ToolArgumentValidationFailure):
+            raise ToolBusinessError(
+                validation.error,
+                validation.message,
+                hint=validation.hint or "",
+            )
+        arguments = validation.arguments
+        return cast(
+            JsonValue,
+            _search_web_business(
+                query=_required_string_argument(arguments, "query"),
+                domains=_optional_string_list_argument(arguments, "domains"),
+                recency_days=_optional_int_argument(arguments, "recency_days"),
+                max_results=(
+                    _optional_int_argument(arguments, "max_results")
+                    or _SEARCH_WEB_DEFAULT_MAX_RESULTS
+                ),
+                config=config,
+                timeout_budget=timeout_budget,
+                cancellation_token=process_token,
+            ),
+        )
+    if tool_name == _FETCH_WEB_PAGE_TOOL_NAME:
+        validation = validate_and_project_arguments(
+            call=call,
+            tool_name=_FETCH_WEB_PAGE_TOOL_NAME,
+            schema=_FETCH_WEB_PAGE_PARAMETERS,
+        )
+        if isinstance(validation, ToolArgumentValidationFailure):
+            raise ToolBusinessError(
+                validation.error,
+                validation.message,
+                hint=validation.hint or "",
+            )
+        return _fetch_web_page_business(
+            url=_required_string_argument(validation.arguments, "url"),
+            config=config,
+            timeout_budget=timeout_budget,
+            cancellation_token=process_token,
+        )
+    raise ValueError(f"unknown web tool for process-backed execution: {tool_name}")
+
+
+def _web_process_failed_envelope(
+    *,
+    error_type: str,
+    message: str,
+    hint: str | None,
+) -> JsonValue:
+    """构造 Web process-backed failed JSON 信封。
+
+    Args:
+        error_type: 工具失败错误码。
+        message: 面向 LLM 的失败说明。
+        hint: 可选恢复提示。
+
+    Returns:
+        process-backed failed JSON 信封。
+
+    Raises:
+        无。
+    """
+
+    return process_tool_failed_envelope(
+        error_type=error_type.strip() or "execution_error",
+        message=message.strip() or "Tool execution failed.",
+        hint=hint,
     )
 
 
@@ -1507,7 +1809,7 @@ def _fetch_web_page_business(
 
     :param url: 目标网页 URL。
     :param config: Web provider 配置。
-    :param timeout_budget: 单次工具调用预算；当前保持旧行为传 ``None``。
+    :param timeout_budget: 单次工具调用预算，用于约束下游 HTTP 请求预算。
     :param cancellation_token: Host 取消令牌。
     :returns: 抓取成功载荷。
     :raises WebToolCancelledError: Host 取消时抛出。

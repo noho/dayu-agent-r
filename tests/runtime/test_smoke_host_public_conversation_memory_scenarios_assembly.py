@@ -9,7 +9,13 @@ from datetime import datetime
 
 import pytest
 
-from dayu.contracts import JsonValue, ToolBundle, ToolBundleSourceKind, ToolBundleSourceRef
+from dayu.contracts import (
+    AsyncDirectToolExecutionCapability,
+    JsonValue,
+    ToolBundle,
+    ToolBundleSourceKind,
+    ToolBundleSourceRef,
+)
 from dayu.contracts.tool_call import BatchToolExecutionContext, ToolCallRequest
 from dayu.contracts.tool_declaration import ToolDefinition
 from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolExecutionOutcome
@@ -1377,6 +1383,7 @@ def _non_smoke_tool_definition() -> ToolDefinition:
             ),
         ),
         callable=_NonSmokeTool(),
+        execution=AsyncDirectToolExecutionCapability(),
         truncate=None,
         display=None,
         tags=(_TOOL_TAG,),

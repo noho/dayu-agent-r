@@ -15,6 +15,7 @@ import pytest
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import BatchToolExecutionContext, ToolCallRequest
 from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
+from dayu.contracts.tool_execution import AsyncDirectToolExecutionCapability
 from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolExecutionOutcome
 from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.contracts.tool_schema import (
@@ -1569,6 +1570,7 @@ def _long_chapter_tooling_options() -> HostToolingOptions:
                         ),
                     ),
                     callable=_LongChapterMockTool(),
+                    execution=AsyncDirectToolExecutionCapability(),
                     truncate=None,
                     display=None,
                     tags=("slice7",),

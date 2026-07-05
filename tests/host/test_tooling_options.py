@@ -14,6 +14,7 @@ from dayu.contracts.tool_call import (
     ToolCallRequest,
 )
 from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
+from dayu.contracts.tool_execution import AsyncDirectToolExecutionCapability
 from dayu.contracts.tool_outcome import (
     TOOL_CANCELLED_REASON_HOST_CANCELLED,
     ToolCancelledOutcome,
@@ -29,6 +30,7 @@ from dayu.host import (
     FrameworkToolName,
     FrameworkToolPolicyView,
     HostToolingOptions,
+    ProcessCapsuleInterruptPolicy,
     default_framework_tool_policy_view,
 )
 from dayu.host.tool_duplicate_governance import (
@@ -107,6 +109,7 @@ def _definition(name: str) -> ToolDefinition:
             ),
         ),
         callable=_noop_tool,
+        execution=AsyncDirectToolExecutionCapability(),
         truncate=None,
         display=None,
         tags=(),
@@ -224,6 +227,11 @@ def test_host_tooling_options_accepts_normal_business_bundle() -> None:
     assert options.source_refs == (_source_ref(),)
     assert options.framework_tool_policy == default_framework_tool_policy_view()
     assert isinstance(options.duplicate_governance_policy, DuplicateGovernancePolicy)
+    assert isinstance(
+        options.process_capsule_interrupt_policy,
+        ProcessCapsuleInterruptPolicy,
+    )
+    assert options.process_capsule_interrupt_policy == ProcessCapsuleInterruptPolicy()
     assert isinstance(
         options.duplicate_governance_policy.messages,
         DuplicateGovernanceMessages,
@@ -351,6 +359,76 @@ def test_host_tooling_options_rejects_invalid_duplicate_policy_type() -> None:
             source_refs=(_source_ref(),),
             duplicate_governance_policy=cast(
                 DuplicateGovernancePolicy,
+                "invalid-policy",
+            ),
+        )
+
+
+def test_process_capsule_interrupt_policy_accepts_zero_and_positive_grace() -> None:
+    """process capsule cleanup policy 接受有限非负 grace 数值。"""
+
+    policy = ProcessCapsuleInterruptPolicy(
+        terminate_grace_seconds=0.0,
+        kill_grace_seconds=1.25,
+    )
+
+    assert policy.terminate_grace_seconds == 0.0
+    assert policy.kill_grace_seconds == 1.25
+
+
+def test_host_tooling_options_accepts_custom_process_capsule_policy() -> None:
+    """HostToolingOptions 必须保留调用方传入的 process capsule cleanup policy。"""
+
+    policy = ProcessCapsuleInterruptPolicy(
+        terminate_grace_seconds=0.3,
+        kill_grace_seconds=0.4,
+    )
+    options = HostToolingOptions(
+        business_tool_bundle=ToolBundle(definitions=(_definition("lookup_filing"),)),
+        source_refs=(_source_ref(),),
+        process_capsule_interrupt_policy=policy,
+    )
+
+    assert options.process_capsule_interrupt_policy is policy
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_error"),
+    (
+        (cast(float, True), TypeError),
+        (-0.1, ValueError),
+        (float("nan"), ValueError),
+        (float("inf"), ValueError),
+        (float("-inf"), ValueError),
+    ),
+)
+def test_process_capsule_interrupt_policy_rejects_invalid_grace(
+    value: float,
+    expected_error: type[Exception],
+) -> None:
+    """process capsule cleanup policy 拒绝 bool、负数、NaN 与无穷。"""
+
+    with pytest.raises(expected_error):
+        ProcessCapsuleInterruptPolicy(
+            terminate_grace_seconds=value,
+            kill_grace_seconds=0.2,
+        )
+    with pytest.raises(expected_error):
+        ProcessCapsuleInterruptPolicy(
+            terminate_grace_seconds=0.2,
+            kill_grace_seconds=value,
+        )
+
+
+def test_host_tooling_options_rejects_invalid_process_capsule_policy_type() -> None:
+    """HostToolingOptions 必须拒绝非 typed process capsule cleanup policy。"""
+
+    with pytest.raises(ValueError, match="process_capsule_interrupt_policy"):
+        HostToolingOptions(
+            business_tool_bundle=ToolBundle(definitions=(_definition("lookup_filing"),)),
+            source_refs=(_source_ref(),),
+            process_capsule_interrupt_policy=cast(
+                ProcessCapsuleInterruptPolicy,
                 "invalid-policy",
             ),
         )

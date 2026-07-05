@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -266,6 +267,86 @@ async def test_default_local_worker_close_cancels_active_event_stream(
     assert pending_read.cancelled()
     with pytest.raises(RuntimeError, match="closed"):
         handle.events()
+
+
+@pytest.mark.asyncio
+async def test_default_local_worker_cancel_closes_active_event_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """on_cancel 会走 event stream close path 并取消活跃 anext。"""
+
+    stream_started = asyncio.Event()
+    stream_finalized = asyncio.Event()
+    release_stream = asyncio.Event()
+
+    async def _blocked_run_agent_messages(
+        incoming: AgentRunRequest,
+    ) -> AsyncIterator[EngineEvent]:
+        """替换为受控阻塞 Engine stream。
+
+        :param incoming: Engine request。
+        :returns: 受控 EngineEvent stream。
+        """
+
+        del incoming
+        stream_started.set()
+        try:
+            await release_stream.wait()
+            yield _engine_event()
+        finally:
+            stream_finalized.set()
+
+    monkeypatch.setattr(
+        "dayu.host.local_proxy.run_agent_messages",
+        _blocked_run_agent_messages,
+    )
+
+    worker = DefaultLocalEngineWorkerFactory().create_worker(_snapshot())
+    handle = await worker.accept(_snapshot(), _request())
+    event_stream = handle.events()
+    pending_read = asyncio.create_task(_read_one_event(event_stream))
+    await stream_started.wait()
+
+    handle.on_cancel("test_cancel")
+    handle.on_cancel("test_cancel_replay")
+    await asyncio.wait_for(stream_finalized.wait(), timeout=1.0)
+
+    assert pending_read.cancelled()
+    await handle.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        handle.events()
+
+
+@pytest.mark.asyncio
+async def test_default_local_worker_cancel_logs_background_close_failure(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """on_cancel 后台 close task 失败时记录 worker id 与原因。"""
+
+    worker = DefaultLocalEngineWorkerFactory().create_worker(_snapshot())
+    handle = await worker.accept(_snapshot(), _request())
+
+    async def _raising_close() -> None:
+        """模拟后台 close 失败。
+
+        :returns: 不会正常返回。
+        :raises RuntimeError: 始终抛出测试异常。
+        """
+
+        raise RuntimeError("test close failed")
+
+    monkeypatch.setattr(handle, "close", _raising_close)
+
+    with caplog.at_level(logging.WARNING, logger="dayu.host.local_proxy"):
+        handle.on_cancel("test_cancel_reason")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    assert "host.local_proxy.cancel_close_failed" in caplog.text
+    assert handle.local_worker_id in caplog.text
+    assert "reason=test_cancel_reason" in caplog.text
+    assert "error_type=RuntimeError" in caplog.text
 
 
 async def _read_one_event(event_stream: AsyncIterator[EngineEvent]) -> EngineEvent:

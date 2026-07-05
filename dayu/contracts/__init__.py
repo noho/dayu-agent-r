@@ -22,6 +22,11 @@
 - :func:`tool` / :class:`ToolDisplayInfo` / :class:`ToolDefinition` /
   :class:`ToolBundle` 最小工具声明契约；definition / bundle 只能投影为
   ``ToolSchema`` 后进入 Engine。
+- :class:`ToolExecutionMode` / :data:`ToolExecutionCapability` 及其具体
+  capability 声明；只供 Host / ToolRuntime 选择执行边界，不进入
+  LLM-facing schema。
+- process-backed 工具子进程结果信封常量、构造 helper 与 parser；只供 Host
+  parser 与具体工具实现共享，不进入 LLM-facing tool schema。
 - :class:`ToolBundleSourceKind` / :class:`ToolBundleSourceRef` 工具 bundle
   来源引用契约。
 
@@ -51,6 +56,32 @@ from dayu.contracts.tool_declaration import (
     ToolDefinition,
     ToolDisplayInfo,
     tool,
+)
+from dayu.contracts.tool_execution import (
+    AsyncDirectToolExecutionCapability,
+    PROCESS_TOOL_ENVELOPE_COMPLETED_STATUS,
+    PROCESS_TOOL_ENVELOPE_COMPLETED_VALUE_FIELD,
+    PROCESS_TOOL_ENVELOPE_FAILED_ERROR_TYPE_FIELD,
+    PROCESS_TOOL_ENVELOPE_FAILED_HINT_FIELD,
+    PROCESS_TOOL_ENVELOPE_FAILED_MESSAGE_FIELD,
+    PROCESS_TOOL_ENVELOPE_FAILED_STATUS,
+    PROCESS_TOOL_ENVELOPE_RESERVED_STATUSES,
+    PROCESS_TOOL_ENVELOPE_STATUS_FIELD,
+    ProcessBackedToolContext,
+    ProcessBackedToolExecutionCapability,
+    ProcessBackedToolTarget,
+    ProcessBackedToolTargetFactory,
+    ProcessToolCompletedEnvelope,
+    ProcessToolEnvelopeParseResult,
+    ProcessToolFailedEnvelope,
+    ProcessToolMalformedEnvelope,
+    ProcessToolUnsupportedEnvelope,
+    ThreadBackedToolExecutionCapability,
+    ToolExecutionCapability,
+    ToolExecutionMode,
+    parse_process_tool_envelope,
+    process_tool_completed_envelope,
+    process_tool_failed_envelope,
 )
 from dayu.contracts.tool_executor import ToolExecutor
 from dayu.contracts.tool_outcome import (
@@ -85,6 +116,7 @@ from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 
 __all__ = [
     "ALLOWED_TOOL_CANCELLED_REASONS",
+    "AsyncDirectToolExecutionCapability",
     "BatchToolExecutionContext",
     "BatchToolExecutionOutcome",
     "BatchToolExecutionRecord",
@@ -92,6 +124,14 @@ __all__ = [
     "CancellationToken",
     "GeminiToolCallState",
     "JsonValue",
+    "PROCESS_TOOL_ENVELOPE_COMPLETED_STATUS",
+    "PROCESS_TOOL_ENVELOPE_COMPLETED_VALUE_FIELD",
+    "PROCESS_TOOL_ENVELOPE_FAILED_ERROR_TYPE_FIELD",
+    "PROCESS_TOOL_ENVELOPE_FAILED_HINT_FIELD",
+    "PROCESS_TOOL_ENVELOPE_FAILED_MESSAGE_FIELD",
+    "PROCESS_TOOL_ENVELOPE_FAILED_STATUS",
+    "PROCESS_TOOL_ENVELOPE_RESERVED_STATUSES",
+    "PROCESS_TOOL_ENVELOPE_STATUS_FIELD",
     "TOOL_CANCELLED_REASON_APPROVAL_DENIED",
     "TOOL_CANCELLED_REASON_HOST_CANCELLED",
     "TOOL_CANCELLED_REASON_TIMEOUT",
@@ -110,11 +150,22 @@ __all__ = [
     "ToolCompletedOutcome",
     "ToolDefinition",
     "ToolDisplayInfo",
+    "ToolExecutionCapability",
+    "ToolExecutionMode",
     "ToolExecutionOutcome",
     "ToolExecutor",
     "ToolFailedOutcome",
     "ToolFunctionSchema",
     "ToolParametersSchema",
+    "ProcessBackedToolContext",
+    "ProcessBackedToolExecutionCapability",
+    "ProcessBackedToolTarget",
+    "ProcessBackedToolTargetFactory",
+    "ProcessToolCompletedEnvelope",
+    "ProcessToolEnvelopeParseResult",
+    "ProcessToolFailedEnvelope",
+    "ProcessToolMalformedEnvelope",
+    "ProcessToolUnsupportedEnvelope",
     "ToolResultEnvelope",
     "ToolResultFailure",
     "ToolResultMeta",
@@ -122,6 +173,10 @@ __all__ = [
     "ToolSchema",
     "ToolTruncateSpec",
     "ToolTruncationStrategy",
+    "ThreadBackedToolExecutionCapability",
+    "parse_process_tool_envelope",
+    "process_tool_completed_envelope",
+    "process_tool_failed_envelope",
     "tool",
     "truncate_limit_key_for_strategy",
 ]

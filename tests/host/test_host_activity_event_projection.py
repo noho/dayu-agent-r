@@ -17,6 +17,7 @@ from dayu.contracts.tool_declaration import (
     ToolDefinition,
     ToolDisplayInfo,
 )
+from dayu.contracts.tool_execution import AsyncDirectToolExecutionCapability
 from dayu.contracts.tool_outcome import ToolExecutionOutcome
 from dayu.contracts.tool_schema import (
     ToolFunctionSchema,
@@ -1125,6 +1126,7 @@ def _definition(name: str, *, display_name: str | None) -> ToolDefinition:
             ),
         ),
         callable=_Tool(),
+        execution=AsyncDirectToolExecutionCapability(),
         truncate=None,
         display=None if display_name is None else ToolDisplayInfo(name=display_name),
         tags=(),

@@ -45,10 +45,12 @@ def discover_tools(spec: ToolsDiscoveryProviderSpec) -> ToolsDiscoveryProviderOu
     limits = _parse_limits(spec.config)
     workspace_root = parse_fins_workspace_root_config(spec.config)
     runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
-    read_runtime = runtime.get_read_runtime(
-        processor_cache_max_entries=limits.processor_cache_max_entries
+    read_runtime = runtime.get_read_runtime(processor_cache_max_entries=limits.processor_cache_max_entries)
+    definitions = build_fins_read_tool_definitions(
+        read_runtime=read_runtime,
+        workspace_root=workspace_root,
+        limits=limits,
     )
-    definitions = build_fins_read_tool_definitions(read_runtime=read_runtime, limits=limits)
     _validate_fins_definitions(definitions)
     return ToolsDiscoveryProviderOutput(
         provider_id=_PROVIDER_ID,

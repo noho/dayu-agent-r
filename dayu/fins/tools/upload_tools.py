@@ -16,6 +16,7 @@ from typing import Final, Literal, TypeAlias
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import BatchToolExecutionContext, ToolCallRequest
 from dayu.contracts.tool_declaration import ToolDefinition, ToolDisplayInfo
+from dayu.contracts.tool_execution import AsyncDirectToolExecutionCapability
 from dayu.contracts.tool_outcome import (
     TOOL_CANCELLED_REASON_HOST_CANCELLED,
     ToolCancelledOutcome,
@@ -160,6 +161,7 @@ def build_fins_upload_tool(runtime: FinsIngestionRuntime) -> ToolDefinition:
             ),
         ),
         callable=FinsUploadToolCallable(runtime=runtime),
+        execution=AsyncDirectToolExecutionCapability(),
         truncate=None,
         display=ToolDisplayInfo(name="Start Fins Upload"),
         tags=("fins", "fins-upload"),

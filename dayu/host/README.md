@@ -29,6 +29,7 @@ Dayu 是生产级通用 Agent，具备买方财报分析能力，核心范式是
 - Host 以 durable EventLog 与同事务状态索引作为事实真源；projection、memory、tool trace、audit、outbox 与 diagnostic 都是派生视图或观察记录。
 - 同一 Session 的 active Run 由 Host admission 约束；queued Run 是 durable state，不是内存队列。
 - Engine 只执行单次 `AgentRunRequest`，不拥有 Session / Run / Attempt 生命周期；EngineEvent 必须经 Host identity、状态与幂等校验后才能变成 Host facts。
+- 用户取消动作经 UI / Service 映射为 Host cancel command 后，Host 的公开承诺是 Codex / Claude Code 类体感：快速停止等待当前模型 / 工具执行并恢复可交互路径；旧模型输出、旧工具结果或旧 wait result 不能污染已取消 Run。该承诺不表示远端 LLM provider、外部 job 或第三方服务一定已经物理停止。
 - 工具调用只通过 Host-owned ToolRuntime 进入业务工具；工具结果、等待、截断、`fetch_more` 与重复调用治理必须经过 Host accept barrier。
 - 上下文预算和 compact 治理由 Host 负责；Engine 只在 provider 明确报告上下文溢出时发出 `context_compaction_requested`。
 - Conversation Memory 只消费 committed canonical facts 与 accepted compact 结果；assistant final answer 和普通工具证据不会自动成为 evidence-backed fact。
@@ -88,7 +89,7 @@ Host 与其它层的稳定边界如下：
 
 包根还导出函数式 command / read facade：`ensure_session`、`create_session`、`get_session`、`list_sessions`、`get_run`、`submit_followup`、`retry_run`、`replay_run`、`cancel_run`、`cancel_session_runs`、`resolve_wait`、`close_session`、`purge_session`、`report_storage_usage`、`run_storage_maintenance`。普通 Service 优先使用 `open_host` 返回的异步 handle；低层 facade 不公开 durable store 或 scheduler 作为包根公共面。
 
-`OpenHostOptions` 是 construction-time boundary，显式接收 durable SQLite 路径、artifact root、SQLite busy / retry policy、payload inline threshold、runtime lane 参数、worker factory、ordinary run baseline、tooling options、context budget policy、compactor baseline、memory projection policy、memory catch-up page size 与 truncation manager 开关。
+`OpenHostOptions` 是 construction-time boundary，显式接收 durable SQLite 路径、artifact root、SQLite busy / retry policy、payload inline threshold、runtime lane 参数、worker factory、ordinary run baseline、tooling options、context budget policy、compactor baseline、memory projection policy、memory catch-up page size 与 truncation manager 开关。process-backed 工具子进程 terminate / kill cleanup grace 属于 `HostToolingOptions.process_capsule_interrupt_policy`，不作为 `OpenHostOptions` 直接字段，也不改变 `AgentPolicy.tool_execution_timeout_seconds` 的业务执行 deadline 语义。
 
 本地执行边界由 `LocalEngineWorkerFactory`、`LocalEngineWorker` 与 `LocalWorkerHandle` 表达。Host 创建 `AttemptDispatchSnapshot` 与 `AgentRunRequest`，worker 接住后返回 handle；Host 消费 handle 的 EngineEvent stream，并在 cancel 或 shutdown 时调用 handle 的关闭 / cancel hook。
 
@@ -179,7 +180,7 @@ steered = await host.submit_followup(session.session_id, steer_request)
 
 `steered.accepted_run_id` 仍是 `target_run_id`；Host 会在该 Run 下创建新的 Attempt / execution。旧 Attempt 不会 resume；旧 active worker 若仍在运行，Host 在 commit 后只做 best-effort cancel 传播。
 
-`cancel` 是 Host durable command，不是直接杀 worker。当前 public cancel mode 只有 `GRACEFUL`：
+`cancel` 是 Host durable command。当前 public cancel mode 只有 `GRACEFUL`：
 
 ```python
 from dayu.host import CancelMode, CancelRunRequest
@@ -194,7 +195,7 @@ cancel_request = CancelRunRequest(
 cancelled = await host.cancel_run(active_run_id, cancel_request)
 ```
 
-`cancelled` 是取消 command commit 后的最新 `RunSnapshot`。对于 active Run，Host 会写入 durable cancelling / cancelled 事实，并通过 active worker registry 传播取消；已 accepted 的事实不会被撤回。每个 steer / cancel command 都必须使用自己的 `client_request_id` 作为幂等边界。
+`cancelled` 是取消 command commit 后的最新 `RunSnapshot`。对于 active Run，Host 会写入 durable cancelling / cancelled 事实，并通过 active worker registry 传播取消；Host 关闭 / 取消本地 Engine worker event stream，向 Engine 注入 cancellation token，并由 ToolRuntime 对可抢占工具执行边界执行取消 / 超时治理。每个 steer / cancel command 都必须使用自己的 `client_request_id` 作为幂等边界。
 
 ## Wait callback completion
 
@@ -238,7 +239,7 @@ Host 公共契约分为 Host 专属契约、Dayu Agent 公共契约和 Engine �
 - `OutboxTerminalItem` / `OutboxTerminalItemsBatch` / `OutboxTerminalCursor` / `OutboxProjectionStatus` / `OutboxTerminalItemState`：离线 terminal notification 读取与 drain 契约。
 - `HostApiError` / `HostApiErrorCode` / `HostApiErrorDetail`：public API 错误；错误码包括 `NOT_FOUND`、`INVALID_STATE`、`CONFLICT`、`IDEMPOTENCY_CONFLICT`、`PERMISSION_DENIED`、`UNSUPPORTED_OPERATION`、`INTERNAL_ERROR`。
 - `HostCallContext` / `OperationContext` / `AuthorizationClaim` / `HostMetadataEntry`：调用上下文、授权声明与稳定 metadata。
-- `HostToolingOptions` / `FrameworkToolName` / `FrameworkToolPolicyView`：业务 ToolBundle 与 Host framework tool 的 construction-time 输入边界。
+- `HostToolingOptions` / `FrameworkToolName` / `FrameworkToolPolicyView` / `ProcessCapsuleInterruptPolicy`：业务 ToolBundle、Host framework tool 与 process-backed capsule cleanup interrupt policy 的 construction-time 输入边界。
 - `ContextBudgetPolicy` / `MemoryProjectionPolicy`：context governance 与 conversation memory projection 的 typed policy。
 - `WaitCallbackCompletionEnvelope` / `WaitCallbackAuthInput` / `WaitCallbackAuthAccepted` / `WaitCallbackAuthRejected` / `WaitCallbackAdapterResult` / `WaitCallbackAdapterStatus`：framework-independent wait callback completion 契约。调用方在 Service/Web transport 层完成请求解析后，把强类型 envelope 交给 `DefaultWaitCallbackAdapter`；adapter 只做认证、payload digest 校验、stale / late 预分类和 `ResolveWaitRequest(source=CALLBACK)` 转换，状态迁移仍进入 Host `resolve_wait` 管线。
 - `CallbackWaitResolvePort` / `CallbackWaitResolveResult` / `WaitCallbackStateReadPort`：callback adapter 接入 command-layer wait resolve 与 wait state 预读的端口契约。command-layer 实现必须保留现有 resolve wakeup 语义：非 replay 且创建 resume dispatch 时唤醒 dispatch，replay 不重复唤醒。
@@ -368,6 +369,8 @@ EngineEvent ingest 校验 run / attempt / execution identity、当前 durable st
 ### ToolRuntime
 
 ToolRuntime 把 construction-time `HostToolingOptions` 中的业务工具 bundle 与 Host framework tools 组合成 effective tool bundle，并向 Engine 提供受治理的 `ToolExecutor`。工具结果只有通过 Host accept barrier 后才会返回给 Engine；side-effect / paid tool 必须携带工具幂等键；attempt-local duplicate governance、run-scoped truncation cursor 和 optional `fetch_more` 都在 ToolRuntime 内治理。
+
+ToolRuntime 默认从 effective `ToolDefinition.execution` 选择执行 capsule：`async_direct` 直接运行 async callable，`thread_backed` 只表示可取消 wrapper awaitable、不承诺停止 OS thread，`process_backed` 通过可序列化 target factory 构造子进程目标。process-backed 子进程只返回 `dayu.contracts` 定义的 JSON 信封，Host capsule 将 `completed` / `failed` 信封映射为工具 outcome；failed 信封的 `hint` 会映射到结构化 `ToolResultFailure.hint`，不拼入 `message`。取消和超时仍由父进程 Host 治理独占处理。execution capability 与 process-backed 信封字段不进入 Engine-facing `ToolSchema` 或 LLM-facing schema。
 
 长事务工具需要启动外部工作时，业务 callable 先返回 awaiting outcome；ToolRuntime 只在 Host awaiting accept ack 已 durable 成立后，才通过 construction-time activation registry 调用 provider 内部 activation adapter。该 adapter 不进入 Engine contract，也不暴露给 LLM-facing tool schema。
 
@@ -566,6 +569,9 @@ Admission 是所有 Run 输入的 durable 入口。它在事务内判断 Session
 - `ACCEPTED` / `QUEUED` Run 可直接写入 cancel request 与 `RUN_CANCELLED` terminal，并释放 queue promotion 资格。
 - pre-worker `STARTING` Attempt 可在 worker accept 前直接写入 Attempt / Run cancelled。
 - active `RUNNING` / `CANCELLING` Run 会写入 `RUN_CANCELLING`，commit 后通过 `ActiveWorkerRegistry` 传播 cancel；Host 注入 Engine 的 cancellation token 是主通道，`LocalWorkerHandle.on_cancel(reason)` 只是补充 hook。Host active cancel watchdog 是 accepted-cancel closeout supervisor，不提供 public post-cancel timeout budget；它可把仍未收口的 active Attempt / Run 关闭为 `CANCELLED`，并触发 queued promotion。该收口不表示底层 provider / tool 已被物理杀停。
+- active worker event stream 在取消路径上会被关闭或取消，避免 Host 继续等待旧模型流自然结束；迟到 EngineEvent 进入 Host 前必须通过 identity 与状态校验，不匹配当前 durable state 时 fail closed 为 rejected / diagnostic。
+- Doc、Fins read 与 Web blocking 工具生产路径声明为 process-backed execution；取消或超时时，ToolRuntime 父进程治理返回 `tool_runtime_cancelled` / `tool_runtime_timeout` 类结果，并对进程边界执行 terminate / kill cleanup。子进程不得返回 `awaiting`、`cancelled`、`timeout` 或 `host_cancelled` 等 Host-governed 信封；迟到工具结果不能越过 Host accept barrier。
+- WAITING Run 取消只收口 Host durable wait / Run / Attempt 事实，不在 command transaction 内等待 provider I/O；外部 lifecycle 由 wait poller / adapter best-effort 处理，迟到 wait result 不会恢复旧 Attempt。
 - `WAITING` Run 直接收口 wait 与 Run cancel，不恢复旧 Attempt。
 - `RECOVERING` Run 可在 recovery dispatch 前直接 cancel，释放 active slot。
 - 已 terminal Run 的 cancel 只记录幂等 ack 并返回当前 terminal snapshot，不改写 terminal truth。

@@ -17,6 +17,7 @@ from dayu.contracts.tool_call import (
     ToolCallRequest,
 )
 from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
+from dayu.contracts.tool_execution import AsyncDirectToolExecutionCapability
 from dayu.contracts.tool_outcome import (
     BatchToolExecutionOutcome,
     ToolAwaitingOutcome,
@@ -651,6 +652,7 @@ def _definition(callable_: _AwaitingBusinessTool) -> ToolDefinition:
             ),
         ),
         callable=callable_,
+        execution=AsyncDirectToolExecutionCapability(),
         truncate=None,
         display=None,
         tags=("test",),
