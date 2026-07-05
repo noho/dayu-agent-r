@@ -476,6 +476,14 @@ def test_web_tool_definitions_declare_process_backed_execution() -> None:
         assert isinstance(definition.execution, ProcessBackedToolExecutionCapability)
 
 
+def test_web_tools_do_not_redeclare_process_envelope_constants() -> None:
+    """Web 工具不得重新声明本地 process envelope 常量。"""
+
+    source = Path(web_tools.__file__).read_text(encoding="utf-8")
+
+    assert "_WEB_PROCESS_" not in source
+
+
 def test_web_process_target_factory_is_pickle_round_trippable() -> None:
     """Web process target factory 和 target 必须可 pickle round-trip。"""
 
@@ -567,7 +575,7 @@ def test_web_process_target_fast_search_success_path(
 
 
 def test_web_process_target_failed_json_envelope_preserves_code_and_hint() -> None:
-    """process target 参数失败时应返回 failed JSON 信封。"""
+    """process target 参数失败时应分离 failed message 与 hint。"""
 
     definition = _definitions_by_name(_discover_definitions({}))["fetch_web_page"]
 
@@ -580,7 +588,8 @@ def test_web_process_target_failed_json_envelope_preserves_code_and_hint() -> No
     assert envelope["status"] == "failed"
     assert envelope["error_type"] == "invalid_argument"
     assert "url" in str(envelope["message"])
-    assert "Hint:" in str(envelope["message"])
+    assert "Hint:" not in str(envelope["message"])
+    assert envelope["hint"] == "Add required fields and retry: url."
 
 
 @pytest.mark.parametrize("tool_name", _WEB_TOOL_NAMES)

@@ -32,6 +32,8 @@ from dayu.contracts import (
     ToolFunctionSchema,
     ToolParametersSchema,
     ToolSchema,
+    process_tool_completed_envelope,
+    process_tool_failed_envelope,
 )
 from dayu.contracts.tool_schema import ToolTruncateSpec, ToolTruncationStrategy
 from dayu.documents.processors._doc_processor_factory import create_doc_file_processor
@@ -74,12 +76,6 @@ _READ_FILE_ENCODINGS: Final[tuple[str, ...]] = ("utf-8", "gbk", "latin1", "cp125
 _READ_LINES_ENCODINGS: Final[tuple[str, ...]] = ("utf-8", "gbk")
 _MARKDOWN_SUFFIXES: Final[frozenset[str]] = frozenset({".md", ".markdown"})
 _DOC_LOOP_CANCELLATION_CHECK_INTERVAL: Final[int] = 1_000
-_DOC_PROCESS_STATUS_FIELD: Final[str] = "status"
-_DOC_PROCESS_COMPLETED_STATUS: Final[str] = "completed"
-_DOC_PROCESS_FAILED_STATUS: Final[str] = "failed"
-_DOC_PROCESS_VALUE_FIELD: Final[str] = "value"
-_DOC_PROCESS_ERROR_TYPE_FIELD: Final[str] = "error_type"
-_DOC_PROCESS_MESSAGE_FIELD: Final[str] = "message"
 
 
 @dataclass(frozen=True, slots=True)
@@ -382,15 +378,11 @@ class _DocProcessTarget:
         except _DocBusinessFailure as failure:
             return _process_failed_envelope(failure)
         except Exception:
-            return {
-                _DOC_PROCESS_STATUS_FIELD: _DOC_PROCESS_FAILED_STATUS,
-                _DOC_PROCESS_ERROR_TYPE_FIELD: "execution_error",
-                _DOC_PROCESS_MESSAGE_FIELD: f"Tool {self.tool_name!r} execution failed.",
-            }
-        return {
-            _DOC_PROCESS_STATUS_FIELD: _DOC_PROCESS_COMPLETED_STATUS,
-            _DOC_PROCESS_VALUE_FIELD: value,
-        }
+            return process_tool_failed_envelope(
+                error_type="execution_error",
+                message=f"Tool {self.tool_name!r} execution failed.",
+            )
+        return process_tool_completed_envelope(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1214,33 +1206,11 @@ def _process_failed_envelope(failure: _DocBusinessFailure) -> JsonValue:
         无。
     """
 
-    return {
-        _DOC_PROCESS_STATUS_FIELD: _DOC_PROCESS_FAILED_STATUS,
-        _DOC_PROCESS_ERROR_TYPE_FIELD: failure.error,
-        _DOC_PROCESS_MESSAGE_FIELD: _process_failure_message(failure),
-    }
-
-
-def _process_failure_message(failure: _DocBusinessFailure) -> str:
-    """生成 process-backed failed 信封消息。
-
-    当前 Host process envelope 契约没有独立 hint 字段，因此这里把 hint 附在
-    message 内，避免生产 process-backed 路径丢失恢复提示，同时不修改 Host
-    public contract 或 runtime JSON 契约。
-
-    Args:
-        failure: 同步业务失败。
-
-    Returns:
-        非空失败消息。
-
-    Raises:
-        无。
-    """
-
-    if failure.hint is None or failure.hint.strip() == "":
-        return failure.message
-    return f"{failure.message} Hint: {failure.hint}"
+    return process_tool_failed_envelope(
+        error_type=failure.error,
+        message=failure.message,
+        hint=failure.hint,
+    )
 
 
 def _project_doc_paths(

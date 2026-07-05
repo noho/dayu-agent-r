@@ -280,6 +280,14 @@ def test_all_doc_tool_definitions_declare_process_backed_execution(tmp_path: Pat
         assert isinstance(definition.execution, ProcessBackedToolExecutionCapability)
 
 
+def test_doc_tools_do_not_redeclare_process_envelope_constants() -> None:
+    """Doc 工具不得重新声明本地 process envelope 常量。"""
+
+    source = Path(doc_tools.__file__).read_text(encoding="utf-8")
+
+    assert "_DOC_PROCESS_" not in source
+
+
 @pytest.mark.parametrize("tool_name", _DOC_TOOL_NAMES)
 def test_doc_process_target_factory_is_pickle_round_trippable(
     tmp_path: Path,
@@ -386,13 +394,14 @@ def test_doc_process_target_nonexistent_allowed_path_keeps_file_not_found(
     assert isinstance(envelope, Mapping)
     assert envelope["status"] == "failed"
     assert envelope["error_type"] == "file_not_found"
-    assert "Verify the file path and retry." in str(envelope["message"])
+    assert "Verify the file path and retry." not in str(envelope["message"])
+    assert envelope["hint"] == "Verify the file path and retry."
 
 
-def test_doc_process_target_argument_validation_failure_embeds_hint(
+def test_doc_process_target_argument_validation_failure_separates_hint(
     tmp_path: Path,
 ) -> None:
-    """process target 参数校验失败时 failed message 必须保留原 hint 文本。"""
+    """process target 参数校验失败时 message 与 hint 必须分离。"""
 
     definition = _definitions_by_name(_discover_definitions(tmp_path))["read_file"]
 
@@ -404,7 +413,8 @@ def test_doc_process_target_argument_validation_failure_embeds_hint(
     assert isinstance(envelope, Mapping)
     assert envelope["status"] == "failed"
     assert envelope["error_type"] == "invalid_argument"
-    assert "Add required fields and retry: file_path." in str(envelope["message"])
+    assert "Hint:" not in str(envelope["message"])
+    assert envelope["hint"] == "Add required fields and retry: file_path."
 
 
 @pytest.mark.parametrize("tool_name", _DOC_TOOL_NAMES)

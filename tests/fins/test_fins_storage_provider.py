@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import io
+import json
 import pickle
 import time
 from collections.abc import Mapping
@@ -103,6 +104,14 @@ _FINS_READ_TOOL_NAMES = (
 _FINANCIAL_HTML_DOCUMENT_ID: Final[str] = "aapl-html-2024-10k"
 _FINANCIAL_HTML_PRIMARY_DOCUMENT: Final[str] = "aapl-html-2024-10k.html"
 _INCOME_STATEMENT_TYPE: Final[str] = "income"
+_AAPL_XBRL_FIXTURE_DIR: Final[Path] = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "aapl_xbrl"
+    / "fil_0000320193-24-000123"
+)
+_AAPL_XBRL_DOCUMENT_ID: Final[str] = "fil_0000320193-24-000123"
+_AAPL_XBRL_VERIFIED_CONCEPT: Final[str] = "NetIncomeLoss"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _FINS_WAIT_ADAPTER_PATH = (_REPO_ROOT / "dayu" / "fins" / "ingestion" / "wait_adapter.py").resolve(strict=False)
 _FINS_DEFAULT_FORBIDDEN_IMPORT_ROOTS = ("dayu.engine", "dayu.host", "dayu.service", "dayu.ui")
@@ -739,6 +748,14 @@ def test_fins_read_definitions_declare_process_backed_execution(tmp_path: Path) 
         assert isinstance(definition.execution, ProcessBackedToolExecutionCapability)
 
 
+def test_fins_tools_do_not_redeclare_process_envelope_constants() -> None:
+    """Fins 工具不得重新声明本地 process envelope 常量。"""
+
+    source = Path("dayu/fins/tools/fins_tools.py").read_text(encoding="utf-8")
+
+    assert "_FINS_PROCESS_" not in source
+
+
 def test_fins_read_process_target_factory_pickle_round_trip(tmp_path: Path) -> None:
     """Fins read process target factory / target 必须可 pickle 且不携带运行时对象。"""
 
@@ -821,7 +838,7 @@ def test_fins_read_process_target_processor_and_table_paths(tmp_path: Path) -> N
 
 
 def test_fins_read_process_target_failure_envelope(tmp_path: Path) -> None:
-    """process target 参数失败应返回 failed JSON 信封而不是 Host-governed 状态。"""
+    """process target 参数失败应分离 failed message 与 hint。"""
 
     workspace_root = _build_fins_workspace(tmp_path)
     target = _build_process_target(workspace_root, "list_documents", {})
@@ -831,6 +848,8 @@ def test_fins_read_process_target_failure_envelope(tmp_path: Path) -> None:
     assert isinstance(envelope, Mapping)
     assert envelope.get("status") == "failed"
     assert envelope.get("error_type") == "invalid_argument"
+    assert "Hint:" not in str(envelope.get("message"))
+    assert envelope.get("hint") == "Add required fields and retry: ticker."
     assert "host_cancelled" not in envelope.values()
     assert "cancelled" not in envelope.values()
     assert "timeout" not in envelope.values()
@@ -879,6 +898,35 @@ def test_fins_read_financial_statement_runs_in_spawned_child(tmp_path: Path) -> 
     assert isinstance(value.get("rows"), list)
     assert "supported" not in value
     assert "error" not in value
+
+
+def test_fins_read_aapl_xbrl_query_runs_in_spawned_child(tmp_path: Path) -> None:
+    """真实 AAPL XBRL fixture 应可通过 spawned child 查询稳定 fact。"""
+
+    workspace_root = _build_fins_aapl_xbrl_workspace(tmp_path)
+    target = _build_process_target(
+        workspace_root,
+        "query_xbrl_facts",
+        {
+            "ticker": "AAPL",
+            "document_id": _AAPL_XBRL_DOCUMENT_ID,
+            "concepts": [_AAPL_XBRL_VERIFIED_CONCEPT],
+        },
+    )
+
+    outcome = asyncio.run(_run_process_capsule(target))
+
+    assert isinstance(outcome, ToolCompletedOutcome)
+    value = outcome.result.value
+    assert isinstance(value, Mapping)
+    facts = value.get("facts")
+    assert isinstance(facts, list)
+    concept_names = {
+        _xbrl_fact_concept_local_name(fact)
+        for fact in facts
+        if isinstance(fact, Mapping)
+    }
+    assert _AAPL_XBRL_VERIFIED_CONCEPT in concept_names
 
 
 def test_fins_read_process_backed_cancel_drops_late_result(tmp_path: Path) -> None:
@@ -1576,6 +1624,197 @@ def _build_fins_financial_html_workspace(tmp_path: Path) -> Path:
         batching_repository.rollback_batch(token)
         raise
     return workspace_root
+
+
+def _build_fins_aapl_xbrl_workspace(tmp_path: Path) -> Path:
+    """构造包含真实 AAPL XBRL fixture 的 Fins 工作区。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        Fins workspace root。
+
+    Raises:
+        OSError: fixture 读取或仓储写入失败时抛出。
+        AssertionError: fixture 元数据缺少仓储必填字段时抛出。
+    """
+
+    workspace_root = tmp_path / "fins-aapl-xbrl-workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    company_repository = FsCompanyMetaRepository(workspace_root, repository_set=repository_set)
+    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    meta = _aapl_xbrl_fixture_meta()
+    internal_document_id = _fixture_meta_text(meta, "internal_document_id")
+    form_type = _fixture_meta_text(meta, "form_type")
+    primary_document = _fixture_meta_text(meta, "primary_document")
+    source_meta = _source_meta_without_files(meta)
+    token = batching_repository.begin_batch("AAPL")
+    try:
+        company_repository.upsert_company_meta(
+            CompanyMeta(
+                company_id="0000320193",
+                company_name="Apple Inc.",
+                ticker="AAPL",
+                market="US",
+                resolver_version="test",
+                updated_at=now_iso8601(),
+                ticker_aliases=["APPLE"],
+            )
+        )
+        source_repository.create_source_document(
+            SourceDocumentUpsertRequest(
+                ticker="AAPL",
+                document_id=_AAPL_XBRL_DOCUMENT_ID,
+                internal_document_id=internal_document_id,
+                form_type=form_type,
+                primary_document=primary_document,
+                meta=source_meta,
+            ),
+            SourceKind.FILING,
+        )
+        handle = source_repository.get_source_handle(
+            "AAPL",
+            _AAPL_XBRL_DOCUMENT_ID,
+            SourceKind.FILING,
+        )
+        file_metas = []
+        for file_path in _aapl_xbrl_fixture_files():
+            with file_path.open("rb") as stream:
+                file_metas.append(
+                    blob_repository.store_file(
+                        handle,
+                        file_path.name,
+                        stream,
+                        content_type=_fixture_content_type(file_path),
+                    )
+                )
+        source_repository.update_source_document(
+            SourceDocumentUpsertRequest(
+                ticker="AAPL",
+                document_id=_AAPL_XBRL_DOCUMENT_ID,
+                internal_document_id=internal_document_id,
+                form_type=form_type,
+                primary_document=primary_document,
+                meta=source_meta,
+                files=file_metas,
+            ),
+            SourceKind.FILING,
+        )
+        batching_repository.commit_batch(token)
+    except Exception:
+        batching_repository.rollback_batch(token)
+        raise
+    return workspace_root
+
+
+def _aapl_xbrl_fixture_meta() -> Mapping[str, JsonValue]:
+    """读取 AAPL XBRL fixture 的 meta.json。
+
+    Returns:
+        JSON object 形态的 fixture 元数据。
+
+    Raises:
+        OSError: fixture 文件读取失败时抛出。
+        AssertionError: meta.json 不是 JSON object 时抛出。
+    """
+
+    parsed = json.loads((_AAPL_XBRL_FIXTURE_DIR / "meta.json").read_text(encoding="utf-8"))
+    assert isinstance(parsed, Mapping)
+    return cast(Mapping[str, JsonValue], parsed)
+
+
+def _fixture_meta_text(meta: Mapping[str, JsonValue], key: str) -> str:
+    """从 fixture meta 中读取必填文本字段。
+
+    Args:
+        meta: fixture 元数据。
+        key: 字段名。
+
+    Returns:
+        字段文本。
+
+    Raises:
+        AssertionError: 字段缺失或不是文本时抛出。
+    """
+
+    value = meta.get(key)
+    assert isinstance(value, str)
+    return value
+
+
+def _source_meta_without_files(meta: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
+    """返回去掉 files 列表后的 source meta。
+
+    Args:
+        meta: fixture 元数据。
+
+    Returns:
+        可写入仓储的 source meta。
+
+    Raises:
+        无。
+    """
+
+    return {key: value for key, value in meta.items() if key != "files"}
+
+
+def _aapl_xbrl_fixture_files() -> tuple[Path, ...]:
+    """列出 AAPL XBRL fixture 的业务文件。
+
+    Returns:
+        不包含 meta.json 的 fixture 文件路径。
+
+    Raises:
+        OSError: 目录遍历失败时抛出。
+    """
+
+    return tuple(
+        file_path
+        for file_path in sorted(_AAPL_XBRL_FIXTURE_DIR.iterdir())
+        if file_path.is_file() and file_path.name != "meta.json"
+    )
+
+
+def _fixture_content_type(file_path: Path) -> str | None:
+    """按 fixture 文件后缀返回最小 content type。
+
+    Args:
+        file_path: fixture 文件路径。
+
+    Returns:
+        content type；未知后缀返回 ``None``。
+
+    Raises:
+        无。
+    """
+
+    if file_path.suffix in {".htm", ".html"}:
+        return "text/html"
+    if file_path.suffix in {".xml", ".xsd"}:
+        return "application/xml"
+    return None
+
+
+def _xbrl_fact_concept_local_name(fact: Mapping[str, JsonValue]) -> str:
+    """提取 fact concept 的本地名。
+
+    Args:
+        fact: XBRL fact 载荷。
+
+    Returns:
+        去掉 taxonomy 前缀后的 concept 名；缺失时返回空字符串。
+
+    Raises:
+        无。
+    """
+
+    concept = fact.get("concept")
+    if not isinstance(concept, str):
+        return ""
+    return concept.rsplit(":", maxsplit=1)[-1]
 
 
 def _fixture_markdown() -> str:

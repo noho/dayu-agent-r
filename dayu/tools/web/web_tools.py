@@ -45,6 +45,8 @@ from dayu.contracts.tool_call import BatchToolExecutionContext, ToolCallRequest
 from dayu.contracts.tool_execution import (
     ProcessBackedToolContext,
     ProcessBackedToolExecutionCapability,
+    process_tool_completed_envelope,
+    process_tool_failed_envelope,
 )
 from dayu.contracts.tool_declaration import ToolDefinition, tool
 from dayu.contracts.tool_outcome import ToolExecutionOutcome
@@ -161,12 +163,6 @@ _SEARCH_PROVIDER_UNAVAILABLE_HINT: Final[str] = (
 )
 _WEB_SEARCH_CANCELLED_MESSAGE: Final[str] = "网页搜索工具调用已被宿主取消。"
 _WEB_FETCH_CANCELLED_MESSAGE: Final[str] = "网页抓取工具调用已被宿主取消。"
-_WEB_PROCESS_STATUS_FIELD: Final[str] = "status"
-_WEB_PROCESS_COMPLETED_STATUS: Final[str] = "completed"
-_WEB_PROCESS_FAILED_STATUS: Final[str] = "failed"
-_WEB_PROCESS_VALUE_FIELD: Final[str] = "value"
-_WEB_PROCESS_ERROR_TYPE_FIELD: Final[str] = "error_type"
-_WEB_PROCESS_MESSAGE_FIELD: Final[str] = "message"
 
 
 WebPayload: TypeAlias = dict[str, JsonValue]
@@ -513,15 +509,11 @@ class _WebProcessTarget:
                 hint="Parent ToolRuntime owns cancellation and timeout closeout.",
             )
         except Exception:
-            return {
-                _WEB_PROCESS_STATUS_FIELD: _WEB_PROCESS_FAILED_STATUS,
-                _WEB_PROCESS_ERROR_TYPE_FIELD: "execution_error",
-                _WEB_PROCESS_MESSAGE_FIELD: f"Tool {self.tool_name!r} execution failed.",
-            }
-        return {
-            _WEB_PROCESS_STATUS_FIELD: _WEB_PROCESS_COMPLETED_STATUS,
-            _WEB_PROCESS_VALUE_FIELD: value,
-        }
+            return process_tool_failed_envelope(
+                error_type="execution_error",
+                message=f"Tool {self.tool_name!r} execution failed.",
+            )
+        return process_tool_completed_envelope(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1638,12 +1630,8 @@ def _web_process_failed_envelope(
     error_type: str,
     message: str,
     hint: str | None,
-) -> WebPayload:
+) -> JsonValue:
     """构造 Web process-backed failed JSON 信封。
-
-    当前 Host process envelope 契约只消费 ``error_type`` 与 ``message``，
-    不消费独立 ``hint`` 字段；因此这里把 hint 合入 message，避免改变
-    ``dayu.runtime.interruptible_process`` 与 Host capsule 契约。
 
     Args:
         error_type: 工具失败错误码。
@@ -1657,15 +1645,11 @@ def _web_process_failed_envelope(
         无。
     """
 
-    message_text = message.strip() or "Tool execution failed."
-    hint_text = (hint or "").strip()
-    if hint_text:
-        message_text = f"{message_text} Hint: {hint_text}"
-    return {
-        _WEB_PROCESS_STATUS_FIELD: _WEB_PROCESS_FAILED_STATUS,
-        _WEB_PROCESS_ERROR_TYPE_FIELD: error_type.strip() or "execution_error",
-        _WEB_PROCESS_MESSAGE_FIELD: message_text,
-    }
+    return process_tool_failed_envelope(
+        error_type=error_type.strip() or "execution_error",
+        message=message.strip() or "Tool execution failed.",
+        hint=hint,
+    )
 
 
 def _validation_failed_outcome(

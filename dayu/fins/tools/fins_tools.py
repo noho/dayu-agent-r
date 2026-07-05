@@ -22,6 +22,8 @@ from dayu.contracts.tool_declaration import ToolDefinition, tool
 from dayu.contracts.tool_execution import (
     ProcessBackedToolContext,
     ProcessBackedToolExecutionCapability,
+    process_tool_completed_envelope,
+    process_tool_failed_envelope,
 )
 from dayu.contracts.tool_outcome import ToolExecutionOutcome
 from dayu.contracts.tool_schema import (
@@ -76,12 +78,6 @@ _INVALID_ARGUMENT_HINT: Final[str] = "Fix arguments to match the tool schema and
 _FILE_NOT_FOUND_HINT: Final[str] = "Verify the ticker, document_id, ref, or table_ref and retry."
 _UNEXPECTED_FAILURE_HINT: Final[str] = "Inspect provider diagnostics or retry with narrower arguments."
 _FINS_CANCELLED_HINT: Final[str] = "当前工具调用已停止；等待新的用户指令或后续调度。"
-_FINS_PROCESS_STATUS_FIELD: Final[str] = "status"
-_FINS_PROCESS_COMPLETED_STATUS: Final[str] = "completed"
-_FINS_PROCESS_FAILED_STATUS: Final[str] = "failed"
-_FINS_PROCESS_VALUE_FIELD: Final[str] = "value"
-_FINS_PROCESS_ERROR_TYPE_FIELD: Final[str] = "error_type"
-_FINS_PROCESS_MESSAGE_FIELD: Final[str] = "message"
 
 _BusinessCall = Callable[[CancellationToken], JsonValue]
 
@@ -282,17 +278,12 @@ class _FinsReadProcessTarget:
         except _FinsReadBusinessFailure as failure:
             return _process_failed_envelope(failure)
         except Exception:
-            return {
-                _FINS_PROCESS_STATUS_FIELD: _FINS_PROCESS_FAILED_STATUS,
-                _FINS_PROCESS_ERROR_TYPE_FIELD: "execution_error",
-                _FINS_PROCESS_MESSAGE_FIELD: (
-                    f"Tool {self.tool_name!r} execution failed. Hint: {_UNEXPECTED_FAILURE_HINT}"
-                ),
-            }
-        return {
-            _FINS_PROCESS_STATUS_FIELD: _FINS_PROCESS_COMPLETED_STATUS,
-            _FINS_PROCESS_VALUE_FIELD: value,
-        }
+            return process_tool_failed_envelope(
+                error_type="execution_error",
+                message=f"Tool {self.tool_name!r} execution failed.",
+                hint=_UNEXPECTED_FAILURE_HINT,
+            )
+        return process_tool_completed_envelope(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1328,33 +1319,11 @@ def _process_failed_envelope(failure: _FinsReadBusinessFailure) -> JsonValue:
         无。
     """
 
-    return {
-        _FINS_PROCESS_STATUS_FIELD: _FINS_PROCESS_FAILED_STATUS,
-        _FINS_PROCESS_ERROR_TYPE_FIELD: failure.error,
-        _FINS_PROCESS_MESSAGE_FIELD: _process_failure_message(failure),
-    }
-
-
-def _process_failure_message(failure: _FinsReadBusinessFailure) -> str:
-    """生成 process-backed failed 信封消息。
-
-    Host process envelope 当前没有独立 hint 字段，因此把 hint 附在 message
-    内，避免 process-backed 生产路径丢失恢复提示，同时不修改 Host public
-    contract 或 runtime JSON 契约。
-
-    Args:
-        failure: 同步业务失败。
-
-    Returns:
-        非空失败消息。
-
-    Raises:
-        无。
-    """
-
-    if failure.hint is None or failure.hint.strip() == "":
-        return failure.message
-    return f"{failure.message} Hint: {failure.hint}"
+    return process_tool_failed_envelope(
+        error_type=failure.error,
+        message=failure.message,
+        hint=failure.hint,
+    )
 
 
 def _search_document_business(
