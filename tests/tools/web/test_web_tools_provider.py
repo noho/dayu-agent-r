@@ -4,13 +4,20 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import logging
+import multiprocessing
+import os
 import pickle
+import signal
 import socket
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from multiprocessing.process import BaseProcess
 from pathlib import Path
 from typing import ParamSpec, TypeVar, cast
 
@@ -50,6 +57,7 @@ from dayu.host.tool_runtime import (
     ToolRuntimeHandle,
 )
 from dayu.host.tooling import default_framework_tool_policy_view
+from dayu.runtime.interruptible_process import ProcessGroupCleanupReason
 from dayu.runtime.tools_discovery import (
     PythonImportPathProvider,
     ToolsDiscovery,
@@ -74,6 +82,8 @@ _FORBIDDEN_CANCEL_MESSAGE_PARTS = (
 )
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
+_LIVE_BROWSER_CLEANUP_SMOKE_ENV = "DAYU_RUN_LIVE_BROWSER_CLEANUP_SMOKE"
+_PROCESS_DESCENDANT_WAIT_SECONDS = 3.0
 _FORBIDDEN_IMPORTS = (
     "dayu.engine.tool_registry",
     "dayu.engine.truncation_manager",
@@ -336,6 +346,91 @@ class _SocketWebServer:
             connection.sendall(header + body)
         except OSError:
             return
+
+
+@dataclass(frozen=True, slots=True)
+class _SyntheticNestedPlaywrightWorker:
+    """测试用可 pickle Playwright worker，负责启动 synthetic nested child。"""
+
+    def __call__(
+        self,
+        *,
+        url: str,
+        timeout_seconds: float,
+        headers: Mapping[str, str] | None = None,
+        playwright_channel: str | None = None,
+        playwright_storage_state_path: str = "",
+    ) -> web_playwright_backend.WebPayload:
+        """启动长生命周期 nested child 后保持 worker 存活。
+
+        :param url: 测试 URL。
+        :param timeout_seconds: worker 总预算。
+        :param headers: 可选请求头。
+        :param playwright_channel: 可选浏览器 channel。
+        :param playwright_storage_state_path: 用作 nested child PID 文件路径。
+        :returns: 理论成功载荷；测试会在返回前中断 worker。
+        :raises RuntimeError: PID 文件路径为空时抛出。
+        """
+
+        del url, timeout_seconds, headers, playwright_channel
+        if not playwright_storage_state_path:
+            raise RuntimeError("synthetic nested child pid path is required")
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import time\n"
+                "time.sleep(60)\n",
+            ],
+        )
+        Path(playwright_storage_state_path).write_text(
+            str(child.pid),
+            encoding="utf-8",
+        )
+        time.sleep(60)
+        return {"ok": True, "content": "unexpected synthetic result"}
+
+
+@dataclass(frozen=True, slots=True)
+class _LiveBrowserLongRunningWorker:
+    """测试用可 pickle Playwright worker，负责启动真实 Chromium 子进程。"""
+
+    def __call__(
+        self,
+        *,
+        url: str,
+        timeout_seconds: float,
+        headers: Mapping[str, str] | None = None,
+        playwright_channel: str | None = None,
+        playwright_storage_state_path: str = "",
+    ) -> web_playwright_backend.WebPayload:
+        """启动真实浏览器并保持 worker 存活。
+
+        :param url: 本地 fixture URL。
+        :param timeout_seconds: worker 总预算。
+        :param headers: 可选请求头。
+        :param playwright_channel: 可选浏览器 channel。
+        :param playwright_storage_state_path: 用作 ready marker 文件路径。
+        :returns: 理论成功载荷；测试会在返回前中断 worker。
+        :raises RuntimeError: ready marker 路径为空时抛出。
+        """
+
+        del timeout_seconds, headers, playwright_channel
+        if not playwright_storage_state_path:
+            raise RuntimeError("live browser ready marker path is required")
+        from playwright.sync_api import sync_playwright
+
+        playwright = sync_playwright().start()
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context()
+        page = context.new_page()
+        page.goto(url, wait_until="domcontentloaded", timeout=5000)
+        Path(playwright_storage_state_path).write_text("ready", encoding="utf-8")
+        time.sleep(60)
+        context.close()
+        browser.close()
+        playwright.stop()
+        return {"ok": True, "content": "unexpected live browser result"}
 
 
 def test_web_provider_discovers_search_and_fetch() -> None:
@@ -1475,6 +1570,180 @@ def test_playwright_unpicklable_worker_fails_closed(
     assert worker_calls == []
 
 
+def test_playwright_worker_process_cleanup_kills_synthetic_nested_child_on_posix(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Playwright raw worker cleanup 应通过共享 primitive 清理 synthetic nested child。"""
+
+    if os.name != "posix":
+        pytest.skip("process-group cleanup smoke only applies to POSIX")
+    caplog.set_level(logging.DEBUG, logger=web_playwright_backend.__name__)
+    pid_path = tmp_path / "synthetic-nested-child.pid"
+    worker_kwargs: web_playwright_backend._WorkerKwargs = {
+        "url": "https://example.com/synthetic",
+        "timeout_seconds": 30.0,
+        "headers": None,
+        "playwright_channel": None,
+        "playwright_storage_state_path": str(pid_path),
+    }
+    process, result_queue = _start_playwright_worker_process(
+        worker_callable=_SyntheticNestedPlaywrightWorker(),
+        worker_kwargs=worker_kwargs,
+    )
+    nested_pid: int | None = None
+    try:
+        nested_pid = _read_pid_file(pid_path, timeout_seconds=3.0)
+        assert _pid_exists(nested_pid)
+
+        started_at = time.monotonic()
+        cleanup = web_playwright_backend._terminate_playwright_process(process)
+        cleanup_elapsed_seconds = time.monotonic() - started_at
+        terminate_result = cleanup["terminate"]
+
+        assert terminate_result is not None
+        diagnostic = terminate_result.cleanup
+        if not diagnostic.group_signal_sent:
+            assert diagnostic.reason in {
+                ProcessGroupCleanupReason.UNSUPPORTED,
+                ProcessGroupCleanupReason.CHILD_PID_UNAVAILABLE,
+                ProcessGroupCleanupReason.CHILD_ALREADY_EXITED,
+                ProcessGroupCleanupReason.PGID_UNAVAILABLE,
+                ProcessGroupCleanupReason.CURRENT_PGID_UNAVAILABLE,
+                ProcessGroupCleanupReason.PARENT_PGID_UNAVAILABLE,
+                ProcessGroupCleanupReason.PGID_MATCHES_CURRENT_PROCESS_GROUP,
+                ProcessGroupCleanupReason.PGID_MATCHES_PARENT_PROCESS_GROUP,
+                ProcessGroupCleanupReason.GROUP_SIGNAL_FAILED,
+            }
+            pytest.skip(f"process-group cleanup fallback: {diagnostic.reason.value}")
+        assert diagnostic.reason is ProcessGroupCleanupReason.GROUP_SIGNALED
+        assert diagnostic.group_signal_sent is True
+        assert "reason=group_signaled" in caplog.text
+        assert "group_signal_sent=True" in caplog.text
+        assert _wait_for_pid_absent(nested_pid, timeout_seconds=1.0)
+        assert cleanup["kill"] is None
+        assert terminate_result.elapsed_seconds <= (
+            web_playwright_backend._PW_PROCESS_TERMINATE_GRACE_SECONDS
+        )
+        assert cleanup_elapsed_seconds <= (
+            web_playwright_backend._PW_PROCESS_TERMINATE_GRACE_SECONDS
+        )
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=1.0)
+        if nested_pid is not None and _pid_exists(nested_pid):
+            os.kill(nested_pid, signal.SIGKILL)
+            _wait_for_pid_absent(nested_pid, timeout_seconds=1.0)
+        result_queue.close()
+        result_queue.join_thread()
+
+
+def test_playwright_worker_process_cleanup_supports_running_event_loop(
+    tmp_path: Path,
+) -> None:
+    """Playwright cleanup 在当前线程已有 running loop 时仍应完成。"""
+
+    if os.name != "posix":
+        pytest.skip("process-group cleanup bridge smoke only applies to POSIX")
+    pid_path = tmp_path / "synthetic-nested-child-loop.pid"
+    worker_kwargs: web_playwright_backend._WorkerKwargs = {
+        "url": "https://example.com/synthetic-loop",
+        "timeout_seconds": 30.0,
+        "headers": None,
+        "playwright_channel": None,
+        "playwright_storage_state_path": str(pid_path),
+    }
+    process, result_queue = _start_playwright_worker_process(
+        worker_callable=_SyntheticNestedPlaywrightWorker(),
+        worker_kwargs=worker_kwargs,
+    )
+    nested_pid: int | None = None
+    try:
+        nested_pid = _read_pid_file(pid_path, timeout_seconds=3.0)
+        cleanup = asyncio.run(_terminate_process_inside_running_loop(process))
+        terminate_result = cleanup["terminate"]
+        assert terminate_result is not None
+        if not terminate_result.cleanup.group_signal_sent:
+            pytest.skip(
+                "process-group cleanup fallback: "
+                f"{terminate_result.cleanup.reason.value}"
+            )
+        assert terminate_result.cleanup.reason is ProcessGroupCleanupReason.GROUP_SIGNALED
+        assert _wait_for_pid_absent(nested_pid, timeout_seconds=1.0)
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=1.0)
+        if nested_pid is not None and _pid_exists(nested_pid):
+            os.kill(nested_pid, signal.SIGKILL)
+            _wait_for_pid_absent(nested_pid, timeout_seconds=1.0)
+        result_queue.close()
+        result_queue.join_thread()
+
+
+def test_playwright_live_browser_cleanup_smoke_is_manual_and_best_effort(
+    tmp_path: Path,
+) -> None:
+    """可选 live browser cleanup smoke 默认跳过，显式开启后验证 descendants。"""
+
+    if os.environ.get(_LIVE_BROWSER_CLEANUP_SMOKE_ENV) != "1":
+        pytest.skip(f"set {_LIVE_BROWSER_CLEANUP_SMOKE_ENV}=1 to run live smoke")
+    if os.name != "posix":
+        pytest.skip("live browser descendant inspection requires POSIX ps")
+    if not _live_playwright_chromium_available():
+        pytest.skip("Playwright Chromium binary is not available")
+    process_table = _process_table_from_ps()
+    if process_table is None:
+        pytest.skip("process descendant inspection via ps is unavailable")
+    server = _SocketWebServer.start(
+        response_body=(
+            b"<html><head><title>Live Browser Cleanup</title></head>"
+            b"<body>browser cleanup fixture</body></html>"
+        ),
+        max_connections=8,
+    )
+    marker_path = tmp_path / "live-browser-ready.txt"
+    worker_kwargs: web_playwright_backend._WorkerKwargs = {
+        "url": server.url,
+        "timeout_seconds": 10.0,
+        "headers": None,
+        "playwright_channel": None,
+        "playwright_storage_state_path": str(marker_path),
+    }
+    process, result_queue = _start_playwright_worker_process(
+        worker_callable=_LiveBrowserLongRunningWorker(),
+        worker_kwargs=worker_kwargs,
+    )
+    descendant_pids: set[int] = set()
+    try:
+        _wait_for_file(marker_path, timeout_seconds=10.0)
+        assert process.pid is not None
+        descendant_pids = _descendant_pids(process.pid)
+        if not descendant_pids:
+            pytest.skip("no live browser descendants were observable")
+        cleanup = web_playwright_backend._terminate_playwright_process(process)
+        terminate_result = cleanup["terminate"]
+        assert terminate_result is not None
+        if not terminate_result.cleanup.group_signal_sent:
+            pytest.skip(
+                "process-group cleanup fallback: "
+                f"{terminate_result.cleanup.reason.value}"
+            )
+        assert _wait_for_pids_absent(
+            descendant_pids,
+            timeout_seconds=_PROCESS_DESCENDANT_WAIT_SECONDS,
+        )
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=1.0)
+        _kill_remaining_pids(descendant_pids)
+        result_queue.close()
+        result_queue.join_thread()
+        server.close()
+
+
 def test_fetch_playwright_fallback_receives_channel_and_storage_state_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2015,6 +2284,220 @@ def _process_arguments_for_tool(tool_name: str) -> Mapping[str, JsonValue]:
     if tool_name == "fetch_web_page":
         return {"url": "http://127.0.0.1/page"}
     raise ValueError(f"unknown web tool: {tool_name}")
+
+
+def _start_playwright_worker_process(
+    *,
+    worker_callable: web_playwright_backend._PlaywrightWorkerProtocol,
+    worker_kwargs: web_playwright_backend._WorkerKwargs,
+) -> tuple[BaseProcess, web_playwright_backend._ResultQueueProtocol]:
+    """通过生产 Playwright worker entrypoint 启动测试 worker。
+
+    :param worker_callable: 可 pickle 的 worker callable。
+    :param worker_kwargs: worker 关键字参数。
+    :returns: 已启动进程与父进程侧结果队列。
+    """
+
+    ctx = multiprocessing.get_context("spawn")
+    result_queue = cast(
+        web_playwright_backend._ResultQueueProtocol,
+        ctx.Queue(maxsize=1),
+    )
+    process = ctx.Process(
+        target=web_playwright_backend._playwright_process_entry,
+        args=(result_queue, worker_callable, worker_kwargs),
+    )
+    process.daemon = True
+    process.start()
+    return process, result_queue
+
+
+async def _terminate_process_inside_running_loop(
+    process: BaseProcess,
+) -> web_playwright_backend._PlaywrightProcessCleanup:
+    """在已有 running event loop 的线程中调用同步 cleanup helper。
+
+    :param process: 待 cleanup 的 Playwright worker 进程。
+    :returns: cleanup 诊断。
+    """
+
+    return web_playwright_backend._terminate_playwright_process(process)
+
+
+def _live_playwright_chromium_available() -> bool:
+    """探测当前环境是否可启动 Playwright Chromium。
+
+    :returns: 可启动返回 ``True``，缺少依赖或 browser binary 时返回 ``False``。
+    """
+
+    try:
+        from playwright.sync_api import sync_playwright
+
+        playwright = sync_playwright().start()
+        browser = playwright.chromium.launch(headless=True)
+        browser.close()
+        playwright.stop()
+    except Exception:
+        return False
+    return True
+
+
+def _wait_for_file(path: Path, *, timeout_seconds: float) -> None:
+    """等待文件出现。
+
+    :param path: 待等待文件路径。
+    :param timeout_seconds: 最多等待秒数。
+    :returns: 无返回值。
+    :raises AssertionError: 超时仍未出现时抛出。
+    """
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if path.is_file():
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"file was not written: {path}")
+
+
+def _process_table_from_ps() -> dict[int, int] | None:
+    """通过 POSIX ``ps`` 读取 PID 到 PPID 的映射。
+
+    :returns: PID 到 PPID 的映射；``ps`` 不可用时返回 ``None``。
+    """
+
+    try:
+        completed = subprocess.run(
+            ["ps", "-axo", "pid=,ppid="],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    table: dict[int, int] = {}
+    for line in completed.stdout.splitlines():
+        parts = line.strip().split()
+        if len(parts) != 2:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        table[pid] = ppid
+    return table
+
+
+def _descendant_pids(root_pid: int) -> set[int]:
+    """读取某个 PID 当前可观察到的后代 PID 集合。
+
+    :param root_pid: 根进程 PID。
+    :returns: 当前进程表中可观察到的后代 PID 集合。
+    """
+
+    process_table = _process_table_from_ps()
+    if process_table is None:
+        return set()
+    children_by_parent: dict[int, set[int]] = {}
+    for pid, ppid in process_table.items():
+        children_by_parent.setdefault(ppid, set()).add(pid)
+    descendants: set[int] = set()
+    pending = list(children_by_parent.get(root_pid, set()))
+    while pending:
+        pid = pending.pop()
+        if pid in descendants:
+            continue
+        descendants.add(pid)
+        pending.extend(children_by_parent.get(pid, set()))
+    return descendants
+
+
+def _wait_for_pids_absent(pids: set[int], *, timeout_seconds: float) -> bool:
+    """等待一组 PID 全部消失。
+
+    :param pids: 待检查 PID 集合。
+    :param timeout_seconds: 最多等待秒数。
+    :returns: 全部消失返回 ``True``。
+    """
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if all(not _pid_exists(pid) for pid in pids):
+            return True
+        time.sleep(0.05)
+    return all(not _pid_exists(pid) for pid in pids)
+
+
+def _kill_remaining_pids(pids: set[int]) -> None:
+    """清理 optional live smoke 中仍可见的后代 PID。
+
+    :param pids: 待清理 PID 集合。
+    :returns: 无返回值。
+    """
+
+    for pid in pids:
+        if not _pid_exists(pid):
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            continue
+    _wait_for_pids_absent(pids, timeout_seconds=1.0)
+
+
+def _read_pid_file(path: Path, *, timeout_seconds: float) -> int:
+    """在限定时间内读取 PID 文件。
+
+    :param path: PID 文件路径。
+    :param timeout_seconds: 最多等待秒数。
+    :returns: 文件中记录的 PID。
+    :raises AssertionError: 超时仍未读到合法 PID 时抛出。
+    """
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            raw_pid = path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            time.sleep(0.02)
+            continue
+        if raw_pid:
+            return int(raw_pid)
+        time.sleep(0.02)
+    raise AssertionError(f"pid file was not written: {path}")
+
+
+def _pid_exists(pid: int) -> bool:
+    """判断 PID 是否仍存在。
+
+    :param pid: 待检查 PID。
+    :returns: PID 仍存在返回 ``True``。
+    """
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_for_pid_absent(pid: int, *, timeout_seconds: float) -> bool:
+    """等待 PID 消失。
+
+    :param pid: 待检查 PID。
+    :param timeout_seconds: 最多等待秒数。
+    :returns: PID 在时限内消失返回 ``True``。
+    """
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if not _pid_exists(pid):
+            return True
+        time.sleep(0.02)
+    return not _pid_exists(pid)
 
 
 async def _execute_web_runtime_fetch_and_cancel(

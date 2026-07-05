@@ -7,6 +7,7 @@ Playwright 回退执行逻辑，不包含 requests 主路径编排或工具注�
 from __future__ import annotations
 
 import atexit
+import asyncio
 import logging
 import math
 import multiprocessing
@@ -15,14 +16,20 @@ import pickle
 import time
 from collections.abc import Callable, Mapping
 from multiprocessing.process import BaseProcess
-from queue import Empty
-from threading import Lock
+from queue import Empty, Queue
+from threading import Lock, Thread
 from typing import Protocol, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse
 
 import requests
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
+from dayu.runtime.interruptible_process import (
+    ProcessCleanupSignal,
+    ProcessInterruptResult,
+    enter_new_process_session_if_supported,
+    interrupt_multiprocessing_process,
+)
 
 MODULE = "ENGINE.WEB_PLAYWRIGHT"
 _LOGGER = logging.getLogger(__name__)
@@ -39,6 +46,7 @@ _DEFAULT_SEC_CH_UA_MOBILE = "?0"
 _DEFAULT_SEC_CH_UA_PLATFORM = '"macOS"'
 
 WebPayload: TypeAlias = dict[str, JsonValue]
+_ProcessInterruptBridgeMessage: TypeAlias = ProcessInterruptResult | BaseException
 
 
 class _ResultQueueProtocol(Protocol):
@@ -309,6 +317,13 @@ _PW_RESULT_DRAIN_GRACE_SECONDS = 0.5
 _PW_PROCESS_TERMINATE_GRACE_SECONDS = 1.0
 
 
+class _PlaywrightProcessCleanup(TypedDict):
+    """Playwright raw worker cleanup 诊断。"""
+
+    terminate: ProcessInterruptResult | None
+    kill: ProcessInterruptResult | None
+
+
 class CancelledError(RuntimeError):
     """迁移 Playwright backend 内部取消错误。
 
@@ -390,6 +405,7 @@ def _playwright_process_entry(
         无。
     """
 
+    enter_new_process_session_if_supported()
     try:
         result_queue.put({
             "kind": "result",
@@ -415,17 +431,156 @@ def _is_picklable_worker(worker_callable: _PlaywrightWorkerProtocol) -> bool:
     return True
 
 
-def _terminate_playwright_process(process: BaseProcess) -> None:
-    """尽力终止 Playwright worker 进程。"""
+def _thread_has_running_asyncio_loop() -> bool:
+    """判断当前线程是否已经运行 asyncio event loop。
 
+    :returns: 当前线程已有 running loop 时返回 ``True``。
+    """
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+def _run_process_interrupt_in_helper_thread(
+    process: BaseProcess,
+    signal_kind: ProcessCleanupSignal,
+    grace_seconds: float,
+    result_queue: Queue[_ProcessInterruptBridgeMessage],
+) -> None:
+    """在短生命周期线程中运行 async process interrupt primitive。
+
+    :param process: 待 cleanup 的 raw multiprocessing process。
+    :param signal_kind: cleanup 信号类型。
+    :param grace_seconds: signal 后等待退出的秒数。
+    :param result_queue: 回传结果或异常的线程内队列。
+    :returns: 无返回值。
+    """
+
+    try:
+        result_queue.put(
+            asyncio.run(
+                interrupt_multiprocessing_process(
+                    process,
+                    signal_kind=signal_kind,
+                    grace_seconds=grace_seconds,
+                )
+            )
+        )
+    except BaseException as exc:
+        result_queue.put(exc)
+
+
+def _interrupt_playwright_process_sync(
+    process: BaseProcess,
+    *,
+    signal_kind: ProcessCleanupSignal,
+    grace_seconds: float,
+) -> ProcessInterruptResult:
+    """从同步 Playwright cleanup 路径调用 async runtime primitive。
+
+    当前线程没有 running loop 时直接使用 ``asyncio.run``。当前线程已经有
+    running loop 时，在短生命周期 helper thread 中运行 ``asyncio.run``，
+    避免 cleanup 路径因调用上下文变化触发 ``asyncio.run`` 的运行时限制。
+
+    :param process: 待 cleanup 的 raw multiprocessing process。
+    :param signal_kind: cleanup 信号类型。
+    :param grace_seconds: signal 后等待退出的秒数。
+    :returns: runtime primitive 返回的 interrupt 结果。
+    :raises BaseException: helper thread 中 runtime primitive 抛出的异常会原样传播。
+    """
+
+    if not _thread_has_running_asyncio_loop():
+        return asyncio.run(
+            interrupt_multiprocessing_process(
+                process,
+                signal_kind=signal_kind,
+                grace_seconds=grace_seconds,
+            )
+        )
+    result_queue: Queue[_ProcessInterruptBridgeMessage] = Queue(maxsize=1)
+    helper_thread = Thread(
+        target=_run_process_interrupt_in_helper_thread,
+        args=(process, signal_kind, grace_seconds, result_queue),
+        name="dayu-web-playwright-cleanup",
+        daemon=True,
+    )
+    helper_thread.start()
+    helper_thread.join()
+    try:
+        message = result_queue.get_nowait()
+    except Empty as exc:
+        raise RuntimeError("playwright process cleanup helper returned no result") from exc
+    if isinstance(message, BaseException):
+        raise message
+    return message
+
+
+def _log_playwright_process_cleanup_stage(
+    *,
+    stage: str,
+    result: ProcessInterruptResult | None,
+) -> None:
+    """记录 Playwright worker cleanup 诊断。
+
+    日志只包含 cleanup 诊断字段，不包含 URL、内容或 headers。
+
+    :param stage: cleanup 阶段标签。
+    :param result: runtime primitive 返回的 interrupt 结果；未执行时为 ``None``。
+    :returns: 无返回值。
+    """
+
+    if result is None:
+        return
+    diagnostic = result.cleanup
+    Log.debug(
+        "Playwright worker cleanup "
+        f"stage={stage} "
+        f"reason={diagnostic.reason.value} "
+        f"direct_signal_sent={diagnostic.direct_signal_sent} "
+        f"group_signal_sent={diagnostic.group_signal_sent} "
+        f"exited={result.exited} "
+        f"exitcode={result.exitcode} "
+        f"elapsed_seconds={result.elapsed_seconds:.6f}",
+        module=MODULE,
+    )
+
+
+def _terminate_playwright_process(process: BaseProcess) -> _PlaywrightProcessCleanup:
+    """尽力终止 Playwright worker 进程并返回 cleanup 诊断。
+
+    :param process: Playwright raw ``multiprocessing.Process`` worker。
+    :returns: terminate / kill 两阶段 cleanup 诊断；未执行的阶段为 ``None``。
+    :raises TypeError: cleanup grace 配置非法时由 runtime primitive 抛出。
+    :raises ValueError: cleanup grace 配置非法时由 runtime primitive 抛出。
+    """
+
+    cleanup: _PlaywrightProcessCleanup = {"terminate": None, "kill": None}
     if not process.is_alive():
         process.join(timeout=0)
-        return
-    process.terminate()
-    process.join(timeout=_PW_PROCESS_TERMINATE_GRACE_SECONDS)
+        return cleanup
+    cleanup["terminate"] = _interrupt_playwright_process_sync(
+        process,
+        signal_kind=ProcessCleanupSignal.TERMINATE,
+        grace_seconds=_PW_PROCESS_TERMINATE_GRACE_SECONDS,
+    )
+    _log_playwright_process_cleanup_stage(
+        stage=ProcessCleanupSignal.TERMINATE.value,
+        result=cleanup["terminate"],
+    )
     if process.is_alive():
-        process.kill()
-        process.join(timeout=_PW_PROCESS_TERMINATE_GRACE_SECONDS)
+        cleanup["kill"] = _interrupt_playwright_process_sync(
+            process,
+            signal_kind=ProcessCleanupSignal.KILL,
+            grace_seconds=_PW_PROCESS_TERMINATE_GRACE_SECONDS,
+        )
+        _log_playwright_process_cleanup_stage(
+            stage=ProcessCleanupSignal.KILL.value,
+            result=cleanup["kill"],
+        )
+    return cleanup
 
 
 def _poll_playwright_result_queue(

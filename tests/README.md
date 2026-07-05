@@ -174,7 +174,7 @@ Service composition 测试，覆盖 `dayu.service` 在 Host 外部把 runtime ty
 
 `tests/tools/fixtures/documents/` 存放工具 provider 测试使用的确定性文档 fixture。当前包含 Markdown 与 Docling JSON 样本，测试应复制到临时目录后通过 provider 白名单访问，不直接把 fixture 根作为隐式生产路径。
 
-`tests/tools/web/` 的 Web provider 测试必须保持 deterministic：搜索 provider、requests 主路径和 Playwright fallback 都通过 monkeypatch / fixture 替身控制，不做 live network 请求。
+`tests/tools/web/` 的 Web provider 测试必须保持 deterministic：搜索 provider、requests 主路径和 Playwright fallback 默认都通过 monkeypatch / fixture 替身控制，不做 live network 请求；Playwright raw worker cleanup 默认覆盖使用 synthetic nested child 验证进程组清理边界，不依赖真实浏览器 binary。显式设置 `DAYU_RUN_LIVE_BROWSER_CLEANUP_SMOKE=1` 时，才运行 optional/manual live browser cleanup smoke，并按环境能力 skip。
 Web live smoke 位于 `utils/smoke_web_ci.py`，不在默认 pytest 中运行；直接运行该脚本会启动本地 fixture server，依次覆盖 HTML requests/fetch、PDF Docling conversion、client-rendered browser fallback 与 local assembly config hard gate；local assembly config case 通过完整 `ConfigLoader.load()`、`assemble_effective_tool_provider_configs()`、`discover_service_tools()` 与 `ToolDefinition.callable` 验证 Web overlay config 和 `truncate_max_chars`。默认还会从 `utils/web_ci_urls.jsonl` 采样 2 个 external URL 作为 diagnostic-only 输入，并运行 `auto` / `tavily` / `serper` / `duckduckgo` 四个 `search_web` provider diagnostic-only cases；运行时会打印 `SMOKE ...` UI 摘要行并按 `--log-level` 输出诊断日志，默认日志级别为 `debug`，但会压低与 Web smoke 判断无关的装配、抽取库和工具内部 debug 噪音；传 `--external-limit 0` 可跳过外部 URL fetch，但 search provider diagnostics 仍默认运行。`tests/tools/web/test_smoke_web_ci.py` 只覆盖 smoke 判定、summary contract、默认 case matrix、UI/log 输出、typed `search_cases` 与 diagnostic-only 边界。
 
 ### `tests/fins/`
