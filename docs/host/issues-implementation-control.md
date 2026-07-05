@@ -155,11 +155,11 @@ git push -u github <branch>
 | 项目 | 当前值 |
 |---|---|
 | phase | Host issue-backed follow-up implementation backlog |
-| gate | accepted-plan-commit |
-| implementation status | WU-TOOLS-CANCEL-01 residual hardening reached final-closeout-pass and PR #170 was merged on 2026-07-05, closing GitHub Issue #87. Its final closeout artifact remains `docs/reviews/wu-tools-cancel-01-residual-hardening-final-closeout.md`, and final accepted commit remains `ddbcef5b`. WU-WAIT-04 goal confirmation was accepted by the user with the hard constraint that smoke can only use public contracts. Plan artifact `docs/host/wu-wait-04-production-awaiting-e2e-smoke-plan.md` received two plan review artifacts, plan fix at `docs/reviews/wu-wait-04-plan-fix-codex.md`, re-review artifacts, and final controller adjudication at `docs/reviews/wu-wait-04-plan-rereview-controller-adjudication.md`. All accepted plan review findings are fixed. |
+| gate | accepted-slice-commit |
+| implementation status | WU-TOOLS-CANCEL-01 residual hardening reached final-closeout-pass and PR #170 was merged on 2026-07-05, closing GitHub Issue #87. Its final closeout artifact remains `docs/reviews/wu-tools-cancel-01-residual-hardening-final-closeout.md`, and final accepted commit remains `ddbcef5b`. WU-WAIT-04 goal confirmation was accepted by the user with the hard constraint that smoke can only use public contracts. Plan artifact `docs/host/wu-wait-04-production-awaiting-e2e-smoke-plan.md` passed plan review / fix / re-review. Accepted plan commit is `35d947ea`. Slice S1 `Service production poller assembly gap` implementation, controller validation, code review, and controller adjudication passed with no accepted findings. |
 | active work unit | WU-WAIT-04 |
 | default next work unit | WU-WAIT-04 is the next implementation entry point after PR #170 merge. |
-| next entry point | Create accepted plan commit for WU-WAIT-04, then enter implementation Slice S1. |
+| next entry point | Create accepted slice commit for WU-WAIT-04 S1, then enter implementation Slice S2. |
 | design source | `docs/host/design.md` and `docs/engine/design.md` for Host / Engine stream terminology, CLI diagnostics, logging, and UI / Service / Host / Engine ownership boundaries. |
 | issue status comments | Active/backlog issue owners retained here: #129 / #70 / #34 / #119 / #71 / #27 / #72 / #75 / #43 / #36 / #78 / #156 / #96 / #38 / #88 / #112 / #20 / #80 / #115, plus residual-risk destinations #121 / #122. Completed WU history, draft PR closeout records, merged PR notes, and closed issue notes are archived in `docs/host/issues-implementation-control-archive.md`; #63 / #87 / #89 / #90 / #91 / #92 / #111 / #130 / #133 / #168 are no longer active implementation owners. |
 | blocking open questions | None for WU-WAIT-04 plan gate. |

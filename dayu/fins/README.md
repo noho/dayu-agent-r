@@ -165,6 +165,7 @@ Fins ingestion 通过三个独立 awaiting provider 暴露 awaiting tools：
 - `build_fins_wait_adapter_registry(workspace_root=..., tool_names=...)`
 - `FinsIngestionWaitActivationAdapter`
 - `build_fins_wait_activation_registry(runtime=..., tool_names=...)`
+- `build_fins_wait_poll_adapter_registry(runtime=..., tool_names=...)`
 
 ## 调用者装配示例
 
@@ -705,7 +706,7 @@ Direct stream 不创建 durable job record；调用方关闭 async iterator、�
 
 ### Wait adapter 与 Host resume
 
-Fins awaiting tools 不直接恢复 Host Run。Service assembly 根据启用的 Fins awaiting provider 显式构造 wait adapter registry 与 wait activation registry，并确保 awaiting tool callable 与 activation adapter 使用同一个 workspace-scoped ingestion runtime。Host poller 通过 `FinsIngestionWaitPollAdapter` 读取 process-local observation snapshot，再由 Host 自己执行 resolve / resume / failed / lost 治理。Fins wait adapter 不改变 Host wait record，不写 Host EventLog，也不恢复旧 Engine 生成器。
+Fins awaiting tools 不直接恢复 Host Run。Service assembly 根据启用的 Fins awaiting provider 显式构造 wait adapter registry、wait activation registry 与 wait poll adapter registry，并确保 awaiting tool callable、activation adapter 与 poll adapter 使用同一个 workspace-scoped ingestion runtime。Host poller 通过 `FinsIngestionWaitPollAdapter` 读取 process-local observation snapshot，再由 Host 自己执行 resolve / resume / failed / lost 治理。Fins wait adapter 不改变 Host wait record，不写 Host EventLog，也不恢复旧 Engine 生成器。
 
 ### Ticker normalization
 
