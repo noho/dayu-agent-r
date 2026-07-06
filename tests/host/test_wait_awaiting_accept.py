@@ -11,7 +11,7 @@ import pytest
 
 from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
 from dayu.host.api import AttemptStatus, EnsureSessionRequest, RunStatus, WaitAdapterKey
-from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.codec import format_utc_timestamp, sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import (
     EventClass,
@@ -42,6 +42,7 @@ from dayu.host.durable.state import (
     WaitRecordRow,
     WaitRecordStatus,
     WaitResumePolicy,
+    WaitSnapshotRef,
     WorkerKind,
     mark_dispatch_waiting_for_lane_row,
     mark_dispatching_after_lane_row,
@@ -107,6 +108,38 @@ def test_awaiting_accept_creates_wait_record_and_waiting_state(
             "ATTEMPT_SUSPENDED",
         ]
         assert all(event.event_class is EventClass.CANONICAL_FACT for event in events)
+
+
+def test_awaiting_accept_persists_complete_snapshot_ref(tmp_path: Path) -> None:
+    """awaiting accept 持久化完整 snapshot ref。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        snapshot_ref = WaitSnapshotRef(
+            snapshot_id="fins-observation-start-test",
+            captured_at=_NOW,
+            snapshot_digest=sha256_digest_json(
+                {
+                    "captured_at": format_utc_timestamp(_NOW),
+                    "snapshot_id": "fins-observation-start-test",
+                }
+            ),
+        )
+        candidate = replace(_awaiting_candidate(seeded), snapshot_ref=snapshot_ref)
+        accept_port = DefaultHostToolAwaitingAcceptPort(
+            transaction_runner=store.transaction_runner
+        )
+
+        result = accept_port.accept_tool_awaiting(candidate)
+
+        assert isinstance(result, ToolAwaitingAcceptedAck)
+        _, _, wait_record, _ = _read_state(store.transaction_runner, candidate)
+        assert wait_record is not None
+        assert wait_record.snapshot_ref == snapshot_ref
 
 
 def test_awaiting_accept_same_key_replays_existing_ack_without_duplicate_events(

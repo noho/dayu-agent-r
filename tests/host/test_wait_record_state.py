@@ -33,6 +33,7 @@ from dayu.host.durable.state import (
     deserialize_wait_poll_last_outcome,
     deserialize_wait_record_status,
     deserialize_wait_resume_policy,
+    deserialize_wait_snapshot_ref,
     insert_attempt,
     insert_run,
     insert_session,
@@ -370,6 +371,34 @@ def test_wait_record_codecs_round_trip_all_typed_fields(tmp_path: Path) -> None:
         assert row.poll_last_error_code is None
         assert row.poll_last_error_message is None
         assert row.poll_abandoned_at is None
+
+
+def test_wait_snapshot_ref_rejects_invalid_digest() -> None:
+    """WaitSnapshotRef 构造阶段拒绝无效 digest，避免把不完整引用推迟到 SQLite 才失败。
+
+    :returns: ``None``。
+    """
+
+    with pytest.raises(HostDurableError, match="snapshot_digest must be sha256 digest"):
+        WaitSnapshotRef(
+            snapshot_id="snapshot-1",
+            captured_at=_SNAPSHOT_AT,
+            snapshot_digest="not-a-digest",
+        )
+
+
+def test_deserialize_wait_snapshot_ref_rejects_missing_digest() -> None:
+    """wait snapshot 三列反序列化阶段拒绝缺失 digest 的不完整引用。
+
+    :returns: ``None``。
+    """
+
+    with pytest.raises(HostDurableError, match="snapshot ref columns must be paired"):
+        deserialize_wait_snapshot_ref(
+            "snapshot-1",
+            "2026-05-16T00:00:00.000000Z",
+            None,
+        )
 
 
 def test_wait_record_status_and_policy_codecs_are_closed() -> None:

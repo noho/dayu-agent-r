@@ -52,6 +52,7 @@ from dayu.host.durable._validation import (
     require_int as _require_int,
     require_non_empty_text as _require_non_empty_text,
     require_optional_non_empty_text as _require_optional_non_empty_text,
+    require_sha256_digest as _require_sha256_digest,
     require_text as _require_text,
 )
 from dayu.host.durable.errors import HostDurableError, HostRowDecodeError
@@ -372,18 +373,18 @@ class WaitSnapshotRef:
 
     :param snapshot_id: 快照标识。
     :param captured_at: 快照采集时间，必须为 UTC aware ``datetime``。
-    :param snapshot_digest: 快照摘要；无摘要时为 ``None``。
+    :param snapshot_digest: 快照摘要，必须是 Host durable sha256 digest。
     """
 
     snapshot_id: str
     captured_at: datetime
-    snapshot_digest: str | None
+    snapshot_digest: str
 
     def __post_init__(self) -> None:
         """校验快照引用字段。
 
         :returns: ``None``。
-        :raises HostDurableError: 快照 id 为空、超长或时间格式非法时抛出。
+        :raises HostDurableError: 快照 id 为空、超长、digest 格式无效或时间格式非法时抛出。
         """
 
         _require_text_max_length(
@@ -397,7 +398,7 @@ class WaitSnapshotRef:
             format_utc_timestamp(self.captured_at)
         except ValueError as exc:
             raise HostDurableError("snapshot_captured_at must be UTC aware") from exc
-        _require_optional_non_empty_text(self.snapshot_digest, field_name="snapshot_digest")
+        _require_sha256_digest(self.snapshot_digest, field_name="snapshot_digest")
 
 
 @dataclass(frozen=True, slots=True)
@@ -755,7 +756,7 @@ def deserialize_wait_snapshot_ref(
 
     if snapshot_id is None and captured_at is None and snapshot_digest is None:
         return None
-    if snapshot_id is None or captured_at is None:
+    if snapshot_id is None or captured_at is None or snapshot_digest is None:
         raise HostDurableError("snapshot ref columns must be paired")
     try:
         parsed = parse_utc_timestamp(captured_at)
