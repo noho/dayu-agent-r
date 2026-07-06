@@ -1276,10 +1276,7 @@ def test_fins_tool_discovery_spec_injects_runtime_workspace_root(
     :raises AssertionError: workspace root 未注入或污染 raw config 时抛出。
     """
 
-    raw_config: dict[str, JsonValue] = {
-        "workspace_root": None,
-        "limits": {},
-    }
+    raw_config: dict[str, JsonValue] = {"limits": {}}
     provider = ToolDiscoveryProviderConfig(
         provider_id="financial-read-tools",
         import_path="dayu.fins.tools.provider:discover_tools",
@@ -1297,7 +1294,7 @@ def test_fins_tool_discovery_spec_injects_runtime_workspace_root(
     spec = _tool_discovery_spec(effective_providers[0])
 
     assert spec.config["workspace_root"] == str(tmp_path.resolve(strict=False))
-    assert raw_config["workspace_root"] is None
+    assert "workspace_root" not in raw_config
 
 
 def test_fins_tool_discovery_spec_preserves_explicit_workspace_root(
@@ -1529,7 +1526,7 @@ def test_discover_service_tools_carries_effective_fins_config_into_compose(
                     "source_kind": "explicit_provider",
                     "source_id": "dayu.fins.tools.download_provider",
                     "enabled": True,
-                    "config": {"workspace_root": "workspace/"},
+                    "config": {},
                 }
             },
         },
@@ -1547,9 +1544,7 @@ def test_discover_service_tools_carries_effective_fins_config_into_compose(
         for provider_config in discovered_tools.effective_provider_configs
         if provider_config.provider_id == "financial-download-tools"
     )
-    assert discovered_provider.config["workspace_root"] == str(
-        (fins_workspace / "workspace").resolve(strict=False)
-    )
+    assert discovered_provider.config["workspace_root"] == str(fins_workspace)
 
     raw_provider = config.tool_discovery.providers["financial-download-tools"]
     corrupted_config = replace(

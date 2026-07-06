@@ -382,6 +382,10 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
     assert standard_256k.agent_policy.max_iterations == 24
     assert standard_256k.agent_policy.fallback_prompt == default_fallback_prompt()
     assert (
+        standard_256k.compactor_baseline.artifact_root
+        == ".dayu/artifacts/compaction"
+    )
+    assert (
         config.execution_profiles.execution_profiles["standard-1m"]
         .min_context_window_tokens
         == 1000000
@@ -397,9 +401,16 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
     host_runtime = config.host_runtime.runtimes["local"]
     assert host_runtime.sqlite.write_busy_retry_count == 8
     assert host_runtime.sqlite.write_retry_initial_delay_seconds == 0.005
+    assert host_runtime.store_root == ".dayu/host"
+    assert host_runtime.artifact_root == ".dayu/artifacts"
+    assert host_runtime.sqlite.path == ".dayu/host/dayu_host.sqlite3"
     assert host_runtime.payload_inline_threshold_bytes == 65535
     assert host_runtime.worker_startup_timeout_seconds == 10.0
     assert host_runtime.process_capsule_interrupt_policy is None
+    assert (
+        config.runtime_lanes.coordinator.db_path
+        == ".dayu/runtime/runtime_lanes.sqlite3"
+    )
     assert config.runtime_lanes.lanes["llm_api"].capacity == 4
     read_provider = config.tool_discovery.providers["financial-read-tools"]
     download_provider = config.tool_discovery.providers["financial-download-tools"]
@@ -408,7 +419,7 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
     assert read_provider.source_kind == ToolBundleSourceKind.EXPLICIT_PROVIDER
     assert read_provider.import_path == "dayu.fins.tools.provider:discover_tools"
     assert read_provider.enabled is True
-    assert read_provider.config["workspace_root"] == "workspace/"
+    assert "workspace_root" not in read_provider.config
     assert "include_ingestion_tools" not in read_provider.config
     assert read_provider.config["limits"] == {
         "processor_cache_max_entries": 128,
@@ -426,14 +437,14 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
         "dayu.fins.tools.download_provider:discover_tools"
     )
     assert download_provider.enabled is True
-    assert download_provider.config["workspace_root"] == "workspace/"
+    assert "workspace_root" not in download_provider.config
     assert preprocess_provider.import_path == (
         "dayu.fins.tools.preprocess_provider:discover_tools"
     )
     assert preprocess_provider.enabled is True
-    assert preprocess_provider.config["workspace_root"] == "workspace/"
+    assert "workspace_root" not in preprocess_provider.config
     assert upload_provider.enabled is True
-    assert upload_provider.config["workspace_root"] == "workspace/"
+    assert "workspace_root" not in upload_provider.config
     assert "allowed_upload_roots" not in upload_provider.config
     doc_provider = config.tool_discovery.providers["doc-tools"]
     assert doc_provider.enabled is False

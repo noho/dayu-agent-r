@@ -88,7 +88,7 @@ dayu/config/
 - `context_window_class`：profile 面向的上下文窗口分档，当前只允许 `256k` 与 `1m`。
 - `min_context_window_tokens`：profile 要求的最小模型上下文窗口 token 数，`256k` 为 `262144`，`1m` 为 `1000000`。
 - `run_baseline`：普通 Run 默认 `model_id` 与 `runner_option_hint_id`。
-- `compactor_baseline`：compactor 默认 `model_id`、`scene_id`、`runner_option_hint_id`、`user_prompt_template_path` 与 `artifact_root`。
+- `compactor_baseline`：compactor 默认 `model_id`、`scene_id`、`runner_option_hint_id`、`user_prompt_template_path` 与 `artifact_root`；相对 `artifact_root` 按当前 workspace root 解析，包内默认写入 `.dayu/artifacts/compaction`。
 - `context_budget_policy`：对齐 Host public `ContextBudgetPolicy` 的 ratio-first 配置；上下文窗口来自 effective model 的 `context_window_tokens`。
 - `memory_projection_policy`：对齐 Host public `MemoryProjectionPolicy` 的 per-section cap / floor 配置，包含 selected recent window、fallback selected recent window、evidence fact、session summary、answer anchor、forward intent、reference continuity、inline delta repair limits 与 `policy_ref`；`context_window_size` 由 profile 显式配置并由 Service 一对一装配。
 - `tool_truncation_policy`：只配置默认截断治理参数和默认 limits，不配置 per-tool strategy / target。
@@ -136,8 +136,8 @@ dayu/config/
 
 每条 runtime 记录覆盖：
 
-- Host durable store 与 artifact roots。
-- SQLite path、busy timeout 与写事务 busy retry 策略。
+- Host durable store 与 artifact roots；相对路径按当前 workspace root 解析，包内默认写入 `.dayu/host` 与 `.dayu/artifacts`。
+- SQLite path、busy timeout 与写事务 busy retry 策略；相对路径按当前 workspace root 解析，包内默认写入 `.dayu/host/dayu_host.sqlite3`。
 - `host_execution_lane_name`：引用 `runtime_lanes.json` 中已存在的 lane。
 - `worker_backend`，当前默认配置为 `local`。
 - `dispatch_poll_interval_seconds`。
@@ -154,7 +154,7 @@ dayu/config/
 
 | 字段 | 含义 |
 |---|---|
-| `coordinator.db_path` | 独立 runtime lane SQLite DB 路径 |
+| `coordinator.db_path` | 独立 runtime lane SQLite DB 路径；相对路径按当前 workspace root 解析，包内默认写入 `.dayu/runtime/runtime_lanes.sqlite3` |
 | `coordinator.busy_timeout_seconds` | coordinator SQLite busy timeout |
 | `coordinator.poll_interval_seconds` | acquire 轮询间隔 |
 | `lanes` | 按 lane 名索引的容量配置 |
@@ -178,7 +178,7 @@ provider 字段：
 
 `import_path` 与 `entry_point` 必须二选一。provider id 来自 `providers` map key，不在 record 内重复配置。`config` 缺省等价空对象；需要业务含义时由调用方先把 raw config 与运行时参数装配为 effective provider spec，再交给对应 provider 解析，例如文档路径白名单、财报 workspace root、Web 请求限制等。启用 provider 返回空工具集合是配置错误；不希望某个 provider 参与发现时使用 `enabled=false`。
 
-包内默认 Fins providers 分为四组，均为 `enabled=true` 且 raw config 中 `workspace_root="workspace/"`。这个值是 packaged relative default：当 Service runtime `workspace_root` 为 `/path/to/project` 时，Service effective config 会把它解析为 `/path/to/project/workspace`，再传给 Fins provider。Fins provider 默认参与工具发现；scene manifest 再决定实际选择哪些 Fins tools：
+包内默认 Fins providers 分为四组，均为 `enabled=true` 且 raw config 不写 `workspace_root`。Service effective config 会用当前 runtime workspace root 注入绝对 `workspace_root` 后再传给 Fins provider；workspace overlay 只有在需要改用其它财报仓储根目录时才显式配置 `config.workspace_root`。Fins provider 默认参与工具发现；scene manifest 再决定实际选择哪些 Fins tools：
 
 | provider id | import path | 能力 |
 |---|---|---|

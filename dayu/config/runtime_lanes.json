@@ -1,6 +1,6 @@
 {
   "coordinator": {
-    "db_path": "workspace/.dayu/runtime/runtime_lanes.sqlite3",
+    "db_path": ".dayu/runtime/runtime_lanes.sqlite3",
     "busy_timeout_seconds": 5.0,
     "poll_interval_seconds": 0.05
   },
