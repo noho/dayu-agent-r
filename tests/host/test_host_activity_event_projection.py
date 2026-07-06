@@ -44,6 +44,8 @@ from dayu.host import (
     HostEvent,
     HostEventClass,
     HostEventKind,
+    HostTerminalStatus,
+    HostThinkingView,
     HostToolingOptions,
     LocalEngineWorker,
     LocalWorkerHandle,
@@ -759,6 +761,28 @@ def test_delta_and_unknown_events_keep_identity_without_activity(
     assert unknown.event_class is HostEventClass.PROJECTION_SIGNAL
     assert unknown.event_type == "FUTURE_PROGRESS"
     assert unknown.activity is None
+
+
+def test_terminal_host_event_rejects_thinking_payload() -> None:
+    """terminal HostEvent 防卫性拒绝 thinking payload。"""
+
+    with pytest.raises(ValueError, match="terminal kind must not include thinking"):
+        HostEvent(
+            event_id="event-failed-with-thinking",
+            event_sequence=1,
+            session_id="session-direct",
+            run_id="run-direct",
+            event_class=HostEventClass.CANONICAL_FACT,
+            event_type="RUN_FAILED",
+            kind=HostEventKind.FAILED,
+            activity=None,
+            dedupe_key="event-failed-with-thinking",
+            terminal_status=HostTerminalStatus.FAILED,
+            final_answer=None,
+            error_message="provider failed safely",
+            cancel_reason=None,
+            thinking=HostThinkingView(text_delta="hidden reasoning"),
+        )
 
 
 def _project_event(tmp_path: pathlib.Path, row: EventLogRow) -> HostEvent:

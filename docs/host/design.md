@@ -336,7 +336,7 @@ EventLog
 - `preview delta`：模型 content / reasoning / tool-call 的增量片段，只服务展示体验，默认不是 canonical fact。
 - `stream fanout`：把已提交 Host events 分发给多个客户端的 projection / sink。慢客户端必须通过 `event_sequence` cursor 补读，不能反压 EventLog append。
 
-Host 默认不把 `content_delta`、`reasoning_delta`、`tool_call_delta` 这三类 per-delta EngineEvent 写入主 EventLog。Host 可以接受这些事件并把它们用于本次运行的即时展示路径，但 durable replay、Host event stream 补读、memory、audit 与 RunResult 不能承诺 token-level delta replay；可恢复真源仍是 terminal final answer、工具接受事实、compact canonical fact、usage / diagnostic / projection signal 等已提交 EventLog facts。若未来需要多客户端 live token fanout，必须另行设计 transient fanout 能力，不能把主 EventLog 的 durable replay 语义改成 token-level 保真。
+Host 默认不把 `content_delta` 与 `tool_call_delta` 写入 EventLog；`reasoning_delta` 只为 live thinking display 写入 `PREVIEW` row。Host 可以接受这些事件并把它们用于本次运行的即时展示路径，但 durable replay、Host event stream 补读、memory、audit 与 RunResult 不能承诺 token-level delta replay；可恢复真源仍是 terminal final answer、工具接受事实、compact canonical fact、usage / diagnostic / projection signal 等已提交 EventLog facts。若未来需要多客户端 live token fanout，必须另行设计 transient fanout 能力，不能把主 EventLog 的 durable replay 语义改成 token-level 保真。
 
 ## 5. Session 生命周期
 
@@ -1590,7 +1590,7 @@ Runner-call reconstruction contract 使用以下 scalar aliases：`Digest` 表�
 EngineEvent 到 Host EventLog 的映射原则：
 
 - 参与恢复、resume、memory、audit、governance 的 EngineEvent 映射为 canonical event。
-- 只服务 UI 流式体验的 per-delta EngineEvent 默认被 Host 接受但不写入主 EventLog；它们不进入 canonical projection，也不承诺 durable replay。非 delta 的 UI / progress 事件可以映射为 preview event。
+- 只服务 UI 流式体验的 per-delta EngineEvent 默认被 Host 接受但不写入主 EventLog；它们不进入 canonical projection，也不承诺 durable replay。当前 transient delta 子集是 `content_delta` 与 `tool_call_delta`。`reasoning_delta` 因 live thinking 展示需要写入 `PREVIEW` row，但仅供运行态 Host event stream 投影，不成为 memory、audit、resume、outbox terminal 或 canonical replay 真源。
 - Host 可以把多个 EngineEvent 聚合成一个 canonical fact，但不得丢失恢复必须的信息。
 - 工具事实 canonical owner 是 ToolRuntime Host accept path。EngineEvent ingest 不得为同一工具 outcome 追加第二条工具 canonical fact；描述已 accepted 工具结果的 EngineEvent 必须携带 accepted event refs / accepted tool fact ids，并只能映射为 preview、diagnostic、trace 或 idempotent no-op。
 
@@ -1599,7 +1599,7 @@ EngineEvent 到 Host EventLog 的映射原则：
 ```text
 iteration_started              -> preview
 content_delta                  -> accepted non-durable delta; no EventLog row by default
-reasoning_delta                -> accepted non-durable delta; no EventLog row by default
+reasoning_delta                -> preview (live thinking display only; not canonical replay truth)
 content_completed              -> preview
 tool_call_delta                -> accepted non-durable delta; no EventLog row by default
 tool_calls_batch_ready         -> preview or diagnostic
