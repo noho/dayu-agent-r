@@ -419,6 +419,51 @@ class _KeyboardInterruptInputReader:
         raise KeyboardInterrupt
 
 
+@dataclass(frozen=True, slots=True)
+class _ComposerReadInterrupt:
+    """测试 composer 读取异常步骤。"""
+
+    exception_type: type[BaseException]
+
+
+_ComposerReadStep = str | _ComposerReadInterrupt
+
+
+class _ScriptedComposer:
+    """按脚本返回输入或抛出异常的测试 composer。"""
+
+    prompt_calls: list[str]
+    _remaining: list[_ComposerReadStep]
+
+    def __init__(self, steps: tuple[_ComposerReadStep, ...]) -> None:
+        """初始化 scripted composer。
+
+        :param steps: 每次读取的返回文本或异常步骤。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.prompt_calls = []
+        self._remaining = list(steps)
+
+    async def read(self, prompt: str) -> str:
+        """读取下一条脚本输入。
+
+        :param prompt: 输入提示文本。
+        :returns: 脚本中的输入文本。
+        :raises EOFError: 脚本耗尽或脚本要求 EOF 时抛出。
+        :raises KeyboardInterrupt: 脚本要求输入态中断时抛出。
+        """
+
+        self.prompt_calls.append(prompt)
+        if not self._remaining:
+            raise EOFError
+        step = self._remaining.pop(0)
+        if isinstance(step, str):
+            return step
+        raise step.exception_type()
+
+
 class _AutoSigintMonitor(CliSigintMonitor):
     """测试用一次 SIGINT monitor。"""
 
@@ -859,11 +904,49 @@ def test_interactive_verbose_debug_diagnostics_do_not_pollute_stdout(
     assert "[DEBUG]" not in captured.out
 
 
-def test_interactive_input_keyboard_interrupt_exits_without_run_requests(
+@pytest.mark.asyncio
+async def test_interactive_first_idle_keyboard_interrupt_redisplays_prompt_without_exit(
+    tmp_path: Path,
+) -> None:
+    """输入态第一次空 prompt Ctrl-C 应重绘 prompt，且不得发 submit / cancel。"""
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    invocation = interactive_command.new_cli_invocation(
+        command_name="interactive",
+        scenario="interactive",
+        display_user="本地 CLI 用户",
+        ticker="AAPL",
+    )
+    fake_host = _FakeHost()
+    composer = _ScriptedComposer(
+        (
+            _ComposerReadInterrupt(KeyboardInterrupt),
+            _ComposerReadInterrupt(EOFError),
+        )
+    )
+
+    exit_code = await interactive_command._run_interactive_repl(
+        host=cast(Host, fake_host),
+        runtime=runtime,
+        workspace_root=tmp_path,
+        invocation=invocation,
+        session_id="session-1",
+        run_overrides=interactive_command.ServiceRunOverrides(),
+        composer=composer,
+        sigint_monitor_factory=_NoopSigintMonitor,
+    )
+
+    assert exit_code == EXIT_SUCCESS
+    assert composer.prompt_calls == ["dayu> ", "dayu> "]
+    assert fake_host.submit_requests == []
+    assert fake_host.cancel_requests == []
+
+
+def test_interactive_second_consecutive_input_keyboard_interrupt_exits_without_run_requests(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """输入态 Ctrl-C 应退出当前 command，且不发 submit / cancel。"""
+    """输入态连续两次空 prompt Ctrl-C 应退出当前 command，且不发 submit / cancel。"""
 
     fake_host = _FakeHost()
     monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
@@ -882,6 +965,47 @@ def test_interactive_input_keyboard_interrupt_exits_without_run_requests(
 
     assert exit_code == EXIT_KEYBOARD_INTERRUPT
     assert fake_host.submit_requests == []
+    assert fake_host.cancel_requests == []
+
+
+@pytest.mark.asyncio
+async def test_interactive_normal_input_resets_idle_keyboard_interrupt_exit_pending(
+    tmp_path: Path,
+) -> None:
+    """输入态第一次 Ctrl-C 后提交正常输入，应重置本地退出待确认状态。"""
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    invocation = interactive_command.new_cli_invocation(
+        command_name="interactive",
+        scenario="interactive",
+        display_user="本地 CLI 用户",
+        ticker="AAPL",
+    )
+    fake_host = _FakeHost(submit_statuses=(HostTerminalStatus.SUCCEEDED,))
+    composer = _ScriptedComposer(
+        (
+            _ComposerReadInterrupt(KeyboardInterrupt),
+            "请总结收入变化",
+            _ComposerReadInterrupt(KeyboardInterrupt),
+            _ComposerReadInterrupt(EOFError),
+        )
+    )
+
+    exit_code = await interactive_command._run_interactive_repl(
+        host=cast(Host, fake_host),
+        runtime=runtime,
+        workspace_root=tmp_path,
+        invocation=invocation,
+        session_id="session-1",
+        run_overrides=interactive_command.ServiceRunOverrides(),
+        composer=composer,
+        sigint_monitor_factory=_NoopSigintMonitor,
+    )
+
+    assert exit_code == EXIT_SUCCESS
+    assert composer.prompt_calls == ["dayu> ", "dayu> ", "dayu> ", "dayu> "]
+    assert len(fake_host.submit_requests) == 1
+    assert fake_host.submit_requests[0].user_prompt == "请总结收入变化"
     assert fake_host.cancel_requests == []
 
 

@@ -617,6 +617,7 @@ dayu-cli interactive --debug-stream
 - 如果你想显式复用某条长期对话，使用 `--label`。同一个 label 可在 `prompt --label` 与 `interactive --label` 之间互通；之后恢复时沿用首次创建时的会话绑定。
 - 带 `--label` 的 CLI 启动时，会明确提示当前是“新创建标签”还是“恢复标签”；`prompt --label` 在回答末尾还会再次打印标签提示框，方便你后续继续复用同一个 label。
 - 同一个 label 在任意时刻只能被一个 CLI 进程占用：`interactive --label` 会在整个 REPL 生命周期内持有该 label，直到双 `Ctrl+D` 完整退出；`prompt --label` 会在本轮返回最终回答前持有该 label。若命中占用中的 label，CLI 会提示你等待当前对话结束后重试，或改用新的 `--label`。
+- 在空的 `dayu>` 提示符下，第一次按 `Ctrl+C` 会回到一个干净的新提示符，连续第二次按 `Ctrl+C` 才会退出；如果中间提交了正常输入，之后的 `Ctrl+C` 会重新按第一次处理。
 - 如果你在 workspace 本地覆写了带 label 会命中的 scene manifest，必须使用当前 `ScenePrepare` 支持的 scene-only schema。
 - 默认不回显模型思考过程；如需在终端查看，显式传 `--thinking`。
 

@@ -501,12 +501,20 @@ async def _run_interactive_repl(
     )
     effective_key_monitor_factory = new_running_key_monitor if key_monitor_factory is None else key_monitor_factory
     effective_run_view = new_interactive_run_view() if run_view is None else run_view
+    idle_interrupt_exit_pending = False
     try:
         while True:
             try:
                 user_prompt = await effective_composer.read(INTERACTIVE_INPUT_PROMPT)
             except EOFError:
+                idle_interrupt_exit_pending = False
                 return EXIT_SUCCESS
+            except KeyboardInterrupt:
+                if idle_interrupt_exit_pending:
+                    return EXIT_KEYBOARD_INTERRUPT
+                idle_interrupt_exit_pending = True
+                continue
+            idle_interrupt_exit_pending = False
             stripped_prompt = user_prompt.strip()
             if stripped_prompt == "":
                 continue
