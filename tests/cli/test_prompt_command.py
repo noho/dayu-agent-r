@@ -46,6 +46,7 @@ from dayu.host.api import (
     HostFinalAnswerView,
     HostStreamCursor,
     HostTerminalStatus,
+    HostThinkingView,
     OutboxProjectionStatus,
     OutboxTerminalCursor,
     OutboxTerminalItem,
@@ -64,6 +65,8 @@ from dayu.service.entrypoint_runtime import EntrypointRuntimeResult
 from dayu.cli.activity import CliActivityRenderer, CliActivityRendererOptions
 from dayu.cli.run_keys import RunningKeyAction
 from dayu.cli.session_terminal_cursor import read_cli_terminal_cursor
+from dayu.cli.thinking import CliThinkingRenderer, CliThinkingRendererOptions
+from dayu.service.entrypoint_runtime import EntrypointThinking
 
 _NOW = datetime(2026, 6, 14, 8, 0, 0, tzinfo=UTC)
 _MODEL_ID = "deepseek-v4-flash"
@@ -735,7 +738,8 @@ def test_prompt_command_outputs_fast_live_terminal_and_converts_requests(
 
     assert exit_code == EXIT_SUCCESS
     assert captured.out.strip() == "prompt answer"
-    assert captured.err == ""
+    assert "Activity:" in captured.err
+    assert "工具批次完成" in captured.err
     assert captured_requests[0].scene_id == "prompt"
     assert captured_requests[0].context_slot_values == {
         "fins_default_subject": "AAPL",
@@ -860,7 +864,8 @@ def test_prompt_verbose_debug_diagnostics_do_not_pollute_stdout(
     assert captured.out.strip() == "prompt answer"
     assert "[VERBOSE]" not in captured.out
     assert "[DEBUG]" not in captured.out
-    assert "Activity:" not in captured.err
+    assert "Activity:" not in captured.out
+    assert "Activity:" in captured.err
 
 
 def test_prompt_command_without_ticker_uses_default_context_slots(
@@ -932,12 +937,12 @@ def test_prompt_command_uses_outbox_fallback_when_watcher_fails(
     assert fake_host.read_outbox_requests[0].limit == 50
 
 
-def test_prompt_default_no_detail_suppresses_activity_and_keeps_final_answer_stdout(
+def test_prompt_default_detail_outputs_activity_and_keeps_final_answer_stdout(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """prompt 默认不注册 activity renderer，final answer 仍只写 stdout。"""
+    """prompt 默认显示 activity，final answer 仍只写 stdout。"""
 
     workspace_root = tmp_path
     fake_host = _FakeHost(
@@ -956,9 +961,88 @@ def test_prompt_default_no_detail_suppresses_activity_and_keeps_final_answer_std
 
     assert exit_code == EXIT_SUCCESS
     assert captured.out.strip() == "prompt answer"
+    assert "Activity:" in captured.err
+    assert "工具批次完成" in captured.err
+    assert "记录烟测事实" in captured.err
+
+
+def test_prompt_no_detail_suppresses_activity_and_keeps_final_answer_stdout(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--no-detail`` 不注册 activity renderer，final answer 仍只写 stdout。"""
+
+    workspace_root = tmp_path
+    fake_host = _FakeHost(
+        submit_terminal=_terminal_event(status=HostTerminalStatus.SUCCEEDED),
+        submit_events=(_activity_event(),),
+    )
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        prompt_command,
+        "open_host",
+        lambda _options: _FakeOpenHostContext(fake_host),
+    )
+
+    exit_code = cli_main.main(
+        ("prompt", "--base", str(workspace_root), "--no-detail", "请总结收入变化")
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_SUCCESS
+    assert captured.out.strip() == "prompt answer"
     assert "Activity:" not in captured.err
     assert "工具批次完成" not in captured.err
     assert "记录烟测事实" not in captured.err
+
+
+def test_prompt_thinking_flag_outputs_reasoning_delta_and_no_thinking_suppresses_it(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """有 thinking event 时，``--thinking`` 与 ``--no-thinking`` 输出必须不同。"""
+
+    workspace_root = tmp_path
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        prompt_command,
+        "open_host",
+        lambda _options: _FakeOpenHostContext(
+            _FakeHost(
+                submit_terminal=_terminal_event(status=HostTerminalStatus.SUCCEEDED),
+                submit_events=(_thinking_event(),),
+            )
+        ),
+    )
+
+    thinking_exit = cli_main.main(
+        ("prompt", "--base", str(workspace_root), "--thinking", "请总结收入变化")
+    )
+    thinking_captured = capsys.readouterr()
+
+    monkeypatch.setattr(
+        prompt_command,
+        "open_host",
+        lambda _options: _FakeOpenHostContext(
+            _FakeHost(
+                submit_terminal=_terminal_event(status=HostTerminalStatus.SUCCEEDED),
+                submit_events=(_thinking_event(),),
+            )
+        ),
+    )
+    no_thinking_exit = cli_main.main(
+        ("prompt", "--base", str(workspace_root), "--no-thinking", "请总结收入变化")
+    )
+    no_thinking_captured = capsys.readouterr()
+
+    assert thinking_exit == EXIT_SUCCESS
+    assert no_thinking_exit == EXIT_SUCCESS
+    assert thinking_captured.out.strip() == "prompt answer"
+    assert no_thinking_captured.out.strip() == "prompt answer"
+    assert "Thinking: 正在分析收入变化" in thinking_captured.err
+    assert "Thinking:" not in no_thinking_captured.err
 
 
 def test_prompt_detail_outputs_activity_for_non_tty_and_keeps_final_answer_stdout(
@@ -1091,6 +1175,42 @@ async def test_prompt_sigint_after_run_id_cancels_host_run(
 
 
 @pytest.mark.asyncio
+async def test_prompt_cancel_helper_closes_thinking_renderer() -> None:
+    """prompt 本地取消 helper 应显式关闭 thinking renderer。"""
+
+    accepted_run = prompt_command._AcceptedRunState()
+    submit_task = asyncio.create_task(_never_finishes_prompt_terminal())
+    stderr = io.StringIO()
+    thinking_renderer = CliThinkingRenderer(
+        stderr=stderr,
+        options=CliThinkingRendererOptions(enabled=True),
+    )
+    fake_host = _FakeHost(
+        submit_terminal=None,
+    )
+
+    result = await prompt_command._cancel_prompt_turn_after_local_request(
+        host=cast(Host, fake_host),
+        invocation=prompt_command.new_cli_invocation(
+            command_name="prompt",
+            scenario="prompt",
+            display_user="本地 CLI 用户",
+            ticker="AAPL",
+        ),
+        accepted_run=accepted_run,
+        submit_task=submit_task,
+        sigint_monitor=_NoopSigintMonitor(),
+        observed_sigint_count=0,
+        thinking_renderer=thinking_renderer,
+    )
+
+    assert result is None
+    assert fake_host.cancel_requests == []
+    thinking_renderer.record(_entrypoint_thinking(dedupe_key="thinking-after-cancel"))
+    assert stderr.getvalue() == ""
+
+
+@pytest.mark.asyncio
 async def test_prompt_ctrl_t_toggles_running_activity_without_cancel(
     tmp_path: Path,
 ) -> None:
@@ -1151,6 +1271,11 @@ async def test_prompt_esc_requests_cancel_after_run_id(
         stderr=stderr,
         options=CliActivityRendererOptions(visible=True, enabled=True),
     )
+    thinking_stderr = io.StringIO()
+    thinking_renderer = CliThinkingRenderer(
+        stderr=thinking_stderr,
+        options=CliThinkingRendererOptions(enabled=True),
+    )
     key_monitor = _FakeRunningKeyMonitor(
         (RunningKeyAction.CANCEL_RUN,),
         delay_ticks=2,
@@ -1170,6 +1295,7 @@ async def test_prompt_esc_requests_cancel_after_run_id(
         run_overrides=prompt_command.ServiceRunOverrides(),
         sigint_monitor=_NoopSigintMonitor(),
         activity_renderer=renderer,
+        thinking_renderer=thinking_renderer,
         key_monitor=key_monitor,
     )
 
@@ -1178,6 +1304,8 @@ async def test_prompt_esc_requests_cancel_after_run_id(
     assert len(fake_host.cancel_requests) == 1
     assert fake_host.cancel_requests[0].mode is CancelMode.GRACEFUL
     assert "Activity: cancel requested" in stderr.getvalue()
+    thinking_renderer.record(_entrypoint_thinking(dedupe_key="thinking-after-esc"))
+    assert thinking_stderr.getvalue() == ""
     assert key_monitor.closed_count == 1
 
 
@@ -1259,7 +1387,6 @@ async def test_prompt_cancel_terminal_wins_over_second_sigint(
 @pytest.mark.parametrize(
     "unsupported_args, expected_fragment",
     (
-        (("--thinking",), "--thinking/--no-thinking"),
         (("--web-provider", "serper"), "--web-provider"),
         (("--enable-tool-trace",), "--enable-tool-trace"),
         (("--doc-limits-json", "{}"), "--doc-limits-json"),
@@ -1278,6 +1405,24 @@ def test_prompt_command_rejects_unsupported_old_execution_flags(
     assert exit_code == EXIT_USAGE_ERROR
     assert "unsupported option" in captured.err
     assert expected_fragment in captured.err
+
+
+def test_prompt_thinking_flags_are_display_options_not_execution_overrides() -> None:
+    """``--thinking`` / ``--no-thinking`` 不进入旧执行参数拒绝集合。
+
+    :returns: ``None``。
+    :raises AssertionError: thinking 展示参数被错误列为 unsupported 时抛出。
+    """
+
+    thinking_args = parse_cli_args(("prompt", "hello", "--thinking"))
+    no_thinking_args = parse_cli_args(("prompt", "hello", "--no-thinking"))
+
+    assert thinking_args.thinking is True
+    assert no_thinking_args.thinking is False
+    assert "--thinking/--no-thinking" not in unsupported_execution_option_names(thinking_args)
+    assert "--thinking/--no-thinking" not in unsupported_execution_option_names(
+        no_thinking_args
+    )
 
 
 def test_prompt_debug_stream_is_not_unsupported_execution_option() -> None:
@@ -1529,6 +1674,17 @@ async def _prepare_prompt_runtime(workspace_root: Path) -> EntrypointRuntimeResu
     )
 
 
+async def _never_finishes_prompt_terminal() -> prompt_command.EntrypointRunTerminalResult:
+    """构造永不完成的 prompt terminal awaitable。
+
+    :returns: 永不实际返回的 prompt terminal result。
+    :raises asyncio.CancelledError: 调用方取消 task 时透传。
+    """
+
+    await asyncio.Event().wait()
+    raise RuntimeError("unreachable prompt terminal")
+
+
 def _run_snapshot(*, run_id: str, status: RunStatus) -> RunSnapshot:
     """构造 RunSnapshot。
 
@@ -1615,6 +1771,47 @@ def _activity_event() -> HostEvent:
         final_answer=None,
         error_message=None,
         cancel_reason=None,
+    )
+
+
+def _thinking_event() -> HostEvent:
+    """构造 Host thinking event。
+
+    :returns: HostEvent。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return HostEvent(
+        event_id="thinking-run-1-1",
+        event_sequence=1,
+        session_id="session-1",
+        run_id="run-1",
+        event_class=HostEventClass.PREVIEW,
+        event_type="REASONING_DELTA",
+        kind=HostEventKind.PROGRESS,
+        activity=None,
+        thinking=HostThinkingView(text_delta="正在分析收入变化"),
+        dedupe_key="thinking-run-1-1",
+        terminal_status=None,
+        final_answer=None,
+        error_message=None,
+        cancel_reason=None,
+    )
+
+
+def _entrypoint_thinking(*, dedupe_key: str) -> EntrypointThinking:
+    """构造 Service entrypoint thinking。
+
+    :param dedupe_key: thinking dedupe key。
+    :returns: Service entrypoint thinking。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return EntrypointThinking(
+        run_id="run-1",
+        event_sequence=1,
+        dedupe_key=dedupe_key,
+        text_delta="取消后不应输出",
     )
 
 

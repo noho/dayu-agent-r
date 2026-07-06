@@ -53,6 +53,7 @@ from dayu.cli.run_keys import (
     new_running_key_monitor,
 )
 from dayu.cli.session_terminal_cursor import advance_cli_terminal_cursor
+from dayu.cli.thinking import CliThinkingRenderer, CliThinkingRendererOptions
 from dayu.contracts import JsonValue
 from dayu.host.api import (
     CancelMode,
@@ -185,6 +186,7 @@ async def _run_prompt_command_async(args: ParsedCliArgs) -> int:
             session_id=session_id,
             sigint_monitor=CliSigintMonitor(),
             detail=args.detail,
+            thinking=args.thinking,
         )
 
 
@@ -262,7 +264,8 @@ async def _execute_prompt_on_existing_session(
     prepared: _PreparedPromptExistingSessionExecution,
     session_id: str,
     sigint_monitor: CliSigintMonitor,
-    detail: bool = False,
+    detail: bool = True,
+    thinking: bool = True,
 ) -> int:
     """在已解析的已有 Session 上执行 prompt turn。
 
@@ -271,6 +274,7 @@ async def _execute_prompt_on_existing_session(
     :param session_id: 已存在且调用方已选择的 Host Session id。
     :param sigint_monitor: prompt 运行阶段 SIGINT monitor。
     :param detail: 是否显示运行态 activity stream。
+    :param thinking: 是否显示运行态 thinking 增量。
     :returns: CLI 退出码。
     :raises Exception: submit、cancel 或 terminal observation 失败时向上抛出。
     """
@@ -284,6 +288,7 @@ async def _execute_prompt_on_existing_session(
         run_overrides=prepared.run_overrides,
         sigint_monitor=sigint_monitor,
         activity_renderer=_new_detail_activity_renderer() if detail else None,
+        thinking_renderer=_new_thinking_renderer() if thinking else None,
         key_monitor=new_running_key_monitor(),
     )
     if terminal is None:
@@ -312,6 +317,16 @@ def _new_detail_activity_renderer() -> CliActivityRenderer:
             enabled=True,
         )
     )
+
+
+def _new_thinking_renderer() -> CliThinkingRenderer:
+    """创建 ``--thinking`` 模式使用的 thinking renderer。
+
+    :returns: 强制启用的 CLI thinking renderer。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return CliThinkingRenderer(options=CliThinkingRendererOptions(enabled=True))
 
 
 async def _ensure_prompt_session(
@@ -370,6 +385,7 @@ async def _submit_prompt_turn_handling_sigint(
     run_overrides: ServiceRunOverrides,
     sigint_monitor: CliSigintMonitor,
     activity_renderer: CliActivityRenderer | None = None,
+    thinking_renderer: CliThinkingRenderer | None = None,
     key_monitor: RunningKeyMonitor | None = None,
 ) -> EntrypointRunTerminalResult | None:
     """提交 prompt turn，并在 SIGINT 时按 Host public cancel 语义收口。
@@ -382,6 +398,7 @@ async def _submit_prompt_turn_handling_sigint(
     :param run_overrides: 本轮可映射执行 override。
     :param sigint_monitor: prompt 运行阶段 SIGINT monitor。
     :param activity_renderer: 运行态 activity renderer；``None`` 表示不输出。
+    :param thinking_renderer: 运行态 thinking renderer；``None`` 表示不输出。
     :param key_monitor: 运行态 TTY 按键 monitor；``None`` 表示 no-op。
     :returns: Host terminal result；Run accepted 前 SIGINT 返回 ``None``。
     :raises Exception: submit、cancel 或 terminal observation 失败时向上抛出。
@@ -389,6 +406,7 @@ async def _submit_prompt_turn_handling_sigint(
 
     accepted_run = _AcceptedRunState()
     renderer = activity_renderer
+    thinking = thinking_renderer
     monitor = NoopRunningKeyMonitor() if key_monitor is None else key_monitor
     sigint_monitor.install()
     observed_sigint_count = sigint_monitor.count
@@ -416,6 +434,7 @@ async def _submit_prompt_turn_handling_sigint(
             host_assembly=runtime.host_assembly,
             on_run_accepted=accepted_run.record,
             on_activity=None if renderer is None else renderer.record,
+            on_thinking=None if thinking is None else thinking.record,
         )
     )
     sigint_task = asyncio.create_task(sigint_monitor.wait_next(observed_sigint_count))
@@ -443,6 +462,7 @@ async def _submit_prompt_turn_handling_sigint(
                     sigint_monitor=sigint_monitor,
                     observed_sigint_count=observed_sigint_count,
                     activity_renderer=renderer,
+                    thinking_renderer=thinking,
                 )
             first_sigint_count = await sigint_task
             return await _cancel_prompt_turn_after_local_request(
@@ -453,10 +473,13 @@ async def _submit_prompt_turn_handling_sigint(
                 sigint_monitor=sigint_monitor,
                 observed_sigint_count=first_sigint_count,
                 activity_renderer=renderer,
+                thinking_renderer=thinking,
             )
     finally:
         if renderer is not None:
             renderer.close()
+        if thinking is not None:
+            thinking.close()
         monitor.close()
         sigint_monitor.close()
         await cancel_and_await_task(sigint_task)
@@ -472,6 +495,7 @@ async def _cancel_prompt_turn_after_local_request(
     sigint_monitor: CliSigintMonitor,
     observed_sigint_count: int,
     activity_renderer: CliActivityRenderer | None = None,
+    thinking_renderer: CliThinkingRenderer | None = None,
 ) -> EntrypointRunTerminalResult | None:
     """本地取消请求后取消 prompt turn 并等待 Host terminal 或二次 SIGINT。
 
@@ -483,11 +507,14 @@ async def _cancel_prompt_turn_after_local_request(
     :param observed_sigint_count: 第一次取消请求后的 SIGINT 计数；Esc 取消
         时传入进入运行态前的计数，避免 Esc 被当作 Ctrl+C 次数。
     :param activity_renderer: 运行态 activity renderer；``None`` 表示不输出。
+    :param thinking_renderer: 运行态 thinking renderer；``None`` 表示不输出。
     :returns: cancel 后 terminal result；Run accepted 前或二次 SIGINT 时返回
         ``None``。
     :raises Exception: submit、cancel 或 terminal observation 失败时向上抛出。
     """
 
+    if thinking_renderer is not None:
+        thinking_renderer.close()
     submit_task.cancel()
     with suppress(asyncio.CancelledError):
         await submit_task

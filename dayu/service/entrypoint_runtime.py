@@ -218,6 +218,40 @@ EntrypointActivityCallback = Callable[[EntrypointActivity], None]
 """entrypoint runtime activity 通知回调类型。"""
 
 
+@dataclass(frozen=True, slots=True)
+class EntrypointThinking:
+    """entrypoint runtime 传给 UI adapter 的 running thinking 增量。
+
+    :param run_id: 关联 Run id。
+    :param event_sequence: Host event sequence。
+    :param dedupe_key: thinking 增量去重键。
+    :param text_delta: 本次 thinking 增量文本。
+    """
+
+    run_id: str
+    event_sequence: int
+    dedupe_key: str
+    text_delta: str
+
+    def __post_init__(self) -> None:
+        """校验 thinking 增量字段。
+
+        :returns: ``None``。
+        :raises ValueError: 文本字段为空或 sequence 小于零时抛出。
+        """
+
+        _require_non_empty(self.run_id, field_name="EntrypointThinking.run_id")
+        _require_non_negative_int(
+            self.event_sequence, field_name="EntrypointThinking.event_sequence"
+        )
+        _require_non_empty(self.dedupe_key, field_name="EntrypointThinking.dedupe_key")
+        _require_non_empty(self.text_delta, field_name="EntrypointThinking.text_delta")
+
+
+EntrypointThinkingCallback = Callable[[EntrypointThinking], None]
+"""entrypoint runtime thinking 通知回调类型。"""
+
+
 class EntrypointTerminalSource(StrEnum):
     """entrypoint runtime 观察到 Run 终态的来源。
 
@@ -461,6 +495,7 @@ class _TerminalObservationState:
     seen_terminal_event_ids: set[str]
     seen_dedupe_keys: set[str]
     seen_activity_dedupe_keys: set[str]
+    seen_thinking_dedupe_keys: set[str]
     outbox_cursor: OutboxTerminalCursor | None
     watcher_failure_message: str | None
 
@@ -590,6 +625,7 @@ async def submit_entrypoint_turn_and_wait(
     host_assembly: ServiceOpenHostAssemblyResult,
     on_run_accepted: RunAcceptedCallback | None = None,
     on_activity: EntrypointActivityCallback | None = None,
+    on_thinking: EntrypointThinkingCallback | None = None,
     poll_interval_seconds: float = DEFAULT_ENTRYPOINT_TERMINAL_POLL_INTERVAL_SECONDS,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> EntrypointRunTerminalResult:
@@ -603,6 +639,7 @@ async def submit_entrypoint_turn_and_wait(
         adapter 在等待终态期间发起 typed cancel。
     :param on_activity: 可选 activity 回调；只接收 Host public activity 投影和
         Service 本地有界诊断。
+    :param on_thinking: 可选 thinking 回调；只接收 Host public thinking 增量。
     :param poll_interval_seconds: watcher 暂无 terminal 时的 public read 轮询间隔。
     :param sleep: 可注入 sleep coroutine，便于测试。
     :returns: Run terminal 观察结果。
@@ -641,6 +678,7 @@ async def submit_entrypoint_turn_and_wait(
             queue=queue,
             state=state,
             on_activity=on_activity,
+            on_thinking=on_thinking,
             allow_outbox_terminal_fallback=False,
             poll_interval_seconds=poll_interval_seconds,
             sleep=sleep,
@@ -998,6 +1036,7 @@ async def _wait_for_terminal(
     queue: asyncio.Queue[HostEvent | _WatcherFailure],
     state: _TerminalObservationState,
     on_activity: EntrypointActivityCallback | None = None,
+    on_thinking: EntrypointThinkingCallback | None = None,
     allow_outbox_terminal_fallback: bool,
     poll_interval_seconds: float,
     sleep: Callable[[float], Awaitable[None]],
@@ -1010,6 +1049,7 @@ async def _wait_for_terminal(
     :param queue: watcher drain queue。
     :param state: 本轮本地观察状态。
     :param on_activity: 可选 activity 回调。
+    :param on_thinking: 可选 thinking 回调。
     :param allow_outbox_terminal_fallback: 是否允许在未观察到 live terminal 时读取
         Outbox terminal。该路径只用于可能错过 terminal 的补读场景；已 attach
         submit 路径不得把 Outbox 当作通用 final answer 读取接口。
@@ -1028,6 +1068,7 @@ async def _wait_for_terminal(
             state=state,
             run_id=run_id,
             on_activity=on_activity,
+            on_thinking=on_thinking,
         )
         if live_terminal is not None:
             return live_terminal
@@ -1071,6 +1112,7 @@ def _drain_available_watcher_items(
     state: _TerminalObservationState,
     run_id: str,
     on_activity: EntrypointActivityCallback | None = None,
+    on_thinking: EntrypointThinkingCallback | None = None,
 ) -> EntrypointRunTerminalResult | None:
     """消费当前 queue 中已到达的 watcher item。
 
@@ -1078,6 +1120,7 @@ def _drain_available_watcher_items(
     :param state: 本轮本地观察状态。
     :param run_id: 目标 Run id。
     :param on_activity: 可选 activity 回调。
+    :param on_thinking: 可选 thinking 回调。
     :returns: 命中的 terminal result；没有命中时返回 ``None``。
     :raises Exception: ``on_activity`` callback 抛出的异常会向调用方透传。
     """
@@ -1107,6 +1150,12 @@ def _drain_available_watcher_items(
             state=state,
             run_id=run_id,
             on_activity=on_activity,
+        )
+        _emit_entrypoint_thinking_from_host_event(
+            event=item,
+            state=state,
+            run_id=run_id,
+            on_thinking=on_thinking,
         )
 
 
@@ -1160,6 +1209,54 @@ def _entrypoint_activity_from_host_event(event: HostEvent) -> EntrypointActivity
         tool_name=activity.tool_name,
         tool_display_name=activity.tool_display_name,
         counts=_entrypoint_activity_counts_from_host(activity.counts),
+    )
+
+
+def _emit_entrypoint_thinking_from_host_event(
+    *,
+    event: HostEvent,
+    state: _TerminalObservationState,
+    run_id: str,
+    on_thinking: EntrypointThinkingCallback | None,
+) -> None:
+    """把非终态 Host public thinking 投影给 Service thinking callback。
+
+    :param event: Host public event。
+    :param state: 本轮本地观察状态。
+    :param run_id: 当前等待的目标 Run id。
+    :param on_thinking: 可选 thinking 回调。
+    :returns: ``None``。
+    :raises Exception: callback 抛出的异常会向调用方透传。
+    """
+
+    if on_thinking is None or event.terminal_status is not None or event.thinking is None:
+        return
+    if event.run_id != run_id:
+        return
+    if event.dedupe_key in state.seen_thinking_dedupe_keys:
+        return
+    state.seen_thinking_dedupe_keys.add(event.dedupe_key)
+    on_thinking(_entrypoint_thinking_from_host_event(event))
+
+
+def _entrypoint_thinking_from_host_event(event: HostEvent) -> EntrypointThinking:
+    """把 Host public thinking view 转为 entrypoint thinking。
+
+    :param event: Host public event，必须携带 ``thinking`` 和 ``run_id``。
+    :returns: entrypoint thinking DTO。
+    :raises ValueError: event 未携带 thinking 或 run id 时抛出。
+    """
+
+    thinking = event.thinking
+    if thinking is None:
+        raise ValueError("HostEvent.thinking is required")
+    if event.run_id is None:
+        raise ValueError("HostEvent.run_id is required")
+    return EntrypointThinking(
+        run_id=event.run_id,
+        event_sequence=event.event_sequence,
+        dedupe_key=event.dedupe_key,
+        text_delta=thinking.text_delta,
     )
 
 
@@ -1722,6 +1819,7 @@ def _new_terminal_observation_state(
         seen_terminal_event_ids=set(seen_terminal_event_ids),
         seen_dedupe_keys=set(),
         seen_activity_dedupe_keys=set(),
+        seen_thinking_dedupe_keys=set(),
         outbox_cursor=terminal_cursor,
         watcher_failure_message=None,
     )

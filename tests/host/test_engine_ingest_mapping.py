@@ -2188,10 +2188,10 @@ def test_tool_call_requested_and_result_accepted_are_preview(
         assert attempt_status == AttemptStatus.RUNNING
 
 
-def test_delta_events_are_accepted_without_event_log_rows(
+def test_non_reasoning_delta_events_are_accepted_without_event_log_rows(
     tmp_path: Path,
 ) -> None:
-    """Engine content、reasoning 与 tool-call delta 默认不写主 EventLog。"""
+    """Engine content 与 tool-call delta 默认不写主 EventLog。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
@@ -2206,15 +2206,6 @@ def test_delta_events_are_accepted_without_event_log_rows(
             _candidate(
                 seeded,
                 worker_event_index=12,
-                data=ReasoningDeltaData(
-                    iteration_id="iter-delta",
-                    delta="reasoning",
-                ),
-                event_type=EngineEventType.REASONING_DELTA,
-            ),
-            _candidate(
-                seeded,
-                worker_event_index=13,
                 data=ToolCallDeltaData(
                     iteration_id="iter-tool",
                     tool_call_index=0,
@@ -2231,12 +2222,39 @@ def test_delta_events_are_accepted_without_event_log_rows(
         assert [result.status for result in results] == [
             EngineIngestStatus.ACCEPTED,
             EngineIngestStatus.ACCEPTED,
-            EngineIngestStatus.ACCEPTED,
         ]
-        assert [result.events for result in results] == [(), (), ()]
+        assert [result.events for result in results] == [(), ()]
         assert _event_count(store.transaction_runner, "CONTENT_DELTA") == 0
-        assert _event_count(store.transaction_runner, "REASONING_DELTA") == 0
         assert _event_count(store.transaction_runner, "TOOL_CALL_DELTA") == 0
+
+
+def test_reasoning_delta_is_accepted_as_preview_for_live_display(
+    tmp_path: Path,
+) -> None:
+    """Engine reasoning delta 应写 PREVIEW row 供 live thinking 展示。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
+
+        result = ingestor.ingest(
+            _candidate(
+                seeded,
+                worker_event_index=12,
+                data=ReasoningDeltaData(
+                    iteration_id="iter-delta",
+                    delta="reasoning",
+                ),
+                event_type=EngineEventType.REASONING_DELTA,
+            )
+        )
+
+        assert result.status == EngineIngestStatus.ACCEPTED
+        assert len(result.events) == 1
+        assert result.events[0].event_class is EventClass.PREVIEW
+        assert result.events[0].event_type == "REASONING_DELTA"
+        assert _payload(result.events[0])["delta"] == "reasoning"
+        assert _event_count(store.transaction_runner, "REASONING_DELTA") == 1
 
 
 def test_tool_batch_events_stay_preview_not_canonical(
@@ -2326,10 +2344,10 @@ def test_late_terminal_event_is_rejected_after_closeout(tmp_path: Path) -> None:
         assert _payload(result.events[0])["reason"] == "terminal_already_closed"
 
 
-def test_late_transient_delta_is_rejected_before_no_row_short_circuit(
+def test_late_reasoning_delta_is_rejected_before_preview_append(
     tmp_path: Path,
 ) -> None:
-    """终态后的 transient delta 仍先经过 late-event governance。"""
+    """终态后的 reasoning delta 仍先经过 late-event governance。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)

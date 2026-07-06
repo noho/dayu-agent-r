@@ -18,6 +18,7 @@ from dayu.cli.composer import InputReaderComposer
 from dayu.cli.run_keys import RunningKeyAction
 from dayu.cli.run_view import InteractiveRunViewOptions, TerminalInteractiveRunView
 from dayu.cli.session_terminal_cursor import read_cli_terminal_cursor
+from dayu.cli.thinking import CliThinkingRenderer, CliThinkingRendererOptions
 from dayu.cli.agent_entrypoint import (
     CliSigintMonitor,
     package_config_root,
@@ -49,6 +50,7 @@ from dayu.host.api import (
     HostFinalAnswerView,
     HostStreamCursor,
     HostTerminalStatus,
+    HostThinkingView,
     OutboxProjectionStatus,
     OutboxTerminalCursor,
     OutboxTerminalItemsBatch,
@@ -61,6 +63,7 @@ from dayu.host.api import (
     SubmitFollowupRequest,
 )
 from dayu.service.entrypoint_runtime import (
+    EntrypointThinking,
     EntrypointRunTerminalResult,
     EntrypointRuntimeRequest,
     EntrypointRuntimeResult,
@@ -148,6 +151,7 @@ class _FakeHost:
     read_outbox_requests: list[ReadOutboxTerminalItemsRequest]
     _submit_statuses: tuple[HostTerminalStatus | None, ...]
     _submit_activities: tuple[bool, ...]
+    _submit_thinking: tuple[bool, ...]
     _cancel_status: HostTerminalStatus | None
     _run_statuses: tuple[RunStatus, ...]
     _submit_index: int
@@ -159,6 +163,7 @@ class _FakeHost:
         *,
         submit_statuses: tuple[HostTerminalStatus | None, ...] = (),
         submit_activities: tuple[bool, ...] = (),
+        submit_thinking: tuple[bool, ...] = (),
         cancel_status: HostTerminalStatus | None = None,
         run_statuses: tuple[RunStatus, ...] = (RunStatus.SUCCEEDED,),
         block_cancel_after_record: bool = False,
@@ -168,6 +173,7 @@ class _FakeHost:
         :param submit_statuses: 每轮 submit 返回前推入 watcher 的 terminal
             状态；``None`` 表示该轮 watcher 不产生 terminal。
         :param submit_activities: 每轮 submit 是否先推入 activity event。
+        :param submit_thinking: 每轮 submit 是否先推入 thinking event。
         :param cancel_status: cancel 返回前推入 watcher 的 terminal 状态。
         :param run_statuses: ``get_run`` 依次返回的状态。
         :param block_cancel_after_record: 是否在记录 cancel 后阻塞。
@@ -184,6 +190,7 @@ class _FakeHost:
         self.read_outbox_requests = []
         self._submit_statuses = submit_statuses
         self._submit_activities = submit_activities
+        self._submit_thinking = submit_thinking
         self._cancel_status = cancel_status
         self._run_statuses = run_statuses
         self._submit_index = 0
@@ -251,6 +258,10 @@ class _FakeHost:
         if status_index < len(self._submit_statuses):
             status = self._submit_statuses[status_index]
         if status is not None:
+            if status_index < len(self._submit_thinking) and self._submit_thinking[
+                status_index
+            ]:
+                await self.watchers[-1].push(_thinking_event(run_id=run_id))
             if status_index < len(self._submit_activities) and self._submit_activities[status_index]:
                 await self.watchers[-1].push(_activity_event(run_id=run_id))
             await self.watchers[-1].push(_terminal_event(run_id=run_id, status=status))
@@ -1156,7 +1167,7 @@ def test_interactive_activity_uses_run_view_buffer_before_next_prompt(
     monkeypatch.setattr(
         interactive_command,
         "new_interactive_run_view",
-        lambda: run_view,
+        lambda show_activity=False: run_view,
     )
 
     exit_code = cli_main.main(("interactive", "--base", str(tmp_path)))
@@ -1168,6 +1179,102 @@ def test_interactive_activity_uses_run_view_buffer_before_next_prompt(
     assert len(run_view.activity_lines) == 2
     assert all("工具批次完成" in line for line in run_view.activity_lines)
     assert run_view.transcript_lines == ("answer for run-1", "answer for run-2")
+
+
+def test_interactive_no_detail_omits_activity_and_keeps_final_answer_stdout(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--no-detail`` 不注册 activity callback，final answer 仍写 stdout。"""
+
+    fake_host = _FakeHost(
+        submit_statuses=(HostTerminalStatus.SUCCEEDED,),
+        submit_activities=(True,),
+    )
+    run_view_factory_calls: list[bool] = []
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        interactive_command,
+        "open_host",
+        lambda _options: _FakeOpenHostContext(fake_host),
+    )
+    monkeypatch.setattr(
+        interactive_command,
+        "_read_user_input",
+        _input_reader(("第一轮",)),
+    )
+    monkeypatch.setattr(
+        interactive_command,
+        "new_interactive_run_view",
+        lambda show_activity=False: run_view_factory_calls.append(show_activity),
+    )
+
+    exit_code = cli_main.main(("interactive", "--base", str(tmp_path), "--no-detail"))
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_SUCCESS
+    assert captured.out.strip() == "answer for run-1"
+    assert "Activity:" not in captured.err
+    assert run_view_factory_calls == []
+
+
+def test_interactive_thinking_flag_outputs_reasoning_delta_and_no_thinking_suppresses_it(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """有 thinking event 时，``--thinking`` 与 ``--no-thinking`` 输出必须不同。"""
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        interactive_command,
+        "_read_user_input",
+        _input_reader(("第一轮",)),
+    )
+    monkeypatch.setattr(
+        interactive_command,
+        "open_host",
+        lambda _options: _FakeOpenHostContext(
+            _FakeHost(
+                submit_statuses=(HostTerminalStatus.SUCCEEDED,),
+                submit_thinking=(True,),
+            )
+        ),
+    )
+
+    thinking_exit = cli_main.main(
+        ("interactive", "--base", str(tmp_path), "--thinking")
+    )
+    thinking_captured = capsys.readouterr()
+
+    monkeypatch.setattr(
+        interactive_command,
+        "_read_user_input",
+        _input_reader(("第一轮",)),
+    )
+    monkeypatch.setattr(
+        interactive_command,
+        "open_host",
+        lambda _options: _FakeOpenHostContext(
+            _FakeHost(
+                submit_statuses=(HostTerminalStatus.SUCCEEDED,),
+                submit_thinking=(True,),
+            )
+        ),
+    )
+
+    no_thinking_exit = cli_main.main(
+        ("interactive", "--base", str(tmp_path), "--no-thinking")
+    )
+    no_thinking_captured = capsys.readouterr()
+
+    assert thinking_exit == EXIT_SUCCESS
+    assert no_thinking_exit == EXIT_SUCCESS
+    assert thinking_captured.out.strip() == "answer for run-1"
+    assert no_thinking_captured.out.strip() == "answer for run-1"
+    assert "Thinking: 正在分析收入变化" in thinking_captured.err
+    assert "Thinking:" not in no_thinking_captured.err
 
 
 def test_interactive_skips_blank_input_before_submit(
@@ -1467,17 +1574,22 @@ async def test_interactive_repl_returns_130_on_second_sigint(
     assert len(fake_host.cancel_requests) == 1
 
 
-def test_interactive_unsupported_old_flag_exits_with_usage_error(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """unsupported 旧执行参数应 fail fast。"""
+def test_interactive_thinking_flags_are_display_options_not_execution_overrides() -> None:
+    """``--thinking`` / ``--no-thinking`` 不进入旧执行参数拒绝集合。
 
-    exit_code = cli_main.main(("interactive", "--thinking"))
-    captured = capsys.readouterr()
+    :returns: ``None``。
+    :raises AssertionError: thinking 展示参数被错误列为 unsupported 时抛出。
+    """
 
-    assert exit_code == EXIT_USAGE_ERROR
-    assert "unsupported option" in captured.err
-    assert "--thinking/--no-thinking" in captured.err
+    thinking_args = parse_cli_args(("interactive", "--thinking"))
+    no_thinking_args = parse_cli_args(("interactive", "--no-thinking"))
+
+    assert thinking_args.thinking is True
+    assert no_thinking_args.thinking is False
+    assert "--thinking/--no-thinking" not in unsupported_execution_option_names(thinking_args)
+    assert "--thinking/--no-thinking" not in unsupported_execution_option_names(
+        no_thinking_args
+    )
 
 
 def test_interactive_debug_stream_is_not_unsupported_execution_option() -> None:
@@ -1612,6 +1724,11 @@ async def test_cancel_after_first_sigint_returns_completed_submit_terminal() -> 
     accepted_run.record("run-1")
     submit_task = asyncio.create_task(_already_terminal(_terminal_result(status=HostTerminalStatus.SUCCEEDED)))
     await asyncio.sleep(0)
+    stderr = io.StringIO()
+    thinking_renderer = CliThinkingRenderer(
+        stderr=stderr,
+        options=CliThinkingRendererOptions(enabled=True),
+    )
 
     result = await interactive_command._cancel_interactive_turn_after_first_sigint(
         host=cast(Host, _FakeHost()),
@@ -1626,10 +1743,13 @@ async def test_cancel_after_first_sigint_returns_completed_submit_terminal() -> 
         submit_task=submit_task,
         sigint_monitor=_ImmediateSecondSigintMonitor(),
         observed_sigint_count=1,
+        thinking_renderer=thinking_renderer,
     )
 
     assert result is not None
     assert result.terminal_status is HostTerminalStatus.SUCCEEDED
+    thinking_renderer.record(_entrypoint_thinking(dedupe_key="thinking-1"))
+    assert stderr.getvalue() == ""
 
 
 async def _prepare_interactive_runtime(tmp_path: Path) -> EntrypointRuntimeResult:
@@ -1846,6 +1966,48 @@ def _activity_event(*, run_id: str) -> HostEvent:
         final_answer=None,
         error_message=None,
         cancel_reason=None,
+    )
+
+
+def _thinking_event(*, run_id: str) -> HostEvent:
+    """构造 Host thinking event。
+
+    :param run_id: Run id。
+    :returns: HostEvent。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return HostEvent(
+        event_id=f"thinking-{run_id}",
+        event_sequence=int(run_id.removeprefix("run-")),
+        session_id="session-1",
+        run_id=run_id,
+        event_class=HostEventClass.PREVIEW,
+        event_type="REASONING_DELTA",
+        kind=HostEventKind.PROGRESS,
+        activity=None,
+        thinking=HostThinkingView(text_delta="正在分析收入变化"),
+        dedupe_key=f"thinking-{run_id}",
+        terminal_status=None,
+        final_answer=None,
+        error_message=None,
+        cancel_reason=None,
+    )
+
+
+def _entrypoint_thinking(*, dedupe_key: str) -> EntrypointThinking:
+    """构造 Service entrypoint thinking。
+
+    :param dedupe_key: thinking dedupe key。
+    :returns: Service entrypoint thinking。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return EntrypointThinking(
+        run_id="run-1",
+        event_sequence=1,
+        dedupe_key=dedupe_key,
+        text_delta="取消后不应输出",
     )
 
 

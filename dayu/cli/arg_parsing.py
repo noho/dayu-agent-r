@@ -138,7 +138,7 @@ class ParsedCliArgs(argparse.Namespace):
     ticker: str | None
     label: str | None
     model_name: str | None
-    thinking: bool | None
+    thinking: bool
     web_provider: str | None
     temperature: float | None
     debug_sse: bool
@@ -250,11 +250,11 @@ def _new_default_namespace() -> ParsedCliArgs:
     namespace.log_level = DEFAULT_LOG_LEVEL
     namespace.debug_stream = False
     namespace.log_file = None
-    namespace.detail = False
+    namespace.detail = True
     namespace.ticker = None
     namespace.label = None
     namespace.model_name = None
-    namespace.thinking = None
+    namespace.thinking = True
     namespace.web_provider = None
     namespace.temperature = None
     namespace.debug_sse = False
@@ -492,6 +492,21 @@ def _register_interactive_command(
     )
     parser.add_argument("--ticker", help="可选公司代码或财报主体。")
     parser.add_argument("--label", help="复用或绑定的本地会话标签。")
+    detail_group = parser.add_mutually_exclusive_group()
+    detail_group.add_argument(
+        "--detail",
+        dest="detail",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="显示运行态 activity stream。",
+    )
+    detail_group.add_argument(
+        "--no-detail",
+        dest="detail",
+        action="store_false",
+        default=argparse.SUPPRESS,
+        help="不显示运行态 activity stream。",
+    )
     _add_agent_execution_arguments(parser)
 
 
@@ -673,15 +688,15 @@ def _add_agent_execution_arguments(parser: argparse.ArgumentParser) -> None:
         "--thinking",
         dest="thinking",
         action="store_true",
-        default=None,
-        help="请求启用模型思考能力；执行期按当前配置裁决。",
+        default=argparse.SUPPRESS,
+        help="在终端显示运行态思考展示。",
     )
     thinking_group.add_argument(
         "--no-thinking",
         dest="thinking",
         action="store_false",
-        default=None,
-        help="请求关闭模型思考能力；执行期按当前配置裁决。",
+        default=argparse.SUPPRESS,
+        help="不在终端显示运行态思考展示。",
     )
     parser.add_argument("--web-provider", help="Web 工具 provider 覆盖标识。")
     parser.add_argument("--temperature", type=float, help="本轮模型采样温度覆盖值。")

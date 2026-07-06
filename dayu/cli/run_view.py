@@ -98,9 +98,11 @@ class InteractiveRunViewOptions:
     """interactive run view 配置。
 
     :param enabled: 是否启用 view 切换与 activity 展示。
+    :param initial_mode: 初始展示模式。
     """
 
     enabled: bool
+    initial_mode: InteractiveRunViewMode = InteractiveRunViewMode.TRANSCRIPT
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,9 +125,10 @@ class _InteractiveRunViewActivitySink:
 class TerminalInteractiveRunView:
     """非 full-screen 的 interactive transcript/activity run view。
 
-    默认处于 transcript view。activity 到达时总是进入 activity buffer；只有在
-    activity view 已打开时才实时写 UI stderr。terminal result 始终进入
-    transcript buffer；在 transcript view 下保持原 stdout/stderr 用户通道输出。
+    默认处于 transcript view，也可由 CLI display option 初始打开 activity
+    view。activity 到达时总是进入 activity buffer；只有在 activity view
+    已打开时才实时写 UI stderr。terminal result 始终进入 transcript
+    buffer，并写入 stdout/stderr 用户通道。
     """
 
     _stdout: TextIO
@@ -159,7 +162,10 @@ class TerminalInteractiveRunView:
         self._stderr = sys.stderr if stderr is None else stderr
         self._enabled = self._stderr.isatty() if options is None else options.enabled
         self._closed = False
-        self._mode = InteractiveRunViewMode.TRANSCRIPT
+        initial_mode = (
+            InteractiveRunViewMode.TRANSCRIPT if options is None else options.initial_mode
+        )
+        self._mode = initial_mode if self._enabled else InteractiveRunViewMode.TRANSCRIPT
         self._activity_sink = _InteractiveRunViewActivitySink(view=self)
         self._transcript_lines = []
         self._activity_lines = []
@@ -256,9 +262,9 @@ class TerminalInteractiveRunView:
         stderr_lines = _split_buffer_lines(stderr_buffer.getvalue())
         self._transcript_lines.extend(stdout_lines)
         self._transcript_lines.extend(stderr_lines)
-        if not self._enabled or self._mode is InteractiveRunViewMode.TRANSCRIPT:
-            _write_lines(stdout_lines, self._stdout)
-            _write_lines(stderr_lines, self._stderr)
+        _write_lines(stdout_lines, self._stdout)
+        _write_lines(stderr_lines, self._stderr)
+        self._mode = InteractiveRunViewMode.TRANSCRIPT
         return exit_code
 
     def toggle_view(self) -> None:
@@ -321,16 +327,23 @@ def new_interactive_run_view(
     *,
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
+    show_activity: bool = False,
 ) -> InteractiveRunView:
     """按当前 stderr TTY 能力创建 interactive run view。
 
     :param stdout: transcript 用户结果输出流；``None`` 表示当前 ``sys.stdout``。
     :param stderr: UI / 错误输出流；``None`` 表示当前 ``sys.stderr``。
+    :param show_activity: 初始是否展示运行态 activity。
     :returns: interactive run view。
     :raises Exception: 不主动抛出异常。
     """
 
-    return TerminalInteractiveRunView(stdout=stdout, stderr=stderr)
+    options = (
+        InteractiveRunViewOptions(enabled=True, initial_mode=InteractiveRunViewMode.ACTIVITY)
+        if show_activity
+        else None
+    )
+    return TerminalInteractiveRunView(stdout=stdout, stderr=stderr, options=options)
 
 
 def _split_buffer_lines(value: str) -> list[str]:

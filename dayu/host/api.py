@@ -2645,6 +2645,25 @@ class HostActivityView:
             raise TypeError("HostActivityView.counts must be HostActivityCounts")
 
 
+@dataclass(frozen=True, slots=True)
+class HostThinkingView:
+    """Host public event 的运行态 thinking 展示视图。
+
+    :param text_delta: 本次 thinking 增量文本，必须非空。
+    """
+
+    text_delta: str
+
+    def __post_init__(self) -> None:
+        """校验 thinking 展示视图字段。
+
+        :returns: ``None``。
+        :raises ValueError: thinking 增量为空时抛出。
+        """
+
+        _require_non_empty(self.text_delta, field_name="HostThinkingView.text_delta")
+
+
 class HostTerminalStatus(StrEnum):
     """Service-facing terminal Host event 状态。
 
@@ -3016,6 +3035,7 @@ class HostEvent:
     :param event_type: EventLog row 的 public 事件类型标签。
     :param kind: Service-facing event 类型。
     :param activity: 安全 activity 展示视图；无可展示 activity 时为 ``None``。
+    :param thinking: 运行态 thinking 展示视图；无 thinking 增量时为 ``None``。
     :param dedupe_key: 调用方去重使用的稳定键。
     :param terminal_status: terminal event 状态；非终态事件为 ``None``。
     :param final_answer: 成功终态事件内联的最终回答视图；非成功终态为
@@ -3038,6 +3058,7 @@ class HostEvent:
     final_answer: HostFinalAnswerView | None
     error_message: str | None
     cancel_reason: str | None
+    thinking: HostThinkingView | None = None
 
     def __post_init__(self) -> None:
         """校验 Service-facing Host event 字段。
@@ -3062,6 +3083,10 @@ class HostEvent:
             self.activity, HostActivityView
         ):
             raise TypeError("HostEvent.activity must be HostActivityView")
+        if self.thinking is not None and not isinstance(
+            self.thinking, HostThinkingView
+        ):
+            raise TypeError("HostEvent.thinking must be HostThinkingView")
         _require_non_empty(self.dedupe_key, field_name="HostEvent.dedupe_key")
         _require_optional_non_empty(
             self.error_message, field_name="HostEvent.error_message"
@@ -3087,6 +3112,8 @@ def _validate_host_event_terminal_payload(event: HostEvent) -> None:
             )
         return
 
+    if event.thinking is not None:
+        raise ValueError("HostEvent terminal kind must not include thinking")
     expected_status = _terminal_status_for_event_kind(event.kind)
     if event.terminal_status != expected_status:
         raise ValueError("HostEvent.terminal_status does not match kind")
@@ -3535,6 +3562,7 @@ __all__ = [
     "HostPayloadRef",
     "HostStreamCursor",
     "HostTerminalStatus",
+    "HostThinkingView",
     "ListSessionsResult",
     "LocalEngineWorker",
     "LocalEngineWorkerFactory",

@@ -238,8 +238,6 @@ def unsupported_execution_option_names(args: ParsedCliArgs) -> tuple[str, ...]:
     """
 
     names: list[str] = []
-    if args.thinking is not None:
-        names.append("--thinking/--no-thinking")
     if args.web_provider is not None:
         names.append("--web-provider")
     if args.debug_sse:

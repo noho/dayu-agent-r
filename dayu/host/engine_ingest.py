@@ -894,6 +894,11 @@ class EngineEventIngestor:
         """
 
         event = context.candidate.engine_event
+        if event.type == EngineEventType.REASONING_DELTA and isinstance(
+            event.data, ReasoningDeltaData
+        ):
+            row = self._append_preview_event(transaction, context)
+            return _single_event_result(row)
         if _is_transient_delta_event(event):
             return _accepted_no_event_result()
         if event.type == EngineEventType.FINAL_ANSWER and isinstance(
@@ -4589,9 +4594,6 @@ def _is_transient_delta_event(event: EngineEvent) -> bool:
         event.type == EngineEventType.CONTENT_DELTA
         and isinstance(event.data, ContentDeltaData)
     ) or (
-        event.type == EngineEventType.REASONING_DELTA
-        and isinstance(event.data, ReasoningDeltaData)
-    ) or (
         event.type == EngineEventType.TOOL_CALL_DELTA
         and isinstance(event.data, ToolCallDeltaData)
     )
@@ -4624,6 +4626,9 @@ def _preview_payload(
         common["has_content"] = data.content is not None
         common["has_reasoning_content"] = data.reasoning_content is not None
         common["finish_reason"] = data.finish_reason.value
+    elif isinstance(data, ReasoningDeltaData):
+        common["iteration_id"] = data.iteration_id
+        common["delta"] = data.delta
     elif isinstance(data, ToolCallsBatchReadyData):
         common["iteration_id"] = data.iteration_id
         common["tool_call_count"] = len(data.tool_calls)

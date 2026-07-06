@@ -754,6 +754,8 @@ def test_delta_and_unknown_events_keep_identity_without_activity(
     assert content.activity is None
     assert reasoning.event_type == "REASONING_DELTA"
     assert reasoning.activity is None
+    assert reasoning.thinking is not None
+    assert reasoning.thinking.text_delta == "hidden reasoning"
     assert unknown.event_class is HostEventClass.PROJECTION_SIGNAL
     assert unknown.event_type == "FUTURE_PROGRESS"
     assert unknown.activity is None
