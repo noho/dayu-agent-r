@@ -32,6 +32,7 @@ from dayu.fins.ingestion.wait_adapter import (
     FINS_UPLOAD_AWAITING_TOOL_NAME,
     build_fins_wait_activation_registry,
     build_fins_wait_adapter_registry,
+    build_fins_wait_poll_adapter_registry,
 )
 from dayu.fins.ingestion_runtime import FinsIngestionRuntime
 from dayu.fins.service_runtime import DefaultFinsRuntime
@@ -52,6 +53,8 @@ from dayu.host.memory import MemoryProjectionPolicy
 from dayu.host.wait_adapter import (
     WaitActivationRegistry,
     WaitAdapterRegistry,
+    WaitPollAdapterRegistry,
+    WaitPollerRuntimePolicy,
 )
 from dayu.host.tool_duplicate_governance import (
     DuplicateDecisionKind,
@@ -162,12 +165,15 @@ class ServiceAssemblyOverrides:
     :param model_id: 普通 Run 模型显式 override；``None`` 表示不覆盖。
     :param runner_option_hint_id: 普通 Run runner option hint 显式 override；
         ``None`` 表示不覆盖。
+    :param wait_poller_policy: Service assembly 显式启用 production wait poller
+        的 typed opt-in；``None`` 表示默认不启动 poller。
     """
 
     host_runtime_id: str | None = None
     execution_profile_id: str | None = None
     model_id: str | None = None
     runner_option_hint_id: str | None = None
+    wait_poller_policy: WaitPollerRuntimePolicy | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -830,6 +836,7 @@ def _compose_options(
         ),
         memory_projection_catchup_batch_size=(host_runtime.memory_projection_catch_up_batch_size),
         enable_truncation_manager=(execution_profile.tool_truncation_policy.enabled),
+        wait_poller_policy=request.overrides.wait_poller_policy,
     )
 
 
@@ -1713,17 +1720,21 @@ def _tooling_options_from_discovery(
         return None
     if not source_refs:
         raise ValueError("discovered tools must have source refs")
+    available_tool_names = frozenset(
+        definition.name for definition in tool_bundle.definitions
+    )
     wait_adapter_registry = _fins_wait_adapter_registry_from_provider_configs(
         provider_configs,
-        available_tool_names=frozenset(
-            definition.name for definition in tool_bundle.definitions
-        ),
+        available_tool_names=available_tool_names,
     )
     wait_activation_registry = _fins_wait_activation_registry_from_provider_configs(
         provider_configs,
-        available_tool_names=frozenset(
-            definition.name for definition in tool_bundle.definitions
-        ),
+        available_tool_names=available_tool_names,
+        fins_awaiting_runtime=fins_awaiting_runtime,
+    )
+    wait_poll_adapter_registry = _fins_wait_poll_adapter_registry_from_provider_configs(
+        provider_configs,
+        available_tool_names=available_tool_names,
         fins_awaiting_runtime=fins_awaiting_runtime,
     )
     return HostToolingOptions(
@@ -1731,6 +1742,7 @@ def _tooling_options_from_discovery(
         source_refs=source_refs,
         wait_adapter_registry=wait_adapter_registry,
         wait_activation_registry=wait_activation_registry,
+        wait_poll_adapter_registry=wait_poll_adapter_registry,
         duplicate_governance_policy=_duplicate_governance_policy_from_config(
             duplicate_governance_policy_config
         ),
@@ -1817,6 +1829,40 @@ def _fins_wait_activation_registry_from_provider_configs(
     # 生产路径中 awaiting tool callable、poll adapter 与 activation adapter
     # 必须共享同一个 runtime，避免 accepted activation 看不到工具准备的 observation。
     return build_fins_wait_activation_registry(
+        runtime=fins_awaiting_runtime,
+        tool_names=registry_inputs.tool_names,
+    )
+
+
+def _fins_wait_poll_adapter_registry_from_provider_configs(
+    provider_configs: tuple[ToolDiscoveryProviderConfig, ...],
+    *,
+    available_tool_names: frozenset[str],
+    fins_awaiting_runtime: FinsObservationRuntime | None,
+) -> WaitPollAdapterRegistry | None:
+    """从显式 provider config 构造 Fins wait poll adapter registry。
+
+    :param provider_configs: 当前 Host assembly 使用的工具发现 provider 配置。
+    :param available_tool_names: 当前 ToolBundle 中实际存在的工具名。
+    :param fins_awaiting_runtime: Service discovery 创建的共享 Fins awaiting
+        runtime；无 Fins awaiting provider 时为 ``None``。
+    :returns: Fins wait poll adapter registry；没有可绑定 awaiting 工具时为
+        ``None``。
+    :raises ValueError: workspace root 缺失、非绝对、不一致，或共享 runtime
+        缺失时抛出。
+    """
+
+    registry_inputs = _fins_awaiting_registry_inputs_from_provider_configs(
+        provider_configs,
+        available_tool_names=available_tool_names,
+    )
+    if registry_inputs is None:
+        return None
+    if fins_awaiting_runtime is None:
+        raise ValueError("Fins wait poll adapter registry requires shared runtime")
+    if not isinstance(fins_awaiting_runtime, FinsIngestionRuntime):
+        raise ValueError("Fins wait poll adapter registry requires ingestion runtime")
+    return build_fins_wait_poll_adapter_registry(
         runtime=fins_awaiting_runtime,
         tool_names=registry_inputs.tool_names,
     )

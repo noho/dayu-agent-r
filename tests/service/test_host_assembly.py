@@ -41,6 +41,7 @@ from dayu.fins.ingestion.observation_handle import (
 from dayu.fins.ingestion.wait_adapter import (
     FINS_INGESTION_WAIT_ADAPTER_KEY,
     FinsIngestionWaitActivationAdapter,
+    FinsIngestionWaitPollAdapter,
 )
 from dayu.fins.ingestion_runtime import FinsIngestionRuntime
 from dayu.fins.service_runtime import DefaultFinsRuntime
@@ -57,7 +58,7 @@ from dayu.host.api import (
 from dayu.host.tool_duplicate_governance import (
     DuplicateDecisionKind,
 )
-from dayu.host.wait_adapter import WaitActivationRequest
+from dayu.host.wait_adapter import WaitActivationRequest, WaitPollerRuntimePolicy
 from dayu.host.waiting import ToolAwaitingAcceptedAck, ToolAwaitingEventRef
 from dayu.runtime.config_loader import ConfigLoader, RuntimeConfig
 from dayu.runtime.config_loader import (
@@ -217,6 +218,7 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
     assert result.options.payload_inline_threshold_bytes == 2048
     assert result.options.worker_startup_timeout_seconds == 4.5
     assert result.options.enable_truncation_manager is True
+    assert result.options.wait_poller_policy is None
     assert result.options.tooling_options is not None
     process_policy = result.options.tooling_options.process_capsule_interrupt_policy
     assert process_policy.terminate_grace_seconds == 0.35
@@ -265,6 +267,63 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
     assert result.diagnostics.ordinary_profile_compatibility.profile_id == "standard-256k"
     assert result.diagnostics.ordinary_profile_compatibility.selected_model_id == _MODEL_ID
     assert result.diagnostics.tool_selection == ("mode=select,tools=record_smoke_fact")
+
+
+def test_compose_open_host_options_passes_explicit_wait_poller_policy(
+    tmp_path: Path,
+) -> None:
+    """Service assembly 显式 poller override 必须进入 Host opener options。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises AssertionError: poller policy 未按 typed override 传递时抛出。
+    """
+
+    _write_tool_discovery_overlay(tmp_path)
+    locations = resolve_runtime_locations(
+        project_root=tmp_path,
+        package_config_root=_PACKAGE_CONFIG_ROOT,
+    )
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
+        workspace_config_dir=locations.config_overlay_dir
+    )
+    discovered_tools = _discover_service_tools_for_workspace(config, workspace_root=tmp_path)
+    scene_inputs = prepare_scene(
+        ScenePrepareRequest(
+            scene_id=_SCENE_ID,
+            scene_manifest_root=locations.scene_manifest_root,
+            prompt_asset_root=locations.prompt_asset_root,
+            context_slot_values={
+                "fins_default_subject": "测试财报主体",
+                "base_user": "service-assembly-test",
+            },
+            available_tools=_scene_tool_catalog(discovered_tools),
+        )
+    )
+    policy = WaitPollerRuntimePolicy(
+        enabled=True,
+        poll_interval_seconds=0.2,
+    )
+
+    result = compose_open_host_options(
+        ServiceOpenHostAssemblyRequest(
+            workspace_root=tmp_path,
+            config=config,
+            locations=locations,
+            scene_inputs=scene_inputs,
+            discovered_tools=discovered_tools,
+            overrides=ServiceAssemblyOverrides(
+                host_runtime_id="local",
+                execution_profile_id="standard-256k",
+                model_id=_MODEL_ID,
+                runner_option_hint_id=_RUNNER_HINT_ID,
+                wait_poller_policy=policy,
+            ),
+            env={"DEEPSEEK_API_KEY": _API_KEY},
+        )
+    )
+
+    assert result.options.wait_poller_policy is policy
 
 
 def test_compose_open_host_options_reads_compactor_scene_id_from_profile(
@@ -737,6 +796,7 @@ def test_tooling_options_without_fins_awaiting_providers_has_no_wait_adapter_reg
     assert tooling_options.business_tool_bundle.definitions[0].name == "lookup_fact"
     assert tooling_options.wait_adapter_registry is None
     assert tooling_options.wait_activation_registry is None
+    assert tooling_options.wait_poll_adapter_registry is None
 
 
 def test_tooling_options_binds_fins_wait_adapter_registry_for_enabled_awaiting_providers(
@@ -784,6 +844,7 @@ def test_tooling_options_binds_fins_wait_adapter_registry_for_enabled_awaiting_p
     assert tooling_options is not None
     assert tooling_options.wait_adapter_registry is not None
     assert tooling_options.wait_activation_registry is not None
+    assert tooling_options.wait_poll_adapter_registry is not None
     download_binding = tooling_options.wait_adapter_registry.resolve_binding(
         tool_name=DOWNLOAD_TOOL_NAME,
         await_kind=ToolAwaitKind.EXTERNAL_JOB,
@@ -807,6 +868,11 @@ def test_tooling_options_binds_fins_wait_adapter_registry_for_enabled_awaiting_p
     )
     assert isinstance(activation_adapter, FinsIngestionWaitActivationAdapter)
     assert activation_adapter.runtime is fins_runtime
+    poll_adapter = tooling_options.wait_poll_adapter_registry.resolve_adapter(
+        FINS_INGESTION_WAIT_ADAPTER_KEY
+    )
+    assert isinstance(poll_adapter, FinsIngestionWaitPollAdapter)
+    assert poll_adapter.runtime is fins_runtime
 
 
 @pytest.mark.asyncio
@@ -837,6 +903,7 @@ async def test_service_fins_awaiting_wiring_uses_shared_runtime_for_activation(
     assert tooling_options is not None
     assert tooling_options.wait_adapter_registry is not None
     assert tooling_options.wait_activation_registry is not None
+    assert tooling_options.wait_poll_adapter_registry is not None
     definition = tooling_options.business_tool_bundle.definitions[0]
     callable_ = definition.callable
     assert definition.name == DOWNLOAD_TOOL_NAME
@@ -847,6 +914,12 @@ async def test_service_fins_awaiting_wiring_uses_shared_runtime_for_activation(
     assert isinstance(activation_adapter, FinsIngestionWaitActivationAdapter)
     assert activation_adapter.runtime is discovered_tools.fins_awaiting_runtime
     assert activation_adapter.runtime is callable_.runtime
+    poll_adapter = tooling_options.wait_poll_adapter_registry.resolve_adapter(
+        FINS_INGESTION_WAIT_ADAPTER_KEY
+    )
+    assert isinstance(poll_adapter, FinsIngestionWaitPollAdapter)
+    assert poll_adapter.runtime is discovered_tools.fins_awaiting_runtime
+    assert poll_adapter.runtime is callable_.runtime
 
     outcome = await callable_(
         _service_tool_call(
@@ -901,6 +974,41 @@ def test_tooling_options_skips_wait_adapter_for_missing_awaiting_tool_definition
     assert tooling_options is not None
     assert tooling_options.wait_adapter_registry is None
     assert tooling_options.wait_activation_registry is None
+    assert tooling_options.wait_poll_adapter_registry is None
+
+
+def test_tooling_options_skips_wait_poll_adapter_for_disabled_awaiting_provider(
+    tmp_path: Path,
+) -> None:
+    """禁用的 Fins awaiting provider 不应装配 wait poll adapter。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises AssertionError: 禁用 provider 仍产生 poll registry 时抛出。
+    """
+
+    workspace_root = (tmp_path / "fins-workspace").resolve(strict=False)
+    disabled_provider = replace(
+        _provider_config(
+            provider_id="financial-download-tools",
+            import_path="dayu.fins.tools.download_provider:discover_tools",
+            source_id="dayu.fins.tools.download_provider",
+            workspace_root=workspace_root,
+        ),
+        enabled=False,
+    )
+    tooling_options = _tooling_options_from_discovery(
+        tool_bundle=ToolBundle(definitions=(_tool_definition(DOWNLOAD_TOOL_NAME),)),
+        source_refs=(_source_ref("fins-awaiting-test"),),
+        provider_configs=(disabled_provider,),
+        fins_awaiting_runtime=None,
+        duplicate_governance_policy_config=_duplicate_governance_policy_config(),
+    )
+
+    assert tooling_options is not None
+    assert tooling_options.wait_adapter_registry is None
+    assert tooling_options.wait_activation_registry is None
+    assert tooling_options.wait_poll_adapter_registry is None
 
 
 def test_fins_awaiting_provider_workspace_root_mismatch_fails_before_open_host(
@@ -1168,10 +1276,7 @@ def test_fins_tool_discovery_spec_injects_runtime_workspace_root(
     :raises AssertionError: workspace root 未注入或污染 raw config 时抛出。
     """
 
-    raw_config: dict[str, JsonValue] = {
-        "workspace_root": None,
-        "limits": {},
-    }
+    raw_config: dict[str, JsonValue] = {"limits": {}}
     provider = ToolDiscoveryProviderConfig(
         provider_id="financial-read-tools",
         import_path="dayu.fins.tools.provider:discover_tools",
@@ -1189,7 +1294,7 @@ def test_fins_tool_discovery_spec_injects_runtime_workspace_root(
     spec = _tool_discovery_spec(effective_providers[0])
 
     assert spec.config["workspace_root"] == str(tmp_path.resolve(strict=False))
-    assert raw_config["workspace_root"] is None
+    assert "workspace_root" not in raw_config
 
 
 def test_fins_tool_discovery_spec_preserves_explicit_workspace_root(
@@ -1421,7 +1526,7 @@ def test_discover_service_tools_carries_effective_fins_config_into_compose(
                     "source_kind": "explicit_provider",
                     "source_id": "dayu.fins.tools.download_provider",
                     "enabled": True,
-                    "config": {"workspace_root": "workspace/"},
+                    "config": {},
                 }
             },
         },
@@ -1439,9 +1544,7 @@ def test_discover_service_tools_carries_effective_fins_config_into_compose(
         for provider_config in discovered_tools.effective_provider_configs
         if provider_config.provider_id == "financial-download-tools"
     )
-    assert discovered_provider.config["workspace_root"] == str(
-        (fins_workspace / "workspace").resolve(strict=False)
-    )
+    assert discovered_provider.config["workspace_root"] == str(fins_workspace)
 
     raw_provider = config.tool_discovery.providers["financial-download-tools"]
     corrupted_config = replace(

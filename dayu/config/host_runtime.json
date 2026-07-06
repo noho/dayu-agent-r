@@ -2,10 +2,10 @@
   "default_host_runtime_id": "local",
   "runtimes": {
     "local": {
-      "store_root": "workspace/.dayu/host",
-      "artifact_root": "workspace/.dayu/artifacts",
+      "store_root": ".dayu/host",
+      "artifact_root": ".dayu/artifacts",
       "sqlite": {
-        "path": "workspace/.dayu/host/dayu_host.sqlite3",
+        "path": ".dayu/host/dayu_host.sqlite3",
         "busy_timeout_seconds": 5.0,
         "write_busy_retry_count": 8,
         "write_retry_initial_delay_seconds": 0.005,

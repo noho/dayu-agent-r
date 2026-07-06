@@ -7,7 +7,6 @@
       "source_id": "dayu.fins.tools.provider",
       "enabled": true,
       "config": {
-        "workspace_root": "workspace/",
         "limits": {
           "processor_cache_max_entries": 128,
           "list_documents_max_items": 300,
@@ -28,9 +27,7 @@
       "source_kind": "explicit_provider",
       "source_id": "dayu.fins.tools.download_provider",
       "enabled": true,
-      "config": {
-        "workspace_root": "workspace/"
-      }
+      "config": {}
     },
     "financial-preprocess-tools": {
       "import_path": "dayu.fins.tools.preprocess_provider:discover_tools",
@@ -38,9 +35,7 @@
       "source_kind": "explicit_provider",
       "source_id": "dayu.fins.tools.preprocess_provider",
       "enabled": true,
-      "config": {
-        "workspace_root": "workspace/"
-      }
+      "config": {}
     },
     "financial-upload-tools": {
       "import_path": "dayu.fins.tools.upload_provider:discover_tools",
@@ -48,9 +43,7 @@
       "source_kind": "explicit_provider",
       "source_id": "dayu.fins.tools.upload_provider",
       "enabled": true,
-      "config": {
-        "workspace_root": "workspace/"
-      }
+      "config": {}
     },
     "doc-tools": {
       "import_path": "dayu.tools.doc_provider:discover_tools",

@@ -60,6 +60,8 @@ from dayu.host.wait_adapter import (
     WaitExternalJobLifecycleNoop,
     WaitExternalJobLifecycleResult,
     WaitExternalJobRefSource,
+    WaitPollAdapterRegistration,
+    WaitPollAdapterRegistry,
     WaitPollLost,
     WaitPollNotReady,
     WaitPollReady,
@@ -260,6 +262,32 @@ def build_fins_wait_activation_registry(
     return WaitActivationRegistry(
         (
             WaitActivationAdapterRegistration(
+                adapter_key=FINS_INGESTION_WAIT_ADAPTER_KEY,
+                adapter=adapter,
+            ),
+        )
+    )
+
+
+def build_fins_wait_poll_adapter_registry(
+    *, runtime: FinsObservationRuntime, tool_names: Sequence[str]
+) -> WaitPollAdapterRegistry:
+    """为启用的 Fins awaiting tools 构造 Host poll adapter registry。
+
+    :param runtime: Fins awaiting tool callable 使用的共享 observation runtime。
+    :param tool_names: 本次 Service assembly 中由启用 provider 声明的 Fins
+        awaiting 工具名；重复名称视为配置错误。
+    :returns: Host wait poll adapter registry。
+    :raises ValueError: 工具名为空、重复或不属于 Fins awaiting 稳定工具名时
+        抛出。
+    """
+
+    # poll adapter 由单个 adapter key 分发，tool_names 只用于装配期校验。
+    _deterministic_tool_names(tool_names)
+    adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
+    return WaitPollAdapterRegistry(
+        (
+            WaitPollAdapterRegistration(
                 adapter_key=FINS_INGESTION_WAIT_ADAPTER_KEY,
                 adapter=adapter,
             ),
