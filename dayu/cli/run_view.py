@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -16,6 +17,11 @@ from typing import Final, Protocol, TextIO
 
 from dayu.cli.activity import format_cli_activity_line
 from dayu.cli.output import render_interactive_terminal_result
+from dayu.cli.runtime_display import (
+    clear_completed_rows,
+    resolve_terminal_columns,
+    terminal_row_count,
+)
 from dayu.service.entrypoint_runtime import EntrypointActivity, EntrypointRunTerminalResult
 
 _TRANSCRIPT_HEADER: Final[str] = "Interactive transcript"
@@ -64,6 +70,23 @@ class InteractiveRunView(Protocol):
         """
         ...
 
+    def finish_runtime_display(self) -> None:
+        """结束当前运行态展示，为 terminal result 输出让出干净位置。
+
+        :returns: ``None``。
+        :raises OSError: 输出流写入失败时由实现透传。
+        """
+        ...
+
+    def set_runtime_line_guard(self, guard: Callable[[], None] | None) -> None:
+        """设置运行态输出前需要执行的行收尾回调。
+
+        :param guard: 输出运行态行前执行的回调；``None`` 表示不执行。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+        ...
+
     def toggle_view(self) -> None:
         """切换 transcript/activity view。
 
@@ -99,10 +122,16 @@ class InteractiveRunViewOptions:
 
     :param enabled: 是否启用 view 切换与 activity 展示。
     :param initial_mode: 初始展示模式。
+    :param terminal_control: 是否允许输出 ANSI 清理控制符；``None`` 表示按
+        stderr 是否 TTY 自动判断。
+    :param terminal_columns: 运行态清理使用的终端列数；``None`` 表示读取当前
+        终端或使用默认 fallback。
     """
 
     enabled: bool
     initial_mode: InteractiveRunViewMode = InteractiveRunViewMode.TRANSCRIPT
+    terminal_control: bool | None = None
+    terminal_columns: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,10 +164,14 @@ class TerminalInteractiveRunView:
     _stderr: TextIO
     _enabled: bool
     _closed: bool
+    _supports_terminal_control: bool
+    _terminal_columns: int
     _mode: InteractiveRunViewMode
     _activity_sink: ActivitySink
     _transcript_lines: list[str]
     _activity_lines: list[str]
+    _rendered_activity_row_count: int
+    _runtime_line_guard: Callable[[], None] | None
     _seen_activity_dedupe_keys: set[str]
     _last_activity_event_sequence: int | None
 
@@ -162,6 +195,12 @@ class TerminalInteractiveRunView:
         self._stderr = sys.stderr if stderr is None else stderr
         self._enabled = self._stderr.isatty() if options is None else options.enabled
         self._closed = False
+        terminal_control = None if options is None else options.terminal_control
+        self._supports_terminal_control = (
+            self._stderr.isatty() if terminal_control is None else terminal_control
+        )
+        terminal_columns = None if options is None else options.terminal_columns
+        self._terminal_columns = resolve_terminal_columns(terminal_columns)
         initial_mode = (
             InteractiveRunViewMode.TRANSCRIPT if options is None else options.initial_mode
         )
@@ -169,6 +208,8 @@ class TerminalInteractiveRunView:
         self._activity_sink = _InteractiveRunViewActivitySink(view=self)
         self._transcript_lines = []
         self._activity_lines = []
+        self._rendered_activity_row_count = 0
+        self._runtime_line_guard = None
         self._seen_activity_dedupe_keys = set()
         self._last_activity_event_sequence = None
 
@@ -211,6 +252,16 @@ class TerminalInteractiveRunView:
 
         return self._activity_sink
 
+    def set_runtime_line_guard(self, guard: Callable[[], None] | None) -> None:
+        """设置运行态输出前需要执行的行收尾回调。
+
+        :param guard: 输出运行态行前执行的回调；``None`` 表示不执行。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._runtime_line_guard = guard
+
     def record_activity(self, activity: EntrypointActivity) -> None:
         """记录并按当前 view mode 渲染 activity。
 
@@ -235,7 +286,7 @@ class TerminalInteractiveRunView:
         line = format_cli_activity_line(activity)
         self._activity_lines.append(line)
         if self._enabled and self._mode is InteractiveRunViewMode.ACTIVITY:
-            print(line, file=self._stderr)
+            self._render_runtime_line(line)
 
     def render_terminal_result(self, result: EntrypointRunTerminalResult) -> int:
         """渲染单轮 terminal result。
@@ -251,6 +302,7 @@ class TerminalInteractiveRunView:
                 stdout=self._stdout,
                 stderr=self._stderr,
             )
+        self.finish_runtime_display()
         stdout_buffer = StringIO()
         stderr_buffer = StringIO()
         exit_code = render_interactive_terminal_result(
@@ -278,18 +330,24 @@ class TerminalInteractiveRunView:
             return
         if self._mode is InteractiveRunViewMode.TRANSCRIPT:
             self._mode = InteractiveRunViewMode.ACTIVITY
-            _render_view_snapshot(
+            rendered_count = _render_view_snapshot(
                 header=_ACTIVITY_HEADER,
                 lines=self._activity_lines,
                 stderr=self._stderr,
+                line_guard=self._runtime_line_guard,
+                terminal_columns=self._terminal_columns,
             )
+            self._rendered_activity_row_count += rendered_count
             return
         self._mode = InteractiveRunViewMode.TRANSCRIPT
-        _render_view_snapshot(
+        rendered_count = _render_view_snapshot(
             header=_TRANSCRIPT_HEADER,
             lines=self._transcript_lines,
             stderr=self._stderr,
+            line_guard=self._runtime_line_guard,
+            terminal_columns=self._terminal_columns,
         )
+        self._rendered_activity_row_count += rendered_count
 
     def render_cancel_requested(self) -> None:
         """渲染用户已请求取消的运行态提示。
@@ -300,7 +358,7 @@ class TerminalInteractiveRunView:
 
         if self._closed or not self._enabled:
             return
-        print(_CANCEL_REQUESTED_MESSAGE, file=self._stderr)
+        self._render_runtime_line(_CANCEL_REQUESTED_MESSAGE)
 
     def render_local_exit_after_cancel(self) -> None:
         """渲染二次中断导致本地退出的提示。
@@ -311,7 +369,43 @@ class TerminalInteractiveRunView:
 
         if self._closed or not self._enabled:
             return
-        print(_LOCAL_EXIT_AFTER_CANCEL_MESSAGE, file=self._stderr)
+        self._render_runtime_line(_LOCAL_EXIT_AFTER_CANCEL_MESSAGE)
+
+    def _render_runtime_line(self, line: str) -> None:
+        """输出一条 interactive 运行态行并记录其屏幕行数。
+
+        :param line: 已格式化的单行展示文本。
+        :returns: ``None``。
+        :raises OSError: 输出流写入失败时由底层 ``print`` 透传。
+        """
+
+        if self._runtime_line_guard is not None:
+            self._runtime_line_guard()
+        print(line, file=self._stderr)
+        self._rendered_activity_row_count += terminal_row_count(
+            line,
+            columns=self._terminal_columns,
+        )
+
+    def finish_runtime_display(self) -> None:
+        """结束当前运行态展示，为 terminal result 输出让出干净位置。
+
+        TTY 下清除当前 turn 的 activity/view 快照行；非 TTY 或测试捕获流下
+        保留可读输出，不写 ANSI 控制符。
+
+        :returns: ``None``。
+        :raises OSError: 输出流写入失败时由底层输出流透传。
+        """
+
+        if (
+            self._closed
+            or not self._enabled
+            or not self._supports_terminal_control
+            or self._rendered_activity_row_count == 0
+        ):
+            return
+        clear_completed_rows(self._stderr, row_count=self._rendered_activity_row_count)
+        self._rendered_activity_row_count = 0
 
     def close(self) -> None:
         """关闭 view，后续 activity 不再写入 buffer。
@@ -377,21 +471,34 @@ def _render_view_snapshot(
     header: str,
     lines: Sequence[str],
     stderr: TextIO,
-) -> None:
+    line_guard: Callable[[], None] | None,
+    terminal_columns: int,
+) -> int:
     """渲染当前 view buffer 快照。
 
     :param header: 快照标题。
     :param lines: buffer 行。
     :param stderr: UI 输出流。
-    :returns: ``None``。
+    :param line_guard: 输出快照前执行的运行态行收尾回调。
+    :param terminal_columns: 运行态清理使用的终端列数。
+    :returns: 写出的屏幕行数。
     :raises OSError: 输出流写入失败时由底层 ``print`` 透传。
     """
 
+    if line_guard is not None:
+        line_guard()
     print(f"[{header}]", file=stderr)
+    row_count = terminal_row_count(f"[{header}]", columns=terminal_columns)
     if not lines:
         print(_EMPTY_VIEW_MESSAGE, file=stderr)
-        return
+        return row_count + terminal_row_count(
+            _EMPTY_VIEW_MESSAGE,
+            columns=terminal_columns,
+        )
     _write_lines(lines, stderr)
+    for line in lines:
+        row_count += terminal_row_count(line, columns=terminal_columns)
+    return row_count
 
 
 __all__: tuple[str, ...] = (

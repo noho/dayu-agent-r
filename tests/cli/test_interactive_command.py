@@ -1435,11 +1435,29 @@ async def test_interactive_esc_requests_cancel_after_run_id(
     stderr = io.StringIO()
     run_view = TerminalInteractiveRunView(
         stderr=stderr,
-        options=InteractiveRunViewOptions(enabled=True),
+        options=InteractiveRunViewOptions(
+            enabled=True,
+            terminal_control=True,
+            terminal_columns=80,
+        ),
+    )
+    thinking_renderer = CliThinkingRenderer(
+        stderr=stderr,
+        options=CliThinkingRendererOptions(
+            enabled=True,
+            terminal_control=True,
+            terminal_columns=80,
+        ),
     )
     key_monitor = _FakeRunningKeyMonitor(
         (RunningKeyAction.CANCEL_RUN,),
         delay_ticks=2,
+    )
+    thinking_renderer.record(
+        _entrypoint_thinking(
+            dedupe_key="thinking-before-esc",
+            text_delta="The user is asking",
+        )
     )
 
     result = await interactive_command._submit_interactive_turn_handling_sigint(
@@ -1452,6 +1470,7 @@ async def test_interactive_esc_requests_cancel_after_run_id(
         run_overrides=interactive_command.ServiceRunOverrides(),
         sigint_monitor=_NoopSigintMonitor(),
         run_view=run_view,
+        thinking_renderer=thinking_renderer,
         key_monitor=key_monitor,
     )
 
@@ -1459,7 +1478,11 @@ async def test_interactive_esc_requests_cancel_after_run_id(
     assert result.terminal_status is HostTerminalStatus.CANCELLED
     assert len(fake_host.cancel_requests) == 1
     assert fake_host.cancel_requests[0].client_request_id.endswith(":turn-1:run-run-1:cancel:cli_sigint")
-    assert "Interactive: cancel requested" in stderr.getvalue()
+    assert "Thinking: The user is asking\r\x1b[2KInteractive: cancel requested" in (
+        stderr.getvalue()
+    )
+    thinking_renderer.record(_entrypoint_thinking(dedupe_key="thinking-after-esc"))
+    assert stderr.getvalue().count("Thinking:") == 1
     assert key_monitor.started_count == 1
     assert key_monitor.closed_count == 1
 
@@ -2012,10 +2035,15 @@ def _thinking_event(*, run_id: str) -> HostEvent:
     )
 
 
-def _entrypoint_thinking(*, dedupe_key: str) -> EntrypointThinking:
+def _entrypoint_thinking(
+    *,
+    dedupe_key: str,
+    text_delta: str = "取消后不应输出",
+) -> EntrypointThinking:
     """构造 Service entrypoint thinking。
 
     :param dedupe_key: thinking dedupe key。
+    :param text_delta: thinking 文本增量。
     :returns: Service entrypoint thinking。
     :raises Exception: 不主动抛出异常。
     """
@@ -2024,7 +2052,7 @@ def _entrypoint_thinking(*, dedupe_key: str) -> EntrypointThinking:
         run_id="run-1",
         event_sequence=1,
         dedupe_key=dedupe_key,
-        text_delta="取消后不应输出",
+        text_delta=text_delta,
     )
 
 

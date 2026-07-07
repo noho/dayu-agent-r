@@ -63,6 +63,7 @@ from dayu.host.api import (
 from dayu.service.entrypoint_runtime import EntrypointRuntimeRequest
 from dayu.service.entrypoint_runtime import EntrypointRuntimeResult
 from dayu.cli.activity import CliActivityRenderer, CliActivityRendererOptions
+from dayu.cli.output import render_prompt_terminal_result
 from dayu.cli.run_keys import RunningKeyAction
 from dayu.cli.session_terminal_cursor import read_cli_terminal_cursor
 from dayu.cli.thinking import CliThinkingRenderer, CliThinkingRendererOptions
@@ -1127,6 +1128,93 @@ def test_prompt_detail_activity_does_not_enter_log_file(
 
 
 @pytest.mark.asyncio
+async def test_prompt_tty_runtime_display_closes_thinking_before_activity_and_final(
+    tmp_path: Path,
+) -> None:
+    """TTY prompt 应在 activity 前闭合 thinking，并在 final 前清理运行态展示。"""
+
+    runtime = await _prepare_prompt_runtime(tmp_path)
+    invocation = prompt_command.new_cli_invocation(
+        command_name="prompt",
+        scenario="prompt",
+        display_user="本地 CLI 用户",
+        ticker="AAPL",
+    )
+    terminal_columns = 40
+    stream = io.StringIO()
+    activity_renderer = CliActivityRenderer(
+        stderr=stream,
+        options=CliActivityRendererOptions(
+            visible=True,
+            enabled=True,
+            terminal_control=True,
+            terminal_columns=terminal_columns,
+        ),
+    )
+    thinking_renderer = CliThinkingRenderer(
+        stderr=stream,
+        options=CliThinkingRendererOptions(
+            enabled=True,
+            terminal_control=True,
+            terminal_columns=terminal_columns,
+        ),
+    )
+    fake_host = _FakeHost(
+        submit_terminal=_terminal_event(status=HostTerminalStatus.SUCCEEDED),
+        submit_events=(
+            _activity_event_with_sequence(
+                event_sequence=1,
+                dedupe_key="activity-long",
+                title="工具批次完成并生成较长运行态展示",
+                summary="这一条 activity 故意足够长，用于覆盖终端软换行后的多屏幕行清理。",
+            ),
+            _thinking_event_with_sequence(
+                event_sequence=2,
+                dedupe_key="thinking-1",
+                text_delta="The user is asking",
+            ),
+            _activity_event_with_sequence(
+                event_sequence=3,
+                dedupe_key="activity-tool",
+                title="工具调用完成",
+                summary="tool activity",
+            ),
+        ),
+    )
+
+    terminal = await prompt_command._submit_prompt_turn_handling_sigint(
+        host=cast(Host, fake_host),
+        runtime=runtime,
+        invocation=invocation,
+        session_id="session-1",
+        user_prompt="请总结收入变化",
+        run_overrides=prompt_command.ServiceRunOverrides(),
+        sigint_monitor=_NoopSigintMonitor(),
+        activity_renderer=activity_renderer,
+        thinking_renderer=thinking_renderer,
+    )
+
+    assert terminal is not None
+    render_exit_code = render_prompt_terminal_result(
+        terminal,
+        stdout=stream,
+        stderr=stream,
+    )
+
+    output = stream.getvalue()
+    final_answer_index = output.index("prompt answer")
+    last_activity_index = output.rfind("Activity:", 0, final_answer_index)
+    last_thinking_index = output.rfind("Thinking:", 0, final_answer_index)
+    last_clear_index = output.rfind("\x1b[2K", 0, final_answer_index)
+    assert render_exit_code == EXIT_SUCCESS
+    assert "Thinking: The user is asking\r\x1b[2KActivity:" in output
+    assert output.count("\x1b[1A\r\x1b[2K") >= 3
+    assert last_clear_index > last_activity_index
+    assert last_clear_index > last_thinking_index
+    assert output.endswith("prompt answer\n")
+
+
+@pytest.mark.asyncio
 async def test_prompt_sigint_after_run_id_cancels_host_run(
     tmp_path: Path,
 ) -> None:
@@ -1183,7 +1271,7 @@ async def test_prompt_sigint_after_run_id_cancels_host_run(
 
 @pytest.mark.asyncio
 async def test_prompt_cancel_helper_closes_thinking_renderer() -> None:
-    """prompt 本地取消 helper 应显式关闭 thinking renderer。"""
+    """prompt 本地取消 helper 应先收尾再关闭 thinking renderer。"""
 
     accepted_run = prompt_command._AcceptedRunState()
     submit_task = asyncio.create_task(_never_finishes_prompt_terminal())
@@ -1191,6 +1279,12 @@ async def test_prompt_cancel_helper_closes_thinking_renderer() -> None:
     thinking_renderer = CliThinkingRenderer(
         stderr=stderr,
         options=CliThinkingRendererOptions(enabled=True),
+    )
+    thinking_renderer.record(
+        _entrypoint_thinking(
+            dedupe_key="thinking-before-cancel",
+            text_delta="The user is asking",
+        )
     )
     fake_host = _FakeHost(
         submit_terminal=None,
@@ -1213,8 +1307,9 @@ async def test_prompt_cancel_helper_closes_thinking_renderer() -> None:
 
     assert result is None
     assert fake_host.cancel_requests == []
+    assert stderr.getvalue() == "Thinking: The user is asking\n"
     thinking_renderer.record(_entrypoint_thinking(dedupe_key="thinking-after-cancel"))
-    assert stderr.getvalue() == ""
+    assert stderr.getvalue() == "Thinking: The user is asking\n"
 
 
 @pytest.mark.asyncio
@@ -1276,12 +1371,20 @@ async def test_prompt_esc_requests_cancel_after_run_id(
     stderr = io.StringIO()
     renderer = CliActivityRenderer(
         stderr=stderr,
-        options=CliActivityRendererOptions(visible=True, enabled=True),
+        options=CliActivityRendererOptions(
+            visible=True,
+            enabled=True,
+            terminal_control=True,
+            terminal_columns=80,
+        ),
     )
-    thinking_stderr = io.StringIO()
     thinking_renderer = CliThinkingRenderer(
-        stderr=thinking_stderr,
-        options=CliThinkingRendererOptions(enabled=True),
+        stderr=stderr,
+        options=CliThinkingRendererOptions(
+            enabled=True,
+            terminal_control=True,
+            terminal_columns=80,
+        ),
     )
     key_monitor = _FakeRunningKeyMonitor(
         (RunningKeyAction.CANCEL_RUN,),
@@ -1291,6 +1394,12 @@ async def test_prompt_esc_requests_cancel_after_run_id(
         submit_terminal=None,
         run_statuses=(RunStatus.RUNNING,),
         cancel_terminal=_terminal_event(status=HostTerminalStatus.CANCELLED),
+    )
+    thinking_renderer.record(
+        _entrypoint_thinking(
+            dedupe_key="thinking-before-esc",
+            text_delta="The user is asking",
+        )
     )
 
     result = await prompt_command._submit_prompt_turn_handling_sigint(
@@ -1310,9 +1419,11 @@ async def test_prompt_esc_requests_cancel_after_run_id(
     assert result.terminal_status is HostTerminalStatus.CANCELLED
     assert len(fake_host.cancel_requests) == 1
     assert fake_host.cancel_requests[0].mode is CancelMode.GRACEFUL
-    assert "Activity: cancel requested" in stderr.getvalue()
+    assert "Thinking: The user is asking\r\x1b[2KActivity: cancel requested" in (
+        stderr.getvalue()
+    )
     thinking_renderer.record(_entrypoint_thinking(dedupe_key="thinking-after-esc"))
-    assert thinking_stderr.getvalue() == ""
+    assert stderr.getvalue().count("Thinking:") == 1
     assert key_monitor.closed_count == 1
 
 
@@ -1337,7 +1448,26 @@ async def test_prompt_second_sigint_exits_after_cancel_request(
     stderr = io.StringIO()
     renderer = CliActivityRenderer(
         stderr=stderr,
-        options=CliActivityRendererOptions(visible=True, enabled=True),
+        options=CliActivityRendererOptions(
+            visible=True,
+            enabled=True,
+            terminal_control=True,
+            terminal_columns=80,
+        ),
+    )
+    thinking_renderer = CliThinkingRenderer(
+        stderr=stderr,
+        options=CliThinkingRendererOptions(
+            enabled=True,
+            terminal_control=True,
+            terminal_columns=80,
+        ),
+    )
+    thinking_renderer.record(
+        _entrypoint_thinking(
+            dedupe_key="thinking-before-second-sigint",
+            text_delta="The user is asking",
+        )
     )
 
     result = await prompt_command._submit_prompt_turn_handling_sigint(
@@ -1349,12 +1479,16 @@ async def test_prompt_second_sigint_exits_after_cancel_request(
         run_overrides=prompt_command.ServiceRunOverrides(),
         sigint_monitor=_SecondSigintAfterCancelMonitor(fake_host),
         activity_renderer=renderer,
+        thinking_renderer=thinking_renderer,
     )
 
     assert result is None
     assert len(fake_host.cancel_requests) == 1
-    assert "Activity: cancel requested" in stderr.getvalue()
+    assert "Thinking: The user is asking\r\x1b[2KActivity: cancel requested" in (
+        stderr.getvalue()
+    )
     assert "local process exiting" in stderr.getvalue()
+    assert stderr.getvalue().count("Thinking:") == 1
 
 
 @pytest.mark.asyncio
@@ -1766,9 +1900,34 @@ def _activity_event() -> HostEvent:
     :raises Exception: 不主动抛出异常。
     """
 
-    return HostEvent(
-        event_id="activity-run-1-1",
+    return _activity_event_with_sequence(
         event_sequence=1,
+        dedupe_key="activity-run-1-1",
+        title="工具批次完成",
+        summary="完成 1 个工具调用。",
+    )
+
+
+def _activity_event_with_sequence(
+    *,
+    event_sequence: int,
+    dedupe_key: str,
+    title: str,
+    summary: str,
+) -> HostEvent:
+    """构造可指定 sequence 的 Host activity event。
+
+    :param event_sequence: Host event sequence。
+    :param dedupe_key: activity dedupe key。
+    :param title: activity 标题。
+    :param summary: activity 摘要。
+    :returns: HostEvent。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return HostEvent(
+        event_id=dedupe_key,
+        event_sequence=event_sequence,
         session_id="session-1",
         run_id="run-1",
         event_class=HostEventClass.PREVIEW,
@@ -1777,14 +1936,14 @@ def _activity_event() -> HostEvent:
         activity=HostActivityView(
             kind=HostActivityKind.TOOL_BATCH,
             status=HostActivityStatus.COMPLETED,
-            title="工具批次完成",
-            summary="完成 1 个工具调用。",
+            title=title,
+            summary=summary,
             severity=HostActivitySeverity.INFO,
             tool_name="record_smoke_fact",
             tool_display_name="记录烟测事实",
             counts=HostActivityCounts(total=1, completed=1, failed=0, cancelled=0),
         ),
-        dedupe_key="activity-run-1-1",
+        dedupe_key=dedupe_key,
         terminal_status=None,
         final_answer=None,
         error_message=None,
@@ -1799,17 +1958,39 @@ def _thinking_event() -> HostEvent:
     :raises Exception: 不主动抛出异常。
     """
 
-    return HostEvent(
-        event_id="thinking-run-1-1",
+    return _thinking_event_with_sequence(
         event_sequence=1,
+        dedupe_key="thinking-run-1-1",
+        text_delta="正在分析收入变化",
+    )
+
+
+def _thinking_event_with_sequence(
+    *,
+    event_sequence: int,
+    dedupe_key: str,
+    text_delta: str,
+) -> HostEvent:
+    """构造可指定 sequence 的 Host thinking event。
+
+    :param event_sequence: Host event sequence。
+    :param dedupe_key: thinking dedupe key。
+    :param text_delta: thinking 文本增量。
+    :returns: HostEvent。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return HostEvent(
+        event_id=dedupe_key,
+        event_sequence=event_sequence,
         session_id="session-1",
         run_id="run-1",
         event_class=HostEventClass.PREVIEW,
         event_type="REASONING_DELTA",
         kind=HostEventKind.PROGRESS,
         activity=None,
-        thinking=HostThinkingView(text_delta="正在分析收入变化"),
-        dedupe_key="thinking-run-1-1",
+        thinking=HostThinkingView(text_delta=text_delta),
+        dedupe_key=dedupe_key,
         terminal_status=None,
         final_answer=None,
         error_message=None,
@@ -1817,10 +1998,15 @@ def _thinking_event() -> HostEvent:
     )
 
 
-def _entrypoint_thinking(*, dedupe_key: str) -> EntrypointThinking:
+def _entrypoint_thinking(
+    *,
+    dedupe_key: str,
+    text_delta: str = "取消后不应输出",
+) -> EntrypointThinking:
     """构造 Service entrypoint thinking。
 
     :param dedupe_key: thinking dedupe key。
+    :param text_delta: thinking 文本增量。
     :returns: Service entrypoint thinking。
     :raises Exception: 不主动抛出异常。
     """
@@ -1829,7 +2015,7 @@ def _entrypoint_thinking(*, dedupe_key: str) -> EntrypointThinking:
         run_id="run-1",
         event_sequence=1,
         dedupe_key=dedupe_key,
-        text_delta="取消后不应输出",
+        text_delta=text_delta,
     )
 
 

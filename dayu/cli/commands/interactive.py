@@ -612,6 +612,10 @@ async def _submit_interactive_turn_handling_sigint(
     accepted_run = _AcceptedRunState()
     view = run_view
     thinking = thinking_renderer
+    if view is not None:
+        view.set_runtime_line_guard(
+            None if thinking is None else thinking.finish_runtime_display
+        )
     monitor = NoopRunningKeyMonitor() if key_monitor is None else key_monitor
     sigint_monitor.install()
     observed_sigint_count = sigint_monitor.count
@@ -651,7 +655,12 @@ async def _submit_interactive_turn_handling_sigint(
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if submit_task in done:
-                return await submit_task
+                terminal = await submit_task
+                _finish_interactive_runtime_display(
+                    run_view=view,
+                    thinking_renderer=thinking,
+                )
+                return terminal
             if key_task in done:
                 action = await key_task
                 if action is RunningKeyAction.TOGGLE_ACTIVITY:
@@ -683,12 +692,33 @@ async def _submit_interactive_turn_handling_sigint(
                 thinking_renderer=thinking,
             )
     finally:
+        if view is not None:
+            view.set_runtime_line_guard(None)
         if thinking is not None:
             thinking.close()
         monitor.close()
         sigint_monitor.close()
         await cancel_and_await_task(sigint_task)
         await cancel_and_await_task(key_task)
+
+
+def _finish_interactive_runtime_display(
+    *,
+    run_view: InteractiveRunView | None,
+    thinking_renderer: CliThinkingRenderer | None,
+) -> None:
+    """结束 interactive 单轮运行态展示，为 terminal result 输出让出干净位置。
+
+    :param run_view: interactive 运行态 view；``None`` 表示未启用。
+    :param thinking_renderer: 运行态 thinking renderer；``None`` 表示未启用。
+    :returns: ``None``。
+    :raises OSError: 输出流写入失败时由 renderer 或 view 透传。
+    """
+
+    if thinking_renderer is not None:
+        thinking_renderer.finish_runtime_display()
+    if run_view is not None:
+        run_view.finish_runtime_display()
 
 
 async def _cancel_interactive_turn_after_first_sigint(
@@ -720,6 +750,7 @@ async def _cancel_interactive_turn_after_first_sigint(
     """
 
     if thinking_renderer is not None:
+        thinking_renderer.finish_runtime_display()
         thinking_renderer.close()
     run_id = accepted_run.run_id
     if run_id is None:
@@ -749,6 +780,7 @@ async def _cancel_interactive_turn_after_first_sigint(
         sigint_monitor=sigint_monitor,
         observed_sigint_count=observed_sigint_count,
         run_view=run_view,
+        thinking_renderer=thinking_renderer,
     )
 
 
@@ -798,6 +830,7 @@ async def _cancel_run_waiting_for_terminal_or_second_sigint(
     sigint_monitor: CliSigintMonitor,
     observed_sigint_count: int,
     run_view: InteractiveRunView | None = None,
+    thinking_renderer: CliThinkingRenderer | None = None,
 ) -> EntrypointRunTerminalResult | None:
     """发起 Host cancel，并在第二次 SIGINT 时本地退出。
 
@@ -808,6 +841,7 @@ async def _cancel_run_waiting_for_terminal_or_second_sigint(
     :param sigint_monitor: 本轮 SIGINT monitor。
     :param observed_sigint_count: 第一次 SIGINT 后的计数。
     :param run_view: 运行态 view；``None`` 表示不输出提示。
+    :param thinking_renderer: 运行态 thinking renderer；``None`` 表示不输出。
     :returns: cancel terminal result；第二次 SIGINT 本地退出时返回 ``None``。
     :raises Exception: cancel 或 terminal observation 失败时向上抛出。
     """
@@ -839,6 +873,8 @@ async def _cancel_run_waiting_for_terminal_or_second_sigint(
         )
         if cancel_task in done:
             return await cancel_task
+        if thinking_renderer is not None:
+            thinking_renderer.finish_runtime_display()
         if run_view is not None:
             run_view.render_local_exit_after_cancel()
         cancel_task.cancel()

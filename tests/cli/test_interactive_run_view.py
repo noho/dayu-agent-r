@@ -150,6 +150,51 @@ def test_run_view_can_start_in_activity_mode() -> None:
     assert stdout.getvalue() == ""
 
 
+def test_run_view_finish_non_tty_keeps_readable_activity_snapshot() -> None:
+    """非 TTY 收尾应保留可读 activity view 输出。"""
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    view = TerminalInteractiveRunView(
+        stdout=stdout,
+        stderr=stderr,
+        options=InteractiveRunViewOptions(
+            enabled=True,
+            initial_mode=InteractiveRunViewMode.ACTIVITY,
+        ),
+    )
+
+    view.activity_sink().record_activity(_activity())
+    view.finish_runtime_display()
+
+    assert "Activity: completed 工具批次完成" in stderr.getvalue()
+    assert "\x1b[" not in stderr.getvalue()
+    assert stdout.getvalue() == ""
+
+
+def test_run_view_finish_tty_clears_rendered_activity_lines() -> None:
+    """TTY 收尾应清除当前 activity view 输出。"""
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    view = TerminalInteractiveRunView(
+        stdout=stdout,
+        stderr=stderr,
+        options=InteractiveRunViewOptions(
+            enabled=True,
+            initial_mode=InteractiveRunViewMode.ACTIVITY,
+            terminal_control=True,
+            terminal_columns=1000,
+        ),
+    )
+
+    view.activity_sink().record_activity(_activity())
+    view.finish_runtime_display()
+
+    assert stderr.getvalue().endswith("\x1b[1A\r\x1b[2K")
+    assert stdout.getvalue() == ""
+
+
 def _activity(
     *,
     dedupe_key: str = "activity-1",

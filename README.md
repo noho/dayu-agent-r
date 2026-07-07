@@ -307,7 +307,7 @@ dayu-cli <subcommand> [参数]
 - `--debug` 适合查看普通诊断，例如 Host 打开、命令提交、调度、Runner HTTP 请求和终态收口；默认不会输出逐 token / 逐 delta 级别的 stream 诊断。
 - `--debug-stream` 用于排查高频流式链路问题，例如 stream delta、stream idle heartbeat、SSE 完成标记和 Host 逐 delta ingest 诊断；单独使用 `--debug-stream` 时已经包含普通 `--debug` 诊断。
 - CLI 的用户可见输出和诊断日志默认分离：回答、进度、错误提示仍走 stdout / stderr；Python logging 诊断默认写入系统临时目录下的 `dayu-cli-*.log`。需要固定日志位置时使用 `--log-file <path>`，它只改变诊断日志位置，不改变用户可见输出通道。
-- `--thinking` 和 `--detail` 都是 CLI 终端展示开关，不会启用或关闭模型侧思考能力，也不会改变本次运行的模型配置裁决；当底层 runner 产生 thinking 增量时，`--thinking` 会在运行中回显，最终回答仍保持独立输出。
+- `--thinking` 和 `--detail` 都是 CLI 终端展示开关，不会启用或关闭模型侧思考能力，也不会改变本次运行的模型配置裁决；当底层 runner 产生 thinking 增量时，`--thinking` 会在运行中回显。TTY 终端里拿到最终回答前会清除运行态 thinking / activity 展示，最终只留下回答；非 TTY 捕获流会保留可读的运行态文本，不输出 ANSI 清屏控制符。
 - `--detail` 显示的是终端里的运行态 activity stream；它与 `--debug` / `--debug-stream` 的诊断日志相互独立，activity stream 不会写入 `--log-file`。
 - 全局参数可以写在子命令前，也可以写在子命令后。例如 `dayu-cli --debug prompt "问题"` 和 `dayu-cli prompt "问题" --debug` 等价；`--log-file` 也同理。
 - `prompt`、`interactive`、`write` 还支持更多 Agent 运行参数，例如 `--tool-timeout-seconds`、`--max-iterations`、`--doc-limits-json`、`--fins-limits-json`；需要时可用 `dayu-cli <subcommand> --help` 查看完整列表。
@@ -568,7 +568,7 @@ dayu-cli prompt "总结苹果最新财报中的主要风险" --no-detail
 - 两种写法都可以：要么在问题里直接写公司名或股票代码，要么用 `--ticker` 明确指定研究对象；一般不需要两边重复写。
 - 不带 `--label` 时，`prompt` 保持 one-shot，不承诺后续恢复；带 `--label` 时，本次提问会挂到该 label 对应的可恢复 conversation 上，后续可继续用 `prompt --label <label>` 或 `interactive --label <label>` 接着问。
 - 带 `--label` 的 prompt 在本轮拿到最终回答前会独占该 label；如果另一个进程此时也尝试复用同一个 label，CLI 会直接报错并提示等待当前对话结束，或改用新的 `--label`。
-- 默认会显示运行态思考展示和 activity stream；如果底层 runner 产生 thinking 增量，`--thinking` 会在运行中回显这些增量；如果只想保留最终回答，使用 `--no-thinking` 或 `--no-detail` 关闭对应展示。
+- 默认会显示运行态思考展示和 activity stream；如果底层 runner 产生 thinking 增量，`--thinking` 会在运行中回显这些增量。TTY 终端里最终回答出现前会清除运行态展示；非 TTY 捕获流会保留可读的运行态文本。若完全不想看到对应运行态展示，使用 `--no-thinking` 或 `--no-detail` 关闭。
 - `--thinking` / `--no-thinking` 只控制 CLI 终端展示，不会改变模型配置或 provider 请求参数。
 - `--debug-stream` 用于排查流式输出、SSE 和逐 delta ingest 问题；普通排障优先使用 `--debug`。
 
@@ -618,7 +618,7 @@ dayu-cli interactive --debug-stream
 - 同一个 label 在任意时刻只能被一个 CLI 进程占用：`interactive --label` 会在整个 REPL 生命周期内持有该 label，直到双 `Ctrl+D` 完整退出；`prompt --label` 会在本轮返回最终回答前持有该 label。若命中占用中的 label，CLI 会提示你等待当前对话结束后重试，或改用新的 `--label`。
 - 在空的 `dayu>` 提示符下，第一次按 `Ctrl+C` 会回到一个干净的新提示符，连续第二次按 `Ctrl+C` 才会退出；如果中间提交了正常输入，之后的 `Ctrl+C` 会重新按第一次处理。
 - 如果你在 workspace 本地覆写了带 label 会命中的 scene manifest，必须使用当前 `ScenePrepare` 支持的 scene-only schema。
-- 默认会显示运行态思考展示和 activity stream；如果底层 runner 产生 thinking 增量，`--thinking` 会在运行中回显这些增量；如果只想保留最终回答，使用 `--no-thinking` 或 `--no-detail` 关闭对应展示。
+- 默认会显示运行态思考展示和 activity stream；如果底层 runner 产生 thinking 增量，`--thinking` 会在运行中回显这些增量。TTY 终端里最终回答出现前会清除运行态展示；非 TTY 捕获流会保留可读的运行态文本。若完全不想看到对应运行态展示，使用 `--no-thinking` 或 `--no-detail` 关闭。
 - `--thinking` / `--no-thinking` 只控制 CLI 终端展示，不会改变模型配置或 provider 请求参数。
 
 ### 3.5 微信对话 daemon：

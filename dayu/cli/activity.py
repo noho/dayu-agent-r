@@ -8,9 +8,15 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Final, TextIO
 
+from dayu.cli.runtime_display import (
+    clear_completed_rows,
+    resolve_terminal_columns,
+    terminal_row_count,
+)
 from dayu.service.entrypoint_runtime import (
     EntrypointActivity,
     EntrypointActivityCounts,
@@ -31,10 +37,16 @@ class CliActivityRendererOptions:
 
     :param visible: 初始是否展示 activity。
     :param enabled: 是否允许输出 live activity；通常仅 TTY stderr 启用。
+    :param terminal_control: 是否允许输出 ANSI 清理控制符；``None`` 表示按
+        stderr 是否 TTY 自动判断。
+    :param terminal_columns: 运行态清理使用的终端列数；``None`` 表示读取当前
+        终端或使用默认 fallback。
     """
 
     visible: bool
     enabled: bool
+    terminal_control: bool | None = None
+    terminal_columns: int | None = None
 
 
 class CliActivityRenderer:
@@ -48,6 +60,10 @@ class CliActivityRenderer:
     _visible: bool
     _enabled: bool
     _closed: bool
+    _supports_terminal_control: bool
+    _terminal_columns: int
+    _rendered_row_count: int
+    _runtime_line_guard: Callable[[], None] | None
     _seen_dedupe_keys: set[str]
     _last_event_sequence: int | None
     _last_hidden_title: str | None
@@ -75,6 +91,14 @@ class CliActivityRenderer:
         self._visible = options.visible
         self._enabled = options.enabled
         self._closed = False
+        self._supports_terminal_control = (
+            self._stderr.isatty()
+            if options.terminal_control is None
+            else options.terminal_control
+        )
+        self._terminal_columns = resolve_terminal_columns(options.terminal_columns)
+        self._rendered_row_count = 0
+        self._runtime_line_guard = None
         self._seen_dedupe_keys = set()
         self._last_event_sequence = None
         self._last_hidden_title = None
@@ -88,6 +112,16 @@ class CliActivityRenderer:
         """
 
         return self._visible
+
+    def set_runtime_line_guard(self, guard: Callable[[], None] | None) -> None:
+        """设置 activity 输出前需要执行的运行态行收尾回调。
+
+        :param guard: 输出 activity 前执行的回调；``None`` 表示不执行。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._runtime_line_guard = guard
 
     def record(self, activity: EntrypointActivity) -> None:
         """记录并按当前可见性输出一条 activity。
@@ -113,7 +147,7 @@ class CliActivityRenderer:
         self._last_hidden_title = activity.title
         if not self._visible:
             return
-        print(_activity_line(_ACTIVITY_PREFIX, activity), file=self._stderr)
+        self._render_runtime_line(_activity_line(_ACTIVITY_PREFIX, activity))
 
     def toggle_visible(self) -> None:
         """切换 activity 可见性。
@@ -126,9 +160,8 @@ class CliActivityRenderer:
             return
         self._visible = not self._visible
         if self._enabled and not self._visible and self._last_hidden_title is not None:
-            print(
-                f"{_ACTIVITY_HIDDEN_PREFIX}: {_bounded_text(self._last_hidden_title)}",
-                file=self._stderr,
+            self._render_runtime_line(
+                f"{_ACTIVITY_HIDDEN_PREFIX}: {_bounded_text(self._last_hidden_title)}"
             )
 
     def render_cancel_requested(self) -> None:
@@ -140,7 +173,7 @@ class CliActivityRenderer:
 
         if self._closed or not self._enabled:
             return
-        print(_ACTIVITY_CANCEL_REQUESTED_MESSAGE, file=self._stderr)
+        self._render_runtime_line(_ACTIVITY_CANCEL_REQUESTED_MESSAGE)
 
     def render_local_exit_after_cancel(self) -> None:
         """输出二次中断导致本地退出的运行态提示。
@@ -151,7 +184,43 @@ class CliActivityRenderer:
 
         if self._closed or not self._enabled:
             return
-        print(_ACTIVITY_LOCAL_EXIT_MESSAGE, file=self._stderr)
+        self._render_runtime_line(_ACTIVITY_LOCAL_EXIT_MESSAGE)
+
+    def _render_runtime_line(self, line: str) -> None:
+        """输出一条 activity 运行态行并记录其屏幕行数。
+
+        :param line: 已格式化的单行展示文本。
+        :returns: ``None``。
+        :raises OSError: 输出流写入失败时由底层 ``print`` 透传。
+        """
+
+        if self._runtime_line_guard is not None:
+            self._runtime_line_guard()
+        print(line, file=self._stderr)
+        self._rendered_row_count += terminal_row_count(
+            line,
+            columns=self._terminal_columns,
+        )
+
+    def finish_runtime_display(self) -> None:
+        """结束当前 activity 运行态展示，为 terminal result 输出让出干净位置。
+
+        TTY 下清除本 renderer 已写出的运行态行；非 TTY 或测试捕获流下保持
+        已输出的可读文本不变，且不写 ANSI 控制符。
+
+        :returns: ``None``。
+        :raises OSError: 输出流写入失败时由底层输出流透传。
+        """
+
+        if (
+            self._closed
+            or not self._enabled
+            or not self._supports_terminal_control
+            or self._rendered_row_count == 0
+        ):
+            return
+        clear_completed_rows(self._stderr, row_count=self._rendered_row_count)
+        self._rendered_row_count = 0
 
     def close(self) -> None:
         """关闭 renderer，后续 activity 不再输出。
