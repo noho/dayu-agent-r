@@ -27,7 +27,7 @@ UI -> Service -> Host -> Engine
 
 Dayu 是生产级通用 Agent，具备买方财报分析能力，核心范式是“宿主强约束下的 LLM in the loop”。
 
-在整个 Agent 中，LLM 负责分析、推理和生成；Host 负责生命周期、取消、恢复、工具治理、EventLog、memory / context governance 和持久化事实。Fins 提供买方财报分析所需的业务底座：财报文档存取、ticker 归一、read tools、download / preprocess / upload direct stream、awaiting tools、processor registry、XBRL / financial statement 能力，以及把 lightweight observation handle 映射到 Host wait-resume 的 adapter。
+在整个 Agent 中，LLM 负责分析、推理和生成；Host 负责生命周期、取消、恢复、工具治理、EventLog、memory / context governance 和持久化事实。Fins 提供买方财报分析所需的业务底座：财报文档存取、ticker 归一、公司信息 resolver、read tools、download / preprocess / upload direct stream、awaiting tools、processor registry、XBRL / financial statement 能力，以及把 lightweight observation handle 映射到 Host wait-resume 的 adapter。
 
 `dayu.fins` 的设计重点是把财报业务能力从 Host / Engine 中剥离出来：
 
@@ -93,6 +93,18 @@ Fins 与其它层的稳定边界如下：
 - `BatchingRepositoryProtocol`
 - 对应 `Fs*Repository` 文件系统实现
 - `FileStore` / `LocalFileStore`
+
+### Resolver
+
+`dayu.fins.resolver` 是公司信息等财报业务标识解析能力的 public subpackage。`dayu.fins` 包根不 re-export resolver 符号，调用方应显式导入子包。
+
+当前已实现 FMP 公司信息 resolver：
+
+- `FmpCompanyInfo(canonical_ticker, company_name, ticker_aliases)`：不可变解析结果，`ticker_aliases` 是 tuple，首项恒为 canonical ticker。
+- `FmpCompanyInfoResolver(api_key=..., http_client=..., timeout_seconds=...)`：显式接收 FMP API key 和 timeout，不读取环境变量。
+- `resolve_company_info(canonical_ticker)`：先用 `search-symbol` 定位公司名，再用 `search-name` 搜索严格同名证券，alias 去重后返回。
+
+resolver 只提供业务解析能力；调用方负责读取环境变量、配置超时、处理失败回退和决定是否把公司名投影给 LLM。
 
 ### Read runtime 与 read tools provider
 

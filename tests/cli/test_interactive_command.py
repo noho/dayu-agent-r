@@ -695,10 +695,7 @@ def test_interactive_label_reuses_host_slot_and_fills_context_slots(
     assert exit_code == EXIT_SUCCESS
     assert captured.out.strip() == "answer for run-1"
     assert captured_requests[0].scene_id == "interactive"
-    assert captured_requests[0].context_slot_values == {
-        "fins_default_subject": "AAPL",
-        "base_user": "本地 CLI 用户",
-    }
+    assert captured_requests[0].context_slot_values == {"base_user": "本地 CLI 用户"}
     assert fake_host.ensure_requests[0].scope == "cli.interactive"
     assert fake_host.ensure_requests[0].slot_key == "cli.interactive.earnings"
     assert fake_host.create_requests == []
@@ -1806,10 +1803,7 @@ async def _prepare_interactive_runtime(tmp_path: Path) -> EntrypointRuntimeResul
             package_config_root=package_config_root(),
             explicit_config_dir=None,
             scene_id="interactive",
-            context_slot_values={
-                "fins_default_subject": "AAPL",
-                "base_user": "本地 CLI 用户",
-            },
+            context_slot_values={"base_user": "本地 CLI 用户"},
             assembly_overrides=interactive_command.ServiceAssemblyOverrides(model_id=_MODEL_ID),
             env={"DEEPSEEK_API_KEY": _API_KEY},
         )

@@ -86,9 +86,7 @@ from dayu.service.entrypoint_runtime import (
 )
 from dayu.service.host_assembly import ServiceAssemblyOverrides, ServiceRunOverrides
 
-DEFAULT_FINS_SUBJECT: Final[str] = "未指定具体公司"
 DEFAULT_BASE_USER: Final[str] = "本地 CLI 用户"
-CONTEXT_SLOT_FINS_DEFAULT_SUBJECT: Final[str] = "fins_default_subject"
 CONTEXT_SLOT_BASE_USER: Final[str] = "base_user"
 INTERACTIVE_INPUT_PROMPT: Final[str] = "dayu> "
 _TICKER_OPTION: Final[str] = "--ticker"
@@ -294,7 +292,7 @@ async def _prepare_interactive_existing_session_execution(
             package_config_root=package_config_root(),
             explicit_config_dir=explicit_config_dir,
             scene_id=scenario,
-            context_slot_values=_interactive_context_slot_values(ticker=ticker),
+            context_slot_values=_interactive_context_slot_values(),
             assembly_overrides=ServiceAssemblyOverrides(
                 model_id=optional_stripped_text(
                     args.model_name,
@@ -898,18 +896,14 @@ def _raise_for_unsupported_execution_options(args: ParsedCliArgs) -> None:
         raise CliInteractiveUsageError(f"{_UNSUPPORTED_OPTION_PREFIX}: {', '.join(unsupported)}")
 
 
-def _interactive_context_slot_values(*, ticker: str | None) -> dict[str, JsonValue]:
+def _interactive_context_slot_values() -> dict[str, JsonValue]:
     """构造 interactive scene required context slots。
 
-    :param ticker: 用户显式提供的业务主体；未提供时为 ``None``。
     :returns: 传给 ScenePrepare 的 context slot 值。
     :raises Exception: 不主动抛出异常。
     """
 
-    return {
-        CONTEXT_SLOT_FINS_DEFAULT_SUBJECT: (ticker if ticker is not None else DEFAULT_FINS_SUBJECT),
-        CONTEXT_SLOT_BASE_USER: DEFAULT_BASE_USER,
-    }
+    return {CONTEXT_SLOT_BASE_USER: DEFAULT_BASE_USER}
 
 
 def _read_user_input(prompt: str) -> str:

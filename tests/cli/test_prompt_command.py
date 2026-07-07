@@ -15,6 +15,7 @@ import pytest
 
 import dayu.cli.commands.prompt as prompt_command
 import dayu.cli.main as cli_main
+import dayu.service.scene_context as scene_context
 from dayu.cli.agent_entrypoint import (
     CliSigintMonitor,
     package_config_root,
@@ -68,6 +69,7 @@ from dayu.cli.run_keys import RunningKeyAction
 from dayu.cli.session_terminal_cursor import read_cli_terminal_cursor
 from dayu.cli.thinking import CliThinkingRenderer, CliThinkingRendererOptions
 from dayu.service.entrypoint_runtime import EntrypointThinking
+from dayu.fins.resolver import FmpCompanyInfo
 
 _REMOVED_PROMPT_DEBUG_OPTIONS: tuple[tuple[str, ...], ...] = (
     ("--debug-sse",),
@@ -79,6 +81,7 @@ _REMOVED_PROMPT_DEBUG_OPTIONS: tuple[tuple[str, ...], ...] = (
 _NOW = datetime(2026, 6, 14, 8, 0, 0, tzinfo=UTC)
 _MODEL_ID = "deepseek-v4-flash"
 _API_KEY = "test-provider-key"
+_PROMPT_CURRENT_TIME_TEXT = "# 当前时间\n现在是 2026年6月14日 16:00（Asia/Shanghai，星期日）。"
 _DEFAULT_PROMPT_TOOL_NAME = "get_financial_statement"
 _DEFAULT_TIME_TOOL_NAME = "get_current_time"
 _EXCLUDED_UPLOAD_TOOL_NAME = "start_fins_upload"
@@ -94,6 +97,35 @@ class _RaiseSignal:
     """测试 watcher 异常信号。"""
 
     error: Exception
+
+
+class _FakePromptFmpResolver:
+    """prompt command 测试用 FMP resolver。"""
+
+    def __init__(self, *, api_key: str, timeout_seconds: float) -> None:
+        """初始化 fake resolver。
+
+        :param api_key: FMP API key。
+        :param timeout_seconds: FMP timeout。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        del api_key, timeout_seconds
+
+    def resolve_company_info(self, canonical_ticker: str) -> FmpCompanyInfo:
+        """返回固定公司信息。
+
+        :param canonical_ticker: canonical ticker。
+        :returns: fake 公司信息。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return FmpCompanyInfo(
+            canonical_ticker=canonical_ticker,
+            company_name="Visa Inc.",
+            ticker_aliases=(canonical_ticker,),
+        )
 
 
 class _FakeHostEventIterator:
@@ -721,6 +753,7 @@ def test_prompt_command_outputs_fast_live_terminal_and_converts_requests(
         return await real_prepare(request)
 
     monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.delenv("FMP_API_KEY", raising=False)
     monkeypatch.setattr(prompt_command, "prepare_entrypoint_runtime", capture_prepare)
     monkeypatch.setattr(
         prompt_command,
@@ -751,10 +784,12 @@ def test_prompt_command_outputs_fast_live_terminal_and_converts_requests(
     assert "Activity:" in captured.err
     assert "工具批次完成" in captured.err
     assert captured_requests[0].scene_id == "prompt"
-    assert captured_requests[0].context_slot_values == {
-        "fins_default_subject": "AAPL",
-        "base_user": "本地 CLI 用户",
-    }
+    assert (
+        captured_requests[0].context_slot_values["fins_default_subject"]
+        == "# 当前分析对象\n你正在分析的是 AAPL。"
+    )
+    assert captured_requests[0].context_slot_values["base_user"] == "本地 CLI 用户"
+    assert "Asia/Shanghai" in str(captured_requests[0].context_slot_values["current_time"])
     assert captured_requests[0].assembly_overrides.model_id == _MODEL_ID
     assert fake_host.ensure_requests[0].scope == "cli.prompt"
     assert fake_host.ensure_requests[0].slot_key == "cli.prompt.earnings"
@@ -770,6 +805,46 @@ def test_prompt_command_outputs_fast_live_terminal_and_converts_requests(
     assert submit_request.agent_policy is not None
     assert submit_request.context.request_id != submit_request.client_request_id
     assert submit_request.context.operation_context.business_object_id == "AAPL"
+
+
+def test_prompt_command_ticker_uses_fmp_company_name_when_resolved(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """prompt --ticker 应捕获带公司名的 LLM-facing subject slot。"""
+
+    fake_host = _FakeHost(submit_terminal=_terminal_event(status=HostTerminalStatus.SUCCEEDED))
+    captured_requests: list[EntrypointRuntimeRequest] = []
+    real_prepare = prompt_command.prepare_entrypoint_runtime
+
+    async def capture_prepare(
+        request: EntrypointRuntimeRequest,
+    ) -> EntrypointRuntimeResult:
+        """捕获 runtime request。"""
+
+        captured_requests.append(request)
+        return await real_prepare(request)
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.delenv("FMP_API_KEY", raising=False)
+    monkeypatch.setenv("FMP_API_KEY", "test-fmp-key")
+    monkeypatch.setattr(scene_context, "FmpCompanyInfoResolver", _FakePromptFmpResolver)
+    monkeypatch.setattr(prompt_command, "prepare_entrypoint_runtime", capture_prepare)
+    monkeypatch.setattr(
+        prompt_command,
+        "open_host",
+        lambda _options: _FakeOpenHostContext(fake_host),
+    )
+
+    exit_code = cli_main.main(("prompt", "--base", str(tmp_path), "--ticker", "V", "请总结"))
+
+    assert exit_code == EXIT_SUCCESS
+    assert capsys.readouterr().out.strip() == "prompt answer"
+    assert (
+        captured_requests[0].context_slot_values["fins_default_subject"]
+        == "# 当前分析对象\n你正在分析的是 V（Visa Inc.）。"
+    )
 
 
 @pytest.mark.asyncio
@@ -912,10 +987,10 @@ def test_prompt_command_without_ticker_uses_default_context_slots(
 
     assert exit_code == EXIT_SUCCESS
     assert capsys.readouterr().out.strip() == "prompt answer"
-    assert captured_requests[0].context_slot_values == {
-        "fins_default_subject": "未指定具体公司",
-        "base_user": "本地 CLI 用户",
-    }
+    assert captured_requests[0].context_slot_values["fins_default_subject"] == ""
+    assert "未指定具体公司" not in str(captured_requests[0].context_slot_values)
+    assert captured_requests[0].context_slot_values["base_user"] == "本地 CLI 用户"
+    assert "Asia/Shanghai" in str(captured_requests[0].context_slot_values["current_time"])
     assert fake_host.create_requests[0].bind_slot is False
     assert fake_host.submit_requests[0].context.operation_context.business_object_id is None
 
@@ -1224,7 +1299,8 @@ async def test_prompt_sigint_after_run_id_cancels_host_run(
             explicit_config_dir=None,
             scene_id="prompt",
             context_slot_values={
-                "fins_default_subject": "AAPL",
+                "fins_default_subject": "# 当前分析对象\n你正在分析的是 AAPL。",
+                "current_time": _PROMPT_CURRENT_TIME_TEXT,
                 "base_user": "本地 CLI 用户",
             },
             assembly_overrides=prompt_command.ServiceAssemblyOverrides(model_id=_MODEL_ID),
@@ -1648,6 +1724,23 @@ def test_prompt_empty_label_exits_with_usage_error(
     assert "--label" in captured.err
 
 
+def test_prompt_invalid_ticker_exits_with_usage_error_without_traceback(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """非法 ticker 应在 prompt CLI adapter 层返回清晰用法错误。"""
+
+    exit_code = cli_main.main(("prompt", "--base", str(tmp_path), "--ticker", "!@#$", "请总结"))
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_USAGE_ERROR
+    assert "dayu-cli prompt" in captured.err
+    assert "无法识别的 ticker 形态" in captured.err
+    assert "!@#$" in captured.err
+    assert "Traceback" not in captured.err
+    assert "Traceback" not in captured.out
+
+
 def test_prompt_explicit_config_outside_workspace_exits_with_usage_error(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1708,7 +1801,8 @@ async def test_prompt_sigint_before_run_id_returns_local_interrupt(
             explicit_config_dir=None,
             scene_id="prompt",
             context_slot_values={
-                "fins_default_subject": "AAPL",
+                "fins_default_subject": "# 当前分析对象\n你正在分析的是 AAPL。",
+                "current_time": _PROMPT_CURRENT_TIME_TEXT,
                 "base_user": "本地 CLI 用户",
             },
             assembly_overrides=prompt_command.ServiceAssemblyOverrides(model_id=_MODEL_ID),
@@ -1807,7 +1901,8 @@ async def _prepare_prompt_runtime(workspace_root: Path) -> EntrypointRuntimeResu
             explicit_config_dir=None,
             scene_id="prompt",
             context_slot_values={
-                "fins_default_subject": "AAPL",
+                "fins_default_subject": "# 当前分析对象\n你正在分析的是 AAPL。",
+                "current_time": _PROMPT_CURRENT_TIME_TEXT,
                 "base_user": "本地 CLI 用户",
             },
             assembly_overrides=prompt_command.ServiceAssemblyOverrides(model_id=_MODEL_ID),

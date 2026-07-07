@@ -75,11 +75,13 @@ from dayu.service.entrypoint_runtime import (
     prepare_entrypoint_runtime,
 )
 from dayu.service.host_assembly import ServiceAssemblyOverrides
+from dayu.service.scene_context import (
+    EntrypointContextSlotRequest,
+    build_entrypoint_context_slot_values,
+)
 
-DEFAULT_FINS_SUBJECT: Final[str] = "未指定具体公司"
 DEFAULT_BASE_USER: Final[str] = "本地 CLI 用户"
 DEFAULT_PURGE_REASON: Final[str] = "cli_session_purge"
-CONTEXT_SLOT_FINS_DEFAULT_SUBJECT: Final[str] = "fins_default_subject"
 CONTEXT_SLOT_BASE_USER: Final[str] = "base_user"
 _SESSION_CONTEXT_SCENARIO: Final[str] = "session"
 _SESSION_ID_OPTION: Final[str] = "--session-id"
@@ -649,10 +651,11 @@ def _session_context_slot_values() -> dict[str, JsonValue]:
     :raises Exception: 不主动抛出异常。
     """
 
-    return {
-        CONTEXT_SLOT_FINS_DEFAULT_SUBJECT: DEFAULT_FINS_SUBJECT,
-        CONTEXT_SLOT_BASE_USER: DEFAULT_BASE_USER,
-    }
+    context_slot_values = build_entrypoint_context_slot_values(
+        EntrypointContextSlotRequest(ticker=None)
+    )
+    context_slot_values[CONTEXT_SLOT_BASE_USER] = DEFAULT_BASE_USER
+    return context_slot_values
 
 
 __all__: tuple[str, ...] = ("run_session_command",)

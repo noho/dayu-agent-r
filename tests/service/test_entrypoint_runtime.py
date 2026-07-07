@@ -72,12 +72,158 @@ from dayu.service.entrypoint_runtime import (
     _close_watcher,
 )
 from dayu.service.host_assembly import ServiceAssemblyOverrides, ServiceRunOverrides
+from dayu.service.scene_context import (
+    CURRENT_TIME_SLOT,
+    FINS_DEFAULT_SUBJECT_SLOT,
+    EntrypointContextSlotRequest,
+    build_entrypoint_context_slot_values,
+    current_time,
+    fins_default_subject,
+)
+import dayu.service.scene_context as scene_context
+from dayu.fins.resolver import FmpCompanyInfo, FmpCompanyInfoResolutionError
 
 _PACKAGE_CONFIG_ROOT = Path(__file__).resolve().parents[2] / "dayu" / "config"
 _NOW = datetime(2026, 6, 14, 8, 0, 0, tzinfo=UTC)
 _MODEL_ID = "deepseek-v4-flash"
 _RUNNER_HINT_ID = "interactive"
 _API_KEY = "test-provider-key"
+
+
+class _FakeSceneContextFmpResolver:
+    """scene context 测试用 FMP resolver。"""
+
+    api_key: str
+    timeout_seconds: float
+
+    def __init__(self, *, api_key: str, timeout_seconds: float) -> None:
+        """初始化 fake resolver。
+
+        :param api_key: 调用方传入的 FMP API key。
+        :param timeout_seconds: 调用方传入的 FMP timeout。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.api_key = api_key
+        self.timeout_seconds = timeout_seconds
+
+    def resolve_company_info(self, canonical_ticker: str) -> FmpCompanyInfo:
+        """返回固定公司信息。
+
+        :param canonical_ticker: canonical ticker。
+        :returns: fake 公司信息。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return FmpCompanyInfo(
+            canonical_ticker=canonical_ticker,
+            company_name="Visa Inc.",
+            ticker_aliases=(canonical_ticker,),
+        )
+
+
+class _FailingSceneContextFmpResolver:
+    """scene context 测试用失败 FMP resolver。"""
+
+    def __init__(self, *, api_key: str, timeout_seconds: float) -> None:
+        """初始化失败 resolver。
+
+        :param api_key: 调用方传入的 FMP API key。
+        :param timeout_seconds: 调用方传入的 FMP timeout。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        del api_key, timeout_seconds
+
+    def resolve_company_info(self, canonical_ticker: str) -> FmpCompanyInfo:
+        """模拟 FMP 解析失败。
+
+        :param canonical_ticker: canonical ticker。
+        :returns: 不返回；始终抛出异常。
+        :raises FmpCompanyInfoResolutionError: 始终抛出。
+        """
+
+        del canonical_ticker
+        raise FmpCompanyInfoResolutionError("boom")
+
+
+def test_scene_context_formats_subject_and_current_time() -> None:
+    """scene context helper 应生成自解释的 LLM-facing 中文 slot 文本。"""
+
+    assert fins_default_subject(None) == ""
+    assert fins_default_subject(" v ") == "# 当前分析对象\n你正在分析的是 V。"
+    assert (
+        fins_default_subject("V", company_name="Visa Inc.")
+        == "# 当前分析对象\n你正在分析的是 V（Visa Inc.）。"
+    )
+    assert (
+        current_time(datetime(2026, 7, 7, 15, 8, tzinfo=UTC))
+        == "# 当前时间\n现在是 2026年7月7日 23:08（Asia/Shanghai，星期二）。"
+    )
+    assert (
+        current_time(datetime(2026, 7, 7, 15, 8))
+        == "# 当前时间\n现在是 2026年7月7日 15:08（Asia/Shanghai，星期二）。"
+    )
+
+
+def test_build_entrypoint_context_slot_values_resolves_fmp_company_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """有 FMP key 时 Service helper 应用公司名增强 subject 文本。"""
+
+    monkeypatch.setattr(scene_context, "FmpCompanyInfoResolver", _FakeSceneContextFmpResolver)
+
+    values = build_entrypoint_context_slot_values(
+        EntrypointContextSlotRequest(
+            ticker="V",
+            now=datetime(2026, 7, 7, 15, 8),
+            fmp_api_key="test-fmp-key",
+            fmp_timeout_seconds=2.0,
+        )
+    )
+
+    assert values[FINS_DEFAULT_SUBJECT_SLOT] == "# 当前分析对象\n你正在分析的是 V（Visa Inc.）。"
+    assert values[CURRENT_TIME_SLOT] == "# 当前时间\n现在是 2026年7月7日 15:08（Asia/Shanghai，星期二）。"
+
+
+def test_build_entrypoint_context_slot_values_falls_back_without_fmp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """缺 key 或 FMP 失败时 subject 应回退到 ticker-only 且不暴露错误文本。"""
+
+    no_key_values = build_entrypoint_context_slot_values(
+        EntrypointContextSlotRequest(
+            ticker=None,
+            now=datetime(2026, 7, 7, 15, 8),
+            fmp_api_key=None,
+        )
+    )
+    assert no_key_values[FINS_DEFAULT_SUBJECT_SLOT] == ""
+    assert "未指定具体公司" not in str(no_key_values[FINS_DEFAULT_SUBJECT_SLOT])
+
+    no_key_bad_timeout_values = build_entrypoint_context_slot_values(
+        EntrypointContextSlotRequest(
+            ticker="V",
+            now=datetime(2026, 7, 7, 15, 8),
+            fmp_api_key=None,
+            fmp_timeout_seconds=0,
+        )
+    )
+    assert no_key_bad_timeout_values[FINS_DEFAULT_SUBJECT_SLOT] == "# 当前分析对象\n你正在分析的是 V。"
+
+    monkeypatch.setattr(scene_context, "FmpCompanyInfoResolver", _FailingSceneContextFmpResolver)
+    failed_values = build_entrypoint_context_slot_values(
+        EntrypointContextSlotRequest(
+            ticker="V",
+            now=datetime(2026, 7, 7, 15, 8),
+            fmp_api_key="test-fmp-key",
+        )
+    )
+
+    assert failed_values[FINS_DEFAULT_SUBJECT_SLOT] == "# 当前分析对象\n你正在分析的是 V。"
+    assert "boom" not in str(failed_values[FINS_DEFAULT_SUBJECT_SLOT])
 
 
 @dataclass(frozen=True, slots=True)

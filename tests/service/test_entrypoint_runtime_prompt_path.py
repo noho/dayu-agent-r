@@ -49,6 +49,7 @@ _PACKAGE_CONFIG_ROOT = Path(__file__).resolve().parents[2] / "dayu" / "config"
 _MODEL_ID = "deepseek-v4-flash"
 _RUNNER_HINT_ID = "prompt"
 _API_KEY = "test-provider-key"
+_PROMPT_CURRENT_TIME_TEXT = "# 当前时间\n现在是 2026年6月14日 16:00（Asia/Shanghai，星期日）。"
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,7 +266,10 @@ async def test_prompt_runtime_rejects_missing_required_context_slot(
                 package_config_root=_PACKAGE_CONFIG_ROOT,
                 explicit_config_dir=None,
                 scene_id="prompt",
-                context_slot_values={"base_user": "本地 CLI 用户"},
+                context_slot_values={
+                    "current_time": _PROMPT_CURRENT_TIME_TEXT,
+                    "base_user": "本地 CLI 用户",
+                },
                 assembly_overrides=ServiceAssemblyOverrides(
                     model_id=_MODEL_ID,
                     runner_option_hint_id=_RUNNER_HINT_ID,
@@ -335,6 +339,7 @@ async def _prepare_prompt_runtime(
             scene_id="prompt",
             context_slot_values={
                 "fins_default_subject": fins_default_subject,
+                "current_time": _PROMPT_CURRENT_TIME_TEXT,
                 "base_user": base_user,
             },
             assembly_overrides=ServiceAssemblyOverrides(

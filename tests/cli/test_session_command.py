@@ -1378,5 +1378,6 @@ def _assert_session_runtime_uses_prompt_carrier(
     assert len(capture.requests) == 1
     request = capture.requests[0]
     assert request.scene_id == "prompt"
-    assert request.context_slot_values["fins_default_subject"] == "未指定具体公司"
+    assert request.context_slot_values["fins_default_subject"] == ""
     assert request.context_slot_values["base_user"] == "本地 CLI 用户"
+    assert "Asia/Shanghai" in str(request.context_slot_values["current_time"])

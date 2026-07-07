@@ -11,6 +11,7 @@
 - `dayu.service.host_assembly.compose_submit_followup_request_with_overrides(...)`：在同一 assembly 真源内把可映射的单次 Run override 合并为完整 `runner_options` 与 `agent_policy`。
 - `dayu.service.wait_callback_endpoint.handle_wait_callback_completion(...)`：framework-neutral wait callback completion transport mapper；真实 Web router 只把 path wait id、headers 与已解析 JSON body 传入该函数，mapper 负责 transport 校验、Host callback envelope 构造和 HTTP-like status/body 映射，不注册真实路由。
 - `dayu.service.entrypoint_runtime`：为 product entrypoint 提供 reusable Agent runtime helper，覆盖 runtime 准备、Session ensure/create、submit 前 live watcher attach、terminal observation outbox fallback、interactive existing-session startup reconnect、cancel request 构造与 watcher failure 诊断；该模块不解析 CLI 参数，不保存 CLI cursor，不处理 stdout/stderr，也不安装 signal handler。
+- `dayu.service.scene_context`：为 product entrypoint 生成 LLM-facing context slot 文本，覆盖财报分析对象、当前时间、显式 FMP key 下的公司名增强和 FMP 失败时的 ticker-only fallback；该模块不读取 CLI 参数，不向 LLM 投影 FMP 错误文本。
 - `dayu.service.fins_direct`：为 product entrypoint 提供 reusable Fins direct stream helper，覆盖 download / preprocess / upload 的 typed request 构造、`AsyncIterator[FinsEvent]` 透传、terminal result 收口和 operation-scoped cancellation；该模块不解析 CLI 参数，不处理 stdout/stderr，也不读取 Fins storage。
 
 `compose_open_host_options(request)` 会把选中的 execution profile 映射为 Host typed inputs：`tool_truncation_policy` 决定 ToolRuntime 截断默认值，`tool_duplicate_governance_policy` 决定 `HostToolingOptions.duplicate_governance_policy`，`agent_policy` 决定 ordinary run baseline 的 Agent loop policy。

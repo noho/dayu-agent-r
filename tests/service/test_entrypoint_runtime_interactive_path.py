@@ -226,17 +226,15 @@ class _FakeHost:
 async def test_interactive_runtime_uses_real_manifest_required_slots(
     tmp_path: Path,
 ) -> None:
-    """真实 interactive scene 应要求并消费 fins_default_subject/base_user slots。"""
+    """真实 interactive scene 应只要求并消费当前 manifest 所需 slots。"""
 
     result = await _prepare_interactive_runtime(
         tmp_path,
-        fins_default_subject="测试公司",
         base_user="本地 CLI 用户",
     )
     changed_subject_result = await _prepare_interactive_runtime(
         tmp_path,
-        fins_default_subject="另一家公司",
-        base_user="本地 CLI 用户",
+        base_user="另一位用户",
     )
 
     assert result.scene_inputs.tool_selection.tool_names is not None
@@ -290,7 +288,6 @@ async def test_interactive_two_turns_have_independent_terminal_wait_state(
 
     runtime = await _prepare_interactive_runtime(
         tmp_path,
-        fins_default_subject="测试公司",
         base_user="本地 CLI 用户",
     )
     fake_host = _FakeHost()
@@ -324,13 +321,11 @@ async def test_interactive_two_turns_have_independent_terminal_wait_state(
 async def _prepare_interactive_runtime(
     tmp_path: Path,
     *,
-    fins_default_subject: str,
     base_user: str,
 ) -> EntrypointRuntimeResult:
     """构造真实 interactive runtime assembly 测试结果。
 
     :param tmp_path: pytest 临时 workspace root。
-    :param fins_default_subject: 财报默认主体 context slot。
     :param base_user: 用户展示名 context slot。
     :returns: entrypoint runtime result。
     :raises Exception: runtime assembly 失败时向上抛出。
@@ -342,10 +337,7 @@ async def _prepare_interactive_runtime(
             package_config_root=_PACKAGE_CONFIG_ROOT,
             explicit_config_dir=None,
             scene_id="interactive",
-            context_slot_values={
-                "fins_default_subject": fins_default_subject,
-                "base_user": base_user,
-            },
+            context_slot_values={"base_user": base_user},
             assembly_overrides=ServiceAssemblyOverrides(
                 model_id=_MODEL_ID,
                 runner_option_hint_id=_RUNNER_HINT_ID,

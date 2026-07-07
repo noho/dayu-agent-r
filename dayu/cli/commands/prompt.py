@@ -74,10 +74,13 @@ from dayu.service.entrypoint_runtime import (
     submit_entrypoint_turn_and_wait,
 )
 from dayu.service.host_assembly import ServiceAssemblyOverrides, ServiceRunOverrides
+from dayu.service.scene_context import (
+    FMP_API_KEY_ENV,
+    EntrypointContextSlotRequest,
+    build_entrypoint_context_slot_values,
+)
 
-DEFAULT_FINS_SUBJECT: Final[str] = "未指定具体公司"
 DEFAULT_BASE_USER: Final[str] = "本地 CLI 用户"
-CONTEXT_SLOT_FINS_DEFAULT_SUBJECT: Final[str] = "fins_default_subject"
 CONTEXT_SLOT_BASE_USER: Final[str] = "base_user"
 PROMPT_TURN_INDEX: Final[int] = 1
 _TICKER_OPTION: Final[str] = "--ticker"
@@ -229,13 +232,20 @@ async def _prepare_prompt_existing_session_execution(
         display_user=DEFAULT_BASE_USER,
         ticker=ticker,
     )
+    try:
+        context_slot_values = _prompt_context_slot_values(
+            ticker=ticker,
+            fmp_api_key=os.environ.get(FMP_API_KEY_ENV),
+        )
+    except ValueError as exc:
+        raise CliCommandUsageError(str(exc)) from exc
     runtime = await prepare_entrypoint_runtime(
         EntrypointRuntimeRequest(
             workspace_root=workspace_root,
             package_config_root=package_config_root(),
             explicit_config_dir=explicit_config_dir,
             scene_id=scenario,
-            context_slot_values=_prompt_context_slot_values(ticker=ticker),
+            context_slot_values=context_slot_values,
             assembly_overrides=ServiceAssemblyOverrides(
                 model_id=optional_stripped_text(
                     args.model_name,
@@ -639,18 +649,27 @@ def _raise_for_unsupported_execution_options(args: ParsedCliArgs) -> None:
         raise CliCommandUsageError(f"{_UNSUPPORTED_OPTION_PREFIX}: {', '.join(unsupported)}")
 
 
-def _prompt_context_slot_values(*, ticker: str | None) -> dict[str, JsonValue]:
+def _prompt_context_slot_values(
+    *,
+    ticker: str | None,
+    fmp_api_key: str | None,
+) -> dict[str, JsonValue]:
     """构造 prompt scene required context slots。
 
     :param ticker: 用户显式提供的业务主体；未提供时为 ``None``。
+    :param fmp_api_key: 调用方显式读取的 FMP API key；缺失时回退到 ticker-only。
     :returns: 传给 ScenePrepare 的 context slot 值。
-    :raises Exception: 不主动抛出异常。
+    :raises ValueError: ticker 形态非法时抛出。
     """
 
-    return {
-        CONTEXT_SLOT_FINS_DEFAULT_SUBJECT: (ticker if ticker is not None else DEFAULT_FINS_SUBJECT),
-        CONTEXT_SLOT_BASE_USER: DEFAULT_BASE_USER,
-    }
+    context_slot_values = build_entrypoint_context_slot_values(
+        EntrypointContextSlotRequest(
+            ticker=ticker,
+            fmp_api_key=fmp_api_key,
+        )
+    )
+    context_slot_values[CONTEXT_SLOT_BASE_USER] = DEFAULT_BASE_USER
+    return context_slot_values
 
 
 __all__: tuple[str, ...] = ("CliCommandUsageError", "run_prompt_command")
