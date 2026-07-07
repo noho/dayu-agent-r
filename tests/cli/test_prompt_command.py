@@ -68,6 +68,13 @@ from dayu.cli.session_terminal_cursor import read_cli_terminal_cursor
 from dayu.cli.thinking import CliThinkingRenderer, CliThinkingRendererOptions
 from dayu.service.entrypoint_runtime import EntrypointThinking
 
+_REMOVED_PROMPT_DEBUG_OPTIONS: tuple[tuple[str, ...], ...] = (
+    ("--debug-sse",),
+    ("--debug-tool-delta",),
+    ("--debug-sse-sample-rate", "0.5"),
+    ("--debug-sse-throttle-sec", "1.0"),
+)
+
 _NOW = datetime(2026, 6, 14, 8, 0, 0, tzinfo=UTC)
 _MODEL_ID = "deepseek-v4-flash"
 _API_KEY = "test-provider-key"
@@ -1437,6 +1444,27 @@ def test_prompt_debug_stream_is_not_unsupported_execution_option() -> None:
     assert "--debug-stream" not in unsupported_execution_option_names(args)
 
 
+@pytest.mark.parametrize("removed_args", _REMOVED_PROMPT_DEBUG_OPTIONS)
+def test_prompt_removed_debug_options_are_argparse_unknown(
+    removed_args: tuple[str, ...],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """已删除 debug 参数应由 argparse 作为未知参数拒绝。
+
+    :param removed_args: 单个已删除 debug 参数及其取值。
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: 参数未按未知参数返回用法错误时抛出。
+    """
+
+    exit_code = cli_main.main(("prompt", *removed_args, "请总结收入变化"))
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_USAGE_ERROR
+    assert "unrecognized arguments" in captured.err
+    assert removed_args[0] in captured.err
+
+
 def test_prompt_command_reports_all_unsupported_old_execution_flags(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -1445,12 +1473,6 @@ def test_prompt_command_reports_all_unsupported_old_execution_flags(
     exit_code = cli_main.main(
         (
             "prompt",
-            "--debug-sse",
-            "--debug-tool-delta",
-            "--debug-sse-sample-rate",
-            "0.5",
-            "--debug-sse-throttle-sec",
-            "1.0",
             "--tool-trace-dir",
             "trace",
             "--max-duplicate-tool-calls",
@@ -1466,10 +1488,6 @@ def test_prompt_command_reports_all_unsupported_old_execution_flags(
 
     assert exit_code == EXIT_USAGE_ERROR
     for expected in (
-        "--debug-sse",
-        "--debug-tool-delta",
-        "--debug-sse-sample-rate",
-        "--debug-sse-throttle-sec",
         "--tool-trace-dir",
         "--max-duplicate-tool-calls",
         "--duplicate-tool-hint-prompt",

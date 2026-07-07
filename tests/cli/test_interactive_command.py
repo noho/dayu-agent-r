@@ -73,6 +73,12 @@ from dayu.service.entrypoint_runtime import (
 )
 
 _MODEL_ID = "deepseek-v4-flash"
+_REMOVED_INTERACTIVE_DEBUG_OPTIONS: tuple[tuple[str, ...], ...] = (
+    ("--debug-sse",),
+    ("--debug-tool-delta",),
+    ("--debug-sse-sample-rate", "0.5"),
+    ("--debug-sse-throttle-sec", "1.0"),
+)
 _API_KEY = "test-provider-key"
 
 
@@ -1604,6 +1610,27 @@ def test_interactive_debug_stream_is_not_unsupported_execution_option() -> None:
     assert "--debug-stream" not in unsupported_execution_option_names(args)
 
 
+@pytest.mark.parametrize("removed_args", _REMOVED_INTERACTIVE_DEBUG_OPTIONS)
+def test_interactive_removed_debug_options_are_argparse_unknown(
+    removed_args: tuple[str, ...],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """已删除 debug 参数应由 argparse 作为未知参数拒绝。
+
+    :param removed_args: 单个已删除 debug 参数及其取值。
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: 参数未按未知参数返回用法错误时抛出。
+    """
+
+    exit_code = cli_main.main(("interactive", *removed_args))
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_USAGE_ERROR
+    assert "unrecognized arguments" in captured.err
+    assert removed_args[0] in captured.err
+
+
 def test_interactive_reports_all_unsupported_old_execution_flags(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -1612,12 +1639,6 @@ def test_interactive_reports_all_unsupported_old_execution_flags(
     exit_code = cli_main.main(
         (
             "interactive",
-            "--debug-sse",
-            "--debug-tool-delta",
-            "--debug-sse-sample-rate",
-            "0.5",
-            "--debug-sse-throttle-sec",
-            "1.0",
             "--tool-trace-dir",
             "trace",
             "--max-duplicate-tool-calls",
@@ -1632,10 +1653,6 @@ def test_interactive_reports_all_unsupported_old_execution_flags(
 
     assert exit_code == EXIT_USAGE_ERROR
     for expected in (
-        "--debug-sse",
-        "--debug-tool-delta",
-        "--debug-sse-sample-rate",
-        "--debug-sse-throttle-sec",
         "--tool-trace-dir",
         "--max-duplicate-tool-calls",
         "--duplicate-tool-hint-prompt",

@@ -141,10 +141,6 @@ class ParsedCliArgs(argparse.Namespace):
     thinking: bool
     web_provider: str | None
     temperature: float | None
-    debug_sse: bool
-    debug_tool_delta: bool
-    debug_sse_sample_rate: float | None
-    debug_sse_throttle_sec: float | None
     tool_timeout_seconds: float | None
     enable_tool_trace: bool
     tool_trace_dir: str | None
@@ -257,10 +253,6 @@ def _new_default_namespace() -> ParsedCliArgs:
     namespace.thinking = True
     namespace.web_provider = None
     namespace.temperature = None
-    namespace.debug_sse = False
-    namespace.debug_tool_delta = False
-    namespace.debug_sse_sample_rate = None
-    namespace.debug_sse_throttle_sec = None
     namespace.tool_timeout_seconds = None
     namespace.enable_tool_trace = False
     namespace.tool_trace_dir = None
@@ -700,22 +692,6 @@ def _add_agent_execution_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--web-provider", help="Web 工具 provider 覆盖标识。")
     parser.add_argument("--temperature", type=float, help="本轮模型采样温度覆盖值。")
-    parser.add_argument("--debug-sse", action="store_true", help="保留的 SSE 调试开关。")
-    parser.add_argument(
-        "--debug-tool-delta",
-        action="store_true",
-        help="保留的工具增量调试开关。",
-    )
-    parser.add_argument(
-        "--debug-sse-sample-rate",
-        type=float,
-        help="保留的 SSE 调试采样率。",
-    )
-    parser.add_argument(
-        "--debug-sse-throttle-sec",
-        type=float,
-        help="保留的 SSE 调试节流秒数。",
-    )
     parser.add_argument(
         "--tool-timeout-seconds",
         type=float,
