@@ -86,8 +86,7 @@ from dayu.service.entrypoint_runtime import (
 )
 from dayu.service.host_assembly import ServiceAssemblyOverrides, ServiceRunOverrides
 
-DEFAULT_BASE_USER: Final[str] = "本地 CLI 用户"
-CONTEXT_SLOT_BASE_USER: Final[str] = "base_user"
+DEFAULT_DISPLAY_USER: Final[str] = "本地 CLI 用户"
 INTERACTIVE_INPUT_PROMPT: Final[str] = "dayu> "
 _TICKER_OPTION: Final[str] = "--ticker"
 _MODEL_NAME_OPTION: Final[str] = "--model-name"
@@ -283,7 +282,7 @@ async def _prepare_interactive_existing_session_execution(
     invocation = new_cli_invocation(
         command_name=command_name,
         scenario=scenario,
-        display_user=DEFAULT_BASE_USER,
+        display_user=DEFAULT_DISPLAY_USER,
         ticker=ticker,
     )
     runtime = await prepare_entrypoint_runtime(
@@ -903,7 +902,7 @@ def _interactive_context_slot_values() -> dict[str, JsonValue]:
     :raises Exception: 不主动抛出异常。
     """
 
-    return {CONTEXT_SLOT_BASE_USER: DEFAULT_BASE_USER}
+    return {}
 
 
 def _read_user_input(prompt: str) -> str:

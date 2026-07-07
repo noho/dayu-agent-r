@@ -788,7 +788,6 @@ def test_prompt_command_outputs_fast_live_terminal_and_converts_requests(
         captured_requests[0].context_slot_values["fins_default_subject"]
         == "# 当前分析对象\n你正在分析的是 AAPL。"
     )
-    assert captured_requests[0].context_slot_values["base_user"] == "本地 CLI 用户"
     assert "Asia/Shanghai" in str(captured_requests[0].context_slot_values["current_time"])
     assert captured_requests[0].assembly_overrides.model_id == _MODEL_ID
     assert fake_host.ensure_requests[0].scope == "cli.prompt"
@@ -989,7 +988,6 @@ def test_prompt_command_without_ticker_uses_default_context_slots(
     assert capsys.readouterr().out.strip() == "prompt answer"
     assert captured_requests[0].context_slot_values["fins_default_subject"] == ""
     assert "未指定具体公司" not in str(captured_requests[0].context_slot_values)
-    assert captured_requests[0].context_slot_values["base_user"] == "本地 CLI 用户"
     assert "Asia/Shanghai" in str(captured_requests[0].context_slot_values["current_time"])
     assert fake_host.create_requests[0].bind_slot is False
     assert fake_host.submit_requests[0].context.operation_context.business_object_id is None
@@ -1301,7 +1299,6 @@ async def test_prompt_sigint_after_run_id_cancels_host_run(
             context_slot_values={
                 "fins_default_subject": "# 当前分析对象\n你正在分析的是 AAPL。",
                 "current_time": _PROMPT_CURRENT_TIME_TEXT,
-                "base_user": "本地 CLI 用户",
             },
             assembly_overrides=prompt_command.ServiceAssemblyOverrides(model_id=_MODEL_ID),
             env={"DEEPSEEK_API_KEY": _API_KEY},
@@ -1803,7 +1800,6 @@ async def test_prompt_sigint_before_run_id_returns_local_interrupt(
             context_slot_values={
                 "fins_default_subject": "# 当前分析对象\n你正在分析的是 AAPL。",
                 "current_time": _PROMPT_CURRENT_TIME_TEXT,
-                "base_user": "本地 CLI 用户",
             },
             assembly_overrides=prompt_command.ServiceAssemblyOverrides(model_id=_MODEL_ID),
             env={"DEEPSEEK_API_KEY": _API_KEY},
@@ -1903,7 +1899,6 @@ async def _prepare_prompt_runtime(workspace_root: Path) -> EntrypointRuntimeResu
             context_slot_values={
                 "fins_default_subject": "# 当前分析对象\n你正在分析的是 AAPL。",
                 "current_time": _PROMPT_CURRENT_TIME_TEXT,
-                "base_user": "本地 CLI 用户",
             },
             assembly_overrides=prompt_command.ServiceAssemblyOverrides(model_id=_MODEL_ID),
             env={"DEEPSEEK_API_KEY": _API_KEY},

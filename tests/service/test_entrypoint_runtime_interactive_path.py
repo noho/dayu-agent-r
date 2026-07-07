@@ -30,7 +30,6 @@ from dayu.host.api import (
     RunStatus,
     SubmitFollowupRequest,
 )
-from dayu.runtime.scene_prepare import ScenePrepareError
 from dayu.service.entrypoint_runtime import (
     EntrypointRuntimeRequest,
     EntrypointRuntimeResult,
@@ -228,14 +227,7 @@ async def test_interactive_runtime_uses_real_manifest_required_slots(
 ) -> None:
     """真实 interactive scene 应只要求并消费当前 manifest 所需 slots。"""
 
-    result = await _prepare_interactive_runtime(
-        tmp_path,
-        base_user="本地 CLI 用户",
-    )
-    changed_subject_result = await _prepare_interactive_runtime(
-        tmp_path,
-        base_user="另一位用户",
-    )
+    result = await _prepare_interactive_runtime(tmp_path)
 
     assert result.scene_inputs.tool_selection.tool_names is not None
     assert _DEFAULT_INTERACTIVE_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
@@ -252,32 +244,33 @@ async def test_interactive_runtime_uses_real_manifest_required_slots(
     assert "</when_tag>" not in result.scene_inputs.system_prompt
     assert "<when_tool" not in result.scene_inputs.system_prompt
     assert "</when_tool>" not in result.scene_inputs.system_prompt
-    assert result.scene_inputs.content_digest != (changed_subject_result.scene_inputs.content_digest)
     assert result.host_assembly.diagnostics.model_id == _MODEL_ID
     assert result.host_assembly.diagnostics.runner_option_hint_id == _RUNNER_HINT_ID
 
 
 @pytest.mark.asyncio
-async def test_interactive_runtime_rejects_missing_required_context_slot(
+async def test_interactive_runtime_accepts_empty_context_slots(
     tmp_path: Path,
 ) -> None:
-    """真实 interactive scene 缺 required slot 时必须 fail closed。"""
+    """真实 interactive scene 不应要求入口身份类 context slot。"""
 
-    with pytest.raises(ScenePrepareError, match="base_user"):
-        await prepare_entrypoint_runtime(
-            EntrypointRuntimeRequest(
-                workspace_root=tmp_path,
-                package_config_root=_PACKAGE_CONFIG_ROOT,
-                explicit_config_dir=None,
-                scene_id="interactive",
-                context_slot_values={},
-                assembly_overrides=ServiceAssemblyOverrides(
-                    model_id=_MODEL_ID,
-                    runner_option_hint_id=_RUNNER_HINT_ID,
-                ),
-                env={"DEEPSEEK_API_KEY": _API_KEY},
-            )
+    runtime = await prepare_entrypoint_runtime(
+        EntrypointRuntimeRequest(
+            workspace_root=tmp_path,
+            package_config_root=_PACKAGE_CONFIG_ROOT,
+            explicit_config_dir=None,
+            scene_id="interactive",
+            context_slot_values={},
+            assembly_overrides=ServiceAssemblyOverrides(
+                model_id=_MODEL_ID,
+                runner_option_hint_id=_RUNNER_HINT_ID,
+            ),
+            env={"DEEPSEEK_API_KEY": _API_KEY},
         )
+    )
+
+    assert runtime.scene_inputs.tool_selection.tool_names is not None
+    assert _DEFAULT_INTERACTIVE_TOOL_NAME in runtime.scene_inputs.tool_selection.tool_names
 
 
 @pytest.mark.asyncio
@@ -286,10 +279,7 @@ async def test_interactive_two_turns_have_independent_terminal_wait_state(
 ) -> None:
     """interactive 两轮应各自 attach/close watcher 且不复用 wait state。"""
 
-    runtime = await _prepare_interactive_runtime(
-        tmp_path,
-        base_user="本地 CLI 用户",
-    )
+    runtime = await _prepare_interactive_runtime(tmp_path)
     fake_host = _FakeHost()
 
     first = await submit_entrypoint_turn_and_wait(
@@ -320,13 +310,10 @@ async def test_interactive_two_turns_have_independent_terminal_wait_state(
 
 async def _prepare_interactive_runtime(
     tmp_path: Path,
-    *,
-    base_user: str,
 ) -> EntrypointRuntimeResult:
     """构造真实 interactive runtime assembly 测试结果。
 
     :param tmp_path: pytest 临时 workspace root。
-    :param base_user: 用户展示名 context slot。
     :returns: entrypoint runtime result。
     :raises Exception: runtime assembly 失败时向上抛出。
     """
@@ -337,7 +324,7 @@ async def _prepare_interactive_runtime(
             package_config_root=_PACKAGE_CONFIG_ROOT,
             explicit_config_dir=None,
             scene_id="interactive",
-            context_slot_values={"base_user": base_user},
+            context_slot_values={},
             assembly_overrides=ServiceAssemblyOverrides(
                 model_id=_MODEL_ID,
                 runner_option_hint_id=_RUNNER_HINT_ID,

@@ -80,8 +80,7 @@ from dayu.service.scene_context import (
     build_entrypoint_context_slot_values,
 )
 
-DEFAULT_BASE_USER: Final[str] = "本地 CLI 用户"
-CONTEXT_SLOT_BASE_USER: Final[str] = "base_user"
+DEFAULT_DISPLAY_USER: Final[str] = "本地 CLI 用户"
 PROMPT_TURN_INDEX: Final[int] = 1
 _TICKER_OPTION: Final[str] = "--ticker"
 _MODEL_NAME_OPTION: Final[str] = "--model-name"
@@ -229,7 +228,7 @@ async def _prepare_prompt_existing_session_execution(
     invocation = new_cli_invocation(
         command_name=command_name,
         scenario=scenario,
-        display_user=DEFAULT_BASE_USER,
+        display_user=DEFAULT_DISPLAY_USER,
         ticker=ticker,
     )
     try:
@@ -668,7 +667,6 @@ def _prompt_context_slot_values(
             fmp_api_key=fmp_api_key,
         )
     )
-    context_slot_values[CONTEXT_SLOT_BASE_USER] = DEFAULT_BASE_USER
     return context_slot_values
 
 

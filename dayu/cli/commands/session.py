@@ -80,9 +80,8 @@ from dayu.service.scene_context import (
     build_entrypoint_context_slot_values,
 )
 
-DEFAULT_BASE_USER: Final[str] = "本地 CLI 用户"
+DEFAULT_DISPLAY_USER: Final[str] = "本地 CLI 用户"
 DEFAULT_PURGE_REASON: Final[str] = "cli_session_purge"
-CONTEXT_SLOT_BASE_USER: Final[str] = "base_user"
 _SESSION_CONTEXT_SCENARIO: Final[str] = "session"
 _SESSION_ID_OPTION: Final[str] = "--session-id"
 _LABEL_OPTION: Final[str] = "--label"
@@ -173,7 +172,7 @@ async def _run_session_command_async(args: ParsedCliArgs) -> int:
     invocation = new_cli_invocation(
         command_name=COMMAND_SESSION,
         scenario=_SESSION_CONTEXT_SCENARIO,
-        display_user=DEFAULT_BASE_USER,
+        display_user=DEFAULT_DISPLAY_USER,
         ticker=None,
     )
     runtime = await _prepare_session_runtime(args)
@@ -651,11 +650,9 @@ def _session_context_slot_values() -> dict[str, JsonValue]:
     :raises Exception: 不主动抛出异常。
     """
 
-    context_slot_values = build_entrypoint_context_slot_values(
+    return build_entrypoint_context_slot_values(
         EntrypointContextSlotRequest(ticker=None)
     )
-    context_slot_values[CONTEXT_SLOT_BASE_USER] = DEFAULT_BASE_USER
-    return context_slot_values
 
 
 __all__: tuple[str, ...] = ("run_session_command",)

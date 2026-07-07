@@ -393,7 +393,6 @@ def test_default_non_upload_scenes_do_not_select_upload_tool() -> None:
                 prompt_asset_root=_PACKAGE_PROMPT_ROOT,
                 context_slot_values={
                     "fins_default_subject": "测试财报主体",
-                    "base_user": "scene-prepare-test",
                 },
                 available_tools=available_tools,
             )

@@ -1816,7 +1816,6 @@ async def _prepare_runtime(tmp_path: Path) -> EntrypointRuntimeResult:
             scene_id="smoke_host_public_multiturn",
             context_slot_values={
                 "fins_default_subject": "测试财报主体",
-                "base_user": "service-entrypoint-test",
             },
             assembly_overrides=ServiceAssemblyOverrides(
                 host_runtime_id="local",

@@ -63,11 +63,6 @@
       "name": "fins_default_subject",
       "value_type": "string",
       "required": true
-    },
-    {
-      "name": "base_user",
-      "value_type": "string",
-      "required": true
     }
   ]
 }

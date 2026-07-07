@@ -66,6 +66,9 @@ _ALLOWED_MANIFEST_FIELDS: Final[frozenset[str]] = frozenset(
     }
 )
 _ALLOWED_MODEL_FIELDS: Final[frozenset[str]] = frozenset({"default_model_id", "runner_option_hint_id"})
+_FINS_DEFAULT_SUBJECT_SLOT: Final[str] = "fins_default_subject"
+_FINS_DEFAULT_SUBJECT_PLACEHOLDER: Final[str] = "{{fins_default_subject}}"
+_NO_DEFAULT_SUBJECT_SCENES: Final[frozenset[str]] = frozenset({"interactive", "wechat"})
 
 
 def _repo_root() -> Path:
@@ -179,6 +182,48 @@ def _direct_fragment_paths(manifest: Mapping[str, JsonValue]) -> tuple[Path, ...
     return tuple(paths)
 
 
+def _manifest_declares_context_slot(
+    manifest: Mapping[str, JsonValue],
+    slot_name: str,
+) -> bool:
+    """判断 manifest 是否声明指定 context slot。
+
+    :param manifest: manifest JSON object。
+    :param slot_name: context slot 名称。
+    :returns: 声明该 slot 时返回 ``True``。
+    :raises AssertionError: context slot 结构不符合 schema 时抛出。
+    """
+
+    slots = manifest["context_slots"]
+    assert isinstance(slots, list)
+    for slot in slots:
+        assert isinstance(slot, Mapping)
+        name = slot["name"]
+        assert isinstance(name, str)
+        if name == slot_name:
+            return True
+    return False
+
+
+def _scene_fragment_path(manifest: Mapping[str, JsonValue]) -> Path:
+    """返回当前 manifest 对应的 scene fragment 文件。
+
+    :param manifest: manifest JSON object。
+    :returns: ``prompts/scenes`` 下的 scene fragment 路径。
+    :raises AssertionError: 找不到唯一 scene fragment 时抛出。
+    """
+
+    scene = manifest["scene"]
+    assert isinstance(scene, str)
+    candidates = tuple(
+        path
+        for path in _direct_fragment_paths(manifest)
+        if path.parts[-2:] == ("scenes", f"{scene}.md")
+    )
+    assert len(candidates) == 1
+    return candidates[0]
+
+
 def _fake_tool_catalog() -> SceneToolCatalog:
     """构造覆盖迁移 manifest 工具标签的 fake 工具目录。
 
@@ -247,6 +292,27 @@ def test_all_migrated_scene_assets_prepare_successfully() -> None:
         assert result.system_messages
         assert result.fragment_refs
         assert result.capability_tags == (scene,)
+
+
+def test_fins_default_subject_slot_is_rendered_by_declaring_scenes() -> None:
+    """声明默认研究主体 slot 的 scene 必须实际渲染该 slot。"""
+
+    for path in _iter_manifest_paths():
+        manifest = _load_manifest(path)
+        scene = manifest["scene"]
+        assert isinstance(scene, str)
+        scene_content = _scene_fragment_path(manifest).read_text(encoding="utf-8")
+        placeholder_lines = tuple(
+            line for line in scene_content.splitlines() if _FINS_DEFAULT_SUBJECT_PLACEHOLDER in line
+        )
+        declares_subject = _manifest_declares_context_slot(manifest, _FINS_DEFAULT_SUBJECT_SLOT)
+
+        if declares_subject:
+            assert placeholder_lines, scene
+            assert all(line == _FINS_DEFAULT_SUBJECT_PLACEHOLDER for line in placeholder_lines), scene
+        if scene in _NO_DEFAULT_SUBJECT_SCENES:
+            assert not declares_subject, scene
+            assert not placeholder_lines, scene
 
 
 def test_migrated_scene_manifest_schema_excludes_legacy_fields() -> None:
@@ -318,7 +384,6 @@ def test_prompt_prepared_output_filters_long_transaction_guidance() -> None:
             prompt_asset_root=_prompt_asset_root(),
             context_slot_values={
                 "fins_default_subject": "测试财报主体",
-                "base_user": "测试用户",
             },
             available_tools=_fake_tool_catalog(),
         )
@@ -349,7 +414,7 @@ def test_interactive_and_wechat_prepared_output_keep_download_preprocess_guidanc
                 scene_id=scene_id,
                 scene_manifest_root=_manifest_root(),
                 prompt_asset_root=_prompt_asset_root(),
-                context_slot_values={"base_user": "测试用户"},
+                context_slot_values={},
                 available_tools=_fake_tool_catalog(),
             )
         )
@@ -455,7 +520,6 @@ def test_migrated_base_prompt_assets_preserve_legacy_text_boundaries() -> None:
     assert "当前研究主体" not in agents_content
     assert "fins_default_subject" not in agents_content
     assert "用户任务边界" not in fact_rules_content
-    assert "base_user" not in fact_rules_content
     assert "<when_tag fins>" not in tools_content
     for marker in _LEGACY_TOOLS_CONDITIONAL_MARKERS:
         assert marker in tools_content

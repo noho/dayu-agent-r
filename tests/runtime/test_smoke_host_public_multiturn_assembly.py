@@ -266,7 +266,6 @@ def _args(workspace_root: pathlib.Path, *, reuse_session: bool = False) -> Smoke
         model_id=_MODEL_ID,
         runner_option_hint_id=_RUNNER_HINT_ID,
         fins_default_subject="测试财报主体",
-        base_user="runtime-assembly-test",
         log_level=LogLevel.CRITICAL,
         reuse_session=reuse_session,
         keep_workspace=False,

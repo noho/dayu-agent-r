@@ -1,5 +1,7 @@
 # 证据复核执行契约
 
+{{fins_default_subject}}
+
 ## 任务目标
 - 基于你当前收到的 claim 与 evidence 条目，复核其中疑似 `E1/E2/E3` 是否属实。
 

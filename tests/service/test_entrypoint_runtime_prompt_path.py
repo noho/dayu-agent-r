@@ -220,17 +220,15 @@ class _FakeHost:
 async def test_prompt_runtime_uses_real_prompt_manifest_required_slots(
     tmp_path: Path,
 ) -> None:
-    """真实 prompt scene 应要求并消费 fins_default_subject/base_user slots。"""
+    """真实 prompt scene 应要求并消费财报主体 context slot。"""
 
     result = await _prepare_prompt_runtime(
         tmp_path,
         fins_default_subject="测试公司",
-        base_user="本地 CLI 用户",
     )
     changed_subject_result = await _prepare_prompt_runtime(
         tmp_path,
         fins_default_subject="另一家公司",
-        base_user="本地 CLI 用户",
     )
 
     assert result.scene_inputs.tool_selection.tool_names is not None
@@ -268,7 +266,6 @@ async def test_prompt_runtime_rejects_missing_required_context_slot(
                 scene_id="prompt",
                 context_slot_values={
                     "current_time": _PROMPT_CURRENT_TIME_TEXT,
-                    "base_user": "本地 CLI 用户",
                 },
                 assembly_overrides=ServiceAssemblyOverrides(
                     model_id=_MODEL_ID,
@@ -288,7 +285,6 @@ async def test_submit_entrypoint_turn_reports_accepted_run_id(
     runtime = await _prepare_prompt_runtime(
         tmp_path,
         fins_default_subject="测试公司",
-        base_user="本地 CLI 用户",
     )
     accepted_run_ids: list[str] = []
     fake_host = _FakeHost()
@@ -320,13 +316,11 @@ async def _prepare_prompt_runtime(
     tmp_path: Path,
     *,
     fins_default_subject: str,
-    base_user: str,
 ) -> EntrypointRuntimeResult:
     """准备真实 prompt scene 的 entrypoint runtime。
 
     :param tmp_path: pytest 临时 workspace root。
     :param fins_default_subject: prompt scene 财报主体 slot 值。
-    :param base_user: prompt scene base_user slot 值。
     :returns: entrypoint runtime result。
     :raises Exception: runtime assembly 失败时向上抛出。
     """
@@ -340,7 +334,6 @@ async def _prepare_prompt_runtime(
             context_slot_values={
                 "fins_default_subject": fins_default_subject,
                 "current_time": _PROMPT_CURRENT_TIME_TEXT,
-                "base_user": base_user,
             },
             assembly_overrides=ServiceAssemblyOverrides(
                 model_id=_MODEL_ID,

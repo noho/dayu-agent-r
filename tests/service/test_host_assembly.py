@@ -188,7 +188,6 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
             prompt_asset_root=locations.prompt_asset_root,
             context_slot_values={
                 "fins_default_subject": "测试财报主体",
-                "base_user": "service-assembly-test",
             },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
@@ -295,7 +294,6 @@ def test_compose_open_host_options_passes_explicit_wait_poller_policy(
             prompt_asset_root=locations.prompt_asset_root,
             context_slot_values={
                 "fins_default_subject": "测试财报主体",
-                "base_user": "service-assembly-test",
             },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
@@ -352,7 +350,6 @@ def test_compose_open_host_options_reads_compactor_scene_id_from_profile(
             prompt_asset_root=locations.prompt_asset_root,
             context_slot_values={
                 "fins_default_subject": "测试财报主体",
-                "base_user": "service-assembly-test",
             },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
@@ -428,7 +425,6 @@ def test_compose_submit_followup_request_uses_prepared_system_prompt(
             prompt_asset_root=locations.prompt_asset_root,
             context_slot_values={
                 "fins_default_subject": "测试财报主体",
-                "base_user": "service-assembly-test",
             },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
@@ -472,7 +468,6 @@ def test_compose_submit_followup_request_with_overrides_sets_typed_fields(
             prompt_asset_root=locations.prompt_asset_root,
             context_slot_values={
                 "fins_default_subject": "测试财报主体",
-                "base_user": "service-assembly-test",
             },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
@@ -1667,7 +1662,6 @@ def test_truncation_manager_enabled_is_derived_from_execution_profile(
             prompt_asset_root=locations.prompt_asset_root,
             context_slot_values={
                 "fins_default_subject": "测试财报主体",
-                "base_user": "service-assembly-test",
             },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
@@ -1721,7 +1715,6 @@ def test_memory_projection_context_window_uses_effective_model_window(
             prompt_asset_root=locations.prompt_asset_root,
             context_slot_values={
                 "fins_default_subject": "测试财报主体",
-                "base_user": "service-assembly-test",
             },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
@@ -1785,7 +1778,6 @@ def test_tool_duplicate_governance_policy_is_derived_from_execution_profile(
             prompt_asset_root=locations.prompt_asset_root,
             context_slot_values={
                 "fins_default_subject": "测试财报主体",
-                "base_user": "service-assembly-test",
             },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
@@ -1871,7 +1863,6 @@ def test_explicit_1m_profile_with_256k_model_fails_fast(
             prompt_asset_root=locations.prompt_asset_root,
             context_slot_values={
                 "fins_default_subject": "测试财报主体",
-                "base_user": "service-assembly-test",
             },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
@@ -1923,7 +1914,6 @@ def test_default_profile_does_not_auto_switch_for_1m_model(
             prompt_asset_root=locations.prompt_asset_root,
             context_slot_values={
                 "fins_default_subject": "测试财报主体",
-                "base_user": "service-assembly-test",
             },
             available_tools=_scene_tool_catalog(discovered_tools),
         )

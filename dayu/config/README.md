@@ -209,7 +209,9 @@ Scene manifest 由 `dayu.runtime.scene_prepare` 解释；ConfigLoader 不读取�
 
 Scene manifest 第一版是单 Run 场景装配输入。允许的顶层字段固定为 `schema_version`、`scene`、`version`、`description`、`capability_tags`、`extends`、`model`、`agent_policy`、`tool_selection`、`defaults`、`fragments` 与 `context_slots`。调用方显式传入 manifest root、prompt asset root、typed context slot values 与可用工具目录；ScenePrepare 只读取 manifest 直接引用的 fragments，执行确定性的文本替换，并输出 system messages、已拼接的 system prompt、工具选择结果、model hints、typed agent policy override、fragment refs、source refs 与 content digest。
 
-默认非上传 scene 不使用 broad `"fins"` tag 选择 Fins 工具，也不在 packaged manifest 中列出具体工具名；它们通过窄标签 `"fins-read"`、`"fins-download"`、`"fins-preprocess"` 选择财报 read / download / preprocess 工具，并在需要联网或实时时钟能力时继续用 `"web"`、`"utils"` tag。这样即使 upload provider 默认注册 `start_fins_upload`，也不会被非上传 scene 通过泛化 Fins tag 意外选中。`tool_selection.allow_empty` 只控制 scene 工具选择空匹配语义，和 ToolsDiscovery provider 是否允许空输出无关。
+Prompt fragment 可以使用条件块 marker 控制工具说明是否进入最终 system prompt。`<when_tag TAG>...</when_tag>` 只在当前 scene 选中对应工具 tag 时保留正文；`<when_tool NAME>...</when_tool>` 只在当前 scene 选中对应工具名时保留正文。条件块 marker 是 ScenePrepare 解释的 prompt asset 控制语法，渲染后的 LLM-facing system prompt 不应包含这些 marker。
+
+默认非上传 scene 不使用 broad `"fins"` tag 选择 Fins 工具，也不在 packaged manifest 中列出具体工具名；它们通过窄标签 `"fins-read"`、`"fins-download"`、`"fins-preprocess"` 选择财报 read / download / preprocess 工具，并在需要联网或实时时钟能力时继续用 `"web"`、`"utils"` tag。`utils` tag 当前用于选择 `get_current_time` 工具；manifest 不写 `"time"` tag 或具体工具名也能通过该 tag 获得默认实时时钟能力。这样即使 upload provider 默认注册 `start_fins_upload`，也不会被非上传 scene 通过泛化 Fins tag 意外选中。`tool_selection.allow_empty` 只控制 scene 工具选择空匹配语义，和 ToolsDiscovery provider 是否允许空输出无关。
 
 `conversation_compaction` 是会话压缩专用 scene。该 scene 使用一个 required fragment 作为 compactor system prompt，并在 scene 的 `agent_policy` block 中声明 compactor AgentPolicy。user prompt template 由 execution profile 的 `compactor_baseline.user_prompt_template_path` 指向 prompt asset；template 使用 `<<compaction_request>>` 作为运行期请求数据块占位符，该占位符不是 ScenePrepare context slot，不能写成 `{{...}}`。
 

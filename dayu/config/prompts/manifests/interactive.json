@@ -61,11 +61,5 @@
       "required": true
     }
   ],
-  "context_slots": [
-    {
-      "name": "base_user",
-      "value_type": "string",
-      "required": true
-    }
-  ]
+  "context_slots": []
 }

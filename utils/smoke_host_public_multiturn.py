@@ -101,7 +101,7 @@ _DEFAULT_WORKSPACE_PARENT: Final[pathlib.Path] = _PROJECT_ROOT / "workspace" / "
 _DEFAULT_WORKSPACE_PREFIX: Final[str] = "host-public-multiturn-smoke"
 _DEFAULT_SCENE_ID: Final[str] = "smoke_host_public_multiturn"
 _DEFAULT_SUBJECT: Final[str] = "Dayu Host public runtime assembly smoke"
-_DEFAULT_USER: Final[str] = "manual-smoke-operator"
+_DEFAULT_ACTOR: Final[str] = "manual-smoke-operator"
 _SMOKE_TOOL_NAME: Final[str] = "record_smoke_fact"
 _SMOKE_TOOL_TAG: Final[str] = "manual-smoke"
 _SMOKE_PROVIDER_SPEC_ID: Final[str] = "host-public-multiturn-smoke"
@@ -132,7 +132,6 @@ class SmokeArgs:
     :param model_id: 可选 Run/UI 模型显式 override。
     :param runner_option_hint_id: 可选 Run/UI runner option hint 显式 override。
     :param fins_default_subject: scene context slot 的研究主体。
-    :param base_user: scene context slot 的用户标识。
     :param log_level: Dayu 日志级别。
     :param reuse_session: 是否复用稳定 slot key；默认每次使用 fresh slot。
     :param keep_workspace: 是否在输出中显式标记保留 workspace。
@@ -145,7 +144,6 @@ class SmokeArgs:
     model_id: str | None
     runner_option_hint_id: str | None
     fins_default_subject: str
-    base_user: str
     log_level: LogLevel
     reuse_session: bool
     keep_workspace: bool
@@ -303,11 +301,6 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
         help="传给 scene context slot 的默认研究主体。",
     )
     parser.add_argument(
-        "--base-user",
-        default=_DEFAULT_USER,
-        help="传给 scene context slot 的用户标识。",
-    )
-    parser.add_argument(
         "--log-level",
         choices=tuple(level.name for level in LogLevel),
         default=LogLevel.VERBOSE.name,
@@ -334,7 +327,6 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
     model_id: str | None = namespace.model_id
     runner_option_hint_id: str | None = namespace.runner_option_hint_id
     fins_default_subject: str = namespace.fins_default_subject
-    base_user: str = namespace.base_user
     log_level_text: str = namespace.log_level
     reuse_session: bool = namespace.reuse_session
     keep_workspace: bool = namespace.keep_workspace
@@ -346,7 +338,6 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
         model_id=model_id,
         runner_option_hint_id=runner_option_hint_id,
         fins_default_subject=fins_default_subject,
-        base_user=base_user,
         log_level=LogLevel[log_level_text],
         reuse_session=reuse_session,
         keep_workspace=keep_workspace,
@@ -479,7 +470,6 @@ def _prepare_runtime_assembly(
             prompt_asset_root=locations.prompt_asset_root,
             context_slot_values={
                 "fins_default_subject": args.fins_default_subject,
-                "base_user": args.base_user,
             },
             available_tools=SceneToolCatalog.from_tool_bundle(
                 discovered_tools.tool_bundle
@@ -563,6 +553,7 @@ def _discover_smoke_service_tools(
             ),
         ),
         effective_provider_configs=discovered.effective_provider_configs,
+        fins_awaiting_runtime=discovered.fins_awaiting_runtime,
     )
 
 
@@ -683,7 +674,7 @@ def _host_context(request_id: str) -> HostCallContext:
     """
 
     return HostCallContext(
-        actor=_DEFAULT_USER,
+        actor=_DEFAULT_ACTOR,
         source="utils.smoke_host_public_multiturn",
         request_id=request_id,
         authorization_claims=(
