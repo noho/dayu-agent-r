@@ -36,7 +36,7 @@
 - 含 `ref` 的章节优先走 `read_file_section`。
 </when_tag>
 
-<when_tag fins>
+<when_tag fins-read>
 ## 财报工具指引
 
 ### 工作流
@@ -64,12 +64,21 @@
   - 一旦 `document_id` 变化，先前在旧文档拿到的所有 `ref` / `table_ref` 一律作废，禁止跨文档复用。
 </when_tag>
 
-<when_tag ingestion>
-## 数据摄取工具指引
+<when_tool start_fins_download>
+## start_fins_download
 
-- `start_*` 后按 `next_step.action` 决定轮询或结束。
+- 用途：启动财报下载长事务。
+- 调用后按返回的 `next_step.action` 决定轮询或结束。
 - 除非用户明确要求，不要主动取消任务。
-</when_tag>
+</when_tool>
+
+<when_tool start_fins_preprocess>
+## start_fins_preprocess
+
+- 用途：启动财报预处理长事务。
+- 调用后按返回的 `next_step.action` 决定轮询或结束。
+- 除非用户明确要求，不要主动取消任务。
+</when_tool>
 
 <when_tag web>
 ## 联网工具指引

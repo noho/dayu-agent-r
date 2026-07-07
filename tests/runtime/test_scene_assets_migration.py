@@ -36,10 +36,17 @@ _COMPACTOR_POLICY_SCENES: Final[frozenset[str]] = frozenset({"conversation_compa
 _LEGACY_TOOLS_CONDITIONAL_MARKERS: Final[tuple[str, ...]] = (
     "<when_tag doc>",
     "</when_tag>",
-    "<when_tag fins>",
-    "<when_tag ingestion>",
+    "<when_tag fins-read>",
     "<when_tag web>",
+    "<when_tool start_fins_download>",
+    "<when_tool start_fins_preprocess>",
     "<when_tool get_current_time>",
+    "</when_tool>",
+)
+_PREPARED_CONDITIONAL_MARKERS: Final[tuple[str, ...]] = (
+    "<when_tag",
+    "</when_tag>",
+    "<when_tool",
     "</when_tool>",
 )
 _ALLOWED_MANIFEST_FIELDS: Final[frozenset[str]] = frozenset(
@@ -278,8 +285,8 @@ def test_packaged_select_manifests_use_tag_only_tool_selection() -> None:
             assert tool_tags_any
 
 
-def test_infer_manifest_selects_read_download_preprocess_and_utils_without_upload() -> None:
-    """infer manifest 必须保持旧 read/download/preprocess 暴露面并排除 upload。"""
+def test_infer_manifest_selects_read_and_web_without_long_transaction_or_upload() -> None:
+    """infer manifest 必须保持 read/web 暴露面并排除长事务与 upload。"""
 
     result = prepare_scene(
         ScenePrepareRequest(
@@ -294,11 +301,71 @@ def test_infer_manifest_selects_read_download_preprocess_and_utils_without_uploa
     selected = result.tool_selection.tool_names
     assert selected is not None
     assert "list_documents" in selected
-    assert "start_fins_download" in selected
-    assert "start_fins_preprocess" in selected
-    assert "get_current_time" in selected
+    assert "fake_web_search" in selected
+    assert "start_fins_download" not in selected
+    assert "start_fins_preprocess" not in selected
+    assert "get_current_time" not in selected
     assert "start_fins_upload" not in selected
-    assert "fake_web_search" not in selected
+
+
+def test_prompt_prepared_output_filters_long_transaction_guidance() -> None:
+    """prompt scene 不得暴露下载、预处理或上传工具指引。"""
+
+    result = prepare_scene(
+        ScenePrepareRequest(
+            scene_id="prompt",
+            scene_manifest_root=_manifest_root(),
+            prompt_asset_root=_prompt_asset_root(),
+            context_slot_values={
+                "fins_default_subject": "测试财报主体",
+                "base_user": "测试用户",
+            },
+            available_tools=_fake_tool_catalog(),
+        )
+    )
+
+    selected = result.tool_selection.tool_names
+    assert selected is not None
+    assert "get_financial_statement" in selected
+    assert "get_current_time" in selected
+    assert "start_fins_download" not in selected
+    assert "start_fins_preprocess" not in selected
+    assert "start_fins_upload" not in selected
+    assert "财报工具指引" in result.system_prompt
+    assert "get_current_time" in result.system_prompt
+    assert "start_fins_download" not in result.system_prompt
+    assert "start_fins_preprocess" not in result.system_prompt
+    assert "start_fins_upload" not in result.system_prompt
+    for marker in _PREPARED_CONDITIONAL_MARKERS:
+        assert marker not in result.system_prompt
+
+
+def test_interactive_and_wechat_prepared_output_keep_download_preprocess_guidance() -> None:
+    """interactive/wechat scene 应暴露下载、预处理和当前时间指引。"""
+
+    for scene_id in ("interactive", "wechat"):
+        result = prepare_scene(
+            ScenePrepareRequest(
+                scene_id=scene_id,
+                scene_manifest_root=_manifest_root(),
+                prompt_asset_root=_prompt_asset_root(),
+                context_slot_values={"base_user": "测试用户"},
+                available_tools=_fake_tool_catalog(),
+            )
+        )
+
+        selected = result.tool_selection.tool_names
+        assert selected is not None
+        assert "start_fins_download" in selected
+        assert "start_fins_preprocess" in selected
+        assert "get_current_time" in selected
+        assert "start_fins_upload" not in selected
+        assert "start_fins_download" in result.system_prompt
+        assert "start_fins_preprocess" in result.system_prompt
+        assert "get_current_time" in result.system_prompt
+        assert "start_fins_upload" not in result.system_prompt
+        for marker in _PREPARED_CONDITIONAL_MARKERS:
+            assert marker not in result.system_prompt
 
 
 def test_conversation_compaction_default_model_matches_default_profile_compactor() -> None:
@@ -389,6 +456,7 @@ def test_migrated_base_prompt_assets_preserve_legacy_text_boundaries() -> None:
     assert "fins_default_subject" not in agents_content
     assert "用户任务边界" not in fact_rules_content
     assert "base_user" not in fact_rules_content
+    assert "<when_tag fins>" not in tools_content
     for marker in _LEGACY_TOOLS_CONDITIONAL_MARKERS:
         assert marker in tools_content
 

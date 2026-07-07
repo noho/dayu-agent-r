@@ -34,6 +34,12 @@ _SCENE_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]
 _CONTEXT_SLOT_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _PLACEHOLDER_PATTERN: Final[re.Pattern[str]] = re.compile(r"{{\s*([A-Za-z_][A-Za-z0-9_]*)\s*}}")
 _UNRESOLVED_PLACEHOLDER_PATTERN: Final[re.Pattern[str]] = re.compile(r"{{[^{}]*}}")
+_CONDITION_MARKER_START_PATTERN: Final[re.Pattern[str]] = re.compile(r"</?when_(?:tool|tag)")
+_CONDITION_OPEN_MARKER_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"<when_(tool|tag)\s+([A-Za-z0-9_.-]+)>"
+)
+_CONDITION_CLOSE_MARKER_PATTERN: Final[re.Pattern[str]] = re.compile(r"</when_(tool|tag)>")
+_CONDITION_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9_.-]+$")
 _ALLOWED_MANIFEST_FIELDS: Final[frozenset[str]] = frozenset(
     {
         "schema_version",
@@ -456,6 +462,18 @@ class ScenePrepare:
             manifest_root=manifest_root,
             stack=(),
         )
+        tool_selection = _select_tools(
+            selection=resolved.tool_selection,
+            catalog=request.available_tools,
+        )
+        selected_tool_names = _selected_tool_names(
+            tool_selection=tool_selection,
+            catalog=request.available_tools,
+        )
+        selected_tags = _selected_tool_tags(
+            selected_tool_names=selected_tool_names,
+            catalog=request.available_tools,
+        )
         fragment_contents = _load_fragment_contents(
             fragments=resolved.fragments,
             prompt_asset_root=prompt_asset_root,
@@ -463,16 +481,17 @@ class ScenePrepare:
         )
         rendered_messages = tuple(
             _render_fragment_content(
-                content=content,
+                content=_filter_condition_blocks(
+                    content=content,
+                    selected_tool_names=selected_tool_names,
+                    selected_tags=selected_tags,
+                    fragment_id=fragment.fragment_id,
+                ),
                 context_slots=resolved.context_slots,
                 context_slot_values=request.context_slot_values,
                 fragment_id=fragment.fragment_id,
             )
             for fragment, content in fragment_contents
-        )
-        tool_selection = _select_tools(
-            selection=resolved.tool_selection,
-            catalog=request.available_tools,
         )
         fragment_refs = tuple(
             SceneFragmentRef(
@@ -1077,6 +1096,115 @@ def _replace_placeholders(
     return "".join(rendered_parts)
 
 
+def _filter_condition_blocks(
+    *,
+    content: str,
+    selected_tool_names: frozenset[str],
+    selected_tags: frozenset[str],
+    fragment_id: str,
+) -> str:
+    """按实际选中工具集合过滤 fragment 条件块。
+
+    :param content: fragment 原始文本。
+    :param selected_tool_names: 本 scene 实际选中的工具名集合。
+    :param selected_tags: 本 scene 实际选中工具聚合出的标签集合。
+    :param fragment_id: 错误消息中的 fragment id。
+    :returns: 删除未命中条件块并剥离 marker 后的文本。
+    :raises ScenePrepareError: 条件块 marker 格式非法、错配、未闭合或嵌套时
+        抛出。
+    """
+
+    rendered_parts: list[str] = []
+    cursor = 0
+    active_kind: str | None = None
+    active_name: str | None = None
+    while True:
+        marker_start = _CONDITION_MARKER_START_PATTERN.search(content, cursor)
+        if marker_start is None:
+            if active_kind is not None:
+                raise ScenePrepareError(f"conditional block is not closed in fragment {fragment_id}: {active_kind}")
+            rendered_parts.append(content[cursor:])
+            return "".join(rendered_parts)
+
+        marker_end_index = content.find(">", marker_start.start())
+        if marker_end_index < 0:
+            raise ScenePrepareError(f"malformed conditional marker in fragment {fragment_id}")
+        marker_text = content[marker_start.start() : marker_end_index + 1]
+        open_match = _CONDITION_OPEN_MARKER_PATTERN.fullmatch(marker_text)
+        close_match = _CONDITION_CLOSE_MARKER_PATTERN.fullmatch(marker_text)
+        if open_match is None and close_match is None:
+            raise ScenePrepareError(f"malformed conditional marker in fragment {fragment_id}: {marker_text}")
+
+        if open_match is not None:
+            if active_kind is not None:
+                raise ScenePrepareError(f"nested conditional block in fragment {fragment_id}: {marker_text}")
+            rendered_parts.append(content[cursor : marker_start.start()])
+            active_kind = open_match.group(1)
+            active_name = _require_condition_name(
+                value=open_match.group(2),
+                fragment_id=fragment_id,
+                marker_text=marker_text,
+            )
+            cursor = marker_end_index + 1
+            continue
+
+        if active_kind is None or active_name is None:
+            raise ScenePrepareError(f"conditional close marker without open in fragment {fragment_id}: {marker_text}")
+        assert close_match is not None
+        close_kind = close_match.group(1)
+        if close_kind != active_kind:
+            raise ScenePrepareError(
+                f"conditional marker mismatch in fragment {fragment_id}: {active_kind} closed by {close_kind}"
+            )
+        body = content[cursor : marker_start.start()]
+        if _condition_is_selected(
+            kind=active_kind,
+            name=active_name,
+            selected_tool_names=selected_tool_names,
+            selected_tags=selected_tags,
+        ):
+            rendered_parts.append(body)
+        active_kind = None
+        active_name = None
+        cursor = marker_end_index + 1
+
+
+def _require_condition_name(*, value: str, fragment_id: str, marker_text: str) -> str:
+    """校验条件块名称。
+
+    :param value: marker 中的条件名称。
+    :param fragment_id: 错误消息中的 fragment id。
+    :param marker_text: 原始 marker 文本。
+    :returns: 条件名称。
+    :raises ScenePrepareError: 条件名称为空或包含非法字符时抛出。
+    """
+
+    if _CONDITION_NAME_PATTERN.fullmatch(value) is None:
+        raise ScenePrepareError(f"invalid conditional name in fragment {fragment_id}: {marker_text}")
+    return value
+
+
+def _condition_is_selected(
+    *,
+    kind: str,
+    name: str,
+    selected_tool_names: frozenset[str],
+    selected_tags: frozenset[str],
+) -> bool:
+    """判断条件块是否应保留。
+
+    :param kind: 条件块类别，取值为 ``tool`` 或 ``tag``。
+    :param name: 条件名称。
+    :param selected_tool_names: 实际选中工具名集合。
+    :param selected_tags: 实际选中工具聚合出的标签集合。
+    :returns: 命中时返回 ``True``，否则返回 ``False``。
+    """
+
+    if kind == "tool":
+        return name in selected_tool_names
+    return name in selected_tags
+
+
 def _select_tools(*, selection: SceneToolSelection, catalog: SceneToolCatalog) -> SceneToolSelectionResult:
     """根据 manifest tool_selection 和可用工具目录计算工具白名单。
 
@@ -1104,6 +1232,43 @@ def _select_tools(*, selection: SceneToolSelection, catalog: SceneToolCatalog) -
     if not selected and not selection.allow_empty:
         raise ScenePrepareError("tool_selection select produced empty tool set")
     return SceneToolSelectionResult(mode=selection.mode, tool_names=selected)
+
+
+def _selected_tool_names(
+    *,
+    tool_selection: SceneToolSelectionResult,
+    catalog: SceneToolCatalog,
+) -> frozenset[str]:
+    """把工具选择结果转成实际可见工具名集合。
+
+    :param tool_selection: ScenePrepare 工具选择结果。
+    :param catalog: 可用工具目录。
+    :returns: 实际选中的工具名集合。
+    """
+
+    if tool_selection.tool_names is None:
+        return catalog.names()
+    return tool_selection.tool_names
+
+
+def _selected_tool_tags(
+    *,
+    selected_tool_names: frozenset[str],
+    catalog: SceneToolCatalog,
+) -> frozenset[str]:
+    """聚合实际选中工具携带的 catalog tags。
+
+    :param selected_tool_names: 实际选中的工具名集合。
+    :param catalog: 可用工具目录。
+    :returns: 实际选中工具标签集合。
+    """
+
+    tags: set[str] = set()
+    for tool in catalog.tools:
+        if tool.name not in selected_tool_names:
+            continue
+        tags.update(tool.tags)
+    return frozenset(tags)
 
 
 def _build_source_refs(

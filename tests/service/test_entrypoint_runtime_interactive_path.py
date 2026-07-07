@@ -245,6 +245,15 @@ async def test_interactive_runtime_uses_real_manifest_required_slots(
     assert _DEFAULT_DOWNLOAD_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
     assert _DEFAULT_PREPROCESS_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
     assert _EXCLUDED_UPLOAD_TOOL_NAME not in result.scene_inputs.tool_selection.tool_names
+    assert "财报工具指引" in result.scene_inputs.system_prompt
+    assert _DEFAULT_TIME_TOOL_NAME in result.scene_inputs.system_prompt
+    assert _DEFAULT_DOWNLOAD_TOOL_NAME in result.scene_inputs.system_prompt
+    assert _DEFAULT_PREPROCESS_TOOL_NAME in result.scene_inputs.system_prompt
+    assert _EXCLUDED_UPLOAD_TOOL_NAME not in result.scene_inputs.system_prompt
+    assert "<when_tag" not in result.scene_inputs.system_prompt
+    assert "</when_tag>" not in result.scene_inputs.system_prompt
+    assert "<when_tool" not in result.scene_inputs.system_prompt
+    assert "</when_tool>" not in result.scene_inputs.system_prompt
     assert result.scene_inputs.content_digest != (changed_subject_result.scene_inputs.content_digest)
     assert result.host_assembly.diagnostics.model_id == _MODEL_ID
     assert result.host_assembly.diagnostics.runner_option_hint_id == _RUNNER_HINT_ID
@@ -256,14 +265,14 @@ async def test_interactive_runtime_rejects_missing_required_context_slot(
 ) -> None:
     """真实 interactive scene 缺 required slot 时必须 fail closed。"""
 
-    with pytest.raises(ScenePrepareError, match="fins_default_subject"):
+    with pytest.raises(ScenePrepareError, match="base_user"):
         await prepare_entrypoint_runtime(
             EntrypointRuntimeRequest(
                 workspace_root=tmp_path,
                 package_config_root=_PACKAGE_CONFIG_ROOT,
                 explicit_config_dir=None,
                 scene_id="interactive",
-                context_slot_values={"base_user": "本地 CLI 用户"},
+                context_slot_values={},
                 assembly_overrides=ServiceAssemblyOverrides(
                     model_id=_MODEL_ID,
                     runner_option_hint_id=_RUNNER_HINT_ID,

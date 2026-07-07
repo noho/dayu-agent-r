@@ -235,9 +235,18 @@ async def test_prompt_runtime_uses_real_prompt_manifest_required_slots(
     assert result.scene_inputs.tool_selection.tool_names is not None
     assert DEFAULT_PROMPT_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
     assert DEFAULT_TIME_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
-    assert DEFAULT_DOWNLOAD_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
-    assert DEFAULT_PREPROCESS_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
+    assert DEFAULT_DOWNLOAD_TOOL_NAME not in result.scene_inputs.tool_selection.tool_names
+    assert DEFAULT_PREPROCESS_TOOL_NAME not in result.scene_inputs.tool_selection.tool_names
     assert EXCLUDED_UPLOAD_TOOL_NAME not in result.scene_inputs.tool_selection.tool_names
+    assert "财报工具指引" in result.scene_inputs.system_prompt
+    assert DEFAULT_TIME_TOOL_NAME in result.scene_inputs.system_prompt
+    assert DEFAULT_DOWNLOAD_TOOL_NAME not in result.scene_inputs.system_prompt
+    assert DEFAULT_PREPROCESS_TOOL_NAME not in result.scene_inputs.system_prompt
+    assert EXCLUDED_UPLOAD_TOOL_NAME not in result.scene_inputs.system_prompt
+    assert "<when_tag" not in result.scene_inputs.system_prompt
+    assert "</when_tag>" not in result.scene_inputs.system_prompt
+    assert "<when_tool" not in result.scene_inputs.system_prompt
+    assert "</when_tool>" not in result.scene_inputs.system_prompt
     assert result.scene_inputs.content_digest != (changed_subject_result.scene_inputs.content_digest)
     assert result.host_assembly.diagnostics.model_id == _MODEL_ID
     assert result.host_assembly.diagnostics.runner_option_hint_id == _RUNNER_HINT_ID
