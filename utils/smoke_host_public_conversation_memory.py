@@ -93,6 +93,7 @@ from dayu.service.host_assembly import (
     compose_submit_followup_request,
     discover_service_tools,
 )
+from dayu.service.scene_context import CURRENT_TIME_SLOT, current_time
 from utils.smoke_host_public_diagnostics import (
     print_duplicate_governance_diagnostics,
 )
@@ -548,7 +549,7 @@ def _prepare_runtime_assembly(
             scene_id=args.scene_id,
             scene_manifest_root=locations.scene_manifest_root,
             prompt_asset_root=locations.prompt_asset_root,
-            context_slot_values={},
+            context_slot_values={CURRENT_TIME_SLOT: current_time()},
             available_tools=SceneToolCatalog.from_tool_bundle(
                 discovered_tools.tool_bundle
             ),
@@ -632,6 +633,7 @@ def _discover_smoke_service_tools(
             ),
         ),
         effective_provider_configs=discovered.effective_provider_configs,
+        fins_awaiting_runtime=discovered.fins_awaiting_runtime,
     )
 
 

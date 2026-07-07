@@ -29,6 +29,7 @@ _PACKAGE_MANIFEST_ROOT: Final[Path] = _PACKAGE_PROMPT_ROOT / "manifests"
 _START_FINS_UPLOAD_TOOL_NAME: Final[str] = "start_fins_upload"
 _START_FINS_DOWNLOAD_TOOL_NAME: Final[str] = "start_fins_download"
 _START_FINS_PREPROCESS_TOOL_NAME: Final[str] = "start_fins_preprocess"
+_CURRENT_TIME_TEXT: Final[str] = "# 当前时间\n现在是 2026年7月7日 17:20（Asia/Shanghai，星期二）。"
 _DEFAULT_FINS_READ_TOOL_NAMES: Final[frozenset[str]] = frozenset(
     {
         "list_documents",
@@ -392,6 +393,7 @@ def test_default_non_upload_scenes_do_not_select_upload_tool() -> None:
                 scene_manifest_root=_PACKAGE_MANIFEST_ROOT,
                 prompt_asset_root=_PACKAGE_PROMPT_ROOT,
                 context_slot_values={
+                    "current_time": _CURRENT_TIME_TEXT,
                     "fins_default_subject": "测试财报主体",
                 },
                 available_tools=available_tools,

@@ -85,6 +85,7 @@ from dayu.service.entrypoint_runtime import (
     submit_entrypoint_turn_and_wait,
 )
 from dayu.service.host_assembly import ServiceAssemblyOverrides, ServiceRunOverrides
+from dayu.service.scene_context import CURRENT_TIME_SLOT, current_time
 
 DEFAULT_DISPLAY_USER: Final[str] = "本地 CLI 用户"
 INTERACTIVE_INPUT_PROMPT: Final[str] = "dayu> "
@@ -902,7 +903,7 @@ def _interactive_context_slot_values() -> dict[str, JsonValue]:
     :raises Exception: 不主动抛出异常。
     """
 
-    return {}
+    return {CURRENT_TIME_SLOT: current_time()}
 
 
 def _read_user_input(prompt: str) -> str:

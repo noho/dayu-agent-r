@@ -61,5 +61,11 @@
       "required": true
     }
   ],
-  "context_slots": []
+  "context_slots": [
+    {
+      "name": "current_time",
+      "value_type": "string",
+      "required": true
+    }
+  ]
 }

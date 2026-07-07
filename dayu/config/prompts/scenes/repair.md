@@ -15,4 +15,6 @@
 - 只在当前正文与已给定合同边界内生成局部修复。
 - 若在既有事实边界内无法安全完成修复，应在 `notes` 中说明原因，而不是编造 patch。
 
+{{current_time}}
+
 {{fins_default_subject}}

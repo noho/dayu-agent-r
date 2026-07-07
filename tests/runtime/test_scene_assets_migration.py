@@ -70,7 +70,18 @@ _FINS_DEFAULT_SUBJECT_SLOT: Final[str] = "fins_default_subject"
 _FINS_DEFAULT_SUBJECT_PLACEHOLDER: Final[str] = "{{fins_default_subject}}"
 _FINS_DEFAULT_SUBJECT_TITLE: Final[str] = "# 当前分析对象"
 _FINS_DEFAULT_SUBJECT_MARKDOWN: Final[str] = "# 当前分析对象\n你正在分析的是 V（Visa Inc.）。"
+_CURRENT_TIME_SLOT: Final[str] = "current_time"
+_CURRENT_TIME_PLACEHOLDER: Final[str] = "{{current_time}}"
+_CURRENT_TIME_TITLE: Final[str] = "# 当前时间"
+_CURRENT_TIME_MARKDOWN: Final[str] = "# 当前时间\n现在是 2026年7月7日 17:20（Asia/Shanghai，星期二）。"
 _NO_DEFAULT_SUBJECT_SCENES: Final[frozenset[str]] = frozenset({"interactive", "wechat"})
+_CONVERSATION_MEMORY_SMOKE_SCENES: Final[frozenset[str]] = frozenset(
+    {
+        "smoke_host_public_conversation_memory",
+        "smoke_host_public_conversation_memory_scenarios",
+    }
+)
+_TIME_TOOL_SCENES: Final[frozenset[str]] = frozenset({"prompt", "interactive", "wechat"})
 _PROMPT_OUTPUT_CONTRACT_LINE: Final[str] = "- 输出 Markdown 格式。"
 
 
@@ -227,17 +238,18 @@ def _scene_fragment_path(manifest: Mapping[str, JsonValue]) -> Path:
     return candidates[0]
 
 
-def _placeholder_line_indexes(lines: tuple[str, ...]) -> tuple[int, ...]:
-    """返回默认研究主体占位符所在行号。
+def _placeholder_line_indexes(lines: tuple[str, ...], placeholder: str) -> tuple[int, ...]:
+    """返回指定占位符所在行号。
 
     :param lines: scene fragment 按行拆分后的内容。
+    :param placeholder: 要查找的占位符文本。
     :returns: 包含占位符的零基行号。
     """
 
     return tuple(
         index
         for index, line in enumerate(lines)
-        if _FINS_DEFAULT_SUBJECT_PLACEHOLDER in line
+        if placeholder in line
     )
 
 
@@ -245,7 +257,7 @@ def _first_contract_content_line_index(lines: tuple[str, ...]) -> int:
     """返回首个执行契约正文行号。
 
     :param lines: scene fragment 按行拆分后的内容。
-    :returns: 首个非空、非 Markdown 标题、非默认主体占位符的零基行号。
+    :returns: 首个非空、非 Markdown 标题、非 context slot 占位符的零基行号。
     :raises AssertionError: scene fragment 没有执行契约正文时抛出。
     """
 
@@ -256,6 +268,8 @@ def _first_contract_content_line_index(lines: tuple[str, ...]) -> int:
         if stripped.startswith("#"):
             continue
         if stripped == _FINS_DEFAULT_SUBJECT_PLACEHOLDER:
+            continue
+        if stripped == _CURRENT_TIME_PLACEHOLDER:
             continue
         return index
     raise AssertionError("scene fragment 缺少执行契约正文")
@@ -354,7 +368,7 @@ def test_fins_default_subject_slot_is_rendered_by_declaring_scenes() -> None:
         assert isinstance(scene, str)
         scene_content = _scene_fragment_path(manifest).read_text(encoding="utf-8")
         lines = tuple(scene_content.splitlines())
-        placeholder_indexes = _placeholder_line_indexes(lines)
+        placeholder_indexes = _placeholder_line_indexes(lines, _FINS_DEFAULT_SUBJECT_PLACEHOLDER)
         declares_subject = _manifest_declares_context_slot(manifest, _FINS_DEFAULT_SUBJECT_SLOT)
 
         if declares_subject:
@@ -366,6 +380,52 @@ def test_fins_default_subject_slot_is_rendered_by_declaring_scenes() -> None:
         if scene in _NO_DEFAULT_SUBJECT_SCENES:
             assert not declares_subject, scene
             assert not placeholder_indexes, scene
+
+
+def test_conversation_memory_smoke_scenes_do_not_use_default_subject_slot() -> None:
+    """conversation memory smoke scene 不得声明或渲染默认研究主体 slot。"""
+
+    for scene in _CONVERSATION_MEMORY_SMOKE_SCENES:
+        manifest = _load_manifest(_manifest_root() / f"{scene}.json")
+        scene_content = _scene_fragment_path(manifest).read_text(encoding="utf-8")
+
+        assert not _manifest_declares_context_slot(manifest, _FINS_DEFAULT_SUBJECT_SLOT), scene
+        assert _FINS_DEFAULT_SUBJECT_PLACEHOLDER not in scene_content, scene
+
+
+def test_current_time_slot_is_rendered_by_non_compact_scenes() -> None:
+    """除 compact scene 外，所有 scene 必须在执行契约正文之后渲染当前时间 slot。"""
+
+    for path in _iter_manifest_paths():
+        manifest = _load_manifest(path)
+        scene = manifest["scene"]
+        assert isinstance(scene, str)
+        scene_content = _scene_fragment_path(manifest).read_text(encoding="utf-8")
+        lines = tuple(scene_content.splitlines())
+        current_indexes = _placeholder_line_indexes(lines, _CURRENT_TIME_PLACEHOLDER)
+        subject_indexes = _placeholder_line_indexes(lines, _FINS_DEFAULT_SUBJECT_PLACEHOLDER)
+        declares_current_time = _manifest_declares_context_slot(manifest, _CURRENT_TIME_SLOT)
+        is_compact_scene = scene in _COMPACTOR_POLICY_SCENES
+
+        if is_compact_scene:
+            assert not declares_current_time, scene
+            assert not current_indexes, scene
+            continue
+
+        assert declares_current_time, scene
+        assert len(current_indexes) == 1, scene
+        current_index = current_indexes[0]
+        assert lines[current_index] == _CURRENT_TIME_PLACEHOLDER, scene
+        assert current_index > _first_contract_content_line_index(lines), scene
+        if subject_indexes:
+            assert current_index < subject_indexes[0], scene
+        else:
+            assert current_index == _last_non_empty_line_index(lines), scene
+
+    compaction_user_content = (
+        _prompt_asset_root() / "scenes" / "conversation_compaction_user.md"
+    ).read_text(encoding="utf-8")
+    assert _CURRENT_TIME_PLACEHOLDER not in compaction_user_content
 
 
 def test_prepared_fins_default_subject_does_not_interrupt_scene_contract() -> None:
@@ -409,6 +469,53 @@ def test_prepared_fins_default_subject_does_not_interrupt_scene_contract() -> No
                 scene_title_index,
             )
             assert prompt_output_index < subject_title_index, scene
+
+
+def test_prepared_current_time_does_not_interrupt_scene_contract() -> None:
+    """真实 ScenePrepare 展开后，当前时间块不得插入到执行契约正文之前。"""
+
+    for path in _iter_manifest_paths():
+        manifest = _load_manifest(path)
+        scene = manifest["scene"]
+        assert isinstance(scene, str)
+        if scene in _COMPACTOR_POLICY_SCENES:
+            continue
+
+        scene_content = _scene_fragment_path(manifest).read_text(encoding="utf-8")
+        lines = tuple(scene_content.splitlines())
+        scene_title = lines[0]
+        first_contract_line = lines[_first_contract_content_line_index(lines)]
+        context_slot_values = _required_context_slot_values(manifest)
+        context_slot_values[_CURRENT_TIME_SLOT] = _CURRENT_TIME_MARKDOWN
+        if _manifest_declares_context_slot(manifest, _FINS_DEFAULT_SUBJECT_SLOT):
+            context_slot_values[_FINS_DEFAULT_SUBJECT_SLOT] = _FINS_DEFAULT_SUBJECT_MARKDOWN
+
+        result = prepare_scene(
+            ScenePrepareRequest(
+                scene_id=scene,
+                scene_manifest_root=_manifest_root(),
+                prompt_asset_root=_prompt_asset_root(),
+                context_slot_values=context_slot_values,
+                available_tools=_fake_tool_catalog(),
+            )
+        )
+
+        system_prompt = result.system_prompt
+        scene_title_index = system_prompt.index(scene_title)
+        first_contract_index = system_prompt.index(first_contract_line, scene_title_index)
+        current_title_index = system_prompt.index(_CURRENT_TIME_TITLE, scene_title_index)
+
+        assert system_prompt.count(_CURRENT_TIME_TITLE) == 1, scene
+        assert scene_title_index < first_contract_index < current_title_index, scene
+        if _manifest_declares_context_slot(manifest, _FINS_DEFAULT_SUBJECT_SLOT):
+            subject_title_index = system_prompt.index(_FINS_DEFAULT_SUBJECT_TITLE, scene_title_index)
+            assert current_title_index < subject_title_index, scene
+        if scene == "prompt":
+            prompt_output_index = system_prompt.index(
+                _PROMPT_OUTPUT_CONTRACT_LINE,
+                scene_title_index,
+            )
+            assert prompt_output_index < current_title_index, scene
 
 
 def test_migrated_scene_manifest_schema_excludes_legacy_fields() -> None:
@@ -455,7 +562,10 @@ def test_infer_manifest_selects_read_and_web_without_long_transaction_or_upload(
             scene_id="infer",
             scene_manifest_root=_manifest_root(),
             prompt_asset_root=_prompt_asset_root(),
-            context_slot_values={"fins_default_subject": "测试财报主体"},
+            context_slot_values={
+                "current_time": "测试当前时间",
+                "fins_default_subject": "测试财报主体",
+            },
             available_tools=_fake_tool_catalog(),
         )
     )
@@ -479,6 +589,7 @@ def test_prompt_prepared_output_filters_long_transaction_guidance() -> None:
             scene_manifest_root=_manifest_root(),
             prompt_asset_root=_prompt_asset_root(),
             context_slot_values={
+                "current_time": "测试当前时间",
                 "fins_default_subject": "测试财报主体",
             },
             available_tools=_fake_tool_catalog(),
@@ -510,7 +621,7 @@ def test_interactive_and_wechat_prepared_output_keep_download_preprocess_guidanc
                 scene_id=scene_id,
                 scene_manifest_root=_manifest_root(),
                 prompt_asset_root=_prompt_asset_root(),
-                context_slot_values={},
+                context_slot_values={"current_time": "测试当前时间"},
                 available_tools=_fake_tool_catalog(),
             )
         )
@@ -527,6 +638,33 @@ def test_interactive_and_wechat_prepared_output_keep_download_preprocess_guidanc
         assert "start_fins_upload" not in result.system_prompt
         for marker in _PREPARED_CONDITIONAL_MARKERS:
             assert marker not in result.system_prompt
+
+
+def test_get_current_time_tool_is_selected_only_for_interactive_prompt_scenes() -> None:
+    """只有 prompt/interactive/wechat scene 应暴露真实当前时间工具。"""
+
+    for path in _iter_manifest_paths():
+        manifest = _load_manifest(path)
+        scene = manifest["scene"]
+        assert isinstance(scene, str)
+        result = prepare_scene(
+            ScenePrepareRequest(
+                scene_id=scene,
+                scene_manifest_root=_manifest_root(),
+                prompt_asset_root=_prompt_asset_root(),
+                context_slot_values=_required_context_slot_values(manifest),
+                available_tools=_fake_tool_catalog(),
+            )
+        )
+
+        selected = result.tool_selection.tool_names
+        assert selected is not None
+        if scene in _TIME_TOOL_SCENES:
+            assert "get_current_time" in selected, scene
+            assert "get_current_time" in result.system_prompt, scene
+        else:
+            assert "get_current_time" not in selected, scene
+            assert "get_current_time" not in result.system_prompt, scene
 
 
 def test_conversation_compaction_default_model_matches_default_profile_compactor() -> None:

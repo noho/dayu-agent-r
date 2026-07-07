@@ -48,6 +48,7 @@ _DEFAULT_TIME_TOOL_NAME = "get_current_time"
 _DEFAULT_DOWNLOAD_TOOL_NAME = "start_fins_download"
 _DEFAULT_PREPROCESS_TOOL_NAME = "start_fins_preprocess"
 _EXCLUDED_UPLOAD_TOOL_NAME = "start_fins_upload"
+_INTERACTIVE_CURRENT_TIME_TEXT = "# 当前时间\n现在是 2026年7月7日 17:20（Asia/Shanghai，星期二）。"
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,10 +250,10 @@ async def test_interactive_runtime_uses_real_manifest_required_slots(
 
 
 @pytest.mark.asyncio
-async def test_interactive_runtime_accepts_empty_context_slots(
+async def test_interactive_runtime_requires_current_time_context_slot(
     tmp_path: Path,
 ) -> None:
-    """真实 interactive scene 不应要求入口身份类 context slot。"""
+    """真实 interactive scene 只要求当前时间，不要求入口身份类 context slot。"""
 
     runtime = await prepare_entrypoint_runtime(
         EntrypointRuntimeRequest(
@@ -260,7 +261,7 @@ async def test_interactive_runtime_accepts_empty_context_slots(
             package_config_root=_PACKAGE_CONFIG_ROOT,
             explicit_config_dir=None,
             scene_id="interactive",
-            context_slot_values={},
+            context_slot_values={"current_time": _INTERACTIVE_CURRENT_TIME_TEXT},
             assembly_overrides=ServiceAssemblyOverrides(
                 model_id=_MODEL_ID,
                 runner_option_hint_id=_RUNNER_HINT_ID,
@@ -324,7 +325,7 @@ async def _prepare_interactive_runtime(
             package_config_root=_PACKAGE_CONFIG_ROOT,
             explicit_config_dir=None,
             scene_id="interactive",
-            context_slot_values={},
+            context_slot_values={"current_time": _INTERACTIVE_CURRENT_TIME_TEXT},
             assembly_overrides=ServiceAssemblyOverrides(
                 model_id=_MODEL_ID,
                 runner_option_hint_id=_RUNNER_HINT_ID,

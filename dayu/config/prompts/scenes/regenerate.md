@@ -19,4 +19,6 @@
 - 若某个条件项依赖 `get_financial_statement` / `query_xbrl_facts` 才能成立，必须先选定 statement/xbrl 锚点再写正文；做不到就不要写该句。
 - `证据与出处` 只列正文实际使用过的来源；每行只写来源识别与定位信息，不夹带摘要、分析或结论。
 
+{{current_time}}
+
 {{fins_default_subject}}

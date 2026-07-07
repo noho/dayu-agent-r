@@ -1815,6 +1815,7 @@ async def _prepare_runtime(tmp_path: Path) -> EntrypointRuntimeResult:
             explicit_config_dir=None,
             scene_id="smoke_host_public_multiturn",
             context_slot_values={
+                CURRENT_TIME_SLOT: current_time(_NOW),
                 "fins_default_subject": "测试财报主体",
             },
             assembly_overrides=ServiceAssemblyOverrides(

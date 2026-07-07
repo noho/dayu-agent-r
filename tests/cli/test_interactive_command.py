@@ -73,6 +73,8 @@ from dayu.service.entrypoint_runtime import (
 )
 
 _MODEL_ID = "deepseek-v4-flash"
+_CURRENT_TIME_SLOT = "current_time"
+_CURRENT_TIME_TEXT = "# 当前时间\n现在是 2026年7月7日 17:20（Asia/Shanghai，星期二）。"
 _REMOVED_INTERACTIVE_DEBUG_OPTIONS: tuple[tuple[str, ...], ...] = (
     ("--debug-sse",),
     ("--debug-tool-delta",),
@@ -695,7 +697,8 @@ def test_interactive_label_reuses_host_slot_and_fills_context_slots(
     assert exit_code == EXIT_SUCCESS
     assert captured.out.strip() == "answer for run-1"
     assert captured_requests[0].scene_id == "interactive"
-    assert captured_requests[0].context_slot_values == {}
+    assert tuple(captured_requests[0].context_slot_values) == (_CURRENT_TIME_SLOT,)
+    assert "Asia/Shanghai" in str(captured_requests[0].context_slot_values[_CURRENT_TIME_SLOT])
     assert fake_host.ensure_requests[0].scope == "cli.interactive"
     assert fake_host.ensure_requests[0].slot_key == "cli.interactive.earnings"
     assert fake_host.create_requests == []
@@ -1803,7 +1806,7 @@ async def _prepare_interactive_runtime(tmp_path: Path) -> EntrypointRuntimeResul
             package_config_root=package_config_root(),
             explicit_config_dir=None,
             scene_id="interactive",
-            context_slot_values={},
+            context_slot_values={_CURRENT_TIME_SLOT: _CURRENT_TIME_TEXT},
             assembly_overrides=interactive_command.ServiceAssemblyOverrides(model_id=_MODEL_ID),
             env={"DEEPSEEK_API_KEY": _API_KEY},
         )

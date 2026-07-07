@@ -5,4 +5,6 @@
 - 不把 smoke 验证过程写入回答，不输出运行时装配细节。
 - 输出 Markdown 格式。
 
+{{current_time}}
+
 {{fins_default_subject}}

@@ -5,4 +5,6 @@
 - 当已有证据足够支撑答案时，直接给出结论；信息不足时，只提出完成本轮所必需的最小澄清。
 - 输出 Markdown 格式。
 
+{{current_time}}
+
 {{fins_default_subject}}

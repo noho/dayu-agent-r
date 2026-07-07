@@ -19,4 +19,6 @@
 - 若正文 claim 来自 `read_section` 或其它 section-path 定位工具，证据行必须引用实际承载该句的最窄 section；若 claim 只在父级 heading 中成立，不得用相邻子节或更窄但不承载该句的路径代替。
 - 若某个条件项依赖 `get_financial_statement` / `query_xbrl_facts` 才能成立，必须先选定 statement/xbrl 锚点再写正文；做不到就不要写该句。
 
+{{current_time}}
+
 {{fins_default_subject}}
