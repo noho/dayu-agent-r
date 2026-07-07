@@ -160,11 +160,15 @@ def test_scene_context_formats_subject_and_current_time() -> None:
     )
     assert (
         current_time(datetime(2026, 7, 7, 15, 8, tzinfo=UTC))
-        == "# 当前时间\n现在是 2026年7月7日 23:08（Asia/Shanghai，星期二）。"
+        == "# 当前时间\n"
+        "现在是 2026年7月7日 23:08（Asia/Shanghai，星期二）。\n"
+        "这是对话开始时的当前时间；回答“现在/今天/当前时间”默认使用它；该时间不会自动更新。"
     )
     assert (
         current_time(datetime(2026, 7, 7, 15, 8))
-        == "# 当前时间\n现在是 2026年7月7日 15:08（Asia/Shanghai，星期二）。"
+        == "# 当前时间\n"
+        "现在是 2026年7月7日 15:08（Asia/Shanghai，星期二）。\n"
+        "这是对话开始时的当前时间；回答“现在/今天/当前时间”默认使用它；该时间不会自动更新。"
     )
 
 
@@ -185,7 +189,12 @@ def test_build_entrypoint_context_slot_values_resolves_fmp_company_name(
     )
 
     assert values[FINS_DEFAULT_SUBJECT_SLOT] == "# 当前分析对象\n你正在分析的是 V（Visa Inc.）。"
-    assert values[CURRENT_TIME_SLOT] == "# 当前时间\n现在是 2026年7月7日 15:08（Asia/Shanghai，星期二）。"
+    assert (
+        values[CURRENT_TIME_SLOT]
+        == "# 当前时间\n"
+        "现在是 2026年7月7日 15:08（Asia/Shanghai，星期二）。\n"
+        "这是对话开始时的当前时间；回答“现在/今天/当前时间”默认使用它；该时间不会自动更新。"
+    )
 
 
 def test_build_entrypoint_context_slot_values_falls_back_without_fmp(

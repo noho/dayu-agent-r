@@ -105,7 +105,11 @@ from dayu.service.host_assembly import (
 _PACKAGE_CONFIG_ROOT = Path(__file__).resolve().parents[2] / "dayu" / "config"
 _SCENE_ID = "smoke_host_public_multiturn"
 _CUSTOM_COMPACTOR_SCENE_ID = "custom_compactor_scene"
-_CURRENT_TIME_TEXT = "# 当前时间\n现在是 2026年7月7日 17:20（Asia/Shanghai，星期二）。"
+_CURRENT_TIME_TEXT = (
+    "# 当前时间\n"
+    "现在是 2026年7月7日 17:20（Asia/Shanghai，星期二）。\n"
+    "这是对话开始时的当前时间；回答“现在/今天/当前时间”默认使用它；该时间不会自动更新。"
+)
 _MODEL_ID = "deepseek-v4-flash"
 _RUNNER_HINT_ID = "interactive"
 _API_KEY = "test-provider-key"

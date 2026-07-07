@@ -14,6 +14,7 @@ from dayu.runtime.scene_prepare import (
     SceneToolInfo,
     prepare_scene,
 )
+from dayu.tools.utils.provider import build_get_current_time_tool_definition
 
 _OLD_SCENE_MAX_ITERATIONS: Final[Mapping[str, int]] = {
     "audit": 16,
@@ -73,7 +74,11 @@ _FINS_DEFAULT_SUBJECT_MARKDOWN: Final[str] = "# 当前分析对象\n你正在分
 _CURRENT_TIME_SLOT: Final[str] = "current_time"
 _CURRENT_TIME_PLACEHOLDER: Final[str] = "{{current_time}}"
 _CURRENT_TIME_TITLE: Final[str] = "# 当前时间"
-_CURRENT_TIME_MARKDOWN: Final[str] = "# 当前时间\n现在是 2026年7月7日 17:20（Asia/Shanghai，星期二）。"
+_CURRENT_TIME_MARKDOWN: Final[str] = (
+    "# 当前时间\n"
+    "现在是 2026年7月7日 17:20（Asia/Shanghai，星期二）。\n"
+    "这是对话开始时的当前时间；回答“现在/今天/当前时间”默认使用它；该时间不会自动更新。"
+)
 _NO_DEFAULT_SUBJECT_SCENES: Final[frozenset[str]] = frozenset({"interactive", "wechat"})
 _CONVERSATION_MEMORY_SMOKE_SCENES: Final[frozenset[str]] = frozenset(
     {
@@ -81,7 +86,7 @@ _CONVERSATION_MEMORY_SMOKE_SCENES: Final[frozenset[str]] = frozenset(
         "smoke_host_public_conversation_memory_scenarios",
     }
 )
-_TIME_TOOL_SCENES: Final[frozenset[str]] = frozenset({"prompt", "interactive", "wechat"})
+_TIME_TOOL_SCENES: Final[frozenset[str]] = frozenset({"interactive", "wechat"})
 _PROMPT_OUTPUT_CONTRACT_LINE: Final[str] = "- 输出 Markdown 格式。"
 
 
@@ -581,7 +586,7 @@ def test_infer_manifest_selects_read_and_web_without_long_transaction_or_upload(
 
 
 def test_prompt_prepared_output_filters_long_transaction_guidance() -> None:
-    """prompt scene 不得暴露下载、预处理或上传工具指引。"""
+    """prompt scene 不得暴露下载、预处理、上传或实时当前时间工具指引。"""
 
     result = prepare_scene(
         ScenePrepareRequest(
@@ -599,12 +604,12 @@ def test_prompt_prepared_output_filters_long_transaction_guidance() -> None:
     selected = result.tool_selection.tool_names
     assert selected is not None
     assert "get_financial_statement" in selected
-    assert "get_current_time" in selected
+    assert "get_current_time" not in selected
     assert "start_fins_download" not in selected
     assert "start_fins_preprocess" not in selected
     assert "start_fins_upload" not in selected
     assert "财报工具指引" in result.system_prompt
-    assert "get_current_time" in result.system_prompt
+    assert "get_current_time" not in result.system_prompt
     assert "start_fins_download" not in result.system_prompt
     assert "start_fins_preprocess" not in result.system_prompt
     assert "start_fins_upload" not in result.system_prompt
@@ -640,8 +645,8 @@ def test_interactive_and_wechat_prepared_output_keep_download_preprocess_guidanc
             assert marker not in result.system_prompt
 
 
-def test_get_current_time_tool_is_selected_only_for_interactive_prompt_scenes() -> None:
-    """只有 prompt/interactive/wechat scene 应暴露真实当前时间工具。"""
+def test_get_current_time_tool_is_selected_only_for_interactive_wechat_scenes() -> None:
+    """只有 interactive/wechat scene 应暴露真实当前时间工具。"""
 
     for path in _iter_manifest_paths():
         manifest = _load_manifest(path)
@@ -665,6 +670,43 @@ def test_get_current_time_tool_is_selected_only_for_interactive_prompt_scenes() 
         else:
             assert "get_current_time" not in selected, scene
             assert "get_current_time" not in result.system_prompt, scene
+
+
+def test_current_time_rendering_explains_static_boundary_without_internal_terms() -> None:
+    """当前时间文本必须说明静态边界，且不暴露内部实现术语。"""
+
+    result = prepare_scene(
+        ScenePrepareRequest(
+            scene_id="prompt",
+            scene_manifest_root=_manifest_root(),
+            prompt_asset_root=_prompt_asset_root(),
+            context_slot_values={
+                "current_time": _CURRENT_TIME_MARKDOWN,
+                "fins_default_subject": _FINS_DEFAULT_SUBJECT_MARKDOWN,
+            },
+            available_tools=_fake_tool_catalog(),
+        )
+    )
+
+    assert "对话开始时的当前时间" in result.system_prompt
+    assert "该时间不会自动更新" in result.system_prompt
+    assert "回答“现在/今天/当前时间”默认使用它" in result.system_prompt
+    for internal_term in ("Host", "run input", "context slot", "scene", "tool selection"):
+        assert internal_term not in _CURRENT_TIME_MARKDOWN
+
+
+def test_get_current_time_tool_description_explains_refresh_boundary() -> None:
+    """当前时间工具描述必须说明重新确认实时钟的调用边界。"""
+
+    description = build_get_current_time_tool_definition().schema.function.description
+
+    assert "获取调用这一刻的当前时间" in description
+    assert "用户明确要求获取此刻最新时间" in description
+    assert "等待、查询、下载、上传、处理等动作完成后再确认时间" in description
+    assert "普通“现在/今天/当前时间”问题如果不需要重新确认" in description
+    assert "不调用本工具" in description
+    for internal_term in ("Host", "run input", "context slot", "scene", "tool selection"):
+        assert internal_term not in description
 
 
 def test_conversation_compaction_default_model_matches_default_profile_compactor() -> None:

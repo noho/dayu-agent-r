@@ -97,7 +97,12 @@ def build_get_current_time_tool_definition() -> ToolDefinition:
 
     @tool(
         name=GET_CURRENT_TIME_TOOL_NAME,
-        description=("获取当前日期和时间。仅支持 timezone=Asia/Shanghai；返回 time、timezone、weekday、iso。"),
+        description=(
+            "获取调用这一刻的当前时间。只有用户明确要求获取此刻最新时间，或要求在等待、查询、"
+            "下载、上传、处理等动作完成后再确认时间时才调用。普通“现在/今天/当前时间”问题如果"
+            "不需要重新确认，就使用已给出的当前时间，不调用本工具。仅支持 timezone=Asia/Shanghai；"
+            "返回 time、timezone、weekday、iso。"
+        ),
         parameters=_get_current_time_parameters(),
         tags=(UTILS_TOOL_TAG, TIME_TOOL_TAG),
         display_name="获取当前时间",

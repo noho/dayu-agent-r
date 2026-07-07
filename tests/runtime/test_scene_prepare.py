@@ -29,7 +29,11 @@ _PACKAGE_MANIFEST_ROOT: Final[Path] = _PACKAGE_PROMPT_ROOT / "manifests"
 _START_FINS_UPLOAD_TOOL_NAME: Final[str] = "start_fins_upload"
 _START_FINS_DOWNLOAD_TOOL_NAME: Final[str] = "start_fins_download"
 _START_FINS_PREPROCESS_TOOL_NAME: Final[str] = "start_fins_preprocess"
-_CURRENT_TIME_TEXT: Final[str] = "# 当前时间\n现在是 2026年7月7日 17:20（Asia/Shanghai，星期二）。"
+_CURRENT_TIME_TEXT: Final[str] = (
+    "# 当前时间\n"
+    "现在是 2026年7月7日 17:20（Asia/Shanghai，星期二）。\n"
+    "这是对话开始时的当前时间；回答“现在/今天/当前时间”默认使用它；该时间不会自动更新。"
+)
 _DEFAULT_FINS_READ_TOOL_NAMES: Final[frozenset[str]] = frozenset(
     {
         "list_documents",

@@ -81,7 +81,7 @@ def current_time(now: datetime | None = None) -> str:
 
     :param now: 指定时间；``None`` 时读取当前上海时间。naive datetime 按
         上海时间解释，aware datetime 会转换到上海时间。
-    :returns: 固定格式中文时间文本。
+    :returns: 固定格式中文时间文本，并说明该时间不会自动更新。
     :raises Exception: 不主动抛出异常。
     """
 
@@ -91,7 +91,8 @@ def current_time(now: datetime | None = None) -> str:
         "# 当前时间\n"
         f"现在是 {effective_now.year}年{effective_now.month}月{effective_now.day}日 "
         f"{effective_now.hour:02d}:{effective_now.minute:02d}"
-        f"（{_SHANGHAI_TIMEZONE_NAME}，{weekday}）。"
+        f"（{_SHANGHAI_TIMEZONE_NAME}，{weekday}）。\n"
+        "这是对话开始时的当前时间；回答“现在/今天/当前时间”默认使用它；该时间不会自动更新。"
     )
 
 

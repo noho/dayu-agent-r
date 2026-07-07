@@ -49,7 +49,11 @@ _PACKAGE_CONFIG_ROOT = Path(__file__).resolve().parents[2] / "dayu" / "config"
 _MODEL_ID = "deepseek-v4-flash"
 _RUNNER_HINT_ID = "prompt"
 _API_KEY = "test-provider-key"
-_PROMPT_CURRENT_TIME_TEXT = "# 当前时间\n现在是 2026年6月14日 16:00（Asia/Shanghai，星期日）。"
+_PROMPT_CURRENT_TIME_TEXT = (
+    "# 当前时间\n"
+    "现在是 2026年6月14日 16:00（Asia/Shanghai，星期日）。\n"
+    "这是对话开始时的当前时间；回答“现在/今天/当前时间”默认使用它；该时间不会自动更新。"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,12 +237,12 @@ async def test_prompt_runtime_uses_real_prompt_manifest_required_slots(
 
     assert result.scene_inputs.tool_selection.tool_names is not None
     assert DEFAULT_PROMPT_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
-    assert DEFAULT_TIME_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
+    assert DEFAULT_TIME_TOOL_NAME not in result.scene_inputs.tool_selection.tool_names
     assert DEFAULT_DOWNLOAD_TOOL_NAME not in result.scene_inputs.tool_selection.tool_names
     assert DEFAULT_PREPROCESS_TOOL_NAME not in result.scene_inputs.tool_selection.tool_names
     assert EXCLUDED_UPLOAD_TOOL_NAME not in result.scene_inputs.tool_selection.tool_names
     assert "财报工具指引" in result.scene_inputs.system_prompt
-    assert DEFAULT_TIME_TOOL_NAME in result.scene_inputs.system_prompt
+    assert DEFAULT_TIME_TOOL_NAME not in result.scene_inputs.system_prompt
     assert DEFAULT_DOWNLOAD_TOOL_NAME not in result.scene_inputs.system_prompt
     assert DEFAULT_PREPROCESS_TOOL_NAME not in result.scene_inputs.system_prompt
     assert EXCLUDED_UPLOAD_TOOL_NAME not in result.scene_inputs.system_prompt

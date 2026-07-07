@@ -48,7 +48,11 @@ _DEFAULT_TIME_TOOL_NAME = "get_current_time"
 _DEFAULT_DOWNLOAD_TOOL_NAME = "start_fins_download"
 _DEFAULT_PREPROCESS_TOOL_NAME = "start_fins_preprocess"
 _EXCLUDED_UPLOAD_TOOL_NAME = "start_fins_upload"
-_INTERACTIVE_CURRENT_TIME_TEXT = "# 当前时间\n现在是 2026年7月7日 17:20（Asia/Shanghai，星期二）。"
+_INTERACTIVE_CURRENT_TIME_TEXT = (
+    "# 当前时间\n"
+    "现在是 2026年7月7日 17:20（Asia/Shanghai，星期二）。\n"
+    "这是对话开始时的当前时间；回答“现在/今天/当前时间”默认使用它；该时间不会自动更新。"
+)
 
 
 @dataclass(frozen=True, slots=True)

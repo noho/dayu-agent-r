@@ -19,8 +19,7 @@
     "tool_names": [],
     "tool_tags_any": [
       "fins-read",
-      "web",
-      "utils"
+      "web"
     ],
     "allow_empty": false
   },

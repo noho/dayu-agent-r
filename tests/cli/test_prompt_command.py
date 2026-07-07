@@ -81,7 +81,11 @@ _REMOVED_PROMPT_DEBUG_OPTIONS: tuple[tuple[str, ...], ...] = (
 _NOW = datetime(2026, 6, 14, 8, 0, 0, tzinfo=UTC)
 _MODEL_ID = "deepseek-v4-flash"
 _API_KEY = "test-provider-key"
-_PROMPT_CURRENT_TIME_TEXT = "# 当前时间\n现在是 2026年6月14日 16:00（Asia/Shanghai，星期日）。"
+_PROMPT_CURRENT_TIME_TEXT = (
+    "# 当前时间\n"
+    "现在是 2026年6月14日 16:00（Asia/Shanghai，星期日）。\n"
+    "这是对话开始时的当前时间；回答“现在/今天/当前时间”默认使用它；该时间不会自动更新。"
+)
 _DEFAULT_PROMPT_TOOL_NAME = "get_financial_statement"
 _DEFAULT_TIME_TOOL_NAME = "get_current_time"
 _EXCLUDED_UPLOAD_TOOL_NAME = "start_fins_upload"
@@ -797,7 +801,7 @@ def test_prompt_command_outputs_fast_live_terminal_and_converts_requests(
     assert submit_request.user_prompt == "请总结收入变化"
     assert submit_request.tool_names is not None
     assert _DEFAULT_PROMPT_TOOL_NAME in submit_request.tool_names
-    assert _DEFAULT_TIME_TOOL_NAME in submit_request.tool_names
+    assert _DEFAULT_TIME_TOOL_NAME not in submit_request.tool_names
     assert _EXCLUDED_UPLOAD_TOOL_NAME not in submit_request.tool_names
     assert submit_request.runner_options is not None
     assert submit_request.runner_options.temperature == 0.2
