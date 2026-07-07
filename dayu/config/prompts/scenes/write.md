@@ -1,7 +1,5 @@
 # 写作执行契约
 
-{{fins_default_subject}}
-
 ## 任务目标
 - 输出结构化章节正文。
 
@@ -20,3 +18,5 @@
 - 关键数字、比例、排名或具体断言写入正文时，必须同步选择最能直接支撑该句的具体证据锚点；若一条证据不足以稳妥支撑一句中的全部信息，就拆句、删弱或改写为更客观的表述。
 - 若正文 claim 来自 `read_section` 或其它 section-path 定位工具，证据行必须引用实际承载该句的最窄 section；若 claim 只在父级 heading 中成立，不得用相邻子节或更窄但不承载该句的路径代替。
 - 若某个条件项依赖 `get_financial_statement` / `query_xbrl_facts` 才能成立，必须先选定 statement/xbrl 锚点再写正文；做不到就不要写该句。
+
+{{fins_default_subject}}

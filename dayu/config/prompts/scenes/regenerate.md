@@ -1,7 +1,5 @@
 # 整章重建执行契约
 
-{{fins_default_subject}}
-
 ## 任务目标
 - 仅在结构性失败时，基于骨架与修复合同整章重建正文。
 
@@ -20,3 +18,5 @@
 - 若正文 claim 来自 `read_section` 或其它 section-path 定位工具，证据行必须引用实际承载该句的最窄 section；若 claim 只在父级 heading 中成立，不得用相邻子节或更窄但不承载该句的路径代替。
 - 若某个条件项依赖 `get_financial_statement` / `query_xbrl_facts` 才能成立，必须先选定 statement/xbrl 锚点再写正文；做不到就不要写该句。
 - `证据与出处` 只列正文实际使用过的来源；每行只写来源识别与定位信息，不夹带摘要、分析或结论。
+
+{{fins_default_subject}}

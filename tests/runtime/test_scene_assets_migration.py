@@ -68,7 +68,10 @@ _ALLOWED_MANIFEST_FIELDS: Final[frozenset[str]] = frozenset(
 _ALLOWED_MODEL_FIELDS: Final[frozenset[str]] = frozenset({"default_model_id", "runner_option_hint_id"})
 _FINS_DEFAULT_SUBJECT_SLOT: Final[str] = "fins_default_subject"
 _FINS_DEFAULT_SUBJECT_PLACEHOLDER: Final[str] = "{{fins_default_subject}}"
+_FINS_DEFAULT_SUBJECT_TITLE: Final[str] = "# 当前分析对象"
+_FINS_DEFAULT_SUBJECT_MARKDOWN: Final[str] = "# 当前分析对象\n你正在分析的是 V（Visa Inc.）。"
 _NO_DEFAULT_SUBJECT_SCENES: Final[frozenset[str]] = frozenset({"interactive", "wechat"})
+_PROMPT_OUTPUT_CONTRACT_LINE: Final[str] = "- 输出 Markdown 格式。"
 
 
 def _repo_root() -> Path:
@@ -224,6 +227,54 @@ def _scene_fragment_path(manifest: Mapping[str, JsonValue]) -> Path:
     return candidates[0]
 
 
+def _placeholder_line_indexes(lines: tuple[str, ...]) -> tuple[int, ...]:
+    """返回默认研究主体占位符所在行号。
+
+    :param lines: scene fragment 按行拆分后的内容。
+    :returns: 包含占位符的零基行号。
+    """
+
+    return tuple(
+        index
+        for index, line in enumerate(lines)
+        if _FINS_DEFAULT_SUBJECT_PLACEHOLDER in line
+    )
+
+
+def _first_contract_content_line_index(lines: tuple[str, ...]) -> int:
+    """返回首个执行契约正文行号。
+
+    :param lines: scene fragment 按行拆分后的内容。
+    :returns: 首个非空、非 Markdown 标题、非默认主体占位符的零基行号。
+    :raises AssertionError: scene fragment 没有执行契约正文时抛出。
+    """
+
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            continue
+        if stripped == _FINS_DEFAULT_SUBJECT_PLACEHOLDER:
+            continue
+        return index
+    raise AssertionError("scene fragment 缺少执行契约正文")
+
+
+def _last_non_empty_line_index(lines: tuple[str, ...]) -> int:
+    """返回最后一个非空内容行号。
+
+    :param lines: scene fragment 按行拆分后的内容。
+    :returns: 最后一个非空行的零基行号。
+    :raises AssertionError: scene fragment 为空时抛出。
+    """
+
+    for index in range(len(lines) - 1, -1, -1):
+        if lines[index].strip():
+            return index
+    raise AssertionError("scene fragment 为空")
+
+
 def _fake_tool_catalog() -> SceneToolCatalog:
     """构造覆盖迁移 manifest 工具标签的 fake 工具目录。
 
@@ -295,24 +346,69 @@ def test_all_migrated_scene_assets_prepare_successfully() -> None:
 
 
 def test_fins_default_subject_slot_is_rendered_by_declaring_scenes() -> None:
-    """声明默认研究主体 slot 的 scene 必须实际渲染该 slot。"""
+    """声明默认研究主体 slot 的 scene 必须在执行契约正文之后渲染该 slot。"""
 
     for path in _iter_manifest_paths():
         manifest = _load_manifest(path)
         scene = manifest["scene"]
         assert isinstance(scene, str)
         scene_content = _scene_fragment_path(manifest).read_text(encoding="utf-8")
-        placeholder_lines = tuple(
-            line for line in scene_content.splitlines() if _FINS_DEFAULT_SUBJECT_PLACEHOLDER in line
-        )
+        lines = tuple(scene_content.splitlines())
+        placeholder_indexes = _placeholder_line_indexes(lines)
         declares_subject = _manifest_declares_context_slot(manifest, _FINS_DEFAULT_SUBJECT_SLOT)
 
         if declares_subject:
-            assert placeholder_lines, scene
-            assert all(line == _FINS_DEFAULT_SUBJECT_PLACEHOLDER for line in placeholder_lines), scene
+            assert len(placeholder_indexes) == 1, scene
+            placeholder_index = placeholder_indexes[0]
+            assert lines[placeholder_index] == _FINS_DEFAULT_SUBJECT_PLACEHOLDER, scene
+            assert placeholder_index > _first_contract_content_line_index(lines), scene
+            assert placeholder_index == _last_non_empty_line_index(lines), scene
         if scene in _NO_DEFAULT_SUBJECT_SCENES:
             assert not declares_subject, scene
-            assert not placeholder_lines, scene
+            assert not placeholder_indexes, scene
+
+
+def test_prepared_fins_default_subject_does_not_interrupt_scene_contract() -> None:
+    """真实 ScenePrepare 展开后，默认研究主体块不得插入到执行契约正文之前。"""
+
+    for path in _iter_manifest_paths():
+        manifest = _load_manifest(path)
+        scene = manifest["scene"]
+        assert isinstance(scene, str)
+        if not _manifest_declares_context_slot(manifest, _FINS_DEFAULT_SUBJECT_SLOT):
+            continue
+
+        scene_content = _scene_fragment_path(manifest).read_text(encoding="utf-8")
+        lines = tuple(scene_content.splitlines())
+        scene_title = lines[0]
+        first_contract_line = lines[_first_contract_content_line_index(lines)]
+        context_slot_values = _required_context_slot_values(manifest)
+        context_slot_values[_FINS_DEFAULT_SUBJECT_SLOT] = _FINS_DEFAULT_SUBJECT_MARKDOWN
+
+        result = prepare_scene(
+            ScenePrepareRequest(
+                scene_id=scene,
+                scene_manifest_root=_manifest_root(),
+                prompt_asset_root=_prompt_asset_root(),
+                context_slot_values=context_slot_values,
+                available_tools=_fake_tool_catalog(),
+            )
+        )
+
+        system_prompt = result.system_prompt
+        scene_title_index = system_prompt.index(scene_title)
+        first_contract_index = system_prompt.index(first_contract_line, scene_title_index)
+        subject_title_index = system_prompt.index(_FINS_DEFAULT_SUBJECT_TITLE, scene_title_index)
+
+        assert system_prompt.count(_FINS_DEFAULT_SUBJECT_TITLE) == 1, scene
+        assert system_prompt.count("你正在分析的是 V（Visa Inc.）。") == 1, scene
+        assert scene_title_index < first_contract_index < subject_title_index, scene
+        if scene == "prompt":
+            prompt_output_index = system_prompt.index(
+                _PROMPT_OUTPUT_CONTRACT_LINE,
+                scene_title_index,
+            )
+            assert prompt_output_index < subject_title_index, scene
 
 
 def test_migrated_scene_manifest_schema_excludes_legacy_fields() -> None:
