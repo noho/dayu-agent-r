@@ -55,7 +55,7 @@ Engine 公共入口由 `dayu.engine.agent` 提供，并通过 `dayu.engine.__ini
 
 若 `EngineEvent stream` 结束但没有产出 terminal event，聚合入口返回 `EngineRunOutcomeFailed(error_code="missing_terminal")`。
 
-包根 `dayu.engine` 同时导出 Engine 专属契约和调用 Engine 必需的 Dayu Agent 公共契约，例如工具 schema、工具执行协议、工具 outcome、JSON 值与取消 token。当前包根也导出 Runner 请求身份与输入观测相关公共契约，包括 `ClientCorrelationPolicy`、`RunnerRequestIdentity`、`build_runner_request_identity`、`RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION` 与 `runner_role_sequence_digest`。`_AsyncAgent` 与 `AsyncOpenAIRunner` 是当前实现类，不属于包根稳定导出；调用方依赖函数式入口与 contracts。
+包根 `dayu.engine` 同时导出 Engine 专属契约和调用 Engine 必需的 Dayu Agent 公共契约，例如工具 schema、工具执行协议、工具 outcome、JSON 值与取消 token。当前包根也导出 Runner 请求身份与输入观测相关公共契约，包括 `ClientCorrelationPolicy`、`RunnerRequestIdentity`、`build_runner_request_identity`、`RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION`、`RunnerInputMessageProjection`、`RunnerInputToolCallProjection` 与 `runner_role_sequence_digest`。`_AsyncAgent` 与 `AsyncOpenAIRunner` 是当前实现类，不属于包根稳定导出；调用方依赖函数式入口与 contracts。
 
 ## 3. Run-Scoped 生命周期
 
@@ -469,7 +469,7 @@ Terminal event 类型固定为：
 
 `tool_call_requested` 是观测事件，不是外部二次执行命令。工具执行由 Agent 状态机在事件之后继续调用 `ToolExecutor.execute` 完成。
 
-`iteration_started` 携带 Engine 对本次真实 Runner 输入的直接观察：`message_count`、按实际 message role 顺序计算的 `role_sequence_digest`，以及 `runner_input_serializer_schema_version`。这些字段只描述 Engine 可见输入形态，不包含 Host-owned runner call index、manifest ref、source refs、memory / compact refs、tool schema refs 或 provider raw request。
+`iteration_started` 携带 Engine 对本次真实 Runner 输入的直接观察：`message_count`、按实际 message role 顺序计算的 `role_sequence_digest`、`runner_input_serializer_schema_version`，以及 `input_projection`。`input_projection` 是按实际 Runner 输入顺序排列的中性 LLM-facing message projection，包含 message `index`、`role`、`content` / tool call id、assistant tool call 名称和参数；它不包含 Host-owned runner call index、manifest ref、source refs、memory / compact refs、tool schema refs、provider headers、Authorization/API key 或 provider raw request/response。
 
 工具事件分层如下：
 

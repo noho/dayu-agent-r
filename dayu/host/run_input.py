@@ -16,7 +16,7 @@ from enum import StrEnum
 from typing import NoReturn, Protocol
 
 from dayu.contracts.json_value import JsonValue
-from dayu.contracts.tool_call import BatchToolExecutionRequest
+from dayu.contracts.tool_call import BatchToolExecutionRequest, GeminiToolCallState
 from dayu.contracts.tool_executor import ToolExecutor
 from dayu.contracts.tool_outcome import (
     BatchToolExecutionOutcome,
@@ -92,6 +92,7 @@ from dayu.host.durable.memory import (
     read_latest_memory_snapshot_at_or_before,
 )
 from dayu.host.durable.payload import (
+    BoundedJsonPayloadWriteRequest,
     PayloadDescriptor,
     PayloadStore,
     SQLitePayloadFormat,
@@ -101,6 +102,12 @@ from dayu.host.durable.schema import (
     RUNNER_CALL_INPUT_MANIFEST_MEDIA_TYPE,
     RUNNER_CALL_INPUT_MANIFEST_DESCRIPTOR_KIND,
     RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
+    RUNNER_CALL_INPUT_PROJECTION_DESCRIPTOR_KIND,
+    RUNNER_CALL_INPUT_PROJECTION_MEDIA_TYPE,
+    RUNNER_CALL_INPUT_PROJECTION_SCHEMA_VERSION,
+    SELECTED_TOOL_SCHEMA_SNAPSHOT_DESCRIPTOR_KIND,
+    SELECTED_TOOL_SCHEMA_SNAPSHOT_MEDIA_TYPE,
+    SELECTED_TOOL_SCHEMA_SNAPSHOT_SCHEMA_VERSION,
     TABLE_EVENT_LOG,
 )
 from dayu.host.durable.state import (
@@ -252,6 +259,14 @@ _SYSTEM_ENVELOPE_FORBIDDEN_FRAGMENTS = (
 _RUNNER_CALL_MANIFEST_PAYLOAD_REF_PREFIX = "payload-runner-call-input-manifest"
 _RUNNER_CALL_MANIFEST_SQLITE_PAYLOAD_ID_PREFIX = (
     "sqlite-payload-runner-call-input-manifest"
+)
+_RUNNER_CALL_PROJECTION_PAYLOAD_REF_PREFIX = "payload-runner-call-input-projection"
+_RUNNER_CALL_PROJECTION_SQLITE_PAYLOAD_ID_PREFIX = (
+    "sqlite-payload-runner-call-input-projection"
+)
+_SELECTED_TOOL_SCHEMA_PAYLOAD_REF_PREFIX = "payload-selected-tool-schema-snapshot"
+_SELECTED_TOOL_SCHEMA_SQLITE_PAYLOAD_ID_PREFIX = (
+    "sqlite-payload-selected-tool-schema-snapshot"
 )
 _RUNNER_CALL_EVENT_ID_PREFIX = "event-runner-call-input-assembled"
 _RUNNER_CALL_EVENT_ACTOR = "host.run_input"
@@ -792,10 +807,31 @@ class DurableRunnerCallManifestRecorder:
             record_input.current_facts.attempt.execution_id,
             runner_call_index,
         )
+        projection = _runner_call_projection_body(
+            record_input,
+            runner_call_index=runner_call_index,
+            projection_id=_runner_call_projection_id(event_id),
+        )
+        projection_digest = sha256_digest_json(projection)
+        projection_descriptor = _write_runner_call_projection_payload(
+            transaction,
+            self._payload_store,
+            event_id=event_id,
+            projection=projection,
+            projection_digest=projection_digest,
+        )
+        tool_schema_descriptor = _write_selected_tool_schema_snapshot_payload(
+            transaction,
+            self._payload_store,
+            event_id=event_id,
+            record_input=record_input,
+        )
         manifest = _runner_call_manifest_body(
             record_input,
             runner_call_index=runner_call_index,
             manifest_id=_runner_call_manifest_id(event_id),
+            projection_descriptor=projection_descriptor,
+            tool_schema_descriptor=tool_schema_descriptor,
         )
         manifest_digest = sha256_digest_json(manifest)
         descriptor = _write_runner_call_manifest_payload(
@@ -4238,11 +4274,259 @@ def _runner_call_manifest_id(event_id: str) -> str:
     return f"runner-call-manifest:{event_id}"
 
 
+def _runner_call_projection_id(event_id: str) -> str:
+    """派生 runner-call projection logical id。
+
+    :param event_id: manifest canonical event id。
+    :returns: projection id。
+    """
+
+    return f"runner-call-projection:{event_id}"
+
+
+def _runner_call_projection_body(
+    record_input: RunnerCallManifestRecordInput,
+    *,
+    runner_call_index: int,
+    projection_id: str,
+) -> Mapping[str, JsonValue]:
+    """构造 runner-call LLM-facing input projection body。
+
+    :param record_input: manifest 构造输入。
+    :param runner_call_index: Host-owned runner call index。
+    :param projection_id: projection logical id。
+    :returns: projection canonical JSON object。
+    """
+
+    runner_call_kind, trigger_reason = _runner_call_kind_and_trigger(record_input)
+    messages = tuple(
+        _runner_call_projection_message(record_input, index=index, message=message)
+        for index, message in enumerate(record_input.messages)
+    )
+    return {
+        "schema_version": RUNNER_CALL_INPUT_PROJECTION_SCHEMA_VERSION,
+        "projection_id": projection_id,
+        "session_id": record_input.current_facts.run.session_id,
+        "host_run_id": record_input.current_facts.run.run_id,
+        "attempt_id": record_input.current_facts.attempt.attempt_id,
+        "execution_id": record_input.current_facts.attempt.execution_id,
+        "runner_call_index": runner_call_index,
+        "runner_call_kind": runner_call_kind,
+        "runner_call_trigger_reason": trigger_reason,
+        "iteration_id": None,
+        "iteration_index": None,
+        "runner_input_serializer_schema_version": (
+            RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+        ),
+        "message_count": len(messages),
+        "role_sequence_digest": runner_role_sequence_digest(
+            _message_role_values(record_input.messages)
+        ),
+        "messages": list(messages),
+    }
+
+
+def _runner_call_projection_message(
+    record_input: RunnerCallManifestRecordInput,
+    *,
+    index: int,
+    message: AgentMessage,
+) -> Mapping[str, JsonValue]:
+    """构造 runner-call projection 的单条 message。
+
+    :param record_input: manifest 构造输入。
+    :param index: message 顺序。
+    :param message: 实际 runner input message。
+    :returns: message projection JSON object。
+    """
+
+    base: dict[str, JsonValue] = {
+        "index": index,
+        "role": message.role.value,
+        "content": _message_content_text(message),
+        "content_digest": _message_content_digest(message),
+        "content_size_bytes": _message_content_size_bytes(message),
+        "source_refs": list(
+            _message_source_refs(record_input, index=index, message=message)
+        ),
+        "projector_metadata_id": _projector_metadata_id_for_message(
+            record_input, index=index, message=message
+        ),
+    }
+    if isinstance(message, ToolMessage):
+        base["tool_call_id"] = message.tool_call_id
+    if isinstance(message, AssistantMessage):
+        base["tool_calls"] = [
+            {
+                "tool_call_id": call.id,
+                "name": call.name,
+                "arguments": dict(call.arguments),
+                "provider_state": _provider_state_projection(call.provider_state),
+            }
+            for call in message.tool_calls
+        ]
+    return base
+
+
+def _provider_state_projection(
+    provider_state: GeminiToolCallState | None,
+) -> Mapping[str, JsonValue] | None:
+    """构造 provider tool-call 续航状态的非 secret 结构化投影。
+
+    :param provider_state: Engine tool call provider state。
+    :returns: provider state projection；缺失时返回 ``None``。
+    """
+
+    if provider_state is None:
+        return None
+    return {
+        "provider": "gemini",
+        "state_digest": sha256_digest_json(
+            {"thought_signature": provider_state.thought_signature}
+        ),
+    }
+
+
+def _write_runner_call_projection_payload(
+    transaction: HostTransaction,
+    payload_store: PayloadStore,
+    *,
+    event_id: str,
+    projection: Mapping[str, JsonValue],
+    projection_digest: str,
+) -> PayloadDescriptor:
+    """写入 runner-call input projection payload descriptor。
+
+    :param transaction: 当前 Host transaction。
+    :param payload_store: payload store primitive。
+    :param event_id: manifest canonical event id。
+    :param projection: projection body。
+    :param projection_digest: projection body digest。
+    :returns: payload descriptor。
+    :raises HostDurableError: descriptor 缺失或 digest 不一致时抛出。
+    """
+
+    return payload_store.write_bounded_json_payload(
+        transaction,
+        BoundedJsonPayloadWriteRequest(
+            payload_ref=_runner_call_projection_payload_ref(event_id),
+            sqlite_payload_id=_runner_call_projection_sqlite_payload_id(event_id),
+            payload_json=projection,
+            media_type=RUNNER_CALL_INPUT_PROJECTION_MEDIA_TYPE,
+            metadata={
+                "descriptor_kind": RUNNER_CALL_INPUT_PROJECTION_DESCRIPTOR_KIND,
+                "schema_version": RUNNER_CALL_INPUT_PROJECTION_SCHEMA_VERSION,
+                "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
+                "event_id": event_id,
+            },
+            expected_digest=projection_digest,
+        ),
+    )
+
+
+def _write_selected_tool_schema_snapshot_payload(
+    transaction: HostTransaction,
+    payload_store: PayloadStore,
+    *,
+    event_id: str,
+    record_input: RunnerCallManifestRecordInput,
+) -> PayloadDescriptor | None:
+    """写入 selected tool schema full JSON snapshot payload descriptor。
+
+    :param transaction: 当前 Host transaction。
+    :param payload_store: payload store primitive。
+    :param event_id: manifest canonical event id。
+    :param record_input: manifest 构造输入。
+    :returns: 有工具 schema 时返回 payload descriptor，否则返回 ``None``。
+    :raises HostDurableError: descriptor 缺失或 digest 不一致时抛出。
+    """
+
+    if len(record_input.tool_snapshot.tool_schemas) == 0:
+        return None
+    snapshot = _selected_tool_schema_snapshot_body(record_input)
+    snapshot_digest = sha256_digest_json(snapshot)
+    payload_ref = _selected_tool_schema_payload_ref(event_id)
+    existing = payload_store.read_payload_descriptor(transaction, payload_ref)
+    if existing is not None:
+        if existing.payload_digest != snapshot_digest:
+            raise HostDurableError("selected tool schema snapshot digest mismatch")
+        return existing
+    return payload_store.write_sqlite_payload(
+        transaction,
+        SQLitePayloadWriteRequest(
+            payload_ref=payload_ref,
+            payload_id=_selected_tool_schema_sqlite_payload_id(event_id),
+            payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+            payload_json=snapshot,
+            media_type=SELECTED_TOOL_SCHEMA_SNAPSHOT_MEDIA_TYPE,
+            metadata={
+                "descriptor_kind": SELECTED_TOOL_SCHEMA_SNAPSHOT_DESCRIPTOR_KIND,
+                "schema_version": SELECTED_TOOL_SCHEMA_SNAPSHOT_SCHEMA_VERSION,
+                "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
+                "event_id": event_id,
+            },
+            expected_digest=snapshot_digest,
+        ),
+    )
+
+
+def _selected_tool_schema_snapshot_body(
+    record_input: RunnerCallManifestRecordInput,
+) -> Mapping[str, JsonValue]:
+    """构造 selected tool schema full JSON snapshot body。
+
+    :param record_input: manifest 构造输入。
+    :returns: selected tool schema snapshot canonical JSON object。
+    """
+
+    return {
+        "schema_version": SELECTED_TOOL_SCHEMA_SNAPSHOT_SCHEMA_VERSION,
+        "session_id": record_input.current_facts.run.session_id,
+        "host_run_id": record_input.current_facts.run.run_id,
+        "attempt_id": record_input.current_facts.attempt.attempt_id,
+        "execution_id": record_input.current_facts.attempt.execution_id,
+        "disable_tools": record_input.tool_snapshot.disable_tools,
+        "tool_schema_count": len(record_input.tool_snapshot.tool_schemas),
+        "tool_schemas": [
+            _tool_schema_json(schema)
+            for schema in record_input.tool_snapshot.tool_schemas
+        ],
+    }
+
+
+def _tool_schema_json(schema: ToolSchema) -> Mapping[str, JsonValue]:
+    """把 ToolSchema 转为 LLM-facing JSON snapshot。
+
+    :param schema: Engine tool schema。
+    :returns: OpenAI function-call 风格 JSON object。
+    """
+
+    parameters: dict[str, JsonValue] = {
+        "type": schema.function.parameters.type,
+        "properties": dict(schema.function.parameters.properties),
+        "required": list(schema.function.parameters.required),
+    }
+    if schema.function.parameters.additional_properties is not None:
+        parameters["additionalProperties"] = (
+            schema.function.parameters.additional_properties
+        )
+    return {
+        "type": schema.type,
+        "function": {
+            "name": schema.function.name,
+            "description": schema.function.description,
+            "parameters": parameters,
+        },
+    }
+
+
 def _runner_call_manifest_body(
     record_input: RunnerCallManifestRecordInput,
     *,
     runner_call_index: int,
     manifest_id: str,
+    projection_descriptor: PayloadDescriptor,
+    tool_schema_descriptor: PayloadDescriptor | None,
 ) -> Mapping[str, JsonValue]:
     """构造 runner-call input assembly manifest body。
 
@@ -4253,7 +4537,9 @@ def _runner_call_manifest_body(
     """
 
     roles = _message_role_values(record_input.messages)
-    message_entries = _runner_call_message_entries(record_input)
+    message_entries = _runner_call_message_entries(
+        record_input, projection_descriptor=projection_descriptor
+    )
     projector_metadata = _runner_call_projector_metadata(record_input)
     source_cursor_refs = _source_cursor_refs(record_input)
     input_projection_digest = _input_projection_digest(
@@ -4280,9 +4566,18 @@ def _runner_call_manifest_body(
             RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
         ),
         "input_projection_digest": input_projection_digest,
+        "runner_call_projection_artifact_ref": projection_descriptor.payload_ref,
+        "runner_call_projection_artifact_digest": (
+            projection_descriptor.payload_digest
+        ),
+        "runner_call_projection_artifact_size_bytes": (
+            projection_descriptor.payload_size_bytes
+        ),
         "message_entries": list(message_entries),
         "source_cursor_refs": list(source_cursor_refs),
-        "tool_schema_snapshot_refs": list(_tool_schema_snapshot_refs(record_input)),
+        "tool_schema_snapshot_refs": list(
+            _tool_schema_snapshot_refs(tool_schema_descriptor)
+        ),
         "memory_snapshot_cursor_ref": _memory_snapshot_cursor_ref(
             record_input.memory
         ),
@@ -4375,8 +4670,43 @@ def _runner_call_manifest_hot_payload(
         "input_projection_digest": _manifest_text(
             manifest, "input_projection_digest"
         ),
+        "runner_call_projection_artifact_ref": _manifest_text(
+            manifest, "runner_call_projection_artifact_ref"
+        ),
+        "runner_call_projection_artifact_digest": _manifest_text(
+            manifest, "runner_call_projection_artifact_digest"
+        ),
+        "runner_call_projection_artifact_size_bytes": _manifest_int(
+            manifest, "runner_call_projection_artifact_size_bytes"
+        ),
         "projector_metadata_summary": list(_projector_metadata_summary(manifest)),
-        "diagnostic": None,
+        "diagnostic": _complete_runner_call_hot_diagnostic(manifest),
+    }
+
+
+def _complete_runner_call_hot_diagnostic(
+    manifest: Mapping[str, JsonValue]
+) -> Mapping[str, JsonValue]:
+    """构造 complete runner-call hot payload diagnostic。
+
+    :param manifest: manifest body。
+    :returns: 自描述的 complete diagnostic object。
+    :raises HostDurableError: manifest 字段类型非法时抛出。
+    """
+
+    message_count = _manifest_int(manifest, "message_count")
+    role_sequence_digest = _manifest_text(manifest, "role_sequence_digest")
+    return {
+        "status": _RUNNER_CALL_VALIDATION_COMPLETE,
+        "reason": None,
+        "missing_atom_kind": None,
+        "missing_ref_kind": None,
+        "missing_ref": None,
+        "observed_count": message_count,
+        "expected_count": message_count,
+        "observed_digest": role_sequence_digest,
+        "expected_digest": role_sequence_digest,
+        "consumer_boundary": _RUNNER_CALL_EVENT_SOURCE,
     }
 
 
@@ -4390,6 +4720,26 @@ def _runner_call_manifest_payload_ref(event_id: str) -> str:
     return f"{_RUNNER_CALL_MANIFEST_PAYLOAD_REF_PREFIX}-{event_id}"
 
 
+def _runner_call_projection_payload_ref(event_id: str) -> str:
+    """派生 runner-call projection payload descriptor ref。
+
+    :param event_id: manifest canonical event id。
+    :returns: payload descriptor ref。
+    """
+
+    return f"{_RUNNER_CALL_PROJECTION_PAYLOAD_REF_PREFIX}-{event_id}"
+
+
+def _selected_tool_schema_payload_ref(event_id: str) -> str:
+    """派生 selected tool schema snapshot payload descriptor ref。
+
+    :param event_id: manifest canonical event id。
+    :returns: payload descriptor ref。
+    """
+
+    return f"{_SELECTED_TOOL_SCHEMA_PAYLOAD_REF_PREFIX}-{event_id}"
+
+
 def _runner_call_manifest_sqlite_payload_id(event_id: str) -> str:
     """派生 runner-call manifest SQLite payload id。
 
@@ -4400,8 +4750,30 @@ def _runner_call_manifest_sqlite_payload_id(event_id: str) -> str:
     return f"{_RUNNER_CALL_MANIFEST_SQLITE_PAYLOAD_ID_PREFIX}-{event_id}"
 
 
+def _runner_call_projection_sqlite_payload_id(event_id: str) -> str:
+    """派生 runner-call projection SQLite payload id。
+
+    :param event_id: manifest canonical event id。
+    :returns: SQLite payload id。
+    """
+
+    return f"{_RUNNER_CALL_PROJECTION_SQLITE_PAYLOAD_ID_PREFIX}-{event_id}"
+
+
+def _selected_tool_schema_sqlite_payload_id(event_id: str) -> str:
+    """派生 selected tool schema snapshot SQLite payload id。
+
+    :param event_id: manifest canonical event id。
+    :returns: SQLite payload id。
+    """
+
+    return f"{_SELECTED_TOOL_SCHEMA_SQLITE_PAYLOAD_ID_PREFIX}-{event_id}"
+
+
 def _runner_call_message_entries(
     record_input: RunnerCallManifestRecordInput,
+    *,
+    projection_descriptor: PayloadDescriptor,
 ) -> tuple[Mapping[str, JsonValue], ...]:
     """构造 manifest message entries。
 
@@ -4410,7 +4782,12 @@ def _runner_call_message_entries(
     """
 
     return tuple(
-        _runner_call_message_entry(record_input, index=index, message=message)
+        _runner_call_message_entry(
+            record_input,
+            index=index,
+            message=message,
+            projection_descriptor=projection_descriptor,
+        )
         for index, message in enumerate(record_input.messages)
     )
 
@@ -4420,6 +4797,7 @@ def _runner_call_message_entry(
     *,
     index: int,
     message: AgentMessage,
+    projection_descriptor: PayloadDescriptor,
 ) -> Mapping[str, JsonValue]:
     """构造单条 manifest message entry。
 
@@ -4437,8 +4815,8 @@ def _runner_call_message_entry(
         "source_refs": list(
             _message_source_refs(record_input, index=index, message=message)
         ),
-        "projection_artifact_ref": None,
-        "projection_artifact_digest": None,
+        "projection_artifact_ref": projection_descriptor.payload_ref,
+        "projection_artifact_digest": projection_descriptor.payload_digest,
         "projector_metadata_id": _projector_metadata_id_for_message(
             record_input, index=index, message=message
         ),
@@ -4754,24 +5132,21 @@ def _source_cursor_refs(
 
 
 def _tool_schema_snapshot_refs(
-    record_input: RunnerCallManifestRecordInput,
+    tool_schema_descriptor: PayloadDescriptor | None,
 ) -> tuple[str, ...]:
     """返回工具 schema snapshot refs。
 
-    :param record_input: manifest 构造输入。
+    :param tool_schema_descriptor: selected schema snapshot descriptor。
     :returns: 工具 schema refs；无工具时为空。
     """
 
-    if len(record_input.tool_snapshot.tool_schemas) == 0:
+    if tool_schema_descriptor is None:
         return ()
     return (
-        "tool_schema_snapshot:"
-        + sha256_digest_json(
-            {
-                "tool_schema_count": len(record_input.tool_snapshot.tool_schemas),
-                "disable_tools": record_input.tool_snapshot.disable_tools,
-            }
-        ),
+        "tool_schema_snapshot_ref:" + tool_schema_descriptor.payload_ref,
+        "tool_schema_snapshot_digest:" + tool_schema_descriptor.payload_digest,
+        "tool_schema_snapshot_size_bytes:"
+        + str(tool_schema_descriptor.payload_size_bytes),
     )
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -74,10 +75,12 @@ from dayu.host.durable.schema import (
     TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT,
 )
 from dayu.host.durable.payload import (
+    PayloadKind,
     PayloadStore,
     SQLitePayloadFormat,
     SQLitePayloadWriteRequest,
 )
+from dayu.host.durable.tool_trace import read_tool_trace_json_payload
 from dayu.host.durable.run_transition import (
     CreateRunningRunInput,
     StartRecoveryRunInput,
@@ -482,7 +485,9 @@ def test_runner_call_manifest_is_bounded_and_does_not_inline_messages(
     """大输入只进入 request message，不完整内联到 runner-call manifest。"""
 
     large_prompt = "read filing " + ("x" * 20000)
-    with open_host_durable_store(_options(tmp_path)) as store:
+    with open_host_durable_store(
+        _options(tmp_path, payload_inline_threshold_bytes=21000)
+    ) as store:
         session_id = _ensure_session_id(store.transaction_runner)
         seeded = _seed_current_run(
             store,
@@ -515,10 +520,43 @@ def test_runner_call_manifest_is_bounded_and_does_not_inline_messages(
         assert manifest_event.payload_ref == hot_payload["manifest_payload_ref"]
         assert manifest_event.payload_digest == hot_payload["manifest_digest"]
         assert manifest["message_count"] == len(request.messages)
+        projection_ref = manifest["runner_call_projection_artifact_ref"]
+        projection_digest = manifest["runner_call_projection_artifact_digest"]
+        assert isinstance(projection_ref, str)
+        assert isinstance(projection_digest, str)
         assert len(manifest_text) < 5000
         assert "x" * 128 not in hot_text
         assert "x" * 128 not in manifest_text
         assert large_prompt == _message_content(request.messages[-1])
+        projection = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_json_payload(
+                transaction,
+                projection_ref,
+                expected_digest=projection_digest,
+            )
+        )
+        messages = _json_object_sequence(projection.payload["messages"])
+        manifest_entries = _json_object_sequence(manifest["message_entries"])
+        projection_descriptor = store.transaction_runner.run_read(
+            lambda transaction: PayloadStore().read_payload_descriptor(
+                transaction,
+                projection_ref,
+            )
+        )
+        assert projection_descriptor is not None
+        assert projection_descriptor.payload_kind is PayloadKind.ARTIFACT_REF
+        assert projection_descriptor.sqlite_payload_id is None
+        diagnostic = _json_object(hot_payload["diagnostic"])
+        assert diagnostic["status"] == "complete"
+        assert messages[-1]["content"] == large_prompt
+        assert len(messages) == len(manifest_entries)
+        for message, entry in zip(messages, manifest_entries, strict=True):
+            assert message["index"] == entry["index"]
+            assert message["role"] == entry["role"]
+            assert message["content_digest"] == entry["content_digest"]
+            assert message["content_size_bytes"] == entry["content_size_bytes"]
+            assert entry["projection_artifact_ref"] == projection_ref
+            assert entry["projection_artifact_digest"] == projection_digest
 
 
 def test_session_continuity_does_not_emit_unbudgeted_historical_raw_turns(
@@ -612,8 +650,10 @@ def test_continuity_skips_unsuccessful_prior_runs(tmp_path: Path) -> None:
         assert contents == (_expected_system_content(), "current question")
 
 
-def test_noop_providers_only_create_runner_call_manifest_rows(tmp_path: Path) -> None:
-    """noop providers 只额外创建 runner-call manifest durable rows。"""
+def test_noop_providers_create_manifest_and_projection_payloads(
+    tmp_path: Path,
+) -> None:
+    """noop providers 额外创建 runner-call manifest 与 projection payload。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
@@ -627,7 +667,7 @@ def test_noop_providers_only_create_runner_call_manifest_rows(tmp_path: Path) ->
         _build_request(store, seeded)
 
         after = _table_counts(store.transaction_runner)
-        assert after == (before[0] + 1, before[1] + 1, before[2] + 1)
+        assert after == (before[0] + 1, before[1] + 2, before[2] + 2)
 
 
 def test_no_tool_request_fields_are_disabled(tmp_path: Path) -> None:
@@ -676,6 +716,61 @@ def test_tool_enabled_request_uses_toolruntime_handle(tmp_path: Path) -> None:
         assert "Tools are available for this runner call." in _message_content(
             request.messages[0]
         )
+
+
+def test_tool_enabled_manifest_resolves_selected_schema_snapshot(
+    tmp_path: Path,
+) -> None:
+    """runner-call manifest 引用可恢复的 selected tool schema full JSON。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current question"),
+        )
+        tool_runtime_handle = _tool_runtime_handle()
+
+        create_tool_enabled_run_input_builder(
+            transaction_runner=store.transaction_runner,
+            policy_snapshot=_policy_snapshot(allow_tool_calls=True),
+            tool_runtime_handle=tool_runtime_handle,
+        ).build(_attempt_snapshot(seeded))
+
+        manifest_event = _events_by_type(
+            store.transaction_runner,
+            event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+        )[0]
+        manifest = store.transaction_runner.run_read(
+            lambda transaction: event_payload_object(
+                transaction,
+                manifest_event,
+                payload_label="runner-call manifest",
+            )
+        )
+        refs = manifest["tool_schema_snapshot_refs"]
+        assert isinstance(refs, list)
+        schema_ref = _ref_value(refs, prefix="tool_schema_snapshot_ref:")
+        schema_digest = _ref_value(refs, prefix="tool_schema_snapshot_digest:")
+        snapshot = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_json_payload(
+                transaction,
+                schema_ref,
+                expected_digest=schema_digest,
+            )
+        )
+
+        tool_schemas = _json_object_sequence(snapshot.payload["tool_schemas"])
+        names = {
+            name
+            for function in (
+                _json_object(item["function"]) for item in tool_schemas
+            )
+            for name in (function["name"],)
+            if isinstance(name, str)
+        }
+        assert "lookup_filing" in names
 
 
 def test_replay_no_tool_request_keeps_tools_disabled(tmp_path: Path) -> None:
@@ -4832,16 +4927,22 @@ def _read_memory_checkpoint_sequence(
     return transaction_runner.run_read(operation)
 
 
-def _options(tmp_path: Path) -> HostDurableStoreOptions:
+def _options(
+    tmp_path: Path, *, payload_inline_threshold_bytes: int = 65536
+) -> HostDurableStoreOptions:
     """构造测试用 Host durable store options。
 
     :param tmp_path: pytest 临时目录。
+    :param payload_inline_threshold_bytes: payload inline 阈值。
     :returns: Host durable store options。
     """
 
     return HostDurableStoreOptions(
         db_path=tmp_path / "durable.sqlite3",
-        payload_policy=PayloadStoragePolicy(artifact_root=tmp_path / "artifacts"),
+        payload_policy=PayloadStoragePolicy(
+            artifact_root=tmp_path / "artifacts",
+            payload_inline_threshold_bytes=payload_inline_threshold_bytes,
+        ),
         sqlite_policy=HostSQLiteStoragePolicy(
             busy_timeout_seconds=0.25,
             write_busy_retry_count=3,
@@ -6149,6 +6250,49 @@ def _table_counts(
         )
 
     return transaction_runner.run_read(operation)
+
+
+def _ref_value(refs: list[JsonValue], *, prefix: str) -> str:
+    """从 manifest refs 中读取指定前缀的 ref 值。
+
+    :param refs: manifest ref 列表。
+    :param prefix: 目标前缀。
+    :returns: 去掉前缀后的 ref 值。
+    :raises AssertionError: 未找到文本 ref 时抛出。
+    """
+
+    for item in refs:
+        if isinstance(item, str) and item.startswith(prefix):
+            return item.removeprefix(prefix)
+    raise AssertionError(f"missing ref prefix: {prefix}")
+
+
+def _json_object(value: JsonValue) -> Mapping[str, JsonValue]:
+    """断言 JSON 值是 object。
+
+    :param value: JSON 值。
+    :returns: JSON object。
+    :raises AssertionError: value 不是 object 时抛出。
+    """
+
+    assert isinstance(value, Mapping)
+    return value
+
+
+def _json_object_sequence(value: JsonValue) -> tuple[Mapping[str, JsonValue], ...]:
+    """断言 JSON 值是 object 列表。
+
+    :param value: JSON 值。
+    :returns: JSON object 元组。
+    :raises AssertionError: value 不是 object 列表时抛出。
+    """
+
+    assert isinstance(value, list)
+    objects: list[Mapping[str, JsonValue]] = []
+    for item in value:
+        assert isinstance(item, Mapping)
+        objects.append(item)
+    return tuple(objects)
 
 
 def _count_table(transaction: HostTransaction, table_name: str) -> int:

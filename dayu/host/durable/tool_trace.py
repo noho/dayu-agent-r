@@ -21,9 +21,19 @@ from dayu.host.durable._validation import (
     require_optional_non_empty_text as _require_optional_non_empty_text,
     require_text as _require_text,
 )
-from dayu.host.durable.codec import canonical_json_dumps
+from dayu.host.durable.artifact import LocalArtifactRef, read_artifact_bytes
+from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.errors import HostDurableError
-from dayu.host.durable.schema import TABLE_HOST_TOOL_TRACE_HOT
+from dayu.host.durable.payload import (
+    PayloadDescriptor,
+    PayloadKind,
+    read_payload_descriptor,
+)
+from dayu.host.durable.schema import (
+    TABLE_EVENT_LOG,
+    TABLE_HOST_TOOL_TRACE_HOT,
+    TABLE_SQLITE_PAYLOADS,
+)
 from dayu.host.durable.transaction import HostRow, HostTransaction, SQLiteScalar
 
 TOOL_TRACE_QUERY_MAX_LIMIT = 500
@@ -50,6 +60,10 @@ _RUNNER_CALL_PROJECTOR_ID = "projector_id"
 _RUNNER_CALL_PROJECTOR_SCHEMA_VERSION = "projector_schema_version"
 _RUNNER_CALL_PROJECTOR_DIGEST = "projector_digest"
 _RUNNER_CALL_PROJECTOR_PURPOSE = "purpose"
+_RUNNER_CALL_PROJECTION_ARTIFACT_REF = "runner_call_projection_artifact_ref"
+_RUNNER_CALL_PROJECTION_ARTIFACT_DIGEST = "runner_call_projection_artifact_digest"
+_TOOL_SCHEMA_SNAPSHOT_REF_PREFIX = "tool_schema_snapshot_ref:"
+_TOOL_SCHEMA_SNAPSHOT_DIGEST_PREFIX = "tool_schema_snapshot_digest:"
 
 
 class RunnerCallReconstructionStatus(StrEnum):
@@ -296,6 +310,342 @@ class RunnerCallReconstructionSignalPage:
     signals: tuple[RunnerCallReconstructionSignal, ...]
     next_event_sequence: int
     has_more: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ToolTraceResolvedJsonPayload:
+    """Tool Trace resolver 读取出的 JSON payload。
+
+    :param payload_ref: payload descriptor ref。
+    :param payload_digest: descriptor 中记录的 payload digest。
+    :param payload_size_bytes: descriptor 中记录的 payload 字节数。
+    :param media_type: payload media type。
+    :param payload: 已校验 digest 的 JSON object。
+    """
+
+    payload_ref: str
+    payload_digest: str
+    payload_size_bytes: int
+    media_type: str | None
+    payload: Mapping[str, JsonValue]
+
+
+@dataclass(frozen=True, slots=True)
+class RunnerCallResolvedProjection:
+    """Runner-call reconstruction resolver 结果。
+
+    :param signal: Tool Trace runner-call signal。
+    :param manifest: runner-call manifest JSON payload。
+    :param runner_input_projection: LLM-facing runner input projection JSON payload。
+    :param selected_tool_schema_snapshot: selected tool schema full JSON snapshot；
+        本轮无工具 schema 时为 ``None``。
+    """
+
+    signal: RunnerCallReconstructionSignal
+    manifest: ToolTraceResolvedJsonPayload
+    runner_input_projection: ToolTraceResolvedJsonPayload
+    selected_tool_schema_snapshot: ToolTraceResolvedJsonPayload | None
+
+
+@dataclass(frozen=True, slots=True)
+class ToolTraceResolvedRowPayloads:
+    """Tool Trace hot row resolver 结果。
+
+    :param row: Tool Trace hot row。
+    :param source_event_payload: source EventLog hot payload。
+    :param descriptor_payload: row ``payload_ref`` 指向的 JSON payload；没有
+        payload ref 时为 ``None``。
+    """
+
+    row: ToolTraceHotRow
+    source_event_payload: Mapping[str, JsonValue]
+    descriptor_payload: ToolTraceResolvedJsonPayload | None
+
+
+def resolve_runner_call_projection_from_signal(
+    transaction: HostTransaction,
+    signal: RunnerCallReconstructionSignal,
+) -> RunnerCallResolvedProjection:
+    """从 runner-call signal 解析 manifest、input projection 与 schema snapshot。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :param signal: ``read_runner_call_reconstruction_signals_by_run`` 返回的
+        runner-call signal。
+    :returns: 已校验 digest 的 runner-call resolved projection。
+    :raises HostDurableError: ref 缺失、payload 不存在、payload 不是 JSON object
+        或 digest 校验失败时抛出。
+    """
+
+    if signal.manifest_ref is None:
+        raise HostDurableError("runner-call signal has no manifest_ref")
+    manifest = read_tool_trace_json_payload(
+        transaction,
+        signal.manifest_ref,
+        expected_digest=signal.manifest_digest,
+    )
+    projection_ref = _json_optional_text(
+        manifest.payload,
+        _RUNNER_CALL_PROJECTION_ARTIFACT_REF,
+    )
+    projection_digest = _json_optional_text(
+        manifest.payload,
+        _RUNNER_CALL_PROJECTION_ARTIFACT_DIGEST,
+    )
+    if projection_ref is None:
+        raise HostDurableError("runner-call manifest has no projection artifact ref")
+    projection = read_tool_trace_json_payload(
+        transaction,
+        projection_ref,
+        expected_digest=projection_digest,
+    )
+    return RunnerCallResolvedProjection(
+        signal=signal,
+        manifest=manifest,
+        runner_input_projection=projection,
+        selected_tool_schema_snapshot=_resolve_selected_tool_schema_snapshot(
+            transaction,
+            manifest.payload,
+        ),
+    )
+
+
+def resolve_tool_trace_hot_row_payloads(
+    transaction: HostTransaction,
+    row: ToolTraceHotRow,
+) -> ToolTraceResolvedRowPayloads:
+    """解析 Tool Trace row 的 source EventLog payload 与 descriptor payload。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :param row: Tool Trace hot row。
+    :returns: 已解析 payloads。若 row 没有 ``payload_ref``，descriptor payload
+        为 ``None``。
+    :raises HostDurableError: source event 或 descriptor payload 缺失、格式非法
+        或 digest 校验失败时抛出。
+    """
+
+    source_event_payload = _read_event_payload(transaction, row.event_id)
+    descriptor_ref, descriptor_digest = _descriptor_ref_from_row_or_payload(
+        row,
+        source_event_payload,
+    )
+    descriptor_payload = (
+        None
+        if descriptor_ref is None
+        else read_tool_trace_json_payload(
+            transaction,
+            descriptor_ref,
+            expected_digest=descriptor_digest,
+        )
+    )
+    return ToolTraceResolvedRowPayloads(
+        row=row,
+        source_event_payload=source_event_payload,
+        descriptor_payload=descriptor_payload,
+    )
+
+
+def read_tool_trace_json_payload(
+    transaction: HostTransaction,
+    payload_ref: str,
+    *,
+    expected_digest: str | None,
+) -> ToolTraceResolvedJsonPayload:
+    """读取并校验 Tool Trace resolver 使用的 JSON payload descriptor。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :param payload_ref: payload descriptor ref。
+    :param expected_digest: 调用方期望 digest；为 ``None`` 时只校验 descriptor
+        与实际 payload 自洽。
+    :returns: 已校验 digest 的 JSON payload。
+    :raises HostDurableError: descriptor/payload 缺失、JSON 不是 object 或
+        digest 不匹配时抛出。
+    """
+
+    descriptor = read_payload_descriptor(transaction, payload_ref)
+    if descriptor is None:
+        raise HostDurableError("tool trace payload descriptor is missing")
+    if expected_digest is not None and descriptor.payload_digest != expected_digest:
+        raise HostDurableError("tool trace payload descriptor digest mismatch")
+    if descriptor.payload_kind is PayloadKind.SQLITE_PAYLOAD:
+        payload_json = _read_sqlite_payload_json(transaction, descriptor)
+    elif descriptor.payload_kind is PayloadKind.ARTIFACT_REF:
+        payload_json = _read_artifact_payload_json(transaction, descriptor)
+    else:
+        raise HostDurableError("tool trace payload kind is unsupported")
+    payload = _json_object_from_text(payload_json)
+    if sha256_digest_json(payload) != descriptor.payload_digest:
+        raise HostDurableError("tool trace payload digest mismatch")
+    return ToolTraceResolvedJsonPayload(
+        payload_ref=descriptor.payload_ref,
+        payload_digest=descriptor.payload_digest,
+        payload_size_bytes=descriptor.payload_size_bytes,
+        media_type=descriptor.media_type,
+        payload=payload,
+    )
+
+
+def _read_sqlite_payload_json(
+    transaction: HostTransaction,
+    descriptor: PayloadDescriptor,
+) -> str:
+    """读取 SQLite JSON payload 文本。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :param descriptor: payload descriptor。
+    :returns: payload_json 文本。
+    :raises HostDurableError: SQLite payload id 或 row 缺失时抛出。
+    """
+
+    if descriptor.sqlite_payload_id is None:
+        raise HostDurableError("tool trace sqlite payload id is missing")
+    row = transaction.fetchone(
+        f"""
+        SELECT payload_json
+        FROM {TABLE_SQLITE_PAYLOADS}
+        WHERE payload_id = ?
+        """,
+        (descriptor.sqlite_payload_id,),
+    )
+    if row is None:
+        raise HostDurableError("tool trace sqlite payload row is missing")
+    return _require_text(row.get("payload_json"), field_name="payload_json")
+
+
+def _read_artifact_payload_json(
+    transaction: HostTransaction,
+    descriptor: PayloadDescriptor,
+) -> str:
+    """读取 artifact JSON payload 文本。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :param descriptor: payload descriptor。
+    :returns: artifact UTF-8 文本。
+    :raises HostDurableError: artifact descriptor 不完整、读取失败或 UTF-8 非法时抛出。
+    """
+
+    if descriptor.artifact_relative_path is None:
+        raise HostDurableError("tool trace artifact payload path is missing")
+    content = read_artifact_bytes(
+        transaction.artifact_root,
+        LocalArtifactRef(
+            artifact_relative_path=descriptor.artifact_relative_path,
+            artifact_digest=descriptor.payload_digest,
+            artifact_size_bytes=descriptor.payload_size_bytes,
+        ),
+    )
+    try:
+        return content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HostDurableError("tool trace artifact payload is not UTF-8 JSON") from exc
+
+
+def _resolve_selected_tool_schema_snapshot(
+    transaction: HostTransaction,
+    manifest: Mapping[str, JsonValue],
+) -> ToolTraceResolvedJsonPayload | None:
+    """从 manifest 解析 selected tool schema snapshot payload。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :param manifest: runner-call manifest JSON object。
+    :returns: schema snapshot payload；本轮无工具时返回 ``None``。
+    :raises HostDurableError: refs 字段格式非法或 payload 无法解析时抛出。
+    """
+
+    refs_value = manifest.get("tool_schema_snapshot_refs")
+    if not isinstance(refs_value, list):
+        raise HostDurableError("runner-call manifest tool_schema_snapshot_refs invalid")
+    snapshot_ref: str | None = None
+    snapshot_digest: str | None = None
+    for item in refs_value:
+        if not isinstance(item, str):
+            raise HostDurableError("tool schema snapshot ref must be text")
+        if item.startswith(_TOOL_SCHEMA_SNAPSHOT_REF_PREFIX):
+            snapshot_ref = item.removeprefix(_TOOL_SCHEMA_SNAPSHOT_REF_PREFIX)
+        elif item.startswith(_TOOL_SCHEMA_SNAPSHOT_DIGEST_PREFIX):
+            snapshot_digest = item.removeprefix(_TOOL_SCHEMA_SNAPSHOT_DIGEST_PREFIX)
+    if snapshot_ref is None:
+        return None
+    return read_tool_trace_json_payload(
+        transaction,
+        snapshot_ref,
+        expected_digest=snapshot_digest,
+    )
+
+
+def _read_event_payload(
+    transaction: HostTransaction,
+    event_id: str,
+) -> Mapping[str, JsonValue]:
+    """读取 source EventLog hot payload。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :param event_id: EventLog id。
+    :returns: source event payload JSON object。
+    :raises HostDurableError: event 缺失、payload 缺失或 JSON 非 object 时抛出。
+    """
+
+    row = transaction.fetchone(
+        f"""
+        SELECT payload_json
+        FROM {TABLE_EVENT_LOG}
+        WHERE event_id = ?
+        """,
+        (event_id,),
+    )
+    if row is None:
+        raise HostDurableError("tool trace source event is missing")
+    payload_json = _require_text(row.get("payload_json"), field_name="payload_json")
+    return _json_object_from_text(payload_json)
+
+
+def _descriptor_ref_from_row_or_payload(
+    row: ToolTraceHotRow,
+    source_event_payload: Mapping[str, JsonValue],
+) -> tuple[str | None, str | None]:
+    """从 hot row 或 source payload 读取 payload descriptor ref/digest。
+
+    :param row: Tool Trace hot row。
+    :param source_event_payload: source EventLog payload。
+    :returns: ``(payload_ref, payload_digest)``；无 descriptor 时二者为
+        ``None``。
+    :raises HostDurableError: payload_ref object 字段类型非法时抛出。
+    """
+
+    if row.payload_ref is not None:
+        return row.payload_ref, row.payload_digest
+    payload_ref_value = source_event_payload.get("payload_ref")
+    if isinstance(payload_ref_value, Mapping):
+        payload_mapping = cast(Mapping[str, JsonValue], payload_ref_value)
+        return (
+            _json_optional_text(payload_mapping, "payload_ref"),
+            _json_optional_text(payload_mapping, "payload_digest"),
+        )
+    if payload_ref_value is not None:
+        raise HostDurableError("tool trace source payload_ref must be object")
+    return (
+        _json_optional_text(source_event_payload, "terminal_summary_ref"),
+        _json_optional_text(source_event_payload, "terminal_summary_digest"),
+    )
+
+
+def _json_optional_text(
+    payload: Mapping[str, JsonValue],
+    field_name: str,
+) -> str | None:
+    """读取 JSON object 的可选文本字段。
+
+    :param payload: JSON object。
+    :param field_name: 字段名。
+    :returns: 文本值或 ``None``。
+    :raises HostDurableError: 字段存在但不是文本时抛出。
+    """
+
+    value = payload.get(field_name)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    raise HostDurableError(f"tool trace payload {field_name} must be text")
 
 
 def read_tool_trace_hot_row(
@@ -1101,15 +1451,21 @@ __all__ = [
     "RunnerCallReconstructionSignal",
     "RunnerCallReconstructionSignalPage",
     "RunnerCallReconstructionStatus",
+    "RunnerCallResolvedProjection",
     "ToolTraceHotRow",
     "ToolTraceHotRowWriteResult",
     "ToolTraceHotRowWriteStatus",
     "ToolTraceQueryPage",
+    "ToolTraceResolvedJsonPayload",
+    "ToolTraceResolvedRowPayloads",
     "find_tool_trace_by_diagnostic_ref",
     "find_tool_trace_by_provider_request_id",
     "find_tool_trace_by_tool_call_id",
     "insert_tool_trace_hot_row_if_absent",
     "read_runner_call_reconstruction_signals_by_run",
+    "read_tool_trace_json_payload",
     "read_tool_trace_by_run",
     "read_tool_trace_hot_row",
+    "resolve_runner_call_projection_from_signal",
+    "resolve_tool_trace_hot_row_payloads",
 ]

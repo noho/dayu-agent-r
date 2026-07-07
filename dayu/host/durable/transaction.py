@@ -13,6 +13,7 @@ import sqlite3
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol, TypeVar, cast
 
 from dayu.host.durable.errors import (
@@ -139,24 +140,41 @@ class HostTransaction:
     """Host durable 内部 SQLite transaction wrapper。
 
     :param connection: 已进入 transaction 的 SQLite connection。
+    :param artifact_root: 当前 durable store 的 payload artifact 根目录。
     :param payload_inline_threshold_bytes: 当前 durable store 的 payload inline 阈值。
+    :param create_artifact_root: artifact root 缺失时是否允许创建。
     """
 
     def __init__(
         self,
         connection: sqlite3.Connection,
         *,
+        artifact_root: Path,
         payload_inline_threshold_bytes: int,
+        create_artifact_root: bool,
     ) -> None:
         """初始化 transaction wrapper。
 
         :param connection: 已进入 transaction 的 SQLite connection。
+        :param artifact_root: 当前 durable store 的 payload artifact 根目录。
         :param payload_inline_threshold_bytes: 当前 durable store 的 payload inline 阈值。
+        :param create_artifact_root: artifact root 缺失时是否允许创建。
         :returns: ``None``。
         """
 
         self._connection = connection
+        self._artifact_root = artifact_root
         self._payload_inline_threshold_bytes = payload_inline_threshold_bytes
+        self._create_artifact_root = create_artifact_root
+
+    @property
+    def artifact_root(self) -> Path:
+        """返回当前 durable store 的 payload artifact 根目录。
+
+        :returns: artifact 根目录。
+        """
+
+        return self._artifact_root
 
     @property
     def payload_inline_threshold_bytes(self) -> int:
@@ -166,6 +184,15 @@ class HostTransaction:
         """
 
         return self._payload_inline_threshold_bytes
+
+    @property
+    def create_artifact_root(self) -> bool:
+        """返回 artifact root 缺失时是否允许创建。
+
+        :returns: 允许创建时返回 ``True``。
+        """
+
+        return self._create_artifact_root
 
     def execute(self, sql: str, parameters: SQLParameters = ()) -> HostExecuteResult:
         """执行一条 SQL statement 并返回写入摘要。
@@ -216,7 +243,9 @@ class HostTransactionRunner:
 
     :param connection: runner 持有的 SQLite connection。
     :param sqlite_policy: busy timeout 与 write retry 策略。
+    :param artifact_root: 当前 durable store 的 payload artifact 根目录。
     :param payload_inline_threshold_bytes: 当前 durable store 的 payload inline 阈值。
+    :param create_artifact_root: artifact root 缺失时是否允许创建。
     """
 
     def __init__(
@@ -224,19 +253,25 @@ class HostTransactionRunner:
         connection: sqlite3.Connection,
         sqlite_policy: HostSQLiteStoragePolicy,
         *,
+        artifact_root: Path,
         payload_inline_threshold_bytes: int,
+        create_artifact_root: bool,
     ) -> None:
         """初始化 transaction runner。
 
         :param connection: runner 持有的 SQLite connection。
         :param sqlite_policy: busy timeout 与 write retry 策略。
+        :param artifact_root: 当前 durable store 的 payload artifact 根目录。
         :param payload_inline_threshold_bytes: 当前 durable store 的 payload inline 阈值。
+        :param create_artifact_root: artifact root 缺失时是否允许创建。
         :returns: ``None``。
         """
 
         self._connection = connection
         self._sqlite_policy = sqlite_policy
+        self._artifact_root = artifact_root
         self._payload_inline_threshold_bytes = payload_inline_threshold_bytes
+        self._create_artifact_root = create_artifact_root
         self._active_transaction_count = 0
         self._connection_unusable = False
 
@@ -282,7 +317,9 @@ class HostTransactionRunner:
                     result = operation(
                         HostTransaction(
                             self._connection,
+                            artifact_root=self._artifact_root,
                             payload_inline_threshold_bytes=(self._payload_inline_threshold_bytes),
+                            create_artifact_root=self._create_artifact_root,
                         )
                     )
                     self._connection.execute("COMMIT")
@@ -345,7 +382,9 @@ class HostTransactionRunner:
                     result = operation(
                         HostTransaction(
                             self._connection,
+                            artifact_root=self._artifact_root,
                             payload_inline_threshold_bytes=(self._payload_inline_threshold_bytes),
+                            create_artifact_root=self._create_artifact_root,
                         )
                     )
                     self._connection.execute("COMMIT")

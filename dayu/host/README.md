@@ -360,7 +360,7 @@ Dispatch scheduler 只消费已提交的 accepted / queued / pending dispatch fa
 
 ### RunInputBuilder
 
-RunInputBuilder 只从 durable providers 读取当前 Run facts、Session continuity、conversation memory、compact artifact、accepted tool evidence、fallback context、tool schema snapshot、ToolRuntime handle、scene parameters 和 policy snapshot，构造 `AgentRunRequest`。它会把 Host 内部 id、payload ref、projection checkpoint、policy ref、digest 和 dispatch 状态改写为 LLM-facing 自解释 system sections，避免把宿主治理信息伪装成业务事实。
+RunInputBuilder 只从 durable providers 读取当前 Run facts、Session continuity、conversation memory、compact artifact、accepted tool evidence、fallback context、tool schema snapshot、ToolRuntime handle、scene parameters 和 policy snapshot，构造 `AgentRunRequest`。它会把 Host 内部 id、payload ref、projection checkpoint、policy ref、digest 和 dispatch 状态改写为 LLM-facing 自解释 system sections，避免把宿主治理信息伪装成业务事实。完成普通 runner input 装配后，RunInputBuilder 写入 bounded `RUNNER_CALL_INPUT_ASSEMBLED` manifest，并把完整 LLM-facing messages 与 selected tool schema full JSON 分别保存为可校验 payload descriptor，供 Tool Trace resolver 按需读取。
 
 ### EngineEvent ingest
 
@@ -394,7 +394,7 @@ Conversation Memory 是 Session-level projection / read model，只消费 commit
 
 ### Outbox、audit 与 tool trace
 
-Outbox 从 terminal facts 派生离线 terminal notification item；audit JSONL 记录操作流水和 destructive purge 诊断；tool trace 记录工具执行 hot rows 与诊断，并投影 context pressure、tool timing、failure metadata 等只读结构化 signal。Tool Trace 在缺少 provider request id 但存在 client correlation id 时仍保留该诊断关联字段，不把客户端关联 id 伪装成 provider request id。它们都不能反向驱动 Run / Attempt 状态。
+Outbox 从 terminal facts 派生离线 terminal notification item；audit JSONL 记录操作流水和 destructive purge 诊断；tool trace 记录工具执行 hot rows 与诊断，并投影 context pressure、tool timing、failure metadata、runner-call manifest refs / digests 等只读结构化 signal。Tool Trace 在缺少 provider request id 但存在 client correlation id 时仍保留该诊断关联字段，不把客户端关联 id 伪装成 provider request id。Tool Trace 查询层提供 resolver，可从 refs/digests 按需恢复 runner input projection、selected tool schema snapshot、工具参数、工具结果 payload 和 terminal final answer；hot row 与 cold JSONL 仍不内联大明文。它们都不能反向驱动 Run / Attempt 状态。
 
 ## 关键执行路径
 
@@ -543,7 +543,7 @@ EngineEvent ingest 与 HostEvent projection 是两条边界：
 - HostEvent 是 EventLog 派生 view；watch 只订阅 live events，离线 terminal 通知走 outbox terminal read / drain。
 - failed terminal public projection 可在原始错误消息后追加 `provider_request_id` / `client_correlation_id` 诊断后缀；后缀只来自 terminal payload 已有字段，不改写 EventLog payload message 或 payload digest。
 
-Runner call manifest 由 Host 在 RunInputBuilder 装配普通 runner input 时写入 `RUNNER_CALL_INPUT_ASSEMBLED`。Engine `iteration_started` 到达后，Host ingest 将未关联 manifest 显式链接为 `RUNNER_CALL_INPUT_ITERATION_LINKED`；missing、ambiguous、mismatch 或 link conflict 都 fail closed 为 `ENGINE_EVENT_REJECTED`。
+Runner call manifest 由 Host 在 RunInputBuilder 装配普通 runner input 时写入 `RUNNER_CALL_INPUT_ASSEMBLED`。Engine `iteration_started` 到达后，Host ingest 将未关联 manifest 显式链接为 `RUNNER_CALL_INPUT_ITERATION_LINKED`；missing、ambiguous、mismatch 或 link conflict 都 fail closed 为 `ENGINE_EVENT_REJECTED`。工具结果进入下一轮时，Engine `iteration_started.input_projection` 提供本轮真实 messages 的中性投影，Host ingest 将其保存为 runner-call projection payload 并写 complete continuation manifest；旧事件缺少 projection 时才降级为 `limited_signal(missing_projection_artifact)`。
 
 ## 关键机制
 
@@ -614,7 +614,7 @@ positive orphan proof 需要 durable owner liveness 与本机进程证据支持�
 
 Host ingest 对 final answer、run failed、cancelled、lost、usage、iteration_started、tool awaiting confirmation 与 context compaction request 分别建模。EngineEvent 进入 Host 前只是 worker 输入，必须匹配 run / attempt / execution identity 与当前 durable state；迟到、错 execution、错状态或无法链接 runner-call manifest 的事件会 fail closed 为 diagnostic / rejected path。
 
-同步 ingest 不处理需要异步 compact 的 reactive path；异步 ingest 在必要时执行 reactive compact / recovery。`iteration_started` 会显式链接 Host 先前写入的 `RUNNER_CALL_INPUT_ASSEMBLED` manifest；missing、ambiguous、mismatch 或 link conflict 都以 `ENGINE_EVENT_REJECTED` 收口，避免 provider observation 与 Host input manifest 脱节。
+同步 ingest 不处理需要异步 compact 的 reactive path；异步 ingest 在必要时执行 reactive compact / recovery。`iteration_started` 会显式链接 Host 先前写入的 `RUNNER_CALL_INPUT_ASSEMBLED` manifest；missing、ambiguous、mismatch 或 link conflict 都以 `ENGINE_EVENT_REJECTED` 收口，避免 provider observation 与 Host input manifest 脱节。已有 prior iteration 后的 Engine-only continuation 使用 `iteration_started.input_projection` 保存真实 runner input projection；projection 缺失时保留 limited diagnostic。
 
 ### ToolRuntime accept barrier
 

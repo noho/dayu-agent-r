@@ -161,6 +161,11 @@ _FIELD_MANIFEST_DIGEST = "manifest_digest"
 _FIELD_MESSAGE_COUNT = "message_count"
 _FIELD_ROLE_SEQUENCE_DIGEST = "role_sequence_digest"
 _FIELD_INPUT_PROJECTION_DIGEST = "input_projection_digest"
+_FIELD_RUNNER_CALL_PROJECTION_REF = "runner_call_projection_artifact_ref"
+_FIELD_RUNNER_CALL_PROJECTION_DIGEST = "runner_call_projection_artifact_digest"
+_FIELD_RUNNER_CALL_PROJECTION_SIZE_BYTES = (
+    "runner_call_projection_artifact_size_bytes"
+)
 _FIELD_PROJECTOR_METADATA_SUMMARY = "projector_metadata_summary"
 _FIELD_VALIDATION_STATUS = "validation_status"
 _FIELD_DIAGNOSTIC = "diagnostic"
@@ -699,6 +704,15 @@ def _runner_call_trace_summary(event: ProjectionEventView) -> Mapping[str, JsonV
         ),
         _FIELD_INPUT_PROJECTION_DIGEST: _optional_text(
             payload, _FIELD_INPUT_PROJECTION_DIGEST
+        ),
+        _FIELD_RUNNER_CALL_PROJECTION_REF: _optional_text(
+            payload, _FIELD_RUNNER_CALL_PROJECTION_REF
+        ),
+        _FIELD_RUNNER_CALL_PROJECTION_DIGEST: _optional_text(
+            payload, _FIELD_RUNNER_CALL_PROJECTION_DIGEST
+        ),
+        _FIELD_RUNNER_CALL_PROJECTION_SIZE_BYTES: _optional_int(
+            payload, _FIELD_RUNNER_CALL_PROJECTION_SIZE_BYTES
         ),
         _FIELD_PROJECTOR_METADATA_SUMMARY: list(
             _runner_call_projector_metadata_summary(payload)

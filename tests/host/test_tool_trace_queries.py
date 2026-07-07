@@ -6,13 +6,22 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from dayu.contracts.json_value import JsonValue
-from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.artifact import LocalArtifactStore
+from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
+from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
     append_event,
+)
+from dayu.host.durable.payload import (
+    PayloadStore,
+    SQLitePayloadFormat,
+    SQLitePayloadWriteRequest,
 )
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
@@ -29,8 +38,10 @@ from dayu.host.durable.tool_trace import (
     find_tool_trace_by_tool_call_id,
     read_runner_call_reconstruction_signals_by_run,
     read_tool_trace_by_run,
+    resolve_runner_call_projection_from_signal,
+    resolve_tool_trace_hot_row_payloads,
 )
-from dayu.host.durable.transaction import HostTransactionRunner
+from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.tool_trace import (
     ToolTraceSinkOptions,
     catch_up_tool_trace_projection,
@@ -125,6 +136,125 @@ def _catch_up(
             cold_jsonl_path=tmp_path / "trace" / "cold.jsonl"
         ),
     )
+
+
+def _write_json_payload(
+    transaction: HostTransaction,
+    *,
+    payload_ref: str,
+    payload_id: str,
+    payload: Mapping[str, JsonValue],
+) -> None:
+    """写入测试用 JSON payload descriptor。
+
+    :param transaction: Host transaction。
+    :param payload_ref: payload descriptor ref。
+    :param payload_id: SQLite payload id。
+    :param payload: payload JSON object。
+    :returns: ``None``。
+    """
+
+    PayloadStore().write_sqlite_payload(
+        transaction,
+        SQLitePayloadWriteRequest(
+            payload_ref=payload_ref,
+            payload_id=payload_id,
+            payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+            payload_json=payload,
+            media_type="application/json",
+            metadata={},
+            expected_digest=sha256_digest_json(payload),
+        ),
+    )
+
+
+def _write_json_value_payload(
+    transaction: HostTransaction,
+    *,
+    payload_ref: str,
+    payload_id: str,
+    payload: JsonValue,
+) -> None:
+    """写入测试用任意 JSON payload descriptor。
+
+    :param transaction: Host transaction。
+    :param payload_ref: payload descriptor ref。
+    :param payload_id: SQLite payload id。
+    :param payload: payload JSON 值。
+    :returns: ``None``。
+    """
+
+    PayloadStore().write_sqlite_payload(
+        transaction,
+        SQLitePayloadWriteRequest(
+            payload_ref=payload_ref,
+            payload_id=payload_id,
+            payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+            payload_json=payload,
+            media_type="application/json",
+            metadata={},
+            expected_digest=sha256_digest_json(payload),
+        ),
+    )
+
+
+def _write_artifact_json_payload(
+    transaction: HostTransaction,
+    *,
+    payload_ref: str,
+    payload: Mapping[str, JsonValue],
+) -> None:
+    """写入测试用 artifact JSON payload descriptor。
+
+    :param transaction: Host transaction。
+    :param payload_ref: payload descriptor ref。
+    :param payload: payload JSON object。
+    :returns: ``None``。
+    """
+
+    payload_bytes = canonical_json_dumps(payload).encode("utf-8")
+    artifact_ref = LocalArtifactStore(
+        transaction.artifact_root,
+        create_artifact_root=transaction.create_artifact_root,
+    ).write_artifact_bytes(
+        payload_bytes,
+        expected_digest=sha256_digest_json(payload),
+    )
+    PayloadStore().write_payload_descriptor_for_artifact(
+        transaction,
+        payload_ref,
+        artifact_ref,
+        "application/json",
+        {},
+    )
+
+
+def _json_object(value: JsonValue) -> Mapping[str, JsonValue]:
+    """断言 JSON 值是 object。
+
+    :param value: JSON 值。
+    :returns: JSON object。
+    :raises AssertionError: value 不是 object 时抛出。
+    """
+
+    assert isinstance(value, Mapping)
+    return value
+
+
+def _json_object_sequence(value: JsonValue) -> tuple[Mapping[str, JsonValue], ...]:
+    """断言 JSON 值是 object 列表。
+
+    :param value: JSON 值。
+    :returns: JSON object 元组。
+    :raises AssertionError: value 不是 object 列表时抛出。
+    """
+
+    assert isinstance(value, list)
+    objects: list[Mapping[str, JsonValue]] = []
+    for item in value:
+        assert isinstance(item, Mapping)
+        objects.append(item)
+    return tuple(objects)
 
 
 def _query_signal_objects() -> Mapping[str, JsonValue]:
@@ -593,3 +723,484 @@ def test_runner_call_reconstruction_signal_query_classifies_statuses(
         )
         assert mismatch.diagnostic.observed_digest == observed_digest
         assert mismatch.diagnostic.expected_digest == expected_digest
+
+
+def test_runner_call_projection_resolver_reads_manifest_projection_and_schema(
+    tmp_path: Path,
+) -> None:
+    """resolver 能从 Tool Trace runner-call signal 恢复明文 input 与 schema。"""
+
+    projection_payload: Mapping[str, JsonValue] = {
+        "schema_version": "runner_call_input_projection.v1",
+        "messages": [
+            {
+                "index": 0,
+                "role": "system",
+                "content": "# 当前时间\n2026-07-07\n# 当前分析对象\nV（Visa Inc.）",
+                "content_digest": sha256_digest_json({"content": "system"}),
+                "content_size_bytes": 75,
+                "source_refs": ["event-input"],
+                "projector_metadata_id": "projector:0:system",
+            },
+            {
+                "index": 1,
+                "role": "user",
+                "content": "分析 Visa",
+                "content_digest": sha256_digest_json({"content": "user"}),
+                "content_size_bytes": 12,
+                "source_refs": ["event-input"],
+                "projector_metadata_id": "projector:1:user",
+            },
+        ],
+    }
+    schema_payload: Mapping[str, JsonValue] = {
+        "schema_version": "selected_tool_schema_snapshot.v1",
+        "tool_schemas": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_current_time",
+                    "description": "读取当前时间",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"timezone": {"type": "string"}},
+                        "required": ["timezone"],
+                    },
+                },
+            }
+        ],
+    }
+    projection_digest = sha256_digest_json(projection_payload)
+    schema_digest = sha256_digest_json(schema_payload)
+    manifest_payload: Mapping[str, JsonValue] = {
+        "schema_version": "runner_call_input_manifest.v1",
+        "runner_call_projection_artifact_ref": "payload-projection",
+        "runner_call_projection_artifact_digest": projection_digest,
+        "tool_schema_snapshot_refs": [
+            "tool_schema_snapshot_ref:payload-schema",
+            "tool_schema_snapshot_digest:" + schema_digest,
+        ],
+    }
+    manifest_digest = sha256_digest_json(manifest_payload)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: (
+                _write_json_payload(
+                    transaction,
+                    payload_ref="payload-projection",
+                    payload_id="sqlite-projection",
+                    payload=projection_payload,
+                ),
+                _write_json_payload(
+                    transaction,
+                    payload_ref="payload-schema",
+                    payload_id="sqlite-schema",
+                    payload=schema_payload,
+                ),
+                _write_json_payload(
+                    transaction,
+                    payload_ref="payload-manifest",
+                    payload_id="sqlite-manifest",
+                    payload=manifest_payload,
+                ),
+            )
+        )
+        _append_event(
+            store.transaction_runner,
+            event_id="event-runner-call-resolvable",
+            event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+            payload={
+                "runner_call_index": 0,
+                "runner_call_kind": "initial_user_dispatch",
+                "runner_call_trigger_reason": "initial_user_input",
+                "manifest_payload_ref": "payload-manifest",
+                "manifest_digest": manifest_digest,
+                "validation_status": "complete",
+                "message_count": 2,
+                "role_sequence_digest": sha256_digest_json(
+                    {"roles": ["system", "user"]}
+                ),
+                "input_projection_digest": sha256_digest_json(
+                    {"projection": "summary"}
+                ),
+                "projector_metadata_summary": [],
+                "runner_call_projection_artifact_ref": "payload-projection",
+                "runner_call_projection_artifact_digest": projection_digest,
+                "diagnostic": None,
+            },
+        )
+        _catch_up(store.transaction_runner, tmp_path)
+
+        page = store.transaction_runner.run_read(
+            lambda transaction: read_runner_call_reconstruction_signals_by_run(
+                transaction, "run-1", after_event_sequence=0, limit=10
+            )
+        )
+        resolved = store.transaction_runner.run_read(
+            lambda transaction: resolve_runner_call_projection_from_signal(
+                transaction, page.signals[0]
+            )
+        )
+
+        messages = _json_object_sequence(
+            resolved.runner_input_projection.payload["messages"]
+        )
+        assert "# 当前时间" in str(messages[0]["content"])
+        assert "V（Visa Inc.）" in str(messages[0]["content"])
+        assert resolved.selected_tool_schema_snapshot is not None
+        tool_schemas = _json_object_sequence(
+            resolved.selected_tool_schema_snapshot.payload["tool_schemas"]
+        )
+        function = _json_object(tool_schemas[0]["function"])
+        assert function["name"] == "get_current_time"
+
+
+def test_runner_call_projection_resolver_reads_artifact_projection_payload(
+    tmp_path: Path,
+) -> None:
+    """resolver 能读取 artifact_ref 形式的 projection JSON payload。"""
+
+    projection_payload: Mapping[str, JsonValue] = {
+        "schema_version": "runner_call_input_projection.v1",
+        "messages": [
+            {
+                "index": 0,
+                "role": "user",
+                "content": "artifact projection 明文",
+                "content_digest": sha256_digest_json({"content": "artifact"}),
+            }
+        ],
+    }
+    projection_digest = sha256_digest_json(projection_payload)
+    manifest_payload: Mapping[str, JsonValue] = {
+        "schema_version": "runner_call_input_manifest.v1",
+        "runner_call_projection_artifact_ref": "payload-artifact-projection",
+        "runner_call_projection_artifact_digest": projection_digest,
+        "tool_schema_snapshot_refs": [],
+    }
+    manifest_digest = sha256_digest_json(manifest_payload)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: (
+                _write_artifact_json_payload(
+                    transaction,
+                    payload_ref="payload-artifact-projection",
+                    payload=projection_payload,
+                ),
+                _write_json_payload(
+                    transaction,
+                    payload_ref="payload-artifact-manifest",
+                    payload_id="sqlite-artifact-manifest",
+                    payload=manifest_payload,
+                ),
+            )
+        )
+        _append_event(
+            store.transaction_runner,
+            event_id="event-runner-call-artifact-projection",
+            event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+            payload={
+                "runner_call_index": 0,
+                "runner_call_kind": "initial_user_dispatch",
+                "runner_call_trigger_reason": "initial_user_input",
+                "manifest_payload_ref": "payload-artifact-manifest",
+                "manifest_digest": manifest_digest,
+                "validation_status": "complete",
+                "message_count": 1,
+                "role_sequence_digest": sha256_digest_json({"roles": ["user"]}),
+                "input_projection_digest": sha256_digest_json(
+                    {"projection": "artifact"}
+                ),
+                "projector_metadata_summary": [],
+                "runner_call_projection_artifact_ref": (
+                    "payload-artifact-projection"
+                ),
+                "runner_call_projection_artifact_digest": projection_digest,
+                "diagnostic": {"status": "complete"},
+            },
+        )
+        _catch_up(store.transaction_runner, tmp_path)
+
+        page = store.transaction_runner.run_read(
+            lambda transaction: read_runner_call_reconstruction_signals_by_run(
+                transaction, "run-1", after_event_sequence=0, limit=10
+            )
+        )
+        resolved = store.transaction_runner.run_read(
+            lambda transaction: resolve_runner_call_projection_from_signal(
+                transaction, page.signals[0]
+            )
+        )
+
+        messages = _json_object_sequence(
+            resolved.runner_input_projection.payload["messages"]
+        )
+        assert messages[0]["content"] == "artifact projection 明文"
+        assert resolved.runner_input_projection.payload_ref == (
+            "payload-artifact-projection"
+        )
+
+
+def test_runner_call_projection_resolver_fails_closed_for_missing_manifest_ref(
+    tmp_path: Path,
+) -> None:
+    """runner-call signal 缺 manifest ref 时 resolver fail closed。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        _append_event(
+            store.transaction_runner,
+            event_id="event-runner-call-no-manifest",
+            event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+            payload={
+                "runner_call_index": 0,
+                "runner_call_kind": "initial_user_dispatch",
+                "runner_call_trigger_reason": "initial_user_input",
+                "validation_status": "complete",
+                "message_count": 1,
+                "role_sequence_digest": sha256_digest_json({"roles": ["user"]}),
+                "input_projection_digest": sha256_digest_json(
+                    {"projection": "missing-manifest"}
+                ),
+                "projector_metadata_summary": [],
+                "diagnostic": {"status": "complete"},
+            },
+        )
+        _catch_up(store.transaction_runner, tmp_path)
+
+        page = store.transaction_runner.run_read(
+            lambda transaction: read_runner_call_reconstruction_signals_by_run(
+                transaction, "run-1", after_event_sequence=0, limit=10
+            )
+        )
+
+        with pytest.raises(HostDurableError, match="no manifest_ref"):
+            store.transaction_runner.run_read(
+                lambda transaction: resolve_runner_call_projection_from_signal(
+                    transaction, page.signals[0]
+                )
+            )
+
+
+def test_runner_call_projection_resolver_fails_closed_for_digest_mismatch(
+    tmp_path: Path,
+) -> None:
+    """projection descriptor digest 与 manifest 期望不一致时 resolver fail closed。"""
+
+    projection_payload: Mapping[str, JsonValue] = {"messages": []}
+    projection_digest = sha256_digest_json(projection_payload)
+    manifest_payload: Mapping[str, JsonValue] = {
+        "runner_call_projection_artifact_ref": "payload-projection-mismatch",
+        "runner_call_projection_artifact_digest": sha256_digest_json(
+            {"projection": "wrong"}
+        ),
+        "tool_schema_snapshot_refs": [],
+    }
+    manifest_digest = sha256_digest_json(manifest_payload)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: (
+                _write_json_payload(
+                    transaction,
+                    payload_ref="payload-projection-mismatch",
+                    payload_id="sqlite-projection-mismatch",
+                    payload=projection_payload,
+                ),
+                _write_json_payload(
+                    transaction,
+                    payload_ref="payload-manifest-mismatch",
+                    payload_id="sqlite-manifest-mismatch",
+                    payload=manifest_payload,
+                ),
+            )
+        )
+        _append_event(
+            store.transaction_runner,
+            event_id="event-runner-call-digest-mismatch",
+            event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+            payload={
+                "manifest_payload_ref": "payload-manifest-mismatch",
+                "manifest_digest": manifest_digest,
+                "validation_status": "complete",
+                "message_count": 0,
+                "role_sequence_digest": sha256_digest_json({"roles": []}),
+                "input_projection_digest": sha256_digest_json(
+                    {"projection": "digest-mismatch"}
+                ),
+                "projector_metadata_summary": [],
+                "diagnostic": {"status": "complete"},
+            },
+        )
+        _catch_up(store.transaction_runner, tmp_path)
+        page = store.transaction_runner.run_read(
+            lambda transaction: read_runner_call_reconstruction_signals_by_run(
+                transaction, "run-1", after_event_sequence=0, limit=10
+            )
+        )
+
+        with pytest.raises(HostDurableError, match="descriptor digest mismatch"):
+            store.transaction_runner.run_read(
+                lambda transaction: resolve_runner_call_projection_from_signal(
+                    transaction, page.signals[0]
+                )
+            )
+
+
+def test_runner_call_projection_resolver_fails_closed_for_non_object_payload(
+    tmp_path: Path,
+) -> None:
+    """projection payload 不是 JSON object 时 resolver fail closed。"""
+
+    projection_payload: JsonValue = ["not", "object"]
+    projection_digest = sha256_digest_json(projection_payload)
+    manifest_payload: Mapping[str, JsonValue] = {
+        "runner_call_projection_artifact_ref": "payload-projection-list",
+        "runner_call_projection_artifact_digest": projection_digest,
+        "tool_schema_snapshot_refs": [],
+    }
+    manifest_digest = sha256_digest_json(manifest_payload)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: (
+                _write_json_value_payload(
+                    transaction,
+                    payload_ref="payload-projection-list",
+                    payload_id="sqlite-projection-list",
+                    payload=projection_payload,
+                ),
+                _write_json_payload(
+                    transaction,
+                    payload_ref="payload-manifest-list",
+                    payload_id="sqlite-manifest-list",
+                    payload=manifest_payload,
+                ),
+            )
+        )
+        _append_event(
+            store.transaction_runner,
+            event_id="event-runner-call-non-object",
+            event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+            payload={
+                "manifest_payload_ref": "payload-manifest-list",
+                "manifest_digest": manifest_digest,
+                "validation_status": "complete",
+                "message_count": 0,
+                "role_sequence_digest": sha256_digest_json({"roles": []}),
+                "input_projection_digest": sha256_digest_json(
+                    {"projection": "non-object"}
+                ),
+                "projector_metadata_summary": [],
+                "diagnostic": {"status": "complete"},
+            },
+        )
+        _catch_up(store.transaction_runner, tmp_path)
+        page = store.transaction_runner.run_read(
+            lambda transaction: read_runner_call_reconstruction_signals_by_run(
+                transaction, "run-1", after_event_sequence=0, limit=10
+            )
+        )
+
+        with pytest.raises(HostDurableError, match="must be object"):
+            store.transaction_runner.run_read(
+                lambda transaction: resolve_runner_call_projection_from_signal(
+                    transaction, page.signals[0]
+                )
+            )
+
+
+def test_tool_trace_row_resolver_reads_args_result_and_final_answer(
+    tmp_path: Path,
+) -> None:
+    """row resolver 能读取工具参数、工具结果 payload 与 terminal final answer。"""
+
+    result_payload: Mapping[str, JsonValue] = {
+        "llm_facing_payload": {"current_time": "2026-07-07 19:18:11"}
+    }
+    final_payload: Mapping[str, JsonValue] = {
+        "final_answer": "当前时间是 2026年7月7日 19:18:11。"
+    }
+    result_digest = sha256_digest_json(result_payload)
+    final_digest = sha256_digest_json(final_payload)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: (
+                _write_json_payload(
+                    transaction,
+                    payload_ref="payload-tool-result",
+                    payload_id="sqlite-tool-result",
+                    payload=result_payload,
+                ),
+                _write_json_payload(
+                    transaction,
+                    payload_ref="payload-final",
+                    payload_id="sqlite-final",
+                    payload=final_payload,
+                ),
+            )
+        )
+        _append_event(
+            store.transaction_runner,
+            event_id="event-tool-call",
+            event_type="TOOL_CALL_REQUESTED",
+            payload={
+                "tool_call_id": "call-time",
+                "tool_name": "get_current_time",
+                "arguments_inline_json": {"timezone": "Asia/Shanghai"},
+                "normalized_arguments_digest": sha256_digest_json(
+                    {"arguments": {"timezone": "Asia/Shanghai"}}
+                ),
+            },
+        )
+        _append_event(
+            store.transaction_runner,
+            event_id="event-tool-result",
+            event_type="TOOL_RESULT_ACCEPTED",
+            payload={
+                "tool_call_id": "call-time",
+                "tool_name": "get_current_time",
+                "payload_ref": {
+                    "payload_ref": "payload-tool-result",
+                    "payload_digest": result_digest,
+                },
+                "payload_digest": result_digest,
+            },
+        )
+        _append_event(
+            store.transaction_runner,
+            event_id="event-run-succeeded",
+            event_type="RUN_SUCCEEDED",
+            payload={
+                "terminal_summary_ref": "payload-final",
+                "terminal_summary_digest": final_digest,
+            },
+        )
+        _catch_up(store.transaction_runner, tmp_path)
+
+        page = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_by_run(
+                transaction, "run-1", after_event_sequence=0, limit=10
+            )
+        )
+        by_event = {row.event_id: row for row in page.rows}
+        resolved_args = store.transaction_runner.run_read(
+            lambda transaction: resolve_tool_trace_hot_row_payloads(
+                transaction, by_event["event-tool-call"]
+            )
+        )
+        resolved_result = store.transaction_runner.run_read(
+            lambda transaction: resolve_tool_trace_hot_row_payloads(
+                transaction, by_event["event-tool-result"]
+            )
+        )
+        resolved_final = store.transaction_runner.run_read(
+            lambda transaction: resolve_tool_trace_hot_row_payloads(
+                transaction, by_event["event-run-succeeded"]
+            )
+        )
+
+        assert resolved_args.source_event_payload["arguments_inline_json"] == {
+            "timezone": "Asia/Shanghai"
+        }
+        assert resolved_result.descriptor_payload is not None
+        assert resolved_result.descriptor_payload.payload == result_payload
+        assert resolved_final.descriptor_payload is not None
+        assert resolved_final.descriptor_payload.payload == final_payload

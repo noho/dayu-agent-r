@@ -48,9 +48,11 @@ class HostDurableStore:
         self._transaction_runner = HostTransactionRunner(
             connection,
             options.sqlite_policy,
+            artifact_root=options.payload_policy.artifact_root,
             payload_inline_threshold_bytes=(
                 options.payload_policy.payload_inline_threshold_bytes
             ),
+            create_artifact_root=options.payload_policy.create_artifact_root,
         )
         self._closed = False
 

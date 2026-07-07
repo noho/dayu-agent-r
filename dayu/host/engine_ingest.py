@@ -36,8 +36,10 @@ from dayu.engine.contracts.engine_events import (
     IterationCompletedData,
     IterationStartedData,
     ProviderProtocolErrorData,
+    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION,
     RUN_SUSPENDED_REASON_TOOL_AWAITING,
     ReasoningDeltaData,
+    RunnerInputMessageProjection,
     RunCancelledData,
     RunFailedData,
     RunSuspendedData,
@@ -141,6 +143,7 @@ from dayu.host.durable.event_log import (
 )
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.payload import (
+    BoundedJsonPayloadWriteRequest,
     PayloadDescriptor,
     PayloadStore,
     SQLitePayloadFormat,
@@ -163,6 +166,9 @@ from dayu.host.durable.schema import (
     RUNNER_CALL_INPUT_MANIFEST_DESCRIPTOR_KIND,
     RUNNER_CALL_INPUT_MANIFEST_MEDIA_TYPE,
     RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
+    RUNNER_CALL_INPUT_PROJECTION_DESCRIPTOR_KIND,
+    RUNNER_CALL_INPUT_PROJECTION_MEDIA_TYPE,
+    RUNNER_CALL_INPUT_PROJECTION_SCHEMA_VERSION,
     TABLE_EVENT_LOG,
 )
 from dayu.host.durable.state import (
@@ -278,6 +284,10 @@ _RUNNER_CALL_MANIFEST_REASON_ROLE_DIGEST = "role_sequence_digest_mismatch"
 _RUNNER_CALL_MANIFEST_REF_PREFIX = "payload-runner-call-input-manifest"
 _RUNNER_CALL_MANIFEST_SQLITE_PAYLOAD_ID_PREFIX = (
     "sqlite-payload-runner-call-input-manifest"
+)
+_RUNNER_CALL_PROJECTION_REF_PREFIX = "payload-runner-call-input-projection"
+_RUNNER_CALL_PROJECTION_SQLITE_PAYLOAD_ID_PREFIX = (
+    "sqlite-payload-runner-call-input-projection"
 )
 _RUNNER_CALL_MANIFEST_ID_PREFIX = "runner-call-manifest"
 _RUNNER_CALL_KIND_INITIAL_USER_DISPATCH = "initial_user_dispatch"
@@ -2732,15 +2742,35 @@ class EngineEventIngestor:
             _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
             0,
         )
+        runner_call_index = _next_runner_call_index(
+            transaction, context.run.run_id
+        )
+        projection_descriptor: PayloadDescriptor | None = None
+        if _has_complete_observed_input_projection(data):
+            projection = _observed_runner_call_projection_body(
+                context,
+                data,
+                runner_call_index=runner_call_index,
+                projection_id=_runner_call_projection_id(event_id),
+                runner_call_kind=runner_call_kind,
+                runner_call_trigger_reason=runner_call_trigger_reason,
+            )
+            projection_digest = sha256_digest_json(projection)
+            projection_descriptor = _write_runner_call_projection_payload(
+                transaction,
+                self._payload_store,
+                event_id=event_id,
+                projection=projection,
+                projection_digest=projection_digest,
+            )
         manifest = _limited_runner_call_manifest_body(
             context,
             data,
-            runner_call_index=_next_runner_call_index(
-                transaction, context.run.run_id
-            ),
+            runner_call_index=runner_call_index,
             manifest_id=_runner_call_manifest_id(event_id),
             runner_call_kind=runner_call_kind,
             runner_call_trigger_reason=runner_call_trigger_reason,
+            projection_descriptor=projection_descriptor,
         )
         manifest_digest = sha256_digest_json(manifest)
         descriptor = _write_runner_call_manifest_payload(
@@ -4662,6 +4692,173 @@ def _preview_payload(
     return common
 
 
+def _has_complete_observed_input_projection(data: IterationStartedData) -> bool:
+    """判断 Engine iteration signal 是否携带完整 observed input projection。
+
+    :param data: Engine iteration started data。
+    :returns: projection 非空且数量与 Engine observed message count 一致时返回
+        ``True``。
+    """
+
+    return (
+        len(data.input_projection) > 0
+        and len(data.input_projection) == data.message_count
+    )
+
+
+def _observed_runner_call_projection_body(
+    context: _ValidatedCandidate,
+    data: IterationStartedData,
+    *,
+    runner_call_index: int,
+    projection_id: str,
+    runner_call_kind: str | None,
+    runner_call_trigger_reason: str | None,
+) -> Mapping[str, JsonValue]:
+    """构造 Engine observed runner-call input projection body。
+
+    :param context: 已校验 candidate 上下文。
+    :param data: Engine iteration started data。
+    :param runner_call_index: Host-owned runner call index。
+    :param projection_id: projection logical id。
+    :param runner_call_kind: Host 已判定的 runner call kind。
+    :param runner_call_trigger_reason: Host 已判定的 trigger reason。
+    :returns: projection canonical JSON object。
+    """
+
+    return {
+        "schema_version": RUNNER_CALL_INPUT_PROJECTION_SCHEMA_VERSION,
+        "projection_id": projection_id,
+        "session_id": context.run.session_id,
+        "host_run_id": context.run.run_id,
+        "attempt_id": context.attempt.attempt_id,
+        "execution_id": context.attempt.execution_id,
+        "runner_call_index": runner_call_index,
+        "runner_call_kind": (
+            runner_call_kind
+            if runner_call_kind is not None
+            else _runner_call_kind_for_iteration(data)
+        ),
+        "runner_call_trigger_reason": (
+            runner_call_trigger_reason
+            if runner_call_trigger_reason is not None
+            else _runner_call_trigger_for_iteration(data)
+        ),
+        "iteration_id": data.iteration_id,
+        "iteration_index": data.iteration_index,
+        "runner_input_serializer_schema_version": (
+            data.runner_input_serializer_schema_version
+        ),
+        "message_count": data.message_count,
+        "role_sequence_digest": data.role_sequence_digest,
+        "messages": [
+            _observed_projection_message(context, message)
+            for message in data.input_projection
+        ],
+    }
+
+
+def _observed_projection_message(
+    context: _ValidatedCandidate,
+    message: RunnerInputMessageProjection,
+) -> Mapping[str, JsonValue]:
+    """构造 Engine observed projection 的单条 message。
+
+    :param context: 已校验 candidate 上下文。
+    :param message: Engine observed message projection。
+    :returns: message projection JSON object。
+    """
+
+    base: dict[str, JsonValue] = {
+        "index": message.index,
+        "role": message.role,
+        "content": message.content,
+        "content_digest": _observed_message_content_digest(message),
+        "content_size_bytes": _observed_message_content_size_bytes(message),
+        "source_refs": list(_limited_runner_call_source_refs(context)),
+        "projector_metadata_id": f"projector:{message.index}:{message.role}",
+    }
+    if message.tool_call_id is not None:
+        base["tool_call_id"] = message.tool_call_id
+    if len(message.tool_calls) > 0:
+        base["tool_calls"] = [
+            {
+                "tool_call_id": tool_call.tool_call_id,
+                "name": tool_call.name,
+                "arguments": dict(tool_call.arguments),
+            }
+            for tool_call in message.tool_calls
+        ]
+    return base
+
+
+def _observed_message_content_digest(
+    message: RunnerInputMessageProjection,
+) -> str:
+    """计算 Engine observed message content digest。
+
+    :param message: Engine observed message projection。
+    :returns: ``sha256:`` digest。
+    """
+
+    if len(message.tool_calls) > 0:
+        return sha256_digest_json(
+            {
+                "serializer_schema_version": (
+                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+                ),
+                "role": message.role,
+                "content": message.content,
+                "reasoning_content_digest": None,
+                "tool_calls_digest": sha256_digest_json(
+                    {
+                        "tool_calls": [
+                            {
+                                "id": tool_call.tool_call_id,
+                                "name": tool_call.name,
+                                "arguments": dict(tool_call.arguments),
+                            }
+                            for tool_call in message.tool_calls
+                        ]
+                    }
+                ),
+            }
+        )
+    return sha256_digest_json(
+        {
+            "serializer_schema_version": RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION,
+            "role": message.role,
+            "content": _observed_message_content_text(message),
+        }
+    )
+
+
+def _observed_message_content_size_bytes(
+    message: RunnerInputMessageProjection,
+) -> int:
+    """计算 Engine observed message content 字节数。
+
+    :param message: Engine observed message projection。
+    :returns: UTF-8 字节数；content 为 ``None`` 时按空文本计算。
+    """
+
+    return len(_observed_message_content_text(message).encode("utf-8"))
+
+
+def _observed_message_content_text(
+    message: RunnerInputMessageProjection,
+) -> str:
+    """读取 Engine observed message 文本。
+
+    :param message: Engine observed message projection。
+    :returns: content 文本；``None`` 时返回空串。
+    """
+
+    if message.content is None:
+        return ""
+    return message.content
+
+
 def _limited_runner_call_manifest_body(
     context: _ValidatedCandidate,
     data: IterationStartedData,
@@ -4670,6 +4867,7 @@ def _limited_runner_call_manifest_body(
     manifest_id: str,
     runner_call_kind: str | None,
     runner_call_trigger_reason: str | None,
+    projection_descriptor: PayloadDescriptor | None,
 ) -> Mapping[str, JsonValue]:
     """构造 Engine continuation 的 limited-signal manifest body。
 
@@ -4684,17 +4882,56 @@ def _limited_runner_call_manifest_body(
     :returns: limited-signal manifest body。
     """
 
-    diagnostic = _runner_call_manifest_diagnostic(
-        status=_RUNNER_CALL_MANIFEST_STATUS_LIMITED_SIGNAL,
-        reason=_RUNNER_CALL_MANIFEST_REASON_MISSING_PROJECTION,
-        missing_atom_kind=None,
-        missing_ref_kind=_RUNNER_CALL_DIAGNOSTIC_MISSING_REF_KIND_PROJECTION_ARTIFACT,
-        missing_ref=None,
-        observed_count=data.message_count,
-        expected_count=None,
-        observed_digest=data.role_sequence_digest,
-        expected_digest=None,
-        consumer_boundary=_EVENT_SOURCE,
+    diagnostic = (
+        None
+        if projection_descriptor is not None
+        else _runner_call_manifest_diagnostic(
+            status=_RUNNER_CALL_MANIFEST_STATUS_LIMITED_SIGNAL,
+            reason=_RUNNER_CALL_MANIFEST_REASON_MISSING_PROJECTION,
+            missing_atom_kind=None,
+            missing_ref_kind=(
+                _RUNNER_CALL_DIAGNOSTIC_MISSING_REF_KIND_PROJECTION_ARTIFACT
+            ),
+            missing_ref=None,
+            observed_count=data.message_count,
+            expected_count=None,
+            observed_digest=data.role_sequence_digest,
+            expected_digest=None,
+            consumer_boundary=_EVENT_SOURCE,
+        )
+    )
+    message_entries = (
+        tuple(
+            _observed_runner_call_message_entry(
+                context,
+                message,
+                projection_descriptor=projection_descriptor,
+            )
+            for message in data.input_projection
+        )
+        if projection_descriptor is not None
+        else ()
+    )
+    input_projection_digest = (
+        sha256_digest_json(
+            {
+                "message_entries": list(message_entries),
+                "source_cursor_refs": list(_limited_runner_call_source_refs(context)),
+                "projection_artifact_ref": projection_descriptor.payload_ref,
+                "projection_artifact_digest": projection_descriptor.payload_digest,
+            }
+        )
+        if projection_descriptor is not None
+        else sha256_digest_json(
+            {
+                "signal_kind": "engine_observed_limited_runner_input",
+                "iteration_id": data.iteration_id,
+                "iteration_index": data.iteration_index,
+                "message_count": data.message_count,
+                "role_sequence_digest": data.role_sequence_digest,
+                "diagnostic": diagnostic,
+            }
+        )
     )
     return {
         "schema_version": RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
@@ -4721,17 +4958,23 @@ def _limited_runner_call_manifest_body(
         "runner_input_serializer_schema_version": (
             data.runner_input_serializer_schema_version
         ),
-        "input_projection_digest": sha256_digest_json(
-            {
-                "signal_kind": "engine_observed_limited_runner_input",
-                "iteration_id": data.iteration_id,
-                "iteration_index": data.iteration_index,
-                "message_count": data.message_count,
-                "role_sequence_digest": data.role_sequence_digest,
-                "diagnostic": diagnostic,
-            }
+        "input_projection_digest": input_projection_digest,
+        "runner_call_projection_artifact_ref": (
+            projection_descriptor.payload_ref
+            if projection_descriptor is not None
+            else None
         ),
-        "message_entries": [],
+        "runner_call_projection_artifact_digest": (
+            projection_descriptor.payload_digest
+            if projection_descriptor is not None
+            else None
+        ),
+        "runner_call_projection_artifact_size_bytes": (
+            projection_descriptor.payload_size_bytes
+            if projection_descriptor is not None
+            else None
+        ),
+        "message_entries": list(message_entries),
         "source_cursor_refs": list(_limited_runner_call_source_refs(context)),
         "tool_schema_snapshot_refs": [],
         "memory_snapshot_cursor_ref": None,
@@ -4742,6 +4985,49 @@ def _limited_runner_call_manifest_body(
         ],
         "compactor_identity": None,
         "diagnostic": diagnostic,
+    }
+
+
+def _observed_runner_call_message_entry(
+    context: _ValidatedCandidate,
+    message: RunnerInputMessageProjection,
+    *,
+    projection_descriptor: PayloadDescriptor,
+) -> Mapping[str, JsonValue]:
+    """构造 Engine observed manifest message entry。
+
+    :param context: 已校验 candidate 上下文。
+    :param message: Engine observed message projection。
+    :param projection_descriptor: runner-call projection descriptor。
+    :returns: manifest message entry JSON object。
+    """
+
+    return {
+        "index": message.index,
+        "role": message.role,
+        "content_digest": _observed_message_content_digest(message),
+        "content_size_bytes": _observed_message_content_size_bytes(message),
+        "source_refs": list(_limited_runner_call_source_refs(context)),
+        "projection_artifact_ref": projection_descriptor.payload_ref,
+        "projection_artifact_digest": projection_descriptor.payload_digest,
+        "projector_metadata_id": f"projector:{message.index}:{message.role}",
+        "provider_tool_calls_digest": (
+            sha256_digest_json(
+                {
+                    "tool_calls": [
+                        {
+                            "id": tool_call.tool_call_id,
+                            "name": tool_call.name,
+                            "arguments": dict(tool_call.arguments),
+                        }
+                        for tool_call in message.tool_calls
+                    ]
+                }
+            )
+            if len(message.tool_calls) > 0
+            else None
+        ),
+        "reasoning_content_digest": None,
     }
 
 
@@ -4902,6 +5188,43 @@ def _write_runner_call_manifest_payload(
     )
 
 
+def _write_runner_call_projection_payload(
+    transaction: HostTransaction,
+    payload_store: PayloadStore,
+    *,
+    event_id: str,
+    projection: Mapping[str, JsonValue],
+    projection_digest: str,
+) -> PayloadDescriptor:
+    """写入 Engine observed runner-call input projection payload descriptor。
+
+    :param transaction: 当前 Host transaction。
+    :param payload_store: payload store primitive。
+    :param event_id: manifest canonical event id。
+    :param projection: projection body。
+    :param projection_digest: projection body digest。
+    :returns: payload descriptor。
+    :raises HostDurableError: descriptor digest 不一致时抛出。
+    """
+
+    return payload_store.write_bounded_json_payload(
+        transaction,
+        BoundedJsonPayloadWriteRequest(
+            payload_ref=_runner_call_projection_payload_ref(event_id),
+            sqlite_payload_id=_runner_call_projection_sqlite_payload_id(event_id),
+            payload_json=projection,
+            media_type=RUNNER_CALL_INPUT_PROJECTION_MEDIA_TYPE,
+            metadata={
+                "descriptor_kind": RUNNER_CALL_INPUT_PROJECTION_DESCRIPTOR_KIND,
+                "schema_version": RUNNER_CALL_INPUT_PROJECTION_SCHEMA_VERSION,
+                "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
+                "event_id": event_id,
+            },
+            expected_digest=projection_digest,
+        ),
+    )
+
+
 def _runner_call_manifest_event_request(
     *,
     context: _ValidatedCandidate,
@@ -4976,17 +5299,53 @@ def _runner_call_manifest_hot_payload(
         "manifest_payload_ref": manifest_payload_ref,
         "manifest_digest": manifest_digest,
         "manifest_schema_version": _manifest_text(manifest, "schema_version"),
-        "validation_status": _manifest_text(
-            _manifest_diagnostic(manifest), "status"
-        ),
+        "validation_status": _manifest_validation_status(manifest),
         "message_count": _manifest_int(manifest, "message_count"),
         "role_sequence_digest": _manifest_text(manifest, "role_sequence_digest"),
         "input_projection_digest": _manifest_text(
             manifest, "input_projection_digest"
         ),
         "projector_metadata_summary": list(_projector_metadata_summary(manifest)),
-        "diagnostic": _manifest_diagnostic(manifest),
+        "runner_call_projection_artifact_ref": _manifest_optional_text(
+            manifest, "runner_call_projection_artifact_ref"
+        ),
+        "runner_call_projection_artifact_digest": _manifest_optional_text(
+            manifest, "runner_call_projection_artifact_digest"
+        ),
+        "runner_call_projection_artifact_size_bytes": _manifest_optional_int(
+            manifest, "runner_call_projection_artifact_size_bytes"
+        ),
+        "diagnostic": _manifest_hot_diagnostic(manifest),
     }
+
+
+def _manifest_hot_diagnostic(
+    manifest: Mapping[str, JsonValue]
+) -> Mapping[str, JsonValue]:
+    """构造 runner-call manifest hot payload diagnostic。
+
+    :param manifest: manifest body。
+    :returns: complete 时返回自描述 diagnostic object；非 complete 时返回
+        manifest 内 diagnostic object。
+    :raises HostDurableError: manifest diagnostic 或字段类型非法时抛出。
+    """
+
+    if _manifest_validation_status(manifest) != _RUNNER_CALL_MANIFEST_STATUS_COMPLETE:
+        return _manifest_diagnostic(manifest)
+    message_count = _manifest_int(manifest, "message_count")
+    role_sequence_digest = _manifest_text(manifest, "role_sequence_digest")
+    return _runner_call_manifest_diagnostic(
+        status=_RUNNER_CALL_MANIFEST_STATUS_COMPLETE,
+        reason=None,
+        missing_atom_kind=None,
+        missing_ref_kind=None,
+        missing_ref=None,
+        observed_count=message_count,
+        expected_count=message_count,
+        observed_digest=role_sequence_digest,
+        expected_digest=role_sequence_digest,
+        consumer_boundary=_EVENT_SOURCE,
+    )
 
 
 def _runner_call_manifest_payload_ref(event_id: str) -> str:
@@ -4999,6 +5358,16 @@ def _runner_call_manifest_payload_ref(event_id: str) -> str:
     return f"{_RUNNER_CALL_MANIFEST_REF_PREFIX}:{event_id}"
 
 
+def _runner_call_projection_payload_ref(event_id: str) -> str:
+    """派生 runner-call projection payload descriptor ref。
+
+    :param event_id: manifest canonical event id。
+    :returns: payload descriptor ref。
+    """
+
+    return f"{_RUNNER_CALL_PROJECTION_REF_PREFIX}:{event_id}"
+
+
 def _runner_call_manifest_sqlite_payload_id(event_id: str) -> str:
     """派生 runner-call manifest SQLite payload id。
 
@@ -5009,6 +5378,16 @@ def _runner_call_manifest_sqlite_payload_id(event_id: str) -> str:
     return f"{_RUNNER_CALL_MANIFEST_SQLITE_PAYLOAD_ID_PREFIX}:{event_id}"
 
 
+def _runner_call_projection_sqlite_payload_id(event_id: str) -> str:
+    """派生 runner-call projection SQLite payload id。
+
+    :param event_id: manifest canonical event id。
+    :returns: SQLite payload id。
+    """
+
+    return f"{_RUNNER_CALL_PROJECTION_SQLITE_PAYLOAD_ID_PREFIX}:{event_id}"
+
+
 def _runner_call_manifest_id(event_id: str) -> str:
     """派生 runner-call manifest logical id。
 
@@ -5017,6 +5396,16 @@ def _runner_call_manifest_id(event_id: str) -> str:
     """
 
     return f"{_RUNNER_CALL_MANIFEST_ID_PREFIX}:{event_id}"
+
+
+def _runner_call_projection_id(event_id: str) -> str:
+    """派生 runner-call projection logical id。
+
+    :param event_id: manifest canonical event id。
+    :returns: projection id。
+    """
+
+    return f"runner-call-projection:{event_id}"
 
 
 def _next_runner_call_index(transaction: HostTransaction, run_id: str) -> int:
@@ -5489,8 +5878,9 @@ def _resolution_from_limited_manifest_event(
         payload,
         consumer_boundary="engine_ingest_preview",
     )
+    status = _manifest_text(diagnostic, "status")
     return _RunnerCallIterationResolution(
-        status=_manifest_text(diagnostic, "status"),
+        status=status,
         reason=_manifest_optional_text(diagnostic, "reason"),
         link_event_id=None,
         manifest_event_id=event.event_id,
@@ -5500,7 +5890,9 @@ def _resolution_from_limited_manifest_event(
         expected_digest=_manifest_optional_text(diagnostic, "expected_digest"),
         observed_count=data.message_count,
         observed_digest=data.role_sequence_digest,
-        continuation_limited_signal=True,
+        continuation_limited_signal=(
+            status != _RUNNER_CALL_MANIFEST_STATUS_COMPLETE
+        ),
     )
 
 
@@ -5688,6 +6080,39 @@ def _manifest_diagnostic(
     if not isinstance(value, Mapping):
         raise HostDurableError("runner-call manifest diagnostic must be object")
     return value
+
+
+def _manifest_optional_diagnostic(
+    manifest: Mapping[str, JsonValue]
+) -> Mapping[str, JsonValue] | None:
+    """读取 manifest 中的可选 diagnostic object。
+
+    :param manifest: manifest body。
+    :returns: diagnostic object；complete manifest 无 diagnostic 时返回
+        ``None``。
+    :raises HostDurableError: diagnostic 存在但类型非法时抛出。
+    """
+
+    value = manifest.get("diagnostic")
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise HostDurableError("runner-call manifest diagnostic must be object")
+    return value
+
+
+def _manifest_validation_status(manifest: Mapping[str, JsonValue]) -> str:
+    """读取 manifest validation status。
+
+    :param manifest: manifest body。
+    :returns: complete 或 diagnostic 中的非 complete status。
+    :raises HostDurableError: diagnostic status 字段非法时抛出。
+    """
+
+    diagnostic = _manifest_optional_diagnostic(manifest)
+    if diagnostic is None:
+        return _RUNNER_CALL_MANIFEST_STATUS_COMPLETE
+    return _manifest_text(diagnostic, "status")
 
 
 def _manifest_text(payload: Mapping[str, JsonValue], field_name: str) -> str:

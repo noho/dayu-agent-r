@@ -13,7 +13,11 @@ from datetime import UTC, datetime
 from enum import StrEnum
 
 from dayu.contracts.json_value import JsonValue
-from dayu.host.durable.artifact import LocalArtifactRef, validate_artifact_ref
+from dayu.host.durable.artifact import (
+    LocalArtifactRef,
+    LocalArtifactStore,
+    validate_artifact_ref,
+)
 from dayu.host.durable._validation import (
     optional_text as _optional_text,
     require_int as _require_int,
@@ -80,6 +84,26 @@ class SQLitePayloadWriteRequest:
     payload_format: SQLitePayloadFormat
     payload_json: JsonValue = None
     payload_bytes: bytes | None = None
+    media_type: str | None = None
+    metadata: Mapping[str, JsonValue] = field(default_factory=_empty_metadata)
+    expected_digest: str | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class BoundedJsonPayloadWriteRequest:
+    """带 inline 阈值的 JSON payload 写入请求。
+
+    :param payload_ref: descriptor 主键引用。
+    :param sqlite_payload_id: payload 走 SQLite inline 存储时使用的 row 主键。
+    :param payload_json: 待写入的 JSON 值。
+    :param media_type: descriptor media type；未知时为 ``None``。
+    :param metadata: descriptor metadata JSON object。
+    :param expected_digest: 调用方预期 payload digest；无预期时为 ``None``。
+    """
+
+    payload_ref: str
+    sqlite_payload_id: str
+    payload_json: JsonValue
     media_type: str | None = None
     metadata: Mapping[str, JsonValue] = field(default_factory=_empty_metadata)
     expected_digest: str | None = None
@@ -185,6 +209,22 @@ class PayloadStore:
         """
 
         return read_payload_descriptor(transaction, payload_ref)
+
+    def write_bounded_json_payload(
+        self,
+        transaction: HostTransaction,
+        request: BoundedJsonPayloadWriteRequest,
+    ) -> PayloadDescriptor:
+        """按当前 transaction inline 阈值写入 JSON payload descriptor。
+
+        :param transaction: 调用方提供的 Host durable transaction。
+        :param request: bounded JSON payload 写入请求。
+        :returns: 已持久化 descriptor。
+        :raises HostDurableError: 请求字段、JSON 编码或 descriptor 不一致时抛出。
+        :raises HostDigestMismatchError: ``expected_digest`` 与实际 digest 不一致时抛出。
+        """
+
+        return write_bounded_json_payload(transaction, request)
 
 
 def write_sqlite_payload(
@@ -323,6 +363,68 @@ def read_payload_descriptor(
     return _payload_descriptor_from_host_row(row)
 
 
+def write_bounded_json_payload(
+    transaction: HostTransaction,
+    request: BoundedJsonPayloadWriteRequest,
+) -> PayloadDescriptor:
+    """按 inline 阈值写入 canonical JSON payload。
+
+    payload canonical JSON 字节数小于等于
+    ``transaction.payload_inline_threshold_bytes`` 时写入 SQLite payload；超过阈值
+    时写入当前 durable store 的本地 artifact root，并复用同一 payload descriptor
+    表记录 artifact ref。
+
+    :param transaction: 调用方提供的 Host durable transaction。
+    :param request: bounded JSON payload 写入请求。
+    :returns: 已持久化 descriptor。
+    :raises HostDurableError: 请求字段、JSON 编码或 descriptor 不一致时抛出。
+    :raises HostDigestMismatchError: ``expected_digest`` 与实际 digest 不一致时抛出。
+    """
+
+    _validate_bounded_json_payload_request(request)
+    encoded = _encode_bounded_json_payload(request)
+    _validate_expected_digest(
+        encoded.payload_digest,
+        request.expected_digest,
+        field_name="expected_digest",
+    )
+    existing = read_payload_descriptor(transaction, request.payload_ref)
+    if existing is not None:
+        if existing.payload_digest != encoded.payload_digest:
+            raise HostDurableError("bounded JSON payload descriptor digest mismatch")
+        return existing
+    if encoded.payload_size_bytes <= transaction.payload_inline_threshold_bytes:
+        return write_sqlite_payload(
+            transaction,
+            SQLitePayloadWriteRequest(
+                payload_ref=request.payload_ref,
+                payload_id=request.sqlite_payload_id,
+                payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+                payload_json=request.payload_json,
+                media_type=request.media_type,
+                metadata=request.metadata,
+                expected_digest=encoded.payload_digest,
+            ),
+        )
+    payload_json_text = encoded.payload_json
+    if payload_json_text is None:
+        raise HostDurableError("bounded JSON payload text is missing")
+    artifact_ref = LocalArtifactStore(
+        transaction.artifact_root,
+        create_artifact_root=transaction.create_artifact_root,
+    ).write_artifact_bytes(
+        payload_json_text.encode("utf-8"),
+        expected_digest=encoded.payload_digest,
+    )
+    return write_payload_descriptor_for_artifact(
+        transaction,
+        request.payload_ref,
+        artifact_ref,
+        request.media_type,
+        request.metadata,
+    )
+
+
 def _insert_payload_descriptor(
     transaction: HostTransaction,
     *,
@@ -382,6 +484,45 @@ def _insert_payload_descriptor(
             metadata_json,
             created_at,
         ),
+    )
+
+
+def _validate_bounded_json_payload_request(
+    request: BoundedJsonPayloadWriteRequest,
+) -> None:
+    """校验 bounded JSON payload 写入请求。
+
+    :param request: bounded JSON payload 写入请求。
+    :returns: ``None``。
+    :raises HostDurableError: 字段无效时抛出。
+    """
+
+    _require_non_empty_text(request.payload_ref, field_name="payload_ref")
+    _require_non_empty_text(request.sqlite_payload_id, field_name="sqlite_payload_id")
+    _require_optional_non_empty_text(request.media_type, field_name="media_type")
+    _require_optional_digest(request.expected_digest, field_name="expected_digest")
+
+
+def _encode_bounded_json_payload(
+    request: BoundedJsonPayloadWriteRequest,
+) -> _EncodedSQLitePayload:
+    """编码 bounded JSON payload 并计算 digest。
+
+    :param request: bounded JSON payload 写入请求。
+    :returns: canonical 编码结果。
+    :raises HostDurableError: JSON 编码失败时抛出。
+    """
+
+    try:
+        payload_json = canonical_json_dumps(request.payload_json)
+    except (TypeError, ValueError) as exc:
+        raise HostDurableError("Bounded JSON payload encoding failed") from exc
+    payload_bytes = payload_json.encode("utf-8")
+    return _EncodedSQLitePayload(
+        payload_json=payload_json,
+        payload_bytes=None,
+        payload_size_bytes=len(payload_bytes),
+        payload_digest=sha256_digest_bytes(payload_bytes),
     )
 
 
