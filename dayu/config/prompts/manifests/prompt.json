@@ -19,8 +19,6 @@
     "tool_names": [],
     "tool_tags_any": [
       "fins-read",
-      "fins-download",
-      "fins-preprocess",
       "web",
       "utils"
     ],
