@@ -41,6 +41,10 @@ from dayu.service.entrypoint_runtime import (
 from dayu.service.host_assembly import ServiceAssemblyOverrides, ServiceRunOverrides
 
 DEFAULT_PROMPT_TOOL_NAME: str = "get_financial_statement"
+DEFAULT_TIME_TOOL_NAME: str = "get_current_time"
+DEFAULT_DOWNLOAD_TOOL_NAME: str = "start_fins_download"
+DEFAULT_PREPROCESS_TOOL_NAME: str = "start_fins_preprocess"
+EXCLUDED_UPLOAD_TOOL_NAME: str = "start_fins_upload"
 _PACKAGE_CONFIG_ROOT = Path(__file__).resolve().parents[2] / "dayu" / "config"
 _MODEL_ID = "deepseek-v4-flash"
 _RUNNER_HINT_ID = "prompt"
@@ -141,9 +145,7 @@ class _FakeHost:
         self.watchers.append(watcher)
         return watcher
 
-    async def submit_followup(
-        self, session_id: str, request: SubmitFollowupRequest
-    ) -> FollowupSnapshot:
+    async def submit_followup(self, session_id: str, request: SubmitFollowupRequest) -> FollowupSnapshot:
         """记录 submit 请求并推入成功终态。
 
         :param session_id: 目标 Session id。
@@ -232,9 +234,11 @@ async def test_prompt_runtime_uses_real_prompt_manifest_required_slots(
 
     assert result.scene_inputs.tool_selection.tool_names is not None
     assert DEFAULT_PROMPT_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
-    assert result.scene_inputs.content_digest != (
-        changed_subject_result.scene_inputs.content_digest
-    )
+    assert DEFAULT_TIME_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
+    assert DEFAULT_DOWNLOAD_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
+    assert DEFAULT_PREPROCESS_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
+    assert EXCLUDED_UPLOAD_TOOL_NAME not in result.scene_inputs.tool_selection.tool_names
+    assert result.scene_inputs.content_digest != (changed_subject_result.scene_inputs.content_digest)
     assert result.host_assembly.diagnostics.model_id == _MODEL_ID
     assert result.host_assembly.diagnostics.runner_option_hint_id == _RUNNER_HINT_ID
 

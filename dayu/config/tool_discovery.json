@@ -77,6 +77,14 @@
         "playwright_storage_state_dir": "workspace/.dayu/web_tools_storage_states",
         "allow_private_network_url": false
       }
+    },
+    "utils-tools": {
+      "import_path": "dayu.tools.utils:discover_tools",
+      "entry_point": null,
+      "source_kind": "explicit_provider",
+      "source_id": "dayu.tools.utils",
+      "enabled": true,
+      "config": {}
     }
   }
 }

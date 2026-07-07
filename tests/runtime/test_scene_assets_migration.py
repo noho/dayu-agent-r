@@ -32,9 +32,7 @@ _OLD_SCENE_MAX_ITERATIONS: Final[Mapping[str, int]] = {
     "wechat": 16,
     "write": 24,
 }
-_COMPACTOR_POLICY_SCENES: Final[frozenset[str]] = frozenset(
-    {"conversation_compaction"}
-)
+_COMPACTOR_POLICY_SCENES: Final[frozenset[str]] = frozenset({"conversation_compaction"})
 _LEGACY_TOOLS_CONDITIONAL_MARKERS: Final[tuple[str, ...]] = (
     "<when_tag doc>",
     "</when_tag>",
@@ -60,9 +58,7 @@ _ALLOWED_MANIFEST_FIELDS: Final[frozenset[str]] = frozenset(
         "context_slots",
     }
 )
-_ALLOWED_MODEL_FIELDS: Final[frozenset[str]] = frozenset(
-    {"default_model_id", "runner_option_hint_id"}
-)
+_ALLOWED_MODEL_FIELDS: Final[frozenset[str]] = frozenset({"default_model_id", "runner_option_hint_id"})
 
 
 def _repo_root() -> Path:
@@ -184,18 +180,20 @@ def _fake_tool_catalog() -> SceneToolCatalog:
 
     return SceneToolCatalog(
         tools=(
-            SceneToolInfo(name="list_documents", tags=frozenset({"fins"})),
-            SceneToolInfo(name="get_document_sections", tags=frozenset({"fins"})),
-            SceneToolInfo(name="read_section", tags=frozenset({"fins"})),
-            SceneToolInfo(name="search_document", tags=frozenset({"fins"})),
-            SceneToolInfo(name="list_tables", tags=frozenset({"fins"})),
-            SceneToolInfo(name="get_table", tags=frozenset({"fins"})),
-            SceneToolInfo(name="get_page_content", tags=frozenset({"fins"})),
-            SceneToolInfo(name="get_financial_statement", tags=frozenset({"fins"})),
-            SceneToolInfo(name="query_xbrl_facts", tags=frozenset({"fins"})),
-            SceneToolInfo(name="start_fins_download", tags=frozenset({"fins"})),
-            SceneToolInfo(name="start_fins_preprocess", tags=frozenset({"fins"})),
+            SceneToolInfo(name="list_documents", tags=frozenset({"fins", "fins-read"})),
+            SceneToolInfo(name="get_document_sections", tags=frozenset({"fins", "fins-read"})),
+            SceneToolInfo(name="read_section", tags=frozenset({"fins", "fins-read"})),
+            SceneToolInfo(name="search_document", tags=frozenset({"fins", "fins-read"})),
+            SceneToolInfo(name="list_tables", tags=frozenset({"fins", "fins-read"})),
+            SceneToolInfo(name="get_table", tags=frozenset({"fins", "fins-read"})),
+            SceneToolInfo(name="get_page_content", tags=frozenset({"fins", "fins-read"})),
+            SceneToolInfo(name="get_financial_statement", tags=frozenset({"fins", "fins-read"})),
+            SceneToolInfo(name="query_xbrl_facts", tags=frozenset({"fins", "fins-read"})),
+            SceneToolInfo(name="start_fins_download", tags=frozenset({"fins", "fins-download"})),
+            SceneToolInfo(name="start_fins_preprocess", tags=frozenset({"fins", "fins-preprocess"})),
+            SceneToolInfo(name="start_fins_upload", tags=frozenset({"fins", "fins-upload"})),
             SceneToolInfo(name="fake_web_search", tags=frozenset({"web"})),
+            SceneToolInfo(name="get_current_time", tags=frozenset({"utils", "time"})),
             SceneToolInfo(name="fake_ingestion", tags=frozenset({"ingestion"})),
             SceneToolInfo(
                 name="fake_smoke_fact",
@@ -261,6 +259,46 @@ def test_migrated_scene_manifest_schema_excludes_legacy_fields() -> None:
             assert "default_name" not in model
             assert "temperature_profile" not in model
             assert "default_model_id" in model
+
+
+def test_packaged_select_manifests_use_tag_only_tool_selection() -> None:
+    """包内 select manifest 不得列非空 tool_names。"""
+
+    paths = tuple(_iter_manifest_paths())
+    assert paths
+    for path in paths:
+        manifest = _load_manifest(path)
+        tool_selection = manifest["tool_selection"]
+        assert isinstance(tool_selection, Mapping)
+        if tool_selection["mode"] == "select":
+            tool_names = tool_selection["tool_names"]
+            tool_tags_any = tool_selection["tool_tags_any"]
+            assert tool_names == []
+            assert isinstance(tool_tags_any, list)
+            assert tool_tags_any
+
+
+def test_infer_manifest_selects_read_download_preprocess_and_utils_without_upload() -> None:
+    """infer manifest 必须保持旧 read/download/preprocess 暴露面并排除 upload。"""
+
+    result = prepare_scene(
+        ScenePrepareRequest(
+            scene_id="infer",
+            scene_manifest_root=_manifest_root(),
+            prompt_asset_root=_prompt_asset_root(),
+            context_slot_values={"fins_default_subject": "测试财报主体"},
+            available_tools=_fake_tool_catalog(),
+        )
+    )
+
+    selected = result.tool_selection.tool_names
+    assert selected is not None
+    assert "list_documents" in selected
+    assert "start_fins_download" in selected
+    assert "start_fins_preprocess" in selected
+    assert "get_current_time" in selected
+    assert "start_fins_upload" not in selected
+    assert "fake_web_search" not in selected
 
 
 def test_conversation_compaction_default_model_matches_default_profile_compactor() -> None:
@@ -344,9 +382,7 @@ def test_migrated_base_prompt_assets_preserve_legacy_text_boundaries() -> None:
 
     prompt_root = _prompt_asset_root()
     agents_content = (prompt_root / "base" / "agents.md").read_text(encoding="utf-8")
-    fact_rules_content = (prompt_root / "base" / "fact_rules.md").read_text(
-        encoding="utf-8"
-    )
+    fact_rules_content = (prompt_root / "base" / "fact_rules.md").read_text(encoding="utf-8")
     tools_content = (prompt_root / "base" / "tools.md").read_text(encoding="utf-8")
 
     assert "当前研究主体" not in agents_content

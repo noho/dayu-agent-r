@@ -50,7 +50,7 @@ from .read_runtime_helpers import (
 )
 
 MODULE: Final[str] = "FINS.FINS_TOOLS"
-FINS_TOOL_TAGS: Final[tuple[str, ...]] = ("fins",)
+FINS_TOOL_TAGS: Final[tuple[str, ...]] = ("fins", "fins-read")
 
 LIST_DOCUMENTS_TOOL_NAME: Final[str] = "list_documents"
 GET_DOCUMENT_SECTIONS_TOOL_NAME: Final[str] = "get_document_sections"

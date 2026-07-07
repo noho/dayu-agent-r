@@ -80,6 +80,8 @@ _NOW = datetime(2026, 6, 14, 8, 0, 0, tzinfo=UTC)
 _MODEL_ID = "deepseek-v4-flash"
 _API_KEY = "test-provider-key"
 _DEFAULT_PROMPT_TOOL_NAME = "get_financial_statement"
+_DEFAULT_TIME_TOOL_NAME = "get_current_time"
+_EXCLUDED_UPLOAD_TOOL_NAME = "start_fins_upload"
 
 
 @dataclass(frozen=True, slots=True)
@@ -761,6 +763,8 @@ def test_prompt_command_outputs_fast_live_terminal_and_converts_requests(
     assert submit_request.user_prompt == "请总结收入变化"
     assert submit_request.tool_names is not None
     assert _DEFAULT_PROMPT_TOOL_NAME in submit_request.tool_names
+    assert _DEFAULT_TIME_TOOL_NAME in submit_request.tool_names
+    assert _EXCLUDED_UPLOAD_TOOL_NAME not in submit_request.tool_names
     assert submit_request.runner_options is not None
     assert submit_request.runner_options.temperature == 0.2
     assert submit_request.agent_policy is not None
@@ -993,9 +997,7 @@ def test_prompt_no_detail_suppresses_activity_and_keeps_final_answer_stdout(
         lambda _options: _FakeOpenHostContext(fake_host),
     )
 
-    exit_code = cli_main.main(
-        ("prompt", "--base", str(workspace_root), "--no-detail", "请总结收入变化")
-    )
+    exit_code = cli_main.main(("prompt", "--base", str(workspace_root), "--no-detail", "请总结收入变化"))
     captured = capsys.readouterr()
 
     assert exit_code == EXIT_SUCCESS
@@ -1025,9 +1027,7 @@ def test_prompt_thinking_flag_outputs_reasoning_delta_and_no_thinking_suppresses
         ),
     )
 
-    thinking_exit = cli_main.main(
-        ("prompt", "--base", str(workspace_root), "--thinking", "请总结收入变化")
-    )
+    thinking_exit = cli_main.main(("prompt", "--base", str(workspace_root), "--thinking", "请总结收入变化"))
     thinking_captured = capsys.readouterr()
 
     monkeypatch.setattr(
@@ -1040,9 +1040,7 @@ def test_prompt_thinking_flag_outputs_reasoning_delta_and_no_thinking_suppresses
             )
         ),
     )
-    no_thinking_exit = cli_main.main(
-        ("prompt", "--base", str(workspace_root), "--no-thinking", "请总结收入变化")
-    )
+    no_thinking_exit = cli_main.main(("prompt", "--base", str(workspace_root), "--no-thinking", "请总结收入变化"))
     no_thinking_captured = capsys.readouterr()
 
     assert thinking_exit == EXIT_SUCCESS
@@ -1072,9 +1070,7 @@ def test_prompt_detail_outputs_activity_for_non_tty_and_keeps_final_answer_stdou
         lambda _options: _FakeOpenHostContext(fake_host),
     )
 
-    exit_code = cli_main.main(
-        ("prompt", "--base", str(workspace_root), "--detail", "请总结收入变化")
-    )
+    exit_code = cli_main.main(("prompt", "--base", str(workspace_root), "--detail", "请总结收入变化"))
     captured = capsys.readouterr()
 
     assert exit_code == EXIT_SUCCESS
@@ -1419,9 +1415,7 @@ async def test_prompt_esc_requests_cancel_after_run_id(
     assert result.terminal_status is HostTerminalStatus.CANCELLED
     assert len(fake_host.cancel_requests) == 1
     assert fake_host.cancel_requests[0].mode is CancelMode.GRACEFUL
-    assert "Thinking: The user is asking\r\x1b[2KActivity: cancel requested" in (
-        stderr.getvalue()
-    )
+    assert "Thinking: The user is asking\r\x1b[2KActivity: cancel requested" in (stderr.getvalue())
     thinking_renderer.record(_entrypoint_thinking(dedupe_key="thinking-after-esc"))
     assert stderr.getvalue().count("Thinking:") == 1
     assert key_monitor.closed_count == 1
@@ -1484,9 +1478,7 @@ async def test_prompt_second_sigint_exits_after_cancel_request(
 
     assert result is None
     assert len(fake_host.cancel_requests) == 1
-    assert "Thinking: The user is asking\r\x1b[2KActivity: cancel requested" in (
-        stderr.getvalue()
-    )
+    assert "Thinking: The user is asking\r\x1b[2KActivity: cancel requested" in (stderr.getvalue())
     assert "local process exiting" in stderr.getvalue()
     assert stderr.getvalue().count("Thinking:") == 1
 
@@ -1561,9 +1553,7 @@ def test_prompt_thinking_flags_are_display_options_not_execution_overrides() -> 
     assert thinking_args.thinking is True
     assert no_thinking_args.thinking is False
     assert "--thinking/--no-thinking" not in unsupported_execution_option_names(thinking_args)
-    assert "--thinking/--no-thinking" not in unsupported_execution_option_names(
-        no_thinking_args
-    )
+    assert "--thinking/--no-thinking" not in unsupported_execution_option_names(no_thinking_args)
 
 
 def test_prompt_debug_stream_is_not_unsupported_execution_option() -> None:

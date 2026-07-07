@@ -105,10 +105,7 @@ _FINANCIAL_HTML_DOCUMENT_ID: Final[str] = "aapl-html-2024-10k"
 _FINANCIAL_HTML_PRIMARY_DOCUMENT: Final[str] = "aapl-html-2024-10k.html"
 _INCOME_STATEMENT_TYPE: Final[str] = "income"
 _AAPL_XBRL_FIXTURE_DIR: Final[Path] = (
-    Path(__file__).resolve().parent
-    / "fixtures"
-    / "aapl_xbrl"
-    / "fil_0000320193-24-000123"
+    Path(__file__).resolve().parent / "fixtures" / "aapl_xbrl" / "fil_0000320193-24-000123"
 )
 _AAPL_XBRL_DOCUMENT_ID: Final[str] = "fil_0000320193-24-000123"
 _AAPL_XBRL_VERIFIED_CONCEPT: Final[str] = "NetIncomeLoss"
@@ -684,8 +681,8 @@ def test_storage_repositories_list_and_read_fixture_documents(tmp_path: Path) ->
     assert source.media_type == "text/markdown"
 
 
-def test_fins_provider_discovers_read_tools_with_fins_tag(tmp_path: Path) -> None:
-    """Provider 应发现带 fins tag 的 read tools。"""
+def test_fins_provider_discovers_read_tools_with_fins_read_tag(tmp_path: Path) -> None:
+    """Provider 应发现带 fins/fins-read tags 的 read tools。"""
 
     workspace_root = _build_fins_workspace(tmp_path)
     result = ToolsDiscovery().discover_from_bindings(
@@ -694,6 +691,7 @@ def test_fins_provider_discovers_read_tools_with_fins_tag(tmp_path: Path) -> Non
 
     assert tuple(definition.name for definition in result.tool_bundle.definitions) == _FINS_READ_TOOL_NAMES
     assert all("fins" in definition.tags for definition in result.tool_bundle.definitions)
+    assert all("fins-read" in definition.tags for definition in result.tool_bundle.definitions)
 
 
 def test_fins_read_tools_do_not_import_retired_adapter() -> None:
@@ -921,11 +919,7 @@ def test_fins_read_aapl_xbrl_query_runs_in_spawned_child(tmp_path: Path) -> None
     assert isinstance(value, Mapping)
     facts = value.get("facts")
     assert isinstance(facts, list)
-    concept_names = {
-        _xbrl_fact_concept_local_name(fact)
-        for fact in facts
-        if isinstance(fact, Mapping)
-    }
+    concept_names = {_xbrl_fact_concept_local_name(fact) for fact in facts if isinstance(fact, Mapping)}
     assert _AAPL_XBRL_VERIFIED_CONCEPT in concept_names
 
 

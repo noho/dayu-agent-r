@@ -7,6 +7,7 @@ import asyncio
 import io
 import json
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Final, cast
@@ -21,11 +22,13 @@ from dayu.contracts.tool_call import (
     ToolCallRequest,
 )
 from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
+from dayu.contracts.tool_execution import AsyncDirectToolExecutionCapability
 from dayu.contracts.tool_outcome import (
     ToolCompletedOutcome,
     ToolExecutionOutcome,
     ToolFailedOutcome,
 )
+from dayu.contracts.tool_result import ToolResultMeta, ToolResultSuccess
 from dayu.contracts.tool_schema import ToolTruncateSpec
 from dayu.contracts.tool_source import ToolBundleSourceRef
 from dayu.fins.domain.document_models import (
@@ -101,6 +104,7 @@ _FINS_AWAITING_TOOL_NAMES: Final[tuple[str, ...]] = (
     "start_fins_upload",
 )
 _WEB_TOOL_NAMES: Final[tuple[str, ...]] = ("search_web", "fetch_web_page")
+_UTILS_TOOL_NAMES: Final[tuple[str, ...]] = ("get_current_time",)
 _FORBIDDEN_IMPORT_ROOTS: Final[tuple[str, ...]] = (
     "dayu.engine.tool_registry",
     "dayu.engine.truncation_manager",
@@ -191,6 +195,81 @@ class _AcceptingPort(HostToolFactAcceptPort):
         )
 
 
+@dataclass(slots=True)
+class _FakeSearchWebCallable:
+    """combined ToolRuntime 测试用确定性 search_web callable。
+
+    Args:
+        search_calls: 记录已投影参数。
+        search_tokens: 记录工具执行上下文中的取消 token。
+    """
+
+    search_calls: list[Mapping[str, JsonValue]]
+    search_tokens: list[CancellationToken | None]
+
+    async def __call__(
+        self,
+        call: ToolCallRequest,
+        context: BatchToolExecutionContext,
+    ) -> ToolExecutionOutcome:
+        """执行确定性 search_web 测试调用。
+
+        :param call: 当前工具调用请求。
+        :param context: 批式执行上下文。
+        :returns: 固定 Web 搜索成功 outcome。
+        :raises AssertionError: 参数类型不符合测试预期时抛出。
+        """
+
+        started_at = datetime.now()
+        query = call.arguments.get("query")
+        recency_days = call.arguments.get("recency_days")
+        max_results = call.arguments.get("max_results")
+        assert isinstance(query, str)
+        assert isinstance(recency_days, int)
+        assert isinstance(max_results, int)
+        projected_arguments: Mapping[str, JsonValue] = {
+            "query": query,
+            "domains": ["sec.gov"],
+            "recency_days": recency_days,
+            "max_results": max_results,
+        }
+        self.search_calls.append(projected_arguments)
+        self.search_tokens.append(context.cancellation_token)
+        return ToolCompletedOutcome(
+            result=ToolResultSuccess(
+                ok=True,
+                value={
+                    "query": "AAPL revenue",
+                    "domains": ["sec.gov"],
+                    "total": 1,
+                    "preferred_result": {
+                        "title": "AAPL 10-K",
+                        "url": "https://www.sec.gov/Archives/aapl-2024-10k.htm",
+                        "snippet": "annual report",
+                        "published_date": "",
+                    },
+                    "preferred_result_summary": "AAPL 10-K annual report",
+                    "next_action": "fetch_web_page",
+                    "next_action_args": {"url": "https://www.sec.gov/Archives/aapl-2024-10k.htm"},
+                    "hint": "fetch the preferred result",
+                    "results": [
+                        {
+                            "title": "AAPL 10-K",
+                            "url": "https://www.sec.gov/Archives/aapl-2024-10k.htm",
+                            "snippet": "annual report",
+                            "published_date": "",
+                        }
+                    ],
+                },
+                meta=ToolResultMeta(
+                    tool_name="search_web",
+                    started_at=started_at,
+                    finished_at=datetime.now(),
+                ),
+            )
+        )
+
+
 def test_combined_discovery_returns_single_bundle_without_reserved_names(
     tmp_path: Path,
 ) -> None:
@@ -209,10 +288,11 @@ def test_combined_discovery_returns_single_bundle_without_reserved_names(
         *_FINS_AWAITING_TOOL_NAMES,
         *_DOC_TOOL_NAMES,
         *_WEB_TOOL_NAMES,
+        *_UTILS_TOOL_NAMES,
     )
     assert len(names) == len(set(names))
     assert FrameworkToolName.FETCH_MORE.value not in names
-    assert len(discovered_tools.source_refs) == 6
+    assert len(discovered_tools.source_refs) == 7
     for definition in discovered_tools.tool_bundle.definitions:
         properties = definition.schema.function.parameters.properties
         assert "execution_context" not in properties
@@ -231,18 +311,14 @@ def test_combined_truncate_specs_and_fetch_more_owner(tmp_path: Path) -> None:
 
     discovered_tools = _discover_combined_tools(tmp_path)
     truncating_definitions = tuple(
-        definition
-        for definition in discovered_tools.tool_bundle.definitions
-        if definition.truncate is not None
+        definition for definition in discovered_tools.tool_bundle.definitions if definition.truncate is not None
     )
     runtime, _accept_port = _tool_runtime(discovered_tools.tool_bundle, discovered_tools.source_refs)
 
     assert truncating_definitions
     for definition in truncating_definitions:
         assert type(definition.truncate) is ToolTruncateSpec
-    assert FrameworkToolName.FETCH_MORE.value not in _definition_names(
-        discovered_tools.tool_bundle.definitions
-    )
+    assert FrameworkToolName.FETCH_MORE.value not in _definition_names(discovered_tools.tool_bundle.definitions)
     assert FrameworkToolName.FETCH_MORE in runtime.effective_bundle.injected_framework_tool_names
     fetch_more = runtime.effective_bundle.definitions_by_name[FrameworkToolName.FETCH_MORE.value]
     assert fetch_more.schema in runtime.tool_schemas
@@ -324,56 +400,22 @@ def test_compose_open_host_options_passes_effective_bundle_to_host(
 
 def test_toolruntime_executes_representative_provider_tools_and_accepts_facts(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """ToolRuntime 应执行 Doc / Fins / Web 代表工具并记录 accepted facts。
 
     :param tmp_path: pytest 临时目录。
-    :param monkeypatch: pytest monkeypatch fixture。
     :returns: ``None``。
     :raises AssertionError: 任一 provider outcome 或 accept 事实不符合预期时抛出。
     """
 
     search_calls: list[Mapping[str, JsonValue]] = []
     search_tokens: list[CancellationToken | None] = []
-
-    def fake_search_public_web(**kwargs: JsonValue) -> Mapping[str, JsonValue]:
-        """返回确定性 Web 搜索结果。
-
-        :param kwargs: search_web 投影后的关键字参数。
-        :returns: 当前工具成功响应。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        search_calls.append(kwargs)
-        search_tokens.append(cast(CancellationToken | None, kwargs.get("cancellation_token")))
-        return {
-            "query": "AAPL revenue",
-            "domains": ["sec.gov"],
-            "total": 1,
-            "preferred_result": {
-                "title": "AAPL 10-K",
-                "url": "https://www.sec.gov/Archives/aapl-2024-10k.htm",
-                "snippet": "annual report",
-                "published_date": "",
-            },
-            "preferred_result_summary": "AAPL 10-K annual report",
-            "next_action": "fetch_web_page",
-            "next_action_args": {"url": "https://www.sec.gov/Archives/aapl-2024-10k.htm"},
-            "hint": "fetch the preferred result",
-            "results": [
-                {
-                    "title": "AAPL 10-K",
-                    "url": "https://www.sec.gov/Archives/aapl-2024-10k.htm",
-                    "snippet": "annual report",
-                    "published_date": "",
-                }
-            ],
-        }
-
-    monkeypatch.setattr(web_tools, "search_public_web", fake_search_public_web)
     doc_file = _write_doc_fixture(tmp_path)
-    discovered_tools = _discover_combined_tools(tmp_path)
+    discovered_tools = _with_fake_search_web(
+        _discover_combined_tools(tmp_path),
+        search_calls=search_calls,
+        search_tokens=search_tokens,
+    )
     runtime, accept_port = _tool_runtime(discovered_tools.tool_bundle, discovered_tools.source_refs)
     context = _context()
 
@@ -388,8 +430,8 @@ def test_toolruntime_executes_representative_provider_tools_and_accepts_facts(
                         {
                             "query": "AAPL revenue",
                             "domains": ["sec.gov"],
-                            "recency_days": 7.0,
-                            "max_results": 3.0,
+                            "recency_days": 7,
+                            "max_results": 3,
                         },
                     ),
                 ),
@@ -473,8 +515,8 @@ def test_representative_failures_project_to_current_failed_outcomes(
     assert cast(ToolFailedOutcome, outcomes[2]).result.error == "invalid_argument"
 
 
-def test_scene_prepare_tags_select_doc_fins_and_web_tools(tmp_path: Path) -> None:
-    """ScenePrepare 应能通过 doc/fins/web tags 选择当前工具。
+def test_scene_prepare_tags_select_doc_fins_web_and_utils_tools(tmp_path: Path) -> None:
+    """ScenePrepare 应能通过窄 tags 选择当前工具。
 
     :param tmp_path: pytest 临时目录。
     :returns: ``None``。
@@ -496,7 +538,7 @@ def test_scene_prepare_tags_select_doc_fins_and_web_tools(tmp_path: Path) -> Non
             "tool_selection": {
                 "mode": "select",
                 "tool_names": [],
-                "tool_tags_any": ["doc", "fins", "web"],
+                "tool_tags_any": ["doc", "fins-read", "fins-download", "fins-preprocess", "web", "utils"],
             },
             "defaults": {"missing_required_fragment": "fail_closed"},
             "fragments": [],
@@ -518,7 +560,11 @@ def test_scene_prepare_tags_select_doc_fins_and_web_tools(tmp_path: Path) -> Non
     assert selected is not None
     assert "read_file" in selected
     assert "list_documents" in selected
+    assert "start_fins_download" in selected
+    assert "start_fins_preprocess" in selected
+    assert "start_fins_upload" not in selected
     assert "search_web" in selected
+    assert "get_current_time" in selected
 
 
 def test_web_provider_serial_policy_holds_under_concurrent_calls(
@@ -606,6 +652,57 @@ def _discover_combined_tools(tmp_path: Path) -> ServiceDiscoveredTools:
         workspace_root=tmp_path,
     )
     return discover_service_tools(effective_provider_configs)
+
+
+def _with_fake_search_web(
+    discovered_tools: ServiceDiscoveredTools,
+    *,
+    search_calls: list[Mapping[str, JsonValue]],
+    search_tokens: list[CancellationToken | None],
+) -> ServiceDiscoveredTools:
+    """替换 combined bundle 中的 search_web callable。
+
+    该 helper 保留真实 discovery 的 schema、tags、truncate/source refs 和
+    provider reports，只把 process-backed web callable 换成确定性
+    async-direct 测试 callable，避免 ToolRuntime 验收测试访问真实网络。
+
+    :param discovered_tools: 真实 discovery 输出。
+    :param search_calls: 参数记录列表。
+    :param search_tokens: 取消 token 记录列表。
+    :returns: 替换 search_web 后的 Service discovery 输出。
+    :raises ValueError: bundle 内缺少 search_web 时抛出。
+    """
+
+    definitions: list[ToolDefinition] = []
+    replaced = False
+    for definition in discovered_tools.tool_bundle.definitions:
+        if definition.name != "search_web":
+            definitions.append(definition)
+            continue
+        definitions.append(
+            ToolDefinition(
+                name=definition.name,
+                schema=definition.schema,
+                callable=_FakeSearchWebCallable(
+                    search_calls=search_calls,
+                    search_tokens=search_tokens,
+                ),
+                truncate=definition.truncate,
+                display=definition.display,
+                tags=definition.tags,
+                execution=AsyncDirectToolExecutionCapability(),
+            )
+        )
+        replaced = True
+    if not replaced:
+        raise ValueError("combined tool bundle must include search_web")
+    return ServiceDiscoveredTools(
+        tool_bundle=ToolBundle(definitions=tuple(definitions)),
+        source_refs=discovered_tools.source_refs,
+        provider_reports=discovered_tools.provider_reports,
+        effective_provider_configs=discovered_tools.effective_provider_configs,
+        fins_awaiting_runtime=discovered_tools.fins_awaiting_runtime,
+    )
 
 
 def _tool_runtime(
@@ -999,10 +1096,7 @@ def _is_forbidden_import(module_name: str) -> bool:
     :raises Exception: 不主动抛出异常。
     """
 
-    return any(
-        module_name == root or module_name.startswith(f"{root}.")
-        for root in _FORBIDDEN_IMPORT_ROOTS
-    )
+    return any(module_name == root or module_name.startswith(f"{root}.") for root in _FORBIDDEN_IMPORT_ROOTS)
 
 
 def _write_json(path: Path, value: JsonValue) -> None:

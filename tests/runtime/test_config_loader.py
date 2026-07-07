@@ -467,6 +467,11 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
         == "workspace/.dayu/web_tools_storage_states"
     )
     assert web_provider.config["allow_private_network_url"] is False
+    utils_provider = config.tool_discovery.providers["utils-tools"]
+    assert utils_provider.enabled is True
+    assert utils_provider.import_path == "dayu.tools.utils:discover_tools"
+    assert utils_provider.source_kind == ToolBundleSourceKind.EXPLICIT_PROVIDER
+    assert utils_provider.config == {}
 
 
 def test_host_runtime_process_capsule_policy_missing_block_is_valid(

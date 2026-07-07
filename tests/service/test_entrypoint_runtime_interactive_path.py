@@ -45,6 +45,10 @@ _MODEL_ID = "deepseek-v4-flash"
 _RUNNER_HINT_ID = "interactive"
 _API_KEY = "test-provider-key"
 _DEFAULT_INTERACTIVE_TOOL_NAME = "get_financial_statement"
+_DEFAULT_TIME_TOOL_NAME = "get_current_time"
+_DEFAULT_DOWNLOAD_TOOL_NAME = "start_fins_download"
+_DEFAULT_PREPROCESS_TOOL_NAME = "start_fins_preprocess"
+_EXCLUDED_UPLOAD_TOOL_NAME = "start_fins_upload"
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,9 +149,7 @@ class _FakeHost:
         self.watchers.append(watcher)
         return watcher
 
-    async def submit_followup(
-        self, session_id: str, request: SubmitFollowupRequest
-    ) -> FollowupSnapshot:
+    async def submit_followup(self, session_id: str, request: SubmitFollowupRequest) -> FollowupSnapshot:
         """记录 submit 请求并推入成功终态。
 
         :param session_id: 目标 Session id。
@@ -160,9 +162,7 @@ class _FakeHost:
         self.submit_requests.append(request)
         self._submit_index += 1
         run_id = f"run-{self._submit_index}"
-        await self.watchers[-1].push(
-            _terminal_event(run_id=run_id, event_sequence=self._submit_index + 1)
-        )
+        await self.watchers[-1].push(_terminal_event(run_id=run_id, event_sequence=self._submit_index + 1))
         await asyncio.sleep(0)
         return FollowupSnapshot(
             accepted_input_ref=f"input-{self._submit_index}",
@@ -241,9 +241,11 @@ async def test_interactive_runtime_uses_real_manifest_required_slots(
 
     assert result.scene_inputs.tool_selection.tool_names is not None
     assert _DEFAULT_INTERACTIVE_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
-    assert result.scene_inputs.content_digest != (
-        changed_subject_result.scene_inputs.content_digest
-    )
+    assert _DEFAULT_TIME_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
+    assert _DEFAULT_DOWNLOAD_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
+    assert _DEFAULT_PREPROCESS_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
+    assert _EXCLUDED_UPLOAD_TOOL_NAME not in result.scene_inputs.tool_selection.tool_names
+    assert result.scene_inputs.content_digest != (changed_subject_result.scene_inputs.content_digest)
     assert result.host_assembly.diagnostics.model_id == _MODEL_ID
     assert result.host_assembly.diagnostics.runner_option_hint_id == _RUNNER_HINT_ID
 

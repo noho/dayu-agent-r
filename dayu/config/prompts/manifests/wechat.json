@@ -16,21 +16,13 @@
   },
   "tool_selection": {
     "mode": "select",
-    "tool_names": [
-      "list_documents",
-      "get_document_sections",
-      "read_section",
-      "search_document",
-      "list_tables",
-      "get_table",
-      "get_page_content",
-      "get_financial_statement",
-      "query_xbrl_facts",
-      "start_fins_download",
-      "start_fins_preprocess"
-    ],
+    "tool_names": [],
     "tool_tags_any": [
-      "web"
+      "fins-read",
+      "fins-download",
+      "fins-preprocess",
+      "web",
+      "utils"
     ],
     "allow_empty": false
   },

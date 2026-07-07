@@ -193,6 +193,8 @@ provider 字段：
 
 包内默认 `web-tools` provider 指向 `dayu.tools.web:discover_tools`，默认 `enabled=true`，并默认拒绝 private / local network URL。Provider 只暴露 `search_web` 与 `fetch_web_page`；`config` 可设置 `provider`（`auto` / `tavily` / `serper` / `duckduckgo`）、`request_timeout_seconds`、`max_search_results`、`fetch_truncate_chars`、`allow_private_network_url`、`playwright_channel` 与 `playwright_storage_state_dir`。默认 `playwright_storage_state_dir` 指向 `workspace/.dayu/web_tools_storage_states`；只有该目录下存在目标 host 对应的 storage state 文件时，Playwright fallback 才会注入登录态。只有显式设置 `allow_private_network_url=true` 时，fetch/search URL safety 才允许内网或本地 URL。
 
+包内默认 `utils-tools` provider 指向 `dayu.tools.utils:discover_tools`，默认 `enabled=true`。Provider 当前只暴露 `get_current_time`，用于需要实时时钟的场景；工具只支持 `timezone="Asia/Shanghai"` 或省略该参数，并返回 `time`、`timezone`、`weekday` 与 `iso` 字段。该工具不提供财报、网页或文件事实。
+
 ## prompts 目录职责
 
 `workspace/config/prompts/` 与包内 `dayu/config/prompts/` 用于放置 prompt fragments 和 scene manifests。包内默认资产按目录分为：
@@ -207,7 +209,7 @@ Scene manifest 由 `dayu.runtime.scene_prepare` 解释；ConfigLoader 不读取�
 
 Scene manifest 第一版是单 Run 场景装配输入。允许的顶层字段固定为 `schema_version`、`scene`、`version`、`description`、`capability_tags`、`extends`、`model`、`agent_policy`、`tool_selection`、`defaults`、`fragments` 与 `context_slots`。调用方显式传入 manifest root、prompt asset root、typed context slot values 与可用工具目录；ScenePrepare 只读取 manifest 直接引用的 fragments，执行确定性的文本替换，并输出 system messages、已拼接的 system prompt、工具选择结果、model hints、typed agent policy override、fragment refs、source refs 与 content digest。
 
-默认非上传 scene 不使用 broad `"fins"` tag 选择 Fins 工具；它们显式列出 Fins read / download / preprocess 工具名，并在需要联网能力时继续用 `"web"` tag。这样即使 upload provider 默认注册 `start_fins_upload`，也不会被非上传 scene 通过泛化 Fins tag 意外选中。`tool_selection.allow_empty` 只控制 scene 工具选择空匹配语义，和 ToolsDiscovery provider 是否允许空输出无关。
+默认非上传 scene 不使用 broad `"fins"` tag 选择 Fins 工具，也不在 packaged manifest 中列出具体工具名；它们通过窄标签 `"fins-read"`、`"fins-download"`、`"fins-preprocess"` 选择财报 read / download / preprocess 工具，并在需要联网或实时时钟能力时继续用 `"web"`、`"utils"` tag。这样即使 upload provider 默认注册 `start_fins_upload`，也不会被非上传 scene 通过泛化 Fins tag 意外选中。`tool_selection.allow_empty` 只控制 scene 工具选择空匹配语义，和 ToolsDiscovery provider 是否允许空输出无关。
 
 `conversation_compaction` 是会话压缩专用 scene。该 scene 使用一个 required fragment 作为 compactor system prompt，并在 scene 的 `agent_policy` block 中声明 compactor AgentPolicy。user prompt template 由 execution profile 的 `compactor_baseline.user_prompt_template_path` 指向 prompt asset；template 使用 `<<compaction_request>>` 作为运行期请求数据块占位符，该占位符不是 ScenePrepare context slot，不能写成 `{{...}}`。
 
