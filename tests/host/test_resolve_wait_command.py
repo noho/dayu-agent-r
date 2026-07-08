@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
+from dayu.contracts.json_value import JsonValue
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
 from dayu.contracts.tool_outcome import (
@@ -345,7 +349,7 @@ def test_resolve_wait_failed_and_lost_close_run_without_resume_attempt(
         failed = resolve_wait(
             failed_host,
             failed_seeded.wait_id,
-            _failed_request("resolve-failed"),
+            _failed_request("resolve-failed", hint="retry after provider recovery"),
         )
         lost_seeded = _seed_waiting_run(lost_host)
         lost = resolve_wait(
@@ -362,6 +366,20 @@ def test_resolve_wait_failed_and_lost_close_run_without_resume_attempt(
         assert lost.status is RunStatus.LOST
         assert lost.current_attempt_id == lost_seeded.attempt_id
         assert lost_wait.status is WaitRecordStatus.LOST
+        failed_run_failed = _single_event(
+            _events(failed_host._transaction_runner()), "RUN_FAILED"
+        )
+        lost_run_lost = _single_event(_events(lost_host._transaction_runner()), "RUN_LOST")
+        failed_payload = cast(
+            Mapping[str, JsonValue], json.loads(failed_run_failed.payload_json)
+        )
+        lost_payload = cast(
+            Mapping[str, JsonValue], json.loads(lost_run_lost.payload_json)
+        )
+        assert failed_payload["message"] == (
+            "provider failed retry after provider recovery"
+        )
+        assert lost_payload["message"] == "adapter cannot confirm external job"
     finally:
         failed_host.close()
         lost_host.close()
@@ -609,10 +627,11 @@ def _completed_request(idempotency_key: str) -> ResolveWaitRequest:
     )
 
 
-def _failed_request(idempotency_key: str) -> ResolveWaitRequest:
+def _failed_request(idempotency_key: str, *, hint: str | None = None) -> ResolveWaitRequest:
     """构造 failed resolve wait request。
 
     :param idempotency_key: resolve wait 幂等键。
+    :param hint: 可选恢复提示文本。
     :returns: resolve wait request。
     """
 
@@ -624,7 +643,7 @@ def _failed_request(idempotency_key: str) -> ResolveWaitRequest:
                 ok=False,
                 error="provider_failed",
                 message="provider failed",
-                hint=None,
+                hint=hint,
                 meta=None,
             ),
             payload_ref=None,
@@ -1061,3 +1080,17 @@ def _events_by_type(
     """
 
     return tuple(event for event in events if event.event_type == event_type)
+
+
+def _single_event(events: tuple[EventLogRow, ...], event_type: str) -> EventLogRow:
+    """读取唯一匹配类型的 EventLog row。
+
+    :param events: EventLog rows。
+    :param event_type: 目标 event type。
+    :returns: 唯一匹配的 EventLog row。
+    :raises AssertionError: 匹配数量不是 1 时由断言抛出。
+    """
+
+    matched = _events_by_type(events, event_type)
+    assert len(matched) == 1
+    return matched[0]

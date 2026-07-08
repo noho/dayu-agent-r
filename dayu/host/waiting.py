@@ -997,6 +997,9 @@ class DefaultHostResolveWaitService:
         :returns: resolve 结果。
         """
 
+        outcome = request.outcome
+        if not isinstance(outcome, ResolveWaitFailedOutcome):
+            raise TypeError("resolve wait failed path received non-failed outcome")
         transition = fail_run_from_waiting_in_transaction(
             transaction,
             self._event_log_store,
@@ -1012,6 +1015,7 @@ class DefaultHostResolveWaitService:
                 actor=request.context.actor,
                 source=_WAIT_RESOLUTION_SOURCE,
                 reason=_WAIT_TERMINAL_REASON_FAILED,
+                message=_failed_wait_terminal_message(outcome),
                 resolution_idempotency_key=request.idempotency_key,
                 resolution_digest=resolution_digest,
                 tool_result_payload=_tool_result_resolution_payload(
@@ -1059,6 +1063,9 @@ class DefaultHostResolveWaitService:
         :returns: resolve 结果。
         """
 
+        outcome = request.outcome
+        if not isinstance(outcome, ResolveWaitLostOutcome):
+            raise TypeError("resolve wait lost path received non-lost outcome")
         transition = mark_run_lost_from_waiting_in_transaction(
             transaction,
             self._event_log_store,
@@ -1074,6 +1081,7 @@ class DefaultHostResolveWaitService:
                 actor=request.context.actor,
                 source=_WAIT_RESOLUTION_SOURCE,
                 reason=_WAIT_TERMINAL_REASON_LOST,
+                message=outcome.message,
                 resolution_idempotency_key=request.idempotency_key,
                 resolution_digest=resolution_digest,
                 tool_result_payload=_tool_result_resolution_payload(
@@ -1316,6 +1324,19 @@ def _wait_resolution_payload_plan(
             result_json={"kind": _TOOL_FACT_KIND_LOST, "result": result_json},
         )
     raise TypeError("unsupported resolve wait outcome")
+
+
+def _failed_wait_terminal_message(outcome: ResolveWaitFailedOutcome) -> str:
+    """从 failed wait outcome 构造同源 Run terminal 明文说明。
+
+    :param outcome: failed wait resolution outcome。
+    :returns: 用户可读 terminal message，包含 outcome message 与可选 hint。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if outcome.result.hint is None:
+        return outcome.result.message
+    return f"{outcome.result.message} {outcome.result.hint}"
 
 
 def _completed_payload_digest(outcome: ResolveWaitCompletedOutcome) -> str:

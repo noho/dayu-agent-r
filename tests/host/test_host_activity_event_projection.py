@@ -399,10 +399,10 @@ def test_tool_result_completed_and_cancelled_outcomes(
     assert cancelled_activity.summary == "结果状态：cancelled"
 
 
-def test_tool_awaiting_and_run_waiting_activity_projection(
+def test_tool_awaiting_projects_activity_and_run_waiting_stays_silent(
     tmp_path: pathlib.Path,
 ) -> None:
-    """TOOL_AWAITING / RUN_WAITING 投影等待 activity。"""
+    """TOOL_AWAITING 是唯一工具等待 activity，RUN_WAITING 不重复投影。"""
 
     tool_awaiting = _project_event(
         tmp_path,
@@ -437,13 +437,7 @@ def test_tool_awaiting_and_run_waiting_activity_projection(
     assert tool_activity.title == "等待工具完成：lookup_filing"
     assert tool_activity.tool_name == "lookup_filing"
     assert tool_activity.tool_display_name == "lookup_filing"
-    run_activity = run_waiting.activity
-    assert run_activity is not None
-    assert run_activity.kind is HostActivityKind.TOOL_AWAITING
-    assert run_activity.status is HostActivityStatus.WAITING
-    assert run_activity.title == "等待工具完成"
-    assert run_activity.tool_name is None
-    assert run_activity.tool_display_name is None
+    assert run_waiting.activity is None
 
 
 def test_context_compaction_activity_projection(tmp_path: pathlib.Path) -> None:
@@ -508,7 +502,7 @@ def test_context_compaction_activity_projection(tmp_path: pathlib.Path) -> None:
 def test_non_terminal_run_lifecycle_activity_projection(
     tmp_path: pathlib.Path,
 ) -> None:
-    """RUN_ACCEPTED / RUN_STARTED 等非终态 lifecycle 投影 activity。"""
+    """RUN lifecycle 投影 activity，ATTEMPT governance event 默认静默。"""
 
     accepted = _project_event(
         tmp_path,
@@ -532,6 +526,17 @@ def test_non_terminal_run_lifecycle_activity_projection(
             payload={},
         ),
     )
+    attempt_started = _project_event(
+        tmp_path,
+        _row(
+            event_id="event-attempt-started",
+            event_class=EventClass.CANONICAL_FACT,
+            session_id="session-direct",
+            run_id="run-direct",
+            event_type="ATTEMPT_STARTED",
+            payload={},
+        ),
+    )
 
     accepted_activity = accepted.activity
     assert accepted_activity is not None
@@ -545,6 +550,7 @@ def test_non_terminal_run_lifecycle_activity_projection(
     assert started_activity.kind is HostActivityKind.RUN_LIFECYCLE
     assert started_activity.status is HostActivityStatus.IN_PROGRESS
     assert started_activity.title == "运行已开始"
+    assert attempt_started.activity is None
 
 
 def test_provider_protocol_error_activity_is_bounded(tmp_path: pathlib.Path) -> None:

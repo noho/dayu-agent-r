@@ -632,6 +632,7 @@ class WaitingRunTerminalInput:
     :param actor: 事件 actor。
     :param source: 事件 source。
     :param reason: terminal reason。
+    :param message: 来自 wait/tool outcome 的用户可读终态说明；无则为 ``None``。
     :param resolution_idempotency_key: resolve wait 幂等键。
     :param resolution_digest: resolve wait 语义 digest。
     :param tool_result_payload: ``TOOL_RESULT_ACCEPTED`` payload。
@@ -650,6 +651,7 @@ class WaitingRunTerminalInput:
     actor: str
     source: str
     reason: str
+    message: str | None
     resolution_idempotency_key: str
     resolution_digest: str
     tool_result_payload: JsonValue
@@ -3798,6 +3800,17 @@ def _waiting_run_terminal_event_request(
     :returns: EventLog append request。
     """
 
+    payload: dict[str, JsonValue] = {
+        "run_id": run.run_id,
+        "attempt_id": request.suspended_attempt_id,
+        "wait_id": request.wait_id,
+        "terminal_status": request.run_terminal_status.value,
+        "reason": request.reason,
+        "tool_result_event_ref": _event_ref_json_from_row(tool_result),
+    }
+    if request.message is not None:
+        payload["message"] = request.message
+
     return EventLogAppendRequest(
         event_id=request.run_terminal_event_id,
         event_class=EventClass.CANONICAL_FACT,
@@ -3813,14 +3826,7 @@ def _waiting_run_terminal_event_request(
         idempotency_key=request.resolution_idempotency_key,
         policy_decision=None,
         reason={"reason": request.reason},
-        payload_json={
-            "run_id": run.run_id,
-            "attempt_id": request.suspended_attempt_id,
-            "wait_id": request.wait_id,
-            "terminal_status": request.run_terminal_status.value,
-            "reason": request.reason,
-            "tool_result_event_ref": _event_ref_json_from_row(tool_result),
-        },
+        payload_json=payload,
         payload_ref=None,
         payload_digest=None,
     )
@@ -5993,6 +5999,7 @@ def _validate_waiting_terminal_input(
     _require_non_empty_text(request.actor, field_name="actor")
     _require_non_empty_text(request.source, field_name="source")
     _require_non_empty_text(request.reason, field_name="reason")
+    _require_optional_non_empty_text(request.message, field_name="message")
     _require_non_empty_text(
         request.resolution_idempotency_key,
         field_name="resolution_idempotency_key",

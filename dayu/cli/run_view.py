@@ -166,6 +166,7 @@ class TerminalInteractiveRunView:
     _closed: bool
     _supports_terminal_control: bool
     _terminal_columns: int
+    _default_mode: InteractiveRunViewMode
     _mode: InteractiveRunViewMode
     _activity_sink: ActivitySink
     _transcript_lines: list[str]
@@ -204,7 +205,10 @@ class TerminalInteractiveRunView:
         initial_mode = (
             InteractiveRunViewMode.TRANSCRIPT if options is None else options.initial_mode
         )
-        self._mode = initial_mode if self._enabled else InteractiveRunViewMode.TRANSCRIPT
+        self._default_mode = (
+            initial_mode if self._enabled else InteractiveRunViewMode.TRANSCRIPT
+        )
+        self._mode = self._default_mode
         self._activity_sink = _InteractiveRunViewActivitySink(view=self)
         self._transcript_lines = []
         self._activity_lines = []
@@ -316,7 +320,7 @@ class TerminalInteractiveRunView:
         self._transcript_lines.extend(stderr_lines)
         _write_lines(stdout_lines, self._stdout)
         _write_lines(stderr_lines, self._stderr)
-        self._mode = InteractiveRunViewMode.TRANSCRIPT
+        self._mode = self._default_mode
         return exit_code
 
     def toggle_view(self) -> None:

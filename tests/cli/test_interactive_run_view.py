@@ -108,8 +108,8 @@ def test_run_view_toggle_switches_activity_and_transcript_snapshots() -> None:
     assert "Activity hidden" not in stderr_text
 
 
-def test_run_view_activity_mode_outputs_terminal_and_returns_to_transcript() -> None:
-    """activity view 下 terminal result 应输出 final answer 并回到 transcript。"""
+def test_run_view_activity_mode_outputs_terminal_and_returns_to_default_mode() -> None:
+    """terminal result 应输出 final answer 并回到配置默认 mode。"""
 
     stdout = io.StringIO()
     stderr = io.StringIO()
@@ -127,6 +127,29 @@ def test_run_view_activity_mode_outputs_terminal_and_returns_to_transcript() -> 
     assert view.mode is InteractiveRunViewMode.TRANSCRIPT
     assert view.transcript_lines == ("answer",)
     assert "answer" not in stderr.getvalue()
+
+
+def test_run_view_detail_mode_keeps_activity_after_terminal_result() -> None:
+    """detail 初始 activity mode 不应在一轮结束后静默降级。"""
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    view = TerminalInteractiveRunView(
+        stdout=stdout,
+        stderr=stderr,
+        options=InteractiveRunViewOptions(
+            enabled=True,
+            initial_mode=InteractiveRunViewMode.ACTIVITY,
+        ),
+    )
+
+    exit_code = view.render_terminal_result(_terminal_answer("answer"))
+    view.activity_sink().record_activity(_activity(dedupe_key="activity-next"))
+
+    assert exit_code == EXIT_SUCCESS
+    assert view.mode is InteractiveRunViewMode.ACTIVITY
+    assert stdout.getvalue() == "answer\n"
+    assert "Activity: completed 工具批次完成" in stderr.getvalue()
 
 
 def test_run_view_can_start_in_activity_mode() -> None:

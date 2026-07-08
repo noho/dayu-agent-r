@@ -1079,7 +1079,6 @@ def _activity_from_row(
         _EVENT_TYPE_RUN_ACCEPTED,
         _EVENT_TYPE_RUN_QUEUED,
         _EVENT_TYPE_RUN_STARTED,
-        _EVENT_TYPE_ATTEMPT_STARTED,
         _EVENT_TYPE_RUN_RECOVERING,
     ):
         return _run_lifecycle_activity(row)
@@ -1089,7 +1088,7 @@ def _activity_from_row(
         return _tool_result_accepted_activity(transaction, row)
     if row.event_type == _EVENT_TYPE_TOOL_CALLS_BATCH_DONE:
         return _tool_calls_batch_done_activity(row)
-    if row.event_type in (_EVENT_TYPE_TOOL_AWAITING, _EVENT_TYPE_RUN_WAITING):
+    if row.event_type == _EVENT_TYPE_TOOL_AWAITING:
         return _tool_awaiting_activity(transaction, row)
     if row.event_type in (
         _EVENT_TYPE_CONTEXT_COMPACTION_REQUESTED,
@@ -1131,7 +1130,7 @@ def _run_lifecycle_activity(row: EventLogRow) -> HostActivityView | None:
     if row.event_type in (_EVENT_TYPE_RUN_ACCEPTED, _EVENT_TYPE_RUN_QUEUED):
         status = HostActivityStatus.STARTED
         title = "运行已接受"
-    elif row.event_type in (_EVENT_TYPE_RUN_STARTED, _EVENT_TYPE_ATTEMPT_STARTED):
+    elif row.event_type == _EVENT_TYPE_RUN_STARTED:
         status = HostActivityStatus.IN_PROGRESS
         title = "运行已开始"
     elif row.event_type == _EVENT_TYPE_RUN_RECOVERING:
@@ -1285,8 +1284,8 @@ def _tool_awaiting_activity(
     """投影工具等待 activity。
 
     :param transaction: 当前 Host transaction。
-    :param row: TOOL_AWAITING 或 RUN_WAITING EventLog row。
-    :returns: 等待 activity；未知等待 payload 时返回通用等待 activity。
+    :param row: TOOL_AWAITING EventLog row。
+    :returns: 等待 activity；未知工具 payload 时返回通用等待 activity。
     :raises: 无主动抛出。
     """
 
