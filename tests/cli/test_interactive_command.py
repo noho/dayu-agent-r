@@ -742,6 +742,13 @@ async def test_interactive_existing_session_execution_does_not_create_or_ensure(
         command_name="session",
         scenario="interactive",
     )
+    assert prepared.runtime.host_assembly.options.wait_poller_policy is not None
+    assert prepared.runtime.host_assembly.options.wait_poller_policy.enabled
+    assert prepared.runtime.host_assembly.options.tooling_options is not None
+    assert (
+        prepared.runtime.host_assembly.options.tooling_options.wait_poll_adapter_registry
+        is not None
+    )
     fake_host = _FakeHost(
         submit_statuses=(
             HostTerminalStatus.SUCCEEDED,

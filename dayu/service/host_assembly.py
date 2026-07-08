@@ -264,6 +264,32 @@ class ServiceDiscoveredTools:
     fins_awaiting_runtime: FinsObservationRuntime | None = None
 
 
+def with_entrypoint_wait_poller_policy(
+    *,
+    overrides: ServiceAssemblyOverrides,
+    scene_inputs: PreparedSceneInputs,
+    discovered_tools: ServiceDiscoveredTools,
+) -> ServiceAssemblyOverrides:
+    """按 product entrypoint 实际工具选择补齐 production wait poller policy。
+
+    :param overrides: 调用方显式 assembly override；若已提供
+        ``wait_poller_policy``，该显式值保持原样。
+    :param scene_inputs: 本次 entrypoint 已装配的 scene 输入。
+    :param discovered_tools: 本次 entrypoint 已发现的工具集合与 provider 配置。
+    :returns: 原 override 或补齐 wait poller policy 后的新 override。
+    :raises ValueError: Fins awaiting provider 配置中的 workspace root 非法时抛出。
+    """
+
+    if overrides.wait_poller_policy is not None:
+        return overrides
+    if not _scene_selects_fins_awaiting_tools(
+        scene_inputs=scene_inputs,
+        discovered_tools=discovered_tools,
+    ):
+        return overrides
+    return replace(overrides, wait_poller_policy=WaitPollerRuntimePolicy())
+
+
 @dataclass(frozen=True, slots=True)
 class ServiceOpenHostAssemblyRequest:
     """Service 组合 ``OpenHostOptions`` 的请求。
@@ -1985,6 +2011,37 @@ def _fins_awaiting_registry_inputs_from_provider_configs(
         tool_names=tuple(tool_names),
         workspace_root=_single_fins_workspace_root(workspace_roots),
     )
+
+
+def _scene_selects_fins_awaiting_tools(
+    *,
+    scene_inputs: PreparedSceneInputs,
+    discovered_tools: ServiceDiscoveredTools,
+) -> bool:
+    """判断当前 scene 是否实际暴露 Fins awaiting 长事务工具。
+
+    :param scene_inputs: 本次 scene prepare 输出。
+    :param discovered_tools: 本次工具发现输出。
+    :returns: 当前 scene 会暴露任一 Fins awaiting 工具时返回 ``True``。
+    :raises ValueError: Fins awaiting provider 配置中的 workspace root 非法时抛出。
+    """
+
+    available_tool_names = frozenset(
+        definition.name for definition in discovered_tools.tool_bundle.definitions
+    )
+    registry_inputs = _fins_awaiting_registry_inputs_from_provider_configs(
+        discovered_tools.effective_provider_configs,
+        available_tool_names=available_tool_names,
+    )
+    if registry_inputs is None:
+        return False
+    selected_tool_names = scene_inputs.tool_selection.tool_names
+    if selected_tool_names is None:
+        return True
+    if not selected_tool_names:
+        return False
+    fins_awaiting_tool_names = frozenset(registry_inputs.tool_names)
+    return bool(selected_tool_names.intersection(fins_awaiting_tool_names))
 
 
 def _fins_awaiting_tool_name_from_provider_config(

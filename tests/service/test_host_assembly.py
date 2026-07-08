@@ -100,6 +100,7 @@ from dayu.service.host_assembly import (
     compose_submit_followup_request,
     compose_submit_followup_request_with_overrides,
     discover_service_tools,
+    with_entrypoint_wait_poller_policy,
 )
 
 _PACKAGE_CONFIG_ROOT = Path(__file__).resolve().parents[2] / "dayu" / "config"
@@ -329,6 +330,100 @@ def test_compose_open_host_options_passes_explicit_wait_poller_policy(
     )
 
     assert result.options.wait_poller_policy is policy
+
+
+def test_entrypoint_wait_poller_policy_enabled_for_selected_fins_awaiting_tools(
+    tmp_path: Path,
+) -> None:
+    """entrypoint scene 实际选择 Fins awaiting 工具时应自动启用 poller。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises AssertionError: 未按 scene 工具选择补齐 poller policy 时抛出。
+    """
+
+    locations = resolve_runtime_locations(
+        workspace_root=tmp_path,
+        package_config_root=_PACKAGE_CONFIG_ROOT,
+    )
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
+        workspace_config_dir=locations.config_overlay_dir
+    )
+    discovered_tools = _discover_service_tools_for_workspace(
+        config,
+        workspace_root=tmp_path,
+    )
+    scene_inputs = prepare_scene(
+        ScenePrepareRequest(
+            scene_id="interactive",
+            scene_manifest_root=locations.scene_manifest_root,
+            prompt_asset_root=locations.prompt_asset_root,
+            context_slot_values={"current_time": _CURRENT_TIME_TEXT},
+            available_tools=_scene_tool_catalog(discovered_tools),
+        )
+    )
+    overrides = ServiceAssemblyOverrides(
+        model_id=_MODEL_ID,
+        runner_option_hint_id=_RUNNER_HINT_ID,
+    )
+
+    updated = with_entrypoint_wait_poller_policy(
+        overrides=overrides,
+        scene_inputs=scene_inputs,
+        discovered_tools=discovered_tools,
+    )
+
+    assert overrides.wait_poller_policy is None
+    assert updated.wait_poller_policy is not None
+    assert updated.wait_poller_policy.enabled
+
+
+def test_entrypoint_wait_poller_policy_keeps_prompt_scene_no_poller(
+    tmp_path: Path,
+) -> None:
+    """entrypoint scene 未选择 Fins awaiting 工具时不应启动 poller。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises AssertionError: prompt scene 被误启用 poller 时抛出。
+    """
+
+    locations = resolve_runtime_locations(
+        workspace_root=tmp_path,
+        package_config_root=_PACKAGE_CONFIG_ROOT,
+    )
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
+        workspace_config_dir=locations.config_overlay_dir
+    )
+    discovered_tools = _discover_service_tools_for_workspace(
+        config,
+        workspace_root=tmp_path,
+    )
+    scene_inputs = prepare_scene(
+        ScenePrepareRequest(
+            scene_id="prompt",
+            scene_manifest_root=locations.scene_manifest_root,
+            prompt_asset_root=locations.prompt_asset_root,
+            context_slot_values={
+                "current_time": _CURRENT_TIME_TEXT,
+                "fins_default_subject": "测试财报主体",
+            },
+            available_tools=_scene_tool_catalog(discovered_tools),
+        )
+    )
+    overrides = ServiceAssemblyOverrides(
+        model_id=_MODEL_ID,
+        runner_option_hint_id="prompt",
+    )
+
+    updated = with_entrypoint_wait_poller_policy(
+        overrides=overrides,
+        scene_inputs=scene_inputs,
+        discovered_tools=discovered_tools,
+    )
+
+    assert updated is overrides
+    assert updated.wait_poller_policy is None
 
 
 def test_compose_open_host_options_reads_compactor_scene_id_from_profile(

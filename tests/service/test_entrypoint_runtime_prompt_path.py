@@ -241,6 +241,7 @@ async def test_prompt_runtime_uses_real_prompt_manifest_required_slots(
     assert DEFAULT_DOWNLOAD_TOOL_NAME not in result.scene_inputs.tool_selection.tool_names
     assert DEFAULT_PREPROCESS_TOOL_NAME not in result.scene_inputs.tool_selection.tool_names
     assert EXCLUDED_UPLOAD_TOOL_NAME not in result.scene_inputs.tool_selection.tool_names
+    assert result.host_assembly.options.wait_poller_policy is None
     assert "财报工具指引" in result.scene_inputs.system_prompt
     assert DEFAULT_TIME_TOOL_NAME not in result.scene_inputs.system_prompt
     assert DEFAULT_DOWNLOAD_TOOL_NAME not in result.scene_inputs.system_prompt

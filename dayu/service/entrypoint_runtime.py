@@ -57,6 +57,7 @@ from dayu.service.host_assembly import (
     compose_open_host_options,
     compose_submit_followup_request_with_overrides,
     discover_service_tools,
+    with_entrypoint_wait_poller_policy,
 )
 
 DEFAULT_ENTRYPOINT_TERMINAL_POLL_INTERVAL_SECONDS: Final[float] = 0.05
@@ -541,7 +542,11 @@ async def prepare_entrypoint_runtime(
             locations=locations,
             scene_inputs=scene_inputs,
             discovered_tools=discovered_tools,
-            overrides=request.assembly_overrides,
+            overrides=with_entrypoint_wait_poller_policy(
+                overrides=request.assembly_overrides,
+                scene_inputs=scene_inputs,
+                discovered_tools=discovered_tools,
+            ),
             env=request.env,
         )
     )

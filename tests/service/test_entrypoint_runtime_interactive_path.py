@@ -240,6 +240,13 @@ async def test_interactive_runtime_uses_real_manifest_required_slots(
     assert _DEFAULT_DOWNLOAD_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
     assert _DEFAULT_PREPROCESS_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
     assert _EXCLUDED_UPLOAD_TOOL_NAME not in result.scene_inputs.tool_selection.tool_names
+    assert result.host_assembly.options.wait_poller_policy is not None
+    assert result.host_assembly.options.wait_poller_policy.enabled
+    assert result.host_assembly.options.tooling_options is not None
+    assert (
+        result.host_assembly.options.tooling_options.wait_poll_adapter_registry
+        is not None
+    )
     assert "财报工具指引" in result.scene_inputs.system_prompt
     assert _DEFAULT_TIME_TOOL_NAME in result.scene_inputs.system_prompt
     assert _DEFAULT_DOWNLOAD_TOOL_NAME in result.scene_inputs.system_prompt
