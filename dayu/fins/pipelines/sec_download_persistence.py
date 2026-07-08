@@ -16,7 +16,11 @@ from dayu.fins.domain.document_models import (
     SourceHandle,
     now_iso8601,
 )
-from dayu.fins.downloaders.sec_downloader import DownloaderEvent, RemoteFileDescriptor
+from dayu.fins.downloaders.sec_downloader import (
+    DownloaderEvent,
+    RemoteFileDescriptor,
+    SecDownloadCancelledError,
+)
 from dayu.fins.pipelines.sec_download_event_mapping import DownloadFileResult
 from dayu.fins.storage import (
     DocumentBlobRepositoryProtocol,
@@ -198,6 +202,7 @@ async def persist_rejected_filing_artifact(
     build_file_result_from_downloader_event: Callable[[DownloaderEvent], DownloadFileResult],
     normalize_download_file_result: Callable[[DownloadFileResult], DownloadFileResult],
     summarize_failed_download_file_reasons: Callable[[list[DownloadFileResult]], str],
+    cancellation_checker: Callable[[], bool] | None = None,
 ) -> tuple[bool, Optional[str]]:
     """下载并保存 rejected filing artifact。
 
@@ -218,12 +223,14 @@ async def persist_rejected_filing_artifact(
         build_file_result_from_downloader_event: 下载器事件转文件结果 helper。
         normalize_download_file_result: legacy 文件结果规范化 helper。
         summarize_failed_download_file_reasons: 文件失败原因汇总 helper。
+        cancellation_checker: 可选协作式取消检查器。
 
     Returns:
         `(成功标记, 失败原因)`；成功时失败原因返回 `None`。
 
     Raises:
-        无。内部错误会转换为失败原因返回。
+        SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
+        其他内部错误会转换为失败原因返回。
     """
 
     document_id = f"fil_{filing.accession_number}"
@@ -233,6 +240,7 @@ async def persist_rejected_filing_artifact(
         document_id=document_id,
     )
     file_results: list[DownloadFileResult] = []
+    _raise_if_cancelled(cancellation_checker)
     if download_files_stream is not None:
         async for event in download_files_stream(
             remote_files=remote_files,
@@ -240,10 +248,12 @@ async def persist_rejected_filing_artifact(
             store_file=store_file,
             existing_files={},
             primary_document=filing.primary_document,
+            cancellation_checker=cancellation_checker,
         ):
             if event.event_type == _DOWNLOADER_EVENT_FILE_DOWNLOAD_STARTED:
                 continue
             file_results.append(build_file_result_from_downloader_event(event))
+        _raise_if_cancelled(cancellation_checker)
     else:
         legacy_results = await _maybe_await(
             download_files(
@@ -252,8 +262,10 @@ async def persist_rejected_filing_artifact(
                 store_file=store_file,
                 existing_files={},
                 primary_document=filing.primary_document,
+                cancellation_checker=cancellation_checker,
             )
         )
+        _raise_if_cancelled(cancellation_checker)
         for item in legacy_results:
             file_results.append(normalize_download_file_result(dict(item)))
 
@@ -290,6 +302,23 @@ async def persist_rejected_filing_artifact(
         )
     )
     return True, None
+
+
+def _raise_if_cancelled(cancellation_checker: Callable[[], bool] | None) -> None:
+    """在 rejected artifact 持久化边界观察取消。
+
+    Args:
+        cancellation_checker: 可选协作式取消检查器。
+
+    Returns:
+        无。
+
+    Raises:
+        SecDownloadCancelledError: 取消检查器命中时抛出。
+    """
+
+    if cancellation_checker is not None and cancellation_checker():
+        raise SecDownloadCancelledError("SEC rejected artifact persistence cancelled")
 
 
 def mark_processed_reprocess_required(

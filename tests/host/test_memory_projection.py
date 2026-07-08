@@ -204,6 +204,29 @@ def _event(
     )
 
 
+def _llm_facing_memory_text_view(
+    snapshot: ConversationMemorySnapshotVNext,
+) -> tuple[
+    tuple[tuple[SelectedRecentWindowRole, str], ...],
+    tuple[tuple[SelectedRecentWindowRole, str], ...],
+]:
+    """提取 LLM-facing memory 的稳定 role/text 等价视图。
+
+    :param snapshot: conversation memory snapshot。
+    :returns: selected recent window 与 recent evidence 的 role/text 视图。
+    """
+
+    selected = tuple(
+        (item.role, item.text)
+        for item in snapshot.trace_memory.selected_recent_window
+    )
+    recent_evidence = tuple(
+        (item.role, item.text)
+        for item in snapshot.evidence_fact_memory.recent_evidence_items
+    )
+    return selected, recent_evidence
+
+
 def _accepted_compact_payload(
     *,
     facts: list[dict[str, JsonValue]] | None = None,
@@ -334,8 +357,8 @@ def test_pre_compact_projection_only_builds_selected_recent_window() -> None:
     assert snapshot.forward_intent_memory.intents == ()
 
 
-def test_tool_awaiting_accepted_arguments_project_to_recent_evidence() -> None:
-    """TOOL_AWAITING 已接受参数应进入后续 LLM-facing continuity。"""
+def test_tool_awaiting_does_not_project_llm_facing_memory() -> None:
+    """TOOL_AWAITING 不应形成 awaiting 专属 LLM-facing memory。"""
 
     policy = _policy()
     arguments = {"ticker": "CRCL"}
@@ -363,16 +386,85 @@ def test_tool_awaiting_accepted_arguments_project_to_recent_evidence() -> None:
 
     selected = snapshot.trace_memory.selected_recent_window
     evidence = snapshot.evidence_fact_memory.recent_evidence_items
-    assert tuple(item.role for item in selected) == (
-        SelectedRecentWindowRole.USER,
-        SelectedRecentWindowRole.EVIDENCE,
+    assert tuple(item.role for item in selected) == (SelectedRecentWindowRole.USER,)
+    assert evidence == ()
+    memory_text = "\n".join(
+        item.text for item in snapshot.trace_memory.selected_recent_window
     )
-    assert len(evidence) == 1
-    text = evidence[0].text
-    assert "start_fins_download" in text
-    assert '"ticker":"CRCL"' in text
-    assert "sha256:" not in text
-    assert "awaiting-1" not in text
+    forbidden_fragments = (
+        "等待",
+        "awaiting",
+        "外部工具",
+        "任务",
+        "启动",
+        "取消",
+        "abandoned",
+        "poll",
+        "已接受",
+    )
+    for fragment in forbidden_fragments:
+        assert fragment not in memory_text
+    assert "start_fins_download" not in memory_text
+    assert "CRCL" not in memory_text
+
+
+def test_tool_awaiting_presence_does_not_change_llm_facing_memory_semantics() -> None:
+    """有无 TOOL_AWAITING 时，相同普通事实应生成相同 LLM-facing memory。"""
+
+    policy = _policy()
+    ordinary_events = (
+        _event(1, "user-1", "USER_INPUT_ACCEPTED", {"display_text": "下载Circle财报"}),
+        _event(
+            3,
+            "tool-result-1",
+            "TOOL_RESULT_ACCEPTED",
+            {"display_text": "下载工具返回：已保存 Circle 2024 10-K。"},
+        ),
+        _event(4, "run-1", "RUN_SUCCEEDED", {"final_answer": "Circle 财报已保存。"}),
+    )
+    arguments = {"ticker": "CRCL"}
+    arguments_digest = sha256_digest_json({"arguments": arguments})
+    with_awaiting_events = (
+        ordinary_events[0],
+        _event(
+            2,
+            "awaiting-1",
+            "TOOL_AWAITING",
+            {
+                "tool_name": "start_fins_download",
+                "accepted_arguments": arguments,
+                "accepted_arguments_source_digest": arguments_digest,
+                "normalized_arguments_digest": arguments_digest,
+            },
+        ),
+        ordinary_events[1],
+        ordinary_events[2],
+    )
+
+    ordinary_snapshot = build_conversation_memory_snapshot_from_events(
+        events=ordinary_events,
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+    with_awaiting_snapshot = build_conversation_memory_snapshot_from_events(
+        events=with_awaiting_events,
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+
+    assert (
+        _llm_facing_memory_text_view(with_awaiting_snapshot)
+        == _llm_facing_memory_text_view(ordinary_snapshot)
+    )
+    selected_view, evidence_view = _llm_facing_memory_text_view(with_awaiting_snapshot)
+    memory_text = "\n".join(text for _, text in selected_view + evidence_view)
+    assert "TOOL_AWAITING" not in memory_text
+    assert "start_fins_download" not in memory_text
+    assert "CRCL" not in memory_text
 
 
 def test_selected_recent_window_floor_protects_recent_run_groups() -> None:
@@ -1297,6 +1389,9 @@ def test_conversation_memory_consumer_uses_shared_projection_event_filter() -> N
     consumer = ConversationMemoryProjectionConsumer(policy)
 
     assert consumer.event_filter == conversation_memory_projection_event_filter()
+    event_types = consumer.event_filter.class_filters[0].event_types
+    assert event_types is not None
+    assert "TOOL_AWAITING" not in event_types
 
 
 def test_projection_consumer_skips_failed_compact_without_memory_snapshot(

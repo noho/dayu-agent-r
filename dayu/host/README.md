@@ -656,9 +656,10 @@ Memory 当前只投影这些事件：
 
 - `USER_INPUT_ACCEPTED`：生成 selected recent window 的 user item。
 - `RUN_SUCCEEDED`：从 terminal answer continuity 中提取 assistant item；缺失可读 final answer 时跳过，不用 payload ref / digest / event id 补洞。
-- `TOOL_AWAITING`：把已接受等待工具调用中的 LLM-safe 参数投影为 recent evidence / selected recent continuity；只暴露工具名和已确认参数，不把 wait id、digest、调度状态、等待状态或取消状态伪装成业务事实。
 - `TOOL_RESULT_ACCEPTED`：生成 readable evidence item，优先使用 `display_text`，其次 `content`，再退化为中性 ref summary。
 - `CONTEXT_COMPACTED`：读取 accepted `conversation_compact_output_v1` candidate，物化 session summary、evidence-backed facts、answer anchors、forward intents、reference continuity items，并记录 latest compaction event ref。
+
+Memory 不消费 Host waiting lifecycle 事件。`TOOL_AWAITING`、`RUN_WAITING`、`CANCEL_REQUESTED`、`RUN_CANCELLED`、wait record、poller outcome 与 abandon 只属于 Host durable / audit / wait governance，不进入 LLM-facing memory schema；有无 awaiting 执行机制不能改变下一轮 memory 语义。长事务完成后的可读结果必须经普通 tool result / resume summary 路径进入模型上下文。
 
 snapshot 包含五类稳定视图：
 

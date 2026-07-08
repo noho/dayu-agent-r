@@ -89,6 +89,7 @@ class SecDownloadFilingWorkflowHost(Protocol):
         primary_document: str,
         ticker: str,
         document_id: str,
+        cancel_checker: Callable[[], bool] | None = None,
     ) -> Awaitable[tuple[bool, str, str]]:
         """执行 6-K 预筛选。"""
 
@@ -106,6 +107,7 @@ class SecDownloadFilingWorkflowHost(Protocol):
         rejection_category: str,
         selected_primary_document: str,
         source_fingerprint: str,
+        cancel_checker: Callable[[], bool] | None = None,
     ) -> Awaitable[tuple[bool, Optional[str]]]:
         """持久化 rejected filing artifact。"""
 
@@ -304,6 +306,7 @@ async def run_download_single_filing_stream(
             primary_document=filing.primary_document,
             ticker=ticker,
             document_id=document_id,
+            cancel_checker=cancel_checker,
         )
         if not keep:
             if category == "DOWNLOAD_FAILED":
@@ -339,17 +342,21 @@ async def run_download_single_filing_stream(
                 ),
                 module=host.MODULE,
             )
-            artifact_saved, artifact_error = await host._persist_rejected_filing_artifact(
-                ticker=ticker,
-                cik=cik,
-                filing=filing,
-                remote_files=remote_files,
-                overwrite=overwrite,
-                rejection_reason="6k_filtered",
-                rejection_category=category,
-                selected_primary_document=selected_name or filing.primary_document,
-                source_fingerprint=source_fingerprint,
-            )
+            try:
+                artifact_saved, artifact_error = await host._persist_rejected_filing_artifact(
+                    ticker=ticker,
+                    cik=cik,
+                    filing=filing,
+                    remote_files=remote_files,
+                    overwrite=overwrite,
+                    rejection_reason="6k_filtered",
+                    rejection_category=category,
+                    selected_primary_document=selected_name or filing.primary_document,
+                    source_fingerprint=source_fingerprint,
+                    cancel_checker=cancel_checker,
+                )
+            except SecDownloadCancelledError:
+                return
             if not artifact_saved:
                 filing_result = {
                     "document_id": document_id,

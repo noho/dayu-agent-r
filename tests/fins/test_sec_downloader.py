@@ -314,18 +314,22 @@ def test_resolve_company_success_and_not_found(tmp_path: Path, monkeypatch: pyte
     monkeypatch.setattr(
         downloader,
         "_http_get_json",
-        lambda url: {
+        lambda url, cancellation_checker=None: {
             "0": {"ticker": "AAPL", "cik_str": "320193", "title": "Apple"},
             "1": {"ticker": "MSFT", "cik_str": "789019", "title": "Microsoft"},
         },
     )
     assert _run(downloader.resolve_company("aapl")) == ("320193", "Apple", "0000320193")
 
-    monkeypatch.setattr(downloader, "_http_get_json", lambda url: {"0": {"ticker": "MSFT"}})
+    monkeypatch.setattr(
+        downloader,
+        "_http_get_json",
+        lambda url, cancellation_checker=None: {"0": {"ticker": "MSFT"}},
+    )
     monkeypatch.setattr(
         downloader,
         "_http_get_bytes",
-        lambda url: b"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+        lambda url, cancellation_checker=None: b"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <feed xmlns=\"http://www.w3.org/2005/Atom\"></feed>""",
     )
     with pytest.raises(RuntimeError, match="无法在 SEC ticker map 中找到"):
@@ -342,7 +346,7 @@ def test_resolve_company_uses_hyphenated_class_share_canonical(
     monkeypatch.setattr(
         downloader,
         "_http_get_json",
-        lambda url: {
+        lambda url, cancellation_checker=None: {
             "0": {"ticker": "BRK-B", "cik_str": "1067983", "title": "BERKSHIRE HATHAWAY INC"},
             "1": {"ticker": "BRK-A", "cik_str": "1067983", "title": "BERKSHIRE HATHAWAY INC"},
         },
@@ -350,7 +354,9 @@ def test_resolve_company_uses_hyphenated_class_share_canonical(
     monkeypatch.setattr(
         downloader,
         "_http_get_bytes",
-        lambda url: (_ for _ in ()).throw(AssertionError(f"不应访问 browse-edgar: {url}")),
+        lambda url, cancellation_checker=None: (_ for _ in ()).throw(
+            AssertionError(f"不应访问 browse-edgar: {url}")
+        ),
     )
 
     expected = ("1067983", "BERKSHIRE HATHAWAY INC", "0001067983")
@@ -366,7 +372,11 @@ def test_resolve_company_fallback_via_browse_edgar(
 
     downloader = _create_downloader(tmp_path)
 
-    def _fake_get_json(url: str) -> dict[str, JsonValue]:
+    def _fake_get_json(
+        url: str,
+        cancellation_checker: Callable[[], bool] | None = None,
+    ) -> dict[str, JsonValue]:
+        del cancellation_checker
         if url.endswith("company_tickers.json"):
             return {"0": {"ticker": "MSFT", "cik_str": "789019", "title": "Microsoft"}}
         if "CIK0000814052.json" in url:
@@ -380,7 +390,7 @@ def test_resolve_company_fallback_via_browse_edgar(
     monkeypatch.setattr(
         downloader,
         "_http_get_bytes",
-        lambda url: b"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+        lambda url, cancellation_checker=None: b"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <feed xmlns=\"http://www.w3.org/2005/Atom\">
   <entry>
     <title>20-F - Annual report</title>
@@ -399,7 +409,11 @@ def test_fetch_wrappers_and_blank_filenum(tmp_path: Path, monkeypatch: pytest.Mo
     downloader = _create_downloader(tmp_path)
     captured_urls: list[str] = []
 
-    def _fake_get_json(url: str) -> dict[str, JsonValue]:
+    def _fake_get_json(
+        url: str,
+        cancellation_checker: Callable[[], bool] | None = None,
+    ) -> dict[str, JsonValue]:
+        del cancellation_checker
         captured_urls.append(url)
         return {"ok": True}
 
@@ -426,7 +440,11 @@ SUBJECT COMPANY:
 </SEC-HEADER>
 """
 
-    async def _fake_get_bytes(url: str) -> bytes:
+    async def _fake_get_bytes(
+        url: str,
+        cancellation_checker: Callable[[], bool] | None = None,
+    ) -> bytes:
+        del cancellation_checker
         captured_urls.append(url)
         return payload
 
@@ -465,8 +483,11 @@ def test_fetch_sc13_party_roles_network_failure_returns_none(
 
     downloader = _create_downloader(tmp_path)
 
-    async def _raise_error(url: str) -> bytes:
-        del url
+    async def _raise_error(
+        url: str,
+        cancellation_checker: Callable[[], bool] | None = None,
+    ) -> bytes:
+        del url, cancellation_checker
         raise RuntimeError("boom")
 
     monkeypatch.setattr(downloader, "_http_get_bytes", _raise_error)
@@ -490,7 +511,7 @@ def test_list_filing_files_includes_xbrl_and_exhibits(
     monkeypatch.setattr(
         downloader,
         "_try_fetch_index_items",
-        lambda cik, accession_no_dash: [
+        lambda cik, accession_no_dash, cancellation_checker=None: [
             {"name": "sample-6k.htm"},
             {"name": "sample-6k_htm.xml"},
             {"name": "sample-6k.xsd"},
@@ -500,7 +521,7 @@ def test_list_filing_files_includes_xbrl_and_exhibits(
     monkeypatch.setattr(
         downloader,
         "_try_fetch_index_header_documents",
-        lambda cik, accession_no_dash: [
+        lambda cik, accession_no_dash, cancellation_checker=None: [
             {"name": "form6kcover.htm", "type": "6-K", "description": "FORM 6-K"},
             {"name": "q12025pressrelease.htm", "type": "EX-99.1", "description": "EX-99.1"},
         ],
@@ -562,7 +583,10 @@ def test_list_filing_files_without_http_metadata_skips_head(
     monkeypatch.setattr(
         downloader,
         "_try_fetch_index_items",
-        lambda cik, accession_no_dash: [{"name": "sample-10k.htm"}, {"name": "sample-10k_htm.xml"}],
+        lambda cik, accession_no_dash, cancellation_checker=None: [
+            {"name": "sample-10k.htm"},
+            {"name": "sample-10k_htm.xml"},
+        ],
     )
 
     async def _unexpected_head(
@@ -597,12 +621,24 @@ def test_list_filing_files_includes_primary_linked_html_exhibits(
     """验证 6-K 主文档中的同 filing 相对 HTML 链接会补入下载列表。"""
 
     downloader = _create_downloader(tmp_path)
-    monkeypatch.setattr(downloader, "_try_fetch_index_items", lambda cik, accession_no_dash: [])
-    monkeypatch.setattr(downloader, "_try_fetch_index_header_documents", lambda cik, accession_no_dash: [])
+    monkeypatch.setattr(
+        downloader,
+        "_try_fetch_index_items",
+        lambda cik, accession_no_dash, cancellation_checker=None: [],
+    )
+    monkeypatch.setattr(
+        downloader,
+        "_try_fetch_index_header_documents",
+        lambda cik, accession_no_dash, cancellation_checker=None: [],
+    )
 
-    async def _fake_get_bytes(url: str) -> bytes:
+    async def _fake_get_bytes(
+        url: str,
+        cancellation_checker: Callable[[], bool] | None = None,
+    ) -> bytes:
         """模拟返回带相对 exhibit 链接的 6-K cover。"""
 
+        del cancellation_checker
         assert url.endswith("/sample-6k.htm")
         return b"""
 <html>
@@ -901,7 +937,9 @@ def test_resolve_primary_document_failure_and_fetch_file_bytes(
     monkeypatch.setattr(
         downloader,
         "_http_get_json",
-        lambda url: {"directory": {"item": [{"name": ""}, {"type": "10-K"}, {"other": "x"}]}},
+        lambda url, cancellation_checker=None: {
+            "directory": {"item": [{"name": ""}, {"type": "10-K"}, {"other": "x"}]}
+        },
     )
     with pytest.raises(RuntimeError, match="无法解析 primary_document"):
         _run(
@@ -912,7 +950,11 @@ def test_resolve_primary_document_failure_and_fetch_file_bytes(
             )
         )
 
-    monkeypatch.setattr(downloader, "_http_download", lambda url: b"payload")
+    monkeypatch.setattr(
+        downloader,
+        "_http_download",
+        lambda url, cancellation_checker=None: b"payload",
+    )
     assert _run(downloader.fetch_file_bytes("https://example.com/file.bin")) == b"payload"
 
 
@@ -1016,7 +1058,11 @@ def test_fetch_browse_edgar_filenum_non_empty(tmp_path: Path, monkeypatch: pytes
 </feed>
 """
 
-    async def _fake_get_bytes(url: str) -> bytes:
+    async def _fake_get_bytes(
+        url: str,
+        cancellation_checker: Callable[[], bool] | None = None,
+    ) -> bytes:
+        del cancellation_checker
         captured_urls.append(url)
         return payload
 
@@ -1668,13 +1714,20 @@ def test_try_fetch_index_items_and_helper_paths(tmp_path: Path, monkeypatch: pyt
 
     downloader = _create_downloader(tmp_path)
 
-    async def _raise_runtime(url: str) -> dict[str, JsonValue]:
-        del url
+    async def _raise_runtime(
+        url: str,
+        cancellation_checker: Callable[[], bool] | None = None,
+    ) -> dict[str, JsonValue]:
+        del url, cancellation_checker
         raise RuntimeError("bad index")
 
     monkeypatch.setattr(downloader, "_http_get_json", _raise_runtime)
     assert _run(downloader._try_fetch_index_items("320193", "000032019325000001")) == []
-    monkeypatch.setattr(downloader, "_http_get_bytes", lambda url: b"")
+    monkeypatch.setattr(
+        downloader,
+        "_http_get_bytes",
+        lambda url, cancellation_checker=None: b"",
+    )
     assert _run(downloader._try_fetch_index_header_documents("320193", "000032019325000001")) == []
 
     assert downloader._build_headers()["User-Agent"] == "UA"

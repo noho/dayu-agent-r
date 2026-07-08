@@ -10,6 +10,7 @@ import time
 from typing import AsyncIterator, Awaitable, Callable, Final, Optional, Protocol, TypeVar, cast
 
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.downloaders.sec_downloader import SecDownloadCancelledError
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.pipelines.sec_filing_collection import FilingRecord
 from dayu.fins.ticker_normalization import normalize_ticker
@@ -35,12 +36,20 @@ class _DownloadWorkflowDownloader(Protocol):
 
         ...
 
-    def resolve_company(self, ticker: str) -> Awaitable[tuple[str, str, str]] | tuple[str, str, str]:
+    def resolve_company(
+        self,
+        ticker: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> Awaitable[tuple[str, str, str]] | tuple[str, str, str]:
         """解析公司信息。"""
 
         ...
 
-    def fetch_submissions(self, cik10: str) -> Awaitable[dict[str, JsonValue]] | dict[str, JsonValue]:
+    def fetch_submissions(
+        self,
+        cik10: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> Awaitable[dict[str, JsonValue]] | dict[str, JsonValue]:
         """拉取 submissions。"""
 
         ...
@@ -160,6 +169,7 @@ class SecDownloadWorkflowHost(Protocol):
         sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
         rejection_registry: Optional[dict[str, dict[str, str]]] = None,
         overwrite: bool = False,
+        cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> Awaitable[tuple[list[FilingRecord], set[str]]]:
         """过滤 filings 并收集 filenum。"""
 
@@ -177,6 +187,7 @@ class SecDownloadWorkflowHost(Protocol):
         sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
         rejection_registry: Optional[dict[str, dict[str, str]]] = None,
         overwrite: bool = False,
+        cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> Awaitable[list[FilingRecord]]:
         """补充 browse-edgar SC13 filings。"""
 
@@ -195,6 +206,7 @@ class SecDownloadWorkflowHost(Protocol):
         sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
         rejection_registry: Optional[dict[str, dict[str, str]]] = None,
         overwrite: bool = False,
+        cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> Awaitable[list[FilingRecord]]:
         """在 SC13 为空时执行渐进式回溯。"""
 
@@ -255,7 +267,7 @@ async def run_download_stream_impl(
         overwrite: 是否强制覆盖。
         rebuild: 是否仅基于本地已下载数据重建 `meta/manifest`。
         ticker_aliases: CLI 侧传入的 alias 列表。
-        cancel_checker: 可选取消检查函数，仅在文档边界生效。
+        cancel_checker: 可选协作式取消检查函数。
         parse_date: 日期解析 helper。
         extract_sec_ticker_aliases: SEC alias 提取 helper。
         merge_ticker_aliases: alias 合并 helper。
@@ -341,9 +353,35 @@ async def run_download_stream_impl(
             "rebuild": False,
         },
     )
+    started_at = time.perf_counter()
 
-    cik, company_name, cik10 = await _maybe_await(host._downloader.resolve_company(normalized_ticker))
-    submissions = await _maybe_await(host._downloader.fetch_submissions(cik10))
+    try:
+        cik, company_name, cik10 = await _maybe_await(
+            host._downloader.resolve_company(
+                normalized_ticker,
+                cancellation_checker=cancel_checker,
+            )
+        )
+        submissions = await _maybe_await(
+            host._downloader.fetch_submissions(
+                cik10,
+                cancellation_checker=cancel_checker,
+            )
+        )
+    except SecDownloadCancelledError:
+        yield _cancelled_pipeline_completed_event(
+            host=host,
+            normalized_ticker=normalized_ticker,
+            normalized_market=normalized.market,
+            form_type=form_type,
+            start_date=start_date,
+            end_date=download_end_date,
+            overwrite=overwrite,
+            warnings=(),
+            filing_results=(),
+            elapsed_ms=int((time.perf_counter() - started_at) * 1000),
+        )
+        return
     sec_ticker_aliases = extract_sec_ticker_aliases(
         submissions=submissions,
         primary_ticker=normalized_ticker,
@@ -388,39 +426,61 @@ async def run_download_stream_impl(
     if overwrite:
         clear_filings_dir(host._filing_maintenance_repository, normalized_ticker)
     rejection_registry = load_rejection_registry(host._filing_maintenance_repository, normalized_ticker)
-    filings, filenums = await host._filter_filings(
-        ticker=normalized_ticker,
-        submissions=submissions,
-        form_windows=form_windows,
-        end_date=download_end_date,
-        target_cik=cik,
-        sc13_direction_cache=sc13_direction_cache,
-        rejection_registry=rejection_registry,
-        overwrite=overwrite,
-    )
-    filings = await host._extend_with_browse_edgar_sc13(
-        ticker=normalized_ticker,
-        filings=filings,
-        filenums=filenums,
-        form_windows=form_windows,
-        end_date=download_end_date,
-        target_cik=cik,
-        sc13_direction_cache=sc13_direction_cache,
-        rejection_registry=rejection_registry,
-        overwrite=overwrite,
-    )
-    filings = await host._retry_sc13_if_empty(
-        ticker=normalized_ticker,
-        filings=filings,
-        filenums=filenums,
-        submissions=submissions,
-        form_windows=form_windows,
-        end_date=download_end_date,
-        target_cik=cik,
-        sc13_direction_cache=sc13_direction_cache,
-        rejection_registry=rejection_registry,
-        overwrite=overwrite,
-    )
+    try:
+        filings, filenums = await host._filter_filings(
+            ticker=normalized_ticker,
+            submissions=submissions,
+            form_windows=form_windows,
+            end_date=download_end_date,
+            target_cik=cik,
+            sc13_direction_cache=sc13_direction_cache,
+            rejection_registry=rejection_registry,
+            overwrite=overwrite,
+            cancel_checker=cancel_checker,
+        )
+        filings = await host._extend_with_browse_edgar_sc13(
+            ticker=normalized_ticker,
+            filings=filings,
+            filenums=filenums,
+            form_windows=form_windows,
+            end_date=download_end_date,
+            target_cik=cik,
+            sc13_direction_cache=sc13_direction_cache,
+            rejection_registry=rejection_registry,
+            overwrite=overwrite,
+            cancel_checker=cancel_checker,
+        )
+        filings = await host._retry_sc13_if_empty(
+            ticker=normalized_ticker,
+            filings=filings,
+            filenums=filenums,
+            submissions=submissions,
+            form_windows=form_windows,
+            end_date=download_end_date,
+            target_cik=cik,
+            sc13_direction_cache=sc13_direction_cache,
+            rejection_registry=rejection_registry,
+            overwrite=overwrite,
+            cancel_checker=cancel_checker,
+        )
+    except SecDownloadCancelledError:
+        Log.info(
+            f"下载任务收到取消请求，filing 收集阶段停止: ticker={normalized_ticker}",
+            module=host.MODULE,
+        )
+        yield _cancelled_pipeline_completed_event(
+            host=host,
+            normalized_ticker=normalized_ticker,
+            normalized_market=normalized.market,
+            form_type=form_type,
+            start_date=start_date,
+            end_date=download_end_date,
+            overwrite=overwrite,
+            warnings=(),
+            filing_results=(),
+            elapsed_ms=int((time.perf_counter() - started_at) * 1000),
+        )
+        return
     warnings: list[str] = []
     if should_warn_missing_sc13(form_windows, filings):
         warning = (
@@ -431,7 +491,6 @@ async def run_download_stream_impl(
         Log.warn(warning, module=host.MODULE)
 
     filing_results: list[dict[str, JsonValue]] = []
-    started_at = time.perf_counter()
     cancelled = False
     for filing in filings:
         if cancel_checker is not None and cancel_checker():
@@ -549,6 +608,77 @@ async def run_download_stream_impl(
         status="cancelled" if cancelled else "ok",
     )
     yield DownloadEvent(
+        event_type=DownloadEventType.PIPELINE_COMPLETED,
+        ticker=normalized_ticker,
+        payload={"result": final_result},
+    )
+
+
+def _cancelled_pipeline_completed_event(
+    *,
+    host: SecDownloadWorkflowHost,
+    normalized_ticker: str,
+    normalized_market: str,
+    form_type: Optional[str],
+    start_date: Optional[str],
+    end_date: dt.date,
+    overwrite: bool,
+    warnings: tuple[str, ...],
+    filing_results: tuple[dict[str, JsonValue], ...],
+    elapsed_ms: int,
+) -> DownloadEvent:
+    """构造 SEC 下载取消完成事件。
+
+    Args:
+        host: `SecPipeline` facade 暴露出的最小宿主边界。
+        normalized_ticker: 标准化 ticker。
+        normalized_market: 标准化市场。
+        form_type: 可选表单过滤。
+        start_date: 可选开始日期。
+        end_date: 已解析结束日期。
+        overwrite: 是否覆盖。
+        warnings: 已收集 warning。
+        filing_results: 已完成 filing 结果。
+        elapsed_ms: 已耗时毫秒。
+
+    Returns:
+        `PIPELINE_COMPLETED` 取消事件。
+
+    Raises:
+        无。
+    """
+
+    form_windows = host._resolve_form_windows(
+        form_type=form_type,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    summary = {
+        "total": len(filing_results),
+        "downloaded": sum(1 for item in filing_results if item["status"] == _FILING_STATUS_DOWNLOADED),
+        "skipped": sum(1 for item in filing_results if item["status"] == _FILING_STATUS_SKIPPED),
+        "rejected": sum(1 for item in filing_results if _is_rejected_filing_result(item)),
+        "failed": sum(1 for item in filing_results if item["status"] == _FILING_STATUS_FAILED),
+        "elapsed_ms": elapsed_ms,
+        "reused_downloads": 0,
+        "converted": 0,
+    }
+    final_result = host._build_result(
+        action="download",
+        ticker=normalized_ticker,
+        market_profile={"market": normalized_market},
+        filters=cast(JsonValue, {
+            "forms": sorted(form_windows.keys()),
+            "start_dates": {key: value.isoformat() for key, value in sorted(form_windows.items())},
+            "end_date": end_date.isoformat(),
+            "overwrite": overwrite,
+        }),
+        warnings=cast(JsonValue, list(warnings)),
+        filings=cast(JsonValue, list(filing_results)),
+        summary=cast(JsonValue, summary),
+        status="cancelled",
+    )
+    return DownloadEvent(
         event_type=DownloadEventType.PIPELINE_COMPLETED,
         ticker=normalized_ticker,
         payload={"result": final_result},

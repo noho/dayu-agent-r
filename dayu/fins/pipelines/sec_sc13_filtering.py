@@ -14,6 +14,7 @@ from dayu.fins.downloaders.sec_downloader import (
     BrowseEdgarFiling,
     RemoteFileDescriptor,
     Sc13PartyRoles,
+    SecDownloadCancelledError,
     accession_to_no_dash,
     build_source_fingerprint,
 )
@@ -108,6 +109,7 @@ class _Sc13WorkflowDownloader(Protocol):
         self,
         filenum: str,
         count: int = 100,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> Awaitable[list[BrowseEdgarFiling]] | list[BrowseEdgarFiling]:
         """按 filenum 拉取 browse-edgar 记录。"""
 
@@ -119,6 +121,7 @@ class _Sc13WorkflowDownloader(Protocol):
         cik: str,
         accession_no_dash: str,
         form_type: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> Awaitable[str] | str:
         """解析 filing 的 primary document。"""
 
@@ -129,6 +132,7 @@ class _Sc13WorkflowDownloader(Protocol):
         *,
         archive_cik: str,
         accession_number: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> Awaitable[Optional[Sc13PartyRoles]] | Optional[Sc13PartyRoles]:
         """解析 SC13 双方角色。"""
 
@@ -144,6 +148,7 @@ class _Sc13WorkflowDownloader(Protocol):
         include_xbrl: bool,
         include_exhibits: bool,
         include_http_metadata: bool,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> Awaitable[list[RemoteFileDescriptor]] | list[RemoteFileDescriptor]:
         """列出 filing 远端文件。"""
 
@@ -181,6 +186,7 @@ class SecSc13WorkflowHost(Protocol):
         sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
         rejection_registry: Optional[dict[str, dict[str, str]]] = None,
         overwrite: bool = False,
+        cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> Awaitable[tuple[Sequence[Sc13FilingRecordProtocol], set[str]]]:
         """重新过滤 filings。"""
 
@@ -197,6 +203,7 @@ class SecSc13WorkflowHost(Protocol):
         sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
         rejection_registry: Optional[dict[str, dict[str, str]]] = None,
         overwrite: bool = False,
+        cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> Awaitable[Sequence[Sc13FilingRecordProtocol]]:
         """补拉 browse-edgar SC13。"""
 
@@ -211,6 +218,7 @@ class SecSc13WorkflowHost(Protocol):
         sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
         rejection_registry: Optional[dict[str, dict[str, str]]] = None,
         overwrite: bool = False,
+        cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> Awaitable[bool]:
         """判断单条 SC13 是否应保留。"""
 
@@ -227,6 +235,7 @@ class SecSc13WorkflowHost(Protocol):
         rejection_category: str,
         selected_primary_document: str,
         source_fingerprint: Optional[str],
+        cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> Awaitable[tuple[bool, Optional[str]]] | tuple[bool, Optional[str]]:
         """持久化 rejected artifact。"""
 
@@ -365,6 +374,7 @@ async def filter_sc13_by_direction(
     sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
     rejection_registry: Optional[dict[str, dict[str, str]]] = None,
     overwrite: bool = False,
+    cancel_checker: Optional[Callable[[], bool]] = None,
 ) -> list[Sc13FilingRecordProtocol]:
     """按 SC13 方向规则过滤 filings。"""
 
@@ -383,6 +393,7 @@ async def filter_sc13_by_direction(
             sc13_direction_cache=sc13_direction_cache,
             rejection_registry=rejection_registry,
             overwrite=overwrite,
+            cancel_checker=cancel_checker,
         )
         if keep:
             filtered.append(filing)
@@ -400,6 +411,7 @@ async def should_keep_sc13_direction(
     sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
     rejection_registry: Optional[dict[str, dict[str, str]]] = None,
     overwrite: bool = False,
+    cancel_checker: Optional[Callable[[], bool]] = None,
 ) -> bool:
     """判断单条 SC13 是否应保留。"""
 
@@ -428,6 +440,7 @@ async def should_keep_sc13_direction(
         host._downloader.fetch_sc13_party_roles(
             archive_cik=archive_cik,
             accession_number=filing.accession_number,
+            cancellation_checker=cancel_checker,
         )
     )
     keep = evaluate_sc13_direction(
@@ -450,8 +463,11 @@ async def should_keep_sc13_direction(
                     include_xbrl=True,
                     include_exhibits=True,
                     include_http_metadata=True,
+                    cancellation_checker=cancel_checker,
                 )
             )
+        except SecDownloadCancelledError:
+            raise
         except RuntimeError as exc:
             Log.warn(
                 (
@@ -473,6 +489,7 @@ async def should_keep_sc13_direction(
                     rejection_category="direction_mismatch",
                     selected_primary_document=filing.primary_document,
                     source_fingerprint=source_fingerprint,
+                    cancel_checker=cancel_checker,
                 )
             )
             if not artifact_saved:
@@ -509,6 +526,7 @@ async def extend_with_browse_edgar_sc13(
     sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
     rejection_registry: Optional[dict[str, dict[str, str]]] = None,
     overwrite: bool = False,
+    cancel_checker: Optional[Callable[[], bool]] = None,
 ) -> list[Sc13FilingRecordProtocol]:
     """通过 browse-edgar 补齐 SC13。"""
 
@@ -528,7 +546,14 @@ async def extend_with_browse_edgar_sc13(
             entries = _dicts_to_browse_edgar_filings(_browse_cache_rows(cached_data))
         else:
             try:
-                entries = await _maybe_await(host._downloader.fetch_browse_edgar_filenum(filenum))
+                entries = await _maybe_await(
+                    host._downloader.fetch_browse_edgar_filenum(
+                        filenum,
+                        cancellation_checker=cancel_checker,
+                    )
+                )
+            except SecDownloadCancelledError:
+                raise
             except RuntimeError as exc:
                 Log.warn(f"browse-edgar 拉取失败: filenum={filenum} error={exc}", module=host.MODULE)
                 continue
@@ -567,6 +592,7 @@ async def extend_with_browse_edgar_sc13(
                     sc13_direction_cache=sc13_direction_cache,
                     rejection_registry=rejection_registry,
                     overwrite=overwrite,
+                    cancel_checker=cancel_checker,
                 )
                 if not keep_direction:
                     continue
@@ -577,8 +603,11 @@ async def extend_with_browse_edgar_sc13(
                         cik=entry.cik,
                         accession_no_dash=accession_no_dash,
                         form_type=normalized_form,
+                        cancellation_checker=cancel_checker,
                     )
                 )
+            except SecDownloadCancelledError:
+                raise
             except RuntimeError as exc:
                 Log.warn(
                     (
@@ -616,6 +645,7 @@ async def retry_sc13_if_empty(
     sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
     rejection_registry: Optional[dict[str, dict[str, str]]] = None,
     overwrite: bool = False,
+    cancel_checker: Optional[Callable[[], bool]] = None,
 ) -> list[Sc13FilingRecordProtocol]:
     """在 SC13 初始为空时逐次扩大窗口重试。"""
 
@@ -648,6 +678,7 @@ async def retry_sc13_if_empty(
             sc13_direction_cache=sc13_direction_cache,
             rejection_registry=rejection_registry,
             overwrite=overwrite,
+            cancel_checker=cancel_checker,
         )
         filings = await host._extend_with_browse_edgar_sc13(
             ticker=ticker,
@@ -659,6 +690,7 @@ async def retry_sc13_if_empty(
             sc13_direction_cache=sc13_direction_cache,
             rejection_registry=rejection_registry,
             overwrite=overwrite,
+            cancel_checker=cancel_checker,
         )
 
     return list(filings)

@@ -137,11 +137,16 @@ class StubDownloader:
             raise ValueError("ticker 不能为空")
         return normalized
 
-    def resolve_company(self, ticker: str) -> tuple[str, str, str]:
+    def resolve_company(
+        self,
+        ticker: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> tuple[str, str, str]:
         """返回固定公司信息。
 
         Args:
             ticker: 股票代码。
+            cancellation_checker: 可选取消检查器。
 
         Returns:
             `(cik, company_name, cik10)`。
@@ -150,13 +155,19 @@ class StubDownloader:
             无。
         """
 
+        del ticker, cancellation_checker
         return ("320193", "Test Inc.", "0000320193")
 
-    def fetch_submissions(self, cik10: str) -> dict[str, JsonValue]:
+    def fetch_submissions(
+        self,
+        cik10: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> dict[str, JsonValue]:
         """返回固定 submissions。
 
         Args:
             cik10: 10 位 CIK。
+            cancellation_checker: 可选取消检查器。
 
         Returns:
             submissions JSON。
@@ -165,6 +176,7 @@ class StubDownloader:
             无。
         """
 
+        del cik10, cancellation_checker
         return self._submissions
 
     def list_filing_files(
@@ -251,11 +263,16 @@ class StubDownloader:
                 results.append(item)
         return results
 
-    def fetch_file_bytes(self, url: str) -> bytes:
+    def fetch_file_bytes(
+        self,
+        url: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> bytes:
         """模拟预下载文件内容。
 
         Args:
             url: 文件 URL。
+            cancellation_checker: 可选取消检查器。
 
         Returns:
             文件内容字节。
@@ -264,15 +281,23 @@ class StubDownloader:
             无。
         """
 
+        del cancellation_checker
         self.fetch_file_calls.append(url)
         filename = url.rsplit("/", 1)[-1]
         return self._content_by_name.get(filename, f"prefetch:{filename}".encode("utf-8"))
 
-    def fetch_browse_edgar_filenum(self, filenum: str) -> list[BrowseEdgarFiling]:
+    def fetch_browse_edgar_filenum(
+        self,
+        filenum: str,
+        count: int = 100,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> list[BrowseEdgarFiling]:
         """模拟 browse-edgar 拉取。
 
         Args:
             filenum: filenum。
+            count: 拉取条数上限。
+            cancellation_checker: 可选取消检查器。
 
         Returns:
             filings 列表。
@@ -281,11 +306,18 @@ class StubDownloader:
             无。
         """
 
+        del count, cancellation_checker
         self.browse_calls.append(filenum)
         return self._browse_entries
 
 
-    def resolve_primary_document(self, cik: str, accession_no_dash: str, form_type: str) -> str:
+    def resolve_primary_document(
+        self,
+        cik: str,
+        accession_no_dash: str,
+        form_type: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> str:
         """模拟解析 primary_document。
 
         Args:
@@ -300,10 +332,16 @@ class StubDownloader:
             无。
         """
 
+        del cancellation_checker
         key = f"{cik}:{accession_no_dash}:{form_type}"
         return self._primary_documents.get(key, "primary.htm")
 
-    def fetch_sc13_party_roles(self, archive_cik: str, accession_number: str) -> Optional[Sc13PartyRoles]:
+    def fetch_sc13_party_roles(
+        self,
+        archive_cik: str,
+        accession_number: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> Optional[Sc13PartyRoles]:
         """模拟解析 SC13 方向角色。
 
         Args:
@@ -317,7 +355,7 @@ class StubDownloader:
             无。
         """
 
-        del archive_cik
+        del archive_cik, cancellation_checker
         self.sc13_role_calls.append(accession_number)
         if accession_number in self._sc13_roles_by_accession:
             role_pair = self._sc13_roles_by_accession[accession_number]
@@ -454,37 +492,47 @@ class RebuildOnlyDownloader:
             raise ValueError("ticker 不能为空")
         return normalized
 
-    def resolve_company(self, ticker: str) -> tuple[str, str, str]:
+    def resolve_company(
+        self,
+        ticker: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> tuple[str, str, str]:
         """重建模式不应触发远端公司解析。
 
         Args:
             ticker: 股票代码。
+            cancellation_checker: 可选取消检查器。
 
         Returns:
-            无。
+            不返回；被调用时会抛出异常。
 
         Raises:
             AssertionError: 被调用时抛出。
         """
 
-        del ticker
+        del ticker, cancellation_checker
         self.network_called = True
         raise AssertionError("rebuild 模式不应调用 resolve_company")
 
-    def fetch_submissions(self, cik10: str) -> dict[str, JsonValue]:
+    def fetch_submissions(
+        self,
+        cik10: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> dict[str, JsonValue]:
         """重建模式不应触发 submissions 拉取。
 
         Args:
             cik10: 10 位 CIK。
+            cancellation_checker: 可选取消检查器。
 
         Returns:
-            无。
+            不返回；被调用时会抛出异常。
 
         Raises:
             AssertionError: 被调用时抛出。
         """
 
-        del cik10
+        del cik10, cancellation_checker
         self.network_called = True
         raise AssertionError("rebuild 模式不应调用 fetch_submissions")
 

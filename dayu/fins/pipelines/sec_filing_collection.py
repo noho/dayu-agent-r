@@ -11,6 +11,7 @@ from dayu.contracts.json_value import JsonValue
 import datetime as dt
 import inspect
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Awaitable, Optional, TypeVar
 
 from dayu.fins.downloaders.sec_downloader import RemoteFileDescriptor, SecDownloader
@@ -152,6 +153,7 @@ async def classify_6k_remote_candidates(
     downloader: SecDownloader,
     *,
     max_lines: int,
+    cancellation_checker: Callable[[], bool] | None = None,
 ) -> list[_SixKCandidateDiagnosis]:
     """对 6-K 远端候选文件逐个下载头部并重跑真源分类。
 
@@ -160,12 +162,14 @@ async def classify_6k_remote_candidates(
         primary_document: 当前主文件名。
         downloader: SEC 下载器。
         max_lines: 头部文本最大行数。
+        cancellation_checker: 可选协作式取消检查器。
 
     Returns:
         成功完成分类的候选结果列表。
 
     Raises:
         RuntimeError: 下载候选文件失败时抛出。
+        SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
     """
 
     descriptor_by_name = {
@@ -187,7 +191,12 @@ async def classify_6k_remote_candidates(
         descriptor = descriptor_by_name.get(candidate_name.lower())
         if descriptor is None:
             continue
-        payload = await _maybe_await(downloader.fetch_file_bytes(descriptor.source_url))
+        payload = await _maybe_await(
+            downloader.fetch_file_bytes(
+                descriptor.source_url,
+                cancellation_checker=cancellation_checker,
+            )
+        )
         head_text = _extract_head_text(payload, max_lines=max_lines)
         diagnoses.append(
             _SixKCandidateDiagnosis(
