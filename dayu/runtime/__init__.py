@@ -7,7 +7,8 @@
   脱敏与截断、层中立文本/JSON digest helper、
   workspace 路径公共契约、层中立工具发现装配、层中立配置加载、
   层中立 runtime 位置解析、层中立 scene manifest 装配、
-  层中立工具截断声明补齐、层中立 assembly 选择与 allowlist 合并）。
+  层中立工具截断声明补齐、层中立 assembly 选择与 allowlist 合并、
+  层中立 JSON 敏感字段脱敏）。
 
 硬约束（架构）：
 
@@ -28,8 +29,8 @@
 ``dayu.runtime.config_loader`` 与 ``dayu.runtime.location``、
 ``dayu.runtime.scene_prepare``、
 ``dayu.runtime.tool_truncation``、``dayu.runtime.assembly``、
-``dayu.runtime.diagnostic_text`` 与 ``dayu.runtime._digest`` 等层中立
-runtime 能力；包根不 re-export 这些模块符号。
+``dayu.runtime.diagnostic_text``、``dayu.runtime.json_redaction`` 与
+``dayu.runtime._digest`` 等层中立 runtime 能力；包根不 re-export 这些模块符号。
 """
 
 from __future__ import annotations

@@ -589,6 +589,8 @@ resume 只来自 `resolve_wait`，不是旧 Agent / Runner 的继续执行。长
 - lost outcome 使 Run 进入 `LOST`。
 - 已 cancel、已 terminal、已 resolved / failed / lost 的 late result 不会恢复 Run；Host 只返回幂等结果、冲突或 `WAIT_LATE_RESULT_REJECTED` 诊断。
 
+resume Attempt 的 runner input 会把当前用户请求、使用 LLM-safe replay 参数重建的工具调用、以及已完成工具结果按模型工具协议重建为 LLM-facing 消息；replay 参数来自 `TOOL_AWAITING` 中的脱敏投影，并用原始参数 digest 关联 accepted truth。无法安全恢复 replay 参数的旧事件只投影自解释的恢复说明，不伪造工具调用。
+
 因此 wait-resume 的稳定边界是“新 Attempt 恢复同一 Run”，不是恢复旧 Engine 生成器、旧 Runner HTTP stream 或旧工具调用栈。
 
 ### Dispatch

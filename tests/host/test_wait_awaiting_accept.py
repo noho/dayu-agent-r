@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import inspect
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -9,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
 from dayu.host.api import AttemptStatus, EnsureSessionRequest, RunStatus, WaitAdapterKey
 from dayu.host.durable.codec import format_utc_timestamp, sha256_digest_json
@@ -81,9 +83,7 @@ def test_awaiting_accept_creates_wait_record_and_waiting_state(
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
         candidate = _awaiting_candidate(seeded)
-        accept_port = DefaultHostToolAwaitingAcceptPort(
-            transaction_runner=store.transaction_runner
-        )
+        accept_port = DefaultHostToolAwaitingAcceptPort(transaction_runner=store.transaction_runner)
 
         result = accept_port.accept_tool_awaiting(candidate)
 
@@ -130,9 +130,7 @@ def test_awaiting_accept_persists_complete_snapshot_ref(tmp_path: Path) -> None:
             ),
         )
         candidate = replace(_awaiting_candidate(seeded), snapshot_ref=snapshot_ref)
-        accept_port = DefaultHostToolAwaitingAcceptPort(
-            transaction_runner=store.transaction_runner
-        )
+        accept_port = DefaultHostToolAwaitingAcceptPort(transaction_runner=store.transaction_runner)
 
         result = accept_port.accept_tool_awaiting(candidate)
 
@@ -150,9 +148,7 @@ def test_awaiting_accept_same_key_replays_existing_ack_without_duplicate_events(
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
         candidate = _awaiting_candidate(seeded)
-        accept_port = DefaultHostToolAwaitingAcceptPort(
-            transaction_runner=store.transaction_runner
-        )
+        accept_port = DefaultHostToolAwaitingAcceptPort(transaction_runner=store.transaction_runner)
 
         first = accept_port.accept_tool_awaiting(candidate)
         before = _awaiting_events(store.transaction_runner)
@@ -177,9 +173,7 @@ def test_awaiting_accept_same_key_different_digest_rejects_without_new_facts(
             candidate,
             semantic_input_digest=sha256_digest_json({"semantic": "changed"}),
         )
-        accept_port = DefaultHostToolAwaitingAcceptPort(
-            transaction_runner=store.transaction_runner
-        )
+        accept_port = DefaultHostToolAwaitingAcceptPort(transaction_runner=store.transaction_runner)
 
         first = accept_port.accept_tool_awaiting(candidate)
         before = _awaiting_events(store.transaction_runner)
@@ -221,9 +215,7 @@ def test_awaiting_accept_stale_execution_rejects_without_wait_record(
             accept_idempotency_key="tool-await-stale",
             semantic_input_digest=sha256_digest_json({"semantic": "stale"}),
         )
-        accept_port = DefaultHostToolAwaitingAcceptPort(
-            transaction_runner=store.transaction_runner
-        )
+        accept_port = DefaultHostToolAwaitingAcceptPort(transaction_runner=store.transaction_runner)
 
         result = accept_port.accept_tool_awaiting(candidate)
         _, _, wait_record, events = _read_state(store.transaction_runner, candidate)
@@ -232,6 +224,54 @@ def test_awaiting_accept_stale_execution_rejects_without_wait_record(
         assert result.reason_code.value == "stale_execution"
         assert wait_record is None
         assert events == ()
+
+
+def test_awaiting_accept_persists_only_llm_safe_replay_arguments(
+    tmp_path: Path,
+) -> None:
+    """awaiting accept payload 不持久化敏感原始参数值。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        sensitive_arguments: dict[str, JsonValue] = {
+            "token": "token-raw-value",
+            "api_key": "api-key-raw-value",
+            "password": "password-raw-value",
+            "nested": {
+                "client-secret": "secret-raw-value",
+                "query": "business query",
+            },
+        }
+        normalized_arguments_digest = sha256_digest_json({"arguments": sensitive_arguments})
+        candidate = replace(
+            _awaiting_candidate(seeded),
+            normalized_arguments_digest=normalized_arguments_digest,
+            accepted_arguments=sensitive_arguments,
+        )
+        accept_port = DefaultHostToolAwaitingAcceptPort(transaction_runner=store.transaction_runner)
+
+        result = accept_port.accept_tool_awaiting(candidate)
+
+        assert isinstance(result, ToolAwaitingAcceptedAck)
+        events = _awaiting_events(store.transaction_runner)
+        tool_awaiting = events[0]
+        payload_text = tool_awaiting.payload_json
+        assert "token-raw-value" not in payload_text
+        assert "api-key-raw-value" not in payload_text
+        assert "password-raw-value" not in payload_text
+        assert "secret-raw-value" not in payload_text
+        payload = json.loads(payload_text)
+        assert isinstance(payload, dict)
+        assert payload["accepted_arguments"] == {
+            "token": "<redacted>",
+            "api_key": "<redacted>",
+            "password": "<redacted>",
+            "nested": {
+                "client-secret": "<redacted>",
+                "query": "business query",
+            },
+        }
+        assert payload["accepted_arguments_source_digest"] == normalized_arguments_digest
 
 
 class _SeededRun:
@@ -312,28 +352,32 @@ def _seed_active_run(transaction_runner: HostTransactionRunner) -> _SeededRun:
                 boot_id=None,
             ),
         )
-        input_event = EventLogStore().append_event(
-            transaction,
-            EventLogAppendRequest(
-                event_id="event-input-awaiting",
-                event_class=EventClass.CANONICAL_FACT,
-                session_id=session_id,
-                run_id=seeded.run_id,
-                attempt_id=None,
-                execution_id=None,
-                event_type="USER_INPUT_ACCEPTED",
-                occurred_at=_NOW,
-                actor="tester",
-                source="pytest",
-                client_request_id="client-awaiting",
-                idempotency_key="idem-awaiting-input",
-                policy_decision=None,
-                reason=None,
-                payload_json={"display_text": "hello"},
-                payload_ref=None,
-                payload_digest=None,
-            ),
-        ).row
+        input_event = (
+            EventLogStore()
+            .append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id="event-input-awaiting",
+                    event_class=EventClass.CANONICAL_FACT,
+                    session_id=session_id,
+                    run_id=seeded.run_id,
+                    attempt_id=None,
+                    execution_id=None,
+                    event_type="USER_INPUT_ACCEPTED",
+                    occurred_at=_NOW,
+                    actor="tester",
+                    source="pytest",
+                    client_request_id="client-awaiting",
+                    idempotency_key="idem-awaiting-input",
+                    policy_decision=None,
+                    reason=None,
+                    payload_json={"display_text": "hello"},
+                    payload_ref=None,
+                    payload_digest=None,
+                ),
+            )
+            .row
+        )
         create_running_run_with_starting_attempt_in_transaction(
             transaction,
             EventLogStore(),
@@ -426,7 +470,8 @@ def _awaiting_candidate(seeded: _SeededRun) -> ToolAwaitingAcceptCandidate:
         tool_name="long_tool",
         tool_schema_digest=sha256_digest_json({"schema": "long_tool"}),
         tool_identity_digest=sha256_digest_json({"identity": "long_tool"}),
-        normalized_arguments_digest=sha256_digest_json({"arguments": "long_tool"}),
+        normalized_arguments_digest=sha256_digest_json({"arguments": {"name": "long_tool"}}),
+        accepted_arguments={"name": "long_tool"},
         await_spec=await_spec,
         snapshot_ref=None,
         binding=binding,
@@ -463,11 +508,8 @@ def _read_state(
             read_wait_record_by_id(transaction, candidate.wait_id),
             tuple(
                 row
-                for row in EventLogStore().read_events_after(
-                    transaction, 0, limit=100
-                )
-                if row.event_type
-                in ("TOOL_AWAITING", "RUN_WAITING", "ATTEMPT_SUSPENDED")
+                for row in EventLogStore().read_events_after(transaction, 0, limit=100)
+                if row.event_type in ("TOOL_AWAITING", "RUN_WAITING", "ATTEMPT_SUSPENDED")
             ),
         )
 
@@ -493,8 +535,7 @@ def _awaiting_events(
         return tuple(
             row
             for row in EventLogStore().read_events_after(transaction, 0, limit=100)
-            if row.event_type
-            in ("TOOL_AWAITING", "RUN_WAITING", "ATTEMPT_SUSPENDED")
+            if row.event_type in ("TOOL_AWAITING", "RUN_WAITING", "ATTEMPT_SUSPENDED")
         )
 
     return transaction_runner.run_read(_operation)

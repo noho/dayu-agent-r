@@ -2400,6 +2400,7 @@ class EngineEventIngestor:
                 terminal_closeout=False,
                 promotion_triggered=False,
                 reason=reason,
+                stop_worker_stream=check.accepted,
             )
         diagnostic_payload: dict[str, JsonValue] = dict(payload)
         diagnostic_payload["run_status"] = context.run.status.value
@@ -2425,6 +2426,7 @@ class EngineEventIngestor:
             terminal_closeout=False,
             promotion_triggered=False,
             reason=reason,
+            stop_worker_stream=check.accepted,
         )
 
     def _close_worker_lifecycle(

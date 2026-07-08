@@ -44,6 +44,7 @@ from dayu.host.wait_adapter import (
     WaitPoller,
     WaitResolvePort,
 )
+from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 from tests.host.test_resolve_wait_command import (
     _context,
     _options,
@@ -443,6 +444,47 @@ def test_poll_adapter_ready_result_resolves_wait(
         assert result.resolved == 1
         assert result.lost == 0
         assert wait_record.status is WaitRecordStatus.RESOLVED
+    finally:
+        host.close()
+
+
+def test_poll_adapter_ready_result_logs_status_chain_without_payload(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """poller 在正常 ready 路径输出排障状态链且不记录结果正文。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        adapter = _SequenceAdapter(
+            (
+                WaitPollReady(
+                    ResolveWaitCompletedOutcome(
+                        result=ToolResultSuccess(
+                            ok=True,
+                            value={"payload_secret": "do-not-log"},
+                            meta=None,
+                        ),
+                        payload_ref=None,
+                    )
+                ),
+            )
+        )
+        poller = _poller(host, adapter, seeded.wait_id)
+
+        with caplog.at_level(VERBOSE_LOG_LEVEL, logger="dayu.host.wait_adapter"):
+            result = poller.poll_once()
+
+        assert result.resolved == 1
+        assert "host.wait_poller.poll_once.claimed" in caplog.text
+        assert "host.wait_poller.observe" in caplog.text
+        assert "outcome=ready" in caplog.text
+        assert "host.wait_poller.resolve" in caplog.text
+        assert "resolve_status=updated" in caplog.text
+        assert "host.wait_poller.poll_once.done" in caplog.text
+        assert seeded.wait_id in caplog.text
+        assert "payload_secret" not in caplog.text
+        assert "do-not-log" not in caplog.text
     finally:
         host.close()
 

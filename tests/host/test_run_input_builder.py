@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -32,6 +33,7 @@ from dayu.engine.contracts.messages import (
     AgentMessageRole,
     AssistantMessage,
     SystemMessage,
+    ToolMessage,
     UserMessage,
 )
 from dayu.engine.contracts.engine_events import runner_role_sequence_digest
@@ -139,7 +141,7 @@ from dayu.host.run_input import (
     _is_internal_evidence_source_part,
     _llm_facing_evidence_source_text,
     _normalize_ordinary_run_messages,
-    _resume_wait_message_from_current_start,
+    _resume_wait_messages_from_current_start,
     _vnext_compact_candidate_semantic_lines,
     create_no_tool_run_input_builder,
     create_tool_enabled_run_input_builder,
@@ -350,9 +352,7 @@ def test_current_user_message_resolves_descriptor_payload(
             payload=_user_input_payload("descriptor durable prompt"),
         )
 
-        input_event = _read_event_by_id(
-            store.transaction_runner, "event-current-input"
-        )
+        input_event = _read_event_by_id(store.transaction_runner, "event-current-input")
         request = _build_request(store, seeded)
 
         assert input_event.payload_ref is not None
@@ -386,10 +386,10 @@ def test_recovery_attempt_rebuilds_current_prompt_from_same_run_eventlog_descrip
         assert request.messages[-1].content == "descriptor recovery prompt"
 
 
-def test_resume_wait_message_appends_shared_duplicate_result_guidance(
+def test_resume_wait_messages_rebuild_tool_result_roundtrip(
     tmp_path: Path,
 ) -> None:
-    """resume wait result message 追加重复请求共享结果说明且不泄漏内部 ref。"""
+    """resume wait result 必须重建 user / assistant tool_call / tool 消息闭环。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
@@ -399,43 +399,96 @@ def test_resume_wait_message_appends_shared_duplicate_result_guidance(
             payload=_user_input_payload("resume prompt"),
         )
         _append_resume_wait_projection_events(store.transaction_runner, seeded)
-        current_facts = DurableCurrentRunFactProvider(
-            store.transaction_runner
-        ).load_current_run_facts(_attempt_snapshot(seeded))
+        current_facts = DurableCurrentRunFactProvider(store.transaction_runner).load_current_run_facts(
+            _attempt_snapshot(seeded)
+        )
         resume_started = _read_event_by_id(
             store.transaction_runner,
             "event-run-started-resume",
         )
 
-        def operation(transaction: HostTransaction) -> SystemMessage:
-            """构造 resume wait result message。
+        def operation(transaction: HostTransaction) -> tuple[AgentMessage, ...]:
+            """构造 resume wait result messages。
 
             :param transaction: Host durable transaction。
-            :returns: resume wait system message。
+            :returns: resume wait messages。
             """
 
-            message = _resume_wait_message_from_current_start(
+            return _resume_wait_messages_from_current_start(
                 transaction,
                 replace(current_facts, run_started_event=resume_started),
             )
-            assert message is not None
-            return message
 
-        message = store.transaction_runner.run_read(operation)
+        messages = store.transaction_runner.run_read(operation)
 
-        assert "A previous interrupted step has an accepted wait result." in (
-            message.content
+        assert len(messages) == 3
+        user = messages[0]
+        assistant = messages[1]
+        tool = messages[2]
+        assert isinstance(user, UserMessage)
+        assert user.content == "resume prompt"
+        assert isinstance(assistant, AssistantMessage)
+        assert assistant.content is None
+        assert len(assistant.tool_calls) == 1
+        assert assistant.tool_calls[0].id == "tool-call-private"
+        assert assistant.tool_calls[0].name == "fake_tool"
+        assert assistant.tool_calls[0].arguments == {"ticker": "V"}
+        assert isinstance(tool, ToolMessage)
+        assert tool.tool_call_id == "tool-call-private"
+        assert tool.content == '{"answer": 42}'
+
+
+def test_resume_wait_legacy_message_appends_shared_duplicate_result_guidance(
+    tmp_path: Path,
+) -> None:
+    """旧 wait result 缺工具参数时使用自解释 system guidance。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("resume prompt"),
         )
-        assert "tool_name=fake_tool" in message.content
-        assert "resolution_kind=completed" in message.content
-        assert "tool_fact_kind=completed" in message.content
-        assert 'result={"ok":true,"value":{"answer":42}}' in message.content
-        assert "duplicate requests for the same tool with the same arguments" in (
-            message.content
+        _append_resume_wait_projection_events(
+            store.transaction_runner,
+            seeded,
+            include_accepted_arguments=False,
         )
-        assert "Do not call the same tool again only to obtain the same result." in (
-            message.content
+        current_facts = DurableCurrentRunFactProvider(store.transaction_runner).load_current_run_facts(
+            _attempt_snapshot(seeded)
         )
+        resume_started = _read_event_by_id(
+            store.transaction_runner,
+            "event-run-started-resume",
+        )
+
+        def operation(transaction: HostTransaction) -> tuple[AgentMessage, ...]:
+            """构造 legacy resume wait guidance。
+
+            :param transaction: Host durable transaction。
+            :returns: resume wait messages。
+            """
+
+            return _resume_wait_messages_from_current_start(
+                transaction,
+                replace(current_facts, run_started_event=resume_started),
+            )
+
+        messages = store.transaction_runner.run_read(operation)
+
+        assert len(messages) == 1
+        message = messages[0]
+        assert isinstance(message, SystemMessage)
+        assert "上一轮被等待中断的外部工具步骤已经完成。" in message.content
+        assert "完成的工具：fake_tool" in message.content
+        assert "完成状态：completed" in message.content
+        assert '工具结果：{"answer": 42}' in message.content
+        assert "不要为了同一次请求再次启动相同下载、上传或处理" in (message.content)
+        assert "Resume guidance" not in message.content
+        assert '"kind"' not in message.content
+        assert '"result"' not in message.content
+        assert '"ok"' not in message.content
         assert "wait-resume-private" not in message.content
         assert "tool-call-private" not in message.content
         assert "event-tool-result-resume" not in message.content
@@ -443,6 +496,213 @@ def test_resume_wait_message_appends_shared_duplicate_result_guidance(
         assert "sha256:" not in message.content
         assert "attempt-current" not in message.content
         assert "execution-current" not in message.content
+
+
+@pytest.mark.parametrize(
+    ("wait_created_ref_case", "include_source_digest"),
+    (
+        ("missing", True),
+        ("missing_event", True),
+        ("wrong_event_type", True),
+        ("valid", False),
+    ),
+)
+def test_resume_wait_abnormal_awaiting_event_falls_back_to_guidance(
+    tmp_path: Path,
+    wait_created_ref_case: Literal["valid", "missing", "missing_event", "wrong_event_type"],
+    include_source_digest: bool,
+) -> None:
+    """旧/异常 awaiting 事实不能让 resume input 整体失败。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("resume prompt"),
+        )
+        _append_resume_wait_projection_events(
+            store.transaction_runner,
+            seeded,
+            wait_created_ref_case=wait_created_ref_case,
+            include_accepted_arguments_source_digest=include_source_digest,
+        )
+        current_facts = DurableCurrentRunFactProvider(store.transaction_runner).load_current_run_facts(
+            _attempt_snapshot(seeded)
+        )
+        resume_started = _read_event_by_id(
+            store.transaction_runner,
+            "event-run-started-resume",
+        )
+
+        def operation(transaction: HostTransaction) -> tuple[AgentMessage, ...]:
+            """构造异常 awaiting 引用下的 resume wait guidance。
+
+            :param transaction: Host durable transaction。
+            :returns: resume wait messages。
+            """
+
+            return _resume_wait_messages_from_current_start(
+                transaction,
+                replace(current_facts, run_started_event=resume_started),
+            )
+
+        messages = store.transaction_runner.run_read(operation)
+
+        assert len(messages) == 1
+        message = messages[0]
+        assert isinstance(message, SystemMessage)
+        assert "上一轮被等待中断的外部工具步骤已经完成。" in message.content
+        assert '工具结果：{"answer": 42}' in message.content
+
+
+def test_resume_wait_rejects_digest_mismatch_after_new_arguments_fields(
+    tmp_path: Path,
+) -> None:
+    """新 awaiting replay 字段存在但 digest 不同源时必须 fail closed。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("resume prompt"),
+        )
+        _append_resume_wait_projection_events(
+            store.transaction_runner,
+            seeded,
+            accepted_arguments_source_digest=_DIGEST_B,
+        )
+        current_facts = DurableCurrentRunFactProvider(store.transaction_runner).load_current_run_facts(
+            _attempt_snapshot(seeded)
+        )
+        resume_started = _read_event_by_id(
+            store.transaction_runner,
+            "event-run-started-resume",
+        )
+
+        def operation(transaction: HostTransaction) -> tuple[AgentMessage, ...]:
+            """构造 digest 不同源的 resume wait messages。
+
+            :param transaction: Host durable transaction。
+            :returns: resume wait messages。
+            """
+
+            return _resume_wait_messages_from_current_start(
+                transaction,
+                replace(current_facts, run_started_event=resume_started),
+            )
+
+        with pytest.raises(HostDurableError, match="digest mismatch"):
+            store.transaction_runner.run_read(operation)
+
+
+def test_resume_wait_completed_tool_content_wraps_non_object_value(
+    tmp_path: Path,
+) -> None:
+    """completed wait result 的非 object value 与 Engine 普通工具注入保持一致。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("resume prompt"),
+        )
+        _append_resume_wait_projection_events(
+            store.transaction_runner,
+            seeded,
+            completed_value="download finished",
+        )
+        current_facts = DurableCurrentRunFactProvider(store.transaction_runner).load_current_run_facts(
+            _attempt_snapshot(seeded)
+        )
+        resume_started = _read_event_by_id(
+            store.transaction_runner,
+            "event-run-started-resume",
+        )
+
+        def operation(transaction: HostTransaction) -> tuple[AgentMessage, ...]:
+            """构造非 object 工具结果的 resume wait messages。
+
+            :param transaction: Host durable transaction。
+            :returns: resume wait messages。
+            """
+
+            return _resume_wait_messages_from_current_start(
+                transaction,
+                replace(current_facts, run_started_event=resume_started),
+            )
+
+        messages = store.transaction_runner.run_read(operation)
+
+        tool = messages[2]
+        assert isinstance(tool, ToolMessage)
+        assert tool.content == '{"content": "download finished"}'
+
+
+def test_resume_wait_replays_only_llm_safe_arguments(tmp_path: Path) -> None:
+    """resume 重建 assistant tool call 时只使用脱敏 replay 参数。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("resume prompt"),
+        )
+        _append_resume_wait_projection_events(
+            store.transaction_runner,
+            seeded,
+            accepted_arguments={
+                "token": "<redacted>",
+                "api_key": "<redacted>",
+                "password": "<redacted>",
+                "nested": {
+                    "secret": "<redacted>",
+                    "query": "business query",
+                },
+            },
+        )
+        current_facts = DurableCurrentRunFactProvider(store.transaction_runner).load_current_run_facts(
+            _attempt_snapshot(seeded)
+        )
+        resume_started = _read_event_by_id(
+            store.transaction_runner,
+            "event-run-started-resume",
+        )
+
+        def operation(transaction: HostTransaction) -> tuple[AgentMessage, ...]:
+            """构造脱敏 replay 参数的 resume wait messages。
+
+            :param transaction: Host durable transaction。
+            :returns: resume wait messages。
+            """
+
+            return _resume_wait_messages_from_current_start(
+                transaction,
+                replace(current_facts, run_started_event=resume_started),
+            )
+
+        messages = store.transaction_runner.run_read(operation)
+
+        assistant = messages[1]
+        assert isinstance(assistant, AssistantMessage)
+        replay_arguments = assistant.tool_calls[0].arguments
+        assert replay_arguments == {
+            "token": "<redacted>",
+            "api_key": "<redacted>",
+            "password": "<redacted>",
+            "nested": {
+                "secret": "<redacted>",
+                "query": "business query",
+            },
+        }
+        replay_text = json.dumps(replay_arguments, ensure_ascii=False)
+        assert "token-raw-value" not in replay_text
+        assert "api-key-raw-value" not in replay_text
+        assert "password-raw-value" not in replay_text
+        assert "secret-raw-value" not in replay_text
 
 
 def test_build_is_deterministic_for_same_eventlog_and_policy(
@@ -471,12 +731,15 @@ def test_build_is_deterministic_for_same_eventlog_and_policy(
         assert tuple(_message_content(message) for message in first.messages) == tuple(
             _message_content(message) for message in second.messages
         )
-        assert len(
-            _events_by_type(
-                store.transaction_runner,
-                event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+        assert (
+            len(
+                _events_by_type(
+                    store.transaction_runner,
+                    event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+                )
             )
-        ) == 1
+            == 1
+        )
 
 
 def test_runner_call_manifest_is_bounded_and_does_not_inline_messages(
@@ -485,9 +748,7 @@ def test_runner_call_manifest_is_bounded_and_does_not_inline_messages(
     """大输入只进入 request message，不完整内联到 runner-call manifest。"""
 
     large_prompt = "read filing " + ("x" * 20000)
-    with open_host_durable_store(
-        _options(tmp_path, payload_inline_threshold_bytes=21000)
-    ) as store:
+    with open_host_durable_store(_options(tmp_path, payload_inline_threshold_bytes=21000)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
         seeded = _seed_current_run(
             store,
@@ -713,9 +974,7 @@ def test_tool_enabled_request_uses_toolruntime_handle(tmp_path: Path) -> None:
         assert request.tool_schemas == tool_runtime_handle.tool_schemas
         assert request.tool_executor is tool_runtime_handle.tool_executor
         assert "Tools are disabled" not in _message_content(request.messages[0])
-        assert "Tools are available for this runner call." in _message_content(
-            request.messages[0]
-        )
+        assert "Tools are available for this runner call." in _message_content(request.messages[0])
 
 
 def test_tool_enabled_manifest_resolves_selected_schema_snapshot(
@@ -764,9 +1023,7 @@ def test_tool_enabled_manifest_resolves_selected_schema_snapshot(
         tool_schemas = _json_object_sequence(snapshot.payload["tool_schemas"])
         names = {
             name
-            for function in (
-                _json_object(item["function"]) for item in tool_schemas
-            )
+            for function in (_json_object(item["function"]) for item in tool_schemas)
             for name in (function["name"],)
             if isinstance(name, str)
         }
@@ -797,9 +1054,7 @@ def test_replay_no_tool_request_keeps_tools_disabled(tmp_path: Path) -> None:
         assert request.tool_schemas == ()
         assert request.agent_policy.allow_tool_calls is False
         assert isinstance(request.tool_executor, NoToolExecutor)
-        assert "Tools are disabled for this runner call." in _message_content(
-            request.messages[0]
-        )
+        assert "Tools are disabled for this runner call." in _message_content(request.messages[0])
 
 
 def test_no_tool_builder_rejects_tool_enabled_mode(tmp_path: Path) -> None:
@@ -861,12 +1116,12 @@ def test_durable_memory_provider_uses_covered_snapshot(tmp_path: Path) -> None:
         _write_memory_snapshot(store.transaction_runner, snapshot)
 
         request = _build_request_with_memory(store, seeded, policy)
-        current_facts = DurableCurrentRunFactProvider(
-            store.transaction_runner
-        ).load_current_run_facts(_attempt_snapshot(seeded))
-        memory_view = DurableMemorySnapshotProvider(
-            store.transaction_runner, policy
-        ).load_memory_snapshot(_attempt_snapshot(seeded), current_facts)
+        current_facts = DurableCurrentRunFactProvider(store.transaction_runner).load_current_run_facts(
+            _attempt_snapshot(seeded)
+        )
+        memory_view = DurableMemorySnapshotProvider(store.transaction_runner, policy).load_memory_snapshot(
+            _attempt_snapshot(seeded), current_facts
+        )
         contents = tuple(_message_content(message) for message in request.messages)
 
         system_content = _single_system_content(request.messages)
@@ -913,17 +1168,15 @@ def test_memory_provider_renders_vnext_fact_section_from_snapshot(tmp_path: Path
         _write_memory_snapshot(store.transaction_runner, snapshot)
 
         request = _build_request_with_memory(store, seeded, policy)
-        current_facts = DurableCurrentRunFactProvider(
-            store.transaction_runner
-        ).load_current_run_facts(_attempt_snapshot(seeded))
-        memory_view = DurableMemorySnapshotProvider(
-            store.transaction_runner, policy
-        ).load_memory_snapshot(_attempt_snapshot(seeded), current_facts)
+        current_facts = DurableCurrentRunFactProvider(store.transaction_runner).load_current_run_facts(
+            _attempt_snapshot(seeded)
+        )
+        memory_view = DurableMemorySnapshotProvider(store.transaction_runner, policy).load_memory_snapshot(
+            _attempt_snapshot(seeded), current_facts
+        )
         contents = tuple(_message_content(message) for message in request.messages)
 
-        assert "## Verified Evidence and Facts" in _single_system_content(
-            request.messages
-        )
+        assert "## Verified Evidence and Facts" in _single_system_content(request.messages)
         assert "recent raw user" in contents
         assert contents[-1] == "current prompt"
         assert all(
@@ -951,21 +1204,16 @@ def test_vnext_fact_section_does_not_depend_on_old_subject_blocks(
         _write_memory_snapshot(store.transaction_runner, snapshot)
 
         request = _build_request_with_memory(store, seeded, policy)
-        current_facts = DurableCurrentRunFactProvider(
-            store.transaction_runner
-        ).load_current_run_facts(_attempt_snapshot(seeded))
-        memory_view = DurableMemorySnapshotProvider(
-            store.transaction_runner, policy
-        ).load_memory_snapshot(_attempt_snapshot(seeded), current_facts)
+        current_facts = DurableCurrentRunFactProvider(store.transaction_runner).load_current_run_facts(
+            _attempt_snapshot(seeded)
+        )
+        memory_view = DurableMemorySnapshotProvider(store.transaction_runner, policy).load_memory_snapshot(
+            _attempt_snapshot(seeded), current_facts
+        )
         contents = tuple(_message_content(message) for message in request.messages)
 
-        assert "## Verified Evidence and Facts" in _single_system_content(
-            request.messages
-        )
-        assert all(
-            not content.startswith("Memory confirmed subjects and methodology:")
-            for content in contents
-        )
+        assert "## Verified Evidence and Facts" in _single_system_content(request.messages)
+        assert all(not content.startswith("Memory confirmed subjects and methodology:") for content in contents)
         assert all(
             diagnostic.reason is not MemoryDiagnosticReason.BUDGET_LIMIT_REACHED
             for diagnostic in memory_view.diagnostics
@@ -985,9 +1233,7 @@ def test_noop_memory_snapshot_provider_returns_empty_typed_view(
             payload=_user_input_payload("current prompt"),
         )
         attempt_snapshot = _attempt_snapshot(seeded)
-        current_facts = DurableCurrentRunFactProvider(
-            store.transaction_runner
-        ).load_current_run_facts(attempt_snapshot)
+        current_facts = DurableCurrentRunFactProvider(store.transaction_runner).load_current_run_facts(attempt_snapshot)
 
         view = NoopMemorySnapshotProvider().load_memory_snapshot(
             snapshot=attempt_snapshot,
@@ -1056,9 +1302,7 @@ def test_run_input_builder_accepted_tool_evidence_material_has_no_private_row_ca
         assert tuple(block.accepted_evidence_id for block in evidence_blocks) == tuple(
             evidence.accepted_evidence_id for evidence in seeded_evidence
         )
-        assert evidence_blocks[-1].text == canonical_json_dumps(
-            seeded_evidence[-1].raw_outcome
-        )
+        assert evidence_blocks[-1].text == canonical_json_dumps(seeded_evidence[-1].raw_outcome)
 
 
 def test_run_input_builder_represented_refs_exclude_whole_accepted_evidence_blocks(
@@ -1083,17 +1327,13 @@ def test_run_input_builder_represented_refs_exclude_whole_accepted_evidence_bloc
             memory_snapshot_cursor=None,
             policy_digest=None,
             diagnostics=(),
-            represented_evidence_refs=(
-                seeded_evidence[0].accepted_evidence_id,
-            ),
+            represented_evidence_refs=(seeded_evidence[0].accepted_evidence_id,),
         )
         compact_view = CompactArtifactView(
             messages=(),
             compact_artifact_ref="compact-artifact:test",
             compact_artifact_digest=None,
-            represented_evidence_refs=(
-                seeded_evidence[1].accepted_evidence_id,
-            ),
+            represented_evidence_refs=(seeded_evidence[1].accepted_evidence_id,),
         )
         builder = create_no_tool_run_input_builder(
             transaction_runner=store.transaction_runner,
@@ -1108,9 +1348,7 @@ def test_run_input_builder_represented_refs_exclude_whole_accepted_evidence_bloc
         assert tuple(block.accepted_evidence_id for block in evidence_blocks) == (
             seeded_evidence[2].accepted_evidence_id,
         )
-        assert evidence_blocks[0].text == canonical_json_dumps(
-            seeded_evidence[2].raw_outcome
-        )
+        assert evidence_blocks[0].text == canonical_json_dumps(seeded_evidence[2].raw_outcome)
 
 
 def test_run_input_builder_accepted_tool_evidence_uses_raw_outcome_text(
@@ -1152,18 +1390,10 @@ def test_run_input_builder_accepted_tool_evidence_uses_raw_outcome_text(
         assert _DIGEST_A not in evidence_block.text
         assert seeded_evidence.tool_result_event_id not in evidence_block.text
         assert evidence_block.readable_tool_name == "fins.search"
-        assert evidence_block.readable_query_text == (
-            "Read MSFT FY2025 revenue from filing"
-        )
-        assert evidence_block.accepted_evidence_id == (
-            seeded_evidence.accepted_evidence_id
-        )
-        assert evidence_block.canonical_source_refs == (
-            seeded_evidence.accepted_evidence_id,
-        )
-        assert evidence_block.payload_refs == (
-            f"payload:{seeded_evidence.tool_result_event_id}",
-        )
+        assert evidence_block.readable_query_text == ("Read MSFT FY2025 revenue from filing")
+        assert evidence_block.accepted_evidence_id == (seeded_evidence.accepted_evidence_id)
+        assert evidence_block.canonical_source_refs == (seeded_evidence.accepted_evidence_id,)
+        assert evidence_block.payload_refs == (f"payload:{seeded_evidence.tool_result_event_id}",)
         assert evidence_block.tool_call_event_ref == seeded_evidence.tool_call_event_id
 
 
@@ -1951,9 +2181,7 @@ def test_fallback_context_messages_render_all_and_only_selected_blocks() -> None
         material_blocks=(old, selected, current),
     )
 
-    assert tuple(_message_content(message) for message in messages) == (
-        "selected answer",
-    )
+    assert tuple(_message_content(message) for message in messages) == ("selected answer",)
     assert fallback.source_refs == ("event-selected-answer", "event-current")
 
 
@@ -2045,28 +2273,18 @@ def test_fallback_context_messages_fail_closed_on_selected_view_drift(
     }.get(case_name)
     fallback = _active_fallback(
         selected_blocks=(selected, current),
-        current_input_ref=(
-            "event-other-current" if case_name == "current_input_ref" else "event-current"
-        ),
+        current_input_ref=("event-other-current" if case_name == "current_input_ref" else "event-current"),
         selected_block_ids=selected_block_ids,
-        source_refs=(
-            ("event-stale", "event-current")
-            if case_name == "source_refs"
-            else None
-        ),
-        fallback_input_digest=(
-            _DIGEST_A if case_name == "fallback_digest" else None
-        ),
-        selected_material_view_digest=(
-            _DIGEST_B if case_name == "material_view_digest" else None
-        ),
+        source_refs=(("event-stale", "event-current") if case_name == "source_refs" else None),
+        fallback_input_digest=(_DIGEST_A if case_name == "fallback_digest" else None),
+        selected_material_view_digest=(_DIGEST_B if case_name == "material_view_digest" else None),
     )
 
     with pytest.raises(HostDurableError, match=message):
         _fallback_context_messages(
             fallback=fallback,
             material_blocks=material_blocks,
-    )
+        )
 
 
 def test_fallback_context_messages_fail_closed_on_selected_raw_turn_count_mismatch() -> None:
@@ -2157,9 +2375,7 @@ def test_covered_memory_snapshot_filters_current_user_input(
             session_id=session_id,
             payload=_user_input_payload("current prompt"),
         )
-        current_input = _read_event_by_id(
-            store.transaction_runner, "event-current-input"
-        )
+        current_input = _read_event_by_id(store.transaction_runner, "event-current-input")
         cursor = _required_memory_cursor(store.transaction_runner, seeded)
         snapshot = _current_input_memory_snapshot(
             session_id=session_id,
@@ -2228,12 +2444,12 @@ def test_inline_delta_includes_vnext_memory_sections(tmp_path: Path) -> None:
             payload=_user_input_payload("current prompt"),
         )
 
-        current_facts = DurableCurrentRunFactProvider(
-            store.transaction_runner
-        ).load_current_run_facts(_attempt_snapshot(seeded))
-        memory_view = DurableMemorySnapshotProvider(
-            store.transaction_runner, policy
-        ).load_memory_snapshot(_attempt_snapshot(seeded), current_facts)
+        current_facts = DurableCurrentRunFactProvider(store.transaction_runner).load_current_run_facts(
+            _attempt_snapshot(seeded)
+        )
+        memory_view = DurableMemorySnapshotProvider(store.transaction_runner, policy).load_memory_snapshot(
+            _attempt_snapshot(seeded), current_facts
+        )
 
         assert any(
             diagnostic.reason is MemoryDiagnosticReason.INLINE_DELTA_REPAIR_INCLUDED
@@ -2304,9 +2520,7 @@ def test_small_memory_lag_repairs_inline_without_checkpoint_advance(
             text="prior memory prompt",
         )
         snapshot = build_conversation_memory_snapshot_from_events(
-            events=(
-                _memory_projection_event_from_test_row(prior_event),
-            ),
+            events=(_memory_projection_event_from_test_row(prior_event),),
             session_id=session_id,
             consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
             policy=policy,
@@ -2320,12 +2534,12 @@ def test_small_memory_lag_repairs_inline_without_checkpoint_advance(
         )
 
         request = _build_request_with_memory(store, seeded, policy)
-        current_facts = DurableCurrentRunFactProvider(
-            store.transaction_runner
-        ).load_current_run_facts(_attempt_snapshot(seeded))
-        memory_view = DurableMemorySnapshotProvider(
-            store.transaction_runner, policy
-        ).load_memory_snapshot(_attempt_snapshot(seeded), current_facts)
+        current_facts = DurableCurrentRunFactProvider(store.transaction_runner).load_current_run_facts(
+            _attempt_snapshot(seeded)
+        )
+        memory_view = DurableMemorySnapshotProvider(store.transaction_runner, policy).load_memory_snapshot(
+            _attempt_snapshot(seeded), current_facts
+        )
         checkpoint = _read_memory_checkpoint_sequence(store.transaction_runner)
         contents = tuple(_message_content(message) for message in request.messages)
 
@@ -2354,9 +2568,7 @@ def test_inline_delta_uses_memory_filter_and_covers_required_cursor(
             text="prior memory prompt",
         )
         snapshot = build_conversation_memory_snapshot_from_events(
-            events=(
-                _memory_projection_event_from_test_row(prior_event),
-            ),
+            events=(_memory_projection_event_from_test_row(prior_event),),
             session_id=session_id,
             consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
             policy=policy,
@@ -2370,12 +2582,12 @@ def test_inline_delta_uses_memory_filter_and_covers_required_cursor(
             payload=_user_input_payload("current prompt"),
         )
 
-        current_facts = DurableCurrentRunFactProvider(
-            store.transaction_runner
-        ).load_current_run_facts(_attempt_snapshot(seeded))
-        memory_view = DurableMemorySnapshotProvider(
-            store.transaction_runner, policy
-        ).load_memory_snapshot(_attempt_snapshot(seeded), current_facts)
+        current_facts = DurableCurrentRunFactProvider(store.transaction_runner).load_current_run_facts(
+            _attempt_snapshot(seeded)
+        )
+        memory_view = DurableMemorySnapshotProvider(store.transaction_runner, policy).load_memory_snapshot(
+            _attempt_snapshot(seeded), current_facts
+        )
         required_cursor = _required_memory_cursor(store.transaction_runner, seeded)
         contents = tuple(_message_content(message) for message in memory_view.messages)
         cursor_ref = memory_view.memory_snapshot_cursor
@@ -2383,27 +2595,12 @@ def test_inline_delta_uses_memory_filter_and_covers_required_cursor(
 
         assert any("prior memory prompt" in content for content in contents)
         assert any("matching assistant answer" in content for content in contents)
-        assert all(
-            "preview should not enter memory" not in content for content in contents
-        )
-        assert all(
-            "diagnostic should not enter memory" not in content for content in contents
-        )
-        assert all(
-            "canonical unrelated should not enter memory" not in content
-            for content in contents
-        )
-        assert all(
-            "foreign session should not enter memory" not in content
-            for content in contents
-        )
-        assert (
-            f"checkpoint_event_sequence={required_cursor.checkpoint_event_sequence}"
-            in cursor_ref
-        )
-        assert (
-            f"checkpoint_event_id={required_cursor.checkpoint_event_id}" in cursor_ref
-        )
+        assert all("preview should not enter memory" not in content for content in contents)
+        assert all("diagnostic should not enter memory" not in content for content in contents)
+        assert all("canonical unrelated should not enter memory" not in content for content in contents)
+        assert all("foreign session should not enter memory" not in content for content in contents)
+        assert f"checkpoint_event_sequence={required_cursor.checkpoint_event_sequence}" in cursor_ref
+        assert f"checkpoint_event_id={required_cursor.checkpoint_event_id}" in cursor_ref
 
 
 def test_inline_delta_no_matching_rows_still_covers_required_cursor(
@@ -2419,9 +2616,7 @@ def test_inline_delta_no_matching_rows_still_covers_required_cursor(
             session_id=session_id,
             payload=_user_input_payload("current prompt"),
         )
-        current_input = _read_event_by_id(
-            store.transaction_runner, "event-current-input"
-        )
+        current_input = _read_event_by_id(store.transaction_runner, "event-current-input")
         snapshot = build_conversation_memory_snapshot_from_events(
             events=(),
             session_id=session_id,
@@ -2444,12 +2639,12 @@ def test_inline_delta_no_matching_rows_still_covers_required_cursor(
         )
         _write_memory_snapshot(store.transaction_runner, snapshot)
 
-        current_facts = DurableCurrentRunFactProvider(
-            store.transaction_runner
-        ).load_current_run_facts(_attempt_snapshot(seeded))
-        memory_view = DurableMemorySnapshotProvider(
-            store.transaction_runner, policy
-        ).load_memory_snapshot(_attempt_snapshot(seeded), current_facts)
+        current_facts = DurableCurrentRunFactProvider(store.transaction_runner).load_current_run_facts(
+            _attempt_snapshot(seeded)
+        )
+        memory_view = DurableMemorySnapshotProvider(store.transaction_runner, policy).load_memory_snapshot(
+            _attempt_snapshot(seeded), current_facts
+        )
         required_cursor = _required_memory_cursor(store.transaction_runner, seeded)
         cursor_ref = memory_view.memory_snapshot_cursor
         assert cursor_ref is not None
@@ -2459,13 +2654,8 @@ def test_inline_delta_no_matching_rows_still_covers_required_cursor(
             diagnostic.reason is MemoryDiagnosticReason.INLINE_DELTA_REPAIR_INCLUDED
             for diagnostic in memory_view.diagnostics
         )
-        assert (
-            f"checkpoint_event_sequence={required_cursor.checkpoint_event_sequence}"
-            in cursor_ref
-        )
-        assert (
-            f"checkpoint_event_id={required_cursor.checkpoint_event_id}" in cursor_ref
-        )
+        assert f"checkpoint_event_sequence={required_cursor.checkpoint_event_sequence}" in cursor_ref
+        assert f"checkpoint_event_id={required_cursor.checkpoint_event_id}" in cursor_ref
 
 
 def test_inline_delta_unable_to_cover_required_cursor_raises_repair_required(
@@ -2484,9 +2674,7 @@ def test_inline_delta_unable_to_cover_required_cursor_raises_repair_required(
             text="prior memory prompt",
         )
         snapshot = build_conversation_memory_snapshot_from_events(
-            events=(
-                _memory_projection_event_from_test_row(prior_event),
-            ),
+            events=(_memory_projection_event_from_test_row(prior_event),),
             session_id=session_id,
             consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
             policy=policy,
@@ -2504,9 +2692,7 @@ def test_inline_delta_unable_to_cover_required_cursor_raises_repair_required(
                 )
             )
 
-        assert (
-            exc_info.value.repair_request.reason is MemoryRepairReason.SNAPSHOT_DAMAGED
-        )
+        assert exc_info.value.repair_request.reason is MemoryRepairReason.SNAPSHOT_DAMAGED
 
 
 def test_inline_delta_uses_terminal_content_and_ignores_summary_fallback(
@@ -2525,9 +2711,7 @@ def test_inline_delta_uses_terminal_content_and_ignores_summary_fallback(
             text="prior memory prompt",
         )
         snapshot = build_conversation_memory_snapshot_from_events(
-            events=(
-                _memory_projection_event_from_test_row(prior_event),
-            ),
+            events=(_memory_projection_event_from_test_row(prior_event),),
             session_id=session_id,
             consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
             policy=policy,
@@ -2632,10 +2816,7 @@ def test_over_threshold_memory_lag_raises_repair_required(
         with pytest.raises(MemoryProjectionRepairRequired) as exc_info:
             _build_request_with_memory(store, seeded, policy)
 
-        assert (
-            exc_info.value.repair_request.reason
-            is MemoryRepairReason.SNAPSHOT_LAG_OVER_THRESHOLD
-        )
+        assert exc_info.value.repair_request.reason is MemoryRepairReason.SNAPSHOT_LAG_OVER_THRESHOLD
 
 
 def test_only_future_memory_snapshot_raises_missing_repair_required(
@@ -2659,9 +2840,7 @@ def test_only_future_memory_snapshot_raises_missing_repair_required(
             text="future prompt must not leak",
         )
         snapshot = build_conversation_memory_snapshot_from_events(
-            events=(
-                _memory_projection_event_from_test_row(future_event),
-            ),
+            events=(_memory_projection_event_from_test_row(future_event),),
             session_id=session_id,
             consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
             policy=policy,
@@ -2672,10 +2851,7 @@ def test_only_future_memory_snapshot_raises_missing_repair_required(
         with pytest.raises(MemoryProjectionRepairRequired) as exc_info:
             _build_request_with_memory(store, seeded, policy)
 
-        assert (
-            exc_info.value.repair_request.reason
-            is MemoryRepairReason.SNAPSHOT_MISSING
-        )
+        assert exc_info.value.repair_request.reason is MemoryRepairReason.SNAPSHOT_MISSING
 
 
 def test_memory_provider_uses_latest_snapshot_before_required_cursor(
@@ -2791,10 +2967,7 @@ def test_gross_margin_followup_uses_post_compact_evidence_backed_facts(
         assert "claim_text=Revenue was 100." in system_content
         assert "claim_text=Gross profit was 40." in system_content
         assert "evidence_refs=" not in system_content
-        assert all(
-            "older raw says revenue 100 and gross profit 40" not in content
-            for content in contents
-        )
+        assert all("older raw says revenue 100 and gross profit 40" not in content for content in contents)
         assert contents[-1] == "请基于已确认的收入和毛利计算毛利率"
 
 
@@ -2864,10 +3037,7 @@ def test_no_compaction_recent_raw_turns_continuity_still_works(
 
         assert "上轮问题：收入增长来自哪里？" in contents
         assert "上轮回答：收入增长主要来自订阅业务。" in contents
-        assert all(
-            not content.startswith("Evidence / Fact Memory:")
-            for content in contents
-        )
+        assert all(not content.startswith("Evidence / Fact Memory:") for content in contents)
         assert contents[-1] == "继续说明这个增长因素"
 
 
@@ -2913,9 +3083,7 @@ def test_post_compaction_ordinary_build_preserves_protected_recent_raw_tail(
 
         assert "请列出四条关键风险" in contents
         assert answer_text in contents
-        assert "3. 第三条是客户集中度升高，需要拆解前五大客户变化。" in (
-            "\n".join(contents)
-        )
+        assert "3. 第三条是客户集中度升高，需要拆解前五大客户变化。" in ("\n".join(contents))
         assert "第三条风险来自客户集中度原始证据" in system_content
         assert "## Recent Evidence" in system_content
         assert _message_occurrences(contents, current_prompt) == 1
@@ -2979,9 +3147,7 @@ def test_post_compaction_raw_tail_dedupes_memory_selected_recent_window(
             policy_snapshot=_policy_snapshot(),
             memory_projection_policy=policy,
             memory_snapshot_provider=_StaticMemorySnapshotProvider(memory_view),
-            compact_artifact_provider=DurableCompactArtifactProvider(
-                store.transaction_runner
-            ),
+            compact_artifact_provider=DurableCompactArtifactProvider(store.transaction_runner),
         )
         request = builder.build(_attempt_snapshot(recovery))
         contents = tuple(_message_content(message) for message in request.messages)
@@ -3020,10 +3186,7 @@ def test_post_compaction_raw_tail_skips_without_compact_or_in_fallback(
             policy,
         )
 
-        assert all(
-            answer_text not in _message_content(message)
-            for message in no_compact.messages
-        )
+        assert all(answer_text not in _message_content(message) for message in no_compact.messages)
 
     with open_host_durable_store(_options(tmp_path / "fallback")) as store:
         session_id = _ensure_session_id(store.transaction_runner)
@@ -3059,9 +3222,7 @@ def test_post_compaction_raw_tail_skips_without_compact_or_in_fallback(
             transaction_runner=store.transaction_runner,
             policy_snapshot=_policy_snapshot(),
             memory_projection_policy=policy,
-            compact_artifact_provider=DurableCompactArtifactProvider(
-                store.transaction_runner
-            ),
+            compact_artifact_provider=DurableCompactArtifactProvider(store.transaction_runner),
             context_fallback_provider=_StaticContextFallbackProvider(fallback),
         )
 
@@ -3107,9 +3268,7 @@ def test_llm_facing_evidence_source_text_filters_internal_provenance(
         ("filing:msft-10k", False),
     ),
 )
-def test_internal_evidence_source_part_detection(
-    source_part: str, expected: bool
-) -> None:
+def test_internal_evidence_source_part_detection(source_part: str, expected: bool) -> None:
     """内部 evidence source part 检测只匹配治理 provenance 前缀。"""
 
     assert _is_internal_evidence_source_part(source_part) is expected
@@ -3125,15 +3284,11 @@ def test_compact_artifact_reader_uses_vnext_evidence_mapping_refs() -> None:
                 "summary_text": "用户关注收入与毛利率。",
                 "source_labels": ["T1"],
             },
-            "evidence_backed_facts": [
-                {"claim_text": "收入增长", "evidence_labels": ["E1"]}
-            ],
+            "evidence_backed_facts": [{"claim_text": "收入增长", "evidence_labels": ["E1"]}],
             "answer_anchors": [
                 {
                     "anchor_title": "收入质量",
-                    "anchor_items": [
-                        {"display_text": "关注经常性收入", "ordinal": 1}
-                    ],
+                    "anchor_items": [{"display_text": "关注经常性收入", "ordinal": 1}],
                 }
             ],
             "forward_intents": [
@@ -3167,8 +3322,7 @@ def test_compact_artifact_reader_uses_vnext_evidence_mapping_refs() -> None:
         "fact 1: claim_text=收入增长; evidence_labels=E1",
         "answer_anchor 1: title=收入质量; items=1. 关注经常性收入",
         "forward_intent 1: type=follow_up; status=open; text=继续核对毛利率。",
-        "reference_continuity 1: text=这个因素指收入增长。; "
-        "reason=followup_reference; source_labels=T1",
+        "reference_continuity 1: text=这个因素指收入增长。; " "reason=followup_reference; source_labels=T1",
     )
     assert all("evidence_backed_facts=" not in line for line in lines)
     assert all("answer_anchors=" not in line for line in lines)
@@ -3196,14 +3350,10 @@ def test_compact_artifact_semantic_renderer_rejects_invalid_optional_text(
         "accepted_candidate": {
             "schema_version": "conversation_compact_output_v1",
             "session_summary": None,
-            "evidence_backed_facts": [
-                {"claim_text": "收入增长", "evidence_labels": ["E1"]}
-            ],
+            "evidence_backed_facts": [{"claim_text": "收入增长", "evidence_labels": ["E1"]}],
             "answer_anchors": [],
             "forward_intents": [],
-            "reference_continuity_items": [
-                {"reason": "followup_reference", "text": "这个因素指收入增长。"}
-            ],
+            "reference_continuity_items": [{"reason": "followup_reference", "text": "这个因素指收入增长。"}],
             "diagnostics": [],
         },
         "accepted_evidence_mapping_refs": ["evidence:memory-tool"],
@@ -3233,11 +3383,7 @@ def test_reference_continuity_resolves_second_factor_without_full_long_input(
     """长输入 compact 后只靠 reference continuity 解析“第二个因素”。"""
 
     policy = _memory_policy()
-    long_input = (
-        "第一因素是收入确认节奏。" * 20
-        + "第二个因素是毛利率受云业务拖累。"
-        + "第三因素是费用投放。" * 20
-    )
+    long_input = "第一因素是收入确认节奏。" * 20 + "第二个因素是毛利率受云业务拖累。" + "第三因素是费用投放。" * 20
     preserve_text = "第二个因素：毛利率受云业务拖累"
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
@@ -3295,9 +3441,7 @@ def test_memory_messages_are_stable_for_same_eventlog_and_policy(
             text="prior memory prompt",
         )
         snapshot = build_conversation_memory_snapshot_from_events(
-            events=(
-                _memory_projection_event_from_test_row(prior_event),
-            ),
+            events=(_memory_projection_event_from_test_row(prior_event),),
             session_id=session_id,
             consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
             policy=policy,
@@ -3391,9 +3535,7 @@ def test_current_facts_reject_non_dispatchable_snapshot_state(
 )
 def test_current_facts_reject_stale_snapshot_identity(
     tmp_path: Path,
-    snapshot_field: Literal[
-        "execution_id", "dispatch_record_id", "execution_target"
-    ],
+    snapshot_field: Literal["execution_id", "dispatch_record_id", "execution_target"],
     snapshot_value: str,
     message: str,
 ) -> None:
@@ -3414,17 +3556,11 @@ def test_current_facts_reject_stale_snapshot_identity(
             payload=_user_input_payload("current question"),
         )
         if snapshot_field == "execution_id":
-            stale_snapshot = replace(
-                _attempt_snapshot(seeded), execution_id=snapshot_value
-            )
+            stale_snapshot = replace(_attempt_snapshot(seeded), execution_id=snapshot_value)
         elif snapshot_field == "dispatch_record_id":
-            stale_snapshot = replace(
-                _attempt_snapshot(seeded), dispatch_record_id=snapshot_value
-            )
+            stale_snapshot = replace(_attempt_snapshot(seeded), dispatch_record_id=snapshot_value)
         else:
-            stale_snapshot = replace(
-                _attempt_snapshot(seeded), execution_target=snapshot_value
-            )
+            stale_snapshot = replace(_attempt_snapshot(seeded), execution_target=snapshot_value)
         builder = create_no_tool_run_input_builder(
             transaction_runner=store.transaction_runner,
             policy_snapshot=_policy_snapshot(),
@@ -3516,9 +3652,7 @@ def _build_post_compaction_request(
         transaction_runner=store.transaction_runner,
         policy_snapshot=_policy_snapshot(),
         memory_projection_policy=policy,
-        compact_artifact_provider=DurableCompactArtifactProvider(
-            store.transaction_runner
-        ),
+        compact_artifact_provider=DurableCompactArtifactProvider(store.transaction_runner),
     )
     return builder.build(_attempt_snapshot(seeded))
 
@@ -3539,9 +3673,7 @@ def _four_item_answer() -> str:
     )
 
 
-def _append_current_run_compacted_event(
-    transaction_runner: HostTransactionRunner, seeded: _SeededRun
-) -> None:
+def _append_current_run_compacted_event(transaction_runner: HostTransactionRunner, seeded: _SeededRun) -> None:
     """为当前 Run 追加 accepted CONTEXT_COMPACTED fact。
 
     :param transaction_runner: Host transaction runner。
@@ -3675,13 +3807,9 @@ def _active_fallback(
     """
 
     actual_selected_ids = (
-        tuple(block.block_id for block in selected_blocks)
-        if selected_block_ids is None
-        else selected_block_ids
+        tuple(block.block_id for block in selected_blocks) if selected_block_ids is None else selected_block_ids
     )
-    actual_source_refs = (
-        _source_refs_from_blocks(selected_blocks) if source_refs is None else source_refs
-    )
+    actual_source_refs = _source_refs_from_blocks(selected_blocks) if source_refs is None else source_refs
     actual_view_digest = (
         selected_material_view_digest
         if selected_material_view_digest is not None
@@ -3718,9 +3846,7 @@ def _active_fallback(
         current_input_ref=current_input_ref,
         source_refs=actual_source_refs,
         fallback_input_digest=(
-            fallback_window_digest(window)
-            if fallback_input_digest is None
-            else fallback_input_digest
+            fallback_window_digest(window) if fallback_input_digest is None else fallback_input_digest
         ),
         selected_recent_window_turn_floor=selected_recent_window_turn_floor,
         selected_raw_turn_count=actual_selected_raw_turn_count,
@@ -3841,9 +3967,7 @@ def _source_refs_from_blocks(
     return tuple(dict.fromkeys(refs))
 
 
-def _required_memory_cursor(
-    transaction_runner: HostTransactionRunner, seeded: _SeededRun
-) -> MemorySnapshotCursor:
+def _required_memory_cursor(transaction_runner: HostTransactionRunner, seeded: _SeededRun) -> MemorySnapshotCursor:
     """读取当前 Attempt 所需 memory cursor。
 
     :param transaction_runner: Host transaction runner。
@@ -3858,9 +3982,7 @@ def _required_memory_cursor(
         :returns: memory cursor。
         """
 
-        started = EventLogStore().read_event_by_id(
-            transaction, "event-attempt-started-current"
-        )
+        started = EventLogStore().read_event_by_id(transaction, "event-attempt-started-current")
         assert started is not None
         required_sequence = started.event_sequence - 1
         row = transaction.fetchone(
@@ -4206,11 +4328,7 @@ def _accepted_tool_evidence_blocks(
     :returns: accepted tool evidence blocks。
     """
 
-    return tuple(
-        block
-        for block in blocks
-        if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE
-    )
+    return tuple(block for block in blocks if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE)
 
 
 def _append_prior_accepted_tool_evidence_batch(
@@ -4285,11 +4403,7 @@ def _append_prior_accepted_tool_evidence_tx(
     tool_result_event_id = f"event-prior-tool-result-{ordinal:02d}"
     tool_call_id = f"tool-call-prior-{ordinal:02d}"
     target_run_id = f"run-prior-evidence-{ordinal:02d}" if run_id is None else run_id
-    query_text = (
-        f"Read MSFT FY2025 revenue detail {ordinal}"
-        if semantic_query_text is None
-        else semantic_query_text
-    )
+    query_text = f"Read MSFT FY2025 revenue detail {ordinal}" if semantic_query_text is None else semantic_query_text
     actual_raw_outcome = (
         {
             "kind": "completed",
@@ -4307,9 +4421,7 @@ def _append_prior_accepted_tool_evidence_tx(
     }
     arguments_json: dict[str, JsonValue] = {"arguments": arguments}
     arguments_digest = sha256_digest_json(arguments_json)
-    semantic_query_digest = sha256_digest_json(
-        {"semantic_query_text": query_text}
-    )
+    semantic_query_digest = sha256_digest_json({"semantic_query_text": query_text})
     EventLogStore().append_event(
         transaction,
         _event_request(
@@ -4326,13 +4438,9 @@ def _append_prior_accepted_tool_evidence_tx(
                 "arguments_storage_kind": TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
                 "arguments_inline_json": arguments_json,
                 "arguments_payload_ref": None,
-                "arguments_json_size_bytes": len(
-                    canonical_json_dumps(arguments_json).encode("utf-8")
-                ),
+                "arguments_json_size_bytes": len(canonical_json_dumps(arguments_json).encode("utf-8")),
                 "semantic_input_digest": semantic_query_digest,
-                "semantic_query_storage_kind": (
-                    TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT
-                ),
+                "semantic_query_storage_kind": (TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT),
                 "semantic_query_text": query_text,
                 "semantic_query_payload_ref": None,
                 "semantic_query_digest": semantic_query_digest,
@@ -4380,9 +4488,7 @@ def _append_prior_accepted_tool_evidence_tx(
             run_id=target_run_id,
             event_type="TOOL_RESULT_ACCEPTED",
             payload={
-                "accepted_evidence_envelope": (
-                    accepted_evidence_envelope_to_json_value(envelope)
-                ),
+                "accepted_evidence_envelope": (accepted_evidence_envelope_to_json_value(envelope)),
                 "raw_tool_outcome": actual_raw_outcome,
             },
         ),
@@ -4396,9 +4502,7 @@ def _append_prior_accepted_tool_evidence_tx(
     )
 
 
-def _append_rich_memory_source_events(
-    transaction_runner: HostTransactionRunner, session_id: str
-) -> None:
+def _append_rich_memory_source_events(transaction_runner: HostTransactionRunner, session_id: str) -> None:
     """追加 rich snapshot item 需要引用的 EventLog rows。
 
     :param transaction_runner: Host transaction runner。
@@ -4499,9 +4603,7 @@ def _append_rich_memory_source_events(
     transaction_runner.run_write(operation)
 
 
-def _append_compacted_gross_margin_facts(
-    transaction_runner: HostTransactionRunner, session_id: str
-) -> None:
+def _append_compacted_gross_margin_facts(transaction_runner: HostTransactionRunner, session_id: str) -> None:
     """追加 gross-margin follow-up 需要的 compacted facts。
 
     :param transaction_runner: Host transaction runner。
@@ -4584,39 +4686,39 @@ def _append_reference_continuity_compact_marker(
         :returns: compact producer EventLog row。
         """
 
-        return EventLogStore().append_event(
-            transaction,
-            _event_request(
-                event_id="event-compact-second-factor",
-                event_class=EventClass.CANONICAL_FACT,
-                session_id=session_id,
-                run_id="run-long-input",
-                event_type="CONTEXT_COMPACTED",
-                payload=_compact_payload(
-                    summary_text="long input compacted to reference continuity",
-                    pinned_patch={"candidate_id": "patch-second-factor"},
-                    fact_candidates=[],
-                    reference_continuity_items=[
-                        {
-                            "item_id": "preserve-second-factor",
-                            "label": "第二个因素",
-                            "text": "第二个因素：毛利率受云业务拖累",
-                            "source_refs": ["event-long-input"],
-                            "preserve_reason": (
-                                "needed_for_ordered_item_reference"
-                            ),
-                        }
-                    ],
+        return (
+            EventLogStore()
+            .append_event(
+                transaction,
+                _event_request(
+                    event_id="event-compact-second-factor",
+                    event_class=EventClass.CANONICAL_FACT,
+                    session_id=session_id,
+                    run_id="run-long-input",
+                    event_type="CONTEXT_COMPACTED",
+                    payload=_compact_payload(
+                        summary_text="long input compacted to reference continuity",
+                        pinned_patch={"candidate_id": "patch-second-factor"},
+                        fact_candidates=[],
+                        reference_continuity_items=[
+                            {
+                                "item_id": "preserve-second-factor",
+                                "label": "第二个因素",
+                                "text": "第二个因素：毛利率受云业务拖累",
+                                "source_refs": ["event-long-input"],
+                                "preserve_reason": ("needed_for_ordered_item_reference"),
+                            }
+                        ],
+                    ),
                 ),
-            ),
-        ).row
+            )
+            .row
+        )
 
     return transaction_runner.run_write(operation)
 
 
-def _read_event_by_id(
-    transaction_runner: HostTransactionRunner, event_id: str
-) -> EventLogRow:
+def _read_event_by_id(transaction_runner: HostTransactionRunner, event_id: str) -> EventLogRow:
     """按 event id 读取测试 EventLog row。
 
     :param transaction_runner: Host transaction runner。
@@ -4638,9 +4740,7 @@ def _read_event_by_id(
     return transaction_runner.run_read(operation)
 
 
-def _events_by_type(
-    transaction_runner: HostTransactionRunner, *, event_type: str
-) -> tuple[EventLogRow, ...]:
+def _events_by_type(transaction_runner: HostTransactionRunner, *, event_type: str) -> tuple[EventLogRow, ...]:
     """读取指定 event type 的 EventLog rows。
 
     :param transaction_runner: Host transaction runner。
@@ -4688,9 +4788,7 @@ def _message_occurrences(contents: tuple[str, ...], needle: str) -> int:
     return sum(1 for content in contents if needle in content)
 
 
-def _damage_memory_snapshot_json(
-    transaction_runner: HostTransactionRunner, snapshot_id: str
-) -> None:
+def _damage_memory_snapshot_json(transaction_runner: HostTransactionRunner, snapshot_id: str) -> None:
     """破坏 durable snapshot JSON 内的 digest。
 
     :param transaction_runner: Host transaction runner。
@@ -4721,9 +4819,7 @@ def _damage_memory_snapshot_json(
     transaction_runner.run_write(operation)
 
 
-def _run_attempt_eventlog_state(
-    transaction_runner: HostTransactionRunner, seeded: _SeededRun
-) -> tuple[str, str, int]:
+def _run_attempt_eventlog_state(transaction_runner: HostTransactionRunner, seeded: _SeededRun) -> tuple[str, str, int]:
     """读取 Run / Attempt 状态与 EventLog row 数。
 
     :param transaction_runner: Host transaction runner。
@@ -4918,18 +5014,14 @@ def _read_memory_checkpoint_sequence(
         :returns: checkpoint sequence。
         """
 
-        checkpoint = read_projection_checkpoint(
-            transaction, CONVERSATION_MEMORY_CONSUMER_ID
-        )
+        checkpoint = read_projection_checkpoint(transaction, CONVERSATION_MEMORY_CONSUMER_ID)
         assert checkpoint is not None
         return checkpoint.checkpoint_event_sequence
 
     return transaction_runner.run_read(operation)
 
 
-def _options(
-    tmp_path: Path, *, payload_inline_threshold_bytes: int = 65536
-) -> HostDurableStoreOptions:
+def _options(tmp_path: Path, *, payload_inline_threshold_bytes: int = 65536) -> HostDurableStoreOptions:
     """构造测试用 Host durable store options。
 
     :param tmp_path: pytest 临时目录。
@@ -5119,35 +5211,39 @@ def _seed_current_run_with_descriptor(
                 metadata={"kind": "user_input_accepted"},
             ),
         )
-        input_event = EventLogStore().append_event(
-            transaction,
-            EventLogAppendRequest(
-                event_id="event-current-input",
-                event_class=EventClass.CANONICAL_FACT,
-                session_id=session_id,
-                run_id="run-current",
-                attempt_id=None,
-                execution_id=None,
-                event_type="USER_INPUT_ACCEPTED",
-                occurred_at=_NOW,
-                actor="analyst",
-                source="pytest",
-                client_request_id=None,
-                idempotency_key=None,
-                policy_decision=None,
-                reason=None,
-                payload_json={
-                    "input_ref": None,
-                    "input_digest": _INPUT_DIGEST,
-                    "payload_ref": None,
-                    "payload_digest": None,
-                    "operation_kind": "start_run",
-                    "call_context_digest": _CALL_CONTEXT_DIGEST,
-                },
-                payload_ref=descriptor.payload_ref,
-                payload_digest=descriptor.payload_digest,
-            ),
-        ).row
+        input_event = (
+            EventLogStore()
+            .append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id="event-current-input",
+                    event_class=EventClass.CANONICAL_FACT,
+                    session_id=session_id,
+                    run_id="run-current",
+                    attempt_id=None,
+                    execution_id=None,
+                    event_type="USER_INPUT_ACCEPTED",
+                    occurred_at=_NOW,
+                    actor="analyst",
+                    source="pytest",
+                    client_request_id=None,
+                    idempotency_key=None,
+                    policy_decision=None,
+                    reason=None,
+                    payload_json={
+                        "input_ref": None,
+                        "input_digest": _INPUT_DIGEST,
+                        "payload_ref": None,
+                        "payload_digest": None,
+                        "operation_kind": "start_run",
+                        "call_context_digest": _CALL_CONTEXT_DIGEST,
+                    },
+                    payload_ref=descriptor.payload_ref,
+                    payload_digest=descriptor.payload_digest,
+                ),
+            )
+            .row
+        )
         create_running_run_with_starting_attempt_in_transaction(
             transaction,
             EventLogStore(),
@@ -5213,12 +5309,26 @@ def _seed_current_run_with_descriptor(
 
 
 def _append_resume_wait_projection_events(
-    transaction_runner: HostTransactionRunner, seeded: _SeededRun
+    transaction_runner: HostTransactionRunner,
+    seeded: _SeededRun,
+    *,
+    include_accepted_arguments: bool = True,
+    include_accepted_arguments_source_digest: bool = True,
+    accepted_arguments_source_digest: str | None = None,
+    wait_created_ref_case: Literal["valid", "missing", "missing_event", "wrong_event_type"] = "valid",
+    completed_value: JsonValue | None = None,
+    accepted_arguments: Mapping[str, JsonValue] | None = None,
 ) -> None:
     """追加 resume wait message 投影所需的最小事件。
 
     :param transaction_runner: Host transaction runner。
     :param seeded: 当前测试 Run 引用。
+    :param include_accepted_arguments: 是否写入新 awaiting 参数事实。
+    :param include_accepted_arguments_source_digest: 是否写入 replay 参数来源 digest。
+    :param accepted_arguments_source_digest: 覆盖 replay 参数来源 digest。
+    :param wait_created_ref_case: wait 创建事件引用 case。
+    :param completed_value: completed result value；``None`` 表示使用默认 object。
+    :param accepted_arguments: 覆盖写入 awaiting payload 的 LLM replay 参数。
     :returns: ``None``。
     """
 
@@ -5230,6 +5340,68 @@ def _append_resume_wait_projection_events(
         """
 
         event_log = EventLogStore()
+        normalized_arguments_digest = sha256_digest_json({"arguments": {"ticker": "V"}})
+        wait_payload: dict[str, JsonValue] = {
+            "wait_id": "wait-resume-private",
+            "tool_call_id": "tool-call-private",
+            "tool_name": "fake_tool",
+            "normalized_arguments_digest": normalized_arguments_digest,
+        }
+        if include_accepted_arguments:
+            wait_payload["accepted_arguments"] = accepted_arguments or {"ticker": "V"}
+        if include_accepted_arguments_source_digest:
+            wait_payload["accepted_arguments_source_digest"] = (
+                accepted_arguments_source_digest or normalized_arguments_digest
+            )
+        tool_awaiting = event_log.append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id="event-tool-awaiting-resume",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+                attempt_id=seeded.attempt_id,
+                execution_id=seeded.execution_id,
+                event_type="RUN_WAITING" if wait_created_ref_case == "wrong_event_type" else "TOOL_AWAITING",
+                occurred_at=_NOW,
+                actor="host",
+                source="pytest",
+                client_request_id=None,
+                idempotency_key="awaiting-resume",
+                policy_decision=None,
+                reason=None,
+                payload_json=wait_payload,
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        ).row
+        tool_result_payload: dict[str, JsonValue] = {
+            "wait_id": "wait-resume-private",
+            "tool_call_id": "tool-call-private",
+            "tool_name": "fake_tool",
+            "resolution_kind": "completed",
+            "tool_fact_kind": "completed",
+            "result": {
+                "kind": "completed",
+                "result": {
+                    "ok": True,
+                    "value": {"answer": 42} if completed_value is None else completed_value,
+                },
+            },
+            "payload_ref": "payload-ref-private",
+            "result_digest": _DIGEST_A,
+            "normalized_arguments_digest": normalized_arguments_digest,
+        }
+        if wait_created_ref_case == "valid" or wait_created_ref_case == "wrong_event_type":
+            tool_result_payload["wait_created_event_ref"] = {
+                "event_id": tool_awaiting.event_id,
+                "event_sequence": tool_awaiting.event_sequence,
+            }
+        elif wait_created_ref_case == "missing_event":
+            tool_result_payload["wait_created_event_ref"] = {
+                "event_id": "event-tool-awaiting-missing",
+                "event_sequence": 999,
+            }
         tool_result = event_log.append_event(
             transaction,
             EventLogAppendRequest(
@@ -5247,16 +5419,7 @@ def _append_resume_wait_projection_events(
                 idempotency_key="resolve-resume",
                 policy_decision=None,
                 reason=None,
-                payload_json={
-                    "wait_id": "wait-resume-private",
-                    "tool_call_id": "tool-call-private",
-                    "tool_name": "fake_tool",
-                    "resolution_kind": "completed",
-                    "tool_fact_kind": "completed",
-                    "result": {"ok": True, "value": {"answer": 42}},
-                    "payload_ref": "payload-ref-private",
-                    "result_digest": _DIGEST_A,
-                },
+                payload_json=tool_result_payload,
                 payload_ref=None,
                 payload_digest=None,
             ),
@@ -5329,17 +5492,21 @@ def _force_dispatch_snapshot_state(
             RunStatus.CANCELLED,
             RunStatus.LOST,
         ):
-            run_event = EventLogStore().append_event(
-                transaction,
-                _event_request(
-                    event_id="event-force-run-terminal",
-                    event_class=EventClass.CANONICAL_FACT,
-                    session_id=seeded.session_id,
-                    run_id=seeded.run_id,
-                    event_type="RUN_FAILED",
-                    payload={"reason": "force_run_terminal"},
-                ),
-            ).row
+            run_event = (
+                EventLogStore()
+                .append_event(
+                    transaction,
+                    _event_request(
+                        event_id="event-force-run-terminal",
+                        event_class=EventClass.CANONICAL_FACT,
+                        session_id=seeded.session_id,
+                        run_id=seeded.run_id,
+                        event_type="RUN_FAILED",
+                        payload={"reason": "force_run_terminal"},
+                    ),
+                )
+                .row
+            )
             transaction.execute(
                 "UPDATE host_runs "
                 "SET status = ?, terminal_event_id = ?, "
@@ -5365,17 +5532,21 @@ def _force_dispatch_snapshot_state(
             AttemptStatus.STEERED,
             AttemptStatus.LOST,
         ):
-            attempt_event = EventLogStore().append_event(
-                transaction,
-                _event_request(
-                    event_id="event-force-attempt-terminal",
-                    event_class=EventClass.CANONICAL_FACT,
-                    session_id=seeded.session_id,
-                    run_id=seeded.run_id,
-                    event_type="ATTEMPT_CANCELLED",
-                    payload={"reason": "force_attempt_terminal"},
-                ),
-            ).row
+            attempt_event = (
+                EventLogStore()
+                .append_event(
+                    transaction,
+                    _event_request(
+                        event_id="event-force-attempt-terminal",
+                        event_class=EventClass.CANONICAL_FACT,
+                        session_id=seeded.session_id,
+                        run_id=seeded.run_id,
+                        event_type="ATTEMPT_CANCELLED",
+                        payload={"reason": "force_attempt_terminal"},
+                    ),
+                )
+                .row
+            )
             transaction.execute(
                 "UPDATE host_attempts "
                 "SET status = ?, terminal_event_id = ?, "
@@ -5532,9 +5703,7 @@ def _start_recovery_attempt(
     return transaction_runner.run_write(operation)
 
 
-def _build_request(
-    store: HostDurableStore, seeded: _SeededRun
-) -> AgentRunRequest:
+def _build_request(store: HostDurableStore, seeded: _SeededRun) -> AgentRunRequest:
     """通过默认 no-tool RunInputBuilder 构造 AgentRunRequest。
 
     :param store: Host durable store。
@@ -5655,9 +5824,7 @@ def _tool_runtime_handle() -> ToolRuntimeHandle:
     return DefaultToolRuntimeFactory(EffectiveToolBundleBuilder()).create_tool_runtime(
         ToolRuntimeBuildRequest(
             effective_bundle_request=EffectiveToolBundleBuildRequest(
-                business_tool_bundle=ToolBundle(
-                    definitions=(_tool_definition("lookup_filing"),)
-                ),
+                business_tool_bundle=ToolBundle(definitions=(_tool_definition("lookup_filing"),)),
                 source_refs=(
                     ToolBundleSourceRef(
                         source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
@@ -5962,17 +6129,21 @@ def _append_user_input_tx(
     :returns: EventLog row。
     """
 
-    return EventLogStore().append_event(
-        transaction,
-        _event_request(
-            event_id=event_id,
-            event_class=event_class,
-            session_id=session_id,
-            run_id=run_id,
-            event_type="USER_INPUT_ACCEPTED",
-            payload=payload,
-        ),
-    ).row
+    return (
+        EventLogStore()
+        .append_event(
+            transaction,
+            _event_request(
+                event_id=event_id,
+                event_class=event_class,
+                session_id=session_id,
+                run_id=run_id,
+                event_type="USER_INPUT_ACCEPTED",
+                payload=payload,
+            ),
+        )
+        .row
+    )
 
 
 def _append_success_tx(
@@ -5995,17 +6166,21 @@ def _append_success_tx(
     :returns: EventLog row。
     """
 
-    return EventLogStore().append_event(
-        transaction,
-        _event_request(
-            event_id=event_id,
-            event_class=event_class,
-            session_id=session_id,
-            run_id=run_id,
-            event_type="RUN_SUCCEEDED",
-            payload={"final_answer": answer_text},
-        ),
-    ).row
+    return (
+        EventLogStore()
+        .append_event(
+            transaction,
+            _event_request(
+                event_id=event_id,
+                event_class=event_class,
+                session_id=session_id,
+                run_id=run_id,
+                event_type="RUN_SUCCEEDED",
+                payload={"final_answer": answer_text},
+            ),
+        )
+        .row
+    )
 
 
 def _event_request(
@@ -6206,9 +6381,7 @@ def _single_system_content(messages: tuple[AgentMessage, ...]) -> str:
     :raises AssertionError: system message 数量或位置非法时抛出。
     """
 
-    system_messages = tuple(
-        message for message in messages if isinstance(message, SystemMessage)
-    )
+    system_messages = tuple(message for message in messages if isinstance(message, SystemMessage))
     assert len(system_messages) == 1
     assert messages[0] is system_messages[0]
     _assert_system_content_has_no_internal_refs(system_messages[0].content)

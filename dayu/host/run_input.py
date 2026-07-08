@@ -34,6 +34,7 @@ from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.messages import (
     AgentMessage,
     AgentMessageRole,
+    AssistantToolCall,
     AssistantMessage,
     SystemMessage,
     ToolMessage,
@@ -157,6 +158,7 @@ _EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
 _EVENT_TYPE_RUN_ACCEPTED = "RUN_ACCEPTED"
 _EVENT_TYPE_RUN_STARTED = "RUN_STARTED"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
+_EVENT_TYPE_TOOL_AWAITING = "TOOL_AWAITING"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
 _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED = "RUNNER_CALL_INPUT_ASSEMBLED"
 _PAYLOAD_FIELD_DISPLAY_TEXT = "display_text"
@@ -167,6 +169,11 @@ _PAYLOAD_FIELD_FINAL_ANSWER = "final_answer"
 _PAYLOAD_FIELD_START_REASON = "start_reason"
 _PAYLOAD_FIELD_TOOL_RESULT_EVENT_REF = "tool_result_event_ref"
 _PAYLOAD_FIELD_EVENT_ID = "event_id"
+_PAYLOAD_FIELD_TOOL_CALL_ID = "tool_call_id"
+_PAYLOAD_FIELD_TOOL_NAME = "tool_name"
+_PAYLOAD_FIELD_ACCEPTED_ARGUMENTS = "accepted_arguments"
+_PAYLOAD_FIELD_ACCEPTED_ARGUMENTS_SOURCE_DIGEST = "accepted_arguments_source_digest"
+_PAYLOAD_FIELD_WAIT_CREATED_EVENT_REF = "wait_created_event_ref"
 _PAYLOAD_FIELD_COMPACT_ARTIFACT_REF = "compact_artifact_ref"
 _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST = "compact_artifact_digest"
 _PAYLOAD_FIELD_OPERATION_ID = "operation_id"
@@ -218,7 +225,7 @@ _EXECUTION_GUIDANCE_PREFIX = "Execution guidance:"
 _ACCEPTED_COMPACTED_VIEW_PREFIX = "Accepted compacted conversation view:"
 _RECENT_EVIDENCE_PREFIX = "Recent evidence:"
 _ACCEPTED_TOOL_EVIDENCE_PREFIX = "Accepted tool evidence:"
-_RESUME_GUIDANCE_PREFIX = "Resume guidance:"
+_RESUME_GUIDANCE_PREFIX = "恢复上下文："
 _EVIDENCE_SOURCE_PART_SEPARATOR = ", "
 _INTERNAL_EVIDENCE_SOURCE_PREFIXES = (
     "tool_call_event:",
@@ -257,17 +264,11 @@ _SYSTEM_ENVELOPE_FORBIDDEN_FRAGMENTS = (
     "ConversationCompactOutputVNext",
 )
 _RUNNER_CALL_MANIFEST_PAYLOAD_REF_PREFIX = "payload-runner-call-input-manifest"
-_RUNNER_CALL_MANIFEST_SQLITE_PAYLOAD_ID_PREFIX = (
-    "sqlite-payload-runner-call-input-manifest"
-)
+_RUNNER_CALL_MANIFEST_SQLITE_PAYLOAD_ID_PREFIX = "sqlite-payload-runner-call-input-manifest"
 _RUNNER_CALL_PROJECTION_PAYLOAD_REF_PREFIX = "payload-runner-call-input-projection"
-_RUNNER_CALL_PROJECTION_SQLITE_PAYLOAD_ID_PREFIX = (
-    "sqlite-payload-runner-call-input-projection"
-)
+_RUNNER_CALL_PROJECTION_SQLITE_PAYLOAD_ID_PREFIX = "sqlite-payload-runner-call-input-projection"
 _SELECTED_TOOL_SCHEMA_PAYLOAD_REF_PREFIX = "payload-selected-tool-schema-snapshot"
-_SELECTED_TOOL_SCHEMA_SQLITE_PAYLOAD_ID_PREFIX = (
-    "sqlite-payload-selected-tool-schema-snapshot"
-)
+_SELECTED_TOOL_SCHEMA_SQLITE_PAYLOAD_ID_PREFIX = "sqlite-payload-selected-tool-schema-snapshot"
 _RUNNER_CALL_EVENT_ID_PREFIX = "event-runner-call-input-assembled"
 _RUNNER_CALL_EVENT_ACTOR = "host.run_input"
 _RUNNER_CALL_EVENT_SOURCE = "host.run_input.builder"
@@ -487,9 +488,7 @@ class PolicySnapshot:
 class CurrentRunFactProvider(Protocol):
     """当前 Run durable fact provider 协议。"""
 
-    def load_current_run_facts(
-        self, snapshot: AttemptDispatchSnapshot
-    ) -> CurrentRunFacts:
+    def load_current_run_facts(self, snapshot: AttemptDispatchSnapshot) -> CurrentRunFacts:
         """读取当前 RunInputBuilder 所需 durable facts。
 
         :param snapshot: Attempt dispatch snapshot。
@@ -627,9 +626,7 @@ class ToolSchemaSnapshotProvider(Protocol):
 class ToolExecutorProvider(Protocol):
     """ToolExecutor provider 协议。"""
 
-    def load_tool_executor(
-        self, snapshot: AttemptDispatchSnapshot, current_facts: CurrentRunFacts
-    ) -> ToolExecutor:
+    def load_tool_executor(self, snapshot: AttemptDispatchSnapshot, current_facts: CurrentRunFacts) -> ToolExecutor:
         """读取 Engine ToolExecutor。
 
         :param snapshot: Attempt dispatch snapshot。
@@ -678,9 +675,7 @@ class SceneParameterProvider(Protocol):
 class PolicySnapshotProvider(Protocol):
     """Policy snapshot provider 协议。"""
 
-    def load_policy_snapshot(
-        self, snapshot: AttemptDispatchSnapshot, current_facts: CurrentRunFacts
-    ) -> PolicySnapshot:
+    def load_policy_snapshot(self, snapshot: AttemptDispatchSnapshot, current_facts: CurrentRunFacts) -> PolicySnapshot:
         """读取显式 policy snapshot。
 
         :param snapshot: Attempt dispatch snapshot。
@@ -719,9 +714,7 @@ class RunnerCallManifestRecordInput:
 class RunnerCallManifestRecorder(Protocol):
     """runner-call input assembly manifest 记录器协议。"""
 
-    def record_runner_call_manifest(
-        self, record_input: RunnerCallManifestRecordInput
-    ) -> None:
+    def record_runner_call_manifest(self, record_input: RunnerCallManifestRecordInput) -> None:
         """记录一次 logical runner call input assembly manifest。
 
         :param record_input: manifest 构造输入。
@@ -734,9 +727,7 @@ class RunnerCallManifestRecorder(Protocol):
 class NoopRunnerCallManifestRecorder:
     """不写入 manifest 的测试 recorder。"""
 
-    def record_runner_call_manifest(
-        self, record_input: RunnerCallManifestRecordInput
-    ) -> None:
+    def record_runner_call_manifest(self, record_input: RunnerCallManifestRecordInput) -> None:
         """忽略 manifest 记录请求。
 
         :param record_input: manifest 构造输入。
@@ -760,9 +751,7 @@ class DurableRunnerCallManifestRecorder:
         self._event_log_store = EventLogStore()
         self._payload_store = PayloadStore()
 
-    def record_runner_call_manifest(
-        self, record_input: RunnerCallManifestRecordInput
-    ) -> None:
+    def record_runner_call_manifest(self, record_input: RunnerCallManifestRecordInput) -> None:
         """记录一次 logical runner call input assembly manifest。
 
         :param record_input: manifest 构造输入。
@@ -798,9 +787,7 @@ class DurableRunnerCallManifestRecorder:
         )
         if existing is not None:
             return
-        runner_call_index = _next_runner_call_index(
-            transaction, run_id=record_input.current_facts.run.run_id
-        )
+        runner_call_index = _next_runner_call_index(transaction, run_id=record_input.current_facts.run.run_id)
         event_id = _runner_call_manifest_event_id(
             record_input.current_facts.run.run_id,
             record_input.current_facts.attempt.attempt_id,
@@ -883,9 +870,7 @@ class DurableCurrentRunFactProvider:
         self._transaction_runner = transaction_runner
         self._event_log_store = EventLogStore()
 
-    def load_current_run_facts(
-        self, snapshot: AttemptDispatchSnapshot
-    ) -> CurrentRunFacts:
+    def load_current_run_facts(self, snapshot: AttemptDispatchSnapshot) -> CurrentRunFacts:
         """读取当前 RunInputBuilder 所需 durable facts。
 
         :param snapshot: Attempt dispatch snapshot。
@@ -894,9 +879,7 @@ class DurableCurrentRunFactProvider:
         """
 
         return self._transaction_runner.run_read(
-            lambda transaction: self._load_current_run_facts_tx(
-                transaction, snapshot
-            )
+            lambda transaction: self._load_current_run_facts_tx(transaction, snapshot)
         )
 
     def _load_current_run_facts_tx(
@@ -912,9 +895,7 @@ class DurableCurrentRunFactProvider:
 
         run = read_run_by_id(transaction, snapshot.run_id)
         attempt = read_attempt_by_id(transaction, snapshot.attempt_id)
-        dispatch_record = read_dispatch_record_by_attempt_id(
-            transaction, snapshot.attempt_id
-        )
+        dispatch_record = read_dispatch_record_by_attempt_id(transaction, snapshot.attempt_id)
         _validate_snapshot_rows(
             snapshot=snapshot,
             run=run,
@@ -926,21 +907,15 @@ class DurableCurrentRunFactProvider:
         if run.started_event_id is None:
             raise HostDurableError("RunInputBuilder requires RUN_STARTED event")
         user_input_event = _require_event(
-            self._event_log_store.read_event_by_id(
-                transaction, run.input_event_id
-            ),
+            self._event_log_store.read_event_by_id(transaction, run.input_event_id),
             expected_type=_EVENT_TYPE_USER_INPUT_ACCEPTED,
         )
         run_accepted_event = _require_event(
-            self._event_log_store.read_event_by_id(
-                transaction, run.accepted_event_id
-            ),
+            self._event_log_store.read_event_by_id(transaction, run.accepted_event_id),
             expected_type=_EVENT_TYPE_RUN_ACCEPTED,
         )
         run_started_event = _require_event(
-            self._event_log_store.read_event_by_id(
-                transaction, run.started_event_id
-            ),
+            self._event_log_store.read_event_by_id(transaction, run.started_event_id),
             expected_type=_EVENT_TYPE_RUN_STARTED,
         )
         _validate_current_event_scope(snapshot, user_input_event)
@@ -997,9 +972,7 @@ class DurableSessionContinuityProvider:
         """
 
         return self._transaction_runner.run_read(
-            lambda transaction: self._load_session_continuity_tx(
-                transaction, snapshot, current_facts
-            )
+            lambda transaction: self._load_session_continuity_tx(transaction, snapshot, current_facts)
         )
 
     def _load_session_continuity_tx(
@@ -1017,12 +990,10 @@ class DurableSessionContinuityProvider:
         """
 
         del snapshot
-        resume_message = _resume_wait_message_from_current_start(
-            transaction, current_facts
-        )
-        if resume_message is None:
+        resume_messages = _resume_wait_messages_from_current_start(transaction, current_facts)
+        if len(resume_messages) == 0:
             return SessionContinuityView(messages=())
-        return SessionContinuityView(messages=(resume_message,))
+        return SessionContinuityView(messages=resume_messages)
 
 
 class NoopMemorySnapshotProvider:
@@ -1093,9 +1064,7 @@ class DurableMemorySnapshotProvider:
         """
 
         return self._transaction_runner.run_read(
-            lambda transaction: self._load_memory_snapshot_tx(
-                transaction, snapshot, current_facts
-            )
+            lambda transaction: self._load_memory_snapshot_tx(transaction, snapshot, current_facts)
         )
 
     def _load_memory_snapshot_tx(
@@ -1124,10 +1093,7 @@ class DurableMemorySnapshotProvider:
             memory_snapshot=memory_snapshot,
             required_event_sequence=required_event_sequence,
         )
-        lag_events = (
-            required_event_sequence
-            - memory_snapshot.cursor.checkpoint_event_sequence
-        )
+        lag_events = required_event_sequence - memory_snapshot.cursor.checkpoint_event_sequence
         if lag_events < 0:
             self._raise_repair_required(
                 session_id=snapshot.session_id,
@@ -1136,9 +1102,7 @@ class DurableMemorySnapshotProvider:
                 observed_cursor=memory_snapshot.cursor,
             )
         if lag_events <= 0:
-            return _memory_snapshot_view(
-                memory_snapshot, current_facts, self._policy
-            )
+            return _memory_snapshot_view(memory_snapshot, current_facts, self._policy)
         if (
             lag_events > self._policy.max_lag_events_for_inline_delta
             or lag_events > self._policy.max_delta_repair_events
@@ -1256,9 +1220,7 @@ class DurableMemorySnapshotProvider:
         :raises MemoryProjectionRepairRequired: delta 无法覆盖 required cursor 时抛出。
         """
 
-        event_filter = event_log_read_filter_from_projection_filter(
-            conversation_memory_projection_event_filter()
-        )
+        event_filter = event_log_read_filter_from_projection_filter(conversation_memory_projection_event_filter())
         page = self._event_log_store.read_events_after_matching(
             transaction,
             snapshot.cursor.checkpoint_event_sequence,
@@ -1487,9 +1449,7 @@ class _DurableProtectedRecentRawTailProvider:
         :raises HostDurableError: compact artifact 与 current Run 不匹配时抛出。
         """
 
-        compacted_event = _latest_compacted_event_before_attempt(
-            transaction, current_facts
-        )
+        compacted_event = _latest_compacted_event_before_attempt(transaction, current_facts)
         if compacted_event is None:
             return CompactPipelineOrdinaryRawTailHandoff(
                 messages=(),
@@ -1518,9 +1478,7 @@ class _DurableProtectedRecentRawTailProvider:
         )
         return select_ordinary_protected_raw_tail(
             source_snapshot=source_snapshot,
-            selected_recent_window_turn_floor=(
-                self._policy.selected_recent_window_turn_floor
-            ),
+            selected_recent_window_turn_floor=(self._policy.selected_recent_window_turn_floor),
             memory=memory,
         )
 
@@ -1568,9 +1526,7 @@ class DurableAcceptedToolEvidenceMaterialProvider:
             lambda transaction: self._load_accepted_tool_evidence_materials_tx(
                 transaction,
                 current_facts=current_facts,
-                represented_evidence_refs=_represented_evidence_refs(
-                    memory, compact
-                ),
+                represented_evidence_refs=_represented_evidence_refs(memory, compact),
             )
         )
 
@@ -1634,9 +1590,7 @@ class DurableCompactArtifactProvider:
         """
 
         return self._transaction_runner.run_read(
-            lambda transaction: self._load_compact_artifact_tx(
-                transaction, snapshot, current_facts
-            )
+            lambda transaction: self._load_compact_artifact_tx(transaction, snapshot, current_facts)
         )
 
     def _load_compact_artifact_tx(
@@ -1662,12 +1616,8 @@ class DurableCompactArtifactProvider:
                 compact_artifact_digest=None,
             )
         payload = _payload_object(row)
-        artifact_ref = _required_text_field(
-            payload, _PAYLOAD_FIELD_COMPACT_ARTIFACT_REF
-        )
-        artifact_digest = _required_text_field(
-            payload, _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST
-        )
+        artifact_ref = _required_text_field(payload, _PAYLOAD_FIELD_COMPACT_ARTIFACT_REF)
+        artifact_digest = _required_text_field(payload, _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST)
         message_content = _compact_artifact_message_content(
             compacted_event=row,
             payload=payload,
@@ -1704,17 +1654,13 @@ class NoopToolSchemaSnapshotProvider:
         """
 
         del snapshot, current_facts
-        return ToolSchemaSnapshot(
-            tool_schemas=(), disable_tools=True, tool_runtime_handle=None
-        )
+        return ToolSchemaSnapshot(tool_schemas=(), disable_tools=True, tool_runtime_handle=None)
 
 
 class NoToolExecutor:
     """Phase 5 no-tool 防线 executor。"""
 
-    async def execute(
-        self, request: BatchToolExecutionRequest
-    ) -> BatchToolExecutionOutcome:
+    async def execute(self, request: BatchToolExecutionRequest) -> BatchToolExecutionOutcome:
         """把所有工具调用归一为 Host cancelled outcome。
 
         :param request: Engine 发起的批式工具执行请求。
@@ -1748,9 +1694,7 @@ class NoToolExecutorProvider:
 
         self._executor = NoToolExecutor()
 
-    def load_tool_executor(
-        self, snapshot: AttemptDispatchSnapshot, current_facts: CurrentRunFacts
-    ) -> ToolExecutor:
+    def load_tool_executor(self, snapshot: AttemptDispatchSnapshot, current_facts: CurrentRunFacts) -> ToolExecutor:
         """返回 no-tool executor。
 
         :param snapshot: Attempt dispatch snapshot。
@@ -1810,9 +1754,7 @@ class ToolRuntimeSchemaSnapshotProvider:
         :returns: 带 ToolRuntimeHandle 的 schema snapshot。
         """
 
-        handle = self._handle_provider.load_tool_runtime_handle(
-            snapshot, current_facts
-        )
+        handle = self._handle_provider.load_tool_runtime_handle(snapshot, current_facts)
         return ToolSchemaSnapshot(
             tool_schemas=handle.tool_schemas,
             disable_tools=False,
@@ -1832,9 +1774,7 @@ class ToolRuntimeExecutorProvider:
 
         self._handle_provider = handle_provider
 
-    def load_tool_executor(
-        self, snapshot: AttemptDispatchSnapshot, current_facts: CurrentRunFacts
-    ) -> ToolExecutor:
+    def load_tool_executor(self, snapshot: AttemptDispatchSnapshot, current_facts: CurrentRunFacts) -> ToolExecutor:
         """读取 tool-enabled ToolExecutor。
 
         :param snapshot: Attempt dispatch snapshot。
@@ -1842,9 +1782,7 @@ class ToolRuntimeExecutorProvider:
         :returns: ToolRuntimeHandle 暴露的 executor。
         """
 
-        return self._handle_provider.load_tool_runtime_handle(
-            snapshot, current_facts
-        ).tool_executor
+        return self._handle_provider.load_tool_runtime_handle(snapshot, current_facts).tool_executor
 
 
 class DefaultSceneParameterProvider:
@@ -1875,9 +1813,7 @@ class DefaultSceneParameterProvider:
                 _tools_scene_line(tool_execution_mode),
             )
         )
-        return (
-            SystemMessage(role=AgentMessageRole.SYSTEM, content=content),
-        )
+        return (SystemMessage(role=AgentMessageRole.SYSTEM, content=content),)
 
 
 class StaticPolicySnapshotProvider:
@@ -1892,9 +1828,7 @@ class StaticPolicySnapshotProvider:
 
         self._policy_snapshot = policy_snapshot
 
-    def load_policy_snapshot(
-        self, snapshot: AttemptDispatchSnapshot, current_facts: CurrentRunFacts
-    ) -> PolicySnapshot:
+    def load_policy_snapshot(self, snapshot: AttemptDispatchSnapshot, current_facts: CurrentRunFacts) -> PolicySnapshot:
         """返回构造时注入的 policy snapshot。
 
         :param snapshot: Attempt dispatch snapshot。
@@ -1919,9 +1853,7 @@ class RunInputBuilder:
         session_continuity_provider: SessionContinuityProvider,
         memory_snapshot_provider: MemorySnapshotProvider,
         compact_artifact_provider: CompactArtifactProvider,
-        accepted_tool_evidence_material_provider: (
-            AcceptedToolEvidenceMaterialProvider
-        ),
+        accepted_tool_evidence_material_provider: AcceptedToolEvidenceMaterialProvider,
         context_fallback_provider: ContextFallbackProvider,
         tool_schema_snapshot_provider: ToolSchemaSnapshotProvider,
         tool_executor_provider: ToolExecutorProvider,
@@ -1929,9 +1861,7 @@ class RunInputBuilder:
         policy_snapshot_provider: PolicySnapshotProvider,
         tool_execution_mode: ToolExecutionMode,
         runner_call_manifest_recorder: RunnerCallManifestRecorder | None = None,
-        protected_recent_raw_tail_provider: (
-            CompactPipelineProtectedRawTailProvider | None
-        ) = None,
+        protected_recent_raw_tail_provider: CompactPipelineProtectedRawTailProvider | None = None,
     ) -> None:
         """初始化 RunInputBuilder。
 
@@ -1958,9 +1888,7 @@ class RunInputBuilder:
         self._session_continuity_provider = session_continuity_provider
         self._memory_snapshot_provider = memory_snapshot_provider
         self._compact_artifact_provider = compact_artifact_provider
-        self._accepted_tool_evidence_material_provider = (
-            accepted_tool_evidence_material_provider
-        )
+        self._accepted_tool_evidence_material_provider = accepted_tool_evidence_material_provider
         self._context_fallback_provider = context_fallback_provider
         self._tool_schema_snapshot_provider = tool_schema_snapshot_provider
         self._tool_executor_provider = tool_executor_provider
@@ -1968,9 +1896,7 @@ class RunInputBuilder:
         self._policy_snapshot_provider = policy_snapshot_provider
         self._tool_execution_mode = tool_execution_mode
         self._runner_call_manifest_recorder = (
-            NoopRunnerCallManifestRecorder()
-            if runner_call_manifest_recorder is None
-            else runner_call_manifest_recorder
+            NoopRunnerCallManifestRecorder() if runner_call_manifest_recorder is None else runner_call_manifest_recorder
         )
         self._protected_recent_raw_tail_provider = (
             _NoopProtectedRecentRawTailProvider()
@@ -1986,32 +1912,19 @@ class RunInputBuilder:
         :raises HostDurableError: durable facts 缺失、不匹配或 provider 违反工具模式约束时抛出。
         """
 
-        current_facts = self._current_run_provider.load_current_run_facts(
-            attempt_snapshot
-        )
-        policy_snapshot = self._policy_snapshot_provider.load_policy_snapshot(
-            attempt_snapshot, current_facts
-        )
-        continuity = self._session_continuity_provider.load_session_continuity(
-            attempt_snapshot, current_facts
-        )
-        memory = self._memory_snapshot_provider.load_memory_snapshot(
-            attempt_snapshot, current_facts
-        )
-        compact = self._compact_artifact_provider.load_compact_artifact(
-            attempt_snapshot, current_facts
-        )
+        current_facts = self._current_run_provider.load_current_run_facts(attempt_snapshot)
+        policy_snapshot = self._policy_snapshot_provider.load_policy_snapshot(attempt_snapshot, current_facts)
+        continuity = self._session_continuity_provider.load_session_continuity(attempt_snapshot, current_facts)
+        memory = self._memory_snapshot_provider.load_memory_snapshot(attempt_snapshot, current_facts)
+        compact = self._compact_artifact_provider.load_compact_artifact(attempt_snapshot, current_facts)
         fallback = self._context_fallback_provider.load_context_fallback(
             run_id=current_facts.run.run_id,
-            run_started_event_sequence=(
-                current_facts.run_started_event.event_sequence
-            ),
+            run_started_event_sequence=(current_facts.run_started_event.event_sequence),
             current_input_ref=current_facts.user_input_event.event_id,
         )
         if fallback is None:
             protected_recent_raw_tail = (
-                self._protected_recent_raw_tail_provider
-                .load_ordinary_raw_tail(
+                self._protected_recent_raw_tail_provider.load_ordinary_raw_tail(
                     attempt_snapshot,
                     current_facts,
                     memory,
@@ -2033,14 +1946,11 @@ class RunInputBuilder:
                 *continuity.messages,
             )
         else:
-            evidence = (
-                self._accepted_tool_evidence_material_provider
-                .load_accepted_tool_evidence_materials(
-                    attempt_snapshot,
-                    current_facts,
-                    memory,
-                    compact,
-                )
+            evidence = self._accepted_tool_evidence_material_provider.load_accepted_tool_evidence_materials(
+                attempt_snapshot,
+                current_facts,
+                memory,
+                compact,
             )
             fallback_material_blocks = (
                 fallback.material_blocks
@@ -2057,12 +1967,8 @@ class RunInputBuilder:
                 fallback=fallback,
                 material_blocks=fallback_material_blocks,
             )
-        tool_snapshot = self._tool_schema_snapshot_provider.load_tool_schema_snapshot(
-            attempt_snapshot, current_facts
-        )
-        tool_executor = self._tool_executor_provider.load_tool_executor(
-            attempt_snapshot, current_facts
-        )
+        tool_snapshot = self._tool_schema_snapshot_provider.load_tool_schema_snapshot(attempt_snapshot, current_facts)
+        tool_executor = self._tool_executor_provider.load_tool_executor(attempt_snapshot, current_facts)
         _validate_tool_mode_snapshot(
             self._tool_execution_mode,
             tool_snapshot,
@@ -2078,10 +1984,7 @@ class RunInputBuilder:
                 self._tool_execution_mode,
             ),
             *bounded_context_messages,
-            UserMessage(
-                role=AgentMessageRole.USER,
-                content=current_facts.user_prompt,
-            ),
+            *_current_user_tail_messages(current_facts, continuity),
         )
         messages = _normalize_ordinary_run_messages(candidate_messages)
         self._runner_call_manifest_recorder.record_runner_call_manifest(
@@ -2112,9 +2015,7 @@ class RunInputBuilder:
             cancellation_token=attempt_snapshot.cancellation_token,
         )
 
-    def build_material_blocks(
-        self, attempt_snapshot: AttemptDispatchSnapshot
-    ) -> tuple[RunInputMaterialBlock, ...]:
+    def build_material_blocks(self, attempt_snapshot: AttemptDispatchSnapshot) -> tuple[RunInputMaterialBlock, ...]:
         """构造与 ordinary Run input 同源的 compact material block view。
 
         本方法是 Host internal helper，供 Context Governance / compact builder
@@ -2126,23 +2027,12 @@ class RunInputBuilder:
         :raises HostDurableError: durable facts 缺失或 provider 读取失败时抛出。
         """
 
-        current_facts = self._current_run_provider.load_current_run_facts(
-            attempt_snapshot
-        )
-        continuity = self._session_continuity_provider.load_session_continuity(
-            attempt_snapshot, current_facts
-        )
-        memory = self._memory_snapshot_provider.load_memory_snapshot(
-            attempt_snapshot, current_facts
-        )
-        compact = self._compact_artifact_provider.load_compact_artifact(
-            attempt_snapshot, current_facts
-        )
-        evidence = (
-            self._accepted_tool_evidence_material_provider
-            .load_accepted_tool_evidence_materials(
-                attempt_snapshot, current_facts, memory, compact
-            )
+        current_facts = self._current_run_provider.load_current_run_facts(attempt_snapshot)
+        continuity = self._session_continuity_provider.load_session_continuity(attempt_snapshot, current_facts)
+        memory = self._memory_snapshot_provider.load_memory_snapshot(attempt_snapshot, current_facts)
+        compact = self._compact_artifact_provider.load_compact_artifact(attempt_snapshot, current_facts)
+        evidence = self._accepted_tool_evidence_material_provider.load_accepted_tool_evidence_materials(
+            attempt_snapshot, current_facts, memory, compact
         )
         return build_run_input_material_blocks(
             current_facts=current_facts,
@@ -2181,35 +2071,23 @@ def create_no_tool_run_input_builder(
         raise ValueError("create_no_tool_run_input_builder requires no-tool mode")
     return RunInputBuilder(
         current_run_provider=DurableCurrentRunFactProvider(transaction_runner),
-        session_continuity_provider=DurableSessionContinuityProvider(
-            transaction_runner
-        ),
+        session_continuity_provider=DurableSessionContinuityProvider(transaction_runner),
         memory_snapshot_provider=(
-            NoopMemorySnapshotProvider()
-            if memory_snapshot_provider is None
-            else memory_snapshot_provider
+            NoopMemorySnapshotProvider() if memory_snapshot_provider is None else memory_snapshot_provider
         ),
         compact_artifact_provider=(
-            NoopCompactArtifactProvider()
-            if compact_artifact_provider is None
-            else compact_artifact_provider
+            NoopCompactArtifactProvider() if compact_artifact_provider is None else compact_artifact_provider
         ),
-        accepted_tool_evidence_material_provider=(
-            DurableAcceptedToolEvidenceMaterialProvider(transaction_runner)
-        ),
+        accepted_tool_evidence_material_provider=(DurableAcceptedToolEvidenceMaterialProvider(transaction_runner)),
         context_fallback_provider=(
-            NoopContextFallbackProvider()
-            if context_fallback_provider is None
-            else context_fallback_provider
+            NoopContextFallbackProvider() if context_fallback_provider is None else context_fallback_provider
         ),
         tool_schema_snapshot_provider=NoopToolSchemaSnapshotProvider(),
         tool_executor_provider=NoToolExecutorProvider(),
         scene_parameter_provider=DefaultSceneParameterProvider(),
         policy_snapshot_provider=StaticPolicySnapshotProvider(policy_snapshot),
         tool_execution_mode=tool_execution_mode,
-        runner_call_manifest_recorder=DurableRunnerCallManifestRecorder(
-            transaction_runner
-        ),
+        runner_call_manifest_recorder=DurableRunnerCallManifestRecorder(transaction_runner),
         protected_recent_raw_tail_provider=(
             None
             if memory_projection_policy is None
@@ -2247,37 +2125,23 @@ def create_tool_enabled_run_input_builder(
     handle_provider = StaticToolRuntimeHandleProvider(tool_runtime_handle)
     return RunInputBuilder(
         current_run_provider=DurableCurrentRunFactProvider(transaction_runner),
-        session_continuity_provider=DurableSessionContinuityProvider(
-            transaction_runner
-        ),
+        session_continuity_provider=DurableSessionContinuityProvider(transaction_runner),
         memory_snapshot_provider=(
-            NoopMemorySnapshotProvider()
-            if memory_snapshot_provider is None
-            else memory_snapshot_provider
+            NoopMemorySnapshotProvider() if memory_snapshot_provider is None else memory_snapshot_provider
         ),
         compact_artifact_provider=(
-            NoopCompactArtifactProvider()
-            if compact_artifact_provider is None
-            else compact_artifact_provider
+            NoopCompactArtifactProvider() if compact_artifact_provider is None else compact_artifact_provider
         ),
-        accepted_tool_evidence_material_provider=(
-            DurableAcceptedToolEvidenceMaterialProvider(transaction_runner)
-        ),
+        accepted_tool_evidence_material_provider=(DurableAcceptedToolEvidenceMaterialProvider(transaction_runner)),
         context_fallback_provider=(
-            NoopContextFallbackProvider()
-            if context_fallback_provider is None
-            else context_fallback_provider
+            NoopContextFallbackProvider() if context_fallback_provider is None else context_fallback_provider
         ),
-        tool_schema_snapshot_provider=ToolRuntimeSchemaSnapshotProvider(
-            handle_provider
-        ),
+        tool_schema_snapshot_provider=ToolRuntimeSchemaSnapshotProvider(handle_provider),
         tool_executor_provider=ToolRuntimeExecutorProvider(handle_provider),
         scene_parameter_provider=DefaultSceneParameterProvider(),
         policy_snapshot_provider=StaticPolicySnapshotProvider(policy_snapshot),
         tool_execution_mode=ToolExecutionMode.TOOL_ENABLED,
-        runner_call_manifest_recorder=DurableRunnerCallManifestRecorder(
-            transaction_runner
-        ),
+        runner_call_manifest_recorder=DurableRunnerCallManifestRecorder(transaction_runner),
         protected_recent_raw_tail_provider=(
             None
             if memory_projection_policy is None
@@ -2352,9 +2216,7 @@ def _require_event(row: EventLogRow | None, *, expected_type: str) -> EventLogRo
     return row
 
 
-def _validate_current_event_scope(
-    snapshot: AttemptDispatchSnapshot, event: EventLogRow
-) -> None:
+def _validate_current_event_scope(snapshot: AttemptDispatchSnapshot, event: EventLogRow) -> None:
     """校验当前 Run 事件归属。
 
     :param snapshot: Attempt dispatch snapshot。
@@ -2435,9 +2297,7 @@ def _memory_messages(
     summary = _memory_session_summary_message(snapshot)
     if summary is not None:
         messages.append(summary)
-    facts = _memory_evidence_fact_message(
-        snapshot.evidence_fact_memory.evidence_backed_facts
-    )
+    facts = _memory_evidence_fact_message(snapshot.evidence_fact_memory.evidence_backed_facts)
     if facts is not None:
         messages.append(facts)
     anchors = _memory_answer_anchor_message(snapshot)
@@ -2446,9 +2306,7 @@ def _memory_messages(
     intents = _memory_forward_intent_message(snapshot)
     if intents is not None:
         messages.append(intents)
-    reference = _memory_reference_continuity_message(
-        snapshot.trace_memory.reference_continuity_items
-    )
+    reference = _memory_reference_continuity_message(snapshot.trace_memory.reference_continuity_items)
     if reference is not None:
         messages.append(reference)
     messages.extend(
@@ -2492,11 +2350,7 @@ def _memory_evidence_fact_message(
         return None
     lines = [_MEMORY_EVIDENCE_FACT_HEADER]
     for index, fact in enumerate(facts, start=1):
-        lines.append(
-            f"Source F{index}: "
-            f"claim_text={fact.claim_text}; "
-            f"evidence_kind={fact.evidence_kind.value}"
-        )
+        lines.append(f"Source F{index}: " f"claim_text={fact.claim_text}; " f"evidence_kind={fact.evidence_kind.value}")
     return SystemMessage(
         role=AgentMessageRole.SYSTEM,
         content="\n".join(lines),
@@ -2518,11 +2372,7 @@ def _memory_answer_anchor_message(
     lines = [_MEMORY_ANSWER_ANCHOR_HEADER]
     for anchor in anchors:
         child_text = "; ".join(
-            (
-                child.display_text
-                if child.ordinal is None
-                else f"{child.ordinal}. {child.display_text}"
-            )
+            (child.display_text if child.ordinal is None else f"{child.ordinal}. {child.display_text}")
             for child in anchor.anchor_items
         )
         lines.append(f"answer_anchor=title={anchor.anchor_title}; items={child_text}")
@@ -2543,10 +2393,7 @@ def _memory_forward_intent_message(
         return None
     lines = [_MEMORY_FORWARD_INTENT_HEADER]
     for intent in intents:
-        lines.append(
-            "forward_intent="
-            f"type={intent.intent_type}; status={intent.status}; text={intent.text}"
-        )
+        lines.append("forward_intent=" f"type={intent.intent_type}; status={intent.status}; text={intent.text}")
     return SystemMessage(role=AgentMessageRole.SYSTEM, content="\n".join(lines))
 
 
@@ -2727,9 +2574,7 @@ def _normalize_ordinary_run_messages(
         含内部治理标识时抛出。
     """
 
-    sections: dict[str, list[str]] = {
-        section: [] for section in _SYSTEM_ENVELOPE_SECTION_ORDER
-    }
+    sections: dict[str, list[str]] = {section: [] for section in _SYSTEM_ENVELOPE_SECTION_ORDER}
     non_system_messages: list[AgentMessage] = []
     source_system_chars = 0
     for message in messages:
@@ -2834,9 +2679,7 @@ def _system_envelope_section_and_body(content: str) -> tuple[str, str]:
     return (_SYSTEM_SECTION_TASK_INSTRUCTIONS, content)
 
 
-def _stripped_prefixed_system_body(
-    content: str, *, prefix: str, section: str
-) -> tuple[str, str]:
+def _stripped_prefixed_system_body(content: str, *, prefix: str, section: str) -> tuple[str, str]:
     """移除候选 material 内部分类前缀并返回指定 section。
 
     :param content: 候选 system message 内容。
@@ -2878,8 +2721,7 @@ def _render_system_envelope(section_blocks: tuple[tuple[str, str, int], ...]) ->
     """
 
     rendered_sections = tuple(
-        f"{_SYSTEM_ENVELOPE_HEADER_PREFIX}{section}\n{body}"
-        for section, body, _item_count in section_blocks
+        f"{_SYSTEM_ENVELOPE_HEADER_PREFIX}{section}\n{body}" for section, body, _item_count in section_blocks
     )
     return _SYSTEM_ENVELOPE_SEPARATOR.join(rendered_sections)
 
@@ -2904,9 +2746,7 @@ def _validate_system_envelope_content(
         raise HostDurableError("ordinary system envelope exceeded deterministic overhead")
     for fragment in _SYSTEM_ENVELOPE_FORBIDDEN_FRAGMENTS:
         if fragment in content:
-            raise HostDurableError(
-                "ordinary system envelope exposes internal governance material"
-            )
+            raise HostDurableError("ordinary system envelope exposes internal governance material")
 
 
 def _system_envelope_overhead(section_blocks: tuple[tuple[str, str, int], ...]) -> int:
@@ -2919,13 +2759,10 @@ def _system_envelope_overhead(section_blocks: tuple[tuple[str, str, int], ...]) 
     if not section_blocks:
         return 0
     header_chars = sum(
-        len(_SYSTEM_ENVELOPE_HEADER_PREFIX) + len(section) + 1
-        for section, _body, _item_count in section_blocks
+        len(_SYSTEM_ENVELOPE_HEADER_PREFIX) + len(section) + 1 for section, _body, _item_count in section_blocks
     )
     separator_chars = len(_SYSTEM_ENVELOPE_SEPARATOR) * (len(section_blocks) - 1)
-    item_separator_chars = sum(
-        item_count - 1 for _section, _body, item_count in section_blocks
-    )
+    item_separator_chars = sum(item_count - 1 for _section, _body, item_count in section_blocks)
     return header_chars + separator_chars + item_separator_chars
 
 
@@ -2999,9 +2836,7 @@ def _selected_material_render_view(
     selected_ids = frozenset(fallback.selected_block_ids)
     if len(selected_ids) != len(fallback.selected_block_ids):
         raise HostDurableError("fallback selected block ids must be unique")
-    selected_blocks = tuple(
-        block for block in material_blocks if block.block_id in selected_ids
-    )
+    selected_blocks = tuple(block for block in material_blocks if block.block_id in selected_ids)
     if len(selected_blocks) != len(selected_ids):
         raise HostDurableError("fallback selected block id is missing from material view")
     current_block = _selected_current_input_block(
@@ -3013,15 +2848,11 @@ def _selected_material_render_view(
         raise HostDurableError("fallback selected source refs mismatch")
     if (
         fallback.fallback_input_window is not None
-        and fallback_window_digest(fallback.fallback_input_window)
-        != fallback.fallback_input_digest
+        and fallback_window_digest(fallback.fallback_input_window) != fallback.fallback_input_digest
     ):
         raise HostDurableError("fallback input digest mismatch")
     view_digest = selected_material_view_digest(selected_blocks)
-    if (
-        fallback.selected_material_view_digest is not None
-        and fallback.selected_material_view_digest != view_digest
-    ):
+    if fallback.selected_material_view_digest is not None and fallback.selected_material_view_digest != view_digest:
         raise HostDurableError("fallback selected material view digest mismatch")
     _validate_fallback_protected_groups(
         fallback=fallback,
@@ -3106,9 +2937,7 @@ def _validate_fallback_protected_groups(
     """
 
     if fallback.selected_raw_turn_count is not None:
-        selected_raw_turn_count = sum(
-            1 for block in selected_blocks if is_turn_group_material_block(block)
-        )
+        selected_raw_turn_count = sum(1 for block in selected_blocks if is_turn_group_material_block(block))
         if selected_raw_turn_count != fallback.selected_raw_turn_count:
             raise HostDurableError("fallback selected raw turn count mismatch")
     if fallback.selected_recent_window_turn_floor is None:
@@ -3118,20 +2947,15 @@ def _validate_fallback_protected_groups(
     try:
         protected_group_ids = protected_recent_turn_group_ids_for_material_blocks(
             material_blocks,
-            selected_recent_window_turn_floor=(
-                fallback.selected_recent_window_turn_floor
-            ),
+            selected_recent_window_turn_floor=(fallback.selected_recent_window_turn_floor),
         )
     except ValueError as exc:
-        raise HostDurableError(
-            "fallback protected turn_group_id consistency mismatch"
-        ) from exc
+        raise HostDurableError("fallback protected turn_group_id consistency mismatch") from exc
     selected_ids = frozenset(block.block_id for block in selected_blocks)
     expected_protected_ids = frozenset(
         block.block_id
         for block in material_blocks
-        if block.turn_group_id in protected_group_ids
-        and is_turn_group_material_block(block)
+        if block.turn_group_id in protected_group_ids and is_turn_group_material_block(block)
     )
     if not expected_protected_ids.issubset(selected_ids):
         raise HostDurableError("fallback protected group consistency mismatch")
@@ -3214,14 +3038,8 @@ def _llm_facing_evidence_source_text(source_text: str | None) -> str | None:
 
     if source_text is None:
         return None
-    parts = tuple(
-        part.strip()
-        for part in source_text.split(_EVIDENCE_SOURCE_PART_SEPARATOR)
-        if part.strip() != ""
-    )
-    visible_parts = tuple(
-        part for part in parts if not _is_internal_evidence_source_part(part)
-    )
+    parts = tuple(part.strip() for part in source_text.split(_EVIDENCE_SOURCE_PART_SEPARATOR) if part.strip() != "")
+    visible_parts = tuple(part for part in parts if not _is_internal_evidence_source_part(part))
     if len(visible_parts) == 0:
         return None
     return _EVIDENCE_SOURCE_PART_SEPARATOR.join(visible_parts)
@@ -3234,10 +3052,7 @@ def _is_internal_evidence_source_part(source_part: str) -> bool:
     :returns: 内部 provenance 返回 ``True``。
     """
 
-    return any(
-        source_part.startswith(prefix)
-        for prefix in _INTERNAL_EVIDENCE_SOURCE_PREFIXES
-    )
+    return any(source_part.startswith(prefix) for prefix in _INTERNAL_EVIDENCE_SOURCE_PREFIXES)
 
 
 def _run_input_message_content(message: AgentMessage) -> str:
@@ -3353,9 +3168,7 @@ def _compact_material_source_ref(compact: CompactArtifactView) -> str:
     return "compact:no-artifact"
 
 
-def _represented_evidence_refs(
-    memory: MemorySnapshotView, compact: CompactArtifactView
-) -> tuple[str, ...]:
+def _represented_evidence_refs(memory: MemorySnapshotView, compact: CompactArtifactView) -> tuple[str, ...]:
     """合并 memory 与 compact artifact 已表示的 evidence refs。
 
     :param memory: memory provider view。
@@ -3389,9 +3202,7 @@ def _memory_cursor_ref(cursor: MemorySnapshotCursor) -> str:
     )
 
 
-def _memory_projection_event_from_row(
-    transaction: HostTransaction, row: EventLogRow
-) -> MemoryProjectionEvent:
+def _memory_projection_event_from_row(transaction: HostTransaction, row: EventLogRow) -> MemoryProjectionEvent:
     """把 EventLog row 转换为 memory projection event。
 
     :param transaction: Host transaction。
@@ -3417,9 +3228,7 @@ def _memory_projection_event_from_row(
     )
 
 
-def _payload_with_assistant_final_answer(
-    transaction: HostTransaction, row: EventLogRow
-) -> Mapping[str, JsonValue]:
+def _payload_with_assistant_final_answer(transaction: HostTransaction, row: EventLogRow) -> Mapping[str, JsonValue]:
     """必要时把 memory projection 需要的 transient payload 补齐。
 
     :param transaction: Host transaction。
@@ -3539,9 +3348,7 @@ def _validate_loaded_compact_view_matches_event(
 
     payload = _payload_object(compacted_event)
     artifact_ref = _required_text_field(payload, _PAYLOAD_FIELD_COMPACT_ARTIFACT_REF)
-    artifact_digest = _required_text_field(
-        payload, _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST
-    )
+    artifact_digest = _required_text_field(payload, _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST)
     if compact.compact_artifact_ref != artifact_ref:
         raise HostDurableError("compact artifact ref does not match current run")
     if compact.compact_artifact_digest != artifact_digest:
@@ -3567,10 +3374,7 @@ def _compaction_trigger_source_for_compacted_event(
         _PAYLOAD_FIELD_OPERATION_ID,
     )
     requested_event = EventLogStore().read_event_by_id(transaction, operation_id)
-    if (
-        requested_event is None
-        or requested_event.event_type != CONTEXT_COMPACTION_REQUESTED
-    ):
+    if requested_event is None or requested_event.event_type != CONTEXT_COMPACTION_REQUESTED:
         raise HostDurableError("compaction requested event is missing")
     requested_payload = _payload_object(requested_event)
     trigger_value = _required_text_field(
@@ -3626,9 +3430,7 @@ def _accepted_evidence_mapping_refs(
     :raises HostDurableError: 字段缺失或包含非文本元素时抛出。
     """
 
-    return _required_text_list_field(
-        payload, _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS
-    )
+    return _required_text_list_field(payload, _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS)
 
 
 def _vnext_compact_candidate_semantic_lines(
@@ -3643,14 +3445,10 @@ def _vnext_compact_candidate_semantic_lines(
 
     candidate = _required_mapping_field(payload, _PAYLOAD_FIELD_ACCEPTED_CANDIDATE)
     _required_text_field(candidate, _PAYLOAD_FIELD_SCHEMA_VERSION)
-    facts = _required_mapping_list_field(
-        candidate, _PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS
-    )
+    facts = _required_mapping_list_field(candidate, _PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS)
     anchors = _required_mapping_list_field(candidate, _PAYLOAD_FIELD_ANSWER_ANCHORS)
     intents = _required_mapping_list_field(candidate, _PAYLOAD_FIELD_FORWARD_INTENTS)
-    references = _required_mapping_list_field(
-        candidate, _PAYLOAD_FIELD_REFERENCE_CONTINUITY_ITEMS
-    )
+    references = _required_mapping_list_field(candidate, _PAYLOAD_FIELD_REFERENCE_CONTINUITY_ITEMS)
     lines: list[str] = []
     session_summary = _optional_session_summary_text(candidate)
     if session_summary is not None:
@@ -3674,9 +3472,7 @@ def _accepted_compact_fact_lines(
 
     lines: list[str] = []
     for index, fact in enumerate(facts, start=1):
-        parts = [
-            f"fact {index}: claim_text={_required_text_field(fact, _PAYLOAD_FIELD_CLAIM_TEXT)}"
-        ]
+        parts = [f"fact {index}: claim_text={_required_text_field(fact, _PAYLOAD_FIELD_CLAIM_TEXT)}"]
         evidence_kind = _optional_semantic_text_field(
             fact,
             _PAYLOAD_FIELD_EVIDENCE_KIND,
@@ -3778,9 +3574,7 @@ def _accepted_compact_reference_lines(
 
     lines: list[str] = []
     for index, reference in enumerate(references, start=1):
-        parts = [
-            f"reference_continuity {index}: text={_required_text_field(reference, _PAYLOAD_FIELD_TEXT)}"
-        ]
+        parts = [f"reference_continuity {index}: text={_required_text_field(reference, _PAYLOAD_FIELD_TEXT)}"]
         reason = _optional_semantic_text_field(reference, _PAYLOAD_FIELD_REASON)
         if reason is not None:
             parts.append(f"reason={reason}")
@@ -3812,9 +3606,7 @@ def _optional_session_summary_text(
     return _required_text_field(value, _PAYLOAD_FIELD_SUMMARY_TEXT)
 
 
-def _required_mapping_field(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> Mapping[str, JsonValue]:
+def _required_mapping_field(payload: Mapping[str, JsonValue], field_name: str) -> Mapping[str, JsonValue]:
     """读取必填 JSON object 字段。
 
     :param payload: JSON payload。
@@ -3851,9 +3643,7 @@ def _required_mapping_list_field(
     return tuple(items)
 
 
-def _required_text_list_field(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> tuple[str, ...]:
+def _required_text_list_field(payload: Mapping[str, JsonValue], field_name: str) -> tuple[str, ...]:
     """读取必填文本 list 字段。
 
     :param payload: JSON payload。
@@ -3873,9 +3663,7 @@ def _required_text_list_field(
     return tuple(result)
 
 
-def _optional_text_list_field(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> tuple[str, ...]:
+def _optional_text_list_field(payload: Mapping[str, JsonValue], field_name: str) -> tuple[str, ...]:
     """读取可选文本 list 字段。
 
     :param payload: JSON payload。
@@ -3912,9 +3700,7 @@ def _required_text_field(payload: Mapping[str, JsonValue], field_name: str) -> s
     return value
 
 
-def _optional_semantic_text_field(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> str | None:
+def _optional_semantic_text_field(payload: Mapping[str, JsonValue], field_name: str) -> str | None:
     """读取 accepted compact semantic renderer 的可选文本字段。
 
     字段不存在时表示该 semantic item 不提供该属性；字段一旦存在，必须是
@@ -3931,9 +3717,7 @@ def _optional_semantic_text_field(
     return _required_text_field(payload, field_name)
 
 
-def _optional_mapping_text(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> str | None:
+def _optional_mapping_text(payload: Mapping[str, JsonValue], field_name: str) -> str | None:
     """从 mapping 读取可选文本字段。
 
     :param payload: payload 映射。
@@ -3971,14 +3755,56 @@ def _system_prompt_message(system_prompt: str | None) -> tuple[SystemMessage, ..
 
     if system_prompt is None:
         return ()
+    return (SystemMessage(role=AgentMessageRole.SYSTEM, content=system_prompt),)
+
+
+def _current_user_tail_messages(
+    current_facts: CurrentRunFacts,
+    continuity: SessionContinuityView,
+) -> tuple[UserMessage, ...]:
+    """返回普通 dispatch 需要追加的当前用户消息。
+
+    resume continuity 若已经重建 ``user -> assistant(tool_call) -> tool``
+    闭环，则当前用户消息已在 continuity 中，不能再次追加到末尾。
+
+    :param current_facts: 当前 Run facts。
+    :param continuity: session continuity view。
+    :returns: 需要追加的当前用户消息；resume 工具闭环已包含时为空。
+    """
+
+    if _continuity_contains_current_user(current_facts, continuity):
+        return ()
     return (
-        SystemMessage(role=AgentMessageRole.SYSTEM, content=system_prompt),
+        UserMessage(
+            role=AgentMessageRole.USER,
+            content=current_facts.user_prompt,
+        ),
     )
 
 
-def _optional_payload_text(
-    payload: Mapping[str, JsonValue], *, field_name: str
-) -> str | None:
+def _continuity_contains_current_user(
+    current_facts: CurrentRunFacts,
+    continuity: SessionContinuityView,
+) -> bool:
+    """判断 continuity 是否已包含当前用户输入。
+
+    ``DurableSessionContinuityProvider`` 当前只返回 resume 专用的
+    ``user -> assistant(tool_call) -> tool`` 消息，不拼接 memory 或 snapshot 前缀。
+    这里仍遍历完整 continuity，避免未来 provider 组合调整后因前缀消息导致当前
+    用户输入被重复追加。
+
+    :param current_facts: 当前 Run facts。
+    :param continuity: session continuity view。
+    :returns: 任一 continuity 用户消息等于当前用户输入时返回 ``True``。
+    """
+
+    for message in continuity.messages:
+        if isinstance(message, UserMessage) and message.content == current_facts.user_prompt:
+            return True
+    return False
+
+
+def _optional_payload_text(payload: Mapping[str, JsonValue], *, field_name: str) -> str | None:
     """读取 payload 中的可选文本字段。
 
     :param payload: payload 映射。
@@ -3997,9 +3823,7 @@ def _optional_payload_text(
     return value
 
 
-def _execution_target_from_accepted_event(
-    event: EventLogRow, *, fallback: str
-) -> str:
+def _execution_target_from_accepted_event(event: EventLogRow, *, fallback: str) -> str:
     """从 RUN_ACCEPTED payload 读取 execution target。
 
     :param event: RUN_ACCEPTED event。
@@ -4009,34 +3833,28 @@ def _execution_target_from_accepted_event(
     """
 
     payload = _payload_object(event)
-    value = _optional_payload_text(
-        payload, field_name=_PAYLOAD_FIELD_EXECUTION_TARGET
-    )
+    value = _optional_payload_text(payload, field_name=_PAYLOAD_FIELD_EXECUTION_TARGET)
     if value is None:
         return fallback
     return value
 
 
-def _resume_wait_message_from_current_start(
+def _resume_wait_messages_from_current_start(
     transaction: HostTransaction, current_facts: CurrentRunFacts
-) -> SystemMessage | None:
-    """从当前 resume ``RUN_STARTED`` 重建 wait result fact message。
+) -> tuple[AgentMessage, ...]:
+    """从当前 resume ``RUN_STARTED`` 重建 wait result continuation messages。
 
     :param transaction: Host durable transaction。
     :param current_facts: 当前 Run facts。
-    :returns: resume wait fact system message；非 resume Attempt 返回 ``None``。
+    :returns: resume continuation messages；非 resume Attempt 返回空元组。
     :raises HostDurableError: resume payload 或引用事件无法投影时抛出。
     """
 
     start_payload = _payload_object(current_facts.run_started_event)
-    start_reason = _optional_payload_text(
-        start_payload, field_name=_PAYLOAD_FIELD_START_REASON
-    )
+    start_reason = _optional_payload_text(start_payload, field_name=_PAYLOAD_FIELD_START_REASON)
     if start_reason != "resume":
-        return None
-    tool_result_event_id = _event_id_from_payload_ref(
-        start_payload, field_name=_PAYLOAD_FIELD_TOOL_RESULT_EVENT_REF
-    )
+        return ()
+    tool_result_event_id = _event_id_from_payload_ref(start_payload, field_name=_PAYLOAD_FIELD_TOOL_RESULT_EVENT_REF)
     tool_result_event = read_event_by_id(transaction, tool_result_event_id)
     if tool_result_event is None:
         raise HostDurableError("resume tool result event not found")
@@ -4045,37 +3863,180 @@ def _resume_wait_message_from_current_start(
         expected_type=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
     )
     payload = _payload_object(tool_result_event)
-    result_text = json.dumps(
-        payload.get("result"),
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
+    accepted_arguments = _resume_wait_accepted_arguments(transaction, payload)
+    if accepted_arguments is None:
+        return (_resume_wait_fallback_message(payload),)
+    tool_call_id = _required_payload_text(payload, field_name=_PAYLOAD_FIELD_TOOL_CALL_ID)
+    tool_name = _required_payload_text(payload, field_name=_PAYLOAD_FIELD_TOOL_NAME)
+    return (
+        UserMessage(role=AgentMessageRole.USER, content=current_facts.user_prompt),
+        AssistantMessage(
+            role=AgentMessageRole.ASSISTANT,
+            content=None,
+            reasoning_content=None,
+            tool_calls=(
+                AssistantToolCall(
+                    id=tool_call_id,
+                    name=tool_name,
+                    arguments=accepted_arguments,
+                    provider_state=None,
+                ),
+            ),
+        ),
+        ToolMessage(
+            role=AgentMessageRole.TOOL,
+            tool_call_id=tool_call_id,
+            content=_resume_wait_tool_message_content(payload),
+        ),
     )
+
+
+def _resume_wait_fallback_message(payload: Mapping[str, JsonValue]) -> SystemMessage:
+    """构造缺少工具参数时的 resume system guidance。
+
+    :param payload: ``TOOL_RESULT_ACCEPTED`` payload。
+    :returns: 自解释 resume guidance system message。
+    """
+
+    result_text = _resume_wait_tool_message_content(payload)
     content = "\n".join(
         (
             _RESUME_GUIDANCE_PREFIX,
-            "A previous interrupted step has an accepted wait result.",
-            f"tool_name={_required_payload_text(payload, field_name='tool_name')}",
-            "resolution_kind="
-            f"{_required_payload_text(payload, field_name='resolution_kind')}",
-            "tool_fact_kind="
-            f"{_required_payload_text(payload, field_name='tool_fact_kind')}",
-            f"result={result_text}",
-            (
-                "This wait result is the accepted result for the interrupted "
-                "tool request. If the interrupted step made duplicate requests "
-                "for the same tool with the same arguments, treat this same "
-                "result as covering those duplicate requests. Do not call the "
-                "same tool again only to obtain the same result."
-            ),
+            "上一轮被等待中断的外部工具步骤已经完成。",
+            f"完成的工具：{_required_payload_text(payload, field_name=_PAYLOAD_FIELD_TOOL_NAME)}",
+            f"完成状态：{_required_payload_text(payload, field_name='resolution_kind')}",
+            f"工具结果：{result_text}",
+            ("这是同一次用户请求中已完成的工具结果。继续回答用户；不要为了" "同一次请求再次启动相同下载、上传或处理。"),
         )
     )
     return SystemMessage(role=AgentMessageRole.SYSTEM, content=content)
 
 
-def _event_id_from_payload_ref(
-    payload: Mapping[str, JsonValue], *, field_name: str
+def _resume_wait_accepted_arguments(
+    transaction: HostTransaction, tool_result_payload: Mapping[str, JsonValue]
+) -> Mapping[str, JsonValue] | None:
+    """读取 resume 等待工具调用的已接受参数。
+
+    :param transaction: Host durable transaction。
+    :param tool_result_payload: ``TOOL_RESULT_ACCEPTED`` payload。
+    :returns: LLM-safe replay 工具参数；旧记录或异常引用无法重建时返回 ``None``。
+    :raises HostDurableError: 新字段存在但结构损坏或 digest 不一致时抛出。
+    """
+
+    wait_event_id = _optional_event_id_from_payload_ref(
+        tool_result_payload,
+        field_name=_PAYLOAD_FIELD_WAIT_CREATED_EVENT_REF,
+    )
+    if wait_event_id is None:
+        return None
+    wait_event = read_event_by_id(transaction, wait_event_id)
+    if wait_event is None:
+        return None
+    if wait_event.event_type != _EVENT_TYPE_TOOL_AWAITING:
+        return None
+    wait_payload = _payload_object(wait_event)
+    value = wait_payload.get(_PAYLOAD_FIELD_ACCEPTED_ARGUMENTS)
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise HostDurableError("resume wait accepted arguments must be object")
+    accepted_arguments = dict(value)
+    source_digest = wait_payload.get(_PAYLOAD_FIELD_ACCEPTED_ARGUMENTS_SOURCE_DIGEST)
+    if source_digest is None:
+        return None
+    if not isinstance(source_digest, str) or source_digest.strip() == "":
+        raise HostDurableError("resume wait accepted arguments source digest must be text")
+    wait_normalized_digest = _required_payload_text(wait_payload, field_name="normalized_arguments_digest")
+    if source_digest != wait_normalized_digest:
+        raise HostDurableError("resume wait accepted arguments digest mismatch")
+    return accepted_arguments
+
+
+def _resume_wait_tool_message_content(
+    tool_result_payload: Mapping[str, JsonValue],
 ) -> str:
+    """把 wait resolution result 投影为 LLM-facing tool message content。
+
+    :param tool_result_payload: ``TOOL_RESULT_ACCEPTED`` payload。
+    :returns: 与 Engine 普通工具注入一致的扁平 JSON 字符串。
+    :raises HostDurableError: result 结构缺失或非法时抛出。
+    """
+
+    result = tool_result_payload.get("result")
+    if not isinstance(result, Mapping):
+        raise HostDurableError("resume wait result must be object")
+    kind = _required_payload_text(result, field_name="kind")
+    body = result.get("result")
+    if not isinstance(body, Mapping):
+        raise HostDurableError("resume wait result body must be object")
+    if kind == "completed":
+        projected = _resume_wait_completed_tool_content(body)
+    elif kind == "failed":
+        projected = _resume_wait_failed_tool_content(body)
+    elif kind == "cancelled":
+        projected = _resume_wait_cancelled_tool_content(body)
+    else:
+        raise HostDurableError("resume wait result kind is not resumable")
+    return json.dumps(projected, ensure_ascii=False, sort_keys=True)
+
+
+def _resume_wait_completed_tool_content(
+    result_body: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    """投影 completed wait result 的 tool message JSON。
+
+    :param result_body: completed result body。
+    :returns: LLM-facing JSON object。
+    """
+
+    value = result_body.get("value")
+    if isinstance(value, Mapping):
+        return dict(value)
+    return {"content": value}
+
+
+def _resume_wait_failed_tool_content(
+    result_body: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    """投影 failed wait result 的 tool message JSON。
+
+    :param result_body: failed result body。
+    :returns: LLM-facing JSON object。
+    :raises HostDurableError: 必填错误字段缺失时抛出。
+    """
+
+    projected: dict[str, JsonValue] = {
+        "error": _required_payload_text(result_body, field_name="error"),
+        "message": _required_payload_text(result_body, field_name="message"),
+    }
+    hint = _optional_payload_text(result_body, field_name="hint")
+    if hint is not None:
+        projected["hint"] = hint
+    return projected
+
+
+def _resume_wait_cancelled_tool_content(
+    result_body: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    """投影 cancelled wait result 的 tool message JSON。
+
+    :param result_body: cancelled result body。
+    :returns: LLM-facing JSON object。
+    :raises HostDurableError: 必填取消字段缺失时抛出。
+    """
+
+    projected: dict[str, JsonValue] = {
+        "cancelled": True,
+        "reason": _required_payload_text(result_body, field_name="reason"),
+        "message": _required_payload_text(result_body, field_name="message"),
+    }
+    hint = _optional_payload_text(result_body, field_name="hint")
+    if hint is not None:
+        projected["hint"] = hint
+    return projected
+
+
+def _event_id_from_payload_ref(payload: Mapping[str, JsonValue], *, field_name: str) -> str:
     """从 payload 中读取嵌套 event ref 的 event_id。
 
     :param payload: payload 映射。
@@ -4091,6 +4052,24 @@ def _event_id_from_payload_ref(
     if not isinstance(event_id, str) or event_id.strip() == "":
         raise HostDurableError(f"payload field {field_name}.event_id is invalid")
     return event_id
+
+
+def _optional_event_id_from_payload_ref(payload: Mapping[str, JsonValue], *, field_name: str) -> str | None:
+    """从可选 payload event ref 中读取 event_id。
+
+    resume wait 的旧事实可能没有 wait 创建事件引用；该缺失只表示无法安全重建
+    assistant tool call，应由调用方降级到 fallback guidance。字段一旦存在则必须
+    是结构合法的 event ref，避免掩盖 schema 编码错误。
+
+    :param payload: payload 映射。
+    :param field_name: event ref 字段名。
+    :returns: event_id；字段缺失时返回 ``None``。
+    :raises HostDurableError: 字段存在但结构非法时抛出。
+    """
+
+    if field_name not in payload or payload.get(field_name) is None:
+        return None
+    return _event_id_from_payload_ref(payload, field_name=field_name)
 
 
 def _validate_tool_mode_snapshot(
@@ -4110,16 +4089,12 @@ def _validate_tool_mode_snapshot(
     """
 
     if tool_execution_mode == ToolExecutionMode.TOOL_ENABLED:
-        _validate_tool_enabled_snapshot(
-            tool_snapshot, policy_snapshot, tool_executor
-        )
+        _validate_tool_enabled_snapshot(tool_snapshot, policy_snapshot, tool_executor)
         return
     _validate_no_tool_snapshot(tool_snapshot, policy_snapshot)
 
 
-def _validate_no_tool_snapshot(
-    tool_snapshot: ToolSchemaSnapshot, policy_snapshot: PolicySnapshot
-) -> None:
+def _validate_no_tool_snapshot(tool_snapshot: ToolSchemaSnapshot, policy_snapshot: PolicySnapshot) -> None:
     """校验 no-tool request 约束。
 
     :param tool_snapshot: tool schema snapshot。
@@ -4159,13 +4134,9 @@ def _validate_tool_enabled_snapshot(
     if tool_snapshot.tool_runtime_handle is None:
         raise HostDurableError("RunInputBuilder tool-enabled mode requires handle")
     if tool_snapshot.tool_runtime_handle.tool_schemas != tool_snapshot.tool_schemas:
-        raise HostDurableError(
-            "RunInputBuilder tool schemas must come from ToolRuntimeHandle"
-        )
+        raise HostDurableError("RunInputBuilder tool schemas must come from ToolRuntimeHandle")
     if tool_snapshot.tool_runtime_handle.tool_executor is not tool_executor:
-        raise HostDurableError(
-            "RunInputBuilder tool executor must come from same ToolRuntimeHandle"
-        )
+        raise HostDurableError("RunInputBuilder tool executor must come from same ToolRuntimeHandle")
 
 
 def _find_existing_runner_call_manifest_event(
@@ -4204,10 +4175,7 @@ def _find_existing_runner_call_manifest_event(
         if event is None:
             raise HostDurableError("runner-call manifest event row is missing")
         payload = _payload_object(event)
-        if (
-            payload.get("attempt_id") == attempt_id
-            and payload.get("execution_id") == execution_id
-        ):
+        if payload.get("attempt_id") == attempt_id and payload.get("execution_id") == execution_id:
             return event
     return None
 
@@ -4315,13 +4283,9 @@ def _runner_call_projection_body(
         "runner_call_trigger_reason": trigger_reason,
         "iteration_id": None,
         "iteration_index": None,
-        "runner_input_serializer_schema_version": (
-            RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-        ),
+        "runner_input_serializer_schema_version": (RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
         "message_count": len(messages),
-        "role_sequence_digest": runner_role_sequence_digest(
-            _message_role_values(record_input.messages)
-        ),
+        "role_sequence_digest": runner_role_sequence_digest(_message_role_values(record_input.messages)),
         "messages": list(messages),
     }
 
@@ -4346,12 +4310,8 @@ def _runner_call_projection_message(
         "content": _message_content_text(message),
         "content_digest": _message_content_digest(message),
         "content_size_bytes": _message_content_size_bytes(message),
-        "source_refs": list(
-            _message_source_refs(record_input, index=index, message=message)
-        ),
-        "projector_metadata_id": _projector_metadata_id_for_message(
-            record_input, index=index, message=message
-        ),
+        "source_refs": list(_message_source_refs(record_input, index=index, message=message)),
+        "projector_metadata_id": _projector_metadata_id_for_message(record_input, index=index, message=message),
     }
     if isinstance(message, ToolMessage):
         base["tool_call_id"] = message.tool_call_id
@@ -4381,9 +4341,7 @@ def _provider_state_projection(
         return None
     return {
         "provider": "gemini",
-        "state_digest": sha256_digest_json(
-            {"thought_signature": provider_state.thought_signature}
-        ),
+        "state_digest": sha256_digest_json({"thought_signature": provider_state.thought_signature}),
     }
 
 
@@ -4487,10 +4445,7 @@ def _selected_tool_schema_snapshot_body(
         "execution_id": record_input.current_facts.attempt.execution_id,
         "disable_tools": record_input.tool_snapshot.disable_tools,
         "tool_schema_count": len(record_input.tool_snapshot.tool_schemas),
-        "tool_schemas": [
-            _tool_schema_json(schema)
-            for schema in record_input.tool_snapshot.tool_schemas
-        ],
+        "tool_schemas": [_tool_schema_json(schema) for schema in record_input.tool_snapshot.tool_schemas],
     }
 
 
@@ -4507,9 +4462,7 @@ def _tool_schema_json(schema: ToolSchema) -> Mapping[str, JsonValue]:
         "required": list(schema.function.parameters.required),
     }
     if schema.function.parameters.additional_properties is not None:
-        parameters["additionalProperties"] = (
-            schema.function.parameters.additional_properties
-        )
+        parameters["additionalProperties"] = schema.function.parameters.additional_properties
     return {
         "type": schema.type,
         "function": {
@@ -4537,9 +4490,7 @@ def _runner_call_manifest_body(
     """
 
     roles = _message_role_values(record_input.messages)
-    message_entries = _runner_call_message_entries(
-        record_input, projection_descriptor=projection_descriptor
-    )
+    message_entries = _runner_call_message_entries(record_input, projection_descriptor=projection_descriptor)
     projector_metadata = _runner_call_projector_metadata(record_input)
     source_cursor_refs = _source_cursor_refs(record_input)
     input_projection_digest = _input_projection_digest(
@@ -4562,29 +4513,17 @@ def _runner_call_manifest_body(
         "iteration_index": None,
         "message_count": len(record_input.messages),
         "role_sequence_digest": runner_role_sequence_digest(roles),
-        "runner_input_serializer_schema_version": (
-            RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
-        ),
+        "runner_input_serializer_schema_version": (RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION),
         "input_projection_digest": input_projection_digest,
         "runner_call_projection_artifact_ref": projection_descriptor.payload_ref,
-        "runner_call_projection_artifact_digest": (
-            projection_descriptor.payload_digest
-        ),
-        "runner_call_projection_artifact_size_bytes": (
-            projection_descriptor.payload_size_bytes
-        ),
+        "runner_call_projection_artifact_digest": (projection_descriptor.payload_digest),
+        "runner_call_projection_artifact_size_bytes": (projection_descriptor.payload_size_bytes),
         "message_entries": list(message_entries),
         "source_cursor_refs": list(source_cursor_refs),
-        "tool_schema_snapshot_refs": list(
-            _tool_schema_snapshot_refs(tool_schema_descriptor)
-        ),
-        "memory_snapshot_cursor_ref": _memory_snapshot_cursor_ref(
-            record_input.memory
-        ),
+        "tool_schema_snapshot_refs": list(_tool_schema_snapshot_refs(tool_schema_descriptor)),
+        "memory_snapshot_cursor_ref": _memory_snapshot_cursor_ref(record_input.memory),
         "compact_artifact_refs": list(_compact_artifact_refs(record_input.compact)),
-        "context_fallback_decision_ref": _context_fallback_decision_ref(
-            record_input.fallback
-        ),
+        "context_fallback_decision_ref": _context_fallback_decision_ref(record_input.fallback),
         "projector_metadata": list(projector_metadata),
         "compactor_identity": None,
         "diagnostic": None,
@@ -4656,9 +4595,7 @@ def _runner_call_manifest_hot_payload(
         "execution_id": _manifest_optional_text(manifest, "execution_id"),
         "runner_call_index": _manifest_int(manifest, "runner_call_index"),
         "runner_call_kind": _manifest_text(manifest, "runner_call_kind"),
-        "runner_call_trigger_reason": _manifest_text(
-            manifest, "runner_call_trigger_reason"
-        ),
+        "runner_call_trigger_reason": _manifest_text(manifest, "runner_call_trigger_reason"),
         "iteration_id": _manifest_optional_text(manifest, "iteration_id"),
         "iteration_index": manifest.get("iteration_index"),
         "manifest_payload_ref": manifest_payload_ref,
@@ -4667,15 +4604,9 @@ def _runner_call_manifest_hot_payload(
         "validation_status": _RUNNER_CALL_VALIDATION_COMPLETE,
         "message_count": _manifest_int(manifest, "message_count"),
         "role_sequence_digest": _manifest_text(manifest, "role_sequence_digest"),
-        "input_projection_digest": _manifest_text(
-            manifest, "input_projection_digest"
-        ),
-        "runner_call_projection_artifact_ref": _manifest_text(
-            manifest, "runner_call_projection_artifact_ref"
-        ),
-        "runner_call_projection_artifact_digest": _manifest_text(
-            manifest, "runner_call_projection_artifact_digest"
-        ),
+        "input_projection_digest": _manifest_text(manifest, "input_projection_digest"),
+        "runner_call_projection_artifact_ref": _manifest_text(manifest, "runner_call_projection_artifact_ref"),
+        "runner_call_projection_artifact_digest": _manifest_text(manifest, "runner_call_projection_artifact_digest"),
         "runner_call_projection_artifact_size_bytes": _manifest_int(
             manifest, "runner_call_projection_artifact_size_bytes"
         ),
@@ -4684,9 +4615,7 @@ def _runner_call_manifest_hot_payload(
     }
 
 
-def _complete_runner_call_hot_diagnostic(
-    manifest: Mapping[str, JsonValue]
-) -> Mapping[str, JsonValue]:
+def _complete_runner_call_hot_diagnostic(manifest: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
     """构造 complete runner-call hot payload diagnostic。
 
     :param manifest: manifest body。
@@ -4812,14 +4741,10 @@ def _runner_call_message_entry(
         "role": message.role.value,
         "content_digest": _message_content_digest(message),
         "content_size_bytes": _message_content_size_bytes(message),
-        "source_refs": list(
-            _message_source_refs(record_input, index=index, message=message)
-        ),
+        "source_refs": list(_message_source_refs(record_input, index=index, message=message)),
         "projection_artifact_ref": projection_descriptor.payload_ref,
         "projection_artifact_digest": projection_descriptor.payload_digest,
-        "projector_metadata_id": _projector_metadata_id_for_message(
-            record_input, index=index, message=message
-        ),
+        "projector_metadata_id": _projector_metadata_id_for_message(record_input, index=index, message=message),
         "provider_tool_calls_digest": _assistant_tool_calls_digest(message),
         "reasoning_content_digest": _assistant_reasoning_content_digest(message),
     }
@@ -4836,18 +4761,14 @@ def _runner_call_projector_metadata(
 
     metadata_by_id: dict[str, Mapping[str, JsonValue]] = {}
     for index, message in enumerate(record_input.messages):
-        metadata_id = _projector_metadata_id_for_message(
-            record_input, index=index, message=message
-        )
+        metadata_id = _projector_metadata_id_for_message(record_input, index=index, message=message)
         if metadata_id in metadata_by_id:
             continue
         metadata_by_id[metadata_id] = _projector_metadata(
             metadata_id=metadata_id,
             projector_id=_projector_id_for_message(record_input, index, message),
             purpose=_projector_purpose(record_input),
-            source_contract_refs=_message_source_refs(
-                record_input, index=index, message=message
-            ),
+            source_contract_refs=_message_source_refs(record_input, index=index, message=message),
         )
     return tuple(metadata_by_id.values())
 
@@ -4885,9 +4806,7 @@ def _projector_metadata(
     }
 
 
-def _projector_metadata_summary(
-    manifest: Mapping[str, JsonValue]
-) -> tuple[Mapping[str, JsonValue], ...]:
+def _projector_metadata_summary(manifest: Mapping[str, JsonValue]) -> tuple[Mapping[str, JsonValue], ...]:
     """从 manifest body 复制 Tool Trace 可缓存的 projector metadata summary。
 
     :param manifest: manifest body。
@@ -4904,13 +4823,9 @@ def _projector_metadata_summary(
             raise HostDurableError("runner-call projector metadata must be object")
         summaries.append(
             {
-                "projector_metadata_id": _manifest_text(
-                    item, "projector_metadata_id"
-                ),
+                "projector_metadata_id": _manifest_text(item, "projector_metadata_id"),
                 "projector_id": _manifest_text(item, "projector_id"),
-                "projector_schema_version": _manifest_text(
-                    item, "projector_schema_version"
-                ),
+                "projector_schema_version": _manifest_text(item, "projector_schema_version"),
                 "projector_digest": _manifest_text(item, "projector_digest"),
                 "purpose": _manifest_text(item, "purpose"),
             }
@@ -5145,8 +5060,7 @@ def _tool_schema_snapshot_refs(
     return (
         "tool_schema_snapshot_ref:" + tool_schema_descriptor.payload_ref,
         "tool_schema_snapshot_digest:" + tool_schema_descriptor.payload_digest,
-        "tool_schema_snapshot_size_bytes:"
-        + str(tool_schema_descriptor.payload_size_bytes),
+        "tool_schema_snapshot_size_bytes:" + str(tool_schema_descriptor.payload_size_bytes),
     )
 
 
@@ -5270,9 +5184,7 @@ def _manifest_text(payload: Mapping[str, JsonValue], field_name: str) -> str:
     return value
 
 
-def _manifest_optional_text(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> str | None:
+def _manifest_optional_text(payload: Mapping[str, JsonValue], field_name: str) -> str | None:
     """读取 manifest 中的可选文本字段。
 
     :param payload: manifest JSON object。

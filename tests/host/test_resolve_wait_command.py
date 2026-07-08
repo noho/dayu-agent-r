@@ -17,6 +17,7 @@ from dayu.contracts.tool_outcome import (
 from dayu.contracts.tool_result import ToolResultFailure, ToolResultSuccess
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
+from dayu.engine.contracts.messages import AssistantMessage, ToolMessage, UserMessage
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.host import (
     AttemptDispatchSnapshot,
@@ -141,15 +142,19 @@ def test_resolve_wait_completed_resumes_run_and_wakes_dispatch(
         request_for_resume = _build_resume_request(
             host._transaction_runner(), seeded.session_id, snapshot.current_attempt_id
         )
-        assert any(
-            isinstance(message.content, str)
-            and "A previous interrupted step has an accepted wait result."
-            in message.content
-            and "tool_name=long_tool" in message.content
-            and "resolution_kind=completed" in message.content
-            and '"answer":42' in message.content
-            for message in request_for_resume.messages
-        )
+        assert len(request_for_resume.messages) == 4
+        assert isinstance(request_for_resume.messages[1], UserMessage)
+        assert request_for_resume.messages[1].content == "hello"
+        assistant = request_for_resume.messages[2]
+        assert isinstance(assistant, AssistantMessage)
+        assert len(assistant.tool_calls) == 1
+        assert assistant.tool_calls[0].id == "tool-call-resolve"
+        assert assistant.tool_calls[0].name == "long_tool"
+        assert assistant.tool_calls[0].arguments == {"name": "long_tool"}
+        tool = request_for_resume.messages[3]
+        assert isinstance(tool, ToolMessage)
+        assert tool.tool_call_id == "tool-call-resolve"
+        assert tool.content == '{"answer": 42}'
     finally:
         host.close()
 
@@ -856,7 +861,10 @@ def _awaiting_candidate(seeded: _SeededWaitingRun) -> ToolAwaitingAcceptCandidat
         tool_name="long_tool",
         tool_schema_digest=sha256_digest_json({"schema": "long_tool"}),
         tool_identity_digest=sha256_digest_json({"identity": "long_tool"}),
-        normalized_arguments_digest=sha256_digest_json({"arguments": "long_tool"}),
+        normalized_arguments_digest=sha256_digest_json(
+            {"arguments": {"name": "long_tool"}}
+        ),
+        accepted_arguments={"name": "long_tool"},
         await_spec=await_spec,
         snapshot_ref=None,
         binding=binding,

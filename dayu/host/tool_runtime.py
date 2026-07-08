@@ -6941,6 +6941,7 @@ def _tool_awaiting_accept_candidate(
         tool_schema_digest=tool_schema_digest,
         tool_identity_digest=tool_identity_digest,
         normalized_arguments_digest=normalized_arguments_digest,
+        accepted_arguments=call.arguments,
         await_spec=awaiting_outcome.await_spec,
         snapshot_ref=snapshot_ref,
         binding=binding,

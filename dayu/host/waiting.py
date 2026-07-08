@@ -198,6 +198,7 @@ class ToolAwaitingAcceptCandidate:
     :param tool_schema_digest: 工具 schema digest。
     :param tool_identity_digest: 工具身份 digest。
     :param normalized_arguments_digest: 规范化参数 digest。
+    :param accepted_arguments: 与 ``normalized_arguments_digest`` 同源的工具参数。
     :param await_spec: 工具等待规约。
     :param snapshot_ref: 可选等待快照引用。
     :param binding: Host 选择的等待 adapter binding。
@@ -217,6 +218,7 @@ class ToolAwaitingAcceptCandidate:
     tool_schema_digest: str
     tool_identity_digest: str
     normalized_arguments_digest: str
+    accepted_arguments: Mapping[str, JsonValue]
     await_spec: ToolAwaitSpec
     snapshot_ref: WaitSnapshotRef | None
     binding: WaitAdapterBinding
@@ -261,6 +263,11 @@ class ToolAwaitingAcceptCandidate:
             and self.external_job_ref.adapter_key != self.binding.adapter_key
         ):
             raise ValueError("external_job_ref adapter_key must match binding")
+        if (
+            sha256_digest_json({"arguments": dict(self.accepted_arguments)})
+            != self.normalized_arguments_digest
+        ):
+            raise ValueError("accepted_arguments digest mismatch")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1727,6 +1734,8 @@ def _tool_awaiting_event_request(
             wait_id=candidate.wait_id,
             tool_call_id=candidate.tool_call_id,
             tool_name=candidate.tool_name,
+            normalized_arguments_digest=candidate.normalized_arguments_digest,
+            accepted_arguments=candidate.accepted_arguments,
             await_spec=candidate.await_spec,
             adapter_key=candidate.binding.adapter_key.value,
             resume_policy=candidate.binding.resume_policy.value,

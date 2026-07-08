@@ -83,7 +83,7 @@ flowchart TD
 ## 主要组件
 
 - `dayu.contracts`：`JsonValue`、`CancellationToken`、工具 schema、工具声明、工具调用请求、工具 outcome、等待 outcome、`ToolExecutor` 和工具来源引用。
-- `dayu.runtime`：日志级别与装配、协作式取消等待、runtime lane、filelock、diagnostic 文本脱敏、有界截断、digest、workspace 路径契约、config loader、location resolver、scene prepare、tool discovery、assembly helper 与 tool truncation defaults。
+- `dayu.runtime`：日志级别与装配、协作式取消等待、runtime lane、filelock、diagnostic 文本脱敏、JSON 敏感字段脱敏、有界截断、digest、workspace 路径契约、config loader、location resolver、scene prepare、tool discovery、assembly helper 与 tool truncation defaults。
 - `dayu.config`：包内默认 `models`、`execution_profiles`、`host_runtime`、`runtime_lanes`、`tool_discovery` 和 prompt / scene 资产。
 - `dayu.service.host_assembly`：从 runtime config、prepared scene、工具发现和 secret mapping 组合 Host construction-time inputs 与 per-run request。
 - `dayu.service.fins_direct`：从 product entrypoint 显式参数构造 Fins download / preprocess / upload typed request，并把 Fins direct runtime events 以 `AsyncIterator[FinsEvent]` 形式交给调用方消费。

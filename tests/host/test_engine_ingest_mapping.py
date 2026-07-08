@@ -1389,6 +1389,8 @@ def test_run_suspended_only_writes_diagnostic_and_duplicate_is_idempotent(
 
         assert first.status == EngineIngestStatus.ACCEPTED
         assert second.status == EngineIngestStatus.DUPLICATE
+        assert first.stop_worker_stream is False
+        assert second.stop_worker_stream is False
         assert [event.event_type for event in first.events] == [
             "ENGINE_EVENT_DIAGNOSTIC",
         ]
@@ -1458,6 +1460,7 @@ def test_tool_awaiting_confirms_only_matching_host_accepted_wait_refs(
 
         assert result.status == EngineIngestStatus.ACCEPTED
         assert result.reason == "waiting_event_confirmation"
+        assert result.stop_worker_stream is True
         payload = _payload(result.events[0])
         assert payload["waiting_confirmation_accepted"] is True
         assert payload["waiting_confirmation_mismatch_reason"] is None
@@ -4294,7 +4297,10 @@ def _awaiting_accept_candidate(seeded: _SeededRun) -> ToolAwaitingAcceptCandidat
         tool_name="lookup",
         tool_schema_digest=sha256_digest_json({"schema": "lookup"}),
         tool_identity_digest=sha256_digest_json({"identity": "lookup"}),
-        normalized_arguments_digest=sha256_digest_json({"arguments": "lookup"}),
+        normalized_arguments_digest=sha256_digest_json(
+            {"arguments": {"query": "lookup"}}
+        ),
+        accepted_arguments={"query": "lookup"},
         await_spec=await_spec,
         snapshot_ref=None,
         binding=binding,

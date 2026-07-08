@@ -40,6 +40,7 @@ from dayu.host.durable.state import (
     release_wait_record_poll_claim,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 if TYPE_CHECKING:
     from dayu.host.waiting import ToolAwaitingAcceptedAck
@@ -818,6 +819,14 @@ class WaitPoller:
                 claim_conflicts += 1
                 continue
             claimed_records.append(claim)
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.wait_poller.poll_once.claimed owner_id=%s claimed=%s "
+            "claim_conflicts=%s",
+            self._owner_id,
+            len(claimed_records),
+            claim_conflicts,
+        )
 
         not_ready = 0
         resolved = 0
@@ -877,6 +886,14 @@ class WaitPoller:
                     error_message=exc.__class__.__name__,
                 )
                 continue
+            poll_result_kind = _poll_result_kind(poll_result)
+            _LOGGER.log(
+                VERBOSE_LOG_LEVEL,
+                "host.wait_poller.observe wait_id=%s adapter_key=%s outcome=%s",
+                record.wait_id,
+                record.adapter_key.value,
+                poll_result_kind,
+            )
             if isinstance(poll_result, WaitPollNotReady):
                 not_ready += 1
                 claim_conflicts += self._release_with_backoff(
@@ -892,6 +909,15 @@ class WaitPoller:
                 claim_conflicts += self._release_shutdown_skipped(record, claim_id)
                 continue
             resolve_status = self._resolve_claimed_wait(record, poll_result)
+            _LOGGER.log(
+                VERBOSE_LOG_LEVEL,
+                "host.wait_poller.resolve wait_id=%s adapter_key=%s outcome=%s "
+                "resolve_status=%s",
+                record.wait_id,
+                record.adapter_key.value,
+                poll_result_kind,
+                resolve_status.value,
+            )
             if resolve_status is StateMutationStatus.UPDATED:
                 if isinstance(poll_result, WaitPollLost):
                     lost += 1
@@ -909,7 +935,7 @@ class WaitPoller:
                 error_code=_POLL_ERROR_CODE_RESOLVE_EXCEPTION,
                 error_message=resolve_status.value,
             )
-        return WaitPollOnceResult(
+        result = WaitPollOnceResult(
             observed=len(claimed_records),
             not_ready=not_ready,
             resolved=resolved,
@@ -919,6 +945,22 @@ class WaitPoller:
             claim_conflicts=claim_conflicts,
             shutdown_skipped=shutdown_skipped,
         )
+        _LOGGER.log(
+            VERBOSE_LOG_LEVEL,
+            "host.wait_poller.poll_once.done owner_id=%s observed=%s not_ready=%s "
+            "resolved=%s lost=%s abandoned=%s adapter_errors=%s "
+            "claim_conflicts=%s shutdown_skipped=%s",
+            self._owner_id,
+            result.observed,
+            result.not_ready,
+            result.resolved,
+            result.lost,
+            result.abandoned,
+            result.adapter_errors,
+            result.claim_conflicts,
+            result.shutdown_skipped,
+        )
+        return result
 
     def _claim_next_wait_record(self) -> _ClaimedWaitRecord | StateMutationStatus | None:
         """claim 下一条 eligible wait record。
@@ -1332,6 +1374,23 @@ def _poll_idempotency_key(wait_record: WaitRecordRow) -> str:
         }
     ).removeprefix("sha256:")
     return f"poll-{digest}"
+
+
+def _poll_result_kind(result: WaitPollResult) -> str:
+    """返回日志安全的 poll 结果类别。
+
+    :param result: adapter 返回的 poll 结果。
+    :returns: ``not_ready``、``ready`` 或 ``lost``。
+    :raises TypeError: 收到未知 poll 结果类型时抛出。
+    """
+
+    if isinstance(result, WaitPollNotReady):
+        return "not_ready"
+    if isinstance(result, WaitPollReady):
+        return "ready"
+    if isinstance(result, WaitPollLost):
+        return "lost"
+    raise TypeError("unsupported wait poll result")
 
 
 def _backoff_delay_seconds(
