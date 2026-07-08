@@ -269,10 +269,10 @@ class EntrypointTerminalSource(StrEnum):
 class EntrypointRuntimeRequest:
     """准备 product entrypoint Agent runtime 的请求。
 
-    :param workspace_root: 当前项目 / workspace 根目录。
+    :param workspace_root: 当前 workspace 根目录。
     :param package_config_root: 包内默认配置根目录。
     :param explicit_config_dir: 调用方显式指定的配置覆盖目录；``None`` 表示
-        使用默认 ``workspace/config`` 探测行为。
+        使用默认 ``<workspace_root>/config`` 探测行为。
     :param scene_id: 本次 entrypoint 使用的 scene id。
     :param context_slot_values: 传给 ScenePrepare 的业务上下文槽位值。
     :param assembly_overrides: Service assembly 显式 override。
@@ -512,7 +512,7 @@ async def prepare_entrypoint_runtime(
     """
 
     locations = resolve_runtime_locations(
-        project_root=request.workspace_root,
+        workspace_root=request.workspace_root,
         package_config_root=request.package_config_root,
         explicit_config_overlay_dir=request.explicit_config_dir,
     )

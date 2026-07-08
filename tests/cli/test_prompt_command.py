@@ -997,6 +997,60 @@ def test_prompt_command_without_ticker_uses_default_context_slots(
     assert fake_host.submit_requests[0].context.operation_context.business_object_id is None
 
 
+def test_prompt_command_uses_init_generated_workspace_config(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """prompt entrypoint 必须使用 init 在 workspace root 下生成的 config。
+
+    :param tmp_path: pytest 临时目录。
+    :param capsys: pytest 标准输出捕获夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: prompt 未使用 init 生成配置或路径嵌套时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    assert cli_main.main(("init", "--base", str(workspace_root))) == EXIT_SUCCESS
+    capsys.readouterr()
+    fake_host = _FakeHost(submit_terminal=_terminal_event(status=HostTerminalStatus.SUCCEEDED))
+    captured_results: list[EntrypointRuntimeResult] = []
+    real_prepare = prompt_command.prepare_entrypoint_runtime
+
+    async def capture_prepare(
+        request: EntrypointRuntimeRequest,
+    ) -> EntrypointRuntimeResult:
+        """捕获 runtime assembly 结果。
+
+        :param request: CLI 传给 Service 的 runtime request。
+        :returns: 真实 prepare 结果。
+        :raises Exception: 真实 prepare 失败时透传。
+        """
+
+        result = await real_prepare(request)
+        captured_results.append(result)
+        return result
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(prompt_command, "prepare_entrypoint_runtime", capture_prepare)
+    monkeypatch.setattr(
+        prompt_command,
+        "open_host",
+        lambda _options: _FakeOpenHostContext(fake_host),
+    )
+
+    exit_code = cli_main.main(("prompt", "--base", str(workspace_root), "请总结收入变化"))
+
+    assert exit_code == EXIT_SUCCESS
+    assert capsys.readouterr().out.strip() == "prompt answer"
+    assert captured_results[0].locations.config_overlay_dir == workspace_root / "config"
+    assert captured_results[0].host_assembly.options.db_path == (
+        workspace_root / ".dayu" / "host" / "dayu_host.sqlite3"
+    ).resolve(strict=False)
+    assert not (workspace_root / "workspace").exists()
+
+
 def test_prompt_command_uses_outbox_fallback_when_watcher_fails(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

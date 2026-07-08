@@ -359,10 +359,10 @@ def test_compose_open_host_options_passes_effective_bundle_to_host(
 
     _write_combined_tool_discovery_overlay(tmp_path)
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
-        workspace_config_dir=tmp_path / "workspace" / "config"
+        workspace_config_dir=tmp_path / "config"
     )
     locations = resolve_runtime_locations(
-        project_root=tmp_path,
+        workspace_root=tmp_path,
         package_config_root=_PACKAGE_CONFIG_ROOT,
     )
     effective_provider_configs = assemble_effective_tool_provider_configs(
@@ -645,7 +645,7 @@ def _discover_combined_tools(tmp_path: Path) -> ServiceDiscoveredTools:
     _build_fins_workspace(tmp_path)
     _write_combined_tool_discovery_overlay(tmp_path)
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
-        workspace_config_dir=tmp_path / "workspace" / "config"
+        workspace_config_dir=tmp_path / "config"
     )
     effective_provider_configs = assemble_effective_tool_provider_configs(
         tuple(config.tool_discovery.providers.values()),
@@ -752,7 +752,7 @@ def _write_combined_tool_discovery_overlay(tmp_path: Path) -> None:
     """
 
     _write_json(
-        tmp_path / "workspace" / "config" / "tool_discovery.json",
+        tmp_path / "config" / "tool_discovery.json",
         {
             "providers": {
                 "financial-read-tools": {

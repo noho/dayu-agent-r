@@ -1,6 +1,6 @@
 """层中立 runtime 位置解析器。
 
-本模块只根据调用方显式传入的项目根目录与包内配置根目录解析 runtime
+本模块只根据调用方显式传入的 workspace 根目录与包内配置根目录解析 runtime
 assembly 所需位置。它不读取配置 schema、不解释 scene manifest、不创建
 Host / Engine 对象，也不导入任何业务层。
 """
@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+
+from dayu.runtime.workspace_paths import get_config_path
 
 
 class RuntimeLocationError(ValueError):
@@ -31,24 +33,24 @@ class RuntimeLocations:
 
 def resolve_runtime_locations(
     *,
-    project_root: Path,
+    workspace_root: Path,
     package_config_root: Path,
     explicit_config_overlay_dir: Path | None = None,
 ) -> RuntimeLocations:
     """解析 runtime assembly 默认位置。
 
-    :param project_root: 项目根目录；workspace 覆盖目录固定为其下
-        ``workspace/config``。
+    :param workspace_root: workspace 根目录；默认覆盖目录固定为其下
+        ``config``。
     :param package_config_root: 包内默认配置根目录。
     :param explicit_config_overlay_dir: 调用方显式指定的配置覆盖目录；
-        ``None`` 表示沿用默认 ``workspace/config`` 探测行为。
+        ``None`` 表示沿用默认 ``<workspace_root>/config`` 探测行为。
     :returns: runtime assembly 位置解析结果。
     :raises RuntimeLocationError: 显式配置覆盖路径不是目录，或包内 prompt /
         manifest 默认资产不存在时抛出。
     """
 
     if explicit_config_overlay_dir is None:
-        workspace_config = project_root / "workspace" / "config"
+        workspace_config = get_config_path(workspace_root)
         config_overlay_dir = workspace_config if workspace_config.exists() else None
     else:
         _require_directory(

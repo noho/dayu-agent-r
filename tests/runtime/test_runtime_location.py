@@ -26,12 +26,12 @@ def _create_package_prompts(root: Path) -> Path:
 
 
 def test_workspace_config_absent_returns_none_overlay(tmp_path: Path) -> None:
-    """workspace/config 不存在时 config_overlay_dir 必须为 None。"""
+    """workspace root 下 config 不存在时 config_overlay_dir 必须为 None。"""
 
     package_config_root = _create_package_prompts(tmp_path)
 
     locations = resolve_runtime_locations(
-        project_root=tmp_path,
+        workspace_root=tmp_path,
         package_config_root=package_config_root,
     )
 
@@ -43,14 +43,14 @@ def test_workspace_config_absent_returns_none_overlay(tmp_path: Path) -> None:
 def test_workspace_config_exists_selects_overlay_and_workspace_prompts(
     tmp_path: Path,
 ) -> None:
-    """workspace/config 存在且含 prompts 时必须返回 workspace 资产路径。"""
+    """workspace root 下 config 存在且含 prompts 时必须返回 workspace 资产路径。"""
 
     package_config_root = _create_package_prompts(tmp_path)
-    workspace_config = tmp_path / "workspace" / "config"
+    workspace_config = tmp_path / "config"
     (workspace_config / "prompts" / "manifests").mkdir(parents=True)
 
     locations = resolve_runtime_locations(
-        project_root=tmp_path,
+        workspace_root=tmp_path,
         package_config_root=package_config_root,
     )
 
@@ -62,14 +62,14 @@ def test_workspace_config_exists_selects_overlay_and_workspace_prompts(
 def test_workspace_config_without_prompts_keeps_package_assets(
     tmp_path: Path,
 ) -> None:
-    """workspace/config 存在但没有 prompts 时只提供 config overlay。"""
+    """workspace root 下 config 存在但没有 prompts 时只提供 config overlay。"""
 
     package_config_root = _create_package_prompts(tmp_path)
-    workspace_config = tmp_path / "workspace" / "config"
+    workspace_config = tmp_path / "config"
     workspace_config.mkdir(parents=True)
 
     locations = resolve_runtime_locations(
-        project_root=tmp_path,
+        workspace_root=tmp_path,
         package_config_root=package_config_root,
     )
 
@@ -88,7 +88,7 @@ def test_explicit_config_overlay_dir_selects_explicit_config(
     (explicit_config / "prompts" / "manifests").mkdir(parents=True)
 
     locations = resolve_runtime_locations(
-        project_root=tmp_path,
+        workspace_root=tmp_path,
         package_config_root=package_config_root,
         explicit_config_overlay_dir=explicit_config,
     )
@@ -108,7 +108,7 @@ def test_explicit_config_overlay_dir_without_prompts_keeps_package_assets(
     explicit_config.mkdir()
 
     locations = resolve_runtime_locations(
-        project_root=tmp_path,
+        workspace_root=tmp_path,
         package_config_root=package_config_root,
         explicit_config_overlay_dir=explicit_config,
     )
@@ -125,7 +125,7 @@ def test_explicit_config_overlay_dir_must_exist(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeLocationError, match="explicit config overlay dir"):
         resolve_runtime_locations(
-            project_root=tmp_path,
+            workspace_root=tmp_path,
             package_config_root=package_config_root,
             explicit_config_overlay_dir=tmp_path / "missing_config",
         )
@@ -140,7 +140,7 @@ def test_explicit_config_overlay_dir_must_be_directory(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeLocationError, match="explicit config overlay dir"):
         resolve_runtime_locations(
-            project_root=tmp_path,
+            workspace_root=tmp_path,
             package_config_root=package_config_root,
             explicit_config_overlay_dir=explicit_file,
         )
@@ -151,6 +151,6 @@ def test_missing_package_prompt_assets_fail_fast(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeLocationError, match="package prompt asset root"):
         resolve_runtime_locations(
-            project_root=tmp_path,
+            workspace_root=tmp_path,
             package_config_root=tmp_path / "missing_config",
         )

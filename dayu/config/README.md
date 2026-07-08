@@ -1,13 +1,13 @@
 # Dayu 配置说明
 
-本手册只说明当前 `dayu/config/` 的默认配置、`workspace/config/` 覆盖关系与 prompts 目录职责。Engine、Host、Service 和财报领域能力的内部机制不在这里展开。
+本手册只说明当前 `dayu/config/` 的默认配置、workspace root 下 `config/` 覆盖关系与 prompts 目录职责。Engine、Host、Service 和财报领域能力的内部机制不在这里展开。
 
 ## 配置层级
 
 Dayu runtime assembly 配置分两层：
 
 1. 包内默认配置：`dayu/config/`
-2. 工作区覆盖配置：`workspace/config/`
+2. 工作区覆盖配置：`<workspace>/config/`
 
 `dayu-cli init --base <workspace>` 会创建目标 workspace，并把当前包内默认配置文件和 `prompts/`
 资产复制到 `<workspace>/config/`。该命令只生成当前 schema 所需的 `models.json`、
@@ -15,7 +15,7 @@ Dayu runtime assembly 配置分两层：
 和 prompts 资产；不会生成旧 `llm_models.json` / `run.json`，也不会写入明文 API key。
 目标配置文件已存在时默认失败，传 `--overwrite` 才会替换。
 
-`dayu.runtime.location.resolve_runtime_locations` 负责把项目根目录解析为 runtime assembly 位置：`workspace/config` 存在时输出 `config_overlay_dir`，不存在时输出 `None`；prompt assets 与 scene manifests 优先使用 workspace 中已存在的对应目录，否则使用包内默认资产。`ConfigLoader` 只接收调用方显式传入的配置目录，不猜测 workspace 路径。
+`dayu.runtime.location.resolve_runtime_locations` 负责把 workspace root 解析为 runtime assembly 位置：`<workspace>/config` 存在时输出 `config_overlay_dir`，不存在时输出 `None`；prompt assets 与 scene manifests 优先使用 workspace 中已存在的对应目录，否则使用包内默认资产。`ConfigLoader` 只接收调用方显式传入的配置目录，不猜测 workspace 路径。
 
 `dayu.runtime.config_loader.ConfigLoader` 默认加载包内配置；调用方可以显式传入 workspace 配置目录。ConfigLoader 不解析环境变量，不替换 secret，不脱敏，也不 import Host、Engine、Service、UI、Fins 或具体业务工具包。
 
@@ -191,13 +191,13 @@ provider 字段：
 
 包内默认 `doc-tools` provider 指向 `dayu.tools.doc_provider:discover_tools`，默认 `enabled=false` 且 `allowed_paths=[]`。只有在 workspace overlay 启用并在 `config.allowed_paths` 中显式配置可访问文件或目录根时才注册可执行文档工具。白名单为空时 provider 会 fail fast。Doc provider 的 packaged `config.limits` 显式写入默认值：`list_files_max=200`、`get_sections_max=200`、`search_files_max_results=50`、`read_file_max_chars=80000` 与 `read_file_section_max_chars=50000`；workspace overlay 可用同名正整数字段覆盖这些 Doc limits。
 
-包内默认 `web-tools` provider 指向 `dayu.tools.web:discover_tools`，默认 `enabled=true`，并默认拒绝 private / local network URL。Provider 只暴露 `search_web` 与 `fetch_web_page`；`config` 可设置 `provider`（`auto` / `tavily` / `serper` / `duckduckgo`）、`request_timeout_seconds`、`max_search_results`、`fetch_truncate_chars`、`allow_private_network_url`、`playwright_channel` 与 `playwright_storage_state_dir`。默认 `playwright_storage_state_dir` 指向 `workspace/.dayu/web_tools_storage_states`；只有该目录下存在目标 host 对应的 storage state 文件时，Playwright fallback 才会注入登录态。只有显式设置 `allow_private_network_url=true` 时，fetch/search URL safety 才允许内网或本地 URL。
+包内默认 `web-tools` provider 指向 `dayu.tools.web:discover_tools`，默认 `enabled=true`，并默认拒绝 private / local network URL。Provider 只暴露 `search_web` 与 `fetch_web_page`；`config` 可设置 `provider`（`auto` / `tavily` / `serper` / `duckduckgo`）、`request_timeout_seconds`、`max_search_results`、`fetch_truncate_chars`、`allow_private_network_url`、`playwright_channel` 与 `playwright_storage_state_dir`。默认 `playwright_storage_state_dir` 在配置中是 `.dayu/web_tools_storage_states`，Service discovery 会按当前 workspace root 解析为 `<workspace>/.dayu/web_tools_storage_states`；只有该目录下存在目标 host 对应的 storage state 文件时，Playwright fallback 才会注入登录态。只有显式设置 `allow_private_network_url=true` 时，fetch/search URL safety 才允许内网或本地 URL。
 
 包内默认 `utils-tools` provider 指向 `dayu.tools.utils:discover_tools`，默认 `enabled=true`。Provider 当前只暴露 `get_current_time`，用于需要实时时钟的场景；工具只支持 `timezone="Asia/Shanghai"` 或省略该参数，并返回 `time`、`timezone`、`weekday` 与 `iso` 字段。该工具不提供财报、网页或文件事实。
 
 ## prompts 目录职责
 
-`workspace/config/prompts/` 与包内 `dayu/config/prompts/` 用于放置 prompt fragments 和 scene manifests。包内默认资产按目录分为：
+`<workspace>/config/prompts/` 与包内 `dayu/config/prompts/` 用于放置 prompt fragments 和 scene manifests。包内默认资产按目录分为：
 
 | 路径 | 职责 |
 |---|---|

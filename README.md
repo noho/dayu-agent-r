@@ -997,7 +997,7 @@ dayu-cli process --ticker AAPL --ci --document-id fil_001 --document-id fil_002
 
 ### 5.1 Host public 多轮闭环 smoke
 
-`utils/smoke_host_public_multiturn.py` 用于人工观察真实生产式 runtime assembly 是否能只通过 Host public interface / contract 完成多轮会话闭环。脚本默认使用 `workspace/tmp/` 下的 fresh smoke workspace，避免历史 durable DB schema 污染；需要复用已有 workspace 时显式传 `--workspace-root`。脚本使用 runtime location resolver 解析所选 workspace 的 `workspace/config` overlay、prompt asset root 与 scene manifest root，再通过 `ConfigLoader`、`ToolsDiscovery`、`ScenePrepare` 和 `dayu.service.host_assembly` 映射为 `open_host(options)` 与每轮 `submit_followup` typed input。打开后脚本只调用 public Host handle。脚本把 Dayu 日志默认打开到 `VERBOSE`，便于观察 Host command、dispatch、EngineEvent ingest、ToolRuntime、memory catch-up 与 context compact 主路径。默认每次运行使用 fresh session slot；需要在同一个 durable session 内复用时显式加 `--workspace-root` 和 `--reuse-session`。
+`utils/smoke_host_public_multiturn.py` 用于人工观察真实生产式 runtime assembly 是否能只通过 Host public interface / contract 完成多轮会话闭环。脚本默认使用 `workspace/tmp/` 下的 fresh smoke workspace，避免历史 durable DB schema 污染；需要复用已有 workspace 时显式传 `--workspace-root`。脚本使用 runtime location resolver 解析所选 workspace root 下的 `config` overlay、prompt asset root 与 scene manifest root，再通过 `ConfigLoader`、`ToolsDiscovery`、`ScenePrepare` 和 `dayu.service.host_assembly` 映射为 `open_host(options)` 与每轮 `submit_followup` typed input。打开后脚本只调用 public Host handle。脚本把 Dayu 日志默认打开到 `VERBOSE`，便于观察 Host command、dispatch、EngineEvent ingest、ToolRuntime、memory catch-up 与 context compact 主路径。默认每次运行使用 fresh session slot；需要在同一个 durable session 内复用时显式加 `--workspace-root` 和 `--reuse-session`。
 
 ```bash
 source .venv/bin/activate

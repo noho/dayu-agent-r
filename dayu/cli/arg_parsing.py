@@ -317,7 +317,7 @@ def _build_global_arguments_parent() -> argparse.ArgumentParser:
         "--config",
         dest="config_dir",
         default=argparse.SUPPRESS,
-        help="显式配置目录；未提供时使用 workspace/config 或随包默认配置。",
+        help="显式配置目录；未提供时使用 <base>/config 或随包默认配置。",
     )
     parser.add_argument(
         "--log-level",

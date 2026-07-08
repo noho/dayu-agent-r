@@ -746,7 +746,7 @@ def test_workspace_overlay_enables_split_fins_providers(tmp_path: Path) -> None:
     workspace_root = _build_workspace(tmp_path)
     _write_split_fins_provider_overlay(tmp_path, workspace_root)
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
-        workspace_config_dir=tmp_path / "workspace" / "config"
+        workspace_config_dir=tmp_path / "config"
     )
 
     for provider_id in (_READ_SPEC_ID, _DOWNLOAD_SPEC_ID, _PREPROCESS_SPEC_ID, _UPLOAD_SPEC_ID):
@@ -2033,7 +2033,7 @@ def _write_split_fins_provider_overlay(
             },
         }
     }
-    _write_json(tmp_path / "workspace" / "config" / "tool_discovery.json", payload)
+    _write_json(tmp_path / "config" / "tool_discovery.json", payload)
 
 
 def _provider_specs_from_loaded_config(

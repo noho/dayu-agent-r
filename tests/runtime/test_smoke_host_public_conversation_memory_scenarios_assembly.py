@@ -1339,7 +1339,7 @@ def _write_non_smoke_tool_discovery_overlay(workspace_root: pathlib.Path) -> Non
     :raises OSError: 目录或文件写入失败时抛出。
     """
 
-    config_dir = workspace_root / "workspace" / "config"
+    config_dir = workspace_root / "config"
     config_dir.mkdir(parents=True)
     payload = {
         "providers": {

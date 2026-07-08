@@ -98,7 +98,7 @@ def test_runtime_assembly_uses_workspace_tool_discovery_and_typed_overrides(
         env={"DEEPSEEK_API_KEY": _API_KEY},
     )
 
-    assert assembly.diagnostics.config_overlay_dir == tmp_path / "workspace" / "config"
+    assert assembly.diagnostics.config_overlay_dir == tmp_path / "config"
     assert assembly.diagnostics.host_runtime_id == "local"
     assert assembly.diagnostics.execution_profile_id == "standard-256k"
     assert assembly.diagnostics.model_id == _MODEL_ID
@@ -281,7 +281,7 @@ def _write_smoke_tool_discovery_overlay(workspace_root: pathlib.Path) -> None:
     :raises TypeError: JSON 序列化字段非法时抛出。
     """
 
-    config_dir = workspace_root / "workspace" / "config"
+    config_dir = workspace_root / "config"
     config_dir.mkdir(parents=True)
     payload = {
         "providers": {

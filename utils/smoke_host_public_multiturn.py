@@ -126,7 +126,7 @@ _TERMINAL_WAIT_TIMEOUT_SECONDS: Final[float] = 600.0
 class SmokeArgs:
     """命令行参数。
 
-    :param workspace_root: workspace / 项目根目录，用于 location resolver。
+    :param workspace_root: workspace 根目录，用于 location resolver。
     :param scene_id: 需要装配的 scene id。
     :param execution_profile_id: 可选 execution profile 显式 override。
     :param host_runtime_id: 可选 Host runtime 显式 override。
@@ -454,7 +454,7 @@ def _prepare_runtime_assembly(
     """
 
     locations = resolve_runtime_locations(
-        project_root=args.workspace_root,
+        workspace_root=args.workspace_root,
         package_config_root=_PACKAGE_CONFIG_ROOT,
     )
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(

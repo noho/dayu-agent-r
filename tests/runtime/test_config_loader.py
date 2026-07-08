@@ -234,10 +234,10 @@ def _host_runtime_config_record(
 
     runtime_record: dict[str, JsonValue] = {
         "extends": None,
-        "store_root": "workspace/.dayu/host",
-        "artifact_root": "workspace/.dayu/artifacts",
+        "store_root": ".dayu/host",
+        "artifact_root": ".dayu/artifacts",
         "sqlite": {
-            "path": "workspace/.dayu/host/dayu.sqlite3",
+            "path": ".dayu/host/dayu.sqlite3",
             "busy_timeout_seconds": 5.0,
             "write_busy_retry_count": 8,
             "write_retry_initial_delay_seconds": 0.005,
@@ -307,7 +307,7 @@ def _minimal_package_config(root: Path) -> None:
         root / "runtime_lanes.json",
         {
             "coordinator": {
-                "db_path": "workspace/.dayu/runtime/lane.sqlite3",
+                "db_path": ".dayu/runtime/lane.sqlite3",
                 "busy_timeout_seconds": 5.0,
                 "poll_interval_seconds": 0.05,
             },
@@ -464,7 +464,7 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
     assert web_provider.config["playwright_channel"] == "chrome"
     assert (
         web_provider.config["playwright_storage_state_dir"]
-        == "workspace/.dayu/web_tools_storage_states"
+        == ".dayu/web_tools_storage_states"
     )
     assert web_provider.config["allow_private_network_url"] is False
     utils_provider = config.tool_discovery.providers["utils-tools"]
@@ -1173,7 +1173,7 @@ def test_runtime_lanes_catalog_must_not_be_empty(tmp_path: Path) -> None:
         package_root / "runtime_lanes.json",
         {
             "coordinator": {
-                "db_path": "workspace/.dayu/runtime/lane.sqlite3",
+                "db_path": ".dayu/runtime/lane.sqlite3",
                 "busy_timeout_seconds": 5.0,
                 "poll_interval_seconds": 0.05,
             },
@@ -1289,10 +1289,10 @@ def test_host_runtime_lane_reference_must_exist(tmp_path: Path) -> None:
             "default_host_runtime_id": "local",
             "runtimes": {
                 "local": {
-                    "store_root": "workspace/.dayu/host",
-                    "artifact_root": "workspace/.dayu/artifacts",
+                    "store_root": ".dayu/host",
+                    "artifact_root": ".dayu/artifacts",
                     "sqlite": {
-                        "path": "workspace/.dayu/host/dayu.sqlite3",
+                        "path": ".dayu/host/dayu.sqlite3",
                         "busy_timeout_seconds": 5.0,
                         "write_busy_retry_count": 8,
                         "write_retry_initial_delay_seconds": 0.005,
@@ -1325,7 +1325,7 @@ def test_runtime_lane_capacity_claim_ttl_must_exceed_heartbeat(
         package_root / "runtime_lanes.json",
         {
             "coordinator": {
-                "db_path": "workspace/.dayu/runtime/lane.sqlite3",
+                "db_path": ".dayu/runtime/lane.sqlite3",
                 "busy_timeout_seconds": 5.0,
                 "poll_interval_seconds": 0.05,
             },

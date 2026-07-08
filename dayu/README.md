@@ -83,7 +83,7 @@ flowchart TD
 ## 主要组件
 
 - `dayu.contracts`：`JsonValue`、`CancellationToken`、工具 schema、工具声明、工具调用请求、工具 outcome、等待 outcome、`ToolExecutor` 和工具来源引用。
-- `dayu.runtime`：日志级别与装配、协作式取消等待、runtime lane、filelock、diagnostic 文本脱敏、有界截断、digest、config loader、location resolver、scene prepare、tool discovery、assembly helper 与 tool truncation defaults。
+- `dayu.runtime`：日志级别与装配、协作式取消等待、runtime lane、filelock、diagnostic 文本脱敏、有界截断、digest、workspace 路径契约、config loader、location resolver、scene prepare、tool discovery、assembly helper 与 tool truncation defaults。
 - `dayu.config`：包内默认 `models`、`execution_profiles`、`host_runtime`、`runtime_lanes`、`tool_discovery` 和 prompt / scene 资产。
 - `dayu.service.host_assembly`：从 runtime config、prepared scene、工具发现和 secret mapping 组合 Host construction-time inputs 与 per-run request。
 - `dayu.service.fins_direct`：从 product entrypoint 显式参数构造 Fins download / preprocess / upload typed request，并把 Fins direct runtime events 以 `AsyncIterator[FinsEvent]` 形式交给调用方消费。
@@ -97,7 +97,7 @@ flowchart TD
 
 ### Service 装配
 
-Service 从 `dayu.runtime.location` 解析 workspace 与包内资产位置，用 `ConfigLoader` 读取 typed config，用 `ToolsDiscovery` 聚合业务 `ToolBundle`，用 `ScenePrepare` 拼接 system prompt、工具选择和 AgentPolicy override，再通过 `compose_open_host_options(...)` / `compose_submit_followup_request(...)` 或 `compose_submit_followup_request_with_overrides(...)` 生成 Host public typed inputs。需要 production wait poller 时，Service / composition root 在 construction time 显式提供 wait poll adapter registry 与 wait poller policy；Host 不接收 raw config patch、profile id 或隐式 lookup。面向 product entrypoint 的共享 Service helper 在 submit 前 attach `watch_session_events(session_id)`；cancel helper 用 public `get_run(...)` 判断已终态 Run 并跳过取消，非终态则在 `cancel_run(...)` 前 attach watcher；terminal fallback 只使用 `get_run(...)` 与 `read_outbox_terminal_items(...)`。
+Service 从 `dayu.runtime.workspace_paths` 与 `dayu.runtime.location` 解析 workspace 本地路径和包内资产位置，用 `ConfigLoader` 读取 typed config，用 `ToolsDiscovery` 聚合业务 `ToolBundle`，用 `ScenePrepare` 拼接 system prompt、工具选择和 AgentPolicy override，再通过 `compose_open_host_options(...)` / `compose_submit_followup_request(...)` 或 `compose_submit_followup_request_with_overrides(...)` 生成 Host public typed inputs。需要 production wait poller 时，Service / composition root 在 construction time 显式提供 wait poll adapter registry 与 wait poller policy；Host 不接收 raw config patch、profile id 或隐式 lookup。面向 product entrypoint 的共享 Service helper 在 submit 前 attach `watch_session_events(session_id)`；cancel helper 用 public `get_run(...)` 判断已终态 Run 并跳过取消，非终态则在 `cancel_run(...)` 前 attach watcher；terminal fallback 只使用 `get_run(...)` 与 `read_outbox_terminal_items(...)`。
 
 ### 普通 follow-up
 

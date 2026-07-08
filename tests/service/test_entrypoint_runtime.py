@@ -612,7 +612,7 @@ async def test_prepare_entrypoint_runtime_assembles_scene_tools_and_host(
     result = await _prepare_runtime(tmp_path)
 
     assert isinstance(result, EntrypointRuntimeResult)
-    assert result.locations.config_overlay_dir == tmp_path / "workspace" / "config"
+    assert result.locations.config_overlay_dir == tmp_path / "config"
     assert result.scene_inputs.tool_selection.tool_names == frozenset({"record_smoke_fact"})
     assert result.host_assembly.options.ordinary_run_baseline.runner_options.stream is True
 
@@ -1846,7 +1846,7 @@ def _write_tool_discovery_overlay(workspace_root: Path) -> None:
     :raises OSError: 目录或文件写入失败时抛出。
     """
 
-    target_path = workspace_root / "workspace" / "config" / "tool_discovery.json"
+    target_path = workspace_root / "config" / "tool_discovery.json"
     target_path.parent.mkdir(parents=True, exist_ok=True)
     target_path.write_text(
         json.dumps(
