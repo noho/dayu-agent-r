@@ -334,6 +334,47 @@ def test_pre_compact_projection_only_builds_selected_recent_window() -> None:
     assert snapshot.forward_intent_memory.intents == ()
 
 
+def test_tool_awaiting_accepted_arguments_project_to_recent_evidence() -> None:
+    """TOOL_AWAITING 已接受参数应进入后续 LLM-facing continuity。"""
+
+    policy = _policy()
+    arguments = {"ticker": "CRCL"}
+    arguments_digest = sha256_digest_json({"arguments": arguments})
+    snapshot = build_conversation_memory_snapshot_from_events(
+        events=(
+            _event(1, "user-1", "USER_INPUT_ACCEPTED", {"display_text": "下载Circle财报"}),
+            _event(
+                2,
+                "awaiting-1",
+                "TOOL_AWAITING",
+                {
+                    "tool_name": "start_fins_download",
+                    "accepted_arguments": arguments,
+                    "accepted_arguments_source_digest": arguments_digest,
+                    "normalized_arguments_digest": arguments_digest,
+                },
+            ),
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+
+    selected = snapshot.trace_memory.selected_recent_window
+    evidence = snapshot.evidence_fact_memory.recent_evidence_items
+    assert tuple(item.role for item in selected) == (
+        SelectedRecentWindowRole.USER,
+        SelectedRecentWindowRole.EVIDENCE,
+    )
+    assert len(evidence) == 1
+    text = evidence[0].text
+    assert "start_fins_download" in text
+    assert '"ticker":"CRCL"' in text
+    assert "sha256:" not in text
+    assert "awaiting-1" not in text
+
+
 def test_selected_recent_window_floor_protects_recent_run_groups() -> None:
     """selected recent window floor 保护最近 Run group 的全部 eligible material。"""
 

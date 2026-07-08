@@ -143,6 +143,7 @@ class SecDownloadWorkflowHost(Protocol):
         filing: FilingRecord,
         overwrite: bool,
         rejection_registry: dict[str, dict[str, str]],
+        cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> AsyncIterator[DownloadEvent]:
         """执行单 filing 下载流。"""
 
@@ -431,8 +432,10 @@ async def run_download_stream_impl(
 
     filing_results: list[dict[str, JsonValue]] = []
     started_at = time.perf_counter()
+    cancelled = False
     for filing in filings:
         if cancel_checker is not None and cancel_checker():
+            cancelled = True
             Log.info(
                 f"下载任务收到取消请求，文档边界停止: ticker={normalized_ticker}",
                 module=host.MODULE,
@@ -451,24 +454,34 @@ async def run_download_stream_impl(
                 "total_filings": len(filings),
             },
         )
+        filing_terminal_seen = False
         async for event in host._download_single_filing_stream(
             ticker=normalized_ticker,
             cik=cik,
             filing=filing,
             overwrite=overwrite,
             rejection_registry=rejection_registry,
+            cancel_checker=cancel_checker,
         ):
             event_result = event.payload.get("filing_result")
             if event.event_type in {
                 DownloadEventType.FILING_COMPLETED,
                 DownloadEventType.FILING_FAILED,
             } and isinstance(event_result, dict):
+                filing_terminal_seen = True
                 filing_results.append(cast(dict[str, JsonValue], event_result))
                 host._log_filing_download_result(
                     ticker=normalized_ticker,
                     filing_result=cast(dict[str, JsonValue], event_result),
                 )
             yield event
+        if not filing_terminal_seen and cancel_checker is not None and cancel_checker():
+            cancelled = True
+            Log.info(
+                f"下载任务收到取消请求，当前 filing 已停止: ticker={normalized_ticker} document_id={document_id}",
+                module=host.MODULE,
+            )
+            break
 
     save_rejection_registry(host._filing_maintenance_repository, normalized_ticker, rejection_registry)
     for warning in warn_insufficient_filings(
@@ -533,7 +546,7 @@ async def run_download_stream_impl(
         warnings=cast(JsonValue, warnings),
         filings=cast(JsonValue, filing_results),
         summary=cast(JsonValue, summary),
-        status="cancelled" if cancel_checker is not None and cancel_checker() else "ok",
+        status="cancelled" if cancelled else "ok",
     )
     yield DownloadEvent(
         event_type=DownloadEventType.PIPELINE_COMPLETED,

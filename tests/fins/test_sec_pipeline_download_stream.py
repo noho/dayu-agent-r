@@ -91,10 +91,20 @@ class StreamStubDownloader(SecDownloader):
         include_xbrl: bool = True,
         include_exhibits: bool = True,
         include_http_metadata: bool = True,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> list[RemoteFileDescriptor]:
         """返回固定远端文件列表。"""
 
-        del cik, accession_no_dash, primary_document, form_type, include_xbrl, include_exhibits, include_http_metadata
+        del (
+            cik,
+            accession_no_dash,
+            primary_document,
+            form_type,
+            include_xbrl,
+            include_exhibits,
+            include_http_metadata,
+            cancellation_checker,
+        )
         return [
             RemoteFileDescriptor(
                 name="sample-10k.htm",
@@ -113,10 +123,11 @@ class StreamStubDownloader(SecDownloader):
         store_file: Callable[[str, BinaryIO], FileObjectMeta],
         existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
         primary_document: Optional[str] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> AsyncIterator[DownloaderEvent]:
         """输出单文件下载事件。"""
 
-        del overwrite, existing_files, primary_document
+        del overwrite, existing_files, primary_document, cancellation_checker
         descriptor = remote_files[0]
         yield DownloaderEvent(
             event_type="file_download_started",
@@ -150,10 +161,20 @@ class StreamXbrlStubDownloader(StreamStubDownloader):
         include_xbrl: bool = True,
         include_exhibits: bool = True,
         include_http_metadata: bool = True,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> list[RemoteFileDescriptor]:
         """返回 HTML 与 XBRL instance 两个远端文件。"""
 
-        del cik, accession_no_dash, primary_document, form_type, include_xbrl, include_exhibits, include_http_metadata
+        del (
+            cik,
+            accession_no_dash,
+            primary_document,
+            form_type,
+            include_xbrl,
+            include_exhibits,
+            include_http_metadata,
+            cancellation_checker,
+        )
         return [
             RemoteFileDescriptor(
                 name="sample-10k.htm",
@@ -180,10 +201,11 @@ class StreamXbrlStubDownloader(StreamStubDownloader):
         store_file: Callable[[str, BinaryIO], FileObjectMeta],
         existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
         primary_document: Optional[str] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> AsyncIterator[DownloaderEvent]:
         """输出 HTML 与 XBRL instance 两个下载事件。"""
 
-        del overwrite, existing_files, primary_document
+        del overwrite, existing_files, primary_document, cancellation_checker
         payload_by_name = {
             "sample-10k.htm": b"<html>payload</html>",
             "sample_htm.xml": b"<xbrl></xbrl>",
@@ -225,11 +247,31 @@ class _SpySourceRepository(FsSourceDocumentRepository):
         return super().has_filing_xbrl_instance(ticker, document_id)
 
 
-async def _collect_events(pipeline: SecPipeline, ticker: str) -> list[DownloadEvent]:
-    """收集异步下载事件。"""
+async def _collect_events(
+    pipeline: SecPipeline,
+    ticker: str,
+    cancel_checker: Optional[Callable[[], bool]] = None,
+) -> list[DownloadEvent]:
+    """收集异步下载事件。
+
+    Args:
+        pipeline: 待执行的 SEC pipeline。
+        ticker: 下载 ticker。
+        cancel_checker: 可选取消检查函数。
+
+    Returns:
+        下载事件列表。
+
+    Raises:
+        ValueError: pipeline 参数非法时由下游抛出。
+    """
 
     events: list[DownloadEvent] = []
-    async for event in pipeline.download_stream(ticker=ticker, overwrite=False):
+    async for event in pipeline.download_stream(
+        ticker=ticker,
+        overwrite=False,
+        cancel_checker=cancel_checker,
+    ):
         events.append(event)
     return events
 
@@ -262,6 +304,50 @@ def test_download_stream_emits_ordered_events(tmp_path: Path) -> None:
     assert event_types[-1] == "pipeline_completed"
     final_result = _event_pipeline_result(events[-1])
     assert final_result["summary"]["downloaded"] == 1
+
+
+def test_download_stream_final_status_does_not_recheck_cancel_token(
+    tmp_path: Path,
+) -> None:
+    """最终状态只使用已记录取消路径，不在收尾阶段重读取消 token。"""
+
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=StreamStubDownloader(),
+        processor_registry=build_fins_processor_registry(),
+    )
+    call_count = 0
+
+    def _cancel_on_second_call() -> bool:
+        """第二次读取时才返回取消。
+
+        Args:
+            无。
+
+        Returns:
+            第二次及之后调用返回 ``True``。
+
+        Raises:
+            无。
+        """
+
+        nonlocal call_count
+        call_count += 1
+        return call_count >= 2
+
+    import asyncio
+
+    events = asyncio.run(
+        _collect_events(
+            pipeline,
+            ticker="AAPL",
+            cancel_checker=_cancel_on_second_call,
+        )
+    )
+    final_result = _event_pipeline_result(events[-1])
+
+    assert final_result["status"] == "ok"
+    assert call_count == 1
 
 
 def test_download_sync_wrapper_aggregates_stream_result(tmp_path: Path) -> None:

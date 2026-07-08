@@ -176,6 +176,7 @@ class StubDownloader:
         include_xbrl: bool = True,
         include_exhibits: bool = True,
         include_http_metadata: bool = True,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> list[RemoteFileDescriptor]:
         """返回固定远端文件列表。
 
@@ -187,6 +188,7 @@ class StubDownloader:
             include_xbrl: 是否含 XBRL。
             include_exhibits: 是否含 exhibits。
             include_http_metadata: 是否拉取 HTTP 元数据。
+            cancellation_checker: 可选取消检查器。
 
         Returns:
             远端文件描述列表。
@@ -196,7 +198,16 @@ class StubDownloader:
         """
 
         self.list_filing_files_call_count += 1
-        del cik, accession_no_dash, primary_document, form_type, include_xbrl, include_exhibits, include_http_metadata
+        del (
+            cik,
+            accession_no_dash,
+            primary_document,
+            form_type,
+            include_xbrl,
+            include_exhibits,
+            include_http_metadata,
+            cancellation_checker,
+        )
         return self._remote_files
 
     def download_files(
@@ -206,6 +217,7 @@ class StubDownloader:
         store_file: Callable[[str, BinaryIO], FileObjectMeta],
         existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
         primary_document: Optional[str] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> list[DownloadFileResult]:
         """模拟下载并返回文件元数据。
 
@@ -214,6 +226,8 @@ class StubDownloader:
             overwrite: 是否覆盖。
             store_file: 文件存储回调。
             existing_files: 既有文件映射。
+            primary_document: 主文档文件名。
+            cancellation_checker: 可选取消检查器。
 
         Returns:
             下载结果列表。
@@ -223,7 +237,7 @@ class StubDownloader:
         """
 
         self.download_files_called = True
-        del remote_files, overwrite, existing_files, primary_document
+        del remote_files, overwrite, existing_files, primary_document, cancellation_checker
         results: list[DownloadFileResult] = []
         for item in self._download_results:
             name = str(item.get("name", ""))
@@ -325,6 +339,7 @@ class StreamStubDownloader(StubDownloader):
         store_file: Callable[[str, BinaryIO], FileObjectMeta],
         existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
         primary_document: Optional[str] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> AsyncIterator[DownloaderEvent]:
         """模拟流式下载并在每个文件结果前产出 started 事件。
 
@@ -334,6 +349,7 @@ class StreamStubDownloader(StubDownloader):
             store_file: 文件存储回调。
             existing_files: 既有文件映射。
             primary_document: 主文档文件名。
+            cancellation_checker: 可选取消检查器。
 
         Yields:
             文件 started 事件与终态文件事件。
@@ -343,7 +359,7 @@ class StreamStubDownloader(StubDownloader):
         """
 
         self.download_files_called = True
-        del remote_files, overwrite, existing_files, primary_document
+        del remote_files, overwrite, existing_files, primary_document, cancellation_checker
         for item in self._download_results:
             name = str(item.get("name", ""))
             source_url = str(item.get("source_url", ""))

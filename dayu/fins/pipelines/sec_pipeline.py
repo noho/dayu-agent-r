@@ -1026,6 +1026,7 @@ class SecPipeline:
         filing: FilingRecord,
         overwrite: bool,
         rejection_registry: Optional[dict[str, dict[str, str]]] = None,
+        cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> AsyncIterator[DownloadEvent]:
         """下载单个 SEC filing 并产出事件。
 
@@ -1035,6 +1036,7 @@ class SecPipeline:
             filing: filing 记录。
             overwrite: 是否覆盖。
             rejection_registry: 拒绝注册表。
+            cancel_checker: 可选协作式取消检查器。
 
         Yields:
             文件级和 filing 级事件。
@@ -1050,6 +1052,7 @@ class SecPipeline:
             filing=filing,
             overwrite=overwrite,
             rejection_registry=rejection_registry,
+            cancel_checker=cancel_checker,
             is_rejected=_is_rejected,
             record_rejection=_record_rejection,
             build_download_filing_event_payload=build_download_filing_event_payload,

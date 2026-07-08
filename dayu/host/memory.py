@@ -7,6 +7,7 @@ projection，不是事实真源，也不导入 Engine / Service / UI / Fins。
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -71,10 +72,15 @@ _ITEM_ID_PREFIX = "memory-item"
 _DIAGNOSTIC_ID_PREFIX = "memory-diagnostic"
 _EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
+_EVENT_TYPE_TOOL_AWAITING = "TOOL_AWAITING"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
 _PAYLOAD_FIELD_DISPLAY_TEXT = "display_text"
 _PAYLOAD_FIELD_CONTENT = "content"
 _PAYLOAD_FIELD_ACCEPTED_CANDIDATE = "accepted_candidate"
+_PAYLOAD_FIELD_ACCEPTED_ARGUMENTS = "accepted_arguments"
+_PAYLOAD_FIELD_ACCEPTED_ARGUMENTS_SOURCE_DIGEST = "accepted_arguments_source_digest"
+_PAYLOAD_FIELD_NORMALIZED_ARGUMENTS_DIGEST = "normalized_arguments_digest"
+_PAYLOAD_FIELD_TOOL_NAME = "tool_name"
 _PAYLOAD_FIELD_SCHEMA_VERSION = "schema_version"
 _PAYLOAD_FIELD_SESSION_SUMMARY = "session_summary"
 _PAYLOAD_FIELD_SUMMARY_TEXT = "summary_text"
@@ -1246,6 +1252,10 @@ def project_conversation_memory_event(
         assistant_item = _selected_assistant_item(event)
         if assistant_item is not None:
             selected = _replace_item_by_id(selected, assistant_item)
+    elif event.event_type == _EVENT_TYPE_TOOL_AWAITING:
+        awaiting_item = _selected_awaiting_item(event)
+        selected = _replace_item_by_id(selected, awaiting_item)
+        recent_evidence = _replace_item_by_id(recent_evidence, awaiting_item)
     elif event.event_type == _EVENT_TYPE_TOOL_RESULT_ACCEPTED:
         evidence_item = _selected_evidence_item(event)
         selected = _replace_item_by_id(selected, evidence_item)
@@ -1691,6 +1701,80 @@ def _selected_evidence_text(event: MemoryProjectionEvent) -> str:
             return raw_text
         raise ValueError("TOOL_RESULT_ACCEPTED raw_tool_outcome is missing")
     return "工具结果已接受；原始工具响应不可用。"
+
+
+def _selected_awaiting_item(event: MemoryProjectionEvent) -> SelectedRecentWindowItem:
+    """从 TOOL_AWAITING event 构造已确认工具参数 item。
+
+    :param event: TOOL_AWAITING projection event。
+    :returns: selected recent item。
+    :raises ValueError: awaiting payload 缺少已接受参数或 digest 不一致时抛出。
+    """
+
+    text = _selected_awaiting_text(event)
+    return SelectedRecentWindowItem(
+        item_id=_item_id(event, "selected_awaiting"),
+        role=SelectedRecentWindowRole.EVIDENCE,
+        text=text,
+        event_id=event.event_id,
+        event_sequence=event.event_sequence,
+        run_id=event.run_id,
+        source_refs=(event.event_id,),
+        included_reason=MemoryIncludedReason.RECENT_EVIDENCE,
+        excluded_reason=None,
+        size_units=estimate_memory_size_units(text),
+    )
+
+
+def _selected_awaiting_text(event: MemoryProjectionEvent) -> str:
+    """读取 LLM-facing awaiting 参数连续性文本。
+
+    :param event: TOOL_AWAITING projection event。
+    :returns: 不含 Host 内部引用的业务可读连续性文本。
+    :raises ValueError: payload 缺少必要业务字段或 digest 不一致时抛出。
+    """
+
+    tool_name = _required_str(event.payload, _PAYLOAD_FIELD_TOOL_NAME)
+    accepted_arguments = _accepted_arguments_mapping(event.payload)
+    arguments_text = json.dumps(
+        accepted_arguments,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return (
+        "已接受一个等待完成的外部工具步骤。"
+        f"工具：{tool_name}。"
+        f"已确认参数：{arguments_text}。"
+        "这些参数来自已接受的工具调用，可用于后续同类请求的引用连续性；"
+        "不要把等待状态、取消状态或调度状态当成业务事实。"
+    )
+
+
+def _accepted_arguments_mapping(
+    payload: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    """读取并校验 TOOL_AWAITING 的 LLM-safe accepted arguments。
+
+    :param payload: TOOL_AWAITING payload。
+    :returns: 已接受工具参数映射。
+    :raises ValueError: 参数不是对象或 digest 不一致时抛出。
+    """
+
+    value = payload.get(_PAYLOAD_FIELD_ACCEPTED_ARGUMENTS)
+    if not isinstance(value, Mapping):
+        raise ValueError("TOOL_AWAITING accepted_arguments must be object")
+    normalized_digest = _required_str(payload, _PAYLOAD_FIELD_NORMALIZED_ARGUMENTS_DIGEST)
+    source_digest = _required_str(
+        payload,
+        _PAYLOAD_FIELD_ACCEPTED_ARGUMENTS_SOURCE_DIGEST,
+    )
+    if source_digest != normalized_digest:
+        raise ValueError("TOOL_AWAITING accepted arguments digest mismatch")
+    accepted_arguments = dict(value)
+    if sha256_digest_json({"arguments": accepted_arguments}) != normalized_digest:
+        raise ValueError("TOOL_AWAITING accepted arguments content digest mismatch")
+    return accepted_arguments
 
 
 def _accepted_candidate_mapping(

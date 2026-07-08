@@ -200,32 +200,40 @@ async def run_cn_download_stream_impl(
     filings: list[JsonObject] = []
     warnings: list[str] = []
     notes = list(periods.notes)
+    company_info: JsonObject = {}
     try:
+        _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
         profile = discovery.resolve_company(query)
+        _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
         company_meta = upsert_company_meta_for_cn_download(
             repository=host.company_meta_repository,
             profile=profile,
             normalized_ticker=normalized_ticker,
             ticker_aliases=ticker_aliases,
         )
+        company_info = {
+            "company_id": company_meta.company_id,
+            "provider_company_id": profile.company_id,
+            "company_name": profile.company_name,
+            "market": market,
+        }
+        _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
         yield DownloadEvent(
             event_type=DownloadEventType.COMPANY_RESOLVED,
             ticker=normalized_ticker,
-            payload={
-                "company_id": company_meta.company_id,
-                "provider_company_id": profile.company_id,
-                "company_name": profile.company_name,
-                "market": market,
-            },
+            payload=company_info,
         )
         candidates = discovery.list_report_candidates(query, profile)
+        _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
         selected = _select_candidates_for_a4(
             candidates,
             period_windows=period_windows,
             use_default_business_limits=start_date is None,
         )
         if overwrite:
+            _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
             host.filing_maintenance_repository.clear_filing_documents(normalized_ticker)
+            _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
         missing_periods = _resolve_missing_periods(periods.target_periods, selected)
         for period in missing_periods:
             skipped = _build_missing_period_result(period=period)
@@ -310,6 +318,9 @@ async def run_cn_download_stream_impl(
                     document_id=str(failed_item["document_id"]),
                     payload=_filing_event_payload(failed_item),
                 )
+    except CnDownloadCancelledError:
+        notes.append("cancelled")
+        cancelled = True
     except Exception as exc:
         failed = _build_result(
             pipeline_name=pipeline_name,
@@ -350,12 +361,7 @@ async def run_cn_download_stream_impl(
         pipeline_name=pipeline_name,
         status="cancelled" if final_cancelled else "ok",
         ticker=normalized_ticker,
-        company_info={
-            "company_id": company_meta.company_id,
-            "provider_company_id": profile.company_id,
-            "company_name": profile.company_name,
-            "market": market,
-        },
+        company_info=company_info,
         filters={
             "forms": list(periods.target_periods),
             "start_dates": {period: window.start_date for period in periods.target_periods},
@@ -403,6 +409,7 @@ def _is_cancel_requested(cancel_checker: Callable[[], bool] | None) -> bool:
         True 表示已取消。
 
     Raises:
+        CnDownloadCancelledError: ``cancel_checker`` 主动抛出取消异常时原样传播。
         RuntimeError: ``cancel_checker`` 自身失败时抛出。
     """
 
@@ -410,10 +417,42 @@ def _is_cancel_requested(cancel_checker: Callable[[], bool] | None) -> bool:
         return False
     try:
         return cancel_checker()
-    except CnDownloadCancelledError:
-        return True
     except Exception as exc:
+        if isinstance(exc, CnDownloadCancelledError):
+            raise
         raise RuntimeError(f"取消检查失败: {exc}") from exc
+
+
+def _raise_if_cancelled(
+    *,
+    module: str,
+    ticker: str,
+    document_id: str,
+    cancel_checker: Callable[[], bool] | None,
+) -> None:
+    """在 CN/HK ticker 级阶段边界检查取消请求。
+
+    Args:
+        module: 日志模块名。
+        ticker: 当前 ticker。
+        document_id: 可选当前文档 ID。
+        cancel_checker: 可选取消检查函数。
+
+    Returns:
+        无。
+
+    Raises:
+        CnDownloadCancelledError: 取消检查命中时抛出。
+        RuntimeError: ``cancel_checker`` 自身失败时抛出。
+    """
+
+    if not _is_cancel_requested(cancel_checker):
+        return
+    Log.info(
+        f"CN/HK 下载收到取消请求: ticker={ticker} document_id={document_id}",
+        module=module,
+    )
+    raise CnDownloadCancelledError("操作已被取消")
 
 
 def _coerce_market(raw: str) -> CnMarketKind:

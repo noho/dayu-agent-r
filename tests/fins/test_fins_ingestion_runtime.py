@@ -2238,6 +2238,44 @@ def test_abandon_cancelled_prepared_observation_releases_handle_before_activatio
     assert executor.operations == []
 
 
+def test_abandoned_observation_does_not_pollute_repeat_download_observation(
+    tmp_path: Path,
+) -> None:
+    """旧 observation abandon 后，第二次同类下载 observation 应独立完成。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    adapter = _FakeDownloadAdapter()
+    runtime = _build_ingestion_runtime(
+        workspace_root,
+        executor=executor,
+        download_adapters={("fake", "US"): adapter},
+    )
+    first = runtime.prepare_observed_download(
+        FinsDownloadRequest(ticker="AAPL", source="fake"),
+        cancellation_token=_NeverCancelledToken(),
+    )
+
+    runtime.activate_observation(first)
+    first_cancelled = asyncio.run(runtime.cancel_observation(first))
+    asyncio.run(runtime.abandon_observation(first))
+    second = runtime.prepare_observed_download(
+        FinsDownloadRequest(ticker="AAPL", source="fake"),
+        cancellation_token=_NeverCancelledToken(),
+    )
+    runtime.activate_observation(second)
+    executor.run_all()
+    first_polled = asyncio.run(runtime.poll_observation(first))
+    second_polled = asyncio.run(runtime.poll_observation(second))
+
+    assert first_cancelled.status is FinsObservationStatus.PENDING
+    assert first_polled.status is FinsObservationStatus.LOST
+    assert second_polled.status is FinsObservationStatus.SUCCEEDED
+    assert second_polled.result is not None
+    assert second_polled.result.status is FinsResultStatus.SUCCESS
+    assert [request.source for request in adapter.requests] == ["fake"]
+
+
 def test_abandon_submitted_observation_cancels_and_keeps_storage_artifacts(
     tmp_path: Path,
 ) -> None:

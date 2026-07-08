@@ -157,12 +157,15 @@ async def run_cn_download_single_filing_stream(
         return
 
     if _should_reset_before_download(previous_meta=previous_meta, remote_fingerprint=remote_fingerprint, overwrite=overwrite):
+        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
         source_repository.reset_source_document(ticker, document_id, SourceKind.FILING)
+        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
         previous_meta = None
         previous_completed_meta = None
         source_meta_exists = False
 
     if previous_meta is None:
+        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
         update_cn_staging_source_document(
             source_repository=source_repository,
             ticker=ticker,
@@ -177,6 +180,7 @@ async def run_cn_download_single_filing_stream(
             remote_fingerprint=remote_fingerprint,
             previous_meta_exists=False,
         )
+        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
         source_meta_exists = True
     handle = source_repository.get_source_handle(ticker, document_id, SourceKind.FILING)
 
@@ -238,9 +242,15 @@ async def run_cn_download_single_filing_stream(
                 payload=_filing_event_payload(failed),
             )
             return
+        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
         pdf_path = asset.pdf_path
         try:
+            _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
             pdf_bytes = await asyncio.to_thread(pdf_path.read_bytes)
+            _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
+        except CnDownloadCancelledError:
+            _unlink_temp_pdf(pdf_path, module=module)
+            raise
         except Exception as exc:
             _unlink_temp_pdf(pdf_path, module=module)
             yield DownloadEvent(
@@ -276,6 +286,7 @@ async def run_cn_download_single_filing_stream(
         pdf_sha256 = asset.sha256
         reused_pdf = False
     else:
+        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
         pdf_bytes = reusable_pdf
         pdf_sha256 = _read_required_text(previous_meta, "staging_pdf_sha256")
         reused_pdf = True
@@ -288,6 +299,7 @@ async def run_cn_download_single_filing_stream(
         handle=handle,
         docling_filename=docling_filename,
     ):
+        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
         commit_cn_filing_source_document(
             source_repository=source_repository,
             processed_repository=processed_repository,
@@ -323,7 +335,9 @@ async def run_cn_download_single_filing_stream(
         return
 
     if previous_meta is not None and previous_meta.get("ingest_complete") is True and not overwrite:
+        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
         source_repository.reset_source_document(ticker, document_id, SourceKind.FILING)
+        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
         update_cn_staging_source_document(
             source_repository=source_repository,
             ticker=ticker,
@@ -338,13 +352,16 @@ async def run_cn_download_single_filing_stream(
             remote_fingerprint=remote_fingerprint,
             previous_meta_exists=False,
         )
+        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
         previous_meta = None
         source_meta_exists = True
         handle = source_repository.get_source_handle(ticker, document_id, SourceKind.FILING)
 
     if reused_pdf:
+        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
         pdf_entry_meta = _find_file_meta(blob_repository=blob_repository, handle=handle, filename=pdf_filename)
     else:
+        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
         pdf_entry_meta = blob_repository.store_file(
             handle,
             pdf_filename,
@@ -352,6 +369,7 @@ async def run_cn_download_single_filing_stream(
             content_type=_PDF_CONTENT_TYPE,
             metadata={"source": _SOURCE_LABEL_ORIGINAL},
         )
+        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
     pdf_entry = build_cn_file_entry(
         filename=pdf_filename,
         file_meta=pdf_entry_meta,
@@ -386,6 +404,7 @@ async def run_cn_download_single_filing_stream(
     staging_entries = [pdf_entry]
     if staged_docling_entry is not None:
         staging_entries.append(staged_docling_entry)
+    _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
     update_cn_staging_source_document(
         source_repository=source_repository,
         ticker=ticker,
@@ -400,6 +419,7 @@ async def run_cn_download_single_filing_stream(
         remote_fingerprint=remote_fingerprint,
         previous_meta_exists=True,
     )
+    _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
     yield DownloadEvent(
         event_type=DownloadEventType.FILE_DOWNLOADED,
         ticker=ticker,
@@ -415,6 +435,7 @@ async def run_cn_download_single_filing_stream(
 
     _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
     if reusable_docling is None:
+        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
         yield DownloadEvent(
             event_type=DownloadEventType.CONVERSION_STARTED,
             ticker=ticker,
@@ -437,6 +458,8 @@ async def run_cn_download_single_filing_stream(
                 pdf_bytes,
                 pdf_filename,
             )
+        except CnDownloadCancelledError:
+            raise
         except Exception as exc:
             failed = _build_filing_result(
                 document_id=document_id,
@@ -462,21 +485,25 @@ async def run_cn_download_single_filing_stream(
             content_type=_JSON_CONTENT_TYPE,
             metadata={"source": _SOURCE_LABEL_DOCLING, "pdf_sha256": pdf_sha256},
         )
+        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
         reused_docling = False
         converted = True
     else:
+        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
         docling_json_bytes = reusable_docling
-        docling_meta = (
-            staged_docling_meta
-            if staged_docling_meta is not None
-            else blob_repository.store_file(
+        if staged_docling_meta is not None:
+            docling_meta = staged_docling_meta
+        else:
+            _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
+            docling_meta = blob_repository.store_file(
                 handle,
                 docling_filename,
                 BytesIO(docling_json_bytes),
                 content_type=_JSON_CONTENT_TYPE,
                 metadata={"source": _SOURCE_LABEL_DOCLING, "pdf_sha256": pdf_sha256},
             )
-        )
+            _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
+        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
         reused_docling = True
         converted = False
     docling_entry = build_cn_file_entry(
@@ -488,6 +515,7 @@ async def run_cn_download_single_filing_stream(
         pdf_bytes=pdf_bytes,
         docling_json_bytes=docling_json_bytes,
     )
+    _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
     commit_cn_filing_source_document(
         source_repository=source_repository,
         processed_repository=processed_repository,
