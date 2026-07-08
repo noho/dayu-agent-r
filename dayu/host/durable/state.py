@@ -2083,6 +2083,62 @@ def read_wait_records_for_poll_observation(
     return tuple(wait_record_row_from_host_row(row) for row in rows)
 
 
+def read_next_wait_record_poll_due_at(
+    transaction: HostTransaction,
+    *,
+    now: str,
+) -> str | None:
+    """读取当前 active poll wait 的下一次可观察时间。
+
+    本 helper 只用于 poller 空轮询后的 scheduler sleep 计算。若存在已经
+    due 的 wait record，claim path 应先处理它；本 helper 返回未来最早的
+    ``poll_next_observe_at`` 或未过期 claim 的 ``poll_claim_expires_at``。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param now: 当前 UTC timestamp 文本。
+    :returns: 下一次可观察 UTC timestamp；没有 active poll wait 时为 ``None``。
+    :raises HostDurableError: ``now`` 为空或 SQLite row 字段非法时抛出。
+    :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
+    """
+
+    _require_non_empty_text(now, field_name="now")
+    row = transaction.fetchone(
+        f"""
+        SELECT MIN(
+          CASE
+            WHEN poll_claim_id IS NOT NULL AND poll_claim_expires_at > ?
+              THEN poll_claim_expires_at
+            WHEN poll_next_observe_at IS NOT NULL AND poll_next_observe_at > ?
+              THEN poll_next_observe_at
+            ELSE NULL
+          END
+        ) AS next_due_at
+        FROM {TABLE_HOST_WAIT_RECORDS}
+        WHERE resume_policy = ?
+          AND (
+            status = ?
+            OR (status = ? AND poll_abandoned_at IS NULL)
+          )
+          AND (
+            (poll_claim_id IS NOT NULL AND poll_claim_expires_at > ?)
+            OR (poll_next_observe_at IS NOT NULL AND poll_next_observe_at > ?)
+          )
+        """,
+        (
+            now,
+            now,
+            serialize_wait_resume_policy(WaitResumePolicy.POLL),
+            serialize_wait_record_status(WaitRecordStatus.WAITING),
+            serialize_wait_record_status(WaitRecordStatus.CANCELLED),
+            now,
+            now,
+        ),
+    )
+    if row is None:
+        return None
+    return _optional_text(row.get("next_due_at"), field_name="next_due_at")
+
+
 def claim_wait_record_for_poll(
     transaction: HostTransaction,
     *,

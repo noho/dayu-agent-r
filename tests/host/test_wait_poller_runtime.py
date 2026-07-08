@@ -7,7 +7,7 @@ import inspect
 import threading
 import time
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TypedDict
 
@@ -38,6 +38,7 @@ from dayu.host.wait_adapter import (
     WaitPollerRuntimePolicy,
     WaitPollerSupervisor,
     WaitPollNotReady,
+    WaitPollClock,
     WaitPollReady,
     WaitPollResult,
 )
@@ -60,6 +61,8 @@ class _PolicyKwargs(TypedDict):
     backoff_initial_delay_seconds: float
     backoff_multiplier: float
     backoff_max_delay_seconds: float
+    not_ready_observe_interval_seconds: float
+    idle_poll_interval_seconds: float
     close_drain_timeout_seconds: float | None
 
 
@@ -73,6 +76,47 @@ class _FixedClock:
         """
 
         return _POLL_NOW
+
+
+class _ManualClock:
+    """测试用可推进 UTC 时钟。"""
+
+    def __init__(self) -> None:
+        """初始化时钟。
+
+        :returns: ``None``。
+        """
+
+        self._now = _POLL_NOW
+
+    def now(self) -> datetime:
+        """返回当前测试时间。
+
+        :returns: 当前测试时间。
+        """
+
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        """推进测试时间。
+
+        :param seconds: 推进秒数。
+        :returns: ``None``。
+        """
+
+        self._now = self._now + timedelta(seconds=seconds)
+
+
+class _RealtimeUtcClock:
+    """测试用真实 UTC 时钟。"""
+
+    def now(self) -> datetime:
+        """返回当前真实 UTC 时间。
+
+        :returns: 当前 UTC 时间。
+        """
+
+        return datetime.now(UTC)
 
 
 class _PublicCommandResolver:
@@ -133,7 +177,7 @@ class _HandlePollerFactory:
         options: HostCommandHandleOptions,
         adapter_registry: WaitPollAdapterRegistry,
         policy: WaitPollerRuntimePolicy,
-        clock: _FixedClock,
+        clock: WaitPollClock,
         owner_id: str,
     ) -> None:
         """初始化 factory。
@@ -185,6 +229,7 @@ class _SequenceAdapter:
 
         self._results = results
         self.poll_count = 0
+        self.poll_started_at: list[float] = []
         self.abandoned: list[str] = []
 
     def poll_wait(self, wait_record: WaitRecordRow) -> WaitPollResult:
@@ -195,6 +240,7 @@ class _SequenceAdapter:
         """
 
         del wait_record
+        self.poll_started_at.append(time.monotonic())
         index = min(self.poll_count, len(self._results) - 1)
         self.poll_count += 1
         return self._results[index]
@@ -372,6 +418,8 @@ def test_runtime_policy_rejects_non_positive_values() -> None:
         "backoff_initial_delay_seconds",
         "backoff_multiplier",
         "backoff_max_delay_seconds",
+        "not_ready_observe_interval_seconds",
+        "idle_poll_interval_seconds",
         "close_drain_timeout_seconds",
     ):
         values = _policy_kwargs()
@@ -489,6 +537,163 @@ def test_close_wakes_idle_sleep_promptly(tmp_path: Path) -> None:
         assert elapsed < 0.5
         assert supervisor.diagnostics_snapshot().status is WaitPollerLoopStatus.STOPPED
     finally:
+        host.close()
+
+
+def test_background_loop_uses_idle_interval_after_empty_round(tmp_path: Path) -> None:
+    """background loop 空轮询后使用 idle 间隔，避免持续短间隔撞库。"""
+
+    options = _options(tmp_path)
+    policy_values = _policy_kwargs()
+    policy_values["poll_interval_seconds"] = 0.01
+    policy_values["idle_poll_interval_seconds"] = 0.2
+    policy = WaitPollerRuntimePolicy(**policy_values)
+    host = create_host_command_handle(options)
+    supervisor: WaitPollerSupervisor | None = None
+    try:
+        supervisor = _supervisor_without_wait(
+            host,
+            _SequenceAdapter((WaitPollNotReady(),)),
+            options=options,
+            policy=policy,
+        )
+
+        supervisor.open()
+        _wait_until(lambda: supervisor.diagnostics_snapshot().poll_rounds >= 1)
+        time.sleep(0.05)
+
+        assert supervisor.diagnostics_snapshot().poll_rounds == 1
+    finally:
+        if supervisor is not None:
+            supervisor.close()
+        host.close()
+
+
+def test_wakeup_interrupts_idle_after_new_wait_is_created(tmp_path: Path) -> None:
+    """新 wait 创建后 wakeup 可打断 idle sleep 并立即 observe。"""
+
+    options = _options(tmp_path)
+    policy_values = _policy_kwargs()
+    policy_values["idle_poll_interval_seconds"] = 0.5
+    policy = WaitPollerRuntimePolicy(**policy_values)
+    host = create_host_command_handle(options)
+    adapter = _SequenceAdapter((WaitPollNotReady(),))
+    adapter_registry = WaitPollAdapterRegistry(
+        (
+            WaitPollAdapterRegistration(
+                adapter_key=WaitAdapterKey("poll:long-tool"),
+                adapter=adapter,
+            ),
+        )
+    )
+    supervisor = WaitPollerSupervisor(
+        poller_factory=_handle_poller_factory(
+            options=options,
+            adapter_registry=adapter_registry,
+            owner_id="poller-runtime-new-wait",
+            policy=policy,
+        ),
+        policy=policy,
+        owner_id="poller-runtime-new-wait",
+    )
+    try:
+        supervisor.open()
+        _wait_until(lambda: supervisor.diagnostics_snapshot().poll_rounds >= 1)
+
+        _seed_waiting_run(host)
+        started = time.monotonic()
+        supervisor.wakeup()
+        _wait_until(lambda: adapter.poll_count == 1)
+
+        assert time.monotonic() - started < 0.3
+    finally:
+        supervisor.close()
+        host.close()
+
+
+def test_pure_poll_observes_ready_after_not_ready_policy_cadence(
+    tmp_path: Path,
+) -> None:
+    """无 wakeup 时，not-ready 后也按 policy cadence 观察 ready。"""
+
+    options = _options(tmp_path)
+    policy_values = _policy_kwargs()
+    policy_values["poll_interval_seconds"] = 0.2
+    policy_values["not_ready_observe_interval_seconds"] = 0.03
+    policy_values["idle_poll_interval_seconds"] = 0.5
+    policy = WaitPollerRuntimePolicy(**policy_values)
+    clock = _ManualClock()
+    host = create_host_command_handle(options)
+    supervisor: WaitPollerSupervisor | None = None
+    try:
+        seeded = _seed_waiting_run(host)
+        adapter = _SequenceAdapter((WaitPollNotReady(), _ready_result()))
+        supervisor = _supervisor(
+            host,
+            adapter,
+            seeded.wait_id,
+            options=options,
+            policy=policy,
+            clock=clock,
+        )
+
+        first = supervisor.drain_once_for_test()
+        early = supervisor.drain_once_for_test()
+        clock.advance(0.03)
+        second = supervisor.drain_once_for_test()
+
+        wait_record = _read_wait(host._transaction_runner(), seeded.wait_id)
+        assert first.not_ready == 1
+        assert first.next_poll_delay_seconds == pytest.approx(0.03)
+        assert early.observed == 0
+        assert adapter.poll_count == 2
+        assert second.resolved == 1
+        assert wait_record.status is WaitRecordStatus.RESOLVED
+    finally:
+        if supervisor is not None:
+            supervisor.close()
+        host.close()
+
+
+def test_background_loop_uses_not_ready_due_before_poll_interval(
+    tmp_path: Path,
+) -> None:
+    """not-ready cadence 小于 poll interval 时，后台 loop 按 next due 复查。"""
+
+    options = _options(tmp_path)
+    policy_values = _policy_kwargs()
+    policy_values["poll_interval_seconds"] = 0.5
+    policy_values["not_ready_observe_interval_seconds"] = 0.01
+    policy_values["idle_poll_interval_seconds"] = 0.5
+    policy = WaitPollerRuntimePolicy(**policy_values)
+    host = create_host_command_handle(options)
+    supervisor: WaitPollerSupervisor | None = None
+    try:
+        seeded = _seed_waiting_run(host)
+        adapter = _SequenceAdapter((WaitPollNotReady(), _ready_result()))
+        supervisor = _supervisor(
+            host,
+            adapter,
+            seeded.wait_id,
+            options=options,
+            policy=policy,
+            clock=_RealtimeUtcClock(),
+        )
+
+        supervisor.open()
+        _wait_until(lambda: adapter.poll_count == 1)
+        _wait_until(
+            lambda: _read_wait(host._transaction_runner(), seeded.wait_id).status
+            is WaitRecordStatus.RESOLVED
+        )
+
+        wait_record = _read_wait(host._transaction_runner(), seeded.wait_id)
+        elapsed_seconds = adapter.poll_started_at[1] - adapter.poll_started_at[0]
+        assert elapsed_seconds < 0.3
+        assert wait_record.status is WaitRecordStatus.RESOLVED
+    finally:
+        if supervisor is not None:
+            supervisor.close()
         host.close()
 
 
@@ -707,6 +912,7 @@ def _supervisor(
     *,
     options: HostCommandHandleOptions,
     policy: WaitPollerRuntimePolicy | None = None,
+    clock: WaitPollClock | None = None,
 ) -> WaitPollerSupervisor:
     """构造测试 supervisor。
 
@@ -715,6 +921,7 @@ def _supervisor(
     :param wait_id: wait record id。
     :param options: 线程内 Host handle factory 使用的 options。
     :param policy: runtime policy；缺省使用测试默认 policy。
+    :param clock: 测试时钟；缺省使用固定测试时钟。
     :returns: supervisor。
     """
 
@@ -733,6 +940,7 @@ def _supervisor(
             adapter_registry=adapter_registry,
             owner_id="poller-runtime-test",
             policy=resolved_policy,
+            clock=clock,
         ),
         policy=resolved_policy,
         owner_id="poller-runtime-test",
@@ -782,6 +990,7 @@ def _handle_poller_factory(
     adapter_registry: WaitPollAdapterRegistry,
     owner_id: str,
     policy: WaitPollerRuntimePolicy,
+    clock: WaitPollClock | None = None,
 ) -> WaitPollerFactory:
     """构造线程内 Host handle poller factory。
 
@@ -789,6 +998,7 @@ def _handle_poller_factory(
     :param adapter_registry: poll adapter registry。
     :param owner_id: poller owner id。
     :param policy: runtime policy。
+    :param clock: 测试时钟；缺省使用固定测试时钟。
     :returns: poller factory。
     """
 
@@ -796,7 +1006,7 @@ def _handle_poller_factory(
         options=options,
         adapter_registry=adapter_registry,
         policy=policy,
-        clock=_FixedClock(),
+        clock=clock if clock is not None else _FixedClock(),
         owner_id=owner_id,
     )
 
@@ -829,19 +1039,24 @@ def _policy_kwargs() -> _PolicyKwargs:
         "backoff_initial_delay_seconds": 10.0,
         "backoff_multiplier": 2.0,
         "backoff_max_delay_seconds": 20.0,
+        "not_ready_observe_interval_seconds": 0.01,
+        "idle_poll_interval_seconds": 0.05,
         "close_drain_timeout_seconds": 0.02,
     }
 
 
-def _wait_until(predicate: Callable[[], bool]) -> None:
+def _wait_until(
+    predicate: Callable[[], bool], *, timeout_seconds: float = 1.0
+) -> None:
     """等待 predicate 在短时间内成立。
 
     :param predicate: 待观察条件。
+    :param timeout_seconds: 最长等待秒数。
     :returns: ``None``。
     :raises AssertionError: 超时仍未成立时抛出。
     """
 
-    deadline = time.monotonic() + 1.0
+    deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         if predicate():
             return
