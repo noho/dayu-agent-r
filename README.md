@@ -299,8 +299,8 @@ dayu-cli <subcommand> [参数]
 | `--label` | `prompt` `interactive` | 把当前对话绑定到可恢复 label |
 | `--new-session` | `interactive` | 不续接上一次 interactive 多轮会话，改为从头开始一个新会话 |
 | `--web-provider` | `prompt` `interactive` `write` | 指定联网检索 provider，如 `auto`、`tavily`、`serper`、`duckduckgo` |
-| `--thinking` / `--no-thinking` | `prompt` `interactive` | 控制是否在终端回显运行态思考展示；默认 `--thinking` |
-| `--detail` / `--no-detail` | `prompt` `interactive` | 控制是否显示运行态 activity stream；默认 `--detail` |
+| `--thinking` / `--no-thinking` | `prompt` `interactive` `session resume` | 控制是否在终端回显运行态思考展示；默认 `--thinking` |
+| `--detail` / `--no-detail` | `prompt` `interactive` `session resume` | 控制是否显示运行态 activity stream；默认 `--detail` |
 
 说明：
 - `--log-level`、`--debug`、`--verbose`、`--info`、`--quiet` 是同一组日志参数，使用其一即可。

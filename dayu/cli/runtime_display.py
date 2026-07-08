@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import shutil
 import unicodedata
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Final, TextIO
+from typing import Protocol
 
 _CURSOR_UP_ONE_LINE: Final[str] = "\x1b[1A"
 _CARRIAGE_RETURN: Final[str] = "\r"
@@ -18,6 +21,198 @@ _DEFAULT_TERMINAL_LINES: Final[int] = 24
 _MIN_TERMINAL_COLUMNS: Final[int] = 1
 _EAST_ASIAN_FULLWIDTH: Final[str] = "F"
 _EAST_ASIAN_WIDE: Final[str] = "W"
+
+
+class RuntimeActivityDisplay(Protocol):
+    """CLI 运行态 activity-like 展示协议。
+
+    该协议只描述 prompt activity renderer 与 interactive run view 在运行态
+    清理时共享的 UI 能力，不包含二者各自的业务输入、view 切换或 terminal
+    result 渲染差异。
+    """
+
+    def set_runtime_line_guard(self, guard: Callable[[], None] | None) -> None:
+        """设置运行态输出前执行的行收尾回调。
+
+        :param guard: 输出运行态行前执行的回调；``None`` 表示不执行。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+        ...
+
+    def finish_runtime_display(self) -> None:
+        """结束当前运行态展示，为 terminal result 输出让出干净位置。
+
+        :returns: ``None``。
+        :raises OSError: 输出流写入失败时由实现透传。
+        """
+        ...
+
+    def render_cancel_requested(self) -> None:
+        """渲染用户已请求取消的运行态提示。
+
+        :returns: ``None``。
+        :raises OSError: 输出流写入失败时由实现透传。
+        """
+        ...
+
+    def render_local_exit_after_cancel(self) -> None:
+        """渲染二次中断导致本地退出的提示。
+
+        :returns: ``None``。
+        :raises OSError: 输出流写入失败时由实现透传。
+        """
+        ...
+
+    def close(self) -> None:
+        """关闭 activity-like 展示，后续运行态行不再输出。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+        ...
+
+
+class RuntimeThinkingDisplay(Protocol):
+    """CLI 运行态 thinking 展示协议。"""
+
+    def finish_runtime_display(self) -> None:
+        """结束当前 thinking 运行态展示。
+
+        :returns: ``None``。
+        :raises OSError: 输出流写入失败时由实现透传。
+        """
+        ...
+
+    def close(self) -> None:
+        """关闭 thinking 展示，后续增量不再输出。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+        ...
+
+
+@dataclass(slots=True)
+class RuntimeDisplayController:
+    """协调 CLI activity-like 展示与 thinking 展示的运行态清理时序。
+
+    :param activity_display: activity-like 展示；``None`` 表示不输出 activity。
+    :param thinking_display: thinking 展示；``None`` 表示不输出 thinking。
+    """
+
+    activity_display: RuntimeActivityDisplay | None
+    thinking_display: RuntimeThinkingDisplay | None
+    _thinking_closed: bool = False
+    _activity_closed: bool = False
+
+    def install_runtime_line_guard(self) -> None:
+        """安装 activity-like 输出前的 thinking 行收尾 guard。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        if self.activity_display is None or self._activity_closed:
+            return
+        guard: Callable[[], None] | None = None
+        if self.thinking_display is not None and not self._thinking_closed:
+            guard = self.thinking_display.finish_runtime_display
+        self.activity_display.set_runtime_line_guard(guard)
+
+    def clear_runtime_line_guard(self) -> None:
+        """移除 activity-like 输出前的运行态行收尾 guard。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        if self.activity_display is not None and not self._activity_closed:
+            self.activity_display.set_runtime_line_guard(None)
+
+    def finish_runtime_display(self) -> None:
+        """按 thinking 优先顺序结束本轮运行态展示。
+
+        :returns: ``None``。
+        :raises OSError: 输出流写入失败时由底层 renderer 透传。
+        """
+
+        if self.thinking_display is not None and not self._thinking_closed:
+            self.thinking_display.finish_runtime_display()
+        if self.activity_display is not None and not self._activity_closed:
+            self.activity_display.finish_runtime_display()
+
+    def finish_and_close_thinking(self) -> None:
+        """在进入取消路径前结束并关闭 thinking 展示。
+
+        :returns: ``None``。
+        :raises OSError: 输出流写入失败时由底层 renderer 透传。
+        """
+
+        if self.thinking_display is None or self._thinking_closed:
+            return
+        self.thinking_display.finish_runtime_display()
+        self.thinking_display.close()
+        self._thinking_closed = True
+        self.clear_runtime_line_guard()
+
+    def close_thinking(self) -> None:
+        """关闭 thinking 展示，幂等处理取消路径已关闭的情况。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        if self.thinking_display is None or self._thinking_closed:
+            return
+        self.thinking_display.close()
+        self._thinking_closed = True
+        self.clear_runtime_line_guard()
+
+    def close_activity(self) -> None:
+        """关闭 activity-like 展示，幂等处理已关闭的情况。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        if self.activity_display is None or self._activity_closed:
+            return
+        self.clear_runtime_line_guard()
+        self.activity_display.close()
+        self._activity_closed = True
+
+    def close(self) -> None:
+        """关闭 controller 管理的所有运行态展示。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.close_thinking()
+        self.close_activity()
+
+    def render_cancel_requested(self) -> None:
+        """渲染用户已请求取消的 activity-like 提示。
+
+        :returns: ``None``。
+        :raises OSError: 输出流写入失败时由底层 renderer 透传。
+        """
+
+        if self.activity_display is not None and not self._activity_closed:
+            self.activity_display.render_cancel_requested()
+
+    def render_local_exit_after_cancel(self) -> None:
+        """二次中断本地退出前先清理 thinking，再渲染本地退出提示。
+
+        :returns: ``None``。
+        :raises OSError: 输出流写入失败时由底层 renderer 透传。
+        """
+
+        if self.thinking_display is not None and not self._thinking_closed:
+            self.thinking_display.finish_runtime_display()
+        if self.activity_display is not None and not self._activity_closed:
+            self.activity_display.render_local_exit_after_cancel()
 
 
 def resolve_terminal_columns(explicit_columns: int | None) -> int:
@@ -108,6 +303,9 @@ def clear_open_rows(stream: TextIO, *, row_count: int) -> None:
 
 
 __all__: tuple[str, ...] = (
+    "RuntimeActivityDisplay",
+    "RuntimeDisplayController",
+    "RuntimeThinkingDisplay",
     "clear_completed_rows",
     "clear_open_rows",
     "resolve_terminal_columns",

@@ -262,6 +262,8 @@ async def _run_session_resume(args: ParsedCliArgs) -> int:
                     prepared=prepared,
                     session_id=target.session_id,
                     sigint_monitor=CliSigintMonitor(),
+                    detail=args.detail,
+                    thinking=args.thinking,
                 )
             except HostApiError as exc:
                 render_cli_error(_resume_host_error_message(target=target, error=exc))
@@ -282,6 +284,8 @@ async def _run_session_resume(args: ParsedCliArgs) -> int:
                 host=host,
                 prepared=prepared_interactive,
                 session_id=target.session_id,
+                detail=args.detail,
+                thinking=args.thinking,
             )
         except HostApiError as exc:
             render_cli_error(_resume_host_error_message(target=target, error=exc))

@@ -66,6 +66,7 @@ from dayu.service.entrypoint_runtime import EntrypointRuntimeResult
 from dayu.cli.activity import CliActivityRenderer, CliActivityRendererOptions
 from dayu.cli.output import render_prompt_terminal_result
 from dayu.cli.run_keys import RunningKeyAction
+from dayu.cli.runtime_display import RuntimeDisplayController
 from dayu.cli.session_terminal_cursor import read_cli_terminal_cursor
 from dayu.cli.thinking import CliThinkingRenderer, CliThinkingRendererOptions
 from dayu.service.entrypoint_runtime import EntrypointThinking
@@ -1429,7 +1430,10 @@ async def test_prompt_cancel_helper_closes_thinking_renderer() -> None:
         submit_task=submit_task,
         sigint_monitor=_NoopSigintMonitor(),
         observed_sigint_count=0,
-        thinking_renderer=thinking_renderer,
+        runtime_display=RuntimeDisplayController(
+            activity_display=None,
+            thinking_display=thinking_renderer,
+        ),
     )
 
     assert result is None

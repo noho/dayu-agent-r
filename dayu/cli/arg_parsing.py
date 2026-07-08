@@ -446,21 +446,7 @@ def _register_prompt_command(
     parser.add_argument("prompt", type=_non_empty_prompt, help="本轮用户问题。")
     parser.add_argument("--ticker", help="可选公司代码或财报主体。")
     parser.add_argument("--label", help="复用或绑定的本地会话标签。")
-    detail_group = parser.add_mutually_exclusive_group()
-    detail_group.add_argument(
-        "--detail",
-        dest="detail",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help="显示运行态 activity stream。",
-    )
-    detail_group.add_argument(
-        "--no-detail",
-        dest="detail",
-        action="store_false",
-        default=argparse.SUPPRESS,
-        help="不显示运行态 activity stream。",
-    )
+    _add_detail_display_arguments(parser)
     _add_agent_execution_arguments(parser)
 
 
@@ -484,21 +470,7 @@ def _register_interactive_command(
     )
     parser.add_argument("--ticker", help="可选公司代码或财报主体。")
     parser.add_argument("--label", help="复用或绑定的本地会话标签。")
-    detail_group = parser.add_mutually_exclusive_group()
-    detail_group.add_argument(
-        "--detail",
-        dest="detail",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help="显示运行态 activity stream。",
-    )
-    detail_group.add_argument(
-        "--no-detail",
-        dest="detail",
-        action="store_false",
-        default=argparse.SUPPRESS,
-        help="不显示运行态 activity stream。",
-    )
+    _add_detail_display_arguments(parser)
     _add_agent_execution_arguments(parser)
 
 
@@ -614,6 +586,7 @@ def _register_session_resume_action(
         type=_non_empty_prompt,
         help="prompt 模式下一轮用户问题。",
     )
+    _add_detail_display_arguments(parser)
     _add_agent_execution_arguments(parser)
 
 
@@ -722,6 +695,31 @@ def _add_agent_execution_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--doc-limits-json", help="保留的文档工具限制 JSON。")
     parser.add_argument("--fins-limits-json", help="保留的财报工具限制 JSON。")
+
+
+def _add_detail_display_arguments(parser: argparse.ArgumentParser) -> None:
+    """为 Agent 类命令追加运行态 activity 展示参数。
+
+    :param parser: 目标命令解析器。
+    :returns: ``None``。
+    :raises ValueError: argparse 参数注册失败时透传底层异常。
+    """
+
+    detail_group = parser.add_mutually_exclusive_group()
+    detail_group.add_argument(
+        "--detail",
+        dest="detail",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="显示运行态 activity stream。",
+    )
+    detail_group.add_argument(
+        "--no-detail",
+        dest="detail",
+        action="store_false",
+        default=argparse.SUPPRESS,
+        help="不显示运行态 activity stream。",
+    )
 
 
 def _non_empty_prompt(value: str) -> str:

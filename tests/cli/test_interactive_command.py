@@ -17,6 +17,7 @@ import dayu.cli.main as cli_main
 from dayu.cli.composer import InputReaderComposer
 from dayu.cli.run_keys import RunningKeyAction
 from dayu.cli.run_view import InteractiveRunViewOptions, TerminalInteractiveRunView
+from dayu.cli.runtime_display import RuntimeDisplayController
 from dayu.cli.session_terminal_cursor import read_cli_terminal_cursor
 from dayu.cli.thinking import CliThinkingRenderer, CliThinkingRendererOptions
 from dayu.cli.agent_entrypoint import (
@@ -1787,7 +1788,10 @@ async def test_cancel_after_first_sigint_returns_completed_submit_terminal() -> 
         submit_task=submit_task,
         sigint_monitor=_ImmediateSecondSigintMonitor(),
         observed_sigint_count=1,
-        thinking_renderer=thinking_renderer,
+        runtime_display=RuntimeDisplayController(
+            activity_display=None,
+            thinking_display=thinking_renderer,
+        ),
     )
 
     assert result is not None
