@@ -3059,6 +3059,7 @@ Projection 规则：
 
 - compact 前，Session Summary Memory、Answer Anchor Memory 与 Forward Intent Memory 为空。
 - compact 前，Trace Memory 与 Evidence / Fact Memory 只能从 selected recent window 中的 user / assistant / user-visible state / readable tool material 表达；它们不自动生成高阶结构化 item。
+- `TOOL_AWAITING` 是 Host / ToolRuntime 之间的等待治理事实，对模型不可见。`TOOL_AWAITING`、`RUN_WAITING`、`ATTEMPT_SUSPENDED`、wait record、poll outcome、cancel / abandon lifecycle 等 Host / ToolRuntime 等待治理事实不得成为 Conversation Memory producer，也不得投影为 LLM-facing selected recent window、recent evidence、reference continuity 或 semantic memory item。对 LLM 来说，awaiting 与非 awaiting 不改变跨轮 memory 语义；同样的 user input、ordinary tool result 与 final answer，有无中间 awaiting governance event，LLM-facing memory 必须等价。
 - compact 成功后，accepted compact output 生成或更新五类 session memory；post-compact delta material 继续按 selected recent window 进入 prompt assembly。
 - fallback tier 1-3 属于 compact recovery fallback：它们仍送 LLM compactor；accepted output 可以提交 `CONTEXT_COMPACTED`，并由 projection 生成五类 Session Semantic Memory。
 - fallback tier 4-5 属于 dispatch fallback：它们不送 LLM compactor，不提交 `CONTEXT_COMPACTED`，不生成 compact artifact / memory snapshot / 五类 memory。
@@ -3071,7 +3072,7 @@ Snapshot 与 projection checkpoint 必须在同一 durable store transaction 提
 
 Trace Memory 负责对话连续性，不负责事实证明。数据来源包括 `USER_INPUT_ACCEPTED`、`RUN_SUCCEEDED.final_answer` 和用户可见 Run 状态。TraceMemoryView 当前字段为 selected recent window 与 reference continuity items；reference continuity item 用于保存 compact 后仍需解析代词、序号、“刚才那个”等局部承接的最小上下文，不是 fact、summary、answer anchor 或 forward intent。
 
-Evidence / Fact Memory 负责工具证据与基于证据的 claim。`TOOL_RESULT_ACCEPTED` 通过 Host accept barrier 后保存 accepted evidence envelope、payload / artifact refs 与 digest；LLM-facing evidence material 只包含可读 tool、query、response、source text 与 prompt-local opaque label。`evidence_backed_facts` 只来自 accepted `CONTEXT_COMPACTED` 中通过 Host accept barrier 的 fact candidates，或后续明确设计的非 compact producer。这里的 fact 表示 Host-accepted claim 绑定到 accepted evidence，不表示 Host 证明现实世界 truth。
+Evidence / Fact Memory 负责工具证据与基于证据的 claim。`TOOL_RESULT_ACCEPTED` 通过 Host accept barrier 后保存 accepted evidence envelope、payload / artifact refs 与 digest；LLM-facing evidence material 必须自解释，只包含可读 tool、必要 request / query 语义、response、source text 与 prompt-local opaque label。必要 request / query 语义用于让工具结果在下一轮可解释、可复用，例如“查询 Coinbase 的股票代码”或“读取 ticker=COIN 的财报列表”；它不是 `TOOL_CALL_REQUESTED` 原事件、原始参数或内部治理字段的原样回放，也不得暴露 `tool_call_id`、EventLog id、payload ref、artifact ref、digest、wait id、awaiting / poll / cancel 状态或 Python 类型名。`evidence_backed_facts` 只来自 accepted `CONTEXT_COMPACTED` 中通过 Host accept barrier 的 fact candidates，或后续明确设计的非 compact producer。这里的 fact 表示 Host-accepted claim 绑定到 accepted evidence，不表示 Host 证明现实世界 truth。
 
 Session Summary Memory 负责当前 session 的 compact / rollup，服务长对话连续性，不替代事实。它只来自 accepted `CONTEXT_COMPACTED`；多次 compact 使用 rolling compacted view，latest accepted compacted view 是下一次 compact 的 previous accepted view。
 
