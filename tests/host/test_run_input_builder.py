@@ -1136,7 +1136,7 @@ def test_durable_memory_provider_uses_covered_snapshot(tmp_path: Path) -> None:
         assert "summary=compare revenue quality; use reported currency" in system_content
         assert "## Verified Evidence and Facts" in system_content
         assert "claim_text=Revenue increased year over year" in system_content
-        assert "evidence_kind=derived_from_evidence" in system_content
+        assert "evidence_kind=" not in system_content
         assert "evidence_refs=" not in system_content
         assert "extraction_operation_ref=" not in system_content
         assert "event_id=" not in system_content
@@ -3327,7 +3327,7 @@ def test_compact_artifact_reader_uses_vnext_evidence_mapping_refs() -> None:
 @pytest.mark.parametrize(
     ("field_path", "bad_value"),
     (
-        ("fact.evidence_kind", 123),
+        ("reference.text", 123),
         ("reference.reason", ""),
     ),
 )
@@ -3351,17 +3351,13 @@ def test_compact_artifact_semantic_renderer_rejects_invalid_optional_text(
     }
     candidate = payload["accepted_candidate"]
     assert isinstance(candidate, dict)
-    if field_path == "fact.evidence_kind":
-        facts = candidate["evidence_backed_facts"]
-        assert isinstance(facts, list)
-        fact = facts[0]
-        assert isinstance(fact, dict)
-        fact["evidence_kind"] = bad_value
+    references = candidate["reference_continuity_items"]
+    assert isinstance(references, list)
+    reference = references[0]
+    assert isinstance(reference, dict)
+    if field_path == "reference.text":
+        reference["text"] = bad_value
     else:
-        references = candidate["reference_continuity_items"]
-        assert isinstance(references, list)
-        reference = references[0]
-        assert isinstance(reference, dict)
         reference["reason"] = bad_value
 
     with pytest.raises(HostDurableError, match="must be text"):

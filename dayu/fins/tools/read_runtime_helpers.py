@@ -334,7 +334,7 @@ def raise_fins_cancelled(cancellation_token: CancellationToken, *, message: str)
     del cancellation_token
     raise FinsReadCancelledError(
         message=message,
-        hint="当前工具调用已停止；等待新的用户指令或后续调度。",
+        hint="当前工具调用已停止；如仍需要该结果，请等待用户确认后再重新发起。",
     )
 
 

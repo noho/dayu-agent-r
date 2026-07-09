@@ -946,8 +946,7 @@ def test_conversation_compact_input_vnext_previous_view_maps_stable_blocks() -> 
         item.claim_text
         for item in previous_view.evidence_backed_facts
     ) == (
-        "fact=claim_text=Revenue increased year over year; "
-        "evidence_refs=evidence:accepted; evidence_kind=derived_from_evidence",
+        "fact=claim_text=Revenue increased year over year; evidence_refs=evidence:accepted",
     )
     assert tuple(
         item.anchor_title for item in previous_view.answer_anchors
@@ -1099,7 +1098,7 @@ def test_conversation_compact_input_vnext_maps_user_visible_state_to_trace() -> 
         "run is waiting for user confirmation",
     )
     assert tuple(item.trace_kind.value for item in vnext_input.trace_material) == (
-        "user_visible_run_state",
+        "user_visible_progress",
     )
 
 
@@ -2078,10 +2077,7 @@ def test_pre_dispatch_second_compact_rolls_from_latest_accepted_candidate(tmp_pa
 
         assert tuple(block.text for block in view.previous_compacted_view) == (
             "accepted session summary",
-            (
-                "fact=claim_text=accepted fact; evidence_refs=E1; "
-                "evidence_kind=accepted_evidence_material"
-            ),
+            "fact=claim_text=accepted fact; evidence_refs=E1",
             "answer_anchor=accepted anchor",
             "forward_intent=next_step_note; status=open; text=accepted next step",
             "reference_continuity=local_reference; text=accepted reference",
@@ -2156,14 +2152,8 @@ def test_pre_dispatch_previous_view_splits_each_accepted_candidate_item(
         )
         assert tuple(block.text for block in view.previous_compacted_view) == (
             "accepted session summary",
-            (
-                "fact=claim_text=accepted fact one; evidence_refs=E1; "
-                "evidence_kind=accepted_evidence_material"
-            ),
-            (
-                "fact=claim_text=accepted fact two; evidence_refs=E2; "
-                "evidence_kind=accepted_evidence_material"
-            ),
+            "fact=claim_text=accepted fact one; evidence_refs=E1",
+            "fact=claim_text=accepted fact two; evidence_refs=E2",
             "answer_anchor=accepted anchor one",
             "answer_anchor=accepted anchor two",
             "forward_intent=next_step_note; status=open; text=accepted next step",

@@ -274,7 +274,7 @@ class ToolAwaitingAcceptCandidate:
                 raise ValueError(f"{field_name} must be sha256 digest")
         if self.binding.resume_policy is WaitResumePolicy.POLL:
             if self.external_job_ref is None:
-                raise ValueError("poll awaiting candidate requires external_job_ref")
+                raise ValueError("background task candidate requires external_job_ref")
         if (
             self.external_job_ref is not None
             and self.external_job_ref.adapter_key != self.binding.adapter_key

@@ -107,7 +107,7 @@ _SUMMARY_TEXT_FIELD = "summary_text"
 _SOURCE_LABELS_FIELD = "source_labels"
 _CLAIM_TEXT_FIELD = "claim_text"
 _EVIDENCE_LABELS_FIELD = "evidence_labels"
-_EVIDENCE_KIND_FIELD = "evidence_kind"
+_HOST_DERIVED_FACT_EVIDENCE_KIND = FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL
 _ANCHOR_TITLE_FIELD = "anchor_title"
 _ANCHOR_ITEMS_FIELD = "anchor_items"
 _ANSWER_SOURCE_LABELS_FIELD = "answer_source_labels"
@@ -118,7 +118,6 @@ _TEXT_FIELD = "text"
 _STATUS_FIELD = "status"
 _REASON_FIELD = "reason"
 _CODE_FIELD = "code"
-_FACT_EVIDENCE_KIND_VALUES = frozenset(item.value for item in FactEvidenceKindVNext)
 _FORWARD_INTENT_TYPE_VALUES = frozenset(item.value for item in ForwardIntentTypeVNext)
 _FORWARD_INTENT_STATUS_VALUES = frozenset(item.value for item in ForwardIntentStatusVNext)
 _REFERENCE_CONTINUITY_REASON_VALUES = frozenset(item.value for item in ReferenceContinuityReasonVNext)
@@ -662,14 +661,7 @@ def _fact_candidates_vnext(proposal: Mapping[str, JsonValue]) -> tuple[EvidenceB
             EvidenceBackedFactCandidateVNext(
                 claim_text=_required_string(data, _CLAIM_TEXT_FIELD, parent_path=item_path),
                 evidence_labels=_required_string_tuple(data, _EVIDENCE_LABELS_FIELD, parent_path=item_path),
-                evidence_kind=FactEvidenceKindVNext(
-                    _required_enum(
-                        data,
-                        _EVIDENCE_KIND_FIELD,
-                        parent_path=item_path,
-                        allowed_values=_FACT_EVIDENCE_KIND_VALUES,
-                    )
-                ),
+                evidence_kind=_HOST_DERIVED_FACT_EVIDENCE_KIND,
                 source_labels=_optional_string_tuple(data, _SOURCE_LABELS_FIELD, parent_path=item_path),
             )
         )

@@ -68,7 +68,7 @@ DOC_TOOL_NAMES: Final[tuple[str, ...]] = (
     READ_FILE_SECTION_TOOL_NAME,
 )
 
-_DOC_CANCELLED_HINT: Final[str] = "当前工具调用已停止；等待新的用户指令或后续调度。"
+_DOC_CANCELLED_HINT: Final[str] = "当前工具调用已停止；如仍需要该结果，请等待用户确认后再重新发起。"
 _INVALID_ARGUMENT_HINT: Final[str] = "Fix arguments to match the tool schema and retry."
 _PATH_POLICY_HINT: Final[str] = "Use a path under the provider configured allowed roots."
 
@@ -2092,7 +2092,7 @@ def _doc_cancelled() -> ToolBusinessCancelled:
         无。
     """
 
-    return ToolBusinessCancelled(message="文档工具调用已被宿主取消。", hint=_DOC_CANCELLED_HINT)
+    return ToolBusinessCancelled(message="文档工具调用已停止。", hint=_DOC_CANCELLED_HINT)
 
 
 def _cancelled_outcome(

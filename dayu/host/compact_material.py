@@ -117,7 +117,6 @@ _PAYLOAD_FIELD_SUMMARY_TEXT = "summary_text"
 _PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS = "evidence_backed_facts"
 _PAYLOAD_FIELD_CLAIM_TEXT = "claim_text"
 _PAYLOAD_FIELD_EVIDENCE_LABELS = "evidence_labels"
-_PAYLOAD_FIELD_EVIDENCE_KIND = "evidence_kind"
 _PAYLOAD_FIELD_ANSWER_ANCHORS = "answer_anchors"
 _PAYLOAD_FIELD_ANCHOR_TITLE = "anchor_title"
 _PAYLOAD_FIELD_ANCHOR_ITEMS = "anchor_items"
@@ -2365,14 +2364,10 @@ def _candidate_facts_texts(candidate: Mapping[str, JsonValue]) -> tuple[str, ...
             _normalized_structured_field_text(label)
             for label in _required_json_text_tuple(fact, _PAYLOAD_FIELD_EVIDENCE_LABELS)
         )
-        evidence_kind = _normalized_structured_field_text(
-            _required_json_text(fact, _PAYLOAD_FIELD_EVIDENCE_KIND)
-        )
         lines.append(
             "fact="
             f"claim_text={claim_text}; "
-            f"evidence_refs={evidence_refs}; "
-            f"evidence_kind={evidence_kind}"
+            f"evidence_refs={evidence_refs}"
         )
     return tuple(lines)
 
@@ -2631,8 +2626,7 @@ def _snapshot_fact_texts(snapshot: ConversationMemorySnapshotVNext) -> tuple[str
         lines.append(
             "fact="
             f"claim_text={_normalized_structured_field_text(fact.claim_text)}; "
-            f"evidence_refs={evidence_refs}; "
-            f"evidence_kind={_normalized_structured_field_text(fact.evidence_kind.value)}"
+            f"evidence_refs={evidence_refs}"
         )
     return tuple(lines)
 
@@ -3185,7 +3179,7 @@ def _trace_material_vnext(blocks: tuple[CompactMaterialBlock, ...]) -> tuple[Tra
             trace_kind = (
                 TraceReadableKindVNext.USER_INPUT
                 if block.kind is CompactMaterialBlockKind.USER_INPUT
-                else TraceReadableKindVNext.USER_VISIBLE_RUN_STATE
+                else TraceReadableKindVNext.USER_VISIBLE_PROGRESS
             )
             items.append(
                 TraceReadableItemVNext(

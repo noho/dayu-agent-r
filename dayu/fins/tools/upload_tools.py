@@ -53,10 +53,8 @@ _UPLOAD_KIND_MATERIAL: Final[str] = "material"
 _UPLOAD_ACTION_DELETE: Final[str] = "delete"
 _UPLOAD_ACTIONS: Final[frozenset[str]] = frozenset({"auto", "create", "update", "delete"})
 _UPLOAD_KINDS: Final[frozenset[str]] = frozenset({_UPLOAD_KIND_FILING, _UPLOAD_KIND_MATERIAL})
-_CANCELLED_MESSAGE: Final[str] = "Fins upload start was cancelled."
-_CANCELLED_HINT: Final[str] = (
-    "Continue without this Fins upload operation unless the user asks to retry."
-)
+_CANCELLED_MESSAGE: Final[str] = "财报上传任务启动已停止。"
+_CANCELLED_HINT: Final[str] = "当前工具调用已停止；如仍需要该结果，请等待用户确认后再重新发起。"
 
 UploadKind: TypeAlias = Literal["filing", "material"]
 
@@ -116,7 +114,7 @@ class FinsUploadToolCallable:
                 tool_name=UPLOAD_TOOL_NAME,
                 started_at=started_at,
                 error=_ERROR_JOB_START_FAILED,
-                message="上传任务启动失败，未进入等待状态。",
+                message="上传任务未能启动。",
                 hint="请稍后重试，或让系统维护者检查 Fins workspace 存储权限。",
             )
         except Exception:
@@ -124,7 +122,7 @@ class FinsUploadToolCallable:
                 tool_name=UPLOAD_TOOL_NAME,
                 started_at=started_at,
                 error=_ERROR_JOB_START_FAILED,
-                message="上传任务启动失败，未进入等待状态。",
+                message="上传任务未能启动。",
                 hint="请确认 Fins workspace 存储目录存在且有写入权限，或联系系统管理员。",
             )
         return _awaiting_outcome_from_observation_handle(handle)

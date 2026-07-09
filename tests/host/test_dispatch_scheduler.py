@@ -5034,8 +5034,7 @@ async def test_proactive_compaction_recovery_tier2_degrades_previous_view(
             assert tuple(
                 block.text for block in tier2_request.material_pack.previous_compacted_view
             ) == (
-                "fact=claim_text=previous evidence fact must stay exact; "
-                "evidence_refs=E1; evidence_kind=accepted_evidence_material",
+                "fact=claim_text=previous evidence fact must stay exact; evidence_refs=E1",
             )
         finally:
             await scheduler.close()

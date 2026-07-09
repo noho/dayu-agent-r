@@ -193,7 +193,6 @@ _PAYLOAD_FIELD_TEXT = "text"
 _PAYLOAD_FIELD_CLAIM_TEXT = "claim_text"
 _PAYLOAD_FIELD_EVIDENCE_LABELS = "evidence_labels"
 _PAYLOAD_FIELD_SOURCE_LABELS = "source_labels"
-_PAYLOAD_FIELD_EVIDENCE_KIND = "evidence_kind"
 _PAYLOAD_FIELD_ANCHOR_TITLE = "anchor_title"
 _PAYLOAD_FIELD_ANCHOR_ITEMS = "anchor_items"
 _PAYLOAD_FIELD_ORDINAL = "ordinal"
@@ -2346,7 +2345,7 @@ def _memory_evidence_fact_message(
         return None
     lines = [_MEMORY_EVIDENCE_FACT_HEADER]
     for index, fact in enumerate(facts, start=1):
-        lines.append(f"Source F{index}: " f"claim_text={fact.claim_text}; " f"evidence_kind={fact.evidence_kind.value}")
+        lines.append(f"Source F{index}: " f"claim_text={fact.claim_text}")
     return SystemMessage(
         role=AgentMessageRole.SYSTEM,
         content="\n".join(lines),
@@ -3442,12 +3441,6 @@ def _accepted_compact_fact_lines(
     lines: list[str] = []
     for index, fact in enumerate(facts, start=1):
         parts = [f"fact {index}: claim_text={_required_text_field(fact, _PAYLOAD_FIELD_CLAIM_TEXT)}"]
-        evidence_kind = _optional_semantic_text_field(
-            fact,
-            _PAYLOAD_FIELD_EVIDENCE_KIND,
-        )
-        if evidence_kind is not None:
-            parts.append(f"evidence_kind={evidence_kind}")
         evidence_labels = _optional_text_list_field(
             fact,
             _PAYLOAD_FIELD_EVIDENCE_LABELS,

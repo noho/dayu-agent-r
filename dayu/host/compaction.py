@@ -77,7 +77,7 @@ class TraceReadableKindVNext(StrEnum):
 
     USER_INPUT = "user_input"
     ASSISTANT_FINAL_ANSWER = "assistant_final_answer"
-    USER_VISIBLE_RUN_STATE = "user_visible_run_state"
+    USER_VISIBLE_PROGRESS = "user_visible_progress"
 
 
 class FactEvidenceKindVNext(StrEnum):
@@ -1182,7 +1182,7 @@ class EvidenceBackedFactCandidateVNext:
 
     :param claim_text: fact claim 文本。
     :param evidence_labels: 支撑事实的 evidence labels。
-    :param evidence_kind: 证据类型。
+    :param evidence_kind: Host 根据 evidence labels 派生的内部证据类型。
     :param source_labels: 可选辅助 source labels。
     """
 

@@ -9,11 +9,11 @@
 - `schema_version`：JSON string。输入数据格式标识，只用于识别本次请求的数据形态，不是业务事实。
 - `previous_compacted_view`：JSON object 或 null。此前已整理出的可读记忆；为 null 表示没有此前记忆。
 - `previous_compacted_view.session_summary`：JSON string 或 null。此前会话摘要。
-- `previous_compacted_view.evidence_backed_facts`：JSON array。每个元素包含 `source_label`、`claim_text`、`evidence_kind`，表示此前保留的证据支撑事实。
+- `previous_compacted_view.evidence_backed_facts`：JSON array。每个元素包含 `source_label`、`claim_text`，表示此前保留的证据支撑事实。
 - `previous_compacted_view.answer_anchors`：JSON array。每个元素包含 `source_label`、`anchor_title`、`anchor_items`，表示此前回答中的可复用结论。
 - `previous_compacted_view.forward_intents`：JSON array。每个元素包含 `source_label`、`intent_type`、`text`、`status`，表示此前对下一步的开放意图。
 - `previous_compacted_view.reference_continuity_items`：JSON array。每个元素包含 `source_label`、`text`、`reason`，表示后续代词、序号或省略表达需要承接的上下文。
-- `trace_material`：JSON array。每个元素包含 `source_label`、`trace_kind`、`text`。`trace_kind` 允许值为 `user_input`、`assistant_final_answer`、`user_visible_run_state`。
+- `trace_material`：JSON array。每个元素包含 `source_label`、`trace_kind`、`text`。`trace_kind` 允许值为 `user_input`、`assistant_final_answer`、`user_visible_progress`。
 - `evidence_material`：JSON array。每个元素包含 `source_label`、`tool_name`、`query_text`、`response_text`、`source_note`。`query_text` 与 `source_note` 可以为 JSON string 或 null；`response_text` 是可用于生成事实的证据文本。
 - `answer_material`：JSON array。每个元素包含 `source_label`、`answer_text`，表示此前助手最终回答文本。
 - `current_input_anchor`：JSON object，包含 `anchor_label` 与 `text`。它帮助理解当前用户输入，但其 `anchor_label` 不允许出现在任何输出 label 列表中。
@@ -37,7 +37,6 @@ label 规则：
 - `evidence_backed_facts`：必填 JSON array。每个元素是一条被证据文本直接支撑的事实；没有足够证据时输出空数组。
 - `evidence_backed_facts[*].claim_text`：必填 JSON string，只写可由证据文本支撑的事实。
 - `evidence_backed_facts[*].evidence_labels`：必填 JSON string array，必须非空，只能引用 `evidence_material` 中的 label。
-- `evidence_backed_facts[*].evidence_kind`：必填 JSON string，允许值为 `tool_result`、`tool_source_text`、`accepted_evidence_material`。
 - `evidence_backed_facts[*].source_labels`：必填 JSON string array，只能引用 `evidence_material` 中的 label；无法补充时可为空数组。
 - `answer_anchors`：必填 JSON array。每个元素保留此前回答中后续可能被“刚才的结论”等表达引用的内容；没有足够来源时输出空数组。
 - `answer_anchors[*].anchor_title`：必填 JSON string，短标题。
@@ -72,7 +71,6 @@ label 规则：
     {
       "claim_text": "bounded text",
       "evidence_labels": ["E1"],
-      "evidence_kind": "tool_result|tool_source_text|accepted_evidence_material",
       "source_labels": ["E1"]
     }
   ],

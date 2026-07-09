@@ -41,10 +41,8 @@ DOWNLOAD_TOOL_NAME: Final[str] = "start_fins_download"
 _ERROR_INVALID_ARGUMENT: Final[str] = "invalid_argument"
 _ERROR_JOB_START_FAILED: Final[str] = "fins_download_start_failed"
 _DEFAULT_SOURCE: Final[str] = "auto"
-_CANCELLED_MESSAGE: Final[str] = "Fins download start was cancelled."
-_CANCELLED_HINT: Final[str] = (
-    "Continue without this Fins download operation unless the user asks to retry."
-)
+_CANCELLED_MESSAGE: Final[str] = "财报下载任务启动已停止。"
+_CANCELLED_HINT: Final[str] = "当前工具调用已停止；如仍需要该结果，请等待用户确认后再重新发起。"
 
 
 @dataclass(frozen=True)
@@ -102,7 +100,7 @@ class FinsDownloadToolCallable:
                 tool_name=DOWNLOAD_TOOL_NAME,
                 started_at=started_at,
                 error=_ERROR_JOB_START_FAILED,
-                message="下载任务启动失败，未进入等待状态。",
+                message="下载任务未能启动。",
                 hint="请稍后重试，或让系统维护者检查 Fins workspace 存储权限。",
             )
         except Exception:
@@ -110,7 +108,7 @@ class FinsDownloadToolCallable:
                 tool_name=DOWNLOAD_TOOL_NAME,
                 started_at=started_at,
                 error=_ERROR_JOB_START_FAILED,
-                message="下载任务启动失败，未进入等待状态。",
+                message="下载任务未能启动。",
                 hint="请确认 Fins workspace 存储目录存在且有写入权限，或联系系统管理员。",
             )
         return _awaiting_outcome_from_observation_handle(handle)

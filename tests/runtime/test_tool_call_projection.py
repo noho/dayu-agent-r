@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from dayu.contracts import (
     JsonValue,
     TOOL_CANCELLED_REASON_HOST_CANCELLED,
@@ -17,6 +19,7 @@ from dayu.contracts import (
 from dayu.runtime.tool_call_projection import (
     INVALID_ARGUMENT_ERROR,
     ToolArgumentValidationFailure,
+    ToolBusinessCancelled,
     ValidatedToolArguments,
     completed_outcome,
     failed_outcome,
@@ -415,30 +418,36 @@ def test_failed_outcome_normalizes_blank_error_message_and_hint() -> None:
     assert outcome.result.hint is None
 
 
-def test_host_cancelled_outcome_uses_reason_default_message_and_no_governance_leak() -> None:
-    """Host 取消 outcome 应提供默认说明，且不泄漏 Host 治理字段。"""
+def test_host_cancelled_outcome_requires_explicit_message_and_hint() -> None:
+    """取消 outcome helper 不提供 runtime 默认 Host 治理文案。"""
 
-    outcome = host_cancelled_outcome(
-        tool_name=_TOOL_NAME,
-        started_at=_STARTED_AT,
-        finished_at=_FINISHED_AT,
-        message=" ",
-        hint=None,
-    )
+    with pytest.raises(ValueError, match="message"):
+        host_cancelled_outcome(
+            tool_name=_TOOL_NAME,
+            started_at=_STARTED_AT,
+            finished_at=_FINISHED_AT,
+            message=" ",
+            hint="稍后重试",
+        )
 
-    assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
-    assert outcome.message.strip() != ""
-    assert outcome.hint is not None
-    assert outcome.hint.strip() != ""
-    projected_text = f"{outcome.reason} {outcome.message} {outcome.hint}"
-    for forbidden in (
-        "run_id",
-        "session_id",
-        "correlation_id",
-        "cancellation_token",
-        "BatchToolExecutionContext",
-    ):
-        assert forbidden not in projected_text
+    with pytest.raises(ValueError, match="hint"):
+        host_cancelled_outcome(
+            tool_name=_TOOL_NAME,
+            started_at=_STARTED_AT,
+            finished_at=_FINISHED_AT,
+            message="工具调用已停止",
+            hint=" ",
+        )
+
+
+def test_tool_business_cancelled_requires_explicit_message_and_hint() -> None:
+    """业务取消传递对象要求调用方显式提供 LLM-facing 文案。"""
+
+    with pytest.raises(ValueError, match="message"):
+        ToolBusinessCancelled(message=" ", hint="稍后重试")
+
+    with pytest.raises(ValueError, match="hint"):
+        ToolBusinessCancelled(message="工具调用已停止", hint=" ")
 
 
 def _schema(

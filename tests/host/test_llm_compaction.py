@@ -38,6 +38,7 @@ from dayu.host.compaction import (
     CompactionRequest,
     ConversationCompactInputVNext,
     ConversationCompactOutputVNext,
+    FactEvidenceKindVNext,
     ForwardIntentStatusVNext,
     ForwardIntentTypeVNext,
 )
@@ -220,6 +221,17 @@ def test_prompt_forward_intent_enum_values_match_parser_vnext() -> None:
 
     assert len(parsed_intent_types) == len(intent_type_values)
     assert len(parsed_statuses) == len(status_values)
+
+
+def test_compaction_prompt_does_not_expose_internal_evidence_or_run_state_terms() -> None:
+    """compaction prompt 不暴露 Host run-state 或 evidence pipeline 内部枚举。"""
+
+    prompt = _PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
+
+    assert "user_visible_run_state" not in prompt
+    assert "tool_source_text" not in prompt
+    assert "accepted_evidence_material" not in prompt
+    assert "evidence_kind" not in prompt
 
 
 def test_parse_conversation_compact_output_vnext_fails_closed_for_old_schema() -> None:
@@ -460,11 +472,11 @@ def test_parse_conversation_compact_output_vnext_rejects_current_anchor_label() 
         )
 
 
-def test_parse_conversation_compact_output_vnext_reports_fact_evidence_kind_path() -> None:
-    """vNext parser 对 fact evidence_kind 返回完整嵌套字段路径与非法值。
+def test_parse_conversation_compact_output_vnext_derives_fact_evidence_kind() -> None:
+    """vNext parser 由 Host 派生 fact evidence kind，不读取 LLM 字段。
 
     :returns: ``None``。
-    :raises AssertionError: parser 未返回 evidence_kind 路径和非法枚举值时抛出。
+    :raises AssertionError: parser 未派生内部 evidence kind 时抛出。
     """
 
     compact_input = conversation_compact_input_vnext_from_material_pack(
@@ -475,19 +487,18 @@ def test_parse_conversation_compact_output_vnext_reports_fact_evidence_kind_path
         {
             "claim_text": "经营现金流同比增长",
             "evidence_labels": ["E1"],
-            "evidence_kind": "bad_evidence_kind",
             "source_labels": [],
         }
     ]
 
-    with pytest.raises(
-        LLMCompactionProposalError,
-        match=r"evidence_backed_facts\[0\]\.evidence_kind.*bad_evidence_kind",
-    ):
-        parse_conversation_compact_output_vnext(
-            compact_input,
-            json.dumps(proposal, sort_keys=True),
-        )
+    parsed = parse_conversation_compact_output_vnext(
+        compact_input,
+        json.dumps(proposal, sort_keys=True),
+    )
+
+    assert parsed.evidence_backed_facts[0].evidence_kind is (
+        FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL
+    )
 
 
 def test_parse_conversation_compact_output_vnext_reports_forward_intent_type_enum_value() -> None:
@@ -646,7 +657,6 @@ def test_parse_conversation_compact_output_vnext_rejects_cross_section_label() -
         {
             "claim_text": "经营现金流同比增长",
             "evidence_labels": ["A1"],
-            "evidence_kind": "accepted_evidence_material",
             "source_labels": [],
         }
     ]
@@ -839,7 +849,6 @@ def _fact_json() -> dict[str, JsonValue]:
     return {
         "claim_text": "经营现金流同比增长",
         "evidence_labels": ["E1"],
-        "evidence_kind": "accepted_evidence_material",
         "source_labels": ["E1"],
     }
 

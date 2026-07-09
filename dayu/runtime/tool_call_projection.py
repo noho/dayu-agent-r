@@ -4,7 +4,7 @@
 
 - 按当前 ``ToolParametersSchema`` 的窄 JSON Schema 子集校验
   ``ToolCallRequest.arguments``，并应用字段默认值。
-- 构造 completed / failed / host-cancelled outcome，保证三类终态使用一致
+- 构造 completed / failed / cancelled outcome，保证三类终态使用一致
   的 ``ToolResultMeta``。
 
 本模块是层中立 runtime helper，只依赖标准库与 ``dayu.contracts``；
@@ -36,8 +36,6 @@ from dayu.contracts import (
 INVALID_ARGUMENT_ERROR: Final[Literal["invalid_argument"]] = "invalid_argument"
 """工具参数校验失败的固定错误码。"""
 
-_DEFAULT_HOST_CANCELLED_MESSAGE: Final[str] = "工具调用已被宿主取消。"
-_DEFAULT_HOST_CANCELLED_HINT: Final[str] = "不要把本次取消视为业务失败；如仍需要结果，请在后续步骤重新发起请求。"
 _DEFAULT_EXECUTION_ERROR: Final[str] = "execution_error"
 _DEFAULT_FAILURE_MESSAGE: Final[str] = "Tool execution failed."
 
@@ -101,14 +99,26 @@ class ToolBusinessCancelled:
     该类型只用于后续 callable slice 在自身边界内表达“应返回取消 outcome”；
     它不观察 cancellation token，也不承载 Host governance 字段。
 
-    :param message: 可选取消说明；为空时由 ``host_cancelled_outcome`` 填充默认说明。
-    :param hint: 可选恢复提示；为空时由 ``host_cancelled_outcome`` 填充默认提示。
+    :param message: 业务可读取消说明，必须非空。
+    :param hint: 业务可读恢复提示，必须非空。
     :returns: dataclass 实例本身。
-    :raises Exception: 构造期不主动抛出异常。
+    :raises ValueError: message 或 hint 为空时抛出。
     """
 
-    message: str | None
-    hint: str | None
+    message: str
+    hint: str
+
+    def __post_init__(self) -> None:
+        """校验取消说明与恢复提示均由调用方显式提供。
+
+        :returns: ``None``。
+        :raises ValueError: 文本为空或纯空白时抛出。
+        """
+
+        if self.message.strip() == "":
+            raise ValueError("ToolBusinessCancelled.message must be non-empty")
+        if self.hint.strip() == "":
+            raise ValueError("ToolBusinessCancelled.hint must be non-empty")
 
 
 ToolArgumentValidationResult: TypeAlias = ValidatedToolArguments | ToolArgumentValidationFailure
@@ -273,25 +283,32 @@ def host_cancelled_outcome(
     tool_name: str,
     started_at: datetime,
     finished_at: datetime,
-    message: str | None = None,
-    hint: str | None = None,
+    message: str,
+    hint: str,
 ) -> ToolCancelledOutcome:
-    """构造 Host 语义取消 outcome。
+    """构造调用方显式说明的取消 outcome。
 
     :param tool_name: 工具名。
     :param started_at: 工具执行开始时间。
     :param finished_at: 工具执行结束时间。
-    :param message: 可选取消说明；为 ``None`` 或空白时使用非空默认说明。
-    :param hint: 可选恢复提示；为 ``None`` 或空白时使用非空默认提示。
+    :param message: 业务可读取消说明，必须非空。
+    :param hint: 业务可读恢复提示，必须非空。
     :returns: ``ToolCancelledOutcome``，reason 固定为
         ``TOOL_CANCELLED_REASON_HOST_CANCELLED``。
+    :raises ValueError: message 或 hint 为空时抛出。
     :raises Exception: ``ToolResultMeta`` 或 ``ToolCancelledOutcome`` 契约构造失败时透出。
     """
 
+    normalized_message = _blank_to_none(message)
+    if normalized_message is None:
+        raise ValueError("host_cancelled_outcome.message must be non-empty")
+    normalized_hint = _blank_to_none(hint)
+    if normalized_hint is None:
+        raise ValueError("host_cancelled_outcome.hint must be non-empty")
     return ToolCancelledOutcome(
         reason=TOOL_CANCELLED_REASON_HOST_CANCELLED,
-        message=_blank_to_default_optional(message, _DEFAULT_HOST_CANCELLED_MESSAGE),
-        hint=_blank_to_default_optional(hint, _DEFAULT_HOST_CANCELLED_HINT),
+        message=normalized_message,
+        hint=normalized_hint,
         meta=_meta(
             tool_name=tool_name,
             started_at=started_at,
@@ -803,21 +820,6 @@ def _blank_to_default(value: str, default: str) -> str:
     """
 
     return value if value.strip() != "" else default
-
-
-def _blank_to_default_optional(value: str | None, default: str) -> str:
-    """把可选空白字符串替换为默认值。
-
-    :param value: 原始可选文本。
-    :param default: 默认文本。
-    :returns: 非空文本。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    if value is None:
-        return default
-    normalized = value.strip()
-    return normalized if normalized else default
 
 
 def _blank_to_none(value: str | None) -> str | None:

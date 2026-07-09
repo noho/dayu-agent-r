@@ -16,6 +16,8 @@ from bs4 import BeautifulSoup
 
 from dayu.contracts.cancellation import CancellationToken
 
+from .web_cancellation_text import WEB_CANCELLED_HINT
+
 MODULE = "ENGINE.WEB_SEARCH"
 _LOGGER = logging.getLogger(__name__)
 SERPER_API_KEY_ENV = "SERPER_API_KEY"
@@ -320,10 +322,7 @@ def _raise_if_search_cancelled(cancellation_token: CancellationToken | None) -> 
         return
     raise WebSearchCancelledError(
         message=cancellation_token.cancel_reason() or "工具调用已取消",
-        hint=(
-            "[continue_without_web] The host cancelled this web search; "
-            "continue without this web search unless the user asks to retry."
-        ),
+        hint=WEB_CANCELLED_HINT,
     )
 
 

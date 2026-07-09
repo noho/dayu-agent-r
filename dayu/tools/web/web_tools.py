@@ -66,6 +66,7 @@ from .web_challenge_detection import (
     BotChallengeDetectionResult,
     detect_bot_challenge as _detect_bot_challenge,
 )
+from .web_cancellation_text import WEB_CANCELLED_HINT
 from .web_http_encoding import (
     _build_accept_encoding_value,
     _decode_response_text,
@@ -161,8 +162,8 @@ _SEARCH_PROVIDER_UNAVAILABLE_HINT: Final[str] = (
     "[retry_later_or_use_known_source] Search providers are currently unavailable; "
     "retry later, refine the query, or continue with a known source URL."
 )
-_WEB_SEARCH_CANCELLED_MESSAGE: Final[str] = "网页搜索工具调用已被宿主取消。"
-_WEB_FETCH_CANCELLED_MESSAGE: Final[str] = "网页抓取工具调用已被宿主取消。"
+_WEB_SEARCH_CANCELLED_MESSAGE: Final[str] = "网页搜索工具调用已停止。"
+_WEB_FETCH_CANCELLED_MESSAGE: Final[str] = "网页抓取工具调用已停止。"
 
 
 WebPayload: TypeAlias = dict[str, JsonValue]
@@ -741,10 +742,7 @@ def _raise_fetch_cancelled() -> NoReturn:
 
     raise WebToolCancelledError(
         message=_WEB_FETCH_CANCELLED_MESSAGE,
-        hint=(
-            "[continue_without_web] The host cancelled this web fetch; "
-            "continue without this page unless the user asks to retry."
-        ),
+        hint=WEB_CANCELLED_HINT,
     )
 
 
@@ -1340,10 +1338,7 @@ async def _call_search_web(
             tool_name=_SEARCH_WEB_TOOL_NAME,
             started_at=started_at,
             message=_WEB_SEARCH_CANCELLED_MESSAGE,
-            hint=(
-                "[continue_without_web] The host cancelled this web search; "
-                "continue without this web search unless the user asks to retry."
-            ),
+            hint=WEB_CANCELLED_HINT,
         )
 
     arguments = validation.arguments
@@ -1362,10 +1357,7 @@ async def _call_search_web(
                     tool_name=_SEARCH_WEB_TOOL_NAME,
                     started_at=started_at,
                     message=_WEB_SEARCH_CANCELLED_MESSAGE,
-                    hint=(
-                        "[continue_without_web] The host cancelled this web search; "
-                        "continue without this web search unless the user asks to retry."
-                    ),
+                    hint=WEB_CANCELLED_HINT,
                 )
             value = await asyncio.to_thread(
                 _search_web_business,
@@ -1383,7 +1375,7 @@ async def _call_search_web(
             started_at=started_at,
             finished_at=datetime.now(UTC),
             message=_WEB_SEARCH_CANCELLED_MESSAGE,
-            hint=exc.hint,
+            hint=WEB_CANCELLED_HINT,
         )
     except WebSearchProviderUnavailableError as exc:
         return failed_outcome(
@@ -1445,10 +1437,7 @@ async def _call_fetch_web_page(
             tool_name=_FETCH_WEB_PAGE_TOOL_NAME,
             started_at=started_at,
             message=_WEB_FETCH_CANCELLED_MESSAGE,
-            hint=(
-                "[continue_without_web] The host cancelled this web fetch; "
-                "continue without this page unless the user asks to retry."
-            ),
+            hint=WEB_CANCELLED_HINT,
         )
 
     url = _required_string_argument(validation.arguments, "url")
@@ -1459,10 +1448,7 @@ async def _call_fetch_web_page(
                     tool_name=_FETCH_WEB_PAGE_TOOL_NAME,
                     started_at=started_at,
                     message=_WEB_FETCH_CANCELLED_MESSAGE,
-                    hint=(
-                        "[continue_without_web] The host cancelled this web fetch; "
-                        "continue without this page unless the user asks to retry."
-                    ),
+                    hint=WEB_CANCELLED_HINT,
                 )
             value = await asyncio.to_thread(
                 _fetch_web_page_business,
@@ -1477,7 +1463,7 @@ async def _call_fetch_web_page(
             started_at=started_at,
             finished_at=datetime.now(UTC),
             message=exc.message,
-            hint=exc.hint,
+            hint=WEB_CANCELLED_HINT,
         )
     except ToolBusinessError as exc:
         return failed_outcome(

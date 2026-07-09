@@ -77,7 +77,7 @@ FINS_READ_TOOL_NAMES: Final[tuple[str, ...]] = (
 _INVALID_ARGUMENT_HINT: Final[str] = "Fix arguments to match the tool schema and retry."
 _FILE_NOT_FOUND_HINT: Final[str] = "Verify the ticker, document_id, ref, or table_ref and retry."
 _UNEXPECTED_FAILURE_HINT: Final[str] = "Inspect provider diagnostics or retry with narrower arguments."
-_FINS_CANCELLED_HINT: Final[str] = "当前工具调用已停止；等待新的用户指令或后续调度。"
+_FINS_CANCELLED_HINT: Final[str] = "当前工具调用已停止；如仍需要该结果，请等待用户确认后再重新发起。"
 
 _BusinessCall = Callable[[CancellationToken], JsonValue]
 

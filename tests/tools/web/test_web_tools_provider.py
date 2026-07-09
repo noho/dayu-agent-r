@@ -66,6 +66,7 @@ from dayu.runtime.tools_discovery import (
 )
 from dayu.tools.web import discover_tools
 from dayu.tools.web import web_playwright_backend
+from dayu.tools.web import web_cancellation_text
 from dayu.tools.web import web_search_providers
 from dayu.tools.web import web_tools
 
@@ -79,6 +80,9 @@ _FORBIDDEN_CANCEL_MESSAGE_PARTS = (
     "digest",
     "correlation_id",
     "cancellation_token",
+    "host cancelled",
+    "Host cancelled",
+    "continue_without_web",
 )
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -1010,7 +1014,7 @@ def test_search_web_cancelled_before_provider_returns_host_cancelled(
     assert outcome.meta.tool_name == "search_web"
     _assert_no_governance_text(f"{outcome.message} {outcome.hint or ''}")
     assert outcome.hint is not None
-    assert "continue_without_web" in outcome.hint
+    assert outcome.hint == web_cancellation_text.WEB_CANCELLED_HINT
     assert search_calls == []
 
 
@@ -1218,6 +1222,7 @@ def test_fetch_web_page_cancelled_before_work_returns_safe_host_cancelled() -> N
     assert outcome.meta is not None
     assert outcome.meta.tool_name == "fetch_web_page"
     _assert_no_governance_text(f"{outcome.message} {outcome.hint or ''}")
+    assert outcome.hint == web_cancellation_text.WEB_CANCELLED_HINT
 
 
 def test_fetch_web_page_deep_runtime_cancel_message_is_sanitized(
@@ -1390,7 +1395,7 @@ def test_fetch_playwright_cancel_projects_to_host_cancelled(
     assert outcome.meta is not None
     assert outcome.meta.tool_name == "fetch_web_page"
     assert outcome.hint is not None
-    assert "continue_without_web" in outcome.hint
+    assert outcome.hint == web_cancellation_text.WEB_CANCELLED_HINT
     assert received_playwright_tokens == [token]
 
 

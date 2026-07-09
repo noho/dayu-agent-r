@@ -3603,7 +3603,7 @@ class ToolRuntimeExecutor:
         )
 
     def _awaiting_configuration_failure(self) -> ToolFailedOutcome:
-        """构造 awaiting adapter 未配置的受治理错误。
+        """构造后台任务启动能力未配置的受治理错误。
 
         :returns: 工具失败 outcome。
         """
@@ -3618,12 +3618,12 @@ class ToolRuntimeExecutor:
             ToolPolicyDecision(
                 kind=ToolPolicyDecisionKind.GOVERNED_ERROR,
                 reason_code=_TOOL_RUNTIME_AWAITING_BINDING_REASON,
-                message="awaiting adapter binding is not configured",
+                message="该工具当前无法启动后台任务；请改用已可用的工具或稍后重试。",
             )
         )
 
     def _awaiting_external_job_failure(self) -> ToolFailedOutcome:
-        """构造 poll awaiting 缺少外部 job 引用的受治理错误。
+        """构造后台任务缺少可跟踪任务引用的受治理错误。
 
         :returns: 工具失败 outcome。
         """
@@ -3631,14 +3631,14 @@ class ToolRuntimeExecutor:
         self._diagnostic_emitter.emit(
             ToolTraceDiagnosticRecord(
                 reason_code=_TOOL_RUNTIME_AWAITING_EXTERNAL_JOB_REASON,
-                message="poll awaiting binding did not produce external job ref",
+                message="awaiting binding did not produce external job ref",
             )
         )
         return _governed_failure_outcome(
             ToolPolicyDecision(
                 kind=ToolPolicyDecisionKind.GOVERNED_ERROR,
                 reason_code=_TOOL_RUNTIME_AWAITING_EXTERNAL_JOB_REASON,
-                message="poll awaiting requires a durable external job ref",
+                message="该工具后台任务未返回可跟踪的任务引用；请稍后重试或联系系统维护者。",
             )
         )
 
@@ -7411,7 +7411,7 @@ def _runtime_cancelled_policy_decision(reason: str | None) -> ToolPolicyDecision
     :returns: governed error 决策。
     """
 
-    message = "tool execution cancelled before completion"
+    message = "工具调用在完成前已停止"
     if reason is not None:
         message = f"{message}: {reason}"
     return ToolPolicyDecision(

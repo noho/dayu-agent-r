@@ -2938,7 +2938,7 @@ ReadableReferenceContinuityItem
 
 TraceReadableItem
   source_label: PromptLocalLabel
-  trace_kind: "user_input" | "assistant_final_answer" | "user_visible_run_state"
+  trace_kind: "user_input" | "assistant_final_answer" | "user_visible_progress"
   text: str
 
 EvidenceReadableItem
@@ -2963,7 +2963,7 @@ CompactInstruction
 
 所有 readable item 的 `source_label` 都是 prompt-local opaque label，只在本次 compact 调用内有效。`display_text`、`text`、`claim_text` 与 `answer_text` 是模型可读业务内容；这些字段不得承载 durable refs、digest、event sequence、policy name 或 compact boundary。`CompactInstruction` 只表达业务任务和目标输出 schema，不承载 Host budget policy、fallback decision、repair state 或内部 provenance map。
 
-`previous_compacted_view` 只包含上一轮 accepted compacted view 的业务可读 projection，包括 session summary、accepted evidence-backed facts、answer anchors、forward intents 与 reference continuity items；不得包含 raw compact artifact JSON。`trace_material` 只包含用户输入、助手最终回答和用户可见 Run 状态。`evidence_material` 只包含可读 tool、query、response / source text 与 prompt-local evidence label。`answer_material` 只包含可读 assistant final answer / conclusion 与 prompt-local answer label。`current_input_anchor` 只包含当前用户输入文本和 prompt-local anchor label；同一 current user payload 不得再作为 trace material 重复渲染。`instruction` 只表达本次 compact 的业务任务和输出 contract 要求，`output_schema_name` 是业务可读输出 contract 标识，不是 Python 类型名；`instruction` 不承载 Host policy internals。
+`previous_compacted_view` 只包含上一轮 accepted compacted view 的业务可读 projection，包括 session summary、accepted evidence-backed facts、answer anchors、forward intents 与 reference continuity items；不得包含 raw compact artifact JSON。`trace_material` 只包含用户输入、助手最终回答和用户可见进展 / 结果摘要，不暴露 Host run-state 字段名。`evidence_material` 只包含可读 tool、query、response / source text 与 prompt-local evidence label。`answer_material` 只包含可读 assistant final answer / conclusion 与 prompt-local answer label。`current_input_anchor` 只包含当前用户输入文本和 prompt-local anchor label；同一 current user payload 不得再作为 trace material 重复渲染。`instruction` 只表达本次 compact 的业务任务和输出 contract 要求，`output_schema_name` 是业务可读输出 contract 标识，不是 Python 类型名；`instruction` 不承载 Host policy internals。
 
 `current_input_anchor` 是 readable but not citable：LLM 可以读取它来理解本次 compact 的边界，Host 也用它确保当前用户输入不会被 compact / fallback 吞掉；但 `current_input_anchor.anchor_label` 不属于任何 compact candidate 的 allowed source label set。Host accept barrier 必须拒绝任何在 `source_labels`、`evidence_labels`、`answer_source_labels`、diagnostic `source_labels` 或其它 candidate source 字段中引用 `current_input_anchor.anchor_label` 的输出。当前输入只有到下一轮成为历史时，才可能作为 trace material 进入后续 compact。
 
@@ -2992,7 +2992,6 @@ SessionSummaryCandidate
 EvidenceBackedFactCandidate
   claim_text: str
   evidence_labels: list[str]
-  evidence_kind: "tool_result" | "tool_source_text" | "accepted_evidence_material"
   source_labels?: list[str]
 
 AnswerAnchorCandidate
@@ -3021,7 +3020,7 @@ CompactCandidateDiagnostic
   source_labels?: list[str]
 ```
 
-`EvidenceBackedFactCandidate` 只能引用 evidence material labels，不能引用 user input、assistant final answer、session summary、answer anchor 或 forward intent 后冒充工具事实。`AnswerAnchorCandidate` 只能引用 assistant final answer / conclusion labels。`ForwardIntentCandidate` 不能被当作工具执行计划或事实证明，也不能自动触发工具。`ReferenceContinuityCandidate` 只能保存理解局部指代所需的最小文本，不能保留整段长输入。
+`EvidenceBackedFactCandidate` 只能引用 evidence material labels，不能引用 user input、assistant final answer、session summary、answer anchor 或 forward intent 后冒充工具事实。LLM-facing candidate 不输出 `evidence_kind`；Host 根据 evidence labels 所属 material section 派生内部 evidence kind，并在 accepted typed candidate / memory projection 中保留 Host-owned typed value。`AnswerAnchorCandidate` 只能引用 assistant final answer / conclusion labels。`ForwardIntentCandidate` 不能被当作工具执行计划或事实证明，也不能自动触发工具。`ReferenceContinuityCandidate` 只能保存理解局部指代所需的最小文本，不能保留整段长输入。
 
 ### 24.4 Snapshot Typed Schema
 
