@@ -454,6 +454,8 @@ def test_resume_wait_legacy_message_appends_shared_duplicate_result_guidance(
             store.transaction_runner,
             seeded,
             include_accepted_arguments=False,
+            include_request_atom=False,
+            include_accepted_evidence_envelope=False,
         )
         current_facts = DurableCurrentRunFactProvider(store.transaction_runner).load_current_run_facts(
             _attempt_snapshot(seeded)
@@ -526,6 +528,8 @@ def test_resume_wait_abnormal_awaiting_event_falls_back_to_guidance(
             seeded,
             wait_created_ref_case=wait_created_ref_case,
             include_accepted_arguments_source_digest=include_source_digest,
+            include_request_atom=False,
+            include_accepted_evidence_envelope=False,
         )
         current_facts = DurableCurrentRunFactProvider(store.transaction_runner).load_current_run_facts(
             _attempt_snapshot(seeded)
@@ -559,7 +563,7 @@ def test_resume_wait_abnormal_awaiting_event_falls_back_to_guidance(
 def test_resume_wait_rejects_digest_mismatch_after_new_arguments_fields(
     tmp_path: Path,
 ) -> None:
-    """新 awaiting replay 字段存在但 digest 不同源时必须 fail closed。"""
+    """新 request atom digest 与 evidence envelope 不同源时必须 fail closed。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
@@ -571,7 +575,7 @@ def test_resume_wait_rejects_digest_mismatch_after_new_arguments_fields(
         _append_resume_wait_projection_events(
             store.transaction_runner,
             seeded,
-            accepted_arguments_source_digest=_DIGEST_B,
+            request_normalized_arguments_digest=_DIGEST_B,
         )
         current_facts = DurableCurrentRunFactProvider(store.transaction_runner).load_current_run_facts(
             _attempt_snapshot(seeded)
@@ -593,7 +597,7 @@ def test_resume_wait_rejects_digest_mismatch_after_new_arguments_fields(
                 replace(current_facts, run_started_event=resume_started),
             )
 
-        with pytest.raises(HostDurableError, match="digest mismatch"):
+        with pytest.raises(HostDurableError, match="identity mismatch"):
             store.transaction_runner.run_read(operation)
 
 
@@ -5318,6 +5322,9 @@ def _append_resume_wait_projection_events(
     wait_created_ref_case: Literal["valid", "missing", "missing_event", "wrong_event_type"] = "valid",
     completed_value: JsonValue | None = None,
     accepted_arguments: Mapping[str, JsonValue] | None = None,
+    include_request_atom: bool = True,
+    include_accepted_evidence_envelope: bool = True,
+    request_normalized_arguments_digest: str | None = None,
 ) -> None:
     """追加 resume wait message 投影所需的最小事件。
 
@@ -5329,6 +5336,9 @@ def _append_resume_wait_projection_events(
     :param wait_created_ref_case: wait 创建事件引用 case。
     :param completed_value: completed result value；``None`` 表示使用默认 object。
     :param accepted_arguments: 覆盖写入 awaiting payload 的 LLM replay 参数。
+    :param include_request_atom: 是否写入新 ``TOOL_CALL_REQUESTED`` request atom。
+    :param include_accepted_evidence_envelope: 是否在 result payload 写入 accepted evidence envelope。
+    :param request_normalized_arguments_digest: 覆盖 request atom 的参数 digest。
     :returns: ``None``。
     """
 
@@ -5341,6 +5351,63 @@ def _append_resume_wait_projection_events(
 
         event_log = EventLogStore()
         normalized_arguments_digest = sha256_digest_json({"arguments": {"ticker": "V"}})
+        request_arguments = accepted_arguments or {"ticker": "V"}
+        request_arguments_json: dict[str, JsonValue] = {
+            "arguments": dict(request_arguments)
+        }
+        request_arguments_digest = sha256_digest_json(request_arguments_json)
+        request_semantic_query = (
+            "工具 fake_tool 请求参数："
+            f"{canonical_json_dumps(dict(request_arguments))}"
+        )
+        request_semantic_query_digest = sha256_digest_json(
+            {"semantic_query_text": request_semantic_query}
+        )
+        request_event_id = "event-tool-call-requested-resume"
+        if include_request_atom:
+            event_log.append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id=request_event_id,
+                    event_class=EventClass.CANONICAL_FACT,
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    execution_id=seeded.execution_id,
+                    event_type="TOOL_CALL_REQUESTED",
+                    occurred_at=_NOW,
+                    actor="host",
+                    source="pytest",
+                    client_request_id=None,
+                    idempotency_key="request-resume",
+                    policy_decision=None,
+                    reason=None,
+                    payload_json={
+                        "tool_call_id": "tool-call-private",
+                        "tool_name": "fake_tool",
+                        "normalized_arguments_digest": (
+                            request_normalized_arguments_digest
+                            or normalized_arguments_digest
+                        ),
+                        "arguments_json_size_bytes": len(
+                            canonical_json_dumps(request_arguments_json).encode("utf-8")
+                        ),
+                        "arguments_storage_kind": TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
+                        "arguments_inline_json": request_arguments_json,
+                        "arguments_payload_ref": None,
+                        "arguments_payload_digest": request_arguments_digest,
+                        "semantic_input_digest": _DIGEST_A,
+                        "semantic_query_storage_kind": (
+                            TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT
+                        ),
+                        "semantic_query_text": request_semantic_query,
+                        "semantic_query_payload_ref": None,
+                        "semantic_query_digest": request_semantic_query_digest,
+                    },
+                    payload_ref=None,
+                    payload_digest=None,
+                ),
+            )
         wait_payload: dict[str, JsonValue] = {
             "wait_id": "wait-resume-private",
             "tool_call_id": "tool-call-private",
@@ -5392,6 +5459,31 @@ def _append_resume_wait_projection_events(
             "result_digest": _DIGEST_A,
             "normalized_arguments_digest": normalized_arguments_digest,
         }
+        if include_accepted_evidence_envelope:
+            tool_result_payload["accepted_evidence_envelope"] = (
+                accepted_evidence_envelope_to_json_value(
+                    AcceptedEvidenceEnvelope(
+                        evidence_id="evidence:event-tool-result-resume",
+                        producer_event_ref="event-tool-result-resume",
+                        tool_name="fake_tool",
+                        tool_call_id="tool-call-private",
+                        tool_query=AcceptedEvidenceToolQuery(
+                            tool_call_requested_event_ref=request_event_id,
+                            normalized_arguments_digest=normalized_arguments_digest,
+                            semantic_input_digest=_DIGEST_A,
+                        ),
+                        result_ref=AcceptedEvidenceResultRef(
+                            payload_ref=None,
+                            payload_digest=None,
+                            outcome_digest=_DIGEST_A,
+                            truncation_applied=False,
+                        ),
+                        source_refs=(),
+                        locator_refs=(),
+                    )
+                )
+            )
+            tool_result_payload["raw_tool_outcome"] = tool_result_payload["result"]
         if wait_created_ref_case == "valid" or wait_created_ref_case == "wrong_event_type":
             tool_result_payload["wait_created_event_ref"] = {
                 "event_id": tool_awaiting.event_id,

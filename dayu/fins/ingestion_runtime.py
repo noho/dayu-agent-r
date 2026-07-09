@@ -4730,11 +4730,10 @@ def _download_result_details(summary: FinsDownloadResultSummary) -> tuple[FinsEv
     """
 
     bounded = _bounded_download_summary(summary)
-    displayed_skipped_count = max(bounded.skipped_count - bounded.rejected_count, 0)
     return (
         FinsEventDetail("discovered", str(bounded.discovered_count)),
         FinsEventDetail("downloaded", str(bounded.downloaded_count)),
-        FinsEventDetail("skipped", str(displayed_skipped_count)),
+        FinsEventDetail("skipped", str(bounded.skipped_count)),
         FinsEventDetail("rejected", str(bounded.rejected_count)),
         FinsEventDetail("failed", str(bounded.failed_count)),
         FinsEventDetail("written documents", str(len(bounded.written_document_ids))),

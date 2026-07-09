@@ -42,13 +42,14 @@ from dayu.host import (
 )
 from dayu.host.api import EnsureSessionRequest, HostCommandHandleOptions, WaitAdapterKey
 from dayu.host.command import HostCommandHandle, create_host_command_handle
-from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
     EventLogRow,
     EventLogStore,
 )
+from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.memory import read_latest_memory_snapshot
 from dayu.host.durable.liveness import HostInstanceIdentity, register_current_instance
 from dayu.host.durable.run_transition import (
@@ -57,6 +58,7 @@ from dayu.host.durable.run_transition import (
     accept_worker_running_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
 )
+from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.session_lifecycle import ensure_session
 from dayu.host.durable.state import (
     DispatchRecordStatus,
@@ -222,6 +224,9 @@ def test_resolve_wait_committed_tool_result_direct_catchup_without_fact(
             _events(host._transaction_runner()), "TOOL_RESULT_ACCEPTED"
         )
         assert len(tool_events) > 0
+        result_payload = json.loads(tool_events[-1].payload_json)
+        assert "accepted_evidence_envelope" in result_payload
+        assert "raw_tool_outcome" in result_payload
         catch_up_conversation_memory_projection(
             host._transaction_runner(),
             policy=policy,
@@ -240,10 +245,46 @@ def test_resolve_wait_committed_tool_result_direct_catchup_without_fact(
         assert snapshot.status is RunStatus.RUNNING
         assert memory_snapshot is not None
         assert memory_snapshot.snapshot.evidence_fact_memory.evidence_backed_facts == ()
+        recent_evidence = memory_snapshot.snapshot.evidence_fact_memory.recent_evidence_items
+        assert len(recent_evidence) == 1
+        evidence_text = recent_evidence[0].text
+        assert "工具：long_tool" in evidence_text
+        assert '工具 long_tool 请求参数：{"name":"long_tool"}' in evidence_text
+        assert '"answer":42' in evidence_text
+        assert "原始工具响应不可用" not in evidence_text
+        assert "TOOL_AWAITING" not in evidence_text
+        assert "wait" not in evidence_text
         assert (
             memory_snapshot.snapshot.cursor.checkpoint_event_sequence
             >= tool_events[-1].event_sequence
         )
+    finally:
+        host.close()
+
+
+def test_resolve_wait_rejects_request_atom_arguments_digest_mismatch(
+    tmp_path: Path,
+) -> None:
+    """wait-resolution request atom 参数 digest 拼错时必须 fail fast。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: digest mismatch 未被拒绝时抛出。
+    """
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        _rewrite_wait_request_atom_digest(host._transaction_runner(), seeded.wait_id)
+
+        with pytest.raises(HostApiError) as exc_info:
+            resolve_wait(
+                host,
+                seeded.wait_id,
+                _completed_request("resolve-request-digest-mismatch"),
+            )
+        assert isinstance(exc_info.value.__cause__, HostDurableError)
+        assert "arguments digest mismatch" in str(exc_info.value.__cause__)
     finally:
         host.close()
 
@@ -699,6 +740,44 @@ def _cancelled_request(idempotency_key: str) -> ResolveWaitRequest:
         source=WaitResolutionSource.MANUAL,
         observed_at=_OBSERVED,
     )
+
+
+def _rewrite_wait_request_atom_digest(
+    transaction_runner: HostTransactionRunner, wait_id: str
+) -> None:
+    """把 waiting request atom 的参数 digest 改成错误值。
+
+    :param transaction_runner: Host transaction runner。
+    :param wait_id: wait id。
+    :returns: ``None``。
+    """
+
+    event_id = f"event-tool-call-requested-awaiting-{wait_id.removeprefix('wait-')}"
+
+    def _operation(transaction: HostTransaction) -> None:
+        """更新 request atom payload。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
+        row = EventLogStore().read_event_by_id(transaction, event_id)
+        assert row is not None
+        payload = json.loads(row.payload_json)
+        assert isinstance(payload, dict)
+        payload["normalized_arguments_digest"] = sha256_digest_json(
+            {"arguments": {"ticker": "WRONG"}}
+        )
+        transaction.execute(
+            f"""
+            UPDATE {TABLE_EVENT_LOG}
+            SET payload_json = ?
+            WHERE event_id = ?
+            """,
+            (canonical_json_dumps(payload), event_id),
+        )
+
+    transaction_runner.run_write(_operation)
 
 
 def _seed_waiting_run(host: HostCommandHandle) -> _SeededWaitingRun:

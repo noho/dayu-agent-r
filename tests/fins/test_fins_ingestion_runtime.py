@@ -1281,17 +1281,17 @@ async def test_direct_download_projects_adapter_file_progress_events(
 
 
 @pytest.mark.asyncio
-async def test_direct_download_result_details_do_not_double_display_rejected_skips(
+async def test_direct_download_result_details_preserve_exclusive_skipped_count(
     tmp_path: Path,
 ) -> None:
-    """direct download summary 展示应避免 skipped/rejected 重复表达同一批拒绝项。"""
+    """direct download summary 展示应保留互斥 skipped 计数。"""
 
     workspace_root = tmp_path / "fins-workspace"
     adapter = _PersistedSummaryDownloadAdapter(
         FinsDownloadResultSummary(
-            discovered_count=17,
+            discovered_count=18,
             downloaded_count=15,
-            skipped_count=2,
+            skipped_count=1,
             rejected_count=2,
             failed_count=0,
             written_document_ids=tuple(f"fil-{index}" for index in range(15)),
@@ -1310,9 +1310,9 @@ async def test_direct_download_result_details_do_not_double_display_rejected_ski
 
     assert result_event.result is not None
     assert {detail.label: detail.value for detail in result_event.result.details} == {
-        "discovered": "17",
+        "discovered": "18",
         "downloaded": "15",
-        "skipped": "0",
+        "skipped": "1",
         "rejected": "2",
         "failed": "0",
         "written documents": "15",

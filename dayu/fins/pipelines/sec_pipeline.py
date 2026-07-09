@@ -150,6 +150,7 @@ _SEC_FORMS_ADAPTER_JOINER: Final[str] = ","
 _SEC_STATUS_DOWNLOADED: Final[str] = "downloaded"
 _SEC_STATUS_REJECTED: Final[str] = "rejected"
 _SEC_STATUS_SKIPPED: Final[str] = "skipped"
+_SEC_STATUS_FAILED: Final[str] = "failed"
 _SEC_REASON_6K_FILTERED: Final[str] = "6k_filtered"
 _ADAPTER_PROGRESS_FILING_STARTED: Final[str] = "download.filing_started"
 _ADAPTER_PROGRESS_FILING_COMPLETED: Final[str] = "download.filing_completed"
@@ -1858,9 +1859,10 @@ class SecDownloadAdapter(FinsSourceDownloadAdapter):
                 progress_sink=request.progress_sink,
             )
         )
+        persisted_summary = _summary_from_pipeline_result(result)
         return FinsSourceDownloadAdapterResult(
-            discovered_count=_summary_int(result, "total"),
-            persisted_summary=_summary_from_pipeline_result(result),
+            discovered_count=persisted_summary.discovered_count,
+            persisted_summary=persisted_summary,
         )
 
 
@@ -1899,24 +1901,35 @@ def _summary_from_pipeline_result(result: SecPipelineDownloadResult) -> FinsDown
     if not isinstance(filings, list):
         raise ValueError("SEC 下载结果 filings 字段必须是列表")
     written_document_ids: list[str] = []
+    downloaded_count = 0
+    skipped_count = 0
     rejected_count = 0
+    failed_count = 0
     for item in filings:
         if not isinstance(item, dict):
+            failed_count += 1
             continue
-        if item.get("status") == _SEC_STATUS_DOWNLOADED:
+        status = str(item.get("status", "")).strip()
+        if status == _SEC_STATUS_DOWNLOADED:
+            downloaded_count += 1
             document_id = str(item.get("document_id", "")).strip()
             if document_id:
                 written_document_ids.append(document_id)
+            continue
         if _is_rejected_filing_result(item):
             rejected_count += 1
-    summary = result.get("summary", {})
-    if not isinstance(summary, dict):
-        summary = {}
-    failed_count = _json_int(summary.get("failed"), "summary.failed")
+            continue
+        if status == _SEC_STATUS_SKIPPED:
+            skipped_count += 1
+            continue
+        if status == _SEC_STATUS_FAILED:
+            failed_count += 1
+            continue
+        failed_count += 1
     return FinsDownloadResultSummary(
-        discovered_count=_summary_int(result, "total"),
-        downloaded_count=_json_int(summary.get("downloaded"), "summary.downloaded"),
-        skipped_count=_json_int(summary.get("skipped"), "summary.skipped"),
+        discovered_count=len(filings),
+        downloaded_count=downloaded_count,
+        skipped_count=skipped_count,
         rejected_count=rejected_count,
         failed_count=failed_count,
         written_document_ids=tuple(written_document_ids),
@@ -1944,26 +1957,6 @@ def _is_rejected_filing_result(item: dict[str, JsonValue]) -> bool:
     skip_reason = str(item.get("skip_reason", "")).strip()
     reason_code = str(item.get("reason_code", "")).strip()
     return skip_reason == _SEC_REASON_6K_FILTERED or reason_code == _SEC_REASON_6K_FILTERED
-
-
-def _summary_int(result: SecPipelineDownloadResult, field_name: str) -> int:
-    """从 OLD 下载结果读取 summary 整数。
-
-    Args:
-        result: OLD pipeline 下载结果。
-        field_name: summary 字段名。
-
-    Returns:
-        非负整数；缺失时返回 0。
-
-    Raises:
-        ValueError: 字段无法转换为非负整数时抛出。
-    """
-
-    summary = result.get("summary", {})
-    if not isinstance(summary, dict):
-        return 0
-    return _json_int(summary.get(field_name), f"summary.{field_name}")
 
 
 def build_sec_download_adapter(

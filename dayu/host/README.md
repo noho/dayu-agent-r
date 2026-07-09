@@ -394,7 +394,7 @@ Conversation Memory 是 Session-level projection / read model，只消费 commit
 
 ### Outbox、audit 与 tool trace
 
-Outbox 从 terminal facts 派生离线 terminal notification item；audit JSONL 记录操作流水和 destructive purge 诊断；tool trace 记录工具执行 hot rows 与诊断，并投影 context pressure、tool timing、failure metadata、runner-call manifest refs / digests 等只读结构化 signal。Tool Trace 在缺少 provider request id 但存在 client correlation id 时仍保留该诊断关联字段，不把客户端关联 id 伪装成 provider request id。Tool Trace 查询层提供 resolver，可从 refs/digests 按需恢复 runner input projection、selected tool schema snapshot、工具参数、工具结果 payload 和 terminal final answer；hot row 与 cold JSONL 仍不内联大明文。它们都不能反向驱动 Run / Attempt 状态。
+Outbox 从 terminal facts 派生离线 terminal notification item；audit JSONL 记录操作流水和 destructive purge 诊断；tool trace 记录工具执行 hot rows 与诊断，并投影 context pressure、tool timing、failure metadata、runner-call manifest refs / digests 等只读结构化 signal。Tool Trace 在缺少 provider request id 但存在 client correlation id 时仍保留该诊断关联字段，不把客户端关联 id 伪装成 provider request id。Tool Trace 查询层提供 resolver，可从 refs/digests 按需恢复 runner input projection、selected tool schema snapshot、工具参数、工具结果 payload 和 terminal final answer；hot row 与 cold JSONL 会保存 bounded、脱敏、业务可读的工具请求 / 结果摘要，但不内联大明文。`TOOL_CALL_REQUESTED` 摘要来自 request atom；`TOOL_RESULT_ACCEPTED` 摘要通过 accepted evidence envelope 回到同源 request atom，并从 raw tool outcome 派生结果 details。它们都不能反向驱动 Run / Attempt 状态，也不能从 `TOOL_AWAITING` 或 wait / poll 治理状态推断 LLM-facing 业务语义。
 
 ## 关键执行路径
 
@@ -580,7 +580,7 @@ Admission 是所有 Run 输入的 durable 入口。它在事务内判断 Session
 
 ### Resume
 
-resume 只来自 `resolve_wait`，不是旧 Agent / Runner 的继续执行。长事务工具返回 `ToolAwaitingOutcome` 后，ToolRuntime 先进入 Host awaiting accept path；Host 在单个 durable transaction 内写入 `TOOL_AWAITING`、`RUN_WAITING`、`ATTEMPT_SUSPENDED`，创建 wait record，并把 Run / Attempt 推进到 `WAITING` / `SUSPENDED`。
+resume 只来自 `resolve_wait`，不是旧 Agent / Runner 的继续执行。长事务工具返回 `ToolAwaitingOutcome` 后，ToolRuntime 先进入 Host awaiting accept path；Host 在单个 durable transaction 内写入 LLM-safe `TOOL_CALL_REQUESTED` request atom、`TOOL_AWAITING`、`RUN_WAITING`、`ATTEMPT_SUSPENDED`，创建 wait record，并把 Run / Attempt 推进到 `WAITING` / `SUSPENDED`。
 
 外部长事务完成后，调用方通过 `resolve_wait(wait_id, request)` 把结果交回 Host：
 
@@ -589,7 +589,7 @@ resume 只来自 `resolve_wait`，不是旧 Agent / Runner 的继续执行。长
 - lost outcome 使 Run 进入 `LOST`。
 - 已 cancel、已 terminal、已 resolved / failed / lost 的 late result 不会恢复 Run；Host 只返回幂等结果、冲突或 `WAIT_LATE_RESULT_REJECTED` 诊断。
 
-resume Attempt 的 runner input 会把当前用户请求、使用 LLM-safe replay 参数重建的工具调用、以及已完成工具结果按模型工具协议重建为 LLM-facing 消息；replay 参数来自 `TOOL_AWAITING` 中的脱敏投影，并用原始参数 digest 关联 accepted truth。无法安全恢复 replay 参数的旧事件只投影自解释的恢复说明，不伪造工具调用。
+resume Attempt 的 runner input 会把当前用户请求、使用 LLM-safe replay 参数重建的工具调用、以及已完成工具结果按模型工具协议重建为 LLM-facing 消息；replay 参数来自 `TOOL_RESULT_ACCEPTED` accepted evidence envelope 指向的 `TOOL_CALL_REQUESTED` request atom，并用原始参数 digest 关联 accepted truth。无法安全恢复 replay 参数时只投影自解释的恢复说明，不伪造工具调用。
 
 因此 wait-resume 的稳定边界是“新 Attempt 恢复同一 Run”，不是恢复旧 Engine 生成器、旧 Runner HTTP stream 或旧工具调用栈。
 
@@ -656,7 +656,7 @@ Memory 当前只投影这些事件：
 
 - `USER_INPUT_ACCEPTED`：生成 selected recent window 的 user item。
 - `RUN_SUCCEEDED`：从 terminal answer continuity 中提取 assistant item；缺失可读 final answer 时跳过，不用 payload ref / digest / event id 补洞。
-- `TOOL_RESULT_ACCEPTED`：生成 self-explaining readable evidence item；accepted evidence envelope 提供工具名、对应 `TOOL_CALL_REQUESTED` 引用与 digest，Memory projection 从该 request atom 回读 LLM-safe request / query 文本，并与 digest-checked raw tool outcome 合并为业务可读 evidence，不暴露 tool call id、EventLog id、payload / artifact ref、digest、wait / poll / cancel lifecycle 或实现类型名。
+- `TOOL_RESULT_ACCEPTED`：生成 self-explaining readable evidence item；accepted evidence envelope 提供工具名、对应 `TOOL_CALL_REQUESTED` 引用与 digest，Memory projection 从该 request atom 回读 LLM-safe request / query 文本，并与 digest-checked raw tool outcome 合并为业务可读 evidence，不暴露 tool call id、EventLog id、payload / artifact ref、digest、wait / poll / cancel lifecycle 或实现类型名。wait-resolution 产生的 accepted result 也必须携带同一 envelope 与 raw outcome，使长事务完成后的 memory evidence 能说明“哪个工具按什么业务请求返回了什么结果”。
 - `CONTEXT_COMPACTED`：读取 accepted `conversation_compact_output_v1` candidate，物化 session summary、evidence-backed facts、answer anchors、forward intents、reference continuity items，并记录 latest compaction event ref。
 
 Memory 不消费 Host waiting lifecycle 事件。`TOOL_AWAITING`、`RUN_WAITING`、`CANCEL_REQUESTED`、`RUN_CANCELLED`、wait record、poller outcome 与 abandon 只属于 Host durable / audit / wait governance，不进入 LLM-facing memory schema；有无 awaiting 执行机制不能改变下一轮 memory 语义。长事务完成后的可读结果必须经普通 tool result / resume summary 路径进入模型上下文。

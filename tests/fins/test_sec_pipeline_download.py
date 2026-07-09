@@ -1461,6 +1461,77 @@ def test_sec_download_adapter_counts_6k_filtered_as_rejected_in_persisted_summar
     assert summary.downloaded_count == 0
 
 
+def test_sec_download_adapter_summary_classifies_skipped_and_rejected_exclusively() -> None:
+    """SEC adapter summary 应互斥统计真实跳过与 rejected filing。"""
+
+    result: sec_pipeline.SecPipelineDownloadResult = {
+        "pipeline": "sec_download",
+        "action": "download",
+        "status": "ok",
+        "ticker": "ATAT",
+        "market_profile": {},
+        "filters": {},
+        "warnings": [],
+        "filings": [
+            {
+                "document_id": "fil-downloaded",
+                "status": "downloaded",
+            },
+            {
+                "document_id": "fil-already-complete",
+                "status": "skipped",
+                "skip_reason": "already_downloaded_complete",
+                "reason_code": "already_downloaded_complete",
+            },
+            {
+                "document_id": "fil-filtered-6k",
+                "status": "skipped",
+                "skip_reason": "6k_filtered",
+                "reason_code": "6k_filtered",
+            },
+            {
+                "document_id": "fil-failed",
+                "status": "failed",
+            },
+            {
+                "document_id": "fil-unknown-status",
+                "status": "provider_new_status",
+            },
+        ],
+        "summary": {
+            "total": 999,
+            "downloaded": 1,
+            "skipped": 2,
+            "rejected": 1,
+            "failed": 99,
+            "elapsed_ms": 42,
+            "reused_downloads": 0,
+            "converted": 0,
+        },
+    }
+
+    summary = sec_pipeline._summary_from_pipeline_result(result)
+
+    assert summary.discovered_count == 5
+    assert summary.downloaded_count == 1
+    assert summary.skipped_count == 1
+    assert summary.rejected_count == 1
+    assert summary.failed_count == 2
+    assert summary.discovered_count == (
+        summary.downloaded_count
+        + summary.skipped_count
+        + summary.rejected_count
+        + summary.failed_count
+    )
+    assert (
+        summary.discovered_count
+        == summary.downloaded_count
+        + summary.skipped_count
+        + summary.rejected_count
+        + summary.failed_count
+    )
+
+
 def test_sec_pipeline_keeps_6k_results_release(tmp_path: Path) -> None:
     """验证 6-K 命中结果发布规则时保留落盘。
 

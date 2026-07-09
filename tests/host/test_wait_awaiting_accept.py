@@ -78,7 +78,7 @@ def test_awaiting_accept_port_is_abstract() -> None:
 def test_awaiting_accept_creates_wait_record_and_waiting_state(
     tmp_path: Path,
 ) -> None:
-    """awaiting accept 原子写入三类事实、wait record 与 WAITING/SUSPENDED 状态。"""
+    """awaiting accept 原子写入四类事实、wait record 与 WAITING/SUSPENDED 状态。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
@@ -89,6 +89,7 @@ def test_awaiting_accept_creates_wait_record_and_waiting_state(
 
         assert isinstance(result, ToolAwaitingAcceptedAck)
         assert [ref.event_id for ref in result.accepted_event_refs] == [
+            f"event-tool-call-requested-awaiting-{candidate.semantic_input_digest.removeprefix('sha256:')}",
             f"event-tool-awaiting-{candidate.semantic_input_digest.removeprefix('sha256:')}",
             f"event-run-waiting-{candidate.semantic_input_digest.removeprefix('sha256:')}",
             f"event-attempt-suspended-{candidate.semantic_input_digest.removeprefix('sha256:')}",
@@ -103,6 +104,7 @@ def test_awaiting_accept_creates_wait_record_and_waiting_state(
         assert wait_record.external_job_ref is not None
         assert wait_record.external_job_ref.external_job_id == "external-job-1"
         assert [event.event_type for event in events] == [
+            "TOOL_CALL_REQUESTED",
             "TOOL_AWAITING",
             "RUN_WAITING",
             "ATTEMPT_SUSPENDED",
@@ -254,12 +256,30 @@ def test_awaiting_accept_persists_only_llm_safe_replay_arguments(
 
         assert isinstance(result, ToolAwaitingAcceptedAck)
         events = _awaiting_events(store.transaction_runner)
-        tool_awaiting = events[0]
+        for event in events:
+            assert "token-raw-value" not in event.payload_json
+            assert "api-key-raw-value" not in event.payload_json
+            assert "password-raw-value" not in event.payload_json
+            assert "secret-raw-value" not in event.payload_json
+        tool_call_requested = next(
+            event for event in events if event.event_type == "TOOL_CALL_REQUESTED"
+        )
+        request_payload = json.loads(tool_call_requested.payload_json)
+        assert isinstance(request_payload, dict)
+        assert request_payload["arguments_inline_json"] == {
+            "arguments": {
+                "token": "<redacted>",
+                "api_key": "<redacted>",
+                "password": "<redacted>",
+                "nested": {
+                    "client-secret": "<redacted>",
+                    "query": "business query",
+                },
+            }
+        }
+        assert "business query" in str(request_payload["semantic_query_text"])
+        tool_awaiting = next(event for event in events if event.event_type == "TOOL_AWAITING")
         payload_text = tool_awaiting.payload_json
-        assert "token-raw-value" not in payload_text
-        assert "api-key-raw-value" not in payload_text
-        assert "password-raw-value" not in payload_text
-        assert "secret-raw-value" not in payload_text
         payload = json.loads(payload_text)
         assert isinstance(payload, dict)
         assert payload["accepted_arguments"] == {
@@ -509,7 +529,12 @@ def _read_state(
             tuple(
                 row
                 for row in EventLogStore().read_events_after(transaction, 0, limit=100)
-                if row.event_type in ("TOOL_AWAITING", "RUN_WAITING", "ATTEMPT_SUSPENDED")
+                if row.event_type in (
+                    "TOOL_CALL_REQUESTED",
+                    "TOOL_AWAITING",
+                    "RUN_WAITING",
+                    "ATTEMPT_SUSPENDED",
+                )
             ),
         )
 
@@ -535,7 +560,12 @@ def _awaiting_events(
         return tuple(
             row
             for row in EventLogStore().read_events_after(transaction, 0, limit=100)
-            if row.event_type in ("TOOL_AWAITING", "RUN_WAITING", "ATTEMPT_SUSPENDED")
+            if row.event_type in (
+                "TOOL_CALL_REQUESTED",
+                "TOOL_AWAITING",
+                "RUN_WAITING",
+                "ATTEMPT_SUSPENDED",
+            )
         )
 
     return transaction_runner.run_read(_operation)

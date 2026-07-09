@@ -1,8 +1,7 @@
-"""Fins 下载 awaiting tool 定义。
+"""Fins 下载工具定义。
 
-本模块把 Fins shared ingestion runtime 的下载 observation 入口适配为当前
-``ToolDefinition``。工具只启动外部长事务并返回等待 outcome，不轮询完成
-状态，也不暴露 Host 内部治理字段或本地 observation 记录。
+本模块把 Fins 下载能力适配为当前 ``ToolDefinition``，负责参数解析、
+启动下载任务并把启动结果交还给上层工具执行框架。
 """
 
 from __future__ import annotations
@@ -163,11 +162,9 @@ def build_fins_download_tool(runtime: FinsIngestionRuntime) -> ToolDefinition:
             function=ToolFunctionSchema(
                 name=DOWNLOAD_TOOL_NAME,
                 description=(
-                    "Start a financial filing download operation for one company. "
-                    "The tool returns immediately with an external-job wait state "
-                    "after a lightweight observation handle is registered; it does "
-                    "not wait for the download to finish. Use this when source filings must be "
-                    "ingested into the Fins workspace before reading or processing."
+                    "为一家公司下载可用财报源文件。调用后等待工具结果返回；"
+                    "结果会说明发现、下载、跳过、拒绝和失败的文档数量。"
+                    "当本地缺少用户所需财报，或需要先补齐源文件再读取、处理时使用。"
                 ),
                 parameters=_download_parameters_schema(),
             ),
@@ -196,34 +193,34 @@ def _download_parameters_schema() -> ToolParametersSchema:
     properties: dict[str, JsonValue] = {
         "ticker": {
             "type": "string",
-            "description": "Company ticker or exchange-qualified ticker to download, for example AAPL or 00700.HK.",
+            "description": "要下载财报的股票代码，可包含交易所后缀，例如 AAPL 或 00700.HK。",
         },
         "source": {
             "type": "string",
-            "description": "Financial filing source selector. Use auto unless the user explicitly names a supported source.",
+            "description": "财报来源。除非用户明确指定来源，否则使用 auto。",
             "default": _DEFAULT_SOURCE,
         },
         "form_types": {
             "type": "array",
-            "description": "Optional filing form filters such as 10-K, 10-Q or annual-report. Omit or pass an empty list for all supported forms.",
+            "description": "可选表单过滤条件，例如 10-K、10-Q 或 annual-report；省略或传空数组表示不过滤。",
             "items": {"type": "string"},
         },
         "filed_after": {
             "type": "string",
-            "description": "Optional inclusive filing-date lower bound in YYYY-MM-DD form.",
+            "description": "可选披露日期下限，包含当天，格式 YYYY-MM-DD。",
         },
         "filed_before": {
             "type": "string",
-            "description": "Optional inclusive filing-date upper bound in YYYY-MM-DD form.",
+            "description": "可选披露日期上限，包含当天，格式 YYYY-MM-DD。",
         },
         "overwrite_existing": {
             "type": "boolean",
-            "description": "Whether downloaded source documents may replace existing source documents with the same id.",
+            "description": "是否允许新下载的源文件替换本地同一文档的已有源文件。",
             "default": False,
         },
         "rebuild_processed": {
             "type": "boolean",
-            "description": "Whether existing processed outputs for replaced documents should be marked for rebuilding.",
+            "description": "替换源文件后，是否要求后续重新处理对应文档。",
             "default": False,
         },
     }

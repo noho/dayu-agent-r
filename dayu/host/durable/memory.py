@@ -482,7 +482,7 @@ def _tool_result_query_text(
         return ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT
     if (
         request_row.session_id != result_row.session_id
-        or not _same_run_attempt_execution(request_row, result_row)
+        or not _same_run_attempt_compatible_execution(request_row, result_row)
         or request_row.event_class != EventClass.CANONICAL_FACT
         or request_row.event_type != _EVENT_TYPE_TOOL_CALL_REQUESTED
     ):
@@ -503,18 +503,29 @@ def _tool_result_query_text(
     return ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT
 
 
-def _same_run_attempt_execution(left: EventLogRow, right: EventLogRow) -> bool:
-    """判断两条 EventLog row 是否属于同一 run / attempt / execution。
+def _same_run_attempt_compatible_execution(
+    request_row: EventLogRow, result_row: EventLogRow
+) -> bool:
+    """判断 request atom 与 result row 是否属于同一工具调用上下文。
 
-    :param left: 第一条 EventLog row。
-    :param right: 第二条 EventLog row。
-    :returns: 三个执行上下文字段全部一致时返回 ``True``。
+    wait-resolution ``TOOL_RESULT_ACCEPTED`` 由 Run transition 写在 suspended
+    attempt 上，EventLog row 的 ``execution_id`` 可为空；对应 request atom
+    仍保留产生等待时的 execution id。这里允许 result execution 为空，但仍要求
+    run / attempt 相同，避免跨 attempt 拼接 request 与 result。
+
+    :param request_row: ``TOOL_CALL_REQUESTED`` row。
+    :param result_row: ``TOOL_RESULT_ACCEPTED`` row。
+    :returns: run / attempt 相同且 execution 精确匹配或 result execution 为空时
+        返回 ``True``。
     """
 
     return (
-        left.run_id == right.run_id
-        and left.attempt_id == right.attempt_id
-        and left.execution_id == right.execution_id
+        request_row.run_id == result_row.run_id
+        and request_row.attempt_id == result_row.attempt_id
+        and (
+            request_row.execution_id == result_row.execution_id
+            or result_row.execution_id is None
+        )
     )
 
 

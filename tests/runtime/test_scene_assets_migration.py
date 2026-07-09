@@ -797,6 +797,8 @@ def test_migrated_base_prompt_assets_preserve_legacy_text_boundaries() -> None:
     assert "fins_default_subject" not in agents_content
     assert "用户任务边界" not in fact_rules_content
     assert "<when_tag fins>" not in tools_content
+    assert "next_step.action" not in tools_content
+    assert "轮询" not in tools_content
     for marker in _LEGACY_TOOLS_CONDITIONAL_MARKERS:
         assert marker in tools_content
 

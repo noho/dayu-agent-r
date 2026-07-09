@@ -76,7 +76,9 @@ def tool_awaiting_payload(
         "tool_call_id": tool_call_id,
         "tool_name": tool_name,
         "normalized_arguments_digest": normalized_arguments_digest,
-        _PAYLOAD_FIELD_ACCEPTED_ARGUMENTS: _llm_safe_replay_arguments(accepted_arguments),
+        _PAYLOAD_FIELD_ACCEPTED_ARGUMENTS: llm_safe_replay_arguments(
+            accepted_arguments
+        ),
         _PAYLOAD_FIELD_ACCEPTED_ARGUMENTS_SOURCE_DIGEST: normalized_arguments_digest,
         "await_spec": _await_spec_json(await_spec),
         "adapter_key": adapter_key,
@@ -115,7 +117,7 @@ def run_waiting_payload(
     }
 
 
-def _llm_safe_replay_arguments(
+def llm_safe_replay_arguments(
     arguments: Mapping[str, JsonValue],
 ) -> Mapping[str, JsonValue]:
     """把工具参数投影为可用于 LLM replay 的安全参数。
@@ -245,6 +247,8 @@ def tool_result_wait_resolution_payload(
     provider_status_ref: WaitProviderStatusRef | None,
     resume_attempt_id: str | None,
     resume_dispatch_record_id: str | None,
+    accepted_evidence_envelope: JsonValue,
+    raw_tool_outcome: JsonValue,
 ) -> JsonValue:
     """构造 resolve wait 产生的 ``TOOL_RESULT_ACCEPTED`` payload。
 
@@ -279,6 +283,8 @@ def tool_result_wait_resolution_payload(
     :param provider_status_ref: provider 状态引用。
     :param resume_attempt_id: resume Attempt id；不恢复时为 ``None``。
     :param resume_dispatch_record_id: resume dispatch id；不恢复时为 ``None``。
+    :param accepted_evidence_envelope: accepted tool evidence envelope JSON。
+    :param raw_tool_outcome: 与 ``resolution_result`` 同源的原始工具结果 JSON。
     :returns: 可写入 EventLog 的 JSON payload。
     """
 
@@ -305,6 +311,8 @@ def tool_result_wait_resolution_payload(
         "tool_idempotency_key": resolution_idempotency_key,
         "diagnostic_refs": [],
         "accepted_event_refs": [],
+        "accepted_evidence_envelope": accepted_evidence_envelope,
+        "raw_tool_outcome": raw_tool_outcome,
         "result": resolution_result,
         "wait_id": wait_id,
         "resolution_source": resolution_source,

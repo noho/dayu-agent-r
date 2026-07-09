@@ -1445,6 +1445,16 @@ def test_ingestion_tool_schemas_hide_host_internal_fields(tmp_path: Path) -> Non
         assert "raw job record" not in schema_text
         assert "internal governance" not in schema_text
         assert "Host" not in schema_text
+        lowered_schema_text = schema_text.lower()
+        assert "external-job" not in lowered_schema_text
+        assert "observation handle" not in lowered_schema_text
+        assert "runtime" not in lowered_schema_text
+        assert "next_step" not in lowered_schema_text
+        assert "poll" not in lowered_schema_text
+        assert "local file paths to upload" not in lowered_schema_text
+        assert "whether the upload" not in lowered_schema_text
+        assert "required for filing uploads" not in lowered_schema_text
+        assert "optional explicit material" not in lowered_schema_text
 
 
 def test_fins_wait_adapter_registry_binds_download_preprocess_and_upload_tools(

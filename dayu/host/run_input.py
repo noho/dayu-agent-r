@@ -126,6 +126,7 @@ from dayu.host.evidence import accepted_evidence_envelope_from_payload
 from dayu.host.payload_resolution import (
     event_payload_object,
     event_payload_object_for_result_ref,
+    tool_call_request_atoms,
 )
 from dayu.host.projection import event_log_read_filter_from_projection_filter
 from dayu.host.terminal_payload import (
@@ -158,6 +159,7 @@ _EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
 _EVENT_TYPE_RUN_ACCEPTED = "RUN_ACCEPTED"
 _EVENT_TYPE_RUN_STARTED = "RUN_STARTED"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
+_EVENT_TYPE_TOOL_CALL_REQUESTED = "TOOL_CALL_REQUESTED"
 _EVENT_TYPE_TOOL_AWAITING = "TOOL_AWAITING"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
 _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED = "RUNNER_CALL_INPUT_ASSEMBLED"
@@ -174,6 +176,7 @@ _PAYLOAD_FIELD_TOOL_NAME = "tool_name"
 _PAYLOAD_FIELD_ACCEPTED_ARGUMENTS = "accepted_arguments"
 _PAYLOAD_FIELD_ACCEPTED_ARGUMENTS_SOURCE_DIGEST = "accepted_arguments_source_digest"
 _PAYLOAD_FIELD_WAIT_CREATED_EVENT_REF = "wait_created_event_ref"
+_PAYLOAD_FIELD_ARGUMENTS = "arguments"
 _PAYLOAD_FIELD_COMPACT_ARTIFACT_REF = "compact_artifact_ref"
 _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST = "compact_artifact_digest"
 _PAYLOAD_FIELD_OPERATION_ID = "operation_id"
@@ -3863,7 +3866,11 @@ def _resume_wait_messages_from_current_start(
         expected_type=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
     )
     payload = _payload_object(tool_result_event)
-    accepted_arguments = _resume_wait_accepted_arguments(transaction, payload)
+    accepted_arguments = _resume_wait_accepted_arguments(
+        transaction,
+        tool_result_payload=payload,
+        tool_result_event=tool_result_event,
+    )
     if accepted_arguments is None:
         return (_resume_wait_fallback_message(payload),)
     tool_call_id = _required_payload_text(payload, field_name=_PAYLOAD_FIELD_TOOL_CALL_ID)
@@ -3913,43 +3920,80 @@ def _resume_wait_fallback_message(payload: Mapping[str, JsonValue]) -> SystemMes
 
 
 def _resume_wait_accepted_arguments(
-    transaction: HostTransaction, tool_result_payload: Mapping[str, JsonValue]
+    transaction: HostTransaction,
+    *,
+    tool_result_payload: Mapping[str, JsonValue],
+    tool_result_event: EventLogRow,
 ) -> Mapping[str, JsonValue] | None:
-    """读取 resume 等待工具调用的已接受参数。
+    """读取 resume 等待工具调用的 LLM-safe request atom 参数。
 
     :param transaction: Host durable transaction。
     :param tool_result_payload: ``TOOL_RESULT_ACCEPTED`` payload。
-    :returns: LLM-safe replay 工具参数；旧记录或异常引用无法重建时返回 ``None``。
-    :raises HostDurableError: 新字段存在但结构损坏或 digest 不一致时抛出。
+    :param tool_result_event: ``TOOL_RESULT_ACCEPTED`` event row。
+    :returns: LLM-safe replay 工具参数；缺少 accepted evidence envelope 或 request
+        atom 时返回 ``None``。
+    :raises HostDurableError: envelope、request atom 或 digest 结构损坏时抛出。
     """
 
-    wait_event_id = _optional_event_id_from_payload_ref(
-        tool_result_payload,
-        field_name=_PAYLOAD_FIELD_WAIT_CREATED_EVENT_REF,
-    )
-    if wait_event_id is None:
+    try:
+        envelope = accepted_evidence_envelope_from_payload(
+            tool_result_payload,
+            producer_event_ref=tool_result_event.event_id,
+        )
+    except ValueError as exc:
+        if str(exc) == ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH:
+            raise HostDurableError(str(exc)) from exc
+        raise HostDurableError("resume wait accepted evidence envelope is invalid") from exc
+    if envelope is None:
         return None
-    wait_event = read_event_by_id(transaction, wait_event_id)
-    if wait_event is None:
+    request_event_ref = envelope.tool_query.tool_call_requested_event_ref
+    if request_event_ref is None:
         return None
-    if wait_event.event_type != _EVENT_TYPE_TOOL_AWAITING:
+    request_event = read_event_by_id(transaction, request_event_ref)
+    if request_event is None:
         return None
-    wait_payload = _payload_object(wait_event)
-    value = wait_payload.get(_PAYLOAD_FIELD_ACCEPTED_ARGUMENTS)
-    if value is None:
-        return None
+    if not _resume_wait_request_event_matches_result(
+        request_event=request_event,
+        result_event=tool_result_event,
+    ):
+        raise HostDurableError("resume wait request atom event type mismatch")
+    atoms = tool_call_request_atoms(transaction, request_event)
+    if (
+        atoms.tool_call_id != envelope.tool_call_id
+        or atoms.tool_name != envelope.tool_name
+        or atoms.normalized_arguments_digest
+        != envelope.tool_query.normalized_arguments_digest
+    ):
+        raise HostDurableError("resume wait request atom identity mismatch")
+    value = atoms.arguments_json.get(_PAYLOAD_FIELD_ARGUMENTS)
     if not isinstance(value, Mapping):
-        raise HostDurableError("resume wait accepted arguments must be object")
+        raise HostDurableError("resume wait request arguments must be object")
     accepted_arguments = dict(value)
-    source_digest = wait_payload.get(_PAYLOAD_FIELD_ACCEPTED_ARGUMENTS_SOURCE_DIGEST)
-    if source_digest is None:
-        return None
-    if not isinstance(source_digest, str) or source_digest.strip() == "":
-        raise HostDurableError("resume wait accepted arguments source digest must be text")
-    wait_normalized_digest = _required_payload_text(wait_payload, field_name="normalized_arguments_digest")
-    if source_digest != wait_normalized_digest:
-        raise HostDurableError("resume wait accepted arguments digest mismatch")
     return accepted_arguments
+
+
+def _resume_wait_request_event_matches_result(
+    *, request_event: EventLogRow, result_event: EventLogRow
+) -> bool:
+    """校验 resume request atom 与 wait result 属于同一工具调用上下文。
+
+    :param request_event: ``TOOL_CALL_REQUESTED`` row。
+    :param result_event: ``TOOL_RESULT_ACCEPTED`` row。
+    :returns: 身份上下文相容时返回 ``True``。
+    """
+
+    if (
+        request_event.event_class is not EventClass.CANONICAL_FACT
+        or request_event.event_type != _EVENT_TYPE_TOOL_CALL_REQUESTED
+        or request_event.session_id != result_event.session_id
+        or request_event.run_id != result_event.run_id
+        or request_event.attempt_id != result_event.attempt_id
+    ):
+        return False
+    return (
+        request_event.execution_id == result_event.execution_id
+        or result_event.execution_id is None
+    )
 
 
 def _resume_wait_tool_message_content(
