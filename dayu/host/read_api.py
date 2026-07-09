@@ -84,6 +84,10 @@ from dayu.host.durable.state import (
     session_snapshot_from_rows,
 )
 from dayu.host.durable.transaction import HostTransaction
+from dayu.host.lifecycle_events import (
+    HostRunEventType,
+    parse_host_run_event_type,
+)
 from dayu.host.payload_resolution import event_payload_object
 from dayu.host.outbox import (
     OUTBOX_TERMINAL_CONSUMER_ID,
@@ -91,10 +95,6 @@ from dayu.host.outbox import (
 )
 
 _SESSION_WATCH_BATCH_LIMIT = 64
-_EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
-_EVENT_TYPE_RUN_FAILED = "RUN_FAILED"
-_EVENT_TYPE_RUN_CANCELLED = "RUN_CANCELLED"
-_EVENT_TYPE_RUN_LOST = "RUN_LOST"
 _EVENT_TYPE_RUN_ACCEPTED = "RUN_ACCEPTED"
 _EVENT_TYPE_RUN_QUEUED = "RUN_QUEUED"
 _EVENT_TYPE_RUN_STARTED = "RUN_STARTED"
@@ -873,13 +873,14 @@ def _host_event_from_row(transaction: HostTransaction, row: EventLogRow) -> Host
     :raises HostDurableError: terminal payload 损坏时抛出。
     """
 
-    if row.event_type == _EVENT_TYPE_RUN_SUCCEEDED:
+    run_event_type = parse_host_run_event_type(row.event_type)
+    if run_event_type is HostRunEventType.RUN_SUCCEEDED:
         return _succeeded_host_event(transaction, row)
-    if row.event_type == _EVENT_TYPE_RUN_FAILED:
+    if run_event_type is HostRunEventType.RUN_FAILED:
         return _failed_host_event(row)
-    if row.event_type == _EVENT_TYPE_RUN_CANCELLED:
+    if run_event_type is HostRunEventType.RUN_CANCELLED:
         return _cancelled_host_event(row)
-    if row.event_type == _EVENT_TYPE_RUN_LOST:
+    if run_event_type is HostRunEventType.RUN_LOST:
         return _lost_host_event(row)
     return HostEvent(
         event_id=row.event_id,
@@ -1140,16 +1141,16 @@ def _run_lifecycle_activity(row: EventLogRow) -> HostActivityView | None:
     elif row.event_type == _EVENT_TYPE_RUN_RECOVERING:
         status = HostActivityStatus.IN_PROGRESS
         title = "运行恢复中"
-    elif row.event_type == _EVENT_TYPE_RUN_SUCCEEDED:
+    elif row.event_type == HostRunEventType.RUN_SUCCEEDED.value:
         status = HostActivityStatus.COMPLETED
         title = "运行已完成"
-    elif row.event_type == _EVENT_TYPE_RUN_FAILED:
+    elif row.event_type == HostRunEventType.RUN_FAILED.value:
         status = HostActivityStatus.FAILED
         title = "运行失败"
-    elif row.event_type == _EVENT_TYPE_RUN_CANCELLED:
+    elif row.event_type == HostRunEventType.RUN_CANCELLED.value:
         status = HostActivityStatus.CANCELLED
         title = "运行已取消"
-    elif row.event_type == _EVENT_TYPE_RUN_LOST:
+    elif row.event_type == HostRunEventType.RUN_LOST.value:
         status = HostActivityStatus.FAILED
         title = "运行已丢失"
     else:

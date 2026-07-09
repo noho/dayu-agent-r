@@ -11,17 +11,14 @@ transition helper 完成旧 Attempt closeout。Slice 3 起，本模块还负责�
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from uuid import uuid4
 
-from dayu.contracts.json_value import JsonValue
 from dayu.host.admission import AdmissionWakeupPort, PendingDispatchRecord
 from dayu.host.api import AttemptStatus, RunStatus
 from dayu.host.durable.event_log import EventLogStore
-from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.liveness import HostInstanceRow, read_host_instance
 from dayu.host.durable.run_transition import (
     RunTransitionResult,
@@ -30,6 +27,7 @@ from dayu.host.durable.run_transition import (
     StartupRecoveringLostInput,
     close_startup_orphan_attempt_in_transaction,
     lose_recovering_run_in_transaction,
+    read_cancel_requested_event_from_run_link,
     start_recovery_run_with_starting_attempt_in_transaction,
 )
 from dayu.host.durable.state import (
@@ -45,7 +43,6 @@ from dayu.host.durable.state import (
     read_session_by_id,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
-from dayu.host.payload_resolution import event_payload_object
 from dayu.host.recovery_process import (
     DurableOrphanCandidate,
     OrphanClassification,
@@ -76,8 +73,6 @@ _REASON_RECOVERY_DISPATCH_LIMIT_EXCEEDED = (
 _REASON_RECOVERY_DISPATCH_PENDING_FOLLOW_UP = (
     "startup_recovery_dispatch_pending_follow_up"
 )
-_EVENT_TYPE_RUN_CANCELLING = "RUN_CANCELLING"
-_EVENT_TYPE_CANCEL_REQUESTED = "CANCEL_REQUESTED"
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -296,7 +291,7 @@ class StartupRecoveryScanner:
                 and _has_accepted_cancel_fact(
                     transaction,
                     self.event_log_store,
-                    run.run_id,
+                    run,
                 )
             ):
                 return _action(
@@ -654,44 +649,20 @@ def _read_current_attempt_and_dispatch(
 def _has_accepted_cancel_fact(
     transaction: HostTransaction,
     event_log_store: EventLogStore,
-    run_id: str,
+    run: RunRow,
 ) -> bool:
     """判断 Run 是否具有完整 accepted active cancel durable facts。
 
     :param transaction: Host transaction。
     :param event_log_store: EventLog primitive。
-    :param run_id: 目标 Run id。
-    :returns: 存在 ``RUN_CANCELLING`` 且能链接到同 Run 的
-        ``CANCEL_REQUESTED`` 时返回 ``True``。
+    :param run: 目标 Run row。
+    :returns: Run row typed link 能指向同 Run 的 ``CANCEL_REQUESTED`` 时返回
+        ``True``。
     """
 
-    cancelling = event_log_store.read_latest_run_event_by_type(
-        transaction,
-        run_id=run_id,
-        event_type=_EVENT_TYPE_RUN_CANCELLING,
-    )
-    if cancelling is None:
-        return False
-    payload: Mapping[str, JsonValue]
-    try:
-        payload = event_payload_object(
-            transaction,
-            cancelling,
-            payload_label=_EVENT_TYPE_RUN_CANCELLING,
-        )
-    except HostDurableError:
-        return False
-    raw_cancel_request_event_id = payload.get("cancel_request_event_id")
-    if not isinstance(raw_cancel_request_event_id, str):
-        return False
-    cancel_requested = event_log_store.read_event_by_id(
-        transaction,
-        raw_cancel_request_event_id,
-    )
     return (
-        cancel_requested is not None
-        and cancel_requested.run_id == run_id
-        and cancel_requested.event_type == _EVENT_TYPE_CANCEL_REQUESTED
+        read_cancel_requested_event_from_run_link(transaction, event_log_store, run)
+        is not None
     )
 
 

@@ -9,7 +9,6 @@ orchestration、WorkerProxy、Engine dispatch 或 public facade。
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -1002,6 +1001,7 @@ def create_accepted_run_in_transaction(
         started_event_sequence=None,
         terminal_event_id=None,
         terminal_event_sequence=None,
+        cancel_request_event_id=None,
         current_attempt_id=None,
         source_run_id=None,
         source_run_relation=None,
@@ -1062,6 +1062,7 @@ def create_queued_run_in_transaction(
         started_event_sequence=None,
         terminal_event_id=None,
         terminal_event_sequence=None,
+        cancel_request_event_id=None,
         current_attempt_id=None,
         source_run_id=None,
         source_run_relation=None,
@@ -1125,6 +1126,7 @@ def create_running_run_with_starting_attempt_in_transaction(
         started_event_sequence=started_event.event_sequence,
         terminal_event_id=None,
         terminal_event_sequence=None,
+        cancel_request_event_id=None,
         current_attempt_id=request.attempt_id,
         source_run_id=None,
         source_run_relation=None,
@@ -1275,6 +1277,7 @@ def fail_unstarted_run_in_transaction(
         terminal_status=RunStatus.FAILED,
         terminal_event_id=failed_event.event_id,
         terminal_event_sequence=failed_event.event_sequence,
+        cancel_request_event_id=None,
         terminal_at=format_utc_timestamp(request.occurred_at),
     )
     run_result = _require_run_mutation_updated(
@@ -2146,14 +2149,7 @@ def _terminal_run_row_for_closeout(
     """
 
     if request.run_terminal_status is RunStatus.CANCELLED:
-        return cancel_running_run_row(
-            transaction,
-            run_id=request.run_id,
-            current_attempt_id=request.attempt_id,
-            terminal_event_id=terminal_event_id,
-            terminal_event_sequence=terminal_event_sequence,
-            terminal_at=terminal_at,
-        )
+        raise HostDurableError("cancelled terminal closeout requires cancel link")
     return terminal_run_row(
         transaction,
         run_id=request.run_id,
@@ -2195,6 +2191,19 @@ def active_cancel_closeout_in_transaction(
         return invalid
     if run is None or attempt is None or dispatch_record is None:
         raise HostDurableError("active cancel closeout narrowing failed")
+    cancel_requested = read_cancel_requested_event_from_run_link(
+        transaction, event_log_store, run
+    )
+    if (
+        cancel_requested is None
+        or cancel_requested.event_id != request.cancel_request_event_id
+    ):
+        return RunTransitionResult(
+            status=StateMutationStatus.INVALID_STATE,
+            run=run,
+            attempt=attempt,
+            dispatch_record=dispatch_record,
+        )
 
     attempt_event = event_log_store.append_event(
         transaction,
@@ -2247,6 +2256,36 @@ def active_cancel_closeout_in_transaction(
     )
 
 
+def read_cancel_requested_event_from_run_link(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    run: RunRow | None,
+) -> EventLogRow | None:
+    """按 Run row typed cancel link 读取同 Run 的 ``CANCEL_REQUESTED`` fact。
+
+    :param transaction: 调用方提供的 Host transaction。
+    :param event_log_store: EventLog 读取 primitive。
+    :param run: 当前 Run row；缺失时为 ``None``。
+    :returns: 同 Run 的 ``CANCEL_REQUESTED`` event；缺少 typed link、事件缺失、
+        Run 不匹配或 event type 不匹配时返回 ``None``。
+    :raises: 无主动抛出。
+    """
+
+    if run is None or run.cancel_request_event_id is None:
+        return None
+    cancel_requested = event_log_store.read_event_by_id(
+        transaction,
+        run.cancel_request_event_id,
+    )
+    if (
+        cancel_requested is None
+        or cancel_requested.run_id != run.run_id
+        or cancel_requested.event_type != _EVENT_TYPE_CANCEL_REQUESTED
+    ):
+        return None
+    return cancel_requested
+
+
 def active_cancel_watchdog_closeout_in_transaction(
     transaction: HostTransaction,
     event_log_store: EventLogStore,
@@ -2288,8 +2327,10 @@ def active_cancel_watchdog_closeout_in_transaction(
         run_id=request.run_id,
         event_type=_EVENT_TYPE_RUN_CANCELLING,
     )
-    cancel_request_event_id = _cancel_request_event_id_from_cancelling(cancelling)
-    if cancelling is None or cancel_request_event_id is None:
+    cancel_requested = read_cancel_requested_event_from_run_link(
+        transaction, event_log_store, run
+    )
+    if cancelling is None or cancel_requested is None:
         return RunTransitionResult(
             status=StateMutationStatus.INVALID_STATE,
             run=run,
@@ -2307,7 +2348,7 @@ def active_cancel_watchdog_closeout_in_transaction(
             attempt=attempt,
             dispatch_record=dispatch_record,
             cancelling=cancelling,
-            cancel_request_event_id=cancel_request_event_id,
+            cancel_request_event_id=cancel_requested.event_id,
         ),
     ).row
     run_event = event_log_store.append_event(
@@ -2319,7 +2360,7 @@ def active_cancel_watchdog_closeout_in_transaction(
             attempt_cancelled_event_id=attempt_event.event_id,
             dispatch_record=dispatch_record,
             cancelling=cancelling,
-            cancel_request_event_id=cancel_request_event_id,
+            cancel_request_event_id=cancel_requested.event_id,
         ),
     ).row
     terminal_at = format_utc_timestamp(request.occurred_at)
@@ -2499,6 +2540,7 @@ def cancel_waiting_run_in_transaction(
         current_attempt_id=attempt.attempt_id,
         terminal_event_id=run_cancelled_event.event_id,
         terminal_event_sequence=run_cancelled_event.event_sequence,
+        cancel_request_event_id=cancel_request_event.event_id,
         terminal_at=terminal_at,
     )
     run_result = _require_run_mutation_updated(
@@ -2565,6 +2607,7 @@ def cancel_recovering_run_in_transaction(
         run_id=run.run_id,
         terminal_event_id=run_cancelled_event.event_id,
         terminal_event_sequence=run_cancelled_event.event_sequence,
+        cancel_request_event_id=cancel_request_event.event_id,
         terminal_at=terminal_at,
     )
     run_result = _require_run_mutation_updated(
@@ -2629,6 +2672,7 @@ def cancel_queued_in_transaction(
         terminal_status=RunStatus.CANCELLED,
         terminal_event_id=run_cancelled_event.event_id,
         terminal_event_sequence=run_cancelled_event.event_sequence,
+        cancel_request_event_id=cancel_request_event.event_id,
         terminal_at=format_utc_timestamp(request.occurred_at),
     )
     run_result = _require_run_mutation_updated(
@@ -2742,6 +2786,7 @@ def cancel_predispatch_starting_in_transaction(
         current_attempt_id=attempt.attempt_id,
         terminal_event_id=run_cancelled_event.event_id,
         terminal_event_sequence=run_cancelled_event.event_sequence,
+        cancel_request_event_id=cancel_request_event.event_id,
         terminal_at=terminal_at,
     )
     run_result = _require_run_mutation_updated(
@@ -2819,6 +2864,7 @@ def request_active_attempt_cancel_in_transaction(
         transaction,
         run_id=run.run_id,
         current_attempt_id=attempt.attempt_id,
+        cancel_request_event_id=cancel_request_event.event_id,
         updated_at=format_utc_timestamp(request.occurred_at),
     )
     run_result = _require_run_mutation_updated(
@@ -4324,7 +4370,9 @@ def _active_watchdog_attempt_cancelled_event_request(
     :param attempt: 目标 Attempt row。
     :param dispatch_record: 目标 dispatch record。
     :param cancelling: 绑定的 ``RUN_CANCELLING`` event row。
-    :param cancel_request_event_id: 从 ``RUN_CANCELLING`` payload 读取的 cancel request id。
+    :param cancel_request_event_id: 来自 typed ``RunRow.cancel_request_event_id`` 的
+        ``CANCEL_REQUESTED`` event id；调用方已校验它引用同一 Run 的
+        ``CANCEL_REQUESTED``，不是从 ``RUN_CANCELLING`` payload 解析。
     :returns: EventLog append request。
     """
 
@@ -4375,7 +4423,9 @@ def _active_watchdog_run_cancelled_event_request(
     :param attempt_cancelled_event_id: ``ATTEMPT_CANCELLED`` event id。
     :param dispatch_record: 目标 dispatch record。
     :param cancelling: 绑定的 ``RUN_CANCELLING`` event row。
-    :param cancel_request_event_id: 从 ``RUN_CANCELLING`` payload 读取的 cancel request id。
+    :param cancel_request_event_id: 来自 typed ``RunRow.cancel_request_event_id`` 的
+        ``CANCEL_REQUESTED`` event id；调用方已校验它引用同一 Run 的
+        ``CANCEL_REQUESTED``，不是从 ``RUN_CANCELLING`` payload 解析。
     :returns: EventLog append request。
     """
 
@@ -4425,7 +4475,9 @@ def _active_watchdog_cancelled_payload(
     :param attempt: 目标 Attempt row。
     :param dispatch_record: 目标 dispatch record。
     :param cancelling: 绑定的 ``RUN_CANCELLING`` event row。
-    :param cancel_request_event_id: 从 ``RUN_CANCELLING`` payload 读取的 cancel request id。
+    :param cancel_request_event_id: 来自 typed ``RunRow.cancel_request_event_id`` 的
+        ``CANCEL_REQUESTED`` event id；调用方已校验它引用同一 Run 的
+        ``CANCEL_REQUESTED``，不是从 ``RUN_CANCELLING`` payload 解析。
     :param attempt_cancelled_event_id: Run terminal 引用的 Attempt terminal event id；
         Attempt terminal payload 中为 ``None``。
     :returns: watchdog closeout cancelled payload。
@@ -6304,27 +6356,6 @@ def _validate_active_cancel_watchdog_closeout_input(
         request.last_accepted_event_id,
         field_name="last_accepted_event_id",
     )
-
-
-def _cancel_request_event_id_from_cancelling(event: EventLogRow | None) -> str | None:
-    """从 ``RUN_CANCELLING`` fact 中读取 cancel request event id。
-
-    :param event: 最新 ``RUN_CANCELLING`` EventLog row；缺失时为 ``None``。
-    :returns: cancel request event id；payload 缺失或非法时返回 ``None``。
-    """
-
-    if event is None:
-        return None
-    try:
-        value = json.loads(event.payload_json)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(value, Mapping):
-        return None
-    raw = value.get("cancel_request_event_id")
-    if not isinstance(raw, str) or raw.strip() == "":
-        return None
-    return raw
 
 
 def _validate_common_cancel_input(

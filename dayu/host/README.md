@@ -196,7 +196,7 @@ cancel_request = CancelRunRequest(
 cancelled = await host.cancel_run(active_run_id, cancel_request)
 ```
 
-`cancelled` 是取消 command commit 后的最新 `RunSnapshot`。对于 active Run，Host 会写入 durable cancelling / cancelled 事实，并通过 active worker registry 传播取消；Host 关闭 / 取消本地 Engine worker event stream，向 Engine 注入 cancellation token，并由 ToolRuntime 对可抢占工具执行边界执行取消 / 超时治理。每个 steer / cancel command 都必须使用自己的 `client_request_id` 作为幂等边界。
+`cancelled` 是取消 command commit 后的最新 `RunSnapshot`。对于 active Run，Host 会写入 durable cancelling / cancelled 事实，并通过 active worker registry 传播取消；Host 关闭 / 取消本地 Engine worker event stream，向 Engine 注入 cancellation token，并由 ToolRuntime 对可抢占工具执行边界执行取消 / 超时治理。进入取消生命周期的 Run 会在 durable Run row 上保存 typed `cancel_request_event_id`，active watchdog、Engine cooperative cancel、dispatch 与 recovery 都以该 typed link 回查同 Run 的 `CANCEL_REQUESTED`，不从 `RUN_CANCELLING` payload 解析关键链路。每个 steer / cancel command 都必须使用自己的 `client_request_id` 作为幂等边界。
 
 ## Wait callback completion
 
@@ -536,7 +536,7 @@ Host EventLog event class 包括：
 - `DIAGNOSTIC`：诊断、拒绝、provider protocol、closeout、projection 或 recovery 观察。
 - `PROJECTION_SIGNAL`：projection catch-up 与派生视图状态信号。
 
-Host terminal event kind 包括 `SUCCEEDED`、`FAILED`、`CANCELLED`、`LOST`。`HostEvent` 是 Service-facing typed view，携带 `event_id`、`event_sequence`、`session_id`、`run_id`、EventLog public `event_class` / `event_type`、`kind`、可选 `HostActivityView`、可选 `HostThinkingView`、dedupe key、terminal status、final answer 或错误 / cancel 摘要。progress event 不携带 terminal payload；succeeded terminal 必须携带 `HostFinalAnswerView`；failed / cancelled / lost terminal 不携带 final answer。`HostActivityView` 只承载 UI / Service 安全展示字段，工具 activity 的展示名来自 Host admission 冻结的 effective tool display snapshot，缺失时 fallback 稳定工具名；content / reasoning delta 不投影 raw delta activity，其中 reasoning delta 通过独立 `HostThinkingView` 暴露给 UI / Service。
+Host terminal event kind 包括 `SUCCEEDED`、`FAILED`、`CANCELLED`、`LOST`。`HostEvent` 是 Service-facing typed view，携带 `event_id`、`event_sequence`、`session_id`、`run_id`、EventLog public `event_class` / `event_type`、`kind`、可选 `HostActivityView`、可选 `HostThinkingView`、dedupe key、terminal status、final answer 或错误 / cancel 摘要。progress event 不携带 terminal payload；succeeded terminal 必须携带 `HostFinalAnswerView`；failed / cancelled / lost terminal 不携带 final answer。`RUN_LOST` 是 Host terminal / read API 的 `lost` 事实，但 public outbox terminal item 只覆盖 succeeded / failed / cancelled，不把 lost 伪装成可投递 terminal item。`HostActivityView` 只承载 UI / Service 安全展示字段，工具 activity 的展示名来自 Host admission 冻结的 effective tool display snapshot，缺失时 fallback 稳定工具名；content / reasoning delta 不投影 raw delta activity，其中 reasoning delta 通过独立 `HostThinkingView` 暴露给 UI / Service。
 
 EngineEvent ingest 与 HostEvent projection 是两条边界：
 
@@ -569,7 +569,7 @@ Admission 是所有 Run 输入的 durable 入口。它在事务内判断 Session
 
 - `ACCEPTED` / `QUEUED` Run 可直接写入 cancel request 与 `RUN_CANCELLED` terminal，并释放 queue promotion 资格。
 - pre-worker `STARTING` Attempt 可在 worker accept 前直接写入 Attempt / Run cancelled。
-- active `RUNNING` / `CANCELLING` Run 会写入 `RUN_CANCELLING`，commit 后通过 `ActiveWorkerRegistry` 传播 cancel；Host 注入 Engine 的 cancellation token 是主通道，`LocalWorkerHandle.on_cancel(reason)` 只是补充 hook。Host active cancel watchdog 是 accepted-cancel closeout supervisor，不提供 public post-cancel timeout budget；它可把仍未收口的 active Attempt / Run 关闭为 `CANCELLED`，并触发 queued promotion。该收口不表示底层 provider / tool 已被物理杀停。
+- active `RUNNING` / `CANCELLING` Run 会写入 `RUN_CANCELLING` 并在 Run row 保存 typed `cancel_request_event_id`，commit 后通过 `ActiveWorkerRegistry` 传播 cancel；Host 注入 Engine 的 cancellation token 是主通道，`LocalWorkerHandle.on_cancel(reason)` 只是补充 hook。Host active cancel watchdog 是 accepted-cancel closeout supervisor，不提供 public post-cancel timeout budget；它可把仍未收口的 active Attempt / Run 关闭为 `CANCELLED`，并触发 queued promotion。该收口不表示底层 provider / tool 已被物理杀停。
 - active worker event stream 在取消路径上会被关闭或取消，避免 Host 继续等待旧模型流自然结束；迟到 EngineEvent 进入 Host 前必须通过 identity 与状态校验，不匹配当前 durable state 时 fail closed 为 rejected / diagnostic。
 - Doc、Fins read 与 Web blocking 工具生产路径声明为 process-backed execution；取消或超时时，ToolRuntime 父进程治理返回 `tool_runtime_cancelled` / `tool_runtime_timeout` 类结果，并对进程边界执行 terminate / kill cleanup。子进程不得返回 `awaiting`、`cancelled`、`timeout` 或 `host_cancelled` 等 Host-governed 信封；迟到工具结果不能越过 Host accept barrier。
 - WAITING Run 取消只收口 Host durable wait / Run / Attempt 事实，不在 command transaction 内等待 provider I/O；外部 lifecycle 由 wait poller / adapter best-effort 处理，迟到 wait result 不会恢复旧 Attempt。

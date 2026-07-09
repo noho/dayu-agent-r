@@ -394,6 +394,46 @@ def test_run_terminal_shape_check_rejects_non_terminal_ref(
             store.transaction_runner.run_write(operation)
 
 
+@pytest.mark.parametrize("status", (RunStatus.CANCELLING, RunStatus.CANCELLED))
+def test_cancel_acceptance_status_requires_cancel_request_event_id(
+    tmp_path: Path,
+    status: RunStatus,
+) -> None:
+    """Run DDL CHECK 拒绝 cancelling / cancelled 缺 typed cancel link。
+
+    :param tmp_path: pytest 临时目录。
+    :param status: 待验证的 accepted cancel 状态。
+    :returns: ``None``。
+    :raises AssertionError: DDL CHECK 未拒绝非法形状时抛出。
+    """
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(transaction: HostTransaction) -> None:
+            """写入合法 Run 后清空 cancel_request_event_id 以触发 DDL CHECK。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            _insert_session_tx(transaction, session_id="session-cancel-link")
+            _insert_run_tx(
+                transaction,
+                run_id=f"run-{status.value}",
+                session_id="session-cancel-link",
+                status=status,
+                client_request_id=f"request-{status.value}",
+            )
+            transaction.execute(
+                f"UPDATE {TABLE_HOST_RUNS} SET cancel_request_event_id = NULL WHERE run_id = ?",
+                (f"run-{status.value}",),
+            )
+
+        with pytest.raises(HostDurableError, match="CHECK constraint"):
+            store.transaction_runner.run_write(operation)
+
+
 def test_attempt_terminal_shape_check_rejects_terminal_missing_ref(
     tmp_path: Path,
 ) -> None:
@@ -1117,6 +1157,7 @@ def _run_host_row(
                 "started_event_sequence",
                 "terminal_event_id",
                 "terminal_event_sequence",
+                "cancel_request_event_id",
                 "current_attempt_id",
                 "source_run_id",
                 "source_run_relation",
@@ -1144,6 +1185,7 @@ def _run_host_row(
                 None,
                 None,
                 None,
+                None,
                 "local-default",
                 "queue",
                 _TIMESTAMP,
@@ -1166,6 +1208,7 @@ def _run_host_row(
             "started_event_sequence",
             "terminal_event_id",
             "terminal_event_sequence",
+            "cancel_request_event_id",
             "current_attempt_id",
             "source_run_id",
             "source_run_relation",
@@ -1189,6 +1232,7 @@ def _run_host_row(
             3,
             terminal_event_id,
             terminal_event_sequence,
+            None,
             None,
             None,
             None,
@@ -1253,6 +1297,7 @@ def _insert_event_tx(
     *,
     event_id: str,
     session_id: str,
+    event_type: str = "TEST_EVENT",
     run_id: str | None = None,
     attempt_id: str | None = None,
     execution_id: str | None = None,
@@ -1262,6 +1307,7 @@ def _insert_event_tx(
     :param transaction: Host transaction。
     :param event_id: EventLog event id。
     :param session_id: 事件所属 Session。
+    :param event_type: EventLog event type。
     :param run_id: 事件所属 Run。
     :param attempt_id: 事件所属 Attempt。
     :param execution_id: execution id。
@@ -1300,7 +1346,7 @@ def _insert_event_tx(
             run_id,
             attempt_id,
             execution_id,
-            "TEST_EVENT",
+            event_type,
             _TIMESTAMP,
             None,
             None,
@@ -1511,6 +1557,7 @@ def _insert_run_tx(
     started_sequence: int | None = None
     terminal_event_id: str | None = None
     terminal_sequence: int | None = None
+    cancel_request_event_id: str | None = None
     terminal_at: str | None = None
     if status == RunStatus.QUEUED:
         queued_event_id = f"event-queued-{run_id}"
@@ -1537,6 +1584,15 @@ def _insert_run_tx(
             run_id=run_id,
         )
         terminal_at = _TIMESTAMP
+    if status in (RunStatus.CANCELLING, RunStatus.CANCELLED):
+        cancel_request_event_id = f"event-cancel-requested-{run_id}"
+        _insert_event_tx(
+            transaction,
+            event_id=cancel_request_event_id,
+            session_id=session_id,
+            event_type="CANCEL_REQUESTED",
+            run_id=run_id,
+        )
     transaction.execute(
         f"""
         INSERT INTO {TABLE_HOST_RUNS} (
@@ -1554,6 +1610,7 @@ def _insert_run_tx(
           started_event_sequence,
           terminal_event_id,
           terminal_event_sequence,
+          cancel_request_event_id,
           current_attempt_id,
           source_run_id,
           source_run_relation,
@@ -1562,7 +1619,7 @@ def _insert_run_tx(
           created_at,
           updated_at,
           terminal_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             run_id,
@@ -1579,6 +1636,7 @@ def _insert_run_tx(
             started_sequence,
             terminal_event_id,
             terminal_sequence,
+            cancel_request_event_id,
             None,
             None,
             None,

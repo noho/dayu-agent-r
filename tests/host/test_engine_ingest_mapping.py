@@ -1463,7 +1463,7 @@ def test_tool_awaiting_confirms_only_matching_host_accepted_wait_refs(
         assert payload["waiting_confirmation_accepted"] is True
         assert payload["waiting_confirmation_mismatch_reason"] is None
         assert payload["wait_id"] == accept_result.wait_id
-        assert _canonical_tool_event_count(store.transaction_runner) == 1
+        assert _canonical_tool_event_count(store.transaction_runner) == 2
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.WAITING
         assert attempt_status == AttemptStatus.SUSPENDED
@@ -1544,7 +1544,7 @@ def test_tool_awaiting_rejects_mismatched_engine_record_without_state_change(
         assert payload["waiting_confirmation_accepted"] is False
         assert payload["waiting_confirmation_mismatch_reason"] == "awaiting_spec_mismatch"
         assert payload["wait_id"] == accept_result.wait_id
-        assert _canonical_tool_event_count(store.transaction_runner) == 1
+        assert _canonical_tool_event_count(store.transaction_runner) == 2
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.WAITING
         assert attempt_status == AttemptStatus.SUSPENDED
@@ -1585,7 +1585,7 @@ def test_waiting_confirmation_wrong_attempt_identity_is_rejected(
         assert result.status == EngineIngestStatus.REJECTED
         assert result.reason == "stale_execution_id"
         assert _payload(result.events[0])["reason"] == "stale_execution_id"
-        assert _canonical_tool_event_count(store.transaction_runner) == 1
+        assert _canonical_tool_event_count(store.transaction_runner) == 2
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.WAITING
         assert attempt_status == AttemptStatus.SUSPENDED
@@ -1626,7 +1626,7 @@ def test_waiting_confirmation_wrong_execution_identity_is_rejected(
         assert result.status == EngineIngestStatus.REJECTED
         assert result.reason == "stale_execution_id"
         assert _event_count(store.transaction_runner, "ENGINE_EVENT_REJECTED") == 1
-        assert _canonical_tool_event_count(store.transaction_runner) == 1
+        assert _canonical_tool_event_count(store.transaction_runner) == 2
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.WAITING
         assert attempt_status == AttemptStatus.SUSPENDED
@@ -1667,7 +1667,7 @@ def test_old_attempt_late_waiting_confirmation_is_rejected_after_resolve(
         assert result.status == EngineIngestStatus.REJECTED
         assert result.reason == "stale_execution_id"
         assert _payload(result.events[0])["reason"] == "stale_execution_id"
-        assert _canonical_tool_event_count(store.transaction_runner) == 2
+        assert _canonical_tool_event_count(store.transaction_runner) == 3
 
 
 def test_usage_reported_is_projection_signal_without_state_change(
@@ -2415,20 +2415,21 @@ def test_run_cancelled_without_active_cancel_is_rejected(tmp_path: Path) -> None
 
         assert result.status == EngineIngestStatus.REJECTED
         assert _payload(result.events[0])["reason"] == (
-            "run_cancelled_without_active_cancel"
+            "run_cancelled_invalid_active_cancel_link"
         )
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
         assert attempt_status == AttemptStatus.RUNNING
 
 
-def test_run_cancelled_with_malformed_active_cancel_payload_is_rejected(
+def test_run_cancelled_with_malformed_active_cancel_payload_uses_typed_link(
     tmp_path: Path,
 ) -> None:
-    """RUN_CANCELLING payload 缺少 request id 时返回 rejected diagnostic。"""
+    """RUN_CANCELLING payload 缺少 request id 时仍使用 typed row link。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
+        store.transaction_runner.run_write(_RequestActiveCancelOperation(seeded))
         store.transaction_runner.run_write(
             _AppendMalformedRunCancellingOperation(seeded)
         )
@@ -2448,13 +2449,12 @@ def test_run_cancelled_with_malformed_active_cancel_payload_is_rejected(
             transaction_runner=store.transaction_runner
         ).ingest(candidate)
 
-        assert result.status == EngineIngestStatus.REJECTED
-        assert _payload(result.events[0])["reason"] == (
-            "run_cancelled_invalid_active_cancel_payload"
-        )
+        assert result.status == EngineIngestStatus.ACCEPTED
+        assert result.terminal_closeout is True
+        assert _event_count(store.transaction_runner, "RUN_CANCELLED") == 1
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
-        assert run_status == RunStatus.RUNNING
-        assert attempt_status == AttemptStatus.RUNNING
+        assert run_status == RunStatus.CANCELLED
+        assert attempt_status == AttemptStatus.CANCELLED
 
 
 def test_late_worker_terminal_after_timeout_is_rejected_as_terminal_closed(

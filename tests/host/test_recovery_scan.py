@@ -639,7 +639,7 @@ def test_scan_cancelling_positive_orphan_loses_attempt_then_run(
 
     with open_host_durable_store(_options(tmp_path)) as store:
         _seed_running_dispatching_run(store.transaction_runner, "run-1")
-        _mark_run_status(store.transaction_runner, "run-1", RunStatus.CANCELLING)
+        _append_accepted_cancel_facts(store.transaction_runner, "run-1")
 
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
@@ -691,7 +691,6 @@ def test_scan_defers_accepted_cancel_cancelling_to_watchdog_when_enabled(
 
     with open_host_durable_store(_options(tmp_path)) as store:
         _seed_running_dispatching_run(store.transaction_runner, "run-1")
-        _mark_run_status(store.transaction_runner, "run-1", RunStatus.CANCELLING)
         _append_accepted_cancel_facts(store.transaction_runner, "run-1")
 
         result = StartupRecoveryScanner(
@@ -711,14 +710,13 @@ def test_scan_defers_accepted_cancel_cancelling_to_watchdog_when_enabled(
         assert _event_type_count(store.transaction_runner, _EVENT_TYPE_RUN_LOST) == 0
 
 
-def test_scan_malformed_cancelling_payload_uses_orphan_policy(
+def test_scan_malformed_cancelling_payload_uses_typed_cancel_link(
     tmp_path: Path,
 ) -> None:
-    """malformed RUN_CANCELLING payload 不应中断 startup recovery scan。"""
+    """malformed RUN_CANCELLING payload 不影响 typed cancel link 判断。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         _seed_running_dispatching_run(store.transaction_runner, "run-1")
-        _mark_run_status(store.transaction_runner, "run-1", RunStatus.CANCELLING)
         _append_malformed_run_cancelling_payload(store.transaction_runner, "run-1")
 
         result = StartupRecoveryScanner(
@@ -729,13 +727,13 @@ def test_scan_malformed_cancelling_payload_uses_orphan_policy(
         ).scan(_policy())
 
         assert tuple(action.decision for action in result.actions) == (
-            StartupRecoveryDecision.RUN_LOST,
+            StartupRecoveryDecision.DEFERRED_TO_ACTIVE_CANCEL_WATCHDOG,
         )
         assert tuple(action.reason for action in result.actions) == (
-            _REASON_CANCEL_IN_FLIGHT_ATTEMPT_LOST,
+            "accepted_cancel_watchdog_owner",
         )
-        assert _run_status(store.transaction_runner, "run-1") == RunStatus.LOST.value
-        assert _event_type_count(store.transaction_runner, _EVENT_TYPE_RUN_LOST) == 1
+        assert _run_status(store.transaction_runner, "run-1") == RunStatus.CANCELLING.value
+        assert _event_type_count(store.transaction_runner, _EVENT_TYPE_RUN_LOST) == 0
 
 
 def test_scan_watchdog_disabled_keeps_cancelling_orphan_policy(
@@ -745,7 +743,6 @@ def test_scan_watchdog_disabled_keeps_cancelling_orphan_policy(
 
     with open_host_durable_store(_options(tmp_path)) as store:
         _seed_running_dispatching_run(store.transaction_runner, "run-1")
-        _mark_run_status(store.transaction_runner, "run-1", RunStatus.CANCELLING)
         _append_accepted_cancel_facts(store.transaction_runner, "run-1")
 
         result = StartupRecoveryScanner(
@@ -1499,6 +1496,15 @@ def _append_accepted_cancel_facts(
                 },
             ),
         )
+        transaction.execute(
+            "UPDATE host_runs SET status = ?, cancel_request_event_id = ?, updated_at = ? WHERE run_id = ?",
+            (
+                RunStatus.CANCELLING.value,
+                cancel_requested_id,
+                "2026-05-19T03:04:00.000000Z",
+                run_id,
+            ),
+        )
         event_log_store.append_event(
             transaction,
             _event(
@@ -1541,7 +1547,22 @@ def _append_malformed_run_cancelling_payload(
         )
         assert session_row is not None
         session_id = _required_text(session_row, "session_id")
+        cancel_requested_id = f"event-cancel-requested-malformed-{run_id}"
         event_log_store = EventLogStore()
+        event_log_store.append_event(
+            transaction,
+            _event(
+                event_id=cancel_requested_id,
+                session_id=session_id,
+                run_id=run_id,
+                event_type=_EVENT_TYPE_CANCEL_REQUESTED,
+                payload={
+                    "run_id": run_id,
+                    "reason": "user_stop",
+                    "mode": "graceful",
+                },
+            ),
+        )
         event_log_store.append_event(
             transaction,
             EventLogAppendRequest(
@@ -1562,6 +1583,15 @@ def _append_malformed_run_cancelling_payload(
                 payload_json="malformed-cancelling-payload",
                 payload_ref=None,
                 payload_digest=None,
+            ),
+        )
+        transaction.execute(
+            "UPDATE host_runs SET status = ?, cancel_request_event_id = ?, updated_at = ? WHERE run_id = ?",
+            (
+                RunStatus.CANCELLING.value,
+                cancel_requested_id,
+                "2026-05-19T03:04:00.000000Z",
+                run_id,
             ),
         )
 

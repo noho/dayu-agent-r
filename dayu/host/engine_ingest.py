@@ -158,9 +158,9 @@ from dayu.host.durable.run_transition import (
     active_cancel_closeout_in_transaction,
     close_attempt_for_context_recovery_in_transaction,
     fail_recovering_run_in_transaction,
+    read_cancel_requested_event_from_run_link,
     start_recovery_run_with_starting_attempt_in_transaction,
     terminal_closeout_in_transaction,
-    _cancel_request_event_id_from_cancelling,
 )
 from dayu.host.durable.schema import (
     RUNNER_CALL_INPUT_MANIFEST_DESCRIPTOR_KIND,
@@ -233,7 +233,6 @@ _EVENT_TYPE_ATTEMPT_CANCELLED = "ATTEMPT_CANCELLED"
 _EVENT_TYPE_RUN_CANCELLED = "RUN_CANCELLED"
 _EVENT_TYPE_ATTEMPT_LOST = "ATTEMPT_LOST"
 _EVENT_TYPE_RUN_LOST = "RUN_LOST"
-_EVENT_TYPE_RUN_CANCELLING = "RUN_CANCELLING"
 _EVENT_TYPE_RUN_RECOVERING = "RUN_RECOVERING"
 _EVENT_TYPE_TOOL_AWAITING = "TOOL_AWAITING"
 _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED = "RUNNER_CALL_INPUT_ASSEMBLED"
@@ -256,7 +255,7 @@ _REASON_WAITING_EVENT_WITHOUT_HOST_ACCEPTED_REFS = (
     "waiting_event_without_host_accepted_refs"
 )
 _REASON_RUN_CANCELLED_INVALID_ACTIVE_CANCEL_PAYLOAD = (
-    "run_cancelled_invalid_active_cancel_payload"
+    "run_cancelled_invalid_active_cancel_link"
 )
 _REASON_CONTEXT_COMPACTION_REQUIRED = "context_compaction_required"
 _REASON_CONTEXT_COMPACTION_RECOVERY_FAILED = "context_compaction_recovery_failed"
@@ -1185,19 +1184,12 @@ class EngineEventIngestor:
                 promotion_triggered=False,
                 reason=data.reason,
             )
-        cancelling = self._event_log_store.read_latest_run_event_by_type(
+        cancel_requested = read_cancel_requested_event_from_run_link(
             transaction,
-            run_id=context.run.run_id,
-            event_type=_EVENT_TYPE_RUN_CANCELLING,
+            self._event_log_store,
+            context.run,
         )
-        if cancelling is None:
-            return self._append_rejected_diagnostic(
-                transaction,
-                candidate=candidate,
-                reason="run_cancelled_without_active_cancel",
-            )
-        cancel_request_event_id = _cancel_request_event_id_from_cancelling(cancelling)
-        if cancel_request_event_id is None:
+        if cancel_requested is None:
             return self._append_rejected_diagnostic(
                 transaction,
                 candidate=candidate,
@@ -1215,7 +1207,7 @@ class EngineEventIngestor:
                 actor=_EVENT_ACTOR,
                 source=_EVENT_SOURCE,
                 reason=data.reason,
-                cancel_request_event_id=cancel_request_event_id,
+                cancel_request_event_id=cancel_requested.event_id,
                 engine_event_ref=_engine_event_ref(candidate),
                 requested_at=format_utc_timestamp(data.requested_at),
                 accepted_at=format_utc_timestamp(data.accepted_at),

@@ -34,6 +34,10 @@ from dayu.host.durable.schema import (
     TABLE_HOST_OUTBOX_TERMINAL_ITEMS,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction
+from dayu.host.lifecycle_events import (
+    PUBLIC_OUTBOX_TERMINAL_EVENT_TYPES,
+    event_type_values,
+)
 
 OUTBOX_TERMINAL_READ_MAX_LIMIT = 500
 """Outbox terminal read / drain 单次返回 item 数上限。"""
@@ -45,10 +49,6 @@ _MIN_EVENT_CURSOR = 0
 _MIN_EVENT_SEQUENCE = 1
 _MIN_LIMIT = 1
 _EVENT_CLASS_CANONICAL_FACT = "canonical_fact"
-_EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
-_EVENT_TYPE_RUN_FAILED = "RUN_FAILED"
-_EVENT_TYPE_RUN_CANCELLED = "RUN_CANCELLED"
-_EVENT_TYPE_RUN_LOST = "RUN_LOST"
 _TERMINAL_STATUS_SUCCEEDED = "succeeded"
 _TERMINAL_STATUS_FAILED = "failed"
 _TERMINAL_STATUS_CANCELLED = "cancelled"
@@ -68,11 +68,8 @@ _TERMINAL_STATUSES = frozenset(
     )
 )
 _ITEM_STATES = frozenset((_ITEM_STATE_PENDING, _ITEM_STATE_DRAINED))
-_TERMINAL_EVENT_TYPES = (
-    _EVENT_TYPE_RUN_SUCCEEDED,
-    _EVENT_TYPE_RUN_FAILED,
-    _EVENT_TYPE_RUN_CANCELLED,
-    _EVENT_TYPE_RUN_LOST,
+_PUBLIC_TERMINAL_EVENT_TYPE_VALUES = event_type_values(
+    PUBLIC_OUTBOX_TERMINAL_EVENT_TYPES
 )
 
 
@@ -747,9 +744,9 @@ def _latest_outbox_terminal_event_sequence(transaction: HostTransaction) -> int:
         SELECT COALESCE(MAX(event_sequence), 0) AS latest
         FROM {TABLE_EVENT_LOG}
         WHERE event_class = ?
-          AND event_type IN (?, ?, ?, ?)
+          AND event_type IN (?, ?, ?)
         """,
-        (_EVENT_CLASS_CANONICAL_FACT, *_TERMINAL_EVENT_TYPES),
+        (_EVENT_CLASS_CANONICAL_FACT, *_PUBLIC_TERMINAL_EVENT_TYPE_VALUES),
     )
     if row is None:
         return 0

@@ -69,6 +69,7 @@ from dayu.host.durable.run_transition import (
     TerminalCloseoutInput,
     active_cancel_watchdog_closeout_in_transaction,
     fail_unstarted_run_in_transaction,
+    read_cancel_requested_event_from_run_link,
     start_governed_run_with_starting_attempt_in_transaction,
     terminal_closeout_in_transaction,
 )
@@ -219,8 +220,6 @@ from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 _EVENT_SOURCE = "host.dispatch"
 _EVENT_ACTOR = "host.dispatch"
 _EVENT_TYPE_ATTEMPT_RUNNING = "ATTEMPT_RUNNING"
-_EVENT_TYPE_CANCEL_REQUESTED = "CANCEL_REQUESTED"
-_EVENT_TYPE_RUN_CANCELLING = "RUN_CANCELLING"
 _WORKER_ACCEPT_REASON = "local_worker_accepted"
 _ACTIVE_CANCEL_WATCHDOG_ACTOR = "host.active_cancel_watchdog"
 _ACTIVE_CANCEL_WATCHDOG_SOURCE = "host.dispatch"
@@ -4089,7 +4088,7 @@ def _active_cancel_watchdog_candidate_from_run(
     cancel_requested = _read_linked_cancel_requested_event(
         transaction,
         event_log_store,
-        run.run_id,
+        run,
     )
     if cancel_requested is None:
         return None
@@ -4122,46 +4121,17 @@ def _dispatch_record_has_worker_accept(
 def _read_linked_cancel_requested_event(
     transaction: HostTransaction,
     event_log_store: EventLogStore,
-    run_id: str,
+    run: RunRow,
 ) -> EventLogRow | None:
-    """读取 ``RUN_CANCELLING`` 链接的 ``CANCEL_REQUESTED`` fact。
+    """读取 Run row typed cancel link 指向的 ``CANCEL_REQUESTED`` fact。
 
     :param transaction: Host transaction。
     :param event_log_store: EventLog primitive。
-    :param run_id: 目标 Run id。
-    :returns: 同 Run 的 ``CANCEL_REQUESTED`` event；缺失或 payload 非法时返回
-        ``None``。
+    :param run: 目标 Run row。
+    :returns: 同 Run 的 ``CANCEL_REQUESTED`` event；缺失或 link 无效时返回 ``None``。
     """
 
-    cancelling = event_log_store.read_latest_run_event_by_type(
-        transaction,
-        run_id=run_id,
-        event_type=_EVENT_TYPE_RUN_CANCELLING,
-    )
-    if cancelling is None:
-        return None
-    try:
-        payload = event_payload_object(
-            transaction,
-            cancelling,
-            payload_label=_EVENT_TYPE_RUN_CANCELLING,
-        )
-    except HostDurableError:
-        return None
-    raw_cancel_request_event_id = payload.get("cancel_request_event_id")
-    if not isinstance(raw_cancel_request_event_id, str):
-        return None
-    cancel_requested = event_log_store.read_event_by_id(
-        transaction,
-        raw_cancel_request_event_id,
-    )
-    if (
-        cancel_requested is None
-        or cancel_requested.run_id != run_id
-        or cancel_requested.event_type != _EVENT_TYPE_CANCEL_REQUESTED
-    ):
-        return None
-    return cancel_requested
+    return read_cancel_requested_event_from_run_link(transaction, event_log_store, run)
 
 
 def _read_startable_run(transaction: HostTransaction, session_id: str) -> RunRow | None:

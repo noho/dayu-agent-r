@@ -31,7 +31,7 @@ from dayu.host.api import (
 )
 from dayu.host.durable.errors import HostSchemaMismatchError
 
-HOST_SCHEMA_VERSION = 20
+HOST_SCHEMA_VERSION = 21
 """当前 Host durable SQLite schema version。"""
 
 TABLE_EVENT_LOG = "event_log"
@@ -481,6 +481,7 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_RUNS} (
   started_event_sequence INTEGER NULL,
   terminal_event_id TEXT NULL,
   terminal_event_sequence INTEGER NULL,
+  cancel_request_event_id TEXT NULL,
   current_attempt_id TEXT NULL,
   source_run_id TEXT NULL,
   source_run_relation TEXT NULL CHECK (
@@ -502,6 +503,7 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_RUNS} (
   FOREIGN KEY(started_event_sequence) REFERENCES {TABLE_EVENT_LOG}(event_sequence),
   FOREIGN KEY(terminal_event_id) REFERENCES {TABLE_EVENT_LOG}(event_id),
   FOREIGN KEY(terminal_event_sequence) REFERENCES {TABLE_EVENT_LOG}(event_sequence),
+  FOREIGN KEY(cancel_request_event_id) REFERENCES {TABLE_EVENT_LOG}(event_id),
   FOREIGN KEY(source_run_id) REFERENCES {TABLE_HOST_RUNS}(run_id),
   CHECK (
     status != 'accepted'
@@ -530,6 +532,11 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_RUNS} (
   ),
   CHECK (
     {_HOST_RUN_TERMINAL_REFS_UNSET_CHECK_SQL}
+  ),
+  CHECK (
+    status NOT IN ('cancelling', 'cancelled')
+    OR
+    cancel_request_event_id IS NOT NULL
   ),
   CHECK (
     (source_run_id IS NULL AND source_run_relation IS NULL)

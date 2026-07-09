@@ -2949,6 +2949,7 @@ def _run_row(input_event: EventLogRow) -> RunRow:
         started_event_sequence=None,
         terminal_event_id=None,
         terminal_event_sequence=None,
+        cancel_request_event_id=None,
         current_attempt_id=None,
         source_run_id=None,
         source_run_relation=None,

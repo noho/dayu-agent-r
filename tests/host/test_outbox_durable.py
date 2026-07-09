@@ -335,6 +335,50 @@ def test_projection_state_ignores_non_terminal_eventlog_tail(
         assert state.status is OutboxTerminalProjectionStatus.CAUGHT_UP
 
 
+def test_projection_state_ignores_run_lost_eventlog_tail(
+    tmp_path: Path,
+) -> None:
+    """checkpoint 追上 public terminal 后，后续 RUN_LOST 不应报告 outbox lag。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        terminal = _append_event(
+            store.transaction_runner,
+            event_id="event-terminal-public",
+            run_id="run-1",
+            payload={
+                "terminal_summary_ref": "summary-event-terminal-public",
+                "terminal_summary_digest": _SUMMARY_DIGEST,
+            },
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: advance_projection_checkpoint(
+                transaction,
+                OUTBOX_TERMINAL_CONSUMER_ID.value,
+                event_sequence=terminal.event_sequence,
+                event_id=terminal.event_id,
+                now=_NOW_TEXT,
+            )
+        )
+        _append_event(
+            store.transaction_runner,
+            event_id="event-run-lost-tail",
+            run_id="run-lost",
+            payload={"reason": "startup_orphan_attempt_lost"},
+            event_type="RUN_LOST",
+        )
+
+        state = store.transaction_runner.run_read(
+            lambda transaction: read_outbox_terminal_projection_state(
+                transaction,
+                OUTBOX_TERMINAL_CONSUMER_ID.value,
+                catchup_error=None,
+            )
+        )
+
+        assert state.checkpoint_event_sequence == terminal.event_sequence
+        assert state.status is OutboxTerminalProjectionStatus.CAUGHT_UP
+
+
 def test_drain_pending_cas_prevents_second_request_metadata_overwrite(
     tmp_path: Path,
 ) -> None:

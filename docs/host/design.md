@@ -636,6 +636,12 @@ Engine final answer / failure ingest、Tool awaiting、`resolve_wait`、steer、
 | recovery scan | Run `RUNNING` / `CANCELLING` 且 active Attempt 不可确认 | Run `RECOVERING` 或 `LOST` | `ATTEMPT_LOST`、`RUN_RECOVERING` 或 `RUN_LOST` | 不 takeover |
 | recovery dispatch | Run `RECOVERING` 且可重建 messages | Run `RUNNING` / Attempt `STARTING` | `RUN_STARTED(start_reason=recovery)`、`ATTEMPT_STARTED` | 创建新 Attempt；commit 后 dispatch |
 
+Host terminal / lifecycle event set 是 Run 生命周期的 canonical fact 集合。`RUN_SUCCEEDED`、`RUN_FAILED`、`RUN_CANCELLED` 与 `RUN_LOST` 都是 Host Run terminal canonical facts；其中 `RUN_LOST` 表达 recovery、worker lifecycle 或 waiting-result positive proof 得到的 lost terminal，不是用户 cancel，也不是 failure 的展示别名。Read Model、Read API 与 public HostEvent 必须能把 `RUN_LOST` 投影为 `lost` terminal。
+
+Public outbox terminal item set 只包含 `RUN_SUCCEEDED`、`RUN_FAILED` 与 `RUN_CANCELLED`。Outbox 是 public delivery work queue，不拥有 Run terminal truth，不得把 `RUN_LOST` 伪装成 success、failure 或 cancel 的 public terminal item。`RUN_LOST` 仍保留在 EventLog / Run row / read model 中作为 Host terminal truth，但不要求存在 public outbox item。
+
+Non-public terminal fact skip / diagnostic behavior 必须显式且可审计。Outbox consumer 遇到 `RUN_LOST` 时只能记录 skip / diagnostic，不能创建 public terminal item；public outbox watermark、latest item cursor 与 lag 判断只能以 public outbox terminal item event set 为准，不能把 `RUN_LOST` 当成必须投递的 item 候选。
+
 `RUN_STARTED` 表示 Run 进入 active Attempt lifecycle。它必须携带 `start_reason`，第一版枚举为 `initial`、`queue_promotion`、`resume`、`steer`、`recovery`。`start_reason=recovery` 覆盖 crash recovery 和 reactive context compaction recovery；具体原因通过关联的 `ATTEMPT_LOST`、`CONTEXT_COMPACTION_REQUESTED` 或 policy refs 区分。不得用新增的 `RUN_RESUMED` / `RUN_RECOVERED` event 表达同一治理事实。
 
 `RECOVERING` 的退出必须收敛：

@@ -267,6 +267,7 @@ class RunRow:
     started_event_sequence: int | None
     terminal_event_id: str | None
     terminal_event_sequence: int | None
+    cancel_request_event_id: str | None
     current_attempt_id: str | None
     source_run_id: str | None
     source_run_relation: SourceRunRelation | None
@@ -1124,6 +1125,9 @@ def run_row_from_host_row(row: HostRow) -> RunRow:
         started_event_sequence=_decode_optional_int(row, row_name=row_name, column="started_event_sequence"),
         terminal_event_id=terminal_event_id,
         terminal_event_sequence=terminal_event_sequence,
+        cancel_request_event_id=_decode_optional_text(
+            row, row_name=row_name, column="cancel_request_event_id"
+        ),
         current_attempt_id=_decode_optional_text(row, row_name=row_name, column="current_attempt_id"),
         source_run_id=_decode_optional_text(row, row_name=row_name, column="source_run_id"),
         source_run_relation=source_run_relation,
@@ -1531,6 +1535,7 @@ def read_run_by_id(transaction: HostTransaction, run_id: str) -> RunRow | None:
           started_event_sequence,
           terminal_event_id,
           terminal_event_sequence,
+          cancel_request_event_id,
           current_attempt_id,
           source_run_id,
           source_run_relation,
@@ -1577,6 +1582,7 @@ def read_active_run_for_session(transaction: HostTransaction, session_id: str) -
           started_event_sequence,
           terminal_event_id,
           terminal_event_sequence,
+          cancel_request_event_id,
           current_attempt_id,
           source_run_id,
           source_run_relation,
@@ -1632,6 +1638,7 @@ def read_accepted_run_for_session(transaction: HostTransaction, session_id: str)
           started_event_sequence,
           terminal_event_id,
           terminal_event_sequence,
+          cancel_request_event_id,
           current_attempt_id,
           source_run_id,
           source_run_relation,
@@ -1680,6 +1687,7 @@ def read_earliest_queued_run(transaction: HostTransaction, session_id: str) -> R
           started_event_sequence,
           terminal_event_id,
           terminal_event_sequence,
+          cancel_request_event_id,
           current_attempt_id,
           source_run_id,
           source_run_relation,
@@ -1728,6 +1736,7 @@ def read_non_terminal_runs_for_session(transaction: HostTransaction, session_id:
           started_event_sequence,
           terminal_event_id,
           terminal_event_sequence,
+          cancel_request_event_id,
           current_attempt_id,
           source_run_id,
           source_run_relation,
@@ -1780,6 +1789,7 @@ def read_non_terminal_runs(transaction: HostTransaction) -> tuple[RunRow, ...]:
           started_event_sequence,
           terminal_event_id,
           terminal_event_sequence,
+          cancel_request_event_id,
           current_attempt_id,
           source_run_id,
           source_run_relation,
@@ -1830,6 +1840,7 @@ def read_cancelling_runs(transaction: HostTransaction) -> tuple[RunRow, ...]:
           started_event_sequence,
           terminal_event_id,
           terminal_event_sequence,
+          cancel_request_event_id,
           current_attempt_id,
           source_run_id,
           source_run_relation,
@@ -2556,6 +2567,7 @@ def insert_run(transaction: HostTransaction, run: RunRow) -> None:
           started_event_sequence,
           terminal_event_id,
           terminal_event_sequence,
+          cancel_request_event_id,
           current_attempt_id,
           source_run_id,
           source_run_relation,
@@ -2564,7 +2576,7 @@ def insert_run(transaction: HostTransaction, run: RunRow) -> None:
           created_at,
           updated_at,
           terminal_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             run.run_id,
@@ -2581,6 +2593,7 @@ def insert_run(transaction: HostTransaction, run: RunRow) -> None:
             run.started_event_sequence,
             run.terminal_event_id,
             run.terminal_event_sequence,
+            run.cancel_request_event_id,
             run.current_attempt_id,
             run.source_run_id,
             _optional_source_run_relation_text(run.source_run_relation),
@@ -3251,6 +3264,7 @@ def terminal_unstarted_run_row(
     terminal_status: RunStatus,
     terminal_event_id: str,
     terminal_event_sequence: int,
+    cancel_request_event_id: str | None,
     terminal_at: str,
 ) -> RunMutationResult:
     """CAS 将未创建 Attempt 的 Run 收口到终态。
@@ -3261,6 +3275,8 @@ def terminal_unstarted_run_row(
     :param terminal_status: 目标终态，只允许 failed 或 cancelled。
     :param terminal_event_id: terminal 事件 id。
     :param terminal_event_sequence: terminal 事件全局序号。
+    :param cancel_request_event_id: cancelled 终态对应的 ``CANCEL_REQUESTED`` event id；
+        failed 终态必须为 ``None``。
     :param terminal_at: 固定 UTC terminal timestamp 文本。
     :returns: Run mutation 结果。
     :raises HostDurableError: 输入字段无效时抛出。
@@ -3276,6 +3292,10 @@ def terminal_unstarted_run_row(
         terminal_event_sequence=terminal_event_sequence,
         terminal_at=terminal_at,
     )
+    _validate_terminal_cancel_request_link(
+        terminal_status=terminal_status,
+        cancel_request_event_id=cancel_request_event_id,
+    )
     result = transaction.execute(
         f"""
         UPDATE {TABLE_HOST_RUNS}
@@ -3283,6 +3303,7 @@ def terminal_unstarted_run_row(
           status = ?,
           terminal_event_id = ?,
           terminal_event_sequence = ?,
+          cancel_request_event_id = ?,
           updated_at = ?,
           terminal_at = ?
         WHERE run_id = ?
@@ -3296,6 +3317,7 @@ def terminal_unstarted_run_row(
             serialize_run_status(terminal_status),
             terminal_event_id,
             terminal_event_sequence,
+            cancel_request_event_id,
             terminal_at,
             terminal_at,
             run_id,
@@ -3317,6 +3339,7 @@ def cancel_queued_run_row(
     run_id: str,
     terminal_event_id: str,
     terminal_event_sequence: int,
+    cancel_request_event_id: str,
     terminal_at: str,
 ) -> RunMutationResult:
     """CAS 取消 queued Run。
@@ -3325,6 +3348,7 @@ def cancel_queued_run_row(
     :param run_id: 目标 Run id。
     :param terminal_event_id: ``RUN_CANCELLED`` 事件 id。
     :param terminal_event_sequence: ``RUN_CANCELLED`` 全局事件序号。
+    :param cancel_request_event_id: 对应 ``CANCEL_REQUESTED`` event id。
     :param terminal_at: 固定 UTC terminal timestamp 文本。
     :returns: Run mutation 结果，区分 updated/cas_lost/not_found/invalid_state。
     :raises HostDurableError: 输入字段无效时抛出。
@@ -3337,6 +3361,9 @@ def cancel_queued_run_row(
         terminal_event_sequence=terminal_event_sequence,
         terminal_at=terminal_at,
     )
+    _require_non_empty_text(
+        cancel_request_event_id, field_name="cancel_request_event_id"
+    )
     result = transaction.execute(
         f"""
         UPDATE {TABLE_HOST_RUNS}
@@ -3344,6 +3371,7 @@ def cancel_queued_run_row(
           status = ?,
           terminal_event_id = ?,
           terminal_event_sequence = ?,
+          cancel_request_event_id = ?,
           updated_at = ?,
           terminal_at = ?
         WHERE run_id = ?
@@ -3354,6 +3382,7 @@ def cancel_queued_run_row(
             serialize_run_status(RunStatus.CANCELLED),
             terminal_event_id,
             terminal_event_sequence,
+            cancel_request_event_id,
             terminal_at,
             terminal_at,
             run_id,
@@ -3376,6 +3405,7 @@ def cancel_running_run_row(
     current_attempt_id: str,
     terminal_event_id: str,
     terminal_event_sequence: int,
+    cancel_request_event_id: str,
     terminal_at: str,
 ) -> RunMutationResult:
     """CAS 取消 pre-dispatch running Run。
@@ -3385,6 +3415,7 @@ def cancel_running_run_row(
     :param current_attempt_id: 期望的 current Attempt id。
     :param terminal_event_id: ``RUN_CANCELLED`` 事件 id。
     :param terminal_event_sequence: ``RUN_CANCELLED`` 全局事件序号。
+    :param cancel_request_event_id: 对应 ``CANCEL_REQUESTED`` event id。
     :param terminal_at: 固定 UTC terminal timestamp 文本。
     :returns: Run mutation 结果，区分 updated/cas_lost/not_found/invalid_state。
     :raises HostDurableError: 输入字段无效时抛出。
@@ -3398,6 +3429,9 @@ def cancel_running_run_row(
         terminal_at=terminal_at,
     )
     _require_non_empty_text(current_attempt_id, field_name="current_attempt_id")
+    _require_non_empty_text(
+        cancel_request_event_id, field_name="cancel_request_event_id"
+    )
     result = transaction.execute(
         f"""
         UPDATE {TABLE_HOST_RUNS}
@@ -3405,6 +3439,7 @@ def cancel_running_run_row(
           status = ?,
           terminal_event_id = ?,
           terminal_event_sequence = ?,
+          cancel_request_event_id = ?,
           updated_at = ?,
           terminal_at = ?
         WHERE run_id = ?
@@ -3416,6 +3451,7 @@ def cancel_running_run_row(
             serialize_run_status(RunStatus.CANCELLED),
             terminal_event_id,
             terminal_event_sequence,
+            cancel_request_event_id,
             terminal_at,
             terminal_at,
             run_id,
@@ -3442,6 +3478,10 @@ def cancel_cancelling_run_row(
     terminal_at: str,
 ) -> RunMutationResult:
     """CAS 将 active cancelling Run 收口为 cancelled。
+
+    ``cancel_request_event_id`` 在 Run 进入 ``CANCELLING`` 时已经固定；
+    schema 保证 ``CANCELLING`` row 必须持有该 typed cancel link。本 mutator
+    只写入 terminal refs 与 ``CANCELLED`` 状态，保留原有 cancel link。
 
     :param transaction: 调用方提供的 Host transaction。
     :param run_id: 目标 Run id。
@@ -3500,6 +3540,7 @@ def mark_run_cancelling_row(
     *,
     run_id: str,
     current_attempt_id: str,
+    cancel_request_event_id: str,
     updated_at: str,
 ) -> RunMutationResult:
     """CAS 将 active running Run 标记为 cancelling。
@@ -3507,6 +3548,7 @@ def mark_run_cancelling_row(
     :param transaction: 调用方提供的 Host transaction。
     :param run_id: 目标 Run id。
     :param current_attempt_id: 期望的 current Attempt id。
+    :param cancel_request_event_id: 对应 ``CANCEL_REQUESTED`` event id。
     :param updated_at: 固定 UTC timestamp 文本。
     :returns: Run mutation 结果，区分 updated/cas_lost/not_found/invalid_state。
     :raises HostDurableError: 输入字段无效时抛出。
@@ -3515,12 +3557,16 @@ def mark_run_cancelling_row(
 
     _require_non_empty_text(run_id, field_name="run_id")
     _require_non_empty_text(current_attempt_id, field_name="current_attempt_id")
+    _require_non_empty_text(
+        cancel_request_event_id, field_name="cancel_request_event_id"
+    )
     _require_non_empty_text(updated_at, field_name="updated_at")
     result = transaction.execute(
         f"""
         UPDATE {TABLE_HOST_RUNS}
         SET
           status = ?,
+          cancel_request_event_id = ?,
           updated_at = ?
         WHERE run_id = ?
           AND status = ?
@@ -3529,6 +3575,7 @@ def mark_run_cancelling_row(
         """,
         (
             serialize_run_status(RunStatus.CANCELLING),
+            cancel_request_event_id,
             updated_at,
             run_id,
             serialize_run_status(RunStatus.RUNNING),
@@ -4024,6 +4071,7 @@ def cancel_recovering_run_row(
     run_id: str,
     terminal_event_id: str,
     terminal_event_sequence: int,
+    cancel_request_event_id: str,
     terminal_at: str,
 ) -> RunMutationResult:
     """CAS 将 recovering Run 取消收口。
@@ -4032,6 +4080,7 @@ def cancel_recovering_run_row(
     :param run_id: 目标 Run id。
     :param terminal_event_id: ``RUN_CANCELLED`` 事件 id。
     :param terminal_event_sequence: ``RUN_CANCELLED`` 全局事件序号。
+    :param cancel_request_event_id: 对应 ``CANCEL_REQUESTED`` event id。
     :param terminal_at: 固定 UTC terminal timestamp 文本。
     :returns: Run mutation 结果，区分 updated/cas_lost/not_found。
     :raises HostDurableError: 输入字段无效时抛出。
@@ -4043,6 +4092,9 @@ def cancel_recovering_run_row(
         terminal_event_sequence=terminal_event_sequence,
         terminal_at=terminal_at,
     )
+    _require_non_empty_text(
+        cancel_request_event_id, field_name="cancel_request_event_id"
+    )
     result = transaction.execute(
         f"""
         UPDATE {TABLE_HOST_RUNS}
@@ -4050,6 +4102,7 @@ def cancel_recovering_run_row(
           status = ?,
           terminal_event_id = ?,
           terminal_event_sequence = ?,
+          cancel_request_event_id = ?,
           updated_at = ?,
           terminal_at = ?
         WHERE run_id = ?
@@ -4060,6 +4113,7 @@ def cancel_recovering_run_row(
             serialize_run_status(RunStatus.CANCELLED),
             terminal_event_id,
             terminal_event_sequence,
+            cancel_request_event_id,
             terminal_at,
             terminal_at,
             run_id,
@@ -4081,6 +4135,7 @@ def cancel_waiting_run_row(
     current_attempt_id: str,
     terminal_event_id: str,
     terminal_event_sequence: int,
+    cancel_request_event_id: str,
     terminal_at: str,
 ) -> RunMutationResult:
     """CAS 取消 waiting Run。
@@ -4090,6 +4145,7 @@ def cancel_waiting_run_row(
     :param current_attempt_id: 期望的 SUSPENDED Attempt id。
     :param terminal_event_id: ``RUN_CANCELLED`` 事件 id。
     :param terminal_event_sequence: ``RUN_CANCELLED`` 全局事件序号。
+    :param cancel_request_event_id: 对应 ``CANCEL_REQUESTED`` event id。
     :param terminal_at: 固定 UTC terminal timestamp 文本。
     :returns: Run mutation 结果，区分 updated/cas_lost/not_found/invalid_state。
     :raises HostDurableError: 输入字段无效时抛出。
@@ -4102,6 +4158,9 @@ def cancel_waiting_run_row(
         terminal_at=terminal_at,
     )
     _require_non_empty_text(current_attempt_id, field_name="current_attempt_id")
+    _require_non_empty_text(
+        cancel_request_event_id, field_name="cancel_request_event_id"
+    )
     result = transaction.execute(
         f"""
         UPDATE {TABLE_HOST_RUNS}
@@ -4109,6 +4168,7 @@ def cancel_waiting_run_row(
           status = ?,
           terminal_event_id = ?,
           terminal_event_sequence = ?,
+          cancel_request_event_id = ?,
           updated_at = ?,
           terminal_at = ?
         WHERE run_id = ?
@@ -4120,6 +4180,7 @@ def cancel_waiting_run_row(
             serialize_run_status(RunStatus.CANCELLED),
             terminal_event_id,
             terminal_event_sequence,
+            cancel_request_event_id,
             terminal_at,
             terminal_at,
             run_id,
@@ -5104,6 +5165,9 @@ def _validate_run_for_insert(run: RunRow) -> None:
     _require_optional_positive_sequence(run.started_event_sequence, "started_event_sequence")
     _require_optional_non_empty_text(run.terminal_event_id, field_name="terminal_event_id")
     _require_optional_positive_sequence(run.terminal_event_sequence, "terminal_event_sequence")
+    _require_optional_non_empty_text(
+        run.cancel_request_event_id, field_name="cancel_request_event_id"
+    )
     _require_optional_non_empty_text(run.current_attempt_id, field_name="current_attempt_id")
     _require_optional_non_empty_text(run.source_run_id, field_name="source_run_id")
     _require_non_empty_text(run.execution_target, field_name="execution_target")
@@ -5132,6 +5196,28 @@ def _validate_run_for_insert(run: RunRow) -> None:
     )
     if (run.source_run_id is None) != (run.source_run_relation is None):
         raise HostDurableError("Run source relation fields must be paired")
+
+
+def _validate_terminal_cancel_request_link(
+    *, terminal_status: RunStatus, cancel_request_event_id: str | None
+) -> None:
+    """校验 Run terminal mutation 的取消链路形状。
+
+    :param terminal_status: 目标 Run terminal status。
+    :param cancel_request_event_id: 可选 ``CANCEL_REQUESTED`` event id。
+    :returns: ``None``。
+    :raises HostDurableError: cancelled 缺少 link 或非 cancelled 携带 link 时抛出。
+    """
+
+    if terminal_status == RunStatus.CANCELLED:
+        if cancel_request_event_id is None:
+            raise HostDurableError("cancelled Run terminal requires cancel link")
+        _require_non_empty_text(
+            cancel_request_event_id, field_name="cancel_request_event_id"
+        )
+        return
+    if cancel_request_event_id is not None:
+        raise HostDurableError("non-cancelled Run terminal cannot carry cancel link")
 
 
 def _validate_attempt_for_insert(attempt: AttemptRow) -> None:

@@ -16,6 +16,12 @@ from dayu.contracts.json_value import JsonValue
 from dayu.host._terminal_diagnostics import _append_terminal_diagnostic_suffix
 from dayu.host._event_payload import optional_payload_text
 from dayu.host.api import HostTerminalStatus
+from dayu.host.lifecycle_events import (
+    HOST_RUN_TERMINAL_EVENT_TYPES,
+    HostRunEventType,
+    event_type_values,
+    host_terminal_status_for_terminal_event,
+)
 from dayu.host.durable.codec import (
     canonical_json_dumps,
     format_utc_timestamp,
@@ -45,10 +51,8 @@ OUTBOX_TERMINAL_CONSUMER_ID = ProjectionConsumerId("host.outbox-terminal")
 DEFAULT_OUTBOX_TERMINAL_CATCHUP_BATCH_SIZE = 128
 """默认 Outbox terminal projection 单批 catch-up 扫描上限。"""
 
-_EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
 _EVENT_TYPE_RUN_FAILED = "RUN_FAILED"
 _EVENT_TYPE_RUN_CANCELLED = "RUN_CANCELLED"
-_EVENT_TYPE_RUN_LOST = "RUN_LOST"
 _DETAIL_CODE_RUN_LOST_SKIPPED = "run_lost_not_public_terminal_item"
 _PAYLOAD_FIELD_RESULT_REF = "result_ref"
 _PAYLOAD_FIELD_RESULT_DIGEST = "result_digest"
@@ -73,17 +77,7 @@ _IDENTITY_FIELD_TERMINAL_SUMMARY_DIGEST = "terminal_summary_digest"
 _OUTBOX_ITEM_ID_PREFIX = "outbox-terminal-"
 _DIGEST_PREFIX = "sha256:"
 _ITEM_STATE_PENDING = "pending"
-_TERMINAL_EVENT_TYPES: tuple[str, ...] = (
-    _EVENT_TYPE_RUN_SUCCEEDED,
-    _EVENT_TYPE_RUN_FAILED,
-    _EVENT_TYPE_RUN_CANCELLED,
-    _EVENT_TYPE_RUN_LOST,
-)
-_TERMINAL_STATUS_BY_EVENT_TYPE: Mapping[str, HostTerminalStatus] = {
-    _EVENT_TYPE_RUN_SUCCEEDED: HostTerminalStatus.SUCCEEDED,
-    _EVENT_TYPE_RUN_FAILED: HostTerminalStatus.FAILED,
-    _EVENT_TYPE_RUN_CANCELLED: HostTerminalStatus.CANCELLED,
-}
+_HOST_TERMINAL_EVENT_TYPE_VALUES = event_type_values(HOST_RUN_TERMINAL_EVENT_TYPES)
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,7 +139,7 @@ class OutboxTerminalProjectionConsumer:
             (
                 ProjectionEventClassFilter(
                     event_class=EventClass.CANONICAL_FACT,
-                    event_types=_TERMINAL_EVENT_TYPES,
+                    event_types=_HOST_TERMINAL_EVENT_TYPE_VALUES,
                 ),
             )
         )
@@ -163,7 +157,7 @@ class OutboxTerminalProjectionConsumer:
 
         if not self.event_filter.matches(event):
             return ProjectionApplyResult(ProjectionApplyStatus.SKIPPED)
-        if event.event_type == _EVENT_TYPE_RUN_LOST:
+        if event.event_type == HostRunEventType.RUN_LOST.value:
             return ProjectionApplyResult(
                 ProjectionApplyStatus.SKIPPED,
                 idempotency_key=event.event_id,
@@ -243,7 +237,7 @@ def build_outbox_terminal_item_row(
 
     if event.run_id is None:
         raise HostDurableError("outbox terminal event requires run_id")
-    terminal_status = _TERMINAL_STATUS_BY_EVENT_TYPE.get(event.event_type)
+    terminal_status = host_terminal_status_for_terminal_event(event.event_type)
     if terminal_status is None:
         raise HostDurableError("outbox terminal event type is unsupported")
     result_ref, result_digest = _payload_ref_pair(

@@ -136,6 +136,7 @@ def _seed_run(transaction: HostTransaction, *, run_id: str = "run-1") -> None:
             started_event_sequence=started_sequence,
             terminal_event_id=None,
             terminal_event_sequence=None,
+            cancel_request_event_id=None,
             current_attempt_id=None,
             source_run_id=None,
             source_run_relation=None,
