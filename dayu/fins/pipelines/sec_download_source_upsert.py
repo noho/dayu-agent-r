@@ -7,7 +7,12 @@ from dayu.contracts.json_value import JsonValue
 from collections.abc import Callable
 from typing import Optional, Protocol
 
-from dayu.fins.domain.document_models import FilingCreateRequest, FilingUpdateRequest, now_iso8601
+from dayu.fins.domain.document_models import (
+    FinsIngestMethod,
+    FilingCreateRequest,
+    FilingUpdateRequest,
+    now_iso8601,
+)
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.storage import SourceDocumentRepositoryProtocol
 
@@ -198,7 +203,7 @@ def _build_downloaded_filing_meta_payload(
         "document_id": document_id,
         "internal_document_id": internal_document_id,
         "accession_number": filing.accession_number,
-        "ingest_method": "download",
+        "ingest_method": FinsIngestMethod.DOWNLOAD.to_storage_value(),
         "ticker": ticker,
         "company_id": cik,
         "form_type": filing.form_type,

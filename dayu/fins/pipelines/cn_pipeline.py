@@ -39,6 +39,7 @@ from dayu.fins.ingestion_runtime import (
     FinsSourceDownloadAdapterRequest,
     FinsSourceDownloadAdapterResult,
 )
+from dayu.fins.domain.document_models import FinsIngestMethod
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.pipelines.cn_download_models import CnMarketKind
 from dayu.fins.pipelines.cn_download_pdf_gate import (
@@ -869,7 +870,7 @@ class CnPipeline:
                 cancellation_checker=cancellation_checker,
                 meta={
                     "company_id": normalized_company_id,
-                    "ingest_method": "upload",
+                    "ingest_method": FinsIngestMethod.UPLOAD.to_storage_value(),
                     "fiscal_year": fiscal_year,
                     "fiscal_period": normalized_period,
                     "report_kind": derive_report_kind(normalized_period),
@@ -1131,7 +1132,7 @@ class CnPipeline:
                 cancellation_checker=cancellation_checker,
                 meta={
                     "company_id": normalized_company_id,
-                    "ingest_method": "upload",
+                    "ingest_method": FinsIngestMethod.UPLOAD.to_storage_value(),
                     "material_name": material_name,
                     "fiscal_year": fiscal_year,
                     "fiscal_period": normalized_fiscal_period,
@@ -1241,13 +1242,13 @@ class CnPipeline:
             统一结构的结果字典。
 
         Raises:
-            无。
+            KeyError: payload 缺少显式 status 时抛出。
         """
 
         return {
             "pipeline": _pipeline_name_for_ticker(str(payload.get("ticker", ""))),
             "action": action,
-            "status": payload.pop("status", "placeholder"),
+            "status": payload.pop("status"),
             **payload,
         }
 

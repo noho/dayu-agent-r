@@ -16,6 +16,7 @@ from typing import Any, Literal, Optional, cast
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.fins._log import Log
+from dayu.fins.domain.document_models import FinsIngestMethod
 from dayu.documents.processors.base import (
     DocumentProcessor,
     SectionContent,
@@ -1693,8 +1694,16 @@ class FinsReadRuntime:
             source_type = SourceType.SUPPLEMENTARY.value
         elif document_id.startswith("fil_"):
             # 美股 filing: document_id = fil_{accession_number}
-            ingest_method = meta.get("ingest_method") if meta else None
-            source_type = SourceType.SEC_EDGAR.value if ingest_method == "download" else SourceType.UPLOADED.value
+            ingest_method = (
+                FinsIngestMethod.from_storage_value(str(meta["ingest_method"]))
+                if meta
+                else FinsIngestMethod.UPLOAD
+            )
+            source_type = (
+                SourceType.SEC_EDGAR.value
+                if ingest_method is FinsIngestMethod.DOWNLOAD
+                else SourceType.UPLOADED.value
+            )
         else:
             source_type = SourceType.UPLOADED.value
 

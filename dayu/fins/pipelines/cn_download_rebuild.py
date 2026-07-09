@@ -13,7 +13,7 @@ from collections.abc import Callable
 from typing import TypeAlias
 
 from dayu.contracts.json_value import JsonValue
-from dayu.fins.domain.document_models import FilingUpdateRequest, now_iso8601
+from dayu.fins.domain.document_models import FinsIngestMethod, FilingUpdateRequest, now_iso8601
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.pipelines.cn_download_models import (
     CN_PIPELINE_DOWNLOAD_VERSION,
@@ -30,7 +30,6 @@ from dayu.fins.pipelines.cn_form_utils import (
 
 JsonObject: TypeAlias = dict[str, JsonValue]
 
-_INGEST_METHOD_DOWNLOAD = "download"
 _DOCLING_SUFFIX = "_docling.json"
 _PDF_SUFFIX = ".pdf"
 
@@ -132,7 +131,7 @@ def _should_rebuild_meta(
 ) -> bool:
     """判断 source meta 是否属于本次 CN/HK rebuild 范围。"""
 
-    if str(meta.get("ingest_method") or "").strip().lower() != _INGEST_METHOD_DOWNLOAD:
+    if FinsIngestMethod.from_storage_value(str(meta["ingest_method"])) is not FinsIngestMethod.DOWNLOAD:
         return False
     if bool(meta.get("is_deleted", False)):
         return False
@@ -206,7 +205,7 @@ def _rebuild_single_cn_download_document(
     update_payload: JsonObject = {
         "document_id": document_id,
         "internal_document_id": internal_document_id,
-        "ingest_method": _INGEST_METHOD_DOWNLOAD,
+        "ingest_method": FinsIngestMethod.DOWNLOAD.to_storage_value(),
         "ticker": ticker,
         "form_type": form_type,
         "primary_document": primary_document,

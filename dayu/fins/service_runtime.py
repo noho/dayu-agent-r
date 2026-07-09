@@ -11,13 +11,13 @@ from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING
 
-from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins.ingestion_runtime import (
     FinsIngestionRuntime,
     FinsJobCancellationChecker,
     FinsUploadFilingRequest,
     FinsUploadMaterialRequest,
+    FinsUploadPipelineResult,
     FinsUploadRequest,
     FinsUploadResultSummary,
     FinsUploadRunner,
@@ -109,7 +109,7 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
         ticker: str,
         market: str,
         cancellation_checker: FinsJobCancellationChecker,
-    ) -> dict[str, JsonValue]:
+    ) -> FinsUploadPipelineResult:
         """执行 filing 上传 handoff。
 
         Args:
@@ -119,7 +119,7 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
             cancellation_checker: 协作式取消检查器。
 
         Returns:
-            pipeline 上传结果。
+            typed pipeline 上传结果。
 
         Raises:
             ValueError: 必填字段缺失或市场不支持时抛出。
@@ -133,34 +133,38 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
             raise ValueError("filing 上传必须提供 fiscal_period")
         action = _pipeline_upload_action(request.action)
         if market == "US":
-            return self.sec_pipeline.upload_filing(
-                ticker=ticker,
-                action=action,
-                files=list(request.files),
-                fiscal_year=request.fiscal_year,
-                fiscal_period=request.fiscal_period,
-                amended=request.amended,
-                filing_date=request.filing_date,
-                report_date=request.report_date,
-                company_name=request.company_name,
-                ticker_aliases=list(request.ticker_aliases),
-                overwrite=request.overwrite,
-                cancellation_checker=cancellation_checker,
+            return FinsUploadPipelineResult.from_pipeline_json(
+                self.sec_pipeline.upload_filing(
+                    ticker=ticker,
+                    action=action,
+                    files=list(request.files),
+                    fiscal_year=request.fiscal_year,
+                    fiscal_period=request.fiscal_period,
+                    amended=request.amended,
+                    filing_date=request.filing_date,
+                    report_date=request.report_date,
+                    company_name=request.company_name,
+                    ticker_aliases=list(request.ticker_aliases),
+                    overwrite=request.overwrite,
+                    cancellation_checker=cancellation_checker,
+                )
             )
         if market in {"CN", "HK"}:
-            return self.cn_pipeline.upload_filing(
-                ticker=ticker,
-                action=action,
-                files=list(request.files),
-                fiscal_year=request.fiscal_year,
-                fiscal_period=request.fiscal_period,
-                amended=request.amended,
-                filing_date=request.filing_date,
-                report_date=request.report_date,
-                company_name=request.company_name,
-                ticker_aliases=list(request.ticker_aliases),
-                overwrite=request.overwrite,
-                cancellation_checker=cancellation_checker,
+            return FinsUploadPipelineResult.from_pipeline_json(
+                self.cn_pipeline.upload_filing(
+                    ticker=ticker,
+                    action=action,
+                    files=list(request.files),
+                    fiscal_year=request.fiscal_year,
+                    fiscal_period=request.fiscal_period,
+                    amended=request.amended,
+                    filing_date=request.filing_date,
+                    report_date=request.report_date,
+                    company_name=request.company_name,
+                    ticker_aliases=list(request.ticker_aliases),
+                    overwrite=request.overwrite,
+                    cancellation_checker=cancellation_checker,
+                )
             )
         raise ValueError(f"不支持的上传市场: {market}")
 
@@ -171,7 +175,7 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
         ticker: str,
         market: str,
         cancellation_checker: FinsJobCancellationChecker,
-    ) -> dict[str, JsonValue]:
+    ) -> FinsUploadPipelineResult:
         """执行 material 上传 handoff。
 
         Args:
@@ -181,7 +185,7 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
             cancellation_checker: 协作式取消检查器。
 
         Returns:
-            pipeline 上传结果。
+            typed pipeline 上传结果。
 
         Raises:
             ValueError: 必填字段缺失或市场不支持时抛出。
@@ -195,40 +199,44 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
             raise ValueError("material 上传必须提供 material_name")
         action = _pipeline_upload_action(request.action)
         if market == "US":
-            return self.sec_pipeline.upload_material(
-                ticker=ticker,
-                action=action,
-                form_type=request.form_type,
-                material_name=request.material_name,
-                files=list(request.files),
-                document_id=request.document_id,
-                internal_document_id=request.internal_document_id,
-                fiscal_year=request.fiscal_year,
-                fiscal_period=request.fiscal_period,
-                filing_date=request.filing_date,
-                report_date=request.report_date,
-                company_name=request.company_name,
-                ticker_aliases=list(request.ticker_aliases),
-                overwrite=request.overwrite,
-                cancellation_checker=cancellation_checker,
+            return FinsUploadPipelineResult.from_pipeline_json(
+                self.sec_pipeline.upload_material(
+                    ticker=ticker,
+                    action=action,
+                    form_type=request.form_type,
+                    material_name=request.material_name,
+                    files=list(request.files),
+                    document_id=request.document_id,
+                    internal_document_id=request.internal_document_id,
+                    fiscal_year=request.fiscal_year,
+                    fiscal_period=request.fiscal_period,
+                    filing_date=request.filing_date,
+                    report_date=request.report_date,
+                    company_name=request.company_name,
+                    ticker_aliases=list(request.ticker_aliases),
+                    overwrite=request.overwrite,
+                    cancellation_checker=cancellation_checker,
+                )
             )
         if market in {"CN", "HK"}:
-            return self.cn_pipeline.upload_material(
-                ticker=ticker,
-                action=action,
-                form_type=request.form_type,
-                material_name=request.material_name,
-                files=list(request.files),
-                document_id=request.document_id,
-                internal_document_id=request.internal_document_id,
-                fiscal_year=request.fiscal_year,
-                fiscal_period=request.fiscal_period,
-                filing_date=request.filing_date,
-                report_date=request.report_date,
-                company_name=request.company_name,
-                ticker_aliases=list(request.ticker_aliases),
-                overwrite=request.overwrite,
-                cancellation_checker=cancellation_checker,
+            return FinsUploadPipelineResult.from_pipeline_json(
+                self.cn_pipeline.upload_material(
+                    ticker=ticker,
+                    action=action,
+                    form_type=request.form_type,
+                    material_name=request.material_name,
+                    files=list(request.files),
+                    document_id=request.document_id,
+                    internal_document_id=request.internal_document_id,
+                    fiscal_year=request.fiscal_year,
+                    fiscal_period=request.fiscal_period,
+                    filing_date=request.filing_date,
+                    report_date=request.report_date,
+                    company_name=request.company_name,
+                    ticker_aliases=list(request.ticker_aliases),
+                    overwrite=request.overwrite,
+                    cancellation_checker=cancellation_checker,
+                )
             )
         raise ValueError(f"不支持的上传市场: {market}")
 
@@ -255,13 +263,13 @@ def _pipeline_upload_action(action: str) -> str | None:
 def _upload_summary_from_result(
     *,
     request: FinsUploadRequest,
-    result: dict[str, JsonValue],
+    result: FinsUploadPipelineResult,
 ) -> FinsUploadResultSummary:
-    """从 pipeline 上传结果构建 runtime 摘要。
+    """从 typed pipeline 上传结果构建 runtime 摘要。
 
     Args:
         request: 上传请求。
-        result: pipeline 上传结果。
+        result: typed pipeline 上传结果。
 
     Returns:
         runtime 有界上传摘要。
@@ -272,77 +280,16 @@ def _upload_summary_from_result(
 
     return FinsUploadResultSummary(
         source_kind=request.source_kind,
-        document_id=_optional_upload_result_text(result, "document_id"),
-        internal_document_id=_optional_upload_result_text(result, "internal_document_id"),
-        status=_upload_result_text(result, "status", fallback="unknown"),
+        status=result.status,
+        document_id=result.document_id,
+        internal_document_id=result.internal_document_id,
         uploaded_files=tuple(path.name for path in request.files),
-        primary_document=_optional_upload_result_text(result, "primary_document"),
-        deleted=_upload_result_bool(result, "deleted"),
-        skip_reason=_optional_upload_result_text(result, "skip_reason"),
-        document_version=_optional_upload_result_text(result, "document_version"),
-        source_fingerprint=_optional_upload_result_text(result, "source_fingerprint"),
+        primary_document=result.primary_document,
+        deleted=result.deleted,
+        skip_reason=result.skip_reason,
+        document_version=result.document_version,
+        source_fingerprint=result.source_fingerprint,
     )
-
-
-def _upload_result_text(result: dict[str, JsonValue], key: str, *, fallback: str) -> str:
-    """从 upload result 读取文本字段。
-
-    Args:
-        result: pipeline 上传结果。
-        key: 字段名。
-        fallback: 缺失时使用的值。
-
-    Returns:
-        文本字段。
-
-    Raises:
-        无。
-    """
-
-    value = result.get(key)
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return fallback
-
-
-def _optional_upload_result_text(result: dict[str, JsonValue], key: str) -> str | None:
-    """从 upload result 读取可选文本字段。
-
-    Args:
-        result: pipeline 上传结果。
-        key: 字段名。
-
-    Returns:
-        文本字段；缺失或非文本时返回 ``None``。
-
-    Raises:
-        无。
-    """
-
-    value = result.get(key)
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return None
-
-
-def _upload_result_bool(result: dict[str, JsonValue], key: str) -> bool:
-    """从 upload result 读取布尔字段。
-
-    Args:
-        result: pipeline 上传结果。
-        key: 字段名。
-
-    Returns:
-        布尔字段；缺失或非布尔返回 ``False``。
-
-    Raises:
-        无。
-    """
-
-    value = result.get(key)
-    if isinstance(value, bool):
-        return value
-    return False
 
 
 @dataclass

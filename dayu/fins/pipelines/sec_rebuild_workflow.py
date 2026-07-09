@@ -8,7 +8,13 @@ import datetime as dt
 import time
 from typing import Callable, Optional, Protocol, cast
 
-from dayu.fins.domain.document_models import CompanyMeta, FilingUpdateRequest, SourceHandle, now_iso8601
+from dayu.fins.domain.document_models import (
+    CompanyMeta,
+    FinsIngestMethod,
+    FilingUpdateRequest,
+    SourceHandle,
+    now_iso8601,
+)
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.storage import SourceDocumentRepositoryProtocol
 
@@ -118,7 +124,7 @@ def rebuild_download_artifacts(
         )
         if previous_meta is None:
             continue
-        if str(previous_meta.get("ingest_method", "")).strip().lower() != "download":
+        if FinsIngestMethod.from_storage_value(str(previous_meta["ingest_method"])) is not FinsIngestMethod.DOWNLOAD:
             continue
         if not passes_rebuild_filters(
             meta=previous_meta,
@@ -309,7 +315,7 @@ def rebuild_single_local_filing(
         "document_id": document_id,
         "internal_document_id": internal_document_id,
         "accession_number": accession_number,
-        "ingest_method": "download",
+        "ingest_method": FinsIngestMethod.DOWNLOAD.to_storage_value(),
         "ticker": ticker,
         "company_id": company_id,
         "form_type": form_type,

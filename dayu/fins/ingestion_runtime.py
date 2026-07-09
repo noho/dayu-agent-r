@@ -44,6 +44,7 @@ from dayu.fins.direct_events import (
 )
 from dayu.fins.domain.document_models import (
     DocumentMeta,
+    FinsIngestMethod,
     FileObjectMeta,
     ProcessedCreateRequest,
     ProcessedHandle,
@@ -78,7 +79,7 @@ from dayu.fins.ticker_normalization import NormalizedTicker
 from dayu.runtime.filelock import file_lock
 
 _DEFAULT_DOWNLOAD_SOURCE: Final[str] = "auto"
-_DOWNLOAD_INGEST_METHOD: Final[str] = "download"
+_DOWNLOAD_INGEST_METHOD: Final[FinsIngestMethod] = FinsIngestMethod.DOWNLOAD
 _DOWNLOAD_REJECTION_CLASSIFICATION_VERSION: Final[str] = "fins-download-runtime-v1"
 _JOB_ID_PREFIX: Final[str] = "finsjob_"
 _JOB_EVENT_FILE_SUFFIX: Final[str] = ".events.jsonl"
@@ -197,6 +198,13 @@ class FinsIngestionJobStatus(str, Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+class FinsPreprocessResultStatus(str, Enum):
+    """预处理结果的业务状态。"""
+
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
 
 
 _TERMINAL_STATUSES = frozenset(
@@ -460,7 +468,6 @@ _UPLOAD_ACTION_VALUES: Final[frozenset[str]] = frozenset(
         _UPLOAD_ACTION_DELETE,
     }
 )
-_UPLOAD_RESULT_STATUS_UNKNOWN: Final[str] = "unknown"
 _UPLOAD_RESULT_STATUS_FAILED: Final[str] = "failed"
 _UNSUPPORTED_UPLOAD_RUNTIME_MESSAGE: Final[
     str
@@ -601,6 +608,7 @@ class FinsPreprocessResultSummary:
         selected_count: 被选择处理的源文档数量。
         processed_count: 处理成功数量。
         skipped_count: 跳过数量。
+        not_supported_count: 无可用处理器数量。
         failed_count: 失败数量。
         processed_document_ids: 已写入的 processed 文档 ID。
         skipped_document_ids: 因已有产物等原因跳过的源文档 ID。
@@ -611,11 +619,34 @@ class FinsPreprocessResultSummary:
     selected_count: int = 0
     processed_count: int = 0
     skipped_count: int = 0
+    not_supported_count: int = 0
     failed_count: int = 0
     processed_document_ids: tuple[str, ...] = ()
     skipped_document_ids: tuple[str, ...] = ()
     failed_document_ids: tuple[str, ...] = ()
     not_supported_document_ids: tuple[str, ...] = ()
+
+    def result_status(self) -> FinsPreprocessResultStatus:
+        """返回预处理摘要对应的业务状态。
+
+        Args:
+            无。
+
+        Returns:
+            预处理成功或失败状态。
+
+        Raises:
+            ValueError: 计数字段为负数、分类计数超过选择数量或明细数量与计数不一致时抛出。
+        """
+
+        _bounded_preprocess_summary(self)
+        if self.processed_count > 0:
+            return FinsPreprocessResultStatus.SUCCEEDED
+        if self.selected_count == 0 or self.failed_count > 0 or self.not_supported_count > 0:
+            return FinsPreprocessResultStatus.FAILED
+        if self.skipped_count > 0:
+            return FinsPreprocessResultStatus.SUCCEEDED
+        return FinsPreprocessResultStatus.SUCCEEDED
 
     def to_json_summary(self) -> dict[str, JsonValue]:
         """转换为 JSON-compatible 摘要。
@@ -630,40 +661,92 @@ class FinsPreprocessResultSummary:
             ValueError: 文档 ID 数量或长度超过 job record 边界时抛出。
         """
 
+        bounded = _bounded_preprocess_summary(self)
         return {
-            "selected_count": self.selected_count,
-            "processed_count": self.processed_count,
-            "skipped_count": self.skipped_count,
-            "failed_count": self.failed_count,
+            "selected_count": bounded.selected_count,
+            "processed_count": bounded.processed_count,
+            "skipped_count": bounded.skipped_count,
+            "not_supported_count": bounded.not_supported_count,
+            "failed_count": bounded.failed_count,
             "processed_document_ids": list(
                 _bounded_text_tuple(
-                    self.processed_document_ids,
+                    bounded.processed_document_ids,
                     "processed_document_ids",
                     reject_path_separators=False,
                 )
             ),
             "skipped_document_ids": list(
                 _bounded_text_tuple(
-                    self.skipped_document_ids,
+                    bounded.skipped_document_ids,
                     "skipped_document_ids",
                     reject_path_separators=False,
                 )
             ),
             "failed_document_ids": list(
                 _bounded_text_tuple(
-                    self.failed_document_ids,
+                    bounded.failed_document_ids,
                     "failed_document_ids",
                     reject_path_separators=False,
                 )
             ),
             "not_supported_document_ids": list(
                 _bounded_text_tuple(
-                    self.not_supported_document_ids,
+                    bounded.not_supported_document_ids,
                     "not_supported_document_ids",
                     reject_path_separators=False,
                 )
             ),
         }
+
+
+@dataclass(frozen=True)
+class FinsUploadPipelineResult:
+    """production upload pipeline 返回给 runtime 的 typed 结果。
+
+    Attributes:
+        status: 上传业务状态，pipeline 必须显式提供。
+        document_id: 可选业务文档 ID。
+        internal_document_id: 可选来源内部文档 ID。
+        primary_document: 可选主文件名。
+        deleted: 可选删除动作结果；缺失表示 pipeline 未声明。
+        skip_reason: 可选跳过原因。
+        document_version: 可选文档版本。
+        source_fingerprint: 可选来源指纹。
+    """
+
+    status: str
+    document_id: str | None = None
+    internal_document_id: str | None = None
+    primary_document: str | None = None
+    deleted: bool | None = None
+    skip_reason: str | None = None
+    document_version: str | None = None
+    source_fingerprint: str | None = None
+
+    @classmethod
+    def from_pipeline_json(cls, result: Mapping[str, JsonValue]) -> "FinsUploadPipelineResult":
+        """从 pipeline JSON 结果构造 typed upload result。
+
+        Args:
+            result: pipeline 上传完成事件中的 JSON result。
+
+        Returns:
+            已校验的 typed upload result。
+
+        Raises:
+            ValueError: 必填字段缺失、字段类型非法或文本字段为空时抛出。
+        """
+
+        return cls(
+            status=_required_upload_result_text(result, "status"),
+            document_id=_optional_upload_result_text(result, "document_id"),
+            internal_document_id=_optional_upload_result_text(result, "internal_document_id"),
+            primary_document=_optional_upload_result_text(result, "primary_document"),
+            deleted=_optional_upload_result_bool(result, "deleted"),
+            skip_reason=_optional_upload_result_text(result, "skip_reason"),
+            document_version=_optional_upload_result_text(result, "document_version"),
+            source_fingerprint=_optional_upload_result_text(result, "source_fingerprint"),
+        )
 
 
 @dataclass(frozen=True)
@@ -677,19 +760,19 @@ class FinsUploadResultSummary:
         status: 上传业务状态摘要。
         uploaded_files: 已写入或处理的文件名摘要；不得包含路径。
         primary_document: 可选主文件名。
-        deleted: 是否执行了删除动作。
+        deleted: 是否执行了删除动作；``None`` 表示 pipeline 未声明。
         skip_reason: 可选跳过原因。
         document_version: 可选文档版本。
         source_fingerprint: 可选来源指纹。
     """
 
     source_kind: SourceKind
+    status: str
     document_id: str | None = None
     internal_document_id: str | None = None
-    status: str = _UPLOAD_RESULT_STATUS_UNKNOWN
     uploaded_files: tuple[str, ...] = ()
     primary_document: str | None = None
-    deleted: bool = False
+    deleted: bool | None = None
     skip_reason: str | None = None
     document_version: str | None = None
     source_fingerprint: str | None = None
@@ -2766,14 +2849,7 @@ class FinsIngestionRuntime:
         if context.cancellation_checker():
             self._emit_direct_cancelled_result(context)
             return
-        if (
-            summary.processed_count == 0
-            and (
-                summary.selected_count == 0
-                or summary.failed_count > 0
-                or len(summary.not_supported_document_ids) > 0
-            )
-        ):
+        if summary.result_status() is FinsPreprocessResultStatus.FAILED:
             self._emit_direct_result(
                 context,
                 status=FinsResultStatus.FAILURE,
@@ -3195,14 +3271,7 @@ class FinsIngestionRuntime:
             if latest.cancellation_requested or latest.status is FinsIngestionJobStatus.CANCELLING:
                 self._save_cancelled(latest)
                 return
-            if (
-                summary.processed_count == 0
-                and (
-                    summary.selected_count == 0
-                    or summary.failed_count > 0
-                    or len(summary.not_supported_document_ids) > 0
-                )
-            ):
+            if summary.result_status() is FinsPreprocessResultStatus.FAILED:
                 self._save_failed(
                     latest,
                     message="没有任何请求文档完成预处理",
@@ -3523,7 +3592,8 @@ class FinsIngestionRuntime:
         summary = FinsPreprocessResultSummary(
             selected_count=len(document_ids),
             processed_count=len(processed_ids),
-            skipped_count=len(skipped_ids) + len(not_supported_ids),
+            skipped_count=len(skipped_ids),
+            not_supported_count=len(not_supported_ids),
             failed_count=len(failed_ids),
             processed_document_ids=tuple(processed_ids),
             skipped_document_ids=tuple(skipped_ids),
@@ -4759,7 +4829,7 @@ def _preprocess_result_details(summary: FinsPreprocessResultSummary) -> tuple[Fi
         FinsEventDetail("processed", str(json_summary["processed_count"])),
         FinsEventDetail("skipped", str(json_summary["skipped_count"])),
         FinsEventDetail("failed", str(json_summary["failed_count"])),
-        FinsEventDetail("not supported", str(len(summary.not_supported_document_ids))),
+        FinsEventDetail("not supported", str(json_summary["not_supported_count"])),
     )
 
 
@@ -4788,6 +4858,70 @@ def _upload_result_details(summary: FinsUploadResultSummary) -> tuple[FinsEventD
     if isinstance(uploaded_files, list):
         details.append(FinsEventDetail("uploaded files", str(len(uploaded_files))))
     return tuple(details)
+
+
+def _required_upload_result_text(result: Mapping[str, JsonValue], key: str) -> str:
+    """从 upload pipeline result 读取必填文本字段。
+
+    Args:
+        result: pipeline 上传结果。
+        key: 字段名。
+
+    Returns:
+        非空文本字段。
+
+    Raises:
+        ValueError: 字段缺失、类型不是字符串或字符串为空时抛出。
+    """
+
+    value = result.get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    raise ValueError(f"upload pipeline result 缺少必填文本字段: {key}")
+
+
+def _optional_upload_result_text(result: Mapping[str, JsonValue], key: str) -> str | None:
+    """从 upload pipeline result 读取可选文本字段。
+
+    Args:
+        result: pipeline 上传结果。
+        key: 字段名。
+
+    Returns:
+        非空文本字段；缺失时返回 ``None``。
+
+    Raises:
+        ValueError: 字段存在但不是字符串或为空字符串时抛出。
+    """
+
+    value = result.get(key)
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    raise ValueError(f"upload pipeline result 字段必须是非空文本: {key}")
+
+
+def _optional_upload_result_bool(result: Mapping[str, JsonValue], key: str) -> bool | None:
+    """从 upload pipeline result 读取可选布尔字段。
+
+    Args:
+        result: pipeline 上传结果。
+        key: 字段名。
+
+    Returns:
+        布尔字段；缺失时返回 ``None``。
+
+    Raises:
+        ValueError: 字段存在但不是布尔值时抛出。
+    """
+
+    value = result.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"upload pipeline result 字段必须是布尔值: {key}")
 
 
 def _classify_direct_error(exc: Exception) -> FinsErrorKind:
@@ -5343,7 +5477,7 @@ def _download_document_meta(meta: Mapping[str, JsonValue]) -> DocumentMeta:
 
     _assert_bounded_summary(meta, "download_document_meta")
     result: DocumentMeta = dict(meta)
-    result["ingest_method"] = _DOWNLOAD_INGEST_METHOD
+    result["ingest_method"] = _DOWNLOAD_INGEST_METHOD.to_storage_value()
     result["ingest_complete"] = True
     return result
 
@@ -5609,6 +5743,72 @@ def _bounded_download_summary(summary: FinsDownloadResultSummary) -> FinsDownloa
             reject_path_separators=False,
         ),
     )
+
+
+def _bounded_preprocess_summary(summary: FinsPreprocessResultSummary) -> FinsPreprocessResultSummary:
+    """校验预处理结果摘要。
+
+    Args:
+        summary: 预处理结果摘要。
+
+    Returns:
+        字段已校验的预处理摘要。
+
+    Raises:
+        ValueError: 计数为负、分类计数超过选择数量、计数与明细不一致或文档 ID 越界时抛出。
+    """
+
+    processed_ids = _bounded_text_tuple(
+        summary.processed_document_ids,
+        "processed_document_ids",
+        reject_path_separators=False,
+    )
+    skipped_ids = _bounded_text_tuple(
+        summary.skipped_document_ids,
+        "skipped_document_ids",
+        reject_path_separators=False,
+    )
+    failed_ids = _bounded_text_tuple(
+        summary.failed_document_ids,
+        "failed_document_ids",
+        reject_path_separators=False,
+    )
+    not_supported_ids = _bounded_text_tuple(
+        summary.not_supported_document_ids,
+        "not_supported_document_ids",
+        reject_path_separators=False,
+    )
+    bounded = FinsPreprocessResultSummary(
+        selected_count=_non_negative_count(summary.selected_count, "selected_count"),
+        processed_count=_non_negative_count(summary.processed_count, "processed_count"),
+        skipped_count=_non_negative_count(summary.skipped_count, "skipped_count"),
+        not_supported_count=_non_negative_count(
+            summary.not_supported_count,
+            "not_supported_count",
+        ),
+        failed_count=_non_negative_count(summary.failed_count, "failed_count"),
+        processed_document_ids=processed_ids,
+        skipped_document_ids=skipped_ids,
+        failed_document_ids=failed_ids,
+        not_supported_document_ids=not_supported_ids,
+    )
+    if bounded.processed_count != len(processed_ids):
+        raise ValueError("processed_count 必须等于 processed_document_ids 数量")
+    if bounded.skipped_count != len(skipped_ids):
+        raise ValueError("skipped_count 必须等于 skipped_document_ids 数量")
+    if bounded.failed_count != len(failed_ids):
+        raise ValueError("failed_count 必须等于 failed_document_ids 数量")
+    if bounded.not_supported_count != len(not_supported_ids):
+        raise ValueError("not_supported_count 必须等于 not_supported_document_ids 数量")
+    categorized_count = (
+        bounded.processed_count
+        + bounded.skipped_count
+        + bounded.failed_count
+        + bounded.not_supported_count
+    )
+    if categorized_count > bounded.selected_count:
+        raise ValueError("预处理分类计数总和不得超过 selected_count")
+    return bounded
 
 
 def _download_context_request_progress_payload(
@@ -5938,7 +6138,10 @@ def _preprocess_summary_progress_payload(
                 summary.failed_count,
                 _PAYLOAD_FAILED_COUNT,
             ),
-            _PAYLOAD_NOT_SUPPORTED_COUNT: len(summary.not_supported_document_ids),
+            _PAYLOAD_NOT_SUPPORTED_COUNT: _non_negative_count(
+                summary.not_supported_count,
+                _PAYLOAD_NOT_SUPPORTED_COUNT,
+            ),
         }
     )
     return payload
@@ -6597,11 +6800,13 @@ __all__ = [
     "FinsRejectedFilingDownloadArtifact",
     "FinsPreprocessRequest",
     "FinsPreprocessResultSummary",
+    "FinsPreprocessResultStatus",
     "FinsSourceDownloadAdapter",
     "FinsSourceDownloadAdapterRequest",
     "FinsSourceDownloadAdapterResult",
     "FinsUploadFilingRequest",
     "FinsUploadMaterialRequest",
+    "FinsUploadPipelineResult",
     "FinsUploadRequest",
     "FinsUploadResultSummary",
     "FinsUploadRunner",

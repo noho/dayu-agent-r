@@ -11,6 +11,7 @@ from dayu.fins.domain.document_models import (
     DocumentMeta,
     DocumentQuery,
     DocumentSummary,
+    FinsIngestMethod,
     FileObjectMeta,
     FilingCreateRequest,
     FilingDeleteRequest,
@@ -366,7 +367,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
                         report_date=normalized_meta.get("report_date"),
                         filing_date=normalized_meta.get("filing_date"),
                         amended=bool(normalized_meta.get("amended", False)),
-                        ingest_method=str(normalized_meta.get("ingest_method", "upload")),
+                        ingest_method=_ingest_method_from_meta(normalized_meta),
                         ingest_complete=bool(normalized_meta.get("ingest_complete", True)),
                         is_deleted=bool(normalized_meta.get("is_deleted", False)),
                         deleted_at=normalized_meta.get("deleted_at"),
@@ -749,7 +750,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
                         report_date=merged_meta.get("report_date"),
                         filing_date=merged_meta.get("filing_date"),
                         amended=bool(merged_meta.get("amended", False)),
-                        ingest_method=str(merged_meta.get("ingest_method", "upload")),
+                        ingest_method=_ingest_method_from_meta(merged_meta),
                         ingest_complete=bool(merged_meta.get("ingest_complete", True)),
                         is_deleted=bool(merged_meta.get("is_deleted", False)),
                         deleted_at=merged_meta.get("deleted_at"),
@@ -835,7 +836,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
                         report_date=meta.get("report_date"),
                         filing_date=meta.get("filing_date"),
                         amended=bool(meta.get("amended", False)),
-                        ingest_method=str(meta.get("ingest_method", "upload")),
+                        ingest_method=_ingest_method_from_meta(meta),
                         ingest_complete=bool(meta.get("ingest_complete", True)),
                         is_deleted=bool(meta.get("is_deleted", False)),
                         deleted_at=meta.get("deleted_at"),
@@ -876,3 +877,20 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             ),
             file_uris=[str(item.get("uri")) for item in file_payloads if isinstance(item, dict)],
         )
+
+
+def _ingest_method_from_meta(meta: DocumentMeta) -> FinsIngestMethod:
+    """从 source meta 读取并校验 ingest method。
+
+    Args:
+        meta: 已读取或即将写入的 source meta。
+
+    Returns:
+        已校验的 ingest method 枚举值。
+
+    Raises:
+        KeyError: meta 缺少 ``ingest_method`` 时抛出。
+        ValueError: ingest method 不是合法业务值时抛出。
+    """
+
+    return FinsIngestMethod.from_storage_value(str(meta["ingest_method"]))

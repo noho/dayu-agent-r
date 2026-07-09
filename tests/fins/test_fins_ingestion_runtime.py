@@ -68,12 +68,14 @@ from dayu.fins.ingestion_runtime import (
     FinsIngestionJobStatus,
     FinsPreprocessRequest,
     FinsPreprocessResultSummary,
+    FinsPreprocessResultStatus,
     FinsRejectedFilingDownloadArtifact,
     FinsSourceDownloadAdapter,
     FinsSourceDownloadAdapterRequest,
     FinsSourceDownloadAdapterResult,
     FinsUploadFilingRequest,
     FinsUploadMaterialRequest,
+    FinsUploadPipelineResult,
     FinsUploadRequest,
     FinsUploadResultSummary,
     FinsUploadRunner,
@@ -2130,9 +2132,14 @@ def test_result_summaries_allow_slash_in_document_ids() -> None:
     """结果摘要中的 document-id 类字段应允许业务合法斜杠。"""
 
     download_summary = FinsDownloadResultSummary(written_document_ids=("sec/aapl-2024-10ka",))
-    preprocess_summary = FinsPreprocessResultSummary(processed_document_ids=("processed/aapl-2024-10ka",))
+    preprocess_summary = FinsPreprocessResultSummary(
+        selected_count=1,
+        processed_count=1,
+        processed_document_ids=("processed/aapl-2024-10ka",),
+    )
     upload_summary = FinsUploadResultSummary(
         source_kind=SourceKind.FILING,
+        status="uploaded",
         document_id="sec/aapl-2024-10ka",
         internal_document_id="sec/aapl-2024-10ka-internal",
     )
@@ -2141,6 +2148,54 @@ def test_result_summaries_allow_slash_in_document_ids() -> None:
     assert preprocess_summary.to_json_summary()["processed_document_ids"] == ["processed/aapl-2024-10ka"]
     assert upload_summary.to_json_summary()["document_id"] == "sec/aapl-2024-10ka"
     assert upload_summary.to_json_summary()["internal_document_id"] == "sec/aapl-2024-10ka-internal"
+
+
+def test_preprocess_result_status_separates_skipped_and_not_supported() -> None:
+    """预处理状态 helper 应区分 skipped 与 not_supported 语义。"""
+
+    skipped_only = FinsPreprocessResultSummary(
+        selected_count=1,
+        skipped_count=1,
+        skipped_document_ids=("aapl-2024-10k",),
+    )
+    unsupported_only = FinsPreprocessResultSummary(
+        selected_count=1,
+        not_supported_count=1,
+        not_supported_document_ids=("aapl-2024-10k",),
+    )
+
+    assert skipped_only.result_status() is FinsPreprocessResultStatus.SUCCEEDED
+    assert unsupported_only.result_status() is FinsPreprocessResultStatus.FAILED
+    assert unsupported_only.to_json_summary()["skipped_count"] == 0
+    assert unsupported_only.to_json_summary()["not_supported_count"] == 1
+
+
+def test_preprocess_result_status_rejects_over_classified_counts() -> None:
+    """预处理状态 helper 应拒绝分类计数超过选择数量的摘要。"""
+
+    over_classified = FinsPreprocessResultSummary(
+        selected_count=1,
+        processed_count=1,
+        skipped_count=1,
+        processed_document_ids=("aapl-2024-10k",),
+        skipped_document_ids=("msft-2024-10k",),
+    )
+    cancellation_partial = FinsPreprocessResultSummary(
+        selected_count=2,
+        skipped_count=1,
+        skipped_document_ids=("aapl-2024-10k",),
+    )
+
+    with pytest.raises(ValueError, match="selected_count"):
+        over_classified.result_status()
+    assert cancellation_partial.result_status() is FinsPreprocessResultStatus.SUCCEEDED
+
+
+def test_upload_pipeline_result_requires_status() -> None:
+    """upload pipeline typed result 不得用 unknown 伪造缺失状态。"""
+
+    with pytest.raises(ValueError, match="status"):
+        FinsUploadPipelineResult.from_pipeline_json({"document_id": "aapl-2024-10k"})
 
 
 def test_prepare_observed_operations_do_not_submit_until_activation(tmp_path: Path) -> None:
@@ -3385,6 +3440,8 @@ def test_start_preprocess_unsupported_document_records_not_supported_summary(tmp
     assert record.status is FinsIngestionJobStatus.FAILED
     assert record.result_summary["selected_count"] == 1
     assert record.result_summary["processed_count"] == 0
+    assert record.result_summary["skipped_count"] == 0
+    assert record.result_summary["not_supported_count"] == 1
     assert record.result_summary["not_supported_document_ids"] == ["aapl-2024-10k"]
     assert "没有任何请求文档完成预处理" in str(record.failure_summary["message"])
     assert [event.source_event_type for event in progress_events] == [
@@ -3395,6 +3452,8 @@ def test_start_preprocess_unsupported_document_records_not_supported_summary(tmp
     ]
     assert progress_events[2].message == "预处理源文档不支持"
     assert progress_events[2].document_id == "aapl-2024-10k"
+    assert progress_events[3].payload["skipped_count"] == 0
+    assert progress_events[3].payload["not_supported_count"] == 1
 
 
 def test_save_failed_from_exception_logs_secondary_job_store_failure(

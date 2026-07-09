@@ -13,6 +13,7 @@ from typing import TypeAlias
 
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.document_models import (
+    FinsIngestMethod,
     FileObjectMeta,
     FilingCreateRequest,
     FilingUpdateRequest,
@@ -33,7 +34,6 @@ from dayu.fins.ticker_normalization import normalize_ticker, ticker_to_company_i
 
 JsonObject: TypeAlias = dict[str, JsonValue]
 
-_INGEST_METHOD_DOWNLOAD = "download"
 _FISCAL_YEAR_SOURCE = "title_or_category_inferred"
 _REPORT_DATE_SOURCE = "period_inferred"
 
@@ -295,7 +295,7 @@ def _build_base_meta(
     return {
         "document_id": document_id,
         "internal_document_id": internal_document_id,
-        "ingest_method": _INGEST_METHOD_DOWNLOAD,
+        "ingest_method": FinsIngestMethod.DOWNLOAD.to_storage_value(),
         "ticker": ticker,
         "company_id": company_id,
         "provider_company_id": profile.company_id,

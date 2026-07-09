@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Protocol, TypeAlias
 
 from dayu.contracts.json_value import JsonValue
+from dayu.fins.domain.document_models import FinsIngestMethod
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.downloaders.sec_downloader import SecDownloader
 from dayu.fins.pipelines.docling_upload_service import (
@@ -218,7 +219,7 @@ async def run_upload_filing_stream(
             cancellation_checker=cancellation_checker,
             meta={
                 "company_id": normalized_company_id,
-                "ingest_method": "upload",
+                "ingest_method": FinsIngestMethod.UPLOAD.to_storage_value(),
                 "fiscal_year": fiscal_year,
                 "fiscal_period": normalized_period,
                 "report_kind": derive_report_kind(normalized_period),
@@ -414,7 +415,7 @@ async def run_upload_material_stream(
             cancellation_checker=cancellation_checker,
             meta={
                 "company_id": normalized_company_id,
-                "ingest_method": "upload",
+                "ingest_method": FinsIngestMethod.UPLOAD.to_storage_value(),
                 "material_name": material_name,
                 "fiscal_year": fiscal_year,
                 "fiscal_period": normalized_fiscal_period,

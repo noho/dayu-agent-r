@@ -16,12 +16,58 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, Optional
 
 
 DocumentMeta = dict[str, Any]
 """文档元数据字典类型别名。"""
+
+
+class FinsIngestMethod(str, Enum):
+    """财报源文档进入仓储的业务方式。"""
+
+    DOWNLOAD = "download"
+    UPLOAD = "upload"
+
+    @classmethod
+    def from_storage_value(cls, value: str, *, field_name: str = "ingest_method") -> "FinsIngestMethod":
+        """从 storage meta 字符串解析 ingest method。
+
+        Args:
+            value: storage meta 中的业务可读字符串值。
+            field_name: 报错使用的字段名。
+
+        Returns:
+            已校验的 ingest method 枚举值。
+
+        Raises:
+            ValueError: 字符串为空或不是合法 ingest method 时抛出。
+        """
+
+        normalized = value.strip().lower()
+        if not normalized:
+            raise ValueError(f"{field_name} 不能为空")
+        try:
+            return cls(normalized)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} 非法: {value}") from exc
+
+    def to_storage_value(self) -> str:
+        """转换为 storage JSON 使用的业务可读字符串。
+
+        Args:
+            无。
+
+        Returns:
+            storage meta 中持久化的字符串值。
+
+        Raises:
+            无。
+        """
+
+        return self.value
 
 
 @dataclass(frozen=True)
@@ -347,7 +393,7 @@ class RejectedFilingArtifactUpsertRequest:
     report_kind: Optional[str] = None
     amended: bool = False
     has_xbrl: Optional[bool] = None
-    ingest_method: str = "download"
+    ingest_method: FinsIngestMethod = FinsIngestMethod.DOWNLOAD
 
 
 @dataclass(frozen=True)
@@ -374,7 +420,7 @@ class RejectedFilingArtifact:
     report_kind: Optional[str] = None
     amended: bool = False
     has_xbrl: Optional[bool] = None
-    ingest_method: str = "download"
+    ingest_method: FinsIngestMethod = FinsIngestMethod.DOWNLOAD
     rejected_at: str = ""
     created_at: str = ""
     updated_at: str = ""
@@ -419,7 +465,7 @@ class RejectedFilingArtifact:
             report_kind=_optional_str(data.get("report_kind")),
             amended=bool(data.get("amended", False)),
             has_xbrl=data.get("has_xbrl") if isinstance(data.get("has_xbrl"), bool) else None,
-            ingest_method=str(data.get("ingest_method", "download")).strip() or "download",
+            ingest_method=FinsIngestMethod.from_storage_value(str(data["ingest_method"])),
             rejected_at=str(data.get("rejected_at", "")).strip(),
             created_at=str(data.get("created_at", "")).strip(),
             updated_at=str(data.get("updated_at", "")).strip(),
@@ -459,7 +505,7 @@ class RejectedFilingArtifact:
             "report_kind": self.report_kind,
             "amended": self.amended,
             "has_xbrl": self.has_xbrl,
-            "ingest_method": self.ingest_method,
+            "ingest_method": self.ingest_method.to_storage_value(),
             "rejected_at": self.rejected_at,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -627,7 +673,7 @@ class FilingManifestItem:
     report_date: Optional[str] = None
     filing_date: Optional[str] = None
     amended: bool = False
-    ingest_method: str = "download"
+    ingest_method: FinsIngestMethod = FinsIngestMethod.DOWNLOAD
     ingest_complete: bool = True
     is_deleted: bool = False
     deleted_at: Optional[str] = None
@@ -648,7 +694,9 @@ class FilingManifestItem:
             无。
         """
 
-        return asdict(self)
+        payload = asdict(self)
+        payload["ingest_method"] = self.ingest_method.to_storage_value()
+        return payload
 
 
 @dataclass(frozen=True)
