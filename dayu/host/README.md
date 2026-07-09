@@ -31,6 +31,7 @@ Dayu 是生产级通用 Agent，具备买方财报分析能力，核心范式是
 - Engine 只执行单次 `AgentRunRequest`，不拥有 Session / Run / Attempt 生命周期；EngineEvent 必须经 Host identity、状态与幂等校验后才能变成 Host facts。
 - 用户取消动作经 UI / Service 映射为 Host cancel command 后，Host 的公开承诺是 Codex / Claude Code 类体感：快速停止等待当前模型 / 工具执行并恢复可交互路径；旧模型输出、旧工具结果或旧 wait result 不能污染已取消 Run。该承诺不表示远端 LLM provider、外部 job 或第三方服务一定已经物理停止。
 - 工具调用只通过 Host-owned ToolRuntime 进入业务工具；工具结果、等待、截断、`fetch_more` 与重复调用治理必须经过 Host accept barrier。
+- accepted 工具结果投影给 Tool Trace、Read API、Conversation Memory、RunInputBuilder 与 compact material 时，LLM-facing 的查询语义、状态语义、结果摘要和业务 source 由 Host 统一投影；下游消费者只消费该投影，不重新回读或猜测 request atom。
 - 上下文预算和 compact 治理由 Host 负责；Engine 只在 provider 明确报告上下文溢出时发出 `context_compaction_requested`。
 - Conversation Memory 只消费 committed canonical facts 与 accepted compact 结果；assistant final answer 和普通工具证据不会自动成为 evidence-backed fact。
 - 财报业务语义、财报文档下载、预处理、处理与存取不属于 Host；财报文档存取必须通过 `dayu.fins.storage` 下的仓储协议与仓储实现完成。
@@ -656,7 +657,7 @@ Memory 当前只投影这些事件：
 
 - `USER_INPUT_ACCEPTED`：生成 selected recent window 的 user item。
 - `RUN_SUCCEEDED`：从 terminal answer continuity 中提取 assistant item；缺失可读 final answer 时跳过，不用 payload ref / digest / event id 补洞。
-- `TOOL_RESULT_ACCEPTED`：生成 self-explaining readable evidence item；accepted evidence envelope 提供工具名、对应 `TOOL_CALL_REQUESTED` 引用与 digest，Memory projection 从该 request atom 回读 LLM-safe request / query 文本，并与 digest-checked raw tool outcome 合并为业务可读 evidence，不暴露 tool call id、EventLog id、payload / artifact ref、digest、wait / poll / cancel lifecycle 或实现类型名。wait-resolution 产生的 accepted result 也必须携带同一 envelope 与 raw outcome，使长事务完成后的 memory evidence 能说明“哪个工具按什么业务请求返回了什么结果”。
+- `TOOL_RESULT_ACCEPTED`：生成 self-explaining readable evidence item；durable memory consumer 先通过 Host accepted result projection 取得工具名、LLM-safe request / query、结果文本和业务 source，Conversation Memory 只消费这些 projection 字段。缺少 projection 字段时只写入 limited-signal 文本，不从 envelope、request atom 或 raw outcome 重建 accepted evidence；正常 readable evidence 不暴露 tool call id、EventLog id、payload / artifact ref、digest、wait / poll / cancel lifecycle 或实现类型名。
 - `CONTEXT_COMPACTED`：读取 accepted `conversation_compact_output_v1` candidate，物化 session summary、evidence-backed facts、answer anchors、forward intents、reference continuity items，并记录 latest compaction event ref。
 
 Memory 不消费 Host waiting lifecycle 事件。`TOOL_AWAITING`、`RUN_WAITING`、`CANCEL_REQUESTED`、`RUN_CANCELLED`、wait record、poller outcome 与 abandon 只属于 Host durable / audit / wait governance，不进入 LLM-facing memory schema；有无 awaiting 执行机制不能改变下一轮 memory 语义。长事务完成后的可读结果必须经普通 tool result / resume summary 路径进入模型上下文。

@@ -12,7 +12,7 @@ from typing import cast
 import pytest
 
 from dayu.contracts.json_value import JsonValue
-from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import (
@@ -341,7 +341,9 @@ def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> Non
                 "tool_schema_digest": "sha256:schema",
                 "tool_identity_digest": "sha256:identity",
                 "normalized_arguments_digest": arguments_digest,
-                "arguments_json_size_bytes": 48,
+                "arguments_json_size_bytes": len(
+                    canonical_json_dumps(arguments_json).encode("utf-8")
+                ),
                 "arguments_storage_kind": "inline_json",
                 "arguments_inline_json": arguments_json,
                 "arguments_payload_ref": None,
@@ -572,7 +574,9 @@ def test_wait_resolution_tool_trace_summarizes_request_and_result_details(
                 "tool_schema_digest": "sha256:schema",
                 "tool_identity_digest": "sha256:identity",
                 "normalized_arguments_digest": arguments_digest,
-                "arguments_json_size_bytes": 72,
+                "arguments_json_size_bytes": len(
+                    canonical_json_dumps(arguments_json).encode("utf-8")
+                ),
                 "arguments_storage_kind": "inline_json",
                 "arguments_inline_json": arguments_json,
                 "arguments_payload_ref": None,

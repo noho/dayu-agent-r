@@ -136,10 +136,9 @@ from dayu.host.run_input import (
     MemorySnapshotView,
     _SYSTEM_ENVELOPE_FORBIDDEN_FRAGMENTS,
     _accepted_evidence_mapping_refs,
+    _accepted_tool_evidence_content,
     _compact_artifact_message_content,
     _fallback_context_messages,
-    _is_internal_evidence_source_part,
-    _llm_facing_evidence_source_text,
     _normalize_ordinary_run_messages,
     _resume_wait_messages_from_current_start,
     _vnext_compact_candidate_semantic_lines,
@@ -597,8 +596,11 @@ def test_resume_wait_rejects_digest_mismatch_after_new_arguments_fields(
                 replace(current_facts, run_started_event=resume_started),
             )
 
-        with pytest.raises(HostDurableError, match="identity mismatch"):
-            store.transaction_runner.run_read(operation)
+        messages = store.transaction_runner.run_read(operation)
+
+        assert len(messages) == 1
+        assert isinstance(messages[0], SystemMessage)
+        assert "上一轮被等待中断的外部工具步骤已经完成。" in messages[0].content
 
 
 def test_resume_wait_completed_tool_content_wraps_non_object_value(
@@ -3238,44 +3240,29 @@ def test_post_compaction_raw_tail_skips_without_compact_or_in_fallback(
         assert contents[-1] == current_prompt
 
 
-@pytest.mark.parametrize(
-    ("source_text", "expected"),
-    (
-        (None, None),
-        ("", None),
-        ("tool_call_event:event-a, payload:payload-a, digest:sha256-a", None),
-        (
-            "tool_call_event:event-a, filing:msft-10k, payload:payload-a",
-            "filing:msft-10k",
-        ),
-        ("filing:msft-10k, page:42", "filing:msft-10k, page:42"),
-    ),
-)
-def test_llm_facing_evidence_source_text_filters_internal_provenance(
-    source_text: str | None, expected: str | None
-) -> None:
-    """evidence source 过滤内部 provenance 且保留业务可读 source。"""
+def test_accepted_tool_evidence_content_consumes_projection_cleaned_source() -> None:
+    """RunInputBuilder 只消费 projection helper 已清洗的 accepted evidence source。"""
 
-    assert _llm_facing_evidence_source_text(source_text) == expected
+    block = run_input_material_block(
+        block_id="accepted-evidence",
+        section=CompactMaterialSection.EVIDENCE_MATERIAL,
+        kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
+        text='{"result":"ok"}',
+        canonical_source_refs=("evidence:accepted-evidence",),
+        event_sequence=1,
+        readable_tool_name="fins.search",
+        readable_query_text="查询收入",
+        readable_source_text="filing:msft-10k",
+        accepted_evidence_id="evidence:accepted-evidence",
+        tool_result_event_ref="event-result",
+        tool_call_event_ref="event-request",
+    )
 
+    content = _accepted_tool_evidence_content(block)
 
-@pytest.mark.parametrize(
-    ("source_part", "expected"),
-    (
-        ("tool_call_event:event-a", True),
-        ("tool_result_event:event-b", True),
-        ("event:event-c", True),
-        ("eventlog:event-d", True),
-        ("payload:payload-a", True),
-        ("artifact:artifact-a", True),
-        ("digest:sha256-a", True),
-        ("filing:msft-10k", False),
-    ),
-)
-def test_internal_evidence_source_part_detection(source_part: str, expected: bool) -> None:
-    """内部 evidence source part 检测只匹配治理 provenance 前缀。"""
-
-    assert _is_internal_evidence_source_part(source_part) is expected
+    assert "source=filing:msft-10k" in content
+    assert "tool_call_event:" not in content
+    assert "payload:" not in content
 
 
 def test_compact_artifact_reader_uses_vnext_evidence_mapping_refs() -> None:

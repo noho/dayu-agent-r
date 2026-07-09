@@ -45,7 +45,8 @@ from dayu.host.compaction import (
 )
 from dayu.host.context_budget import BudgetTextFragment
 from dayu.host.context_events import CONTEXT_COMPACTED, validate_context_compacted_payload
-from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
+from dayu.host.accepted_result_projection import project_accepted_tool_result
+from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import EventClass, EventLogRow, EventLogStore
 from dayu.host.durable.schema import TABLE_EVENT_LOG
@@ -54,7 +55,6 @@ from dayu.host.durable.transaction import HostRow, HostTransaction
 from dayu.host.evidence import ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH
 from dayu.host.evidence import OpaqueEvidenceRef
 from dayu.host.evidence import accepted_evidence_envelope_from_payload
-from dayu.host.evidence import accepted_tool_raw_outcome_text_from_payload
 from dayu.host.memory import (
     ConversationMemorySnapshotVNext,
     MemoryDiagnostic,
@@ -67,7 +67,6 @@ from dayu.host.memory import (
 from dayu.host.payload_resolution import (
     event_payload_object,
     event_payload_object_for_result_ref,
-    tool_call_request_atoms,
 )
 from dayu.host.terminal_payload import PayloadTextReadPolicy
 from dayu.host._terminal_answer import assistant_final_answer_continuity_text
@@ -132,15 +131,6 @@ _PAYLOAD_FIELD_REFERENCE_CONTINUITY_ITEMS = "reference_continuity_items"
 _PAYLOAD_FIELD_REASON = "reason"
 _PAYLOAD_FIELD_SOURCE_LABELS = "source_labels"
 _PAYLOAD_REF_PREFIX = "payload"
-_READABLE_SOURCE_EMPTY = "accepted tool evidence"
-_READABLE_SOURCE_SEPARATOR = ", "
-_LIMITED_SIGNAL_STATUS = "limited_signal"
-_LIMITED_SIGNAL_REASON_MISSING_ARGUMENTS = "已验收工具请求参数材料缺失"
-_LIMITED_SIGNAL_REASON_UNREADABLE_ARGUMENTS = "已验收工具请求参数材料不可验证"
-_LIMITED_SIGNAL_REASON_SOURCE_MISMATCH = "工具请求与当前证据来源不一致"
-_LIMITED_SIGNAL_DETAIL_UNAVAILABLE = "无法从已验收工具请求恢复查询参数"
-_LIMITED_SIGNAL_DETAIL_UNSAFE = "无法安全展示查询参数"
-_READABLE_ARGUMENTS_PREFIX = "工具参数: "
 _PRE_DISPATCH_BUDGET_FRAGMENT_CURRENT_REF = "current_input_anchor"
 _PRE_DISPATCH_BUDGET_FRAGMENT_PREVIOUS_PREFIX = "previous:"
 
@@ -2279,18 +2269,8 @@ def _accepted_tool_evidence_delta_blocks(
         return ()
     if envelope.evidence_id in represented_evidence_refs:
         return ()
-    result_payload = event_payload_object_for_result_ref(
-        transaction,
-        row,
-        expected_payload_ref=envelope.result_ref.payload_ref,
-        expected_payload_digest=envelope.result_ref.payload_digest,
-        payload_label=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
-    )
-    try:
-        raw_text = accepted_tool_raw_outcome_text_from_payload(result_payload)
-    except ValueError as exc:
-        raise HostDurableError("TOOL_RESULT_ACCEPTED result_preview is not allowed") from exc
-    if raw_text is None:
+    projection = project_accepted_tool_result(transaction, row)
+    if projection.result_text is None:
         raise HostDurableError("TOOL_RESULT_ACCEPTED raw_tool_outcome is missing")
     tool_call_event_ref = envelope.tool_query.tool_call_requested_event_ref
     if tool_call_event_ref is None:
@@ -2301,7 +2281,7 @@ def _accepted_tool_evidence_delta_blocks(
             block_id=f"eventlog:evidence:{row.event_id}:{envelope.evidence_id}",
             section=CompactMaterialSection.EVIDENCE_MATERIAL,
             kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
-            text=raw_text,
+            text=projection.result_text,
             canonical_source_refs=(envelope.evidence_id,),
             event_sequence=row.event_sequence,
             turn_group_id=row.run_id,
@@ -2311,123 +2291,9 @@ def _accepted_tool_evidence_delta_blocks(
             payload_refs=_payload_refs_for_event(row),
             source_locator_refs=envelope.locator_refs,
             readable_tool_name=envelope.tool_name,
-            readable_query_text=_readable_query_text_from_envelope(
-                transaction,
-                event_log_store,
-                row,
-                envelope_tool_call_id=envelope.tool_call_id,
-                envelope_tool_name=envelope.tool_name,
-                envelope_arguments_digest=envelope.tool_query.normalized_arguments_digest,
-                requested_event_ref=envelope.tool_query.tool_call_requested_event_ref,
-            ),
-            readable_source_text=_readable_source_text_from_refs(
-                (*envelope.source_refs, *envelope.locator_refs)
-            ),
+            readable_query_text=projection.query.text,
+            readable_source_text=projection.source.text,
         ),
-    )
-
-
-def _readable_query_text_from_envelope(
-    transaction: HostTransaction,
-    event_log_store: EventLogStore,
-    result_row: EventLogRow,
-    *,
-    envelope_tool_call_id: str,
-    envelope_tool_name: str,
-    envelope_arguments_digest: str,
-    requested_event_ref: str | None,
-) -> str:
-    """从 accepted request atom 构造 evidence query 可读文本。
-
-    :param transaction: 当前 Host transaction。
-    :param event_log_store: EventLog store。
-    :param result_row: TOOL_RESULT_ACCEPTED row。
-    :param envelope_tool_call_id: evidence envelope 中的 tool call id。
-    :param envelope_tool_name: evidence envelope 中的 tool name。
-    :param envelope_arguments_digest: evidence envelope 中的参数 digest。
-    :param requested_event_ref: envelope 指向的 TOOL_CALL_REQUESTED event id。
-    :returns: LLM-facing query text。
-    """
-
-    if requested_event_ref is None:
-        return _limited_signal_query_text(
-            reason=_LIMITED_SIGNAL_REASON_MISSING_ARGUMENTS,
-            detail=_LIMITED_SIGNAL_DETAIL_UNAVAILABLE,
-        )
-    request_row = event_log_store.read_event_by_id(transaction, requested_event_ref)
-    if request_row is None:
-        return _limited_signal_query_text(
-            reason=_LIMITED_SIGNAL_REASON_MISSING_ARGUMENTS,
-            detail=_LIMITED_SIGNAL_DETAIL_UNAVAILABLE,
-        )
-    if request_row.session_id != result_row.session_id:
-        return _limited_signal_query_text(
-            reason=_LIMITED_SIGNAL_REASON_SOURCE_MISMATCH,
-            detail=_LIMITED_SIGNAL_DETAIL_UNSAFE,
-        )
-    if request_row.event_type != _EVENT_TYPE_TOOL_CALL_REQUESTED:
-        return _limited_signal_query_text(
-            reason=_LIMITED_SIGNAL_REASON_SOURCE_MISMATCH,
-            detail=_LIMITED_SIGNAL_DETAIL_UNSAFE,
-        )
-    try:
-        atoms = tool_call_request_atoms(transaction, request_row)
-    except HostDurableError:
-        return _limited_signal_query_text(
-            reason=_LIMITED_SIGNAL_REASON_UNREADABLE_ARGUMENTS,
-            detail=_LIMITED_SIGNAL_DETAIL_UNAVAILABLE,
-        )
-    if (
-        atoms.tool_call_id != envelope_tool_call_id
-        or atoms.tool_name != envelope_tool_name
-        or atoms.normalized_arguments_digest != envelope_arguments_digest
-    ):
-        return _limited_signal_query_text(
-            reason=_LIMITED_SIGNAL_REASON_SOURCE_MISMATCH,
-            detail=_LIMITED_SIGNAL_DETAIL_UNSAFE,
-        )
-    if atoms.semantic_query_text is not None:
-        return _normalized_query_text(atoms.semantic_query_text)
-    return _normalized_query_text(
-        f"{_READABLE_ARGUMENTS_PREFIX}{canonical_json_dumps(atoms.arguments_json)}"
-    )
-
-
-def _limited_signal_query_text(*, reason: str, detail: str) -> str:
-    """构造 query material 的 limited-signal 文本。
-
-    :param reason: 不含内部 ref 的原因文本。
-    :param detail: 不含内部 ref 的影响说明。
-    :returns: 规范化 query 文本。
-    """
-
-    return _normalized_query_text(
-        f"状态={_LIMITED_SIGNAL_STATUS}；原因={reason}；说明={detail}"
-    )
-
-
-def _normalized_query_text(text: str) -> str:
-    """规范化 query 文本并保留完整非空内容。
-
-    :param text: 原始 query 文本。
-    :returns: 规范化后的非空 query 文本。
-    :raises ValueError: 规范化后为空时抛出。
-    """
-
-    return normalized_material_text(text)
-
-
-def _readable_source_text_from_refs(refs: tuple[OpaqueEvidenceRef, ...]) -> str:
-    """把 opaque evidence refs 映射为 LLM-facing source note。
-
-    :param refs: opaque source / locator refs。
-    :returns: source note 文本。
-    """
-
-    if len(refs) == 0:
-        return _READABLE_SOURCE_EMPTY
-    return _READABLE_SOURCE_SEPARATOR.join(
-        f"{ref.ref_kind}:{ref.ref_id}" for ref in refs
     )
 
 

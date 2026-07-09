@@ -121,12 +121,15 @@ from dayu.host.durable.state import (
     read_run_by_id,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
+from dayu.host.accepted_result_projection import (
+    AcceptedToolResultProjection,
+    project_accepted_tool_result,
+)
 from dayu.host.evidence import ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH
 from dayu.host.evidence import accepted_evidence_envelope_from_payload
 from dayu.host.payload_resolution import (
     event_payload_object,
     event_payload_object_for_result_ref,
-    tool_call_request_atoms,
 )
 from dayu.host.projection import event_log_read_filter_from_projection_filter
 from dayu.host.terminal_payload import (
@@ -229,16 +232,6 @@ _ACCEPTED_COMPACTED_VIEW_PREFIX = "Accepted compacted conversation view:"
 _RECENT_EVIDENCE_PREFIX = "Recent evidence:"
 _ACCEPTED_TOOL_EVIDENCE_PREFIX = "Accepted tool evidence:"
 _RESUME_GUIDANCE_PREFIX = "恢复上下文："
-_EVIDENCE_SOURCE_PART_SEPARATOR = ", "
-_INTERNAL_EVIDENCE_SOURCE_PREFIXES = (
-    "tool_call_event:",
-    "tool_result_event:",
-    "event:",
-    "eventlog:",
-    "payload:",
-    "artifact:",
-    "digest:",
-)
 _MEMORY_SESSION_SUMMARY_HEADER = "Session Summary Memory:"
 _MEMORY_EVIDENCE_FACT_HEADER = "Evidence / Fact Memory:"
 _MEMORY_ANSWER_ANCHOR_HEADER = "Answer Anchor Memory:"
@@ -3025,37 +3018,10 @@ def _accepted_tool_evidence_content(block: RunInputMaterialBlock) -> str:
         f"tool_name={block.readable_tool_name}",
         f"query={query_text}",
     ]
-    source_text = _llm_facing_evidence_source_text(block.readable_source_text)
-    if source_text is not None:
-        lines.append(f"source={source_text}")
+    if block.readable_source_text is not None:
+        lines.append(f"source={block.readable_source_text}")
     lines.append(f"result={block.text}")
     return "\n".join(lines)
-
-
-def _llm_facing_evidence_source_text(source_text: str | None) -> str | None:
-    """过滤 accepted evidence source note 中的内部 provenance。
-
-    :param source_text: compact material provider 给出的 source note。
-    :returns: 仅含业务可读 source locator 的文本；无可读项时返回 ``None``。
-    """
-
-    if source_text is None:
-        return None
-    parts = tuple(part.strip() for part in source_text.split(_EVIDENCE_SOURCE_PART_SEPARATOR) if part.strip() != "")
-    visible_parts = tuple(part for part in parts if not _is_internal_evidence_source_part(part))
-    if len(visible_parts) == 0:
-        return None
-    return _EVIDENCE_SOURCE_PART_SEPARATOR.join(visible_parts)
-
-
-def _is_internal_evidence_source_part(source_part: str) -> bool:
-    """判断 source note 片段是否属于内部 provenance。
-
-    :param source_part: source note 片段。
-    :returns: 内部 provenance 返回 ``True``。
-    """
-
-    return any(source_part.startswith(prefix) for prefix in _INTERNAL_EVIDENCE_SOURCE_PREFIXES)
 
 
 def _run_input_message_content(message: AgentMessage) -> str:
@@ -3866,13 +3832,12 @@ def _resume_wait_messages_from_current_start(
         expected_type=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
     )
     payload = _payload_object(tool_result_event)
+    projection = project_accepted_tool_result(transaction, tool_result_event)
     accepted_arguments = _resume_wait_accepted_arguments(
-        transaction,
-        tool_result_payload=payload,
-        tool_result_event=tool_result_event,
+        projection=projection,
     )
     if accepted_arguments is None:
-        return (_resume_wait_fallback_message(payload),)
+        return (_resume_wait_fallback_message(payload, projection),)
     tool_call_id = _required_payload_text(payload, field_name=_PAYLOAD_FIELD_TOOL_CALL_ID)
     tool_name = _required_payload_text(payload, field_name=_PAYLOAD_FIELD_TOOL_NAME)
     return (
@@ -3898,10 +3863,14 @@ def _resume_wait_messages_from_current_start(
     )
 
 
-def _resume_wait_fallback_message(payload: Mapping[str, JsonValue]) -> SystemMessage:
+def _resume_wait_fallback_message(
+    payload: Mapping[str, JsonValue],
+    projection: AcceptedToolResultProjection,
+) -> SystemMessage:
     """构造缺少工具参数时的 resume system guidance。
 
     :param payload: ``TOOL_RESULT_ACCEPTED`` payload。
+    :param projection: accepted result 共享投影。
     :returns: 自解释 resume guidance system message。
     """
 
@@ -3911,7 +3880,7 @@ def _resume_wait_fallback_message(payload: Mapping[str, JsonValue]) -> SystemMes
             _RESUME_GUIDANCE_PREFIX,
             "上一轮被等待中断的外部工具步骤已经完成。",
             f"完成的工具：{_required_payload_text(payload, field_name=_PAYLOAD_FIELD_TOOL_NAME)}",
-            f"完成状态：{_required_payload_text(payload, field_name='resolution_kind')}",
+            f"完成状态：{projection.status.value}",
             f"工具结果：{result_text}",
             ("这是同一次用户请求中已完成的工具结果。继续回答用户；不要为了" "同一次请求再次启动相同下载、上传或处理。"),
         )
@@ -3920,80 +3889,24 @@ def _resume_wait_fallback_message(payload: Mapping[str, JsonValue]) -> SystemMes
 
 
 def _resume_wait_accepted_arguments(
-    transaction: HostTransaction,
     *,
-    tool_result_payload: Mapping[str, JsonValue],
-    tool_result_event: EventLogRow,
+    projection: AcceptedToolResultProjection,
 ) -> Mapping[str, JsonValue] | None:
     """读取 resume 等待工具调用的 LLM-safe request atom 参数。
 
-    :param transaction: Host durable transaction。
-    :param tool_result_payload: ``TOOL_RESULT_ACCEPTED`` payload。
-    :param tool_result_event: ``TOOL_RESULT_ACCEPTED`` event row。
+    :param projection: accepted result 共享投影。
     :returns: LLM-safe replay 工具参数；缺少 accepted evidence envelope 或 request
         atom 时返回 ``None``。
-    :raises HostDurableError: envelope、request atom 或 digest 结构损坏时抛出。
+    :raises HostDurableError: request arguments 结构非法时抛出。
     """
 
-    try:
-        envelope = accepted_evidence_envelope_from_payload(
-            tool_result_payload,
-            producer_event_ref=tool_result_event.event_id,
-        )
-    except ValueError as exc:
-        if str(exc) == ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH:
-            raise HostDurableError(str(exc)) from exc
-        raise HostDurableError("resume wait accepted evidence envelope is invalid") from exc
-    if envelope is None:
+    if projection.request_arguments_json is None:
         return None
-    request_event_ref = envelope.tool_query.tool_call_requested_event_ref
-    if request_event_ref is None:
-        return None
-    request_event = read_event_by_id(transaction, request_event_ref)
-    if request_event is None:
-        return None
-    if not _resume_wait_request_event_matches_result(
-        request_event=request_event,
-        result_event=tool_result_event,
-    ):
-        raise HostDurableError("resume wait request atom event type mismatch")
-    atoms = tool_call_request_atoms(transaction, request_event)
-    if (
-        atoms.tool_call_id != envelope.tool_call_id
-        or atoms.tool_name != envelope.tool_name
-        or atoms.normalized_arguments_digest
-        != envelope.tool_query.normalized_arguments_digest
-    ):
-        raise HostDurableError("resume wait request atom identity mismatch")
-    value = atoms.arguments_json.get(_PAYLOAD_FIELD_ARGUMENTS)
+    value = projection.request_arguments_json.get(_PAYLOAD_FIELD_ARGUMENTS)
     if not isinstance(value, Mapping):
         raise HostDurableError("resume wait request arguments must be object")
     accepted_arguments = dict(value)
     return accepted_arguments
-
-
-def _resume_wait_request_event_matches_result(
-    *, request_event: EventLogRow, result_event: EventLogRow
-) -> bool:
-    """校验 resume request atom 与 wait result 属于同一工具调用上下文。
-
-    :param request_event: ``TOOL_CALL_REQUESTED`` row。
-    :param result_event: ``TOOL_RESULT_ACCEPTED`` row。
-    :returns: 身份上下文相容时返回 ``True``。
-    """
-
-    if (
-        request_event.event_class is not EventClass.CANONICAL_FACT
-        or request_event.event_type != _EVENT_TYPE_TOOL_CALL_REQUESTED
-        or request_event.session_id != result_event.session_id
-        or request_event.run_id != result_event.run_id
-        or request_event.attempt_id != result_event.attempt_id
-    ):
-        return False
-    return (
-        request_event.execution_id == result_event.execution_id
-        or result_event.execution_id is None
-    )
 
 
 def _resume_wait_tool_message_content(

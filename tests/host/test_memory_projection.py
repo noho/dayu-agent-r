@@ -61,8 +61,10 @@ from dayu.host.evidence import (
     AcceptedEvidenceToolQuery,
     accepted_evidence_envelope_to_json_value,
 )
-from dayu.host.memory import (
+from dayu.host.accepted_result_projection import (
     ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT,
+)
+from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
     ConversationMemorySnapshotVNext,
     MemoryDiagnosticReason,
@@ -214,6 +216,9 @@ def _event(
     *,
     run_id: str | None = _RUN_ID,
     evidence_query_text: str | None = None,
+    evidence_tool_name: str | None = None,
+    evidence_result_text: str | None = None,
+    evidence_source_text: str | None = None,
 ) -> MemoryProjectionEvent:
     """构造 memory projection event。
 
@@ -223,6 +228,9 @@ def _event(
     :param payload: canonical payload。
     :param run_id: Host Run id。
     :param evidence_query_text: 可选 LLM-safe 工具 request / query 文本。
+    :param evidence_tool_name: 可选 projection 工具名。
+    :param evidence_result_text: 可选 projection 结果文本。
+    :param evidence_source_text: 可选 projection source 文本。
     :returns: memory projection event。
     """
 
@@ -240,6 +248,9 @@ def _event(
         payload_digest=None,
         payload=payload,
         evidence_query_text=evidence_query_text,
+        evidence_tool_name=evidence_tool_name,
+        evidence_result_text=evidence_result_text,
+        evidence_source_text=evidence_source_text,
     )
 
 
@@ -894,10 +905,10 @@ def test_selected_recent_window_floor_protects_recent_run_groups() -> None:
     assert tuple(item.text for item in selected) == (
         "mid user",
         "mid answer",
-        "工具结果已接受；原始工具响应不可用。",
+        "工具结果已接受；可读投影字段缺失，未展开原始工具响应。",
         "new user",
         "new answer",
-        "工具结果已接受；原始工具响应不可用。",
+        "工具结果已接受；可读投影字段缺失，未展开原始工具响应。",
     )
 
 
@@ -1214,6 +1225,10 @@ def test_accepted_tool_evidence_includes_query_and_raw_outcome_without_refs() ->
                     },
                 },
                 evidence_query_text="查询 DAYU 的业务事实",
+                evidence_tool_name="lookup_mock_fact",
+                evidence_result_text=canonical_json_dumps(
+                    {"status": "ok", "text": "tool fact accepted"}
+                ),
             ),
         ),
         session_id=_SESSION_ID,
@@ -1274,6 +1289,10 @@ def test_accepted_tool_evidence_disambiguates_raw_result_with_request_query() ->
                     "raw_tool_outcome": {"total": 0, "documents": []},
                 },
                 evidence_query_text="读取 ticker=COIN 的财报列表",
+                evidence_tool_name="list_documents",
+                evidence_result_text=canonical_json_dumps(
+                    {"total": 0, "documents": []}
+                ),
             ),
         ),
         session_id=_SESSION_ID,
@@ -1304,11 +1323,11 @@ def test_accepted_tool_evidence_disambiguates_raw_result_with_request_query() ->
         assert fragment not in text
 
 
-def test_accepted_tool_evidence_rejects_result_preview() -> None:
-    """accepted tool evidence 出现旧 preview 字段时不生成 memory continuity。
+def test_accepted_tool_evidence_missing_projection_fields_fail_closed() -> None:
+    """accepted tool evidence 缺 projection 字段时不从 payload 重建。
 
     :returns: ``None``。
-    :raises AssertionError: projection 未拒绝 preview 字段时抛出。
+    :raises AssertionError: memory 从 payload 重建 accepted evidence 时抛出。
     """
 
     policy = _policy()
@@ -1335,31 +1354,94 @@ def test_accepted_tool_evidence_rejects_result_preview() -> None:
         source_refs=(),
     )
 
-    with pytest.raises(ValueError, match="result_preview"):
-        build_conversation_memory_snapshot_from_events(
-            events=(
-                _event(
-                    1,
-                    event_id,
-                    "TOOL_RESULT_ACCEPTED",
-                    {
-                        "accepted_evidence_envelope": (
-                            accepted_evidence_envelope_to_json_value(envelope)
-                        ),
-                        "raw_tool_outcome": {
-                            "status": "ok",
-                            "text": "tool fact accepted",
-                        },
-                        "result_preview": "preview must be rejected",
+    snapshot = build_conversation_memory_snapshot_from_events(
+        events=(
+            _event(
+                1,
+                event_id,
+                "TOOL_RESULT_ACCEPTED",
+                {
+                    "accepted_evidence_envelope": (
+                        accepted_evidence_envelope_to_json_value(envelope)
+                    ),
+                    "raw_tool_outcome": {
+                        "status": "ok",
+                        "text": "tool fact accepted",
                     },
-                    evidence_query_text="查询 DAYU 的业务事实",
-                ),
+                    "result_preview": "preview must not be read by memory",
+                },
+                evidence_query_text="查询 DAYU 的业务事实",
             ),
-            session_id=_SESSION_ID,
-            consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
-            policy=policy,
-            built_at=_NOW,
-        )
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+
+    text = snapshot.trace_memory.selected_recent_window[0].text
+    assert text == "工具结果已接受；可读投影字段缺失，未展开原始工具响应。"
+    assert "lookup_mock_fact" not in text
+    assert "tool fact accepted" not in text
+    assert "preview must not be read" not in text
+
+
+def test_accepted_tool_evidence_uses_projection_fields_without_payload_rebuild() -> None:
+    """Conversation Memory 使用 projection 字段，缺字段时不重建工具证据。"""
+
+    policy = _policy()
+    payload: dict[str, JsonValue] = {
+        "tool_name": "payload_tool_must_not_leak",
+        "raw_tool_outcome": {"text": "payload result must not leak"},
+    }
+    projected_snapshot = build_conversation_memory_snapshot_from_events(
+        events=(
+            _event(
+                1,
+                "event-tool-result-projected-memory",
+                "TOOL_RESULT_ACCEPTED",
+                payload,
+                evidence_query_text="projection query",
+                evidence_tool_name="projection_tool",
+                evidence_result_text=canonical_json_dumps({"text": "projection result"}),
+                evidence_source_text="filing:projection",
+            ),
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+    missing_fields_snapshot = build_conversation_memory_snapshot_from_events(
+        events=(
+            _event(
+                1,
+                "event-tool-result-missing-projection-memory",
+                "TOOL_RESULT_ACCEPTED",
+                payload,
+                evidence_query_text="projection query",
+            ),
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+
+    projected_text = projected_snapshot.trace_memory.selected_recent_window[0].text
+    missing_fields_text = (
+        missing_fields_snapshot.trace_memory.selected_recent_window[0].text
+    )
+    assert "projection_tool" in projected_text
+    assert "projection query" in projected_text
+    assert "projection result" in projected_text
+    assert "filing:projection" in projected_text
+    assert missing_fields_text == (
+        "工具结果已接受；可读投影字段缺失，未展开原始工具响应。"
+    )
+    for forbidden in ("payload_tool_must_not_leak", "payload result must not leak"):
+        assert forbidden not in projected_text
+        assert forbidden not in missing_fields_text
 
 
 def test_accepted_compact_limits_evidence_facts_and_records_budget_diagnostic() -> None:
@@ -1865,6 +1947,7 @@ def test_projection_consumer_uses_limited_query_without_semantic_query(
     arguments_json: Mapping[str, JsonValue] = {"arguments": {"ticker": "MSFT"}}
     arguments_digest = sha256_digest_json(arguments_json)
     semantic_input_digest = sha256_digest_json({"semantic_input": "MSFT"})
+    latest = None
     with open_host_durable_store(_options(tmp_path)) as store:
         store.transaction_runner.run_write(
             lambda transaction: _append_tool_request_and_result_events(
@@ -1903,17 +1986,14 @@ def test_projection_consumer_uses_limited_query_without_semantic_query(
             )
         )
 
-        assert latest is not None
-        text = latest.snapshot.trace_memory.selected_recent_window[0].text
-        assert _FAIL_SAFE_LIMITED_QUERY_TEXT in text
-        assert '"total":1' in text
-        assert "MSFT" not in text
-        assert "arguments" not in text
-        assert "ticker" not in text
-        assert request_event_id not in text
-        assert result_event_id not in text
-        assert tool_call_id not in text
-        assert "sha256:" not in text
+    assert latest is not None
+    text = latest.snapshot.trace_memory.selected_recent_window[0].text
+    assert '参数：{"arguments":{"ticker":"MSFT"}}' in text
+    assert '"total":1' in text
+    assert request_event_id not in text
+    assert result_event_id not in text
+    assert tool_call_id not in text
+    assert "sha256:" not in text
 
 
 @pytest.mark.parametrize(

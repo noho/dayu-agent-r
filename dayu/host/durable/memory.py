@@ -38,8 +38,8 @@ from dayu.host.durable.schema import (
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction
 from dayu.host.context_events import CONTEXT_COMPACTED
+from dayu.host.accepted_result_projection import project_accepted_tool_result
 from dayu.host.memory import (
-    ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT,
     CONVERSATION_MEMORY_CONSUMER_ID,
     AnswerAnchor,
     ConversationMemorySnapshotVNext,
@@ -67,14 +67,9 @@ from dayu.host.terminal_payload import (
     PayloadTextReadPolicy,
     assistant_final_answer_text_from_run_payload,
 )
-from dayu.host.evidence import (
-    ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH,
-    AcceptedEvidenceEnvelope,
-    accepted_evidence_envelope_from_payload,
-)
+from dayu.host.evidence import accepted_evidence_envelope_from_payload
 from dayu.host.payload_resolution import (
     event_payload_object_for_result_ref,
-    tool_call_request_atoms,
 )
 from dayu.host.projection import (
     ProjectionApplyResult,
@@ -84,7 +79,7 @@ from dayu.host.projection import (
     ProjectionEventFilter,
     ProjectionEventView,
 )
-from dayu.host.durable.event_log import EventClass, EventLogRow, read_event_by_id
+from dayu.host.durable.event_log import EventClass, EventLogRow
 
 _ZERO_CURSOR_SEQUENCE = 0
 _ITEM_KIND_EVIDENCE_BACKED_FACT = "evidence_backed_fact"
@@ -115,10 +110,16 @@ class _MemoryProjectionPayloadView:
 
     :param payload: memory projection 消费的 payload。
     :param evidence_query_text: 可选 LLM-safe request / query 文本。
+    :param evidence_tool_name: 可选工具名。
+    :param evidence_result_text: 可选 LLM-safe 工具结果文本。
+    :param evidence_source_text: 可选业务可读 source 文本。
     """
 
     payload: Mapping[str, JsonValue]
     evidence_query_text: str | None
+    evidence_tool_name: str | None
+    evidence_result_text: str | None
+    evidence_source_text: str | None
 
 
 class MemorySnapshotIntegrityFailureKind(StrEnum):
@@ -360,6 +361,9 @@ def _memory_projection_event_from_view(
         payload_digest=event.payload_digest,
         payload=payload_view.payload,
         evidence_query_text=payload_view.evidence_query_text,
+        evidence_tool_name=payload_view.evidence_tool_name,
+        evidence_result_text=payload_view.evidence_result_text,
+        evidence_source_text=payload_view.evidence_source_text,
     )
 
 
@@ -380,6 +384,9 @@ def _memory_projection_payload_view(
         return _MemoryProjectionPayloadView(
             payload=event.payload,
             evidence_query_text=None,
+            evidence_tool_name=None,
+            evidence_result_text=None,
+            evidence_source_text=None,
         )
     if (
         assistant_final_answer_text_from_run_payload(
@@ -391,6 +398,9 @@ def _memory_projection_payload_view(
         return _MemoryProjectionPayloadView(
             payload=event.payload,
             evidence_query_text=None,
+            evidence_tool_name=None,
+            evidence_result_text=None,
+            evidence_source_text=None,
         )
     final_answer = assistant_final_answer_continuity_text(
         transaction,
@@ -401,12 +411,18 @@ def _memory_projection_payload_view(
         return _MemoryProjectionPayloadView(
             payload=event.payload,
             evidence_query_text=None,
+            evidence_tool_name=None,
+            evidence_result_text=None,
+            evidence_source_text=None,
         )
     merged: dict[str, JsonValue] = dict(event.payload)
     merged[_PAYLOAD_FIELD_FINAL_ANSWER] = final_answer
     return _MemoryProjectionPayloadView(
         payload=merged,
         evidence_query_text=None,
+        evidence_tool_name=None,
+        evidence_result_text=None,
+        evidence_source_text=None,
     )
 
 
@@ -422,110 +438,39 @@ def _tool_result_memory_payload_view(
     :raises HostDurableError: envelope 或 payload descriptor 损坏时抛出。
     """
 
-    try:
-        envelope = accepted_evidence_envelope_from_payload(
-            event.payload,
-            producer_event_ref=event.event_id,
-        )
-    except ValueError as exc:
-        if str(exc) == ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH:
-            raise HostDurableError(str(exc)) from exc
-        raise HostDurableError("canonical evidence envelope is invalid") from exc
-    if envelope is None:
+    result_row = _event_row_from_projection_event(event)
+    projection = project_accepted_tool_result(
+        transaction,
+        result_row,
+        resolved_payload=event.payload,
+    )
+    if not projection.envelope_available:
         return _MemoryProjectionPayloadView(
             payload=event.payload,
-            evidence_query_text=None,
+            evidence_query_text=projection.query.text,
+            evidence_tool_name=projection.tool_name,
+            evidence_result_text=projection.result_text,
+            evidence_source_text=projection.source.text,
         )
-    result_row = _event_row_from_projection_event(event)
-    if envelope.result_ref.payload_ref is None:
-        if event.payload_ref is not None:
-            raise HostDurableError(
-                f"{_EVENT_TYPE_TOOL_RESULT_ACCEPTED} payload ref mismatch"
-            )
-        payload = event.payload
-    else:
-        payload = event_payload_object_for_result_ref(
-            transaction,
-            result_row,
-            expected_payload_ref=envelope.result_ref.payload_ref,
-            expected_payload_digest=envelope.result_ref.payload_digest,
-            payload_label=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
-        )
+    envelope = accepted_evidence_envelope_from_payload(
+        event.payload,
+        producer_event_ref=event.event_id,
+    )
+    if envelope is None:
+        raise HostDurableError("canonical evidence envelope is missing")
+    payload = event_payload_object_for_result_ref(
+        transaction,
+        result_row,
+        expected_payload_ref=envelope.result_ref.payload_ref,
+        expected_payload_digest=envelope.result_ref.payload_digest,
+        payload_label=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
+    )
     return _MemoryProjectionPayloadView(
         payload=payload,
-        evidence_query_text=_tool_result_query_text(
-            transaction,
-            result_row,
-            envelope,
-        ),
-    )
-
-
-def _tool_result_query_text(
-    transaction: HostTransaction,
-    result_row: EventLogRow,
-    envelope: AcceptedEvidenceEnvelope,
-) -> str:
-    """从对应 ``TOOL_CALL_REQUESTED`` atom 读取 LLM-safe query 文本。
-
-    :param transaction: Host transaction。
-    :param result_row: 当前 ``TOOL_RESULT_ACCEPTED`` row view。
-    :param envelope: 当前 accepted evidence envelope。
-    :returns: LLM-facing request / query 文本；不可安全读取时返回低信号文本。
-    """
-
-    requested_event_ref = envelope.tool_query.tool_call_requested_event_ref
-    if requested_event_ref is None:
-        return ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT
-    request_row = read_event_by_id(transaction, requested_event_ref)
-    if request_row is None:
-        return ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT
-    if (
-        request_row.session_id != result_row.session_id
-        or not _same_run_attempt_compatible_execution(request_row, result_row)
-        or request_row.event_class != EventClass.CANONICAL_FACT
-        or request_row.event_type != _EVENT_TYPE_TOOL_CALL_REQUESTED
-    ):
-        return ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT
-    try:
-        atoms = tool_call_request_atoms(transaction, request_row)
-    except HostDurableError:
-        return ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT
-    if (
-        atoms.tool_call_id != envelope.tool_call_id
-        or atoms.tool_name != envelope.tool_name
-        or atoms.normalized_arguments_digest
-        != envelope.tool_query.normalized_arguments_digest
-    ):
-        return ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT
-    if atoms.semantic_query_text is not None:
-        return atoms.semantic_query_text
-    return ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT
-
-
-def _same_run_attempt_compatible_execution(
-    request_row: EventLogRow, result_row: EventLogRow
-) -> bool:
-    """判断 request atom 与 result row 是否属于同一工具调用上下文。
-
-    wait-resolution ``TOOL_RESULT_ACCEPTED`` 由 Run transition 写在 suspended
-    attempt 上，EventLog row 的 ``execution_id`` 可为空；对应 request atom
-    仍保留产生等待时的 execution id。这里允许 result execution 为空，但仍要求
-    run / attempt 相同，避免跨 attempt 拼接 request 与 result。
-
-    :param request_row: ``TOOL_CALL_REQUESTED`` row。
-    :param result_row: ``TOOL_RESULT_ACCEPTED`` row。
-    :returns: run / attempt 相同且 execution 精确匹配或 result execution 为空时
-        返回 ``True``。
-    """
-
-    return (
-        request_row.run_id == result_row.run_id
-        and request_row.attempt_id == result_row.attempt_id
-        and (
-            request_row.execution_id == result_row.execution_id
-            or result_row.execution_id is None
-        )
+        evidence_query_text=projection.query.text,
+        evidence_tool_name=projection.tool_name,
+        evidence_result_text=projection.result_text,
+        evidence_source_text=projection.source.text,
     )
 
 

@@ -32,6 +32,9 @@ from dayu.host.compact_material import (
     selected_material_source_refs,
     selected_material_view_digest,
 )
+from dayu.host.accepted_result_projection import (
+    ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT,
+)
 from dayu.host.compact_payload import (
     accepted_evidence_mapping_refs_for_candidate,
     prompt_local_label_mapping_refs,
@@ -72,17 +75,6 @@ _REACTIVE_SINGLE_PASS_REASON = "reactive_single_pass_block"
 _REACTIVE_NOT_IN_PASS_REASON = "not_in_pass"
 _RECENT_EVIDENCE_PREFIX = "Recent accepted tool evidence:"
 _ACCEPTED_TOOL_EVIDENCE_PREFIX = "Accepted tool evidence:"
-_UNAVAILABLE_TOOL_QUERY = "The original tool query is not available in readable form."
-_EVIDENCE_SOURCE_PART_SEPARATOR = ", "
-_INTERNAL_EVIDENCE_SOURCE_PREFIXES = (
-    "tool_call_event:",
-    "tool_result_event:",
-    "event:",
-    "eventlog:",
-    "payload:",
-    "artifact:",
-    "digest:",
-)
 
 
 class MemorySnapshotView(Protocol):
@@ -1117,7 +1109,7 @@ def _accepted_tool_evidence_content(block: RunInputMaterialBlock) -> str:
     if block.readable_tool_name is None:
         raise HostDurableError("accepted tool evidence requires readable tool name")
     query_text = (
-        _UNAVAILABLE_TOOL_QUERY
+        ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT
         if block.readable_query_text is None
         else block.readable_query_text
     )
@@ -1126,49 +1118,10 @@ def _accepted_tool_evidence_content(block: RunInputMaterialBlock) -> str:
         f"tool_name={block.readable_tool_name}",
         f"query={query_text}",
     ]
-    source_text = _llm_facing_evidence_source_text(block.readable_source_text)
-    if source_text is not None:
-        lines.append(f"source={source_text}")
+    if block.readable_source_text is not None:
+        lines.append(f"source={block.readable_source_text}")
     lines.append(f"result={block.text}")
     return "\n".join(lines)
-
-
-def _llm_facing_evidence_source_text(source_text: str | None) -> str | None:
-    """过滤 accepted evidence source note 中的内部 provenance。
-
-    :param source_text: compact material provider 给出的 source note。
-    :returns: 仅含业务可读 source locator 的文本；无可读项时返回 ``None``。
-    """
-
-    if source_text is None:
-        return None
-    parts = tuple(
-        part.strip()
-        for part in source_text.split(_EVIDENCE_SOURCE_PART_SEPARATOR)
-        if part.strip() != ""
-    )
-    visible_parts = tuple(
-        part for part in parts if not _is_internal_evidence_source_part(part)
-    )
-    if len(visible_parts) == 0:
-        return None
-    return _EVIDENCE_SOURCE_PART_SEPARATOR.join(visible_parts)
-
-
-def _is_internal_evidence_source_part(source_part: str) -> bool:
-    """判断 source note 分片是否为内部 provenance。
-
-    :param source_part: ``readable_source_text`` 的逗号分片。
-    :returns: 属于内部 ref / digest / artifact 标识时返回 ``True``。
-    """
-
-    normalized = source_part.strip().lower()
-    if normalized == "":
-        return True
-    return any(
-        normalized.startswith(prefix)
-        for prefix in _INTERNAL_EVIDENCE_SOURCE_PREFIXES
-    )
 
 
 __all__ = [

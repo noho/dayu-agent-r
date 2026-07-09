@@ -329,8 +329,8 @@ def test_ordinary_protected_raw_tail_selects_recent_group_and_memory_dedupes() -
     assert deduped.messages == ()
 
 
-def test_ordinary_protected_raw_tail_filters_internal_evidence_source() -> None:
-    """ordinary raw-tail evidence message 不暴露内部 provenance refs。"""
+def test_ordinary_protected_raw_tail_consumes_projection_cleaned_source() -> None:
+    """ordinary raw-tail evidence message 消费 projection-cleaned source。"""
 
     snapshot = _source_snapshot(ContextCompactionTriggerSource.PROACTIVE)
     evidence = run_input_material_block(
@@ -347,10 +347,7 @@ def test_ordinary_protected_raw_tail_filters_internal_evidence_source() -> None:
         payload_refs=("payload-new",),
         readable_tool_name="fins.search",
         readable_query_text="query new",
-        readable_source_text=(
-            "event:event-tool-result-new, filing page 12, "
-            "payload:payload-new"
-        ),
+        readable_source_text="filing page 12",
     )
     raw_tail_snapshot = replace(
         snapshot,

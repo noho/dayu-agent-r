@@ -16,10 +16,6 @@ from typing import Protocol, TypeAlias, TypeVar
 from dayu.contracts.json_value import JsonValue
 from dayu.host.context_events import CONTEXT_COMPACTED as _EVENT_TYPE_CONTEXT_COMPACTED
 from dayu.host.durable.codec import sha256_digest_json
-from dayu.host.evidence import (
-    accepted_evidence_envelope_from_payload,
-    accepted_tool_raw_outcome_text_from_payload,
-)
 from dayu.host.terminal_payload import (
     PayloadTextReadPolicy,
     assistant_final_answer_text_from_run_payload,
@@ -99,8 +95,6 @@ _PAYLOAD_FIELD_DIAGNOSTICS = "diagnostics"
 _PAYLOAD_FIELD_MESSAGE = "message"
 _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS = "accepted_evidence_mapping_refs"
 _PAYLOAD_FIELD_COMPACT_ARTIFACT_REF = "compact_artifact_ref"
-ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT = "查询语义不可用；参数未安全展开。"
-"""Accepted tool evidence 缺少 LLM-safe request / query 语义时的文本。"""
 
 _MemoryItemT = TypeVar("_MemoryItemT", bound="_MemoryItemWithId")
 
@@ -969,6 +963,9 @@ class MemoryProjectionEvent:
     :param payload_digest: 可选 payload digest。
     :param payload: 已解析 canonical payload。
     :param evidence_query_text: 可选 LLM-safe 工具 request / query 文本。
+    :param evidence_tool_name: 可选工具名。
+    :param evidence_result_text: 可选 LLM-safe 工具结果文本。
+    :param evidence_source_text: 可选业务可读工具 source 文本。
     """
 
     event_sequence: int
@@ -984,6 +981,9 @@ class MemoryProjectionEvent:
     payload_digest: str | None
     payload: Mapping[str, JsonValue]
     evidence_query_text: str | None = None
+    evidence_tool_name: str | None = None
+    evidence_result_text: str | None = None
+    evidence_source_text: str | None = None
 
     def __post_init__(self) -> None:
         """校验 projection event。
@@ -1007,6 +1007,9 @@ class MemoryProjectionEvent:
         if (self.payload_ref is None) != (self.payload_digest is None):
             raise ValueError("payload_ref and payload_digest must be paired")
         _require_optional_non_empty(self.evidence_query_text, "evidence_query_text")
+        _require_optional_non_empty(self.evidence_tool_name, "evidence_tool_name")
+        _require_optional_non_empty(self.evidence_result_text, "evidence_result_text")
+        _require_optional_non_empty(self.evidence_source_text, "evidence_source_text")
 
 
 def default_memory_projection_policy(
@@ -1684,37 +1687,49 @@ def _selected_evidence_text(event: MemoryProjectionEvent) -> str:
 
     :param event: ``TOOL_RESULT_ACCEPTED`` projection event。
     :returns: 工具结果的业务可读文本或无内部引用的 limited-signal 文本。
-    :raises ValueError: accepted evidence envelope 或旧 result preview 非法时抛出。
+    :raises ValueError: 当前实现不从 payload 重建 evidence 文本。
     """
 
-    envelope = accepted_evidence_envelope_from_payload(
-        event.payload,
-        producer_event_ref=event.event_id,
+    if event.evidence_tool_name is not None and event.evidence_result_text is not None:
+        return _accepted_evidence_readable_text(
+            tool_name=event.evidence_tool_name,
+            query_text=(
+                event.evidence_query_text
+                if event.evidence_query_text is not None
+                else _accepted_evidence_query_unavailable_text()
+            ),
+            response_text=event.evidence_result_text,
+            source_text=event.evidence_source_text,
+        )
+    return "工具结果已接受；可读投影字段缺失，未展开原始工具响应。"
+
+
+def _accepted_evidence_query_unavailable_text() -> str:
+    """读取 accepted-result projection owner 定义的 unavailable query 文案。
+
+    该局部导入只用于打断 ``dayu.host.api -> dayu.host.memory`` bootstrap
+    阶段与 durable EventLog helper 的循环导入；文案真源仍在
+    ``dayu.host.accepted_result_projection``。
+
+    :returns: LLM-facing unavailable query 文案。
+    """
+
+    from dayu.host.accepted_result_projection import (  # noqa: PLC0415
+        ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT,
     )
-    if envelope is not None:
-        raw_text = accepted_tool_raw_outcome_text_from_payload(event.payload)
-        if raw_text is not None:
-            return _accepted_evidence_readable_text(
-                tool_name=envelope.tool_name,
-                query_text=(
-                    event.evidence_query_text
-                    if event.evidence_query_text is not None
-                    else ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT
-                ),
-                response_text=raw_text,
-            )
-        raise ValueError("TOOL_RESULT_ACCEPTED raw_tool_outcome is missing")
-    return "工具结果已接受；原始工具响应不可用。"
+
+    return ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT
 
 
 def _accepted_evidence_readable_text(
-    *, tool_name: str, query_text: str, response_text: str
+    *, tool_name: str, query_text: str, response_text: str, source_text: str | None
 ) -> str:
     """构造自解释的 LLM-facing accepted evidence 文本。
 
     :param tool_name: 工具名。
     :param query_text: LLM-safe request / query 文本。
     :param response_text: 工具结果响应文本。
+    :param source_text: 可选业务可读 source 文本。
     :returns: 自解释工具证据文本。
     :raises ValueError: 任一文本为空时抛出。
     """
@@ -1722,13 +1737,15 @@ def _accepted_evidence_readable_text(
     _require_non_empty(tool_name, "tool_name")
     _require_non_empty(query_text, "query_text")
     _require_non_empty(response_text, "response_text")
-    return "\n".join(
-        (
-            f"工具：{tool_name}",
-            f"查询：{query_text}",
-            f"结果：{response_text}",
-        )
-    )
+    lines = [
+        f"工具：{tool_name}",
+        f"查询：{query_text}",
+    ]
+    if source_text is not None:
+        _require_non_empty(source_text, "source_text")
+        lines.append(f"来源：{source_text}")
+    lines.append(f"结果：{response_text}")
+    return "\n".join(lines)
 
 
 def _accepted_candidate_mapping(
@@ -3315,7 +3332,6 @@ def _required_mapping_list(
 
 
 __all__ = [
-    "ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT",
     "CONVERSATION_MEMORY_CONSUMER_ID",
     "CONVERSATION_MEMORY_SNAPSHOT_SCHEMA_VERSION",
     "DEFAULT_ANSWER_ANCHOR_CHAR_CAP",

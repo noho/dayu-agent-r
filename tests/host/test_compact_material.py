@@ -1827,7 +1827,7 @@ def test_pre_dispatch_evidence_missing_request_atom_emits_limited_signal(
 
         query_text = view.material_blocks[0].readable_query_text
         assert query_text is not None
-        assert "limited_signal" in query_text
+        assert query_text == "查询语义不可用；参数未安全展开。"
         assert "event-tool-result-missing-request" not in query_text
         assert "tool-call-event-tool-result-missing-request" not in query_text
 

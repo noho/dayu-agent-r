@@ -46,6 +46,10 @@ from dayu.host.api import (
     SessionSnapshot,
 )
 from dayu.host._terminal_diagnostics import _append_terminal_diagnostic_suffix
+from dayu.host.accepted_result_projection import (
+    AcceptedToolResultStatus,
+    project_accepted_tool_result,
+)
 from dayu.host.command import HostCommandHandle
 from dayu.host.durable.codec import format_utc_timestamp, parse_utc_timestamp
 from dayu.host.durable.errors import HostDurableError
@@ -1218,6 +1222,50 @@ def _tool_result_accepted_activity(
     :raises: 无主动抛出。
     """
 
+    if row.event_class is EventClass.CANONICAL_FACT:
+        return _canonical_tool_result_accepted_activity(transaction, row)
+    if row.event_class is not EventClass.PREVIEW:
+        return None
+    return _preview_tool_result_accepted_activity(transaction, row)
+
+
+def _canonical_tool_result_accepted_activity(
+    transaction: HostTransaction, row: EventLogRow
+) -> HostActivityView | None:
+    """投影 canonical ``TOOL_RESULT_ACCEPTED`` activity。
+
+    :param transaction: 当前 Host transaction。
+    :param row: canonical accepted result row。
+    :returns: 工具结果 activity；缺工具名时返回 ``None``。
+    """
+
+    projection = project_accepted_tool_result(transaction, row)
+    if projection.tool_name is None:
+        return None
+    display_name = _tool_display_name(transaction, row, projection.tool_name)
+    status, severity = _accepted_result_activity_state(projection.status)
+    return HostActivityView(
+        kind=HostActivityKind.TOOL_RESULT,
+        status=status,
+        title=f"工具返回：{display_name}",
+        summary=f"结果状态：{projection.status.value}",
+        severity=severity,
+        tool_name=projection.tool_name,
+        tool_display_name=display_name,
+        counts=None,
+    )
+
+
+def _preview_tool_result_accepted_activity(
+    transaction: HostTransaction, row: EventLogRow
+) -> HostActivityView | None:
+    """投影 preview ``TOOL_RESULT_ACCEPTED`` activity。
+
+    :param transaction: 当前 Host transaction。
+    :param row: preview accepted result row。
+    :returns: 工具结果 activity；payload 缺关键字段时返回 ``None``。
+    """
+
     payload = _activity_payload(transaction, row)
     if payload is None:
         return None
@@ -1237,6 +1285,22 @@ def _tool_result_accepted_activity(
         tool_display_name=display_name,
         counts=None,
     )
+
+
+def _accepted_result_activity_state(
+    status: AcceptedToolResultStatus,
+) -> tuple[HostActivityStatus, HostActivitySeverity]:
+    """把 accepted-result projection status 映射为 activity 状态。
+
+    :param status: accepted result projection status。
+    :returns: activity status 与 severity。
+    """
+
+    if status is AcceptedToolResultStatus.COMPLETED:
+        return HostActivityStatus.COMPLETED, HostActivitySeverity.INFO
+    if status is AcceptedToolResultStatus.CANCELLED:
+        return HostActivityStatus.CANCELLED, HostActivitySeverity.WARNING
+    return HostActivityStatus.FAILED, HostActivitySeverity.ERROR
 
 
 def _tool_calls_batch_done_activity(row: EventLogRow) -> HostActivityView | None:
