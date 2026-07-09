@@ -91,6 +91,8 @@ _FAST_TOOL_EXECUTION_TIMEOUT_SECONDS: float = 0.01
 _SLOW_TOOL_EXECUTION_SECONDS: float = 5.0
 _MINIMAL_MAX_ITERATIONS: int = 1
 _NO_CONTINUATION_ATTEMPTS: int = 0
+_TEST_FALLBACK_PROMPT: str = "test fallback prompt"
+_TEST_CONTINUATION_PROMPT: str = "test continuation prompt"
 _INVALID_CONTINUATION_ATTEMPTS: int = -1
 _INVALID_FAILED_BATCH_THRESHOLDS: tuple[int, ...] = (0, -1)
 _INVALID_TOOL_EXECUTION_TIMEOUTS: tuple[float, ...] = (
@@ -793,20 +795,48 @@ def _final_data(events: Sequence[EngineEvent]) -> FinalAnswerData:
     return data
 
 
-def test_contract_fields_are_explicit() -> None:
-    """Phase 3 contract 字段必须显式存在。"""
+def test_agent_policy_accepts_explicit_prompt_fields() -> None:
+    """AgentPolicy 必须保留调用方显式传入的 prompt 字段。"""
 
     policy = AgentPolicy(
         max_iterations=_MINIMAL_MAX_ITERATIONS,
         continuation_max_attempts=_NO_CONTINUATION_ATTEMPTS,
         allow_tool_calls=True,
         tool_execution_timeout_seconds=_TOOL_EXECUTION_TIMEOUT_SECONDS,
+        fallback_prompt=_TEST_FALLBACK_PROMPT,
+        continuation_prompt=_TEST_CONTINUATION_PROMPT,
     )
 
     assert policy.fallback_mode is AgentFallbackMode.FORCE_ANSWER
     assert policy.max_consecutive_failed_tool_batches == 2
-    assert policy.fallback_prompt
-    assert policy.continuation_prompt
+    assert policy.fallback_prompt == _TEST_FALLBACK_PROMPT
+    assert policy.continuation_prompt == _TEST_CONTINUATION_PROMPT
+
+
+def test_agent_policy_prompt_fields_are_required() -> None:
+    """缺少任一 prompt 字段时，Python 构造器必须直接报 TypeError。"""
+
+    full_kwargs = {
+        "max_iterations": _MINIMAL_MAX_ITERATIONS,
+        "continuation_max_attempts": _NO_CONTINUATION_ATTEMPTS,
+        "allow_tool_calls": True,
+        "tool_execution_timeout_seconds": _TOOL_EXECUTION_TIMEOUT_SECONDS,
+        "fallback_prompt": _TEST_FALLBACK_PROMPT,
+        "continuation_prompt": _TEST_CONTINUATION_PROMPT,
+    }
+    without_fallback_prompt = {
+        key: value for key, value in full_kwargs.items() if key != "fallback_prompt"
+    }
+    without_continuation_prompt = {
+        key: value
+        for key, value in full_kwargs.items()
+        if key != "continuation_prompt"
+    }
+
+    with pytest.raises(TypeError, match="fallback_prompt"):
+        AgentPolicy(**without_fallback_prompt)
+    with pytest.raises(TypeError, match="continuation_prompt"):
+        AgentPolicy(**without_continuation_prompt)
 
 
 def test_agent_policy_rejects_invalid_values() -> None:
@@ -819,6 +849,8 @@ def test_agent_policy_rejects_invalid_values() -> None:
                 continuation_max_attempts=_NO_CONTINUATION_ATTEMPTS,
                 allow_tool_calls=True,
                 tool_execution_timeout_seconds=_TOOL_EXECUTION_TIMEOUT_SECONDS,
+                fallback_prompt=_TEST_FALLBACK_PROMPT,
+                continuation_prompt=_TEST_CONTINUATION_PROMPT,
                 max_consecutive_failed_tool_batches=threshold,
             )
     with pytest.raises(ValueError):
@@ -827,15 +859,20 @@ def test_agent_policy_rejects_invalid_values() -> None:
             continuation_max_attempts=_INVALID_CONTINUATION_ATTEMPTS,
             allow_tool_calls=True,
             tool_execution_timeout_seconds=_TOOL_EXECUTION_TIMEOUT_SECONDS,
+            fallback_prompt=_TEST_FALLBACK_PROMPT,
+            continuation_prompt=_TEST_CONTINUATION_PROMPT,
         )
-    with pytest.raises(ValueError):
-        AgentPolicy(
-            max_iterations=_MINIMAL_MAX_ITERATIONS,
-            continuation_max_attempts=_NO_CONTINUATION_ATTEMPTS,
-            allow_tool_calls=True,
-            tool_execution_timeout_seconds=_TOOL_EXECUTION_TIMEOUT_SECONDS,
-            continuation_prompt=" ",
-        )
+    # continuation_prompt 为空 / 纯空白必须在构造期被拒。
+    for invalid_continuation_prompt in ("", "   ", "\n\t"):
+        with pytest.raises(ValueError):
+            AgentPolicy(
+                max_iterations=_MINIMAL_MAX_ITERATIONS,
+                continuation_max_attempts=_NO_CONTINUATION_ATTEMPTS,
+                allow_tool_calls=True,
+                tool_execution_timeout_seconds=_TOOL_EXECUTION_TIMEOUT_SECONDS,
+                fallback_prompt=_TEST_FALLBACK_PROMPT,
+                continuation_prompt=invalid_continuation_prompt,
+            )
     for timeout_seconds in _INVALID_TOOL_EXECUTION_TIMEOUTS:
         with pytest.raises(ValueError):
             AgentPolicy(
@@ -843,6 +880,8 @@ def test_agent_policy_rejects_invalid_values() -> None:
                 continuation_max_attempts=_NO_CONTINUATION_ATTEMPTS,
                 allow_tool_calls=True,
                 tool_execution_timeout_seconds=timeout_seconds,
+                fallback_prompt=_TEST_FALLBACK_PROMPT,
+                continuation_prompt=_TEST_CONTINUATION_PROMPT,
             )
     # max_iterations < 1 必须在构造期被拒。
     for invalid_max_iterations in (0, -1):
@@ -852,6 +891,8 @@ def test_agent_policy_rejects_invalid_values() -> None:
                 continuation_max_attempts=_NO_CONTINUATION_ATTEMPTS,
                 allow_tool_calls=True,
                 tool_execution_timeout_seconds=_TOOL_EXECUTION_TIMEOUT_SECONDS,
+                fallback_prompt=_TEST_FALLBACK_PROMPT,
+                continuation_prompt=_TEST_CONTINUATION_PROMPT,
             )
     # fallback_prompt 为空 / 纯空白必须在构造期被拒。
     for invalid_fallback_prompt in ("", "   ", "\n\t"):
@@ -862,6 +903,7 @@ def test_agent_policy_rejects_invalid_values() -> None:
                 allow_tool_calls=True,
                 tool_execution_timeout_seconds=_TOOL_EXECUTION_TIMEOUT_SECONDS,
                 fallback_prompt=invalid_fallback_prompt,
+                continuation_prompt=_TEST_CONTINUATION_PROMPT,
             )
 
 

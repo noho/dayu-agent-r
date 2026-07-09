@@ -170,7 +170,7 @@ Engine 公共契约分为 Engine 专属契约与 Dayu Agent 公共契约。
 ### Engine 专属契约
 
 - `AgentRunRequest`：单次 run 的完整输入快照。
-- `AgentPolicy`：Agent loop 策略，包含 iteration 预算、continuation 预算、工具开关、工具握手 timeout、fallback 模式、fallback prompt、continuation prompt 与连续失败工具批次阈值。
+- `AgentPolicy`：Agent loop 策略，包含 iteration 预算、continuation 预算、工具开关、工具握手 timeout、fallback 模式、fallback prompt、continuation prompt 与连续失败工具批次阈值。`fallback_prompt` 与 `continuation_prompt` 是调用方已经解析好的必填文本；Engine 不提供 LLM-facing prompt 默认值。
 - `AgentRunResult`：`run_agent_and_wait` 的终态返回封闭联合。
 - `AgentMessage`：Runner 输入消息封闭联合，成员包括 `SystemMessage`、`UserMessage`、`AssistantMessage`、`ToolMessage`。
 - `AssistantToolCall`：assistant 消息中的工具调用记录，保留 `provider_state` 以支持 provider roundtrip。

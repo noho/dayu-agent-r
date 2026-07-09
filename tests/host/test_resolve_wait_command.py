@@ -1130,6 +1130,8 @@ def _policy_snapshot() -> PolicySnapshot:
             continuation_max_attempts=0,
             allow_tool_calls=False,
             tool_execution_timeout_seconds=1.0,
+            fallback_prompt="test fallback prompt",
+            continuation_prompt="test continuation prompt",
         ),
         policy_snapshot_ref="policy-resolve-wait",
     )

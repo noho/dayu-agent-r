@@ -700,6 +700,8 @@ def _policy_snapshot() -> PolicySnapshot:
             continuation_max_attempts=1,
             allow_tool_calls=True,
             tool_execution_timeout_seconds=10.0,
+            fallback_prompt="test fallback prompt",
+            continuation_prompt="test continuation prompt",
         ),
         policy_snapshot_ref="phase6-policy",
     )

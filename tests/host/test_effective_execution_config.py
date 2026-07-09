@@ -287,6 +287,8 @@ def test_effective_execution_config_round_trips_client_correlation_policy() -> N
             continuation_max_attempts=0,
             allow_tool_calls=False,
             tool_execution_timeout_seconds=1.0,
+            fallback_prompt="test fallback prompt",
+            continuation_prompt="test continuation prompt",
         ),
         runner_spec_source="test",
         runner_options_source="test",
@@ -392,6 +394,8 @@ async def test_descriptor_payload_dispatch_uses_per_run_override(
         continuation_max_attempts=1,
         allow_tool_calls=False,
         tool_execution_timeout_seconds=2.5,
+        fallback_prompt="test fallback prompt",
+        continuation_prompt="test continuation prompt",
     )
     large_prompt = "descriptor prompt " * 600
     async with open_host(options) as host:
@@ -450,6 +454,8 @@ async def test_agent_policy_override_freezes_payload_and_dispatch_snapshot_ref(
         continuation_max_attempts=1,
         allow_tool_calls=False,
         tool_execution_timeout_seconds=3.5,
+        fallback_prompt="test fallback prompt",
+        continuation_prompt="test continuation prompt",
         max_consecutive_failed_tool_batches=4,
     )
     async with open_host(options) as host:
@@ -644,6 +650,8 @@ def _ordinary_run_baseline() -> OrdinaryRunExecutionBaseline:
             continuation_max_attempts=0,
             allow_tool_calls=False,
             tool_execution_timeout_seconds=1.0,
+            fallback_prompt="test fallback prompt",
+            continuation_prompt="test continuation prompt",
         ),
     )
 

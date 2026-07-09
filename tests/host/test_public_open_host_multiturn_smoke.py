@@ -267,6 +267,8 @@ async def test_submit_followup_field_level_execution_override_freezes_effective_
         continuation_max_attempts=0,
         allow_tool_calls=False,
         tool_execution_timeout_seconds=5.0,
+        fallback_prompt="test fallback prompt",
+        continuation_prompt="test continuation prompt",
     )
     assert_at_most_one_system_message(
         first_request.messages, label="override request 0"

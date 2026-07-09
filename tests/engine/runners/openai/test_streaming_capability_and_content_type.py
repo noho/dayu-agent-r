@@ -128,6 +128,8 @@ def _agent_request(
             continuation_max_attempts=_CONTINUATION_MAX_ATTEMPTS,
             allow_tool_calls=True,
             tool_execution_timeout_seconds=_TOOL_EXECUTION_TIMEOUT_SECONDS,
+            fallback_prompt="test fallback prompt",
+            continuation_prompt="test continuation prompt",
         ),
         tool_schemas=(),
         tool_executor=_NoopToolExecutor(),

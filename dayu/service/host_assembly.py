@@ -64,7 +64,7 @@ from dayu.host.tool_duplicate_governance import (
 from dayu.host.tooling import HostToolingOptions
 from dayu.host.tooling import ProcessCapsuleInterruptPolicy
 from dayu.runtime.assembly import (
-    AgentPolicyDefaults,
+    AgentPolicyBaseline,
     ExecutionProfileCompatibilityDiagnostic,
     MergedAgentPolicyConfig,
     ModelRunnerHintOverride,
@@ -605,7 +605,7 @@ def compose_open_host_options(
         execution_baseline=execution_profile.run_baseline,
         scene_model_hints=request.scene_inputs.model_hints,
         run_override=_model_runner_override_from_overrides(request.overrides),
-        code_default=None,
+        base_policy=None,
     )
     compactor_selection = select_runner_option_hint(
         models=config.models,
@@ -615,7 +615,7 @@ def compose_open_host_options(
         ),
         scene_model_hints=None,
         run_override=None,
-        code_default=None,
+        base_policy=None,
     )
     ordinary_profile_compatibility = validate_execution_profile_context_window(
         profile=execution_profile,
@@ -626,7 +626,7 @@ def compose_open_host_options(
         model=compactor_selection.model,
     )
     agent_policy_config = merge_agent_policy_config(
-        code_default=_agent_policy_defaults_from_config(execution_profile.agent_policy),
+        base_policy=_agent_policy_baseline_from_config(execution_profile.agent_policy),
         execution_profile=execution_profile.agent_policy,
         scene_override=request.scene_inputs.agent_policy_override,
         run_override=None,
@@ -1619,17 +1619,17 @@ def _runner_options_with_run_overrides(
     return replace(baseline, temperature=run_overrides.temperature)
 
 
-def _agent_policy_defaults_from_config(
+def _agent_policy_baseline_from_config(
     profile: AgentPolicyConfig,
-) -> AgentPolicyDefaults:
-    """从内嵌 Agent policy 配置投影 runtime helper 所需 code default。
+) -> AgentPolicyBaseline:
+    """从内嵌 Agent policy 配置投影 runtime helper 所需基线字段。
 
     :param profile: ConfigLoader 输出的内嵌 Agent policy 配置。
-    :returns: 与 profile 同值的默认字段集。
+    :returns: 与 profile 同值的基线字段集。
     :raises Exception: 不主动抛出异常。
     """
 
-    return AgentPolicyDefaults(
+    return AgentPolicyBaseline(
         max_iterations=profile.max_iterations,
         continuation_max_attempts=profile.continuation_max_attempts,
         allow_tool_calls=profile.allow_tool_calls,

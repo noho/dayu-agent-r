@@ -26,13 +26,6 @@ class AgentFallbackMode(StrEnum):
     RAISE_ERROR = "raise_error"
 
 
-_DEFAULT_FALLBACK_PROMPT: str = (
-    "请基于目前已经获得的上下文直接给出最终回答，不要再调用工具。"
-)
-_DEFAULT_CONTINUATION_PROMPT: str = (
-    "Your previous response was truncated (finish_reason=length). "
-    "Continue from where you left off without repeating content already produced."
-)
 _DEFAULT_MAX_CONSECUTIVE_FAILED_TOOL_BATCHES: int = 2
 
 
@@ -58,9 +51,9 @@ class AgentPolicy:
     continuation_max_attempts: int
     allow_tool_calls: bool
     tool_execution_timeout_seconds: float
+    fallback_prompt: str
+    continuation_prompt: str
     fallback_mode: AgentFallbackMode = AgentFallbackMode.FORCE_ANSWER
-    fallback_prompt: str = _DEFAULT_FALLBACK_PROMPT
-    continuation_prompt: str = _DEFAULT_CONTINUATION_PROMPT
     max_consecutive_failed_tool_batches: int = (
         _DEFAULT_MAX_CONSECUTIVE_FAILED_TOOL_BATCHES
     )

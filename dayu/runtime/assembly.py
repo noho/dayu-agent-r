@@ -36,7 +36,7 @@ from dayu.runtime.scene_prepare import (
 )
 from dayu.runtime.tool_truncation import effective_tool_truncate_spec
 
-_SOURCE_CODE_DEFAULT: Final[str] = "code_default"
+_SOURCE_RUNTIME_BASE: Final[str] = "runtime_base"
 _SOURCE_EXECUTION_PROFILE: Final[str] = "execution_profile"
 _SOURCE_SCENE_OVERRIDE: Final[str] = "scene_override"
 _SOURCE_RUN_OVERRIDE: Final[str] = "run_override"
@@ -157,8 +157,12 @@ class ExecutionProfileCompatibilityDiagnostic:
 
 
 @dataclass(frozen=True, slots=True)
-class AgentPolicyDefaults:
-    """Agent policy 代码默认值。
+class AgentPolicyBaseline:
+    """Agent policy runtime assembly 基线值。
+
+    该基线来自 ConfigLoader 输出或调用方显式 assembly input，用于补齐
+    runtime-neutral policy 合并链路；它不是 Engine contract 默认值，也不是
+    LLM-facing prompt 文本真源。
 
     :param max_iterations: 最大 agent loop 迭代数。
     :param continuation_max_attempts: continuation 最大尝试次数。
@@ -290,18 +294,18 @@ def select_runner_option_hint(
     execution_baseline: ExecutionBaselineConfig | None,
     scene_model_hints: SceneModelHints | None,
     run_override: ModelRunnerHintOverride | None,
-    code_default: ExecutionBaselineConfig | None,
+    base_policy: ExecutionBaselineConfig | None,
 ) -> RunnerOptionHintSelection:
     """按优先级选择 runtime-neutral 模型与 runner option hint。
 
     优先级固定为 ``run_override > scene_model_hints >
-    execution_baseline > code_default``，并按字段独立合并。
+    execution_baseline > base_policy``，并按字段独立合并。
 
     :param models: 模型 catalog typed view。
     :param execution_baseline: execution profile 的基线选择。
     :param scene_model_hints: ScenePrepare 输出的 scene 模型 hints。
     :param run_override: UI / Run 显式 override。
-    :param code_default: 代码默认选择。
+    :param base_policy: runtime assembly 基线选择。
     :returns: 选中的模型、runner option hint 与来源诊断。
     :raises RuntimeAssemblySelectionError: 模型或 hint 缺失时抛出。
     """
@@ -314,7 +318,7 @@ def select_runner_option_hint(
         baseline_value=(
             None if execution_baseline is None else execution_baseline.model_id
         ),
-        default_value=None if code_default is None else code_default.model_id,
+        default_value=None if base_policy is None else base_policy.model_id,
         field_name=_FIELD_MODEL_ID,
     )
     hint_selection = _select_required_text(
@@ -332,7 +336,7 @@ def select_runner_option_hint(
             else execution_baseline.runner_option_hint_id
         ),
         default_value=(
-            None if code_default is None else code_default.runner_option_hint_id
+            None if base_policy is None else base_policy.runner_option_hint_id
         ),
         field_name=_FIELD_RUNNER_OPTION_HINT_ID,
     )
@@ -465,7 +469,7 @@ def parse_agent_policy_override_config(
 
 def merge_agent_policy_config(
     *,
-    code_default: AgentPolicyDefaults,
+    base_policy: AgentPolicyBaseline,
     execution_profile: AgentPolicyConfig | None,
     scene_override: SceneAgentPolicyOverride | None,
     run_override: AgentPolicyOverrideConfig | None,
@@ -473,10 +477,10 @@ def merge_agent_policy_config(
     """按固定优先级合并 Agent policy 字段。
 
     优先级固定为 ``run_override > scene_override > execution_profile >
-    code_default``，每层只处理 Agent policy 白名单字段，返回仍是
+    base_policy``，每层只处理 Agent policy 白名单字段，返回仍是
     runtime-neutral 字段集。
 
-    :param code_default: 代码默认完整字段集。
+    :param base_policy: runtime assembly 基线完整字段集。
     :param execution_profile: execution profile baseline。
     :param scene_override: ScenePrepare 输出的 typed override。
     :param run_override: UI / Run 显式 typed override。
@@ -485,8 +489,8 @@ def merge_agent_policy_config(
     """
 
     _validate_fallback_mode(
-        code_default.fallback_mode,
-        context=f"{_SOURCE_CODE_DEFAULT}.{_FIELD_FALLBACK_MODE}",
+        base_policy.fallback_mode,
+        context=f"{_SOURCE_RUNTIME_BASE}.{_FIELD_FALLBACK_MODE}",
     )
     if execution_profile is not None:
         _validate_fallback_mode(
@@ -499,7 +503,7 @@ def merge_agent_policy_config(
         baseline_value=(
             None if execution_profile is None else execution_profile.max_iterations
         ),
-        default_value=code_default.max_iterations,
+        default_value=base_policy.max_iterations,
     )
     continuation_max_attempts = _select_value(
         run_value=(
@@ -517,7 +521,7 @@ def merge_agent_policy_config(
             if execution_profile is None
             else execution_profile.continuation_max_attempts
         ),
-        default_value=code_default.continuation_max_attempts,
+        default_value=base_policy.continuation_max_attempts,
     )
     allow_tool_calls = _select_value(
         run_value=None if run_override is None else run_override.allow_tool_calls,
@@ -525,7 +529,7 @@ def merge_agent_policy_config(
         baseline_value=(
             None if execution_profile is None else execution_profile.allow_tool_calls
         ),
-        default_value=code_default.allow_tool_calls,
+        default_value=base_policy.allow_tool_calls,
     )
     tool_execution_timeout_seconds = _select_value(
         run_value=(
@@ -543,7 +547,7 @@ def merge_agent_policy_config(
             if execution_profile is None
             else execution_profile.tool_execution_timeout_seconds
         ),
-        default_value=code_default.tool_execution_timeout_seconds,
+        default_value=base_policy.tool_execution_timeout_seconds,
     )
     fallback_mode = _select_value(
         run_value=None if run_override is None else run_override.fallback_mode,
@@ -551,7 +555,7 @@ def merge_agent_policy_config(
         baseline_value=(
             None if execution_profile is None else execution_profile.fallback_mode
         ),
-        default_value=code_default.fallback_mode,
+        default_value=base_policy.fallback_mode,
     )
     _validate_fallback_mode(
         fallback_mode.value,
@@ -563,7 +567,7 @@ def merge_agent_policy_config(
         baseline_value=(
             None if execution_profile is None else execution_profile.fallback_prompt
         ),
-        default_value=code_default.fallback_prompt,
+        default_value=base_policy.fallback_prompt,
     )
     continuation_prompt = _select_value(
         run_value=None if run_override is None else run_override.continuation_prompt,
@@ -575,7 +579,7 @@ def merge_agent_policy_config(
             if execution_profile is None
             else execution_profile.continuation_prompt
         ),
-        default_value=code_default.continuation_prompt,
+        default_value=base_policy.continuation_prompt,
     )
     max_consecutive_failed_tool_batches = _select_value(
         run_value=(
@@ -593,7 +597,7 @@ def merge_agent_policy_config(
             if execution_profile is None
             else execution_profile.max_consecutive_failed_tool_batches
         ),
-        default_value=code_default.max_consecutive_failed_tool_batches,
+        default_value=base_policy.max_consecutive_failed_tool_batches,
     )
     return MergedAgentPolicyConfig(
         max_iterations=max_iterations.value,
@@ -706,7 +710,7 @@ def _select_required_text(
     :param run_value: run 层字段值。
     :param scene_value: scene 层字段值。
     :param baseline_value: execution profile 层字段值。
-    :param default_value: 代码默认字段值。
+    :param default_value: runtime assembly 基线字段值。
     :param field_name: 字段名。
     :returns: 选中值与来源。
     :raises RuntimeAssemblySelectionError: 所有层均未提供值时抛出。
@@ -735,7 +739,7 @@ def _select_value(
     :param run_value: run 层字段值。
     :param scene_value: scene 层字段值。
     :param baseline_value: execution profile 层字段值。
-    :param default_value: 代码默认字段值。
+    :param default_value: runtime assembly 基线字段值。
     :returns: 选中值与来源。
     """
 
@@ -745,7 +749,7 @@ def _select_value(
         return _SelectedValue(value=scene_value, source=_SOURCE_SCENE_OVERRIDE)
     if baseline_value is not None:
         return _SelectedValue(value=baseline_value, source=_SOURCE_EXECUTION_PROFILE)
-    return _SelectedValue(value=default_value, source=_SOURCE_CODE_DEFAULT)
+    return _SelectedValue(value=default_value, source=_SOURCE_RUNTIME_BASE)
 
 
 def _scene_fallback_mode_value(
@@ -950,7 +954,7 @@ def _ttl_seconds_as_int(value: float) -> int:
 
 
 __all__ = [
-    "AgentPolicyDefaults",
+    "AgentPolicyBaseline",
     "AgentPolicyOverrideConfig",
     "ExecutionProfileCompatibilityDiagnostic",
     "MergedAgentPolicyConfig",

@@ -693,6 +693,8 @@ def _local_execution_options(
             continuation_max_attempts=0,
             allow_tool_calls=True,
             tool_execution_timeout_seconds=10.0,
+            fallback_prompt="test fallback prompt",
+            continuation_prompt="test continuation prompt",
         ),
         worker_factory=factory,
         tooling_options=HostToolingOptions(

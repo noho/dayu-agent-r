@@ -1126,6 +1126,8 @@ def test_compactor_runner_baseline_maps_to_host_owned_compactor(
                     continuation_max_attempts=0,
                     allow_tool_calls=False,
                     tool_execution_timeout_seconds=1.0,
+                    fallback_prompt="test fallback prompt",
+                    continuation_prompt="test continuation prompt",
                 ),
                 compactor_system_prompt="test compactor system prompt",
                 compactor_user_prompt_template=(
@@ -1354,6 +1356,8 @@ def _options(
                 continuation_max_attempts=0,
                 allow_tool_calls=False,
                 tool_execution_timeout_seconds=1.0,
+                fallback_prompt="test fallback prompt",
+                continuation_prompt="test continuation prompt",
             ),
         ),
         worker_factory=worker_factory,

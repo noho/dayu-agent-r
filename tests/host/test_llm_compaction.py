@@ -60,6 +60,8 @@ _TEST_AGENT_POLICY = AgentPolicy(
     continuation_max_attempts=0,
     allow_tool_calls=False,
     tool_execution_timeout_seconds=1.0,
+    fallback_prompt="test fallback prompt",
+    continuation_prompt="test continuation prompt",
 )
 _PROMPT_TEMPLATE_PATH = Path("dayu/config/prompts/scenes/conversation_compaction_user.md")
 _UNTRUSTED_COMPACTION_MATERIAL_BEGIN = "UNTRUSTED_COMPACTION_MATERIAL_JSON_BEGIN"
