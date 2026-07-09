@@ -215,6 +215,7 @@ def _event(
     payload: dict[str, JsonValue],
     *,
     run_id: str | None = _RUN_ID,
+    assistant_final_answer_text: str | None = None,
     evidence_query_text: str | None = None,
     evidence_tool_name: str | None = None,
     evidence_result_text: str | None = None,
@@ -227,6 +228,7 @@ def _event(
     :param event_type: event type。
     :param payload: canonical payload。
     :param run_id: Host Run id。
+    :param assistant_final_answer_text: 可选 typed assistant answer material。
     :param evidence_query_text: 可选 LLM-safe 工具 request / query 文本。
     :param evidence_tool_name: 可选 projection 工具名。
     :param evidence_result_text: 可选 projection 结果文本。
@@ -247,6 +249,7 @@ def _event(
         payload_ref=None,
         payload_digest=None,
         payload=payload,
+        assistant_final_answer_text=assistant_final_answer_text,
         evidence_query_text=evidence_query_text,
         evidence_tool_name=evidence_tool_name,
         evidence_result_text=evidence_result_text,
@@ -1060,10 +1063,43 @@ def test_user_input_missing_display_text_does_not_expose_refs() -> None:
     assert "payload-user-input-ref-only" not in text
 
 
-def test_durable_projection_hydrates_terminal_content_as_selected_recent_window(
+def test_typed_terminal_answer_material_becomes_selected_recent_window() -> None:
+    """typed assistant answer material 进入 selected recent window。
+
+    :returns: ``None``。
+    :raises AssertionError: typed material 没有被 memory consumer 消费时抛出。
+    """
+
+    policy = _policy()
+    snapshot = build_conversation_memory_snapshot_from_events(
+        events=(
+            _event(
+                1,
+                "run-typed-answer",
+                "RUN_SUCCEEDED",
+                {
+                    "terminal_summary_ref": "payload-terminal-final-answer",
+                    "terminal_summary_digest": "sha256:terminal-final-answer",
+                    "content": "裸 content 不应进入 assistant window",
+                },
+                assistant_final_answer_text="typed final answer",
+            ),
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+
+    selected = snapshot.trace_memory.selected_recent_window
+    assert len(selected) == 1
+    assert selected[0].text == "typed final answer"
+
+
+def test_durable_projection_uses_typed_terminal_answer_material(
     tmp_path: Path,
 ) -> None:
-    """durable projection adapter hydrate terminal content 后进入 continuity。"""
+    """durable projection 通过 typed terminal answer material 进入 continuity。"""
 
     policy = _policy()
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -1136,15 +1172,29 @@ def test_durable_projection_hydrates_terminal_content_as_selected_recent_window(
         selected = latest.snapshot.trace_memory.selected_recent_window
         assert len(selected) == 1
         assert selected[0].text == "artifact final answer"
+        assert selected[0].text != " "
+        for fragment in (
+            "terminal_summary_ref",
+            "terminal_summary_digest",
+            "payload_ref",
+            "payload_digest",
+            "artifact_ref",
+            "event_id",
+            "digest",
+            "cursor",
+            "payload-terminal-final-answer",
+            "sha256:",
+        ):
+            assert fragment not in selected[0].text
         assert selected[0].included_reason is MemoryIncludedReason.SELECTED_RECENT_WINDOW
         assert latest.snapshot.evidence_fact_memory.evidence_backed_facts == ()
 
 
 def test_memory_direct_consumer_does_not_follow_terminal_descriptor() -> None:
-    """直接 memory consumer 不跟随 terminal summary descriptor。
+    """直接 memory consumer 在无 typed material 时不跟随 descriptor。
 
-    Durable projection / run-input adapter 负责把 digest-checked terminal content
-    合并成 transient ``final_answer``；纯 consumer 只读取 inline final_answer。
+    Durable projection / RunInputBuilder 负责提供 digest-checked typed answer
+    material；纯 consumer 没有 typed material 时只读取 inline ``final_answer``。
 
     :returns: ``None``。
     :raises AssertionError: direct consumer 错误跟随 descriptor 时抛出。

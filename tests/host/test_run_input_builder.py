@@ -60,7 +60,11 @@ from dayu.host.durable.event_log import (
     EventLogRow,
     EventLogStore,
 )
-from dayu.host.durable.memory import write_memory_snapshot_with_checkpoint
+from dayu.host.durable.memory import (
+    ConversationMemoryProjectionConsumer,
+    read_latest_memory_snapshot,
+    write_memory_snapshot_with_checkpoint,
+)
 from dayu.host.durable.projection import read_projection_checkpoint
 from dayu.host.durable.liveness import (
     HostInstanceIdentity,
@@ -77,6 +81,7 @@ from dayu.host.durable.schema import (
     TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT,
 )
 from dayu.host.durable.payload import (
+    PayloadDescriptor,
     PayloadKind,
     PayloadStore,
     SQLitePayloadFormat,
@@ -163,8 +168,11 @@ from dayu.host.memory import (
     MemoryRepairReason,
     MemorySizeUnits,
     MemorySnapshotCursor,
+    SelectedRecentWindowRole,
     build_conversation_memory_snapshot_from_events,
+    digest_memory_projection_policy,
 )
+from dayu.host.projection import ProjectionRunner
 from tests.host.memory_snapshot_factories import (
     current_input_memory_snapshot,
     recalculate_memory_snapshot_digest,
@@ -2773,11 +2781,99 @@ def test_inline_delta_uses_terminal_content_and_ignores_summary_fallback(
         contents = tuple(_message_content(message) for message in request.messages)
 
         assert "terminal artifact final answer" in contents
+        terminal_answer_text = contents[contents.index("terminal artifact final answer")]
+        _assert_terminal_answer_text_has_no_internal_refs(
+            terminal_answer_text,
+            extra_forbidden=(
+                "payload-terminal-answer",
+                "sqlite-terminal-answer",
+                "event-terminal-answer",
+            ),
+        )
         assert "terminal artifact summary" not in contents
         assert "run summary should not render" not in contents
         assert "summary-only should not render" not in contents
         assert "nested summary should not render" not in contents
         assert "bare run content should not render" not in contents
+
+
+def test_terminal_answer_text_matches_durable_projection_and_run_input(
+    tmp_path: Path,
+) -> None:
+    """descriptor-backed terminal answer 在 memory projection 与 RunInput 中一致。"""
+
+    policy = _memory_policy(max_lag_events_for_inline_delta=16)
+    answer_text = "descriptor backed terminal answer"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        prior_event = _append_prior_user_event(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-prior-memory",
+            event_id="event-prior-memory-input",
+            text="prior memory prompt",
+        )
+        snapshot = build_conversation_memory_snapshot_from_events(
+            events=(_memory_projection_event_from_test_row(prior_event),),
+            session_id=session_id,
+            consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+            policy=policy,
+            built_at="2026-05-15T01:02:03.000000Z",
+        )
+        _write_memory_snapshot(store.transaction_runner, snapshot)
+        terminal_descriptor = store.transaction_runner.run_write(
+            lambda transaction: _append_descriptor_backed_terminal_answer(
+                transaction,
+                session_id=session_id,
+                answer_text=answer_text,
+            )
+        )
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt"),
+        )
+
+        request = _build_request_with_memory(store, seeded, policy)
+        run_input_answers = tuple(
+            _message_content(message)
+            for message in request.messages
+            if isinstance(message, AssistantMessage)
+        )
+
+        consumer = ConversationMemoryProjectionConsumer(policy)
+        ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
+            consumer.consumer_id,
+            limit=20,
+        )
+        policy_digest = digest_memory_projection_policy(policy)
+        latest = store.transaction_runner.run_read(
+            lambda transaction: read_latest_memory_snapshot(
+                transaction,
+                session_id=session_id,
+                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                policy_digest=policy_digest,
+            )
+        )
+
+        assert latest is not None
+        projection_answers = tuple(
+            item.text
+            for item in latest.snapshot.trace_memory.selected_recent_window
+            if item.role is SelectedRecentWindowRole.ASSISTANT
+        )
+        assert answer_text in run_input_answers
+        assert answer_text in projection_answers
+        assert run_input_answers[-1] == projection_answers[-1]
+        _assert_terminal_answer_text_has_no_internal_refs(
+            run_input_answers[-1],
+            extra_forbidden=(
+                terminal_descriptor.payload_ref,
+                terminal_descriptor.payload_digest,
+                "sqlite-cross-path-terminal-answer",
+                "event-cross-path-terminal-answer",
+            ),
+        )
 
 
 def test_over_threshold_memory_lag_raises_repair_required(
@@ -4665,6 +4761,51 @@ def _append_prior_user_event(
     )
 
 
+def _append_descriptor_backed_terminal_answer(
+    transaction: HostTransaction,
+    *,
+    session_id: str,
+    answer_text: str,
+) -> PayloadDescriptor:
+    """追加 descriptor-backed RUN_SUCCEEDED terminal answer。
+
+    :param transaction: Host transaction。
+    :param session_id: Session id。
+    :param answer_text: terminal answer 文本。
+    :returns: 写入的 payload descriptor。
+    """
+
+    descriptor = PayloadStore().write_sqlite_payload(
+        transaction,
+        SQLitePayloadWriteRequest(
+            payload_ref="payload-cross-path-terminal-answer",
+            payload_id="sqlite-cross-path-terminal-answer",
+            payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+            payload_json={
+                "content": answer_text,
+                "summary_text": "cross path summary must not render",
+            },
+        ),
+    )
+    EventLogStore().append_event(
+        transaction,
+        _event_request(
+            event_id="event-cross-path-terminal-answer",
+            event_class=EventClass.CANONICAL_FACT,
+            session_id=session_id,
+            run_id="run-cross-path-terminal-answer",
+            event_type="RUN_SUCCEEDED",
+            payload={
+                "content": "bare run content must not render",
+                "summary_text": "run summary must not render",
+                "terminal_summary_ref": descriptor.payload_ref,
+                "terminal_summary_digest": descriptor.payload_digest,
+            },
+        ),
+    )
+    return descriptor
+
+
 def _append_inline_repair_filter_noise(
     transaction_runner: HostTransactionRunner,
     session_id: str,
@@ -6208,6 +6349,36 @@ def _message_content(message: AgentMessage) -> str:
     if isinstance(message, SystemMessage | UserMessage):
         return message.content
     raise AssertionError("tool messages are not expected in RunInputBuilder tests")
+
+
+def _assert_terminal_answer_text_has_no_internal_refs(
+    text: str,
+    *,
+    extra_forbidden: tuple[str, ...] = (),
+) -> None:
+    """断言 terminal answer LLM-facing 文本不包含 Host 内部引用。
+
+    :param text: terminal answer 文本。
+    :param extra_forbidden: 当前测试额外禁止出现的内部片段。
+    :returns: ``None``。
+    """
+
+    forbidden_fragments = (
+        "terminal_summary_ref",
+        "terminal_summary_digest",
+        "payload_ref",
+        "payload_digest",
+        "artifact_ref",
+        "event_id",
+        "digest",
+        "cursor",
+        "projection",
+        "governance",
+        "sha256:",
+        *extra_forbidden,
+    )
+    for fragment in forbidden_fragments:
+        assert fragment not in text
 
 
 def _expected_system_content() -> str:

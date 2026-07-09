@@ -966,6 +966,8 @@ class MemoryProjectionEvent:
     :param evidence_tool_name: 可选工具名。
     :param evidence_result_text: 可选 LLM-safe 工具结果文本。
     :param evidence_source_text: 可选业务可读工具 source 文本。
+    :param assistant_final_answer_text: 可选 LLM-facing assistant answer continuity
+        文本。它是 projection-internal typed material，不是 EventLog payload 字段。
     """
 
     event_sequence: int
@@ -984,6 +986,7 @@ class MemoryProjectionEvent:
     evidence_tool_name: str | None = None
     evidence_result_text: str | None = None
     evidence_source_text: str | None = None
+    assistant_final_answer_text: str | None = None
 
     def __post_init__(self) -> None:
         """校验 projection event。
@@ -1010,6 +1013,10 @@ class MemoryProjectionEvent:
         _require_optional_non_empty(self.evidence_tool_name, "evidence_tool_name")
         _require_optional_non_empty(self.evidence_result_text, "evidence_result_text")
         _require_optional_non_empty(self.evidence_source_text, "evidence_source_text")
+        _require_optional_non_empty(
+            self.assistant_final_answer_text,
+            "assistant_final_answer_text",
+        )
 
 
 def default_memory_projection_policy(
@@ -1640,10 +1647,12 @@ def _selected_assistant_item(
     :returns: selected item；缺失 final answer continuity 时返回 ``None``。
     """
 
-    text = assistant_final_answer_text_from_run_payload(
-        event.payload,
-        text_policy=PayloadTextReadPolicy.LENIENT_NON_EMPTY,
-    )
+    text = event.assistant_final_answer_text
+    if text is None:
+        text = assistant_final_answer_text_from_run_payload(
+            event.payload,
+            text_policy=PayloadTextReadPolicy.LENIENT_NON_EMPTY,
+        )
     if text is None:
         return None
     return SelectedRecentWindowItem(

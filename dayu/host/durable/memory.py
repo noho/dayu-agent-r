@@ -63,10 +63,7 @@ from dayu.host.memory import (
     project_conversation_memory_event,
 )
 from dayu.host._terminal_answer import assistant_final_answer_continuity_text
-from dayu.host.terminal_payload import (
-    PayloadTextReadPolicy,
-    assistant_final_answer_text_from_run_payload,
-)
+from dayu.host.terminal_payload import PayloadTextReadPolicy
 from dayu.host.evidence import accepted_evidence_envelope_from_payload
 from dayu.host.payload_resolution import (
     event_payload_object_for_result_ref,
@@ -93,7 +90,6 @@ _EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
 _EVENT_TYPE_TOOL_CALL_REQUESTED = "TOOL_CALL_REQUESTED"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
-_PAYLOAD_FIELD_FINAL_ANSWER = "final_answer"
 _PROJECTION_EVENT_ROW_BODY_DIGEST_PLACEHOLDER = "memory-projection-view"
 _EMPTY_PAYLOAD_JSON = "{}"
 _EVENT_TYPE_FILTER = (
@@ -106,9 +102,11 @@ _EVENT_TYPE_FILTER = (
 
 @dataclass(frozen=True, slots=True)
 class _MemoryProjectionPayloadView:
-    """Memory projection event payload 与附加 LLM-safe evidence 文本。
+    """Memory projection event payload 与附加 LLM-safe typed material。
 
     :param payload: memory projection 消费的 payload。
+    :param assistant_final_answer_text: 可选 LLM-facing assistant answer
+        continuity 文本，不回写 EventLog payload。
     :param evidence_query_text: 可选 LLM-safe request / query 文本。
     :param evidence_tool_name: 可选工具名。
     :param evidence_result_text: 可选 LLM-safe 工具结果文本。
@@ -116,6 +114,7 @@ class _MemoryProjectionPayloadView:
     """
 
     payload: Mapping[str, JsonValue]
+    assistant_final_answer_text: str | None
     evidence_query_text: str | None
     evidence_tool_name: str | None
     evidence_result_text: str | None
@@ -360,6 +359,7 @@ def _memory_projection_event_from_view(
         payload_ref=event.payload_ref,
         payload_digest=event.payload_digest,
         payload=payload_view.payload,
+        assistant_final_answer_text=payload_view.assistant_final_answer_text,
         evidence_query_text=payload_view.evidence_query_text,
         evidence_tool_name=payload_view.evidence_tool_name,
         evidence_result_text=payload_view.evidence_result_text,
@@ -370,7 +370,7 @@ def _memory_projection_event_from_view(
 def _memory_projection_payload_view(
     transaction: HostTransaction, event: ProjectionEventView
 ) -> _MemoryProjectionPayloadView:
-    """必要时把 memory projection 需要的 transient payload 补齐。
+    """构造 memory projection 需要的 payload view 与 typed material。
 
     :param transaction: Host transaction。
     :param event: projection runner event view。
@@ -383,20 +383,7 @@ def _memory_projection_payload_view(
     if event.event_type != _EVENT_TYPE_RUN_SUCCEEDED:
         return _MemoryProjectionPayloadView(
             payload=event.payload,
-            evidence_query_text=None,
-            evidence_tool_name=None,
-            evidence_result_text=None,
-            evidence_source_text=None,
-        )
-    if (
-        assistant_final_answer_text_from_run_payload(
-            event.payload,
-            text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
-        )
-        is not None
-    ):
-        return _MemoryProjectionPayloadView(
-            payload=event.payload,
+            assistant_final_answer_text=None,
             evidence_query_text=None,
             evidence_tool_name=None,
             evidence_result_text=None,
@@ -407,18 +394,9 @@ def _memory_projection_payload_view(
         event.payload,
         text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
     )
-    if final_answer is None:
-        return _MemoryProjectionPayloadView(
-            payload=event.payload,
-            evidence_query_text=None,
-            evidence_tool_name=None,
-            evidence_result_text=None,
-            evidence_source_text=None,
-        )
-    merged: dict[str, JsonValue] = dict(event.payload)
-    merged[_PAYLOAD_FIELD_FINAL_ANSWER] = final_answer
     return _MemoryProjectionPayloadView(
-        payload=merged,
+        payload=event.payload,
+        assistant_final_answer_text=final_answer,
         evidence_query_text=None,
         evidence_tool_name=None,
         evidence_result_text=None,
@@ -447,6 +425,7 @@ def _tool_result_memory_payload_view(
     if not projection.envelope_available:
         return _MemoryProjectionPayloadView(
             payload=event.payload,
+            assistant_final_answer_text=None,
             evidence_query_text=projection.query.text,
             evidence_tool_name=projection.tool_name,
             evidence_result_text=projection.result_text,
@@ -467,6 +446,7 @@ def _tool_result_memory_payload_view(
     )
     return _MemoryProjectionPayloadView(
         payload=payload,
+        assistant_final_answer_text=None,
         evidence_query_text=projection.query.text,
         evidence_tool_name=projection.tool_name,
         evidence_result_text=projection.result_text,

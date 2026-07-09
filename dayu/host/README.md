@@ -33,7 +33,7 @@ Dayu 是生产级通用 Agent，具备买方财报分析能力，核心范式是
 - 工具调用只通过 Host-owned ToolRuntime 进入业务工具；工具结果、等待、截断、`fetch_more` 与重复调用治理必须经过 Host accept barrier。
 - accepted 工具结果投影给 Tool Trace、Read API、Conversation Memory、RunInputBuilder 与 compact material 时，LLM-facing 的查询语义、状态语义、结果摘要和业务 source 由 Host 统一投影；下游消费者只消费该投影，不重新回读或猜测 request atom。
 - 上下文预算和 compact 治理由 Host 负责；Engine 只在 provider 明确报告上下文溢出时发出 `context_compaction_requested`。
-- Conversation Memory 只消费 committed canonical facts 与 accepted compact 结果；assistant final answer 和普通工具证据不会自动成为 evidence-backed fact。
+- Conversation Memory 只消费 committed canonical facts 与 accepted compact 结果；assistant final answer 和普通工具证据不会自动成为 evidence-backed fact。descriptor-backed terminal answer continuity 由 Host terminal resolver 解析成 typed LLM-facing material，Memory projection 与 RunInputBuilder 不通过改写 EventLog payload 来投影回答文本。
 - 财报业务语义、财报文档下载、预处理、处理与存取不属于 Host；财报文档存取必须通过 `dayu.fins.storage` 下的仓储协议与仓储实现完成。
 
 ## 架构边界
@@ -361,7 +361,7 @@ Dispatch scheduler 只消费已提交的 accepted / queued / pending dispatch fa
 
 ### RunInputBuilder
 
-RunInputBuilder 只从 durable providers 读取当前 Run facts、Session continuity、conversation memory、compact artifact、accepted tool evidence、fallback context、tool schema snapshot、ToolRuntime handle、scene parameters 和 policy snapshot，构造 `AgentRunRequest`。它会把 Host 内部 id、payload ref、projection checkpoint、policy ref、digest 和 dispatch 状态改写为 LLM-facing 自解释 system sections，避免把宿主治理信息伪装成业务事实。完成普通 runner input 装配后，RunInputBuilder 写入 bounded `RUNNER_CALL_INPUT_ASSEMBLED` manifest，并把完整 LLM-facing messages 与 selected tool schema full JSON 分别保存为可校验 payload descriptor，供 Tool Trace resolver 按需读取。
+RunInputBuilder 只从 durable providers 读取当前 Run facts、Session continuity、conversation memory、compact artifact、accepted tool evidence、fallback context、tool schema snapshot、ToolRuntime handle、scene parameters 和 policy snapshot，构造 `AgentRunRequest`。它会把 Host 内部 id、payload ref、projection checkpoint、policy ref、digest 和 dispatch 状态改写为 LLM-facing 自解释 system sections，避免把宿主治理信息伪装成业务事实。descriptor-backed terminal answer continuity 只以 typed answer text 进入 LLM-facing messages，不把 descriptor、digest 或治理 label 当作回答内容。完成普通 runner input 装配后，RunInputBuilder 写入 bounded `RUNNER_CALL_INPUT_ASSEMBLED` manifest，并把完整 LLM-facing messages 与 selected tool schema full JSON 分别保存为可校验 payload descriptor，供 Tool Trace resolver 按需读取。
 
 ### EngineEvent ingest
 

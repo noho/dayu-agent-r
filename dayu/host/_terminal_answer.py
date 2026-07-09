@@ -7,11 +7,11 @@ fallback，不是失败诊断、取消原因、lost 诊断、compact session_sum
 answer anchor 或 evidence-backed fact 来源。
 
 consumer 边界固定如下：compaction material 使用本 strict continuity resolver 并允许
-digest-checked artifact fallback；Conversation Memory selected recent window 直接消费
-inline ``final_answer`` 且保持 lenient；durable projection / run-input adapter 可以先把
-descriptor-backed terminal artifact ``content`` hydrate 成 transient ``final_answer``，
-再交给 memory consumer。本模块不负责文本截断，长度治理属于调用方的展示、存储或上下文
-预算边界。
+digest-checked artifact fallback；durable projection / RunInputBuilder 把 resolver
+输出作为 projection-internal typed continuity material 传给 memory consumer，不修改
+EventLog payload mapping；直接 Conversation Memory consumer 在缺少 typed material 时只消费
+inline ``final_answer`` 并保持 lenient、descriptor-blind。本模块不负责文本截断，长度治理
+属于调用方的展示、存储或上下文预算边界。
 """
 
 from __future__ import annotations

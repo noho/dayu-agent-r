@@ -134,7 +134,6 @@ from dayu.host.payload_resolution import (
 from dayu.host.projection import event_log_read_filter_from_projection_filter
 from dayu.host.terminal_payload import (
     PayloadTextReadPolicy,
-    assistant_final_answer_text_from_run_payload,
 )
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
@@ -170,7 +169,6 @@ _PAYLOAD_FIELD_DISPLAY_TEXT = "display_text"
 _PAYLOAD_FIELD_SYSTEM_PROMPT = "system_prompt"
 _PAYLOAD_FIELD_OPERATION_KIND = "operation_kind"
 _PAYLOAD_FIELD_EXECUTION_TARGET = "execution_target"
-_PAYLOAD_FIELD_FINAL_ANSWER = "final_answer"
 _PAYLOAD_FIELD_START_REASON = "start_reason"
 _PAYLOAD_FIELD_TOOL_RESULT_EVENT_REF = "tool_result_event_ref"
 _PAYLOAD_FIELD_EVENT_ID = "event_id"
@@ -3179,7 +3177,7 @@ def _memory_projection_event_from_row(transaction: HostTransaction, row: EventLo
     :raises HostDurableError: payload 不是 JSON object 时抛出。
     """
 
-    payload = _payload_with_assistant_final_answer(transaction, row)
+    payload = _memory_projection_payload(transaction, row)
     return MemoryProjectionEvent(
         event_sequence=row.event_sequence,
         event_id=row.event_id,
@@ -3193,11 +3191,19 @@ def _memory_projection_event_from_row(transaction: HostTransaction, row: EventLo
         payload_ref=row.payload_ref,
         payload_digest=row.payload_digest,
         payload=payload,
+        assistant_final_answer_text=_assistant_final_answer_text(
+            transaction,
+            row,
+            payload,
+        ),
     )
 
 
-def _payload_with_assistant_final_answer(transaction: HostTransaction, row: EventLogRow) -> Mapping[str, JsonValue]:
-    """必要时把 memory projection 需要的 transient payload 补齐。
+def _memory_projection_payload(
+    transaction: HostTransaction,
+    row: EventLogRow,
+) -> Mapping[str, JsonValue]:
+    """读取 memory inline repair 使用的 payload。
 
     :param transaction: Host transaction。
     :param row: EventLog row。
@@ -3208,26 +3214,30 @@ def _payload_with_assistant_final_answer(transaction: HostTransaction, row: Even
     payload = _payload_object(row)
     if row.event_type == _EVENT_TYPE_TOOL_RESULT_ACCEPTED:
         return _tool_result_memory_payload(transaction, row, payload)
+    return payload
+
+
+def _assistant_final_answer_text(
+    transaction: HostTransaction,
+    row: EventLogRow,
+    payload: Mapping[str, JsonValue],
+) -> str | None:
+    """读取 RUN_SUCCEEDED 的 typed assistant final-answer continuity 文本。
+
+    :param transaction: Host transaction。
+    :param row: EventLog row。
+    :param payload: 已解析 canonical payload。
+    :returns: LLM-facing assistant answer 文本；非成功终态或缺失时返回 ``None``。
+    :raises HostDurableError: terminal artifact descriptor 损坏时抛出。
+    """
+
     if row.event_type != _EVENT_TYPE_RUN_SUCCEEDED:
-        return payload
-    if (
-        assistant_final_answer_text_from_run_payload(
-            payload,
-            text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
-        )
-        is not None
-    ):
-        return payload
-    final_answer = assistant_final_answer_continuity_text(
+        return None
+    return assistant_final_answer_continuity_text(
         transaction,
         payload,
         text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
     )
-    if final_answer is None:
-        return payload
-    merged: dict[str, JsonValue] = dict(payload)
-    merged[_PAYLOAD_FIELD_FINAL_ANSWER] = final_answer
-    return merged
 
 
 def _tool_result_memory_payload(
