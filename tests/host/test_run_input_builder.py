@@ -154,33 +154,22 @@ from dayu.host.evidence import (
 )
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
-    AnswerAnchor,
-    AnswerAnchorChild,
-    AnswerAnchorMemoryView,
     ConversationMemorySnapshotVNext,
-    EvidenceFactMemoryView,
-    ForwardIntent,
-    ForwardIntentMemoryView,
     MemoryClaimStatus,
     MemoryDiagnosticReason,
-    MemoryEvidenceBackedFactKind,
     MemoryIncludedReason,
-    MemoryProducerKind,
     MemoryProjectionEvent,
     MemoryProjectionPolicy,
-    MemoryProvenanceRef,
     MemoryRepairReason,
     MemorySizeUnits,
     MemorySnapshotCursor,
-    EvidenceBackedFactView,
-    ReferenceContinuityItem,
-    SelectedRecentWindowItem,
-    SelectedRecentWindowRole,
-    SessionSummaryMemoryView,
-    TraceMemoryView,
     build_conversation_memory_snapshot_from_events,
-    calculate_memory_snapshot_digest,
-    digest_memory_projection_policy,
+)
+from tests.host.memory_snapshot_factories import (
+    current_input_memory_snapshot,
+    recalculate_memory_snapshot_digest,
+    reference_continuity_only_snapshot,
+    rich_memory_snapshot,
 )
 from dayu.host.tool_runtime import (
     DefaultToolRuntimeFactory,
@@ -2630,18 +2619,16 @@ def test_inline_delta_no_matching_rows_still_covers_required_cursor(
             policy=policy,
             built_at="2026-05-15T01:02:03.000000Z",
         )
-        snapshot = replace(
-            snapshot,
-            cursor=MemorySnapshotCursor(
-                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
-                checkpoint_event_sequence=current_input.event_sequence,
-                checkpoint_event_id=current_input.event_id,
-                session_id=session_id,
-            ),
-        )
-        snapshot = replace(
-            snapshot,
-            snapshot_digest=calculate_memory_snapshot_digest(snapshot),
+        snapshot = recalculate_memory_snapshot_digest(
+            replace(
+                snapshot,
+                cursor=MemorySnapshotCursor(
+                    consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                    checkpoint_event_sequence=current_input.event_sequence,
+                    checkpoint_event_id=current_input.event_id,
+                    session_id=session_id,
+                ),
+            )
         )
         _write_memory_snapshot(store.transaction_runner, snapshot)
 
@@ -4006,136 +3993,11 @@ def _rich_memory_snapshot(
     :returns: memory snapshot。
     """
 
-    policy_digest = digest_memory_projection_policy(policy)
-    snapshot_without_digest = ConversationMemorySnapshotVNext(
-        schema_version="conversation_memory_snapshot_v1",
-        snapshot_id=f"memory-snapshot-test-{session_id}",
+    return rich_memory_snapshot(
         session_id=session_id,
+        policy=policy,
         cursor=cursor,
-        policy_digest=policy_digest,
-        latest_compaction_event_ref="event-memory-episode",
-        trace_memory=TraceMemoryView(
-            selected_recent_window=(
-                SelectedRecentWindowItem(
-                    item_id="memory-item:selected-user:test",
-                    role=SelectedRecentWindowRole.USER,
-                    text="recent raw user",
-                    event_id="event-memory-raw-user",
-                    event_sequence=3,
-                    run_id="run-memory",
-                    source_refs=("event-memory-raw-user",),
-                    included_reason=MemoryIncludedReason.SELECTED_RECENT_WINDOW,
-                    excluded_reason=None,
-                    size_units=MemorySizeUnits(15),
-                ),
-                SelectedRecentWindowItem(
-                    item_id="memory-item:selected-assistant:test",
-                    role=SelectedRecentWindowRole.ASSISTANT,
-                    text="recent assistant conclusion",
-                    event_id="event-memory-assistant",
-                    event_sequence=4,
-                    run_id="run-memory",
-                    source_refs=("event-memory-assistant",),
-                    included_reason=MemoryIncludedReason.SELECTED_RECENT_WINDOW,
-                    excluded_reason=None,
-                    size_units=MemorySizeUnits(27),
-                ),
-            ),
-            reference_continuity_items=(
-                ReferenceContinuityItem(
-                    item_id="memory-item:reference-continuity:test",
-                    text="second factor: margin mix",
-                    reason="needed_for_ordered_item_reference",
-                    source_refs=("event-memory-raw-user",),
-                    event_id="event-memory-episode",
-                    event_sequence=5,
-                    size_units=MemorySizeUnits(25),
-                ),
-            ),
-        ),
-        evidence_fact_memory=EvidenceFactMemoryView(
-            evidence_backed_facts=(_memory_fact_view(),),
-            recent_evidence_items=(),
-        ),
-        session_summary_memory=SessionSummaryMemoryView(
-            summary_text="compare revenue quality; use reported currency",
-            source_refs=("event-memory-episode",),
-            event_id="event-memory-episode",
-            event_sequence=5,
-            size_units=MemorySizeUnits(46),
-        ),
-        answer_anchor_memory=AnswerAnchorMemoryView(
-            anchors=(
-                AnswerAnchor(
-                    item_id="memory-item:answer-anchor:test",
-                    anchor_title="Revenue quality",
-                    anchor_items=(
-                        AnswerAnchorChild(
-                            display_text="Use reported currency.",
-                            ordinal=1,
-                        ),
-                    ),
-                    source_refs=("event-memory-episode",),
-                    event_id="event-memory-episode",
-                    event_sequence=5,
-                    size_units=MemorySizeUnits(42),
-                ),
-            ),
-        ),
-        forward_intent_memory=ForwardIntentMemoryView(
-            intents=(
-                ForwardIntent(
-                    item_id="memory-item:forward-intent:test",
-                    intent_type="follow_up",
-                    text="what changed in margin?",
-                    status="open",
-                    source_refs=("event-memory-episode",),
-                    event_id="event-memory-episode",
-                    event_sequence=5,
-                    size_units=MemorySizeUnits(23),
-                ),
-            ),
-        ),
-        diagnostics=(),
-        built_at="2026-05-15T01:02:03.000000Z",
-        snapshot_digest="pending",
-    )
-    return replace(
-        snapshot_without_digest,
-        snapshot_digest=calculate_memory_snapshot_digest(snapshot_without_digest),
-    )
-
-
-def _memory_fact_view() -> EvidenceBackedFactView:
-    """构造测试用 evidence-backed fact。
-
-    :returns: evidence-backed fact view。
-    """
-
-    return EvidenceBackedFactView(
-        item_id="memory-item:evidence-backed:test",
-        claim_text="Revenue increased year over year",
-        evidence_kind=MemoryEvidenceBackedFactKind.DERIVED_FROM_EVIDENCE,
-        evidence_refs=("evidence:memory-tool",),
-        provenance=MemoryProvenanceRef(
-            producer_kind=MemoryProducerKind.HOST_PROJECTION,
-            producer_name="conversation_memory",
-            event_id="event-memory-episode",
-            event_sequence=5,
-            run_id="run-memory",
-            attempt_id=None,
-            execution_id=None,
-            tool_result_ref="event-memory-tool",
-            payload_ref="compact-artifact:test",
-            digest_ref=_DIGEST_A,
-            source_refs=(),
-        ),
-        extraction_operation_ref="event:event-memory-episode",
-        compact_artifact_ref="compact-artifact:test",
-        candidate_id="fact-memory-revenue",
-        included_reason=MemoryIncludedReason.EVIDENCE_BACKED_FACT,
-        excluded_reason=None,
-        size_units=MemorySizeUnits(31),
+        snapshot_id=f"memory-snapshot-test-{session_id}",
     )
 
 
@@ -4173,51 +4035,14 @@ def _current_input_memory_snapshot(
     :returns: memory snapshot。
     """
 
-    policy_digest = digest_memory_projection_policy(policy)
-    snapshot_without_digest = ConversationMemorySnapshotVNext(
-        schema_version="conversation_memory_snapshot_v1",
-        snapshot_id=f"memory-snapshot-current-{session_id}",
+    return current_input_memory_snapshot(
         session_id=session_id,
+        policy=policy,
         cursor=cursor,
-        policy_digest=policy_digest,
-        latest_compaction_event_ref=None,
-        trace_memory=TraceMemoryView(
-            selected_recent_window=(
-                SelectedRecentWindowItem(
-                    item_id="memory-item:selected-current",
-                    role=SelectedRecentWindowRole.USER,
-                    text=current_prompt,
-                    event_id=current_input.event_id,
-                    event_sequence=current_input.event_sequence,
-                    run_id=current_input.run_id,
-                    source_refs=(current_input.event_id,),
-                    included_reason=MemoryIncludedReason.SELECTED_RECENT_WINDOW,
-                    excluded_reason=None,
-                    size_units=MemorySizeUnits(len(current_prompt)),
-                ),
-            ),
-            reference_continuity_items=(),
-        ),
-        evidence_fact_memory=EvidenceFactMemoryView(
-            evidence_backed_facts=(),
-            recent_evidence_items=(),
-        ),
-        session_summary_memory=SessionSummaryMemoryView(
-            summary_text=None,
-            source_refs=(),
-            event_id=None,
-            event_sequence=None,
-            size_units=MemorySizeUnits(0),
-        ),
-        answer_anchor_memory=AnswerAnchorMemoryView(anchors=()),
-        forward_intent_memory=ForwardIntentMemoryView(intents=()),
-        diagnostics=(),
-        built_at="2026-05-15T01:02:03.000000Z",
-        snapshot_digest="pending",
-    )
-    return replace(
-        snapshot_without_digest,
-        snapshot_digest=calculate_memory_snapshot_digest(snapshot_without_digest),
+        current_event_id=current_input.event_id,
+        current_event_sequence=current_input.event_sequence,
+        current_run_id=current_input.run_id,
+        current_prompt=current_prompt,
     )
 
 
@@ -4241,48 +4066,14 @@ def _reference_continuity_only_snapshot(
     :returns: memory snapshot。
     """
 
-    policy_digest = digest_memory_projection_policy(policy)
-    snapshot_without_digest = ConversationMemorySnapshotVNext(
-        schema_version="conversation_memory_snapshot_v1",
-        snapshot_id=f"memory-snapshot-reference-continuity-{session_id}",
+    return reference_continuity_only_snapshot(
         session_id=session_id,
+        policy=policy,
         cursor=cursor,
-        policy_digest=policy_digest,
-        latest_compaction_event_ref=producer_event.event_id,
-        trace_memory=TraceMemoryView(
-            selected_recent_window=(),
-            reference_continuity_items=(
-                ReferenceContinuityItem(
-                    item_id="memory-item:reference-continuity:second-factor",
-                    text=preserve_text,
-                    reason="needed_for_ordered_item_reference",
-                    source_refs=(source_event.event_id,),
-                    event_id=producer_event.event_id,
-                    event_sequence=producer_event.event_sequence,
-                    size_units=MemorySizeUnits(len(preserve_text)),
-                ),
-            ),
-        ),
-        evidence_fact_memory=EvidenceFactMemoryView(
-            evidence_backed_facts=(),
-            recent_evidence_items=(),
-        ),
-        session_summary_memory=SessionSummaryMemoryView(
-            summary_text=None,
-            source_refs=(),
-            event_id=None,
-            event_sequence=None,
-            size_units=MemorySizeUnits(0),
-        ),
-        answer_anchor_memory=AnswerAnchorMemoryView(anchors=()),
-        forward_intent_memory=ForwardIntentMemoryView(intents=()),
-        diagnostics=(),
-        built_at="2026-05-15T01:02:03.000000Z",
-        snapshot_digest="pending",
-    )
-    return replace(
-        snapshot_without_digest,
-        snapshot_digest=calculate_memory_snapshot_digest(snapshot_without_digest),
+        source_event_id=source_event.event_id,
+        producer_event_id=producer_event.event_id,
+        producer_event_sequence=producer_event.event_sequence,
+        preserve_text=preserve_text,
     )
 
 
@@ -5335,17 +5126,10 @@ def _append_resume_wait_projection_events(
         event_log = EventLogStore()
         normalized_arguments_digest = sha256_digest_json({"arguments": {"ticker": "V"}})
         request_arguments = accepted_arguments or {"ticker": "V"}
-        request_arguments_json: dict[str, JsonValue] = {
-            "arguments": dict(request_arguments)
-        }
+        request_arguments_json: dict[str, JsonValue] = {"arguments": dict(request_arguments)}
         request_arguments_digest = sha256_digest_json(request_arguments_json)
-        request_semantic_query = (
-            "工具 fake_tool 请求参数："
-            f"{canonical_json_dumps(dict(request_arguments))}"
-        )
-        request_semantic_query_digest = sha256_digest_json(
-            {"semantic_query_text": request_semantic_query}
-        )
+        request_semantic_query = "工具 fake_tool 请求参数：" f"{canonical_json_dumps(dict(request_arguments))}"
+        request_semantic_query_digest = sha256_digest_json({"semantic_query_text": request_semantic_query})
         request_event_id = "event-tool-call-requested-resume"
         if include_request_atom:
             event_log.append_event(
@@ -5369,20 +5153,15 @@ def _append_resume_wait_projection_events(
                         "tool_call_id": "tool-call-private",
                         "tool_name": "fake_tool",
                         "normalized_arguments_digest": (
-                            request_normalized_arguments_digest
-                            or normalized_arguments_digest
+                            request_normalized_arguments_digest or normalized_arguments_digest
                         ),
-                        "arguments_json_size_bytes": len(
-                            canonical_json_dumps(request_arguments_json).encode("utf-8")
-                        ),
+                        "arguments_json_size_bytes": len(canonical_json_dumps(request_arguments_json).encode("utf-8")),
                         "arguments_storage_kind": TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
                         "arguments_inline_json": request_arguments_json,
                         "arguments_payload_ref": None,
                         "arguments_payload_digest": request_arguments_digest,
                         "semantic_input_digest": _DIGEST_A,
-                        "semantic_query_storage_kind": (
-                            TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT
-                        ),
+                        "semantic_query_storage_kind": (TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT),
                         "semantic_query_text": request_semantic_query,
                         "semantic_query_payload_ref": None,
                         "semantic_query_digest": request_semantic_query_digest,
@@ -5443,27 +5222,25 @@ def _append_resume_wait_projection_events(
             "normalized_arguments_digest": normalized_arguments_digest,
         }
         if include_accepted_evidence_envelope:
-            tool_result_payload["accepted_evidence_envelope"] = (
-                accepted_evidence_envelope_to_json_value(
-                    AcceptedEvidenceEnvelope(
-                        evidence_id="evidence:event-tool-result-resume",
-                        producer_event_ref="event-tool-result-resume",
-                        tool_name="fake_tool",
-                        tool_call_id="tool-call-private",
-                        tool_query=AcceptedEvidenceToolQuery(
-                            tool_call_requested_event_ref=request_event_id,
-                            normalized_arguments_digest=normalized_arguments_digest,
-                            semantic_input_digest=_DIGEST_A,
-                        ),
-                        result_ref=AcceptedEvidenceResultRef(
-                            payload_ref=None,
-                            payload_digest=None,
-                            outcome_digest=_DIGEST_A,
-                            truncation_applied=False,
-                        ),
-                        source_refs=(),
-                        locator_refs=(),
-                    )
+            tool_result_payload["accepted_evidence_envelope"] = accepted_evidence_envelope_to_json_value(
+                AcceptedEvidenceEnvelope(
+                    evidence_id="evidence:event-tool-result-resume",
+                    producer_event_ref="event-tool-result-resume",
+                    tool_name="fake_tool",
+                    tool_call_id="tool-call-private",
+                    tool_query=AcceptedEvidenceToolQuery(
+                        tool_call_requested_event_ref=request_event_id,
+                        normalized_arguments_digest=normalized_arguments_digest,
+                        semantic_input_digest=_DIGEST_A,
+                    ),
+                    result_ref=AcceptedEvidenceResultRef(
+                        payload_ref=None,
+                        payload_digest=None,
+                        outcome_digest=_DIGEST_A,
+                        truncation_applied=False,
+                    ),
+                    source_refs=(),
+                    locator_refs=(),
                 )
             )
             tool_result_payload["raw_tool_outcome"] = tool_result_payload["result"]
