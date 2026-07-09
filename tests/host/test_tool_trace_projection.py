@@ -47,6 +47,7 @@ from dayu.host.evidence import (
     AcceptedEvidenceEnvelope,
     AcceptedEvidenceResultRef,
     AcceptedEvidenceToolQuery,
+    OpaqueEvidenceRef,
     accepted_evidence_envelope_to_json_value,
 )
 from dayu.host.open_host import _default_tool_trace_cold_jsonl_path
@@ -327,7 +328,13 @@ def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> Non
             outcome_digest=outcome_digest,
             truncation_applied=False,
         ),
-        source_refs=(),
+        source_refs=(
+            OpaqueEvidenceRef(
+                ref_kind="payload",
+                ref_id="payload-source-internal",
+                digest=None,
+            ),
+        ),
         locator_refs=(),
     )
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -543,7 +550,13 @@ def test_wait_resolution_tool_trace_summarizes_request_and_result_details(
             outcome_digest=sha256_digest_json({"result": "atat"}),
             truncation_applied=False,
         ),
-        source_refs=(),
+        source_refs=(
+            OpaqueEvidenceRef(
+                ref_kind="payload",
+                ref_id="payload-source-internal",
+                digest=None,
+            ),
+        ),
         locator_refs=(),
     )
     raw_outcome: JsonValue = {
@@ -639,6 +652,7 @@ def test_wait_resolution_tool_trace_summarizes_request_and_result_details(
         assert "ticker=ATAT" in cold_text
         assert "discovered=27" in cold_text
         assert "wait-atat-should-not-project" not in cold_text
+        assert "payload-source-internal" not in cold_text
         assert "observation handle" not in cold_text
         assert "runtime" not in cold_text
 

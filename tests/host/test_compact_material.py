@@ -11,6 +11,9 @@ import pytest
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host.api import RunStatus
+from dayu.host.accepted_result_projection import (
+    ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
+)
 from dayu.host.compact_material import (
     CompactMaterialSourceBoundary,
     CompactMaterialPack,
@@ -1651,6 +1654,94 @@ def test_pre_dispatch_evidence_reads_descriptor_raw_payload(tmp_path: Path) -> N
         assert view.material_blocks[0].payload_refs == ("payload-descriptor-evidence",)
 
 
+def test_pre_dispatch_evidence_uses_projection_unavailable_source(
+    tmp_path: Path,
+) -> None:
+    """缺业务 source refs 时 compact material 使用 projection owner 文案。"""
+
+    event_log = EventLogStore()
+    view: PreDispatchCompactMaterialView | None = None
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入仅含内部 source refs 的 accepted evidence。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run row。
+            """
+
+            tool_call_id = "tool-call-unavailable-source"
+            arguments_json: JsonValue = {"arguments": {"ticker": "MSFT"}}
+            arguments_digest = sha256_digest_json(arguments_json)
+            _append_tool_call_requested_event(
+                transaction,
+                event_log,
+                event_id="event-tool-call-unavailable-source",
+                tool_call_id=tool_call_id,
+                semantic_query_text="查询 MSFT 收入",
+            )
+            _append_tool_result_event(
+                transaction,
+                event_log,
+                event_id="event-tool-result-unavailable-source",
+                tool_call_requested_event_ref="event-tool-call-unavailable-source",
+                tool_call_id=tool_call_id,
+                normalized_arguments_digest=arguments_digest,
+                source_refs=(
+                    OpaqueEvidenceRef(
+                        ref_kind="payload",
+                        ref_id="payload-internal",
+                        digest=None,
+                    ),
+                    OpaqueEvidenceRef(
+                        ref_kind="event",
+                        ref_id="event-internal",
+                        digest=None,
+                    ),
+                ),
+            )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-unavailable-source",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current user question"},
+            )
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+        view = store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                event_log,
+                run=run,
+                current_display_text="current user question",
+            )
+        )
+
+    assert view is not None
+    evidence_blocks = tuple(
+        block
+        for block in view.material_blocks
+        if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE
+    )
+    assert len(evidence_blocks) == 1
+    evidence_block = evidence_blocks[0]
+    assert evidence_block.readable_source_text == (
+        ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT
+    )
+    visible_text = "\n".join(
+        (
+            evidence_block.text,
+            evidence_block.readable_query_text or "",
+            evidence_block.readable_source_text or "",
+        )
+    )
+    assert ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT in visible_text
+    assert "payload-internal" not in visible_text
+    assert "event-internal" not in visible_text
+
+
 def test_pre_dispatch_tool_result_without_envelope_yields_no_evidence_block(
     tmp_path: Path,
 ) -> None:
@@ -2552,6 +2643,7 @@ def _append_tool_result_event(
     tool_call_id: str | None = None,
     normalized_arguments_digest: str = _DIGEST,
     run_id: str | None = None,
+    source_refs: tuple[OpaqueEvidenceRef, ...] | None = None,
 ) -> EventLogRow:
     """追加带 accepted evidence envelope 的 TOOL_RESULT_ACCEPTED。
 
@@ -2562,6 +2654,7 @@ def _append_tool_result_event(
     :param tool_call_id: 可选 tool call id；不传时从 event id 派生。
     :param normalized_arguments_digest: envelope 参数 digest。
     :param run_id: 可选 Host Run id。
+    :param source_refs: 可选覆盖 envelope source refs。
     :returns: appended EventLog row。
     """
 
@@ -2570,6 +2663,7 @@ def _append_tool_result_event(
         tool_call_requested_event_ref=tool_call_requested_event_ref,
         tool_call_id=tool_call_id,
         normalized_arguments_digest=normalized_arguments_digest,
+        source_refs=source_refs,
     )
     return _append_event(
         transaction,
@@ -2595,6 +2689,7 @@ def _accepted_evidence_envelope_for_event(
     normalized_arguments_digest: str = _DIGEST,
     payload_ref: str | None = None,
     payload_digest: str | None = None,
+    source_refs: tuple[OpaqueEvidenceRef, ...] | None = None,
 ) -> AcceptedEvidenceEnvelope:
     """构造测试用 accepted evidence envelope。
 
@@ -2604,6 +2699,7 @@ def _accepted_evidence_envelope_for_event(
     :param normalized_arguments_digest: envelope 参数 digest。
     :param payload_ref: raw result payload descriptor ref。
     :param payload_digest: raw result payload digest。
+    :param source_refs: 可选覆盖 source refs。
     :returns: AcceptedEvidenceEnvelope。
     """
 
@@ -2624,7 +2720,11 @@ def _accepted_evidence_envelope_for_event(
             outcome_digest=_DIGEST,
             truncation_applied=False,
         ),
-        source_refs=(OpaqueEvidenceRef(ref_kind="source", ref_id=event_id, digest=None),),
+        source_refs=(
+            (OpaqueEvidenceRef(ref_kind="source", ref_id=event_id, digest=None),)
+            if source_refs is None
+            else source_refs
+        ),
         locator_refs=(),
     )
 

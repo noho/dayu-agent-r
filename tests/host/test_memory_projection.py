@@ -63,6 +63,7 @@ from dayu.host.evidence import (
 )
 from dayu.host.accepted_result_projection import (
     ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT,
+    ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
 )
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
@@ -1279,6 +1280,7 @@ def test_accepted_tool_evidence_includes_query_and_raw_outcome_without_refs() ->
                 evidence_result_text=canonical_json_dumps(
                     {"status": "ok", "text": "tool fact accepted"}
                 ),
+                evidence_source_text=ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
             ),
         ),
         session_id=_SESSION_ID,
@@ -1292,6 +1294,7 @@ def test_accepted_tool_evidence_includes_query_and_raw_outcome_without_refs() ->
     text = selected[0].text
     assert "lookup_mock_fact" in text
     assert "查询 DAYU 的业务事实" in text
+    assert ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT in text
     assert "tool fact accepted" in text
     assert "preview display" not in text
     assert "preview content" not in text

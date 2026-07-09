@@ -35,6 +35,11 @@ from dayu.host.payload_resolution import (
 ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT = "查询语义不可用；参数未安全展开。"
 """Accepted tool result query 不可安全投影时的唯一 LLM-facing 文案。"""
 
+ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT = (
+    "业务来源不可用；工具结果未提供可安全展示的来源。"
+)
+"""Accepted tool result source 不可安全投影时的唯一 LLM-facing 文案。"""
+
 _EVENT_TYPE_TOOL_CALL_REQUESTED = "TOOL_CALL_REQUESTED"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
 _FIELD_TOOL_NAME = "tool_name"
@@ -107,12 +112,12 @@ class AcceptedToolResultQueryProjection:
 class AcceptedToolResultSourceProjection:
     """Accepted tool result 的 source 可读投影。
 
-    :param text: 业务可读 source 文本；无业务 source 时为 ``None``。
+    :param text: LLM-facing source 文本；无业务 source 时为业务中性不可用文案。
     :param state: source 投影状态。
     :param diagnostic_reason: source 被过滤或缺失的原因。
     """
 
-    text: str | None
+    text: str
     state: AcceptedToolResultSourceState
     diagnostic_reason: str | None
 
@@ -610,7 +615,7 @@ def _source_projection(
 
     if envelope is None:
         return AcceptedToolResultSourceProjection(
-            text=None,
+            text=ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
             state=AcceptedToolResultSourceState.UNAVAILABLE,
             diagnostic_reason="accepted_evidence_envelope_missing",
         )
@@ -623,7 +628,7 @@ def _source_projection(
     if len(visible_refs) == 0:
         diagnostics.append("business_source_unavailable")
         return AcceptedToolResultSourceProjection(
-            text=None,
+            text=ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
             state=AcceptedToolResultSourceState.UNAVAILABLE,
             diagnostic_reason="business_source_unavailable",
         )
@@ -779,6 +784,7 @@ def projection_result_digest(projection: AcceptedToolResultProjection) -> str | 
 
 __all__ = [
     "ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT",
+    "ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT",
     "AcceptedToolResultProjection",
     "AcceptedToolResultQueryProjection",
     "AcceptedToolResultQueryState",

@@ -38,6 +38,9 @@ from dayu.engine.contracts.messages import (
 )
 from dayu.engine.contracts.engine_events import runner_role_sequence_digest
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
+from dayu.host.accepted_result_projection import (
+    ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
+)
 from dayu.host._event_payload import (
     payload_object as _payload_object,
     required_payload_text as _required_payload_text,
@@ -3323,8 +3326,8 @@ def test_post_compaction_raw_tail_skips_without_compact_or_in_fallback(
         assert contents[-1] == current_prompt
 
 
-def test_accepted_tool_evidence_content_consumes_projection_cleaned_source() -> None:
-    """RunInputBuilder 只消费 projection helper 已清洗的 accepted evidence source。"""
+def test_accepted_tool_evidence_content_consumes_projection_source_text() -> None:
+    """RunInputBuilder 只消费 projection owner 给出的 accepted evidence source。"""
 
     block = run_input_material_block(
         block_id="accepted-evidence",
@@ -3335,7 +3338,7 @@ def test_accepted_tool_evidence_content_consumes_projection_cleaned_source() -> 
         event_sequence=1,
         readable_tool_name="fins.search",
         readable_query_text="查询收入",
-        readable_source_text="filing:msft-10k",
+        readable_source_text=ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
         accepted_evidence_id="evidence:accepted-evidence",
         tool_result_event_ref="event-result",
         tool_call_event_ref="event-request",
@@ -3343,9 +3346,11 @@ def test_accepted_tool_evidence_content_consumes_projection_cleaned_source() -> 
 
     content = _accepted_tool_evidence_content(block)
 
-    assert "source=filing:msft-10k" in content
+    assert f"source={ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT}" in content
     assert "tool_call_event:" not in content
     assert "payload:" not in content
+    assert "event-request" not in content
+    assert "event-result" not in content
 
 
 def test_compact_artifact_reader_uses_vnext_evidence_mapping_refs() -> None:

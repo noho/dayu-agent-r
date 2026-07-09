@@ -110,7 +110,8 @@ class _MemoryProjectionPayloadView:
     :param evidence_query_text: 可选 LLM-safe request / query 文本。
     :param evidence_tool_name: 可选工具名。
     :param evidence_result_text: 可选 LLM-safe 工具结果文本。
-    :param evidence_source_text: 可选业务可读 source 文本。
+    :param evidence_source_text: 可选业务可读 source 文本；accepted result 正常路径由
+        统一 projection owner 提供非空 source 文本。
     """
 
     payload: Mapping[str, JsonValue]

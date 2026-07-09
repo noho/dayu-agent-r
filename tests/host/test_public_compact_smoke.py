@@ -392,6 +392,7 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
             allow_tool_calls=True,
             tooling_options=_long_chapter_tooling_options(),
             policy_ref="p12-6-public-tool-evidence",
+            selected_recent_window_turn_floor=0,
         )
     ) as host:
         session = await host.ensure_session(ensure_request("p12-6-tool-evidence"))
@@ -1096,6 +1097,7 @@ def _fake_compact_open_options(
     max_compaction_attempts_per_operation: int = (
         _COMPACTOR_MAX_ATTEMPTS_PER_OPERATION
     ),
+    selected_recent_window_turn_floor: int | None = None,
 ) -> OpenHostOptions:
     """构造带 deterministic compactor baseline 的 public ``OpenHostOptions``。
 
@@ -1106,6 +1108,7 @@ def _fake_compact_open_options(
     :param policy_ref: context policy ref。
     :param soft_threshold_tokens: proactive compact soft threshold。
     :param max_compaction_attempts_per_operation: 单次 compact operation proposal 上限。
+    :param selected_recent_window_turn_floor: 可选覆盖 recent raw turn floor。
     :returns: public OpenHostOptions。
     :raises ValueError: typed options 字段非法时由底层抛出。
     """
@@ -1131,6 +1134,14 @@ def _fake_compact_open_options(
             ),
         ),
         compactor_runner_baseline=_fake_compactor_baseline(tmp_path),
+        memory_projection_policy=(
+            base_options.memory_projection_policy
+            if selected_recent_window_turn_floor is None
+            else replace(
+                base_options.memory_projection_policy,
+                selected_recent_window_turn_floor=selected_recent_window_turn_floor,
+            )
+        ),
     )
 
 

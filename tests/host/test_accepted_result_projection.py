@@ -9,6 +9,7 @@ from dayu.contracts.json_value import JsonValue
 from dayu.host.api import RunStatus
 from dayu.host.accepted_result_projection import (
     ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT,
+    ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
     AcceptedToolResultProjection,
     AcceptedToolResultQueryState,
     AcceptedToolResultSourceState,
@@ -184,7 +185,9 @@ def test_projection_falls_back_to_arguments_when_semantic_query_is_absent(
         f"参数：{canonical_json_dumps({'arguments': {'ticker': 'AAPL'}})}"
     )
     assert projection.status is AcceptedToolResultStatus.FAILED
-    assert projection.source.text is None
+    assert projection.source.state is AcceptedToolResultSourceState.UNAVAILABLE
+    assert projection.source.diagnostic_reason == "business_source_unavailable"
+    assert projection.source.text == ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT
 
 
 def test_projection_missing_request_atom_returns_limited_signal(
@@ -217,6 +220,41 @@ def test_projection_missing_request_atom_returns_limited_signal(
     assert projection.query.text == ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT
     assert projection.status is AcceptedToolResultStatus.CANCELLED
     assert "request_atom_unavailable" in projection.diagnostic_reasons
+
+
+def test_projection_missing_envelope_returns_shared_unavailable_source_text(
+    tmp_path: Path,
+) -> None:
+    """accepted evidence envelope 缺失时 source 文本仍由 projection owner 提供。"""
+
+    event_log = EventLogStore()
+    projection: AcceptedToolResultProjection | None = None
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        row = store.transaction_runner.run_write(
+            lambda transaction: _append_event(
+                transaction,
+                event_log,
+                event_id="event-result-no-envelope",
+                event_type="TOOL_RESULT_ACCEPTED",
+                payload={
+                    "tool_call_id": "tool-call-no-envelope",
+                    "tool_name": _TOOL_NAME,
+                    "tool_fact_kind": "completed",
+                    "raw_tool_outcome": {
+                        "kind": "completed",
+                        "result": {"ok": True},
+                    },
+                },
+            )
+        )
+        projection = store.transaction_runner.run_read(
+            lambda transaction: project_accepted_tool_result(transaction, row)
+        )
+
+    assert projection is not None
+    assert projection.source.state is AcceptedToolResultSourceState.UNAVAILABLE
+    assert projection.source.diagnostic_reason == "accepted_evidence_envelope_missing"
+    assert projection.source.text == ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT
 
 
 def test_projection_maps_governed_error_and_unknown_status(tmp_path: Path) -> None:
@@ -370,6 +408,45 @@ def test_projection_filters_internal_source_refs(tmp_path: Path) -> None:
     assert projection is not None
     assert projection.source.state is AcceptedToolResultSourceState.AVAILABLE
     assert projection.source.text == "filing:MSFT-10K"
+
+
+def test_projection_unavailable_source_uses_shared_llm_text_and_filters_internal_refs(
+    tmp_path: Path,
+) -> None:
+    """source 不可用时由 projection owner 给出共享 LLM-facing 文案。"""
+
+    event_log = EventLogStore()
+    projection: AcceptedToolResultProjection | None = None
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        row = store.transaction_runner.run_write(
+            lambda transaction: _append_tool_result(
+                transaction,
+                event_log,
+                event_id="event-result-source-unavailable",
+                tool_call_id="tool-call-source-unavailable",
+                request_event_ref=None,
+                normalized_arguments_digest=_DIGEST,
+                tool_fact_kind="completed",
+                raw_tool_outcome={"kind": "completed", "result": {"ok": True}},
+                source_refs=(
+                    OpaqueEvidenceRef(ref_kind="payload", ref_id="payload-1", digest=None),
+                    OpaqueEvidenceRef(ref_kind="event", ref_id="event-1", digest=None),
+                    OpaqueEvidenceRef(ref_kind="digest", ref_id="sha256:internal", digest=None),
+                ),
+            )
+        )
+        projection = store.transaction_runner.run_read(
+            lambda transaction: project_accepted_tool_result(transaction, row)
+        )
+
+    assert projection is not None
+    assert projection.source.state is AcceptedToolResultSourceState.UNAVAILABLE
+    assert projection.source.diagnostic_reason == "business_source_unavailable"
+    assert projection.source.text == ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT
+    assert "business_source_unavailable" in projection.diagnostic_reasons
+    assert "payload-1" not in projection.source.text
+    assert "event-1" not in projection.source.text
+    assert "sha256:internal" not in projection.source.text
 
 
 def test_projection_reads_descriptor_payload_and_reports_missing_descriptor(
@@ -552,7 +629,7 @@ def test_projection_maps_raw_result_ok_false_and_extracts_details(
 def test_same_accepted_result_has_equivalent_consumer_projection(
     tmp_path: Path,
 ) -> None:
-    """同一 accepted result 在 Trace、Memory、RunInput、CompactMaterial 中语义一致。"""
+    """同一 source-unavailable result 在各消费者中使用同一 projection 语义。"""
 
     event_log = EventLogStore()
     projection: AcceptedToolResultProjection | None = None
@@ -590,8 +667,8 @@ def test_same_accepted_result_has_equivalent_consumer_projection(
                     "result": {"ok": True, "summary": "Revenue is 100"},
                 },
                 source_refs=(
-                    OpaqueEvidenceRef(ref_kind="payload", ref_id="internal", digest=None),
-                    OpaqueEvidenceRef(ref_kind="filing", ref_id="MSFT-10K", digest=None),
+                    OpaqueEvidenceRef(ref_kind="payload", ref_id="payload-internal", digest=None),
+                    OpaqueEvidenceRef(ref_kind="event", ref_id="event-internal", digest=None),
                 ),
             )
             current = _append_event(
@@ -645,6 +722,8 @@ def test_same_accepted_result_has_equivalent_consumer_projection(
         )
 
     assert projection is not None
+    assert projection.source.state is AcceptedToolResultSourceState.UNAVAILABLE
+    assert projection.source.text == ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT
     assert tool_trace_row is not None
     assert memory_snapshot is not None
     assert compact_view is not None
@@ -676,6 +755,14 @@ def test_same_accepted_result_has_equivalent_consumer_projection(
     assert projection.result_text in memory_text
     assert projection.source.text is not None
     assert projection.source.text in memory_text
+    visible_texts = (
+        run_input_text,
+        memory_text,
+        str(tool_trace_row.trace_summary),
+    )
+    for visible_text in visible_texts:
+        assert "payload-internal" not in visible_text
+        assert "event-internal" not in visible_text
 
 
 def _durable_options(tmp_path: Path) -> HostDurableStoreOptions:
