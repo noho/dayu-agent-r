@@ -1174,14 +1174,16 @@ def _run_lifecycle_activity(row: EventLogRow) -> HostActivityView | None:
 def _tool_call_requested_activity(
     transaction: HostTransaction, row: EventLogRow
 ) -> HostActivityView | None:
-    """投影 ``TOOL_CALL_REQUESTED`` activity。
+    """投影 preview ``TOOL_CALL_REQUESTED`` activity。
 
     :param transaction: 当前 Host transaction。
     :param row: TOOL_CALL_REQUESTED EventLog row。
-    :returns: 工具调用开始 activity；payload 缺关键字段时返回 ``None``。
+    :returns: 工具调用开始 activity；canonical request atom 或 payload 缺关键字段时返回 ``None``。
     :raises: 无主动抛出。
     """
 
+    if row.event_class is not EventClass.PREVIEW:
+        return None
     payload = _activity_payload(transaction, row)
     if payload is None:
         return None

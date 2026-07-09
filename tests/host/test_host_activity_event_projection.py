@@ -264,6 +264,32 @@ async def test_tool_activity_uses_admission_display_snapshot(
     assert display_names == {"lookup_filing": "查财报"}
 
 
+def test_canonical_tool_call_request_atom_does_not_project_activity(
+    tmp_path: pathlib.Path,
+) -> None:
+    """canonical TOOL_CALL_REQUESTED request atom 不产生 public activity。"""
+
+    event = _project_event(
+        tmp_path,
+        _row(
+            event_id="event-tool-call-request-atom",
+            event_class=EventClass.CANONICAL_FACT,
+            session_id="session-direct",
+            run_id="run-direct",
+            event_type="TOOL_CALL_REQUESTED",
+            payload={
+                "tool_name": "lookup_filing",
+                "argument_key_count": 2,
+            },
+        ),
+    )
+
+    assert event.kind is HostEventKind.PROGRESS
+    assert event.event_class is HostEventClass.CANONICAL_FACT
+    assert event.event_type == "TOOL_CALL_REQUESTED"
+    assert event.activity is None
+
+
 @pytest.mark.asyncio
 async def test_tool_activity_falls_back_to_stable_name_without_display(
     tmp_path: pathlib.Path,
