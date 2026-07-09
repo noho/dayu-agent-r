@@ -68,6 +68,8 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "RunnerEventType",
         "RunnerHTTPErrorCode",
         "RunnerHTTPErrorData",
+        "RunnerInputMessageProjection",
+        "RunnerInputToolCallProjection",
         "RunnerProtocolErrorData",
         "RunnerRequestIdentity",
         "RunnerReasoningDeltaData",

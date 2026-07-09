@@ -5,8 +5,8 @@
 
 - 启用 ``stream_idle_timeout_seconds`` 时 idle timeout 应映射为
   retriable :class:`RunnerHTTPErrorCode.TIMEOUT`。
-- 启用 ``stream_idle_heartbeat_seconds`` 时心跳到点应输出 DEBUG 日志，
-  且不打断 readany pending（不丢字节）。
+- 启用 ``stream_idle_heartbeat_seconds`` 时心跳到点应输出 stream debug
+  日志，且不打断 readany pending（不丢字节）。
 - 未启用时走旧的 ``_iter_response_bytes_no_idle``，无心跳日志。
 """
 
@@ -28,6 +28,7 @@ from dayu.engine.contracts.runner_events import (
     RunnerHTTPErrorData,
 )
 from dayu.engine.runners.openai.runner import AsyncOpenAIRunner
+from dayu.runtime.log_levels import STREAM_DEBUG_LOG_LEVEL
 
 from tests.engine.runners.openai._factories import make_options, make_spec
 from tests.engine.runners.openai._fakes import (
@@ -135,6 +136,37 @@ def _sse_headers() -> dict[str, str]:
     return {"Content-Type": "text/event-stream"}
 
 
+def _heartbeat_runner() -> AsyncOpenAIRunner:
+    """构造会在 SSE byte read 空闲期间产生 heartbeat 的 runner。
+
+    参数：无。
+    返回值：使用 delayed fake session 的 OpenAI runner。
+    异常：本 helper 不主动转换异常；fake session 或 runner 构造异常会透传。
+    """
+
+    session = _DelayedSession(
+        spec=FakeResponseSpec(
+            status=200,
+            headers=_sse_headers(),
+            body_chunks=[
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                b"data: [DONE]\n\n",
+            ],
+        ),
+        delay_seconds=0.06,
+    )
+    spec = make_spec(
+        max_retries=0,
+        stream_idle_timeout_seconds=0.5,
+        stream_idle_heartbeat_seconds=0.02,
+    )
+    runner = AsyncOpenAIRunner(
+        spec=spec, cancellation_token=FakeCancellationToken()
+    )
+    runner._http_client._session = session  # type: ignore[attr-defined]
+    return runner
+
+
 @pytest.mark.asyncio
 async def test_idle_timeout_emits_retriable_timeout() -> None:
     """idle 超时应映射为 retriable TIMEOUT 错误事件 + Done(ERROR)。"""
@@ -177,34 +209,20 @@ async def test_idle_timeout_emits_retriable_timeout() -> None:
 async def test_idle_heartbeat_emits_debug_log_and_does_not_drop_bytes(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """心跳到点输出 DEBUG 日志，不丢 chunk，最终成功完成。"""
+    """心跳到点输出 stream debug 日志，不丢 chunk，最终成功完成。
 
-    # delay 0.06s < timeout 0.5s；heartbeat 0.02s 会触发至少 1 次心跳日志。
-    session = _DelayedSession(
-        spec=FakeResponseSpec(
-            status=200,
-            headers=_sse_headers(),
-            body_chunks=[
-                b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
-                b"data: [DONE]\n\n",
-            ],
-        ),
-        delay_seconds=0.06,
-    )
-    spec = make_spec(
-        max_retries=0,
-        stream_idle_timeout_seconds=0.5,
-        stream_idle_heartbeat_seconds=0.02,
-    )
-    runner = AsyncOpenAIRunner(
-        spec=spec, cancellation_token=FakeCancellationToken()
-    )
-    runner._http_client._session = session  # type: ignore[attr-defined]
+    参数：
+        caplog: pytest 日志捕获 fixture。
+    返回值：``None``。
+    异常：断言失败时由 pytest 报告。
+    """
+
+    runner = _heartbeat_runner()
 
     namespace_logger = logging.getLogger("dayu")
     namespace_logger.addHandler(caplog.handler)
     try:
-        with caplog.at_level(logging.DEBUG, logger="dayu"):
+        with caplog.at_level(STREAM_DEBUG_LOG_LEVEL, logger="dayu"):
             msgs = [UserMessage(role=AgentMessageRole.USER, content="hi")]
             events: list[RunnerEvent] = []
             async for event in runner.call(
@@ -226,6 +244,43 @@ async def test_idle_heartbeat_emits_debug_log_and_does_not_drop_bytes(
     assert heartbeat_messages, (
         "expected at least one heartbeat debug log, got "
         f"{[r.getMessage() for r in caplog.records]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_idle_heartbeat_is_not_captured_at_normal_debug(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """等价 idle 条件下，普通 DEBUG 不捕获 stream heartbeat。
+
+    参数：
+        caplog: pytest 日志捕获 fixture。
+    返回值：``None``。
+    异常：断言失败时由 pytest 报告。
+    """
+
+    runner = _heartbeat_runner()
+
+    namespace_logger = logging.getLogger("dayu")
+    namespace_logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="dayu"):
+            msgs = [UserMessage(role=AgentMessageRole.USER, content="hi")]
+            events: list[RunnerEvent] = []
+            async for event in runner.call(
+                messages=msgs, options=make_options(stream=True), tools=[]
+            ):
+                events.append(event)
+    finally:
+        namespace_logger.removeHandler(caplog.handler)
+
+    assert not any(
+        e.type is RunnerEventType.RUNNER_HTTP_ERROR for e in events
+    )
+    assert events[-1].type is RunnerEventType.RUNNER_DONE
+    assert not any(
+        "stream_idle.heartbeat" in r.getMessage()
+        for r in caplog.records
     )
 
 

@@ -210,6 +210,7 @@ def test_iteration_started_runner_input_signal_fields_are_locked() -> None:
         "message_count",
         "role_sequence_digest",
         "runner_input_serializer_schema_version",
+        "input_projection",
     }
     assert runner_role_sequence_digest(("system", "user")) == (
         "sha256:"

@@ -57,6 +57,7 @@ EXPECTED_API_EXPORTS: frozenset[str] = frozenset(
         "HostPayloadRef",
         "HostStreamCursor",
         "HostTerminalStatus",
+        "HostThinkingView",
         "ListSessionsResult",
         "LocalEngineWorker",
         "LocalEngineWorkerFactory",

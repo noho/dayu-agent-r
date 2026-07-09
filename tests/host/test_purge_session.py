@@ -133,6 +133,8 @@ _RUN_STATUS_RECOVERING = "recovering"
 _RUN_STATUS_FAILED = "failed"
 _RUN_STATUS_CANCELLED = "cancelled"
 _RUN_STATUS_LOST = "lost"
+_EVENT_TYPE_TEST = "TEST_EVENT"
+_EVENT_TYPE_CANCEL_REQUESTED = "CANCEL_REQUESTED"
 _NON_TERMINAL_RUN_STATUSES = (
     _RUN_STATUS_ACCEPTED,
     _RUN_STATUS_QUEUED,
@@ -1206,6 +1208,7 @@ def _insert_event(
     attempt_id: str | None,
     execution_id: str | None,
     payload_ref: str | None,
+    event_type: str = _EVENT_TYPE_TEST,
 ) -> int:
     """写入 EventLog row 并返回 sequence。
 
@@ -1216,7 +1219,9 @@ def _insert_event(
     :param attempt_id: Attempt id。
     :param execution_id: execution id。
     :param payload_ref: payload descriptor ref。
+    :param event_type: EventLog 事件类型。
     :returns: EventLog sequence。
+    :raises AssertionError: SQLite insert 未返回 row id 时抛出。
     """
 
     result = transaction.execute(
@@ -1251,7 +1256,7 @@ def _insert_event(
             run_id,
             attempt_id,
             execution_id,
-            "TEST_EVENT",
+            event_type,
             _TIMESTAMP,
             "tester",
             "test",
@@ -1532,6 +1537,36 @@ def _insert_run_rows(transaction: HostTransaction, run_status: str, events: _Tar
     )
 
 
+def _insert_cancel_request_event_if_needed(
+    transaction: HostTransaction, *, run_id: str, status: str
+) -> str | None:
+    """按 Run 状态写入专用 ``CANCEL_REQUESTED`` 事件。
+
+    参数：
+        transaction: Host transaction。
+        run_id: Run id。
+        status: Run 状态。
+    返回值：取消语义状态对应的 EventLog id；其它状态返回 ``None``。
+    异常：EventLog 插入未返回 row id 时由 ``_insert_event`` 抛出
+        ``AssertionError``。
+    """
+
+    if status not in (_RUN_STATUS_CANCELLING, _RUN_STATUS_CANCELLED):
+        return None
+    event_id = f"event-{run_id}-cancel-requested"
+    _insert_event(
+        transaction,
+        event_id=event_id,
+        session_id=_SESSION_ID,
+        run_id=run_id,
+        attempt_id=None,
+        execution_id=None,
+        payload_ref=None,
+        event_type=_EVENT_TYPE_CANCEL_REQUESTED,
+    )
+    return event_id
+
+
 def _insert_run_row(
     transaction: HostTransaction,
     *,
@@ -1566,6 +1601,9 @@ def _insert_run_row(
     )
     queued_event_id = accepted_event[0] if status == _RUN_STATUS_QUEUED else None
     queued_event_sequence = accepted_event[1] if status == _RUN_STATUS_QUEUED else None
+    cancel_request_event_id = _insert_cancel_request_event_if_needed(
+        transaction, run_id=run_id, status=status
+    )
     started_event_id = (
         accepted_event[0] if status not in (_RUN_STATUS_ACCEPTED, _RUN_STATUS_QUEUED) and not is_terminal else None
     )
@@ -1589,6 +1627,7 @@ def _insert_run_row(
           started_event_sequence,
           terminal_event_id,
           terminal_event_sequence,
+          cancel_request_event_id,
           current_attempt_id,
           source_run_id,
           source_run_relation,
@@ -1597,7 +1636,7 @@ def _insert_run_row(
           created_at,
           updated_at,
           terminal_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             run_id,
@@ -1614,6 +1653,7 @@ def _insert_run_row(
             started_event_sequence,
             terminal_event[0] if is_terminal else None,
             terminal_event[1] if is_terminal else None,
+            cancel_request_event_id,
             current_attempt_id if status not in (_RUN_STATUS_ACCEPTED, _RUN_STATUS_QUEUED) else None,
             source_run_id,
             source_run_relation,

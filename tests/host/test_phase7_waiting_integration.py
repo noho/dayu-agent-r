@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,6 +32,11 @@ from dayu.contracts.tool_schema import (
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import EngineEvent
+from dayu.engine.contracts.messages import (
+    AssistantMessage,
+    ToolMessage,
+    UserMessage,
+)
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.host import (
     AttemptStatus,
@@ -278,7 +284,13 @@ def test_phase7_resolve_wait_public_entry_is_importable() -> None:
 def test_local_awaiting_tool_manual_resolve_resumes_run(
     tmp_path: Path,
 ) -> None:
-    """本地 awaiting 工具进入 WAITING 后可通过 manual resolve 恢复 Run。"""
+    """本地 awaiting 工具进入 WAITING 后可通过 manual resolve 恢复 Run。
+
+    参数：
+        tmp_path: pytest 临时目录。
+    返回值：``None``。
+    异常：断言失败时由 pytest 报告；Host durable 写入异常透传。
+    """
 
     host = create_host_command_handle(_options(tmp_path))
     try:
@@ -340,15 +352,20 @@ def test_local_awaiting_tool_manual_resolve_resumes_run(
         assert snapshot.status is RunStatus.RUNNING
         assert snapshot.current_attempt_id is not None
         assert snapshot.current_attempt_id != seeded.attempt_id
-        assert any(
-            isinstance(message.content, str)
-            and "A previous interrupted step has an accepted wait result."
-            in message.content
-            and f"tool_name={_TOOL_NAME}" in message.content
-            and "resolution_kind=completed" in message.content
-            and '"answer":42' in message.content
-            for message in resume_request.messages
-        )
+        protocol_messages = resume_request.messages[-3:]
+        user_message, assistant_message, tool_message = protocol_messages
+        assert isinstance(user_message, UserMessage)
+        assert user_message.content == "hello"
+        assert isinstance(assistant_message, AssistantMessage)
+        assert len(assistant_message.tool_calls) == 1
+        assistant_tool_call = assistant_message.tool_calls[0]
+        assert assistant_tool_call.id == batch.calls[0].tool_call_id
+        assert assistant_tool_call.name == _TOOL_NAME
+        assert assistant_tool_call.arguments == {"ticker": "DAYU"}
+        assert isinstance(tool_message, ToolMessage)
+        assert tool_message.tool_call_id == assistant_tool_call.id
+        tool_content = json.loads(tool_message.content)
+        assert tool_content["answer"] == 42
     finally:
         host.close()
 
