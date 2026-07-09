@@ -462,7 +462,7 @@ class _IterationState:
     :param reasoning_chunks: 已收到的推理链增量片段。
     :param completed_content: content completed 事件中的完整正文。
     :param completed_reasoning_content: content completed 事件中的完整推理链。
-    :param finish_reason: 当前已知完成原因。
+    :param finish_reason: Runner done 提供的权威完成原因。
     :param failure_candidate: 当前 Runner 调用产生的失败候选。
     :param provider_request_id: 当前 Runner 调用最终采用的 provider request id。
     :param done_seen: 是否已看到 Runner done。
@@ -1310,16 +1310,14 @@ class _AsyncAgent:
         if isinstance(data, RunnerContentCompletedData):
             state.completed_content = data.content
             state.completed_reasoning_content = data.reasoning_content
-            state.finish_reason = data.finish_reason
             _LOGGER.debug(
                 "engine.agent.runner_event_classified session_id=%s "
-                "run_id=%s iteration_id=%s event_type=%s finish_reason=%s "
-                "has_content=%s has_reasoning=%s",
+                "run_id=%s iteration_id=%s event_type=%s has_content=%s "
+                "has_reasoning=%s",
                 self._request.session_id,
                 self._request.run_id,
                 iteration_id,
                 runner_event.type.value,
-                data.finish_reason.value,
                 data.content is not None,
                 data.reasoning_content is not None,
             )
@@ -1329,7 +1327,6 @@ class _AsyncAgent:
                     iteration_id=iteration_id,
                     content=data.content,
                     reasoning_content=data.reasoning_content,
-                    finish_reason=data.finish_reason,
                 ),
                 occurred_at=runner_event.occurred_at,
             )
@@ -1337,7 +1334,8 @@ class _AsyncAgent:
             _LOGGER.debug(
                 "engine.agent.runner_event_classified session_id=%s "
                 "run_id=%s iteration_id=%s event_type=%s "
-                "prompt_tokens=%s completion_tokens=%s total_tokens=%s",
+                "prompt_tokens=%s completion_tokens=%s total_tokens=%s "
+                "provider_request_id=%s",
                 self._request.session_id,
                 self._request.run_id,
                 iteration_id,
@@ -1345,6 +1343,7 @@ class _AsyncAgent:
                 data.prompt_tokens,
                 data.completion_tokens,
                 data.total_tokens,
+                data.provider_request_id,
             )
             return self._make_event(
                 event_type=EngineEventType.USAGE_REPORTED,
@@ -1353,6 +1352,7 @@ class _AsyncAgent:
                     prompt_tokens=data.prompt_tokens,
                     completion_tokens=data.completion_tokens,
                     total_tokens=data.total_tokens,
+                    provider_request_id=data.provider_request_id,
                 ),
                 occurred_at=runner_event.occurred_at,
             )
@@ -1448,25 +1448,7 @@ class _AsyncAgent:
             return None
         if isinstance(data, RunnerDoneData):
             state.done_seen = True
-            finish_reason = data.finish_reason
-            if (
-                state.finish_reason is not None
-                and state.finish_reason is not data.finish_reason
-            ):
-                _LOGGER.warning(
-                    "engine.agent.finish_reason_mismatch session_id=%s "
-                    "run_id=%s iteration_id=%s completed_finish_reason=%s "
-                    "done_finish_reason=%s provider_request_id=%s",
-                    self._request.session_id,
-                    self._request.run_id,
-                    iteration_id,
-                    state.finish_reason.value,
-                    data.finish_reason.value,
-                    data.provider_request_id,
-                )
-                finish_reason = state.finish_reason
-            else:
-                state.finish_reason = data.finish_reason
+            state.finish_reason = data.finish_reason
             state.provider_request_id = data.provider_request_id
             _LOGGER.debug(
                 "engine.agent.runner_event_classified session_id=%s "
@@ -1476,14 +1458,14 @@ class _AsyncAgent:
                 self._request.run_id,
                 iteration_id,
                 runner_event.type.value,
-                finish_reason.value,
+                data.finish_reason.value,
                 data.provider_request_id,
             )
             return self._make_event(
                 event_type=EngineEventType.ITERATION_COMPLETED,
                 data=IterationCompletedData(
                     iteration_id=iteration_id,
-                    finish_reason=finish_reason,
+                    finish_reason=data.finish_reason,
                     provider_request_id=data.provider_request_id,
                     client_correlation_id=_client_correlation_id_from_state(
                         state

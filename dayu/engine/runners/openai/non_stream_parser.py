@@ -334,7 +334,6 @@ def _emit_from_dict(
             RunnerContentCompletedData(
                 content=content,
                 reasoning_content=reasoning,
-                finish_reason=finish_reason,
             )
         )
     usage = parsed.get("usage")
@@ -358,6 +357,7 @@ def _emit_from_dict(
                     prompt_tokens=normalized.prompt_tokens,
                     completion_tokens=normalized.completion_tokens,
                     total_tokens=normalized.total_tokens,
+                    provider_request_id=provider_request_id,
                 )
             )
     if tool_calls_emitted:

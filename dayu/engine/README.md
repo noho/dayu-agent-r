@@ -489,7 +489,7 @@ Engine 不做 proactive threshold compaction、compact / retry、provider-aware 
 
 OpenAI-compatible Runner 只有在 `RunnerSpec.client_correlation_policy == OPENAI_X_CLIENT_REQUEST_ID` 且 `request_identity` 非空时发送 `X-Client-Request-Id`。policy 关闭或 identity 缺失时不发送。policy 开启时，静态 `RunnerSpec.headers` 不得包含大小写不敏感的 `X-Client-Request-Id`。
 
-OpenAI-compatible Runner 的 provider request id 从响应 header `x-request-id` 提取；DeepSeek 兼容入口缺少 `x-request-id` 时，也会把 `x-ds-trace-id` 映射为 `provider_request_id`。`x-trace-id`、`x-correlation-id`、`cf-ray`、W3C trace context、proxy 或 CDN header 不会被映射为 `provider_request_id`。
+OpenAI-compatible Runner 的 provider request id 从响应 header `x-request-id` 提取；DeepSeek 兼容入口缺少 `x-request-id` 时，也会把 `x-ds-trace-id` 映射为 `provider_request_id`。`x-trace-id`、`x-correlation-id`、`cf-ray`、W3C trace context、proxy 或 CDN header 不会被映射为 `provider_request_id`。Runner usage 事件与 Engine `usage_reported` 会透传该 provider request id；Runner 调用完成原因只由 `runner_done` / `iteration_completed` 承载，`runner_content_completed` / `content_completed` 只表达正文与推理内容完成。
 
 ### Runner close
 

@@ -368,7 +368,13 @@ async def test_sse_unknown_finish_reason_logs_diagnostic(
     assert len(completed_events) == 1
     completed = completed_events[0].data
     assert isinstance(completed, RunnerContentCompletedData)
-    assert completed.finish_reason is FinishReason.STOP
+    done_events = [
+        event for event in events if event.type is RunnerEventType.RUNNER_DONE
+    ]
+    assert len(done_events) == 1
+    done = done_events[0].data
+    assert isinstance(done, RunnerDoneData)
+    assert done.finish_reason is FinishReason.STOP
     assert any(
         "unknown_finish_reason" in record.getMessage()
         for record in caplog.records
@@ -605,7 +611,13 @@ async def test_sse_usage_malformed_before_content_completion_continues(
     completed = completed_events[0].data
     assert isinstance(completed, RunnerContentCompletedData)
     assert completed.content == "ok"
-    assert completed.finish_reason is FinishReason.STOP
+    done_events = [
+        event for event in events if event.type is RunnerEventType.RUNNER_DONE
+    ]
+    assert len(done_events) == 1
+    done = done_events[0].data
+    assert isinstance(done, RunnerDoneData)
+    assert done.finish_reason is FinishReason.STOP
     assert any(
         "usage_field_malformed" in record.getMessage()
         for record in caplog.records

@@ -44,7 +44,15 @@ def test_non_stream_content_completed_and_usage_and_done() -> None:
             },
         }
     ).encode("utf-8")
-    events = list((parse_non_stream_response(payload, hook=make_no_thought_hook(), provider_request_id=None)))
+    events = list(
+        (
+            parse_non_stream_response(
+                payload,
+                hook=make_no_thought_hook(),
+                provider_request_id="req-usage",
+            )
+        )
+    )
     types = [e.type for e in events]
     assert types == [
         RunnerEventType.RUNNER_CONTENT_COMPLETED,
@@ -55,11 +63,11 @@ def test_non_stream_content_completed_and_usage_and_done() -> None:
     assert isinstance(completed, RunnerContentCompletedData)
     assert completed.content == "answer"
     assert completed.reasoning_content == "thoughts"
-    assert completed.finish_reason is FinishReason.STOP
 
     usage = events[1].data
     assert isinstance(usage, RunnerUsageRecordedData)
     assert usage.total_tokens == 9
+    assert usage.provider_request_id == "req-usage"
 
     done = events[2].data
     assert isinstance(done, RunnerDoneData)
@@ -195,7 +203,9 @@ def test_non_stream_unknown_finish_reason_logs_diagnostic(
 
     completed = events[0].data
     assert isinstance(completed, RunnerContentCompletedData)
-    assert completed.finish_reason is FinishReason.STOP
+    done = events[-1].data
+    assert isinstance(done, RunnerDoneData)
+    assert done.finish_reason is FinishReason.STOP
     assert any(
         "unknown_finish_reason" in record.getMessage()
         for record in caplog.records

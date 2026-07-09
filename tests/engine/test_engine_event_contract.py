@@ -160,6 +160,13 @@ def test_tool_awaiting_and_suspended_data_fields_are_locked() -> None:
 def test_provider_request_id_fields_are_locked() -> None:
     """provider request id 字段必须是显式契约字段。"""
 
+    assert {f.name for f in dataclasses.fields(UsageReportedData)} == {
+        "iteration_id",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "provider_request_id",
+    }
     assert {f.name for f in dataclasses.fields(IterationCompletedData)} == {
         "iteration_id",
         "finish_reason",
@@ -181,6 +188,16 @@ def test_provider_request_id_fields_are_locked() -> None:
         "reason",
         "provider_request_id",
         "client_correlation_id",
+    }
+
+
+def test_content_completed_fields_exclude_finish_reason() -> None:
+    """正文完成事件不得重复承载 Runner 调用完成原因。"""
+
+    assert {f.name for f in dataclasses.fields(ContentCompleteData)} == {
+        "iteration_id",
+        "content",
+        "reasoning_content",
     }
 
 

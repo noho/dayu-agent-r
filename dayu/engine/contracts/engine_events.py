@@ -143,13 +143,11 @@ class ContentCompleteData:
     :param iteration_id: 当前迭代 id。
     :param content: 完整正文；为 ``None`` 表示无正文。
     :param reasoning_content: 完整推理链文本；为 ``None`` 表示无推理链。
-    :param finish_reason: 完成原因。
     """
 
     iteration_id: str
     content: str | None
     reasoning_content: str | None
-    finish_reason: FinishReason
 
 
 @dataclass(frozen=True, slots=True)
@@ -327,12 +325,14 @@ class UsageReportedData:
     :param prompt_tokens: 提示 token 数。
     :param completion_tokens: 完成 token 数。
     :param total_tokens: 总 token 数。
+    :param provider_request_id: provider 侧请求 id；为 ``None`` 表示未提供。
     """
 
     iteration_id: str
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    provider_request_id: str | None
 
 
 @dataclass(frozen=True, slots=True)

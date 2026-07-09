@@ -84,6 +84,25 @@ def test_runner_done_data_field_set() -> None:
     assert fields == {"finish_reason", "provider_request_id"}
 
 
+def test_runner_content_completed_data_field_set() -> None:
+    """正文完成事件只承载正文与推理内容。"""
+
+    fields = {f.name for f in dataclasses.fields(RunnerContentCompletedData)}
+    assert fields == {"content", "reasoning_content"}
+
+
+def test_runner_usage_recorded_data_field_set() -> None:
+    """Runner usage 事件必须携带 provider request id。"""
+
+    fields = {f.name for f in dataclasses.fields(RunnerUsageRecordedData)}
+    assert fields == {
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "provider_request_id",
+    }
+
+
 def test_runner_event_type_includes_runner_http_error() -> None:
     """枚举包含 ``RUNNER_HTTP_ERROR`` 成员。"""
 

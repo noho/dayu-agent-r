@@ -3,8 +3,8 @@
 按 ``docs/code_review.md`` §6 与 ``docs/engine/phase1-plan.md`` §6.4 / §12：
 两条解析路径在「最终事件语义」上必须一致——同样的 provider 协议事实，
 不论是流式还是非流式响应，最终的 :class:`RunnerContentCompletedData`
-``content`` / ``reasoning_content`` / ``finish_reason`` 必须相同；终态
-``RunnerDoneData.finish_reason`` 必须相同。
+``content`` / ``reasoning_content`` 必须相同；终态
+:class:`RunnerDoneData.finish_reason` 必须相同。
 
 本测试以 Gemini ``<thought>`` 协议为测试场景：两条路径都应剥离
 ``<thought>`` 到 ``reasoning_content``，且终态 finish_reason 一致。
@@ -129,11 +129,6 @@ async def test_stream_and_non_stream_thought_strip_terminal_parity() -> None:
         == "plan"
     )
     assert (
-        stream_completed.finish_reason
-        is ns_completed.finish_reason
-        is FinishReason.STOP
-    )
-    assert (
         stream_done.finish_reason
         is ns_done.finish_reason
         is FinishReason.STOP
@@ -149,11 +144,11 @@ async def test_stream_and_non_stream_thought_strip_terminal_parity() -> None:
     ),
 )
 @pytest.mark.asyncio
-async def test_stream_and_non_stream_content_finish_reason_parity(
+async def test_stream_and_non_stream_done_finish_reason_parity(
     provider_finish_reason: str,
     expected: FinishReason,
 ) -> None:
-    """正文完成 finish_reason 在流式与非流式路径中保持一致。
+    """Runner done finish_reason 在流式与非流式路径中保持一致。
 
     :param provider_finish_reason: provider 返回的 finish_reason 字符串。
     :param expected: 期望映射到的 Runner finish reason。
@@ -198,8 +193,6 @@ async def test_stream_and_non_stream_content_finish_reason_parity(
     ns_completed, ns_done = _extract_completed_and_done(non_stream_events)
 
     assert stream_completed.content == ns_completed.content == "answer"
-    assert stream_completed.finish_reason is ns_completed.finish_reason
-    assert stream_completed.finish_reason is expected
     assert stream_done.finish_reason is ns_done.finish_reason
     assert stream_done.finish_reason is expected
 

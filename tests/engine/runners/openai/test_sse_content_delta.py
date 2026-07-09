@@ -45,7 +45,6 @@ async def test_content_delta_emitted_for_each_chunk() -> None:
     assert len(completed) == 1
     assert isinstance(completed[0].data, RunnerContentCompletedData)
     assert completed[0].data.content == "Hello world"
-    assert completed[0].data.finish_reason is FinishReason.STOP
 
     done = [e for e in events if e.type is RunnerEventType.RUNNER_DONE]
     assert len(done) == 1

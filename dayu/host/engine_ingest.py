@@ -2875,7 +2875,7 @@ class EngineEventIngestor:
                     "prompt_tokens": data.prompt_tokens,
                     "completion_tokens": data.completion_tokens,
                     "total_tokens": data.total_tokens,
-                    "provider_request_id": None,
+                    "provider_request_id": data.provider_request_id,
                     "policy_ref": diagnostic.policy_ref,
                     "estimator_digest": diagnostic.estimator_digest,
                     "estimated_input_tokens": diagnostic.estimated_input_tokens,
@@ -2931,7 +2931,7 @@ class EngineEventIngestor:
                 prompt_tokens=data.prompt_tokens,
                 completion_tokens=data.completion_tokens,
                 total_tokens=data.total_tokens,
-                provider_request_id=None,
+                provider_request_id=data.provider_request_id,
                 estimator_digest=estimator_digest,
                 policy_ref=policy_ref,
                 observed_at=context.candidate.observed_at,
@@ -4121,7 +4121,7 @@ def _invalid_usage_observation_digest(
             "prompt_tokens": data.prompt_tokens,
             "completion_tokens": data.completion_tokens,
             "total_tokens": data.total_tokens,
-            "provider_request_id": None,
+            "provider_request_id": data.provider_request_id,
             "observed_at": context.candidate.observed_at.isoformat(),
         },
         "diagnostic": {
@@ -4657,7 +4657,6 @@ def _preview_payload(
         common["iteration_id"] = data.iteration_id
         common["has_content"] = data.content is not None
         common["has_reasoning_content"] = data.reasoning_content is not None
-        common["finish_reason"] = data.finish_reason.value
     elif isinstance(data, ReasoningDeltaData):
         common["iteration_id"] = data.iteration_id
         common["delta"] = data.delta

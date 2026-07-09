@@ -644,7 +644,7 @@ ToolRuntime 只有在 Host 接受工具事实后才向 Engine 返回 batch outco
 
 ### Context budget 与 compaction
 
-`ContextBudgetPolicy.context_window_size` 是 Host 的上下文窗口 typed 输入；Service / composition root 通常从模型配置的 `context_window_tokens` 映射而来。Host 以 ratio-first policy 派生 soft / hard threshold，并用保守估算器判断 proactive compact 或 reactive recovery。usage 是 provider capability 驱动的 post-call observation，只能用于诊断、校准和后续治理参考，不能回头修改已经完成的 dispatch decision。
+`ContextBudgetPolicy.context_window_size` 是 Host 的上下文窗口 typed 输入；Service / composition root 通常从模型配置的 `context_window_tokens` 映射而来。Host 以 ratio-first policy 派生 soft / hard threshold，并用保守估算器判断 proactive compact 或 reactive recovery。usage 是 provider capability 驱动的 post-call observation，只能用于诊断、校准和后续治理参考，不能回头修改已经完成的 dispatch decision。Engine usage 事件携带 provider request id 时，Host ingest 会把它写入 durable usage projection signal 与 usage observation diagnostic；缺失时保持 `None`，不使用 client correlation id 伪装 provider id。
 
 proactive compact 发生在 Attempt 创建前；预算超限时 Host 写入 proactive `CONTEXT_COMPACTION_REQUESTED`，运行 compactor，接受合格 compact 后继续普通 dispatch，失败时按 fallback / failure path 收口。reactive compact 只由 EngineEvent `context_compaction_requested` 触发；Host 关闭当前 Attempt、把 Run 推进为 `RECOVERING`，冻结 overflow material，再执行 compact 并创建 recovery Attempt。`finish_reason=LENGTH` 表示模型输出上限，不触发 reactive compact。
 

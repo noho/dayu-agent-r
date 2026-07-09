@@ -41,6 +41,7 @@ from dayu.engine.contracts.engine_events import (
     RunSuspendedData,
     TERMINAL_ENGINE_EVENT_TYPES,
     ToolCallDeltaData,
+    UsageReportedData,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import (
@@ -494,6 +495,7 @@ async def test_success_run_lifts_runner_events_and_agent_final() -> None:
                     prompt_tokens=1,
                     completion_tokens=2,
                     total_tokens=3,
+                    provider_request_id="req-usage",
                 ),
             ),
             _event(
@@ -501,7 +503,6 @@ async def test_success_run_lifts_runner_events_and_agent_final() -> None:
                 RunnerContentCompletedData(
                     content="你好",
                     reasoning_content="想",
-                    finish_reason=FinishReason.STOP,
                 ),
             ),
             _event(
@@ -549,14 +550,20 @@ async def test_success_run_lifts_runner_events_and_agent_final() -> None:
         iteration_completed[0].data.client_correlation_id
         == request_identity.client_correlation_id
     )
+    usage_reported = [
+        event for event in events if event.type is EngineEventType.USAGE_REPORTED
+    ]
+    assert len(usage_reported) == 1
+    assert isinstance(usage_reported[0].data, UsageReportedData)
+    assert usage_reported[0].data.provider_request_id == "req-usage"
     _assert_single_terminal_at_end(events)
 
 
 @pytest.mark.asyncio
-async def test_finish_reason_mismatch_logs_warning(
+async def test_runner_done_finish_reason_is_authority(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """finish_reason 不一致时必须记录 warning 且保留更早完成原因。"""
+    """RunnerDoneData.finish_reason 是唯一迭代完成原因真源。"""
 
     runner = _ScriptedRunner(
         events=(
@@ -565,7 +572,6 @@ async def test_finish_reason_mismatch_logs_warning(
                 RunnerContentCompletedData(
                     content="partial",
                     reasoning_content=None,
-                    finish_reason=FinishReason.STOP,
                 ),
             ),
             _event(
@@ -581,7 +587,7 @@ async def test_finish_reason_mismatch_logs_warning(
 
     events = await _collect(_AsyncAgent(request=_request(), runner=runner))
 
-    assert any(
+    assert not any(
         "engine.agent.finish_reason_mismatch" in record.getMessage()
         for record in caplog.records
     )
@@ -591,7 +597,7 @@ async def test_finish_reason_mismatch_logs_warning(
     ]
     assert len(iteration_completed) == 1
     assert isinstance(iteration_completed[0].data, IterationCompletedData)
-    assert iteration_completed[0].data.finish_reason is FinishReason.STOP
+    assert iteration_completed[0].data.finish_reason is FinishReason.LENGTH
 
 
 @pytest.mark.asyncio
@@ -612,7 +618,6 @@ async def test_async_agent_uses_injected_runner_without_default_runner(
                 RunnerContentCompletedData(
                     content="ok",
                     reasoning_content=None,
-                    finish_reason=FinishReason.STOP,
                 ),
             ),
             _event(
@@ -656,7 +661,6 @@ async def test_phase2_passes_empty_tools_even_when_request_has_schema() -> None:
                 RunnerContentCompletedData(
                     content="ok",
                     reasoning_content=None,
-                    finish_reason=FinishReason.STOP,
                 ),
             ),
             _event(
@@ -1091,7 +1095,6 @@ async def test_cancel_before_final_answer_wins_over_final() -> None:
                 RunnerContentCompletedData(
                     content="should not final",
                     reasoning_content=None,
-                    finish_reason=FinishReason.STOP,
                 ),
             ),
             _event(
@@ -1186,7 +1189,6 @@ async def test_close_error_does_not_override_terminal() -> None:
                 RunnerContentCompletedData(
                     content="ok",
                     reasoning_content=None,
-                    finish_reason=FinishReason.STOP,
                 ),
             ),
             _event(
@@ -1227,7 +1229,6 @@ async def test_close_cancelled_error_releases_run_slot() -> None:
                 RunnerContentCompletedData(
                     content="ok",
                     reasoning_content=None,
-                    finish_reason=FinishReason.STOP,
                 ),
             ),
             _event(
@@ -1327,7 +1328,6 @@ async def test_length_and_content_filter_final_boundaries() -> None:
                     RunnerContentCompletedData(
                         content="partial",
                         reasoning_content=None,
-                        finish_reason=finish_reason,
                     ),
                 ),
                 _event(
@@ -1368,7 +1368,6 @@ async def test_content_filter_final_logs_bounded_provider_message(
                 RunnerContentCompletedData(
                     content=provider_message,
                     reasoning_content=None,
-                    finish_reason=FinishReason.CONTENT_FILTER,
                 ),
             ),
             _event(
@@ -1533,7 +1532,6 @@ async def test_run_agent_and_wait_maps_final_failed_cancelled(
                     RunnerContentCompletedData(
                         content="ok",
                         reasoning_content=None,
-                        finish_reason=FinishReason.STOP,
                     ),
                 ),
                 _event(

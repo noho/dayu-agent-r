@@ -1157,7 +1157,6 @@ def test_old_steered_attempt_event_is_rejected_and_current_attempt_accepts(
                     iteration_id="iter-stale",
                     content="old",
                     reasoning_content=None,
-                    finish_reason=FinishReason.STOP,
                 ),
                 event_type=EngineEventType.CONTENT_COMPLETED,
             )
@@ -1170,7 +1169,6 @@ def test_old_steered_attempt_event_is_rejected_and_current_attempt_accepts(
                     iteration_id="iter-current",
                     content="new",
                     reasoning_content=None,
-                    finish_reason=FinishReason.STOP,
                 ),
                 event_type=EngineEventType.CONTENT_COMPLETED,
             )
@@ -1687,6 +1685,7 @@ def test_usage_reported_is_projection_signal_without_state_change(
                 prompt_tokens=10,
                 completion_tokens=20,
                 total_tokens=30,
+                provider_request_id="req-usage",
             ),
             event_type=EngineEventType.USAGE_REPORTED,
         )
@@ -1707,7 +1706,7 @@ def test_usage_reported_is_projection_signal_without_state_change(
         assert payload["prompt_tokens"] == 10
         assert payload["completion_tokens"] == 20
         assert payload["total_tokens"] == 30
-        assert payload["provider_request_id"] is None
+        assert payload["provider_request_id"] == "req-usage"
         assert payload["policy_ref"] == _REACTIVE_POLICY_REF
         assert isinstance(payload["estimator_digest"], str)
         assert payload["estimated_input_tokens"] == 14
@@ -1754,6 +1753,7 @@ def test_usage_reported_without_policy_keeps_projection_non_failing(
                 prompt_tokens=10,
                 completion_tokens=20,
                 total_tokens=30,
+                provider_request_id=None,
             ),
             event_type=EngineEventType.USAGE_REPORTED,
         )
@@ -1808,6 +1808,7 @@ def test_usage_reported_missing_input_event_keeps_projection_non_failing(
                 prompt_tokens=10,
                 completion_tokens=20,
                 total_tokens=30,
+                provider_request_id=None,
             ),
             event_type=EngineEventType.USAGE_REPORTED,
         )
@@ -1852,6 +1853,7 @@ def test_usage_reported_unreadable_input_event_keeps_projection_non_failing(
                 prompt_tokens=10,
                 completion_tokens=20,
                 total_tokens=30,
+                provider_request_id="req-unreadable-input",
             ),
             event_type=EngineEventType.USAGE_REPORTED,
         )
@@ -1867,7 +1869,7 @@ def test_usage_reported_unreadable_input_event_keeps_projection_non_failing(
         assert payload["estimator_digest"] is None
         assert payload["estimated_input_tokens"] is None
         assert payload["usage_observation_status"] == "estimate_unavailable"
-        assert payload["provider_request_id"] is None
+        assert payload["provider_request_id"] == "req-unreadable-input"
         context_pressure = payload["context_pressure"]
         assert isinstance(context_pressure, Mapping)
         assert context_pressure["status"] == "estimate_unavailable"
@@ -1892,6 +1894,7 @@ def test_usage_reported_invalid_tokens_keeps_projection_non_failing(
                 prompt_tokens=-1,
                 completion_tokens=20,
                 total_tokens=19,
+                provider_request_id="req-invalid-usage",
             ),
             event_type=EngineEventType.USAGE_REPORTED,
         )
@@ -1904,6 +1907,7 @@ def test_usage_reported_invalid_tokens_keeps_projection_non_failing(
         assert result.status == EngineIngestStatus.ACCEPTED
         payload = _payload(result.events[0])
         assert payload["prompt_tokens"] == -1
+        assert payload["provider_request_id"] == "req-invalid-usage"
         assert payload["policy_ref"] == _REACTIVE_POLICY_REF
         assert isinstance(payload["estimator_digest"], str)
         assert payload["estimated_input_tokens"] == 14

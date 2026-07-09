@@ -489,7 +489,6 @@ def _tool_script(*tool_calls: ToolCallRequest) -> tuple[RunnerEvent, ...]:
             RunnerContentCompletedData(
                 content=None,
                 reasoning_content=None,
-                finish_reason=FinishReason.TOOL_CALLS,
             ),
         ),
         _event(
@@ -519,7 +518,6 @@ def _final_script(content: str) -> tuple[RunnerEvent, ...]:
             RunnerContentCompletedData(
                 content=content,
                 reasoning_content=None,
-                finish_reason=FinishReason.STOP,
             ),
         ),
         _event(

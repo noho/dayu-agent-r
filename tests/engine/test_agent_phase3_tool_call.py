@@ -479,7 +479,6 @@ def _tool_script(
             RunnerContentCompletedData(
                 content=None,
                 reasoning_content="reason",
-                finish_reason=FinishReason.TOOL_CALLS,
             ),
         ),
         _event(
@@ -511,7 +510,6 @@ def _final_script(content: str, *, finish_reason: FinishReason = FinishReason.ST
             RunnerContentCompletedData(
                 content=content,
                 reasoning_content=None,
-                finish_reason=finish_reason,
             ),
         ),
         _event(
@@ -705,7 +703,6 @@ async def test_iteration_started_carries_role_digest_from_actual_messages() -> N
                     RunnerContentCompletedData(
                         content="done",
                         reasoning_content=None,
-                        finish_reason=FinishReason.STOP,
                     ),
                 ),
                 _event(
@@ -1159,7 +1156,6 @@ async def test_tool_call_iteration_empty_tool_content_falls_back_to_completed_co
                     RunnerContentCompletedData(
                         content="先说明",
                         reasoning_content=None,
-                        finish_reason=FinishReason.TOOL_CALLS,
                     ),
                 ),
                 _event(

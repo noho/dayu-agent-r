@@ -657,6 +657,7 @@ class SSEParser:
                 prompt_tokens=normalized.prompt_tokens,
                 completion_tokens=normalized.completion_tokens,
                 total_tokens=normalized.total_tokens,
+                provider_request_id=self._provider_request_id,
             )
         )
 
@@ -701,7 +702,6 @@ class SSEParser:
                 RunnerContentCompletedData(
                     content=content,
                     reasoning_content=reasoning,
-                    finish_reason=self._finish_reason or FinishReason.STOP,
                 )
             )
         finish = FinishReason.TOOL_CALLS if self._tool_calls_seen else self._finish_reason or FinishReason.STOP
