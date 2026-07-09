@@ -876,11 +876,11 @@ def test_terminal_failed_and_cancelled_status_exit_mapping(
     assert "Fins cancelled" in cancelled_output.err
 
 
-def test_stream_without_result_returns_failure(
+def test_stream_without_result_returns_contract_violation(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """direct stream 无 RESULT 时 CLI 必须失败收口。"""
+    """direct stream 无 RESULT 时 CLI 必须报告 Service contract violation。"""
 
     service = _FakeFinsDirectService(events=(_progress_event(FinsOperationKind.DOWNLOAD),))
     monkeypatch.setattr(
@@ -895,8 +895,9 @@ def test_stream_without_result_returns_failure(
     assert cli_main.main(("download", "--ticker", "AAPL")) == EXIT_FAILURE
 
     captured = capsys.readouterr()
-    assert "Fins failure" in captured.err
-    assert "ended without result" in captured.err
+    assert "Fins direct Service stream ended without RESULT" in captured.err
+    assert "Fins failure" not in captured.err
+    assert "ended without result" not in captured.err
 
 
 def test_stream_failure_propagates_to_cli_error(
@@ -951,7 +952,7 @@ async def test_sigint_cancels_stream_task_without_job_id(
 
     result = await wait_task
 
-    assert result.status is FinsResultStatus.CANCELLED
+    assert isinstance(result, fins_command._CliDirectLocalExit)
     assert result.exit_code == FINS_DIRECT_EXIT_KEYBOARD_INTERRUPT
     assert token.is_cancelled()
     assert service.closed_streams == 1
@@ -996,6 +997,7 @@ async def test_cancel_race_does_not_override_terminal_result() -> None:
 
     result = await wait_task
 
+    assert isinstance(result, FinsResultSummary)
     assert result.status is FinsResultStatus.SUCCESS
     assert token.is_cancelled()
 

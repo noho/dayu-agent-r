@@ -14,6 +14,7 @@ import pytest
 
 import dayu.cli.commands.interactive as interactive_command
 import dayu.cli.main as cli_main
+import dayu.cli.session_execution as session_execution
 from dayu.cli.composer import InputReaderComposer
 from dayu.cli.run_keys import RunningKeyAction
 from dayu.cli.run_view import InteractiveRunViewOptions, TerminalInteractiveRunView
@@ -40,6 +41,8 @@ from dayu.host.api import (
     FollowupBehavior,
     FollowupSnapshot,
     Host,
+    HostApiError,
+    HostApiErrorCode,
     HostActivityCounts,
     HostActivityKind,
     HostActivitySeverity,
@@ -72,6 +75,7 @@ from dayu.service.entrypoint_runtime import (
     EntrypointStartupReconnectResult,
     EntrypointTerminalSource,
 )
+from dayu.service.host_assembly import ServiceAssemblyOverrides, ServiceRunOverrides
 
 _MODEL_ID = "deepseek-v4-flash"
 _CURRENT_TIME_SLOT = "current_time"
@@ -170,6 +174,7 @@ class _FakeHost:
     _submit_index: int
     _run_status_index: int
     block_cancel_after_record: bool
+    _create_error: HostApiError | None
 
     def __init__(
         self,
@@ -180,6 +185,7 @@ class _FakeHost:
         cancel_status: HostTerminalStatus | None = None,
         run_statuses: tuple[RunStatus, ...] = (RunStatus.SUCCEEDED,),
         block_cancel_after_record: bool = False,
+        create_error: HostApiError | None = None,
     ) -> None:
         """初始化 fake Host。
 
@@ -190,6 +196,7 @@ class _FakeHost:
         :param cancel_status: cancel 返回前推入 watcher 的 terminal 状态。
         :param run_statuses: ``get_run`` 依次返回的状态。
         :param block_cancel_after_record: 是否在记录 cancel 后阻塞。
+        :param create_error: create_session 时抛出的 HostApiError。
         :returns: ``None``。
         :raises Exception: 不主动抛出异常。
         """
@@ -209,6 +216,7 @@ class _FakeHost:
         self._submit_index = 0
         self._run_status_index = 0
         self.block_cancel_after_record = block_cancel_after_record
+        self._create_error = create_error
 
     async def ensure_session(self, request: EnsureSessionRequest) -> SessionSnapshot:
         """记录 ensure_session 请求。
@@ -235,6 +243,8 @@ class _FakeHost:
 
         self.calls.append("create_session")
         self.create_requests.append(request)
+        if self._create_error is not None:
+            raise self._create_error
         slot = None
         if request.scope is not None and request.slot_key is not None:
             slot = SessionSlotRef(scope=request.scope, slot_key=request.slot_key)
@@ -657,7 +667,7 @@ def test_interactive_label_reuses_host_slot_and_fills_context_slots(
 
     fake_host = _FakeHost(submit_statuses=(HostTerminalStatus.SUCCEEDED,))
     captured_requests: list[EntrypointRuntimeRequest] = []
-    real_prepare = interactive_command.prepare_entrypoint_runtime
+    real_prepare = session_execution.prepare_entrypoint_runtime
 
     async def capture_prepare(
         request: EntrypointRuntimeRequest,
@@ -669,7 +679,7 @@ def test_interactive_label_reuses_host_slot_and_fills_context_slots(
 
     monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
     monkeypatch.setattr(
-        interactive_command,
+        session_execution,
         "prepare_entrypoint_runtime",
         capture_prepare,
     )
@@ -737,10 +747,13 @@ async def test_interactive_existing_session_execution_does_not_create_or_ensure(
             str(tmp_path),
         )
     )
-    prepared = await interactive_command._prepare_interactive_existing_session_execution(
+    prepared = await session_execution.prepare_interactive_session_execution(
         args,
         command_name="session",
         scenario="interactive",
+        ticker=None,
+        context_slot_values=interactive_command.build_interactive_context_slot_values(),
+        usage_error_factory=interactive_command.CliInteractiveUsageError,
     )
     assert prepared.runtime.host_assembly.options.wait_poller_policy is not None
     assert prepared.runtime.host_assembly.options.wait_poller_policy.enabled
@@ -756,7 +769,7 @@ async def test_interactive_existing_session_execution_does_not_create_or_ensure(
         )
     )
 
-    exit_code = await interactive_command._execute_interactive_on_existing_session(
+    exit_code = await session_execution.execute_interactive_on_session(
         host=cast(Host, fake_host),
         prepared=prepared,
         session_id="session-existing",
@@ -805,10 +818,13 @@ async def test_interactive_existing_session_runs_startup_before_first_input(
             str(tmp_path),
         )
     )
-    prepared = await interactive_command._prepare_interactive_existing_session_execution(
+    prepared = await session_execution.prepare_interactive_session_execution(
         args,
         command_name="session",
         scenario="interactive",
+        ticker=None,
+        context_slot_values=interactive_command.build_interactive_context_slot_values(),
+        usage_error_factory=interactive_command.CliInteractiveUsageError,
     )
     fake_host = _FakeHost(submit_statuses=(HostTerminalStatus.SUCCEEDED,))
 
@@ -861,12 +877,12 @@ async def test_interactive_existing_session_runs_startup_before_first_input(
 
     monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
     monkeypatch.setattr(
-        interactive_command,
+        session_execution,
         "startup_reconnect_entrypoint_session",
         fake_startup_reconnect,
     )
 
-    exit_code = await interactive_command._execute_interactive_on_existing_session(
+    exit_code = await session_execution.execute_interactive_on_session(
         host=cast(Host, fake_host),
         prepared=prepared,
         session_id="session-existing",
@@ -885,6 +901,37 @@ async def test_interactive_existing_session_runs_startup_before_first_input(
         "terminal-startup",
         "terminal-run-1",
     )
+
+
+def test_interactive_host_api_error_uses_structured_presentation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """interactive 首次 create 阶段 HostApiError 必须结构化展示并返回 failure。"""
+
+    fake_host = _FakeHost(
+        create_error=HostApiError(
+            code=HostApiErrorCode.NOT_FOUND,
+            message="workspace session root missing",
+            retryable=False,
+        )
+    )
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        interactive_command,
+        "open_host",
+        lambda _options: _FakeOpenHostContext(fake_host),
+    )
+
+    exit_code = cli_main.main(("interactive", "--base", str(tmp_path)))
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_FAILURE
+    assert "dayu-cli interactive" in captured.err
+    assert "host_code=not_found" in captured.err
+    assert "host_message=workspace session root missing" in captured.err
+    assert fake_host.calls == ["create_session"]
 
 
 @pytest.mark.parametrize("log_flag", ("--verbose", "--debug", "--debug-stream"))
@@ -940,7 +987,7 @@ async def test_interactive_first_idle_keyboard_interrupt_redisplays_prompt_witho
     """输入态第一次空 prompt Ctrl-C 应重绘 prompt，且不得发 submit / cancel。"""
 
     runtime = await _prepare_interactive_runtime(tmp_path)
-    invocation = interactive_command.new_cli_invocation(
+    invocation = session_execution.new_cli_invocation(
         command_name="interactive",
         scenario="interactive",
         display_user="本地 CLI 用户",
@@ -954,13 +1001,13 @@ async def test_interactive_first_idle_keyboard_interrupt_redisplays_prompt_witho
         )
     )
 
-    exit_code = await interactive_command._run_interactive_repl(
+    exit_code = await session_execution._run_interactive_repl(
         host=cast(Host, fake_host),
         runtime=runtime,
         workspace_root=tmp_path,
         invocation=invocation,
         session_id="session-1",
-        run_overrides=interactive_command.ServiceRunOverrides(),
+        run_overrides=ServiceRunOverrides(),
         composer=composer,
         sigint_monitor_factory=_NoopSigintMonitor,
     )
@@ -1004,7 +1051,7 @@ async def test_interactive_normal_input_resets_idle_keyboard_interrupt_exit_pend
     """输入态第一次 Ctrl-C 后提交正常输入，应重置本地退出待确认状态。"""
 
     runtime = await _prepare_interactive_runtime(tmp_path)
-    invocation = interactive_command.new_cli_invocation(
+    invocation = session_execution.new_cli_invocation(
         command_name="interactive",
         scenario="interactive",
         display_user="本地 CLI 用户",
@@ -1020,13 +1067,13 @@ async def test_interactive_normal_input_resets_idle_keyboard_interrupt_exit_pend
         )
     )
 
-    exit_code = await interactive_command._run_interactive_repl(
+    exit_code = await session_execution._run_interactive_repl(
         host=cast(Host, fake_host),
         runtime=runtime,
         workspace_root=tmp_path,
         invocation=invocation,
         session_id="session-1",
-        run_overrides=interactive_command.ServiceRunOverrides(),
+        run_overrides=ServiceRunOverrides(),
         composer=composer,
         sigint_monitor_factory=_NoopSigintMonitor,
     )
@@ -1183,7 +1230,7 @@ def test_interactive_activity_uses_run_view_buffer_before_next_prompt(
         _input_reader(("第一轮", "第二轮")),
     )
     monkeypatch.setattr(
-        interactive_command,
+        session_execution,
         "new_interactive_run_view",
         lambda show_activity=False: run_view,
     )
@@ -1223,7 +1270,7 @@ def test_interactive_no_detail_omits_activity_and_keeps_final_answer_stdout(
         _input_reader(("第一轮",)),
     )
     monkeypatch.setattr(
-        interactive_command,
+        session_execution,
         "new_interactive_run_view",
         lambda show_activity=False: run_view_factory_calls.append(show_activity),
     )
@@ -1393,7 +1440,7 @@ async def test_interactive_sigint_after_run_id_cancels_host_run(
     """运行态第一次 SIGINT 应发完整 CancelRunRequest 并返回取消终态。"""
 
     runtime = await _prepare_interactive_runtime(tmp_path)
-    invocation = interactive_command.new_cli_invocation(
+    invocation = session_execution.new_cli_invocation(
         command_name="interactive",
         scenario="interactive",
         display_user="本地 CLI 用户",
@@ -1405,14 +1452,14 @@ async def test_interactive_sigint_after_run_id_cancels_host_run(
         run_statuses=(RunStatus.RUNNING,),
     )
 
-    result = await interactive_command._submit_interactive_turn_handling_sigint(
+    result = await session_execution._submit_interactive_turn_handling_sigint(
         host=cast(Host, fake_host),
         runtime=runtime,
         invocation=invocation,
         session_id="session-1",
         turn_index=1,
         user_prompt="请总结收入变化",
-        run_overrides=interactive_command.ServiceRunOverrides(),
+        run_overrides=ServiceRunOverrides(),
         sigint_monitor=_AutoSigintMonitor(),
     )
 
@@ -1433,7 +1480,7 @@ async def test_interactive_esc_requests_cancel_after_run_id(
     """interactive 运行态 Esc 应请求取消当前 accepted Run。"""
 
     runtime = await _prepare_interactive_runtime(tmp_path)
-    invocation = interactive_command.new_cli_invocation(
+    invocation = session_execution.new_cli_invocation(
         command_name="interactive",
         scenario="interactive",
         display_user="本地 CLI 用户",
@@ -1472,14 +1519,14 @@ async def test_interactive_esc_requests_cancel_after_run_id(
         )
     )
 
-    result = await interactive_command._submit_interactive_turn_handling_sigint(
+    result = await session_execution._submit_interactive_turn_handling_sigint(
         host=cast(Host, fake_host),
         runtime=runtime,
         invocation=invocation,
         session_id="session-1",
         turn_index=1,
         user_prompt="请总结收入变化",
-        run_overrides=interactive_command.ServiceRunOverrides(),
+        run_overrides=ServiceRunOverrides(),
         sigint_monitor=_NoopSigintMonitor(),
         run_view=run_view,
         thinking_renderer=thinking_renderer,
@@ -1506,7 +1553,7 @@ async def test_interactive_ctrl_t_switches_run_view_without_cancel(
     """interactive 运行态 Ctrl+T 应切换 run view，且不得触发 Host cancel。"""
 
     runtime = await _prepare_interactive_runtime(tmp_path)
-    invocation = interactive_command.new_cli_invocation(
+    invocation = session_execution.new_cli_invocation(
         command_name="interactive",
         scenario="interactive",
         display_user="本地 CLI 用户",
@@ -1523,14 +1570,14 @@ async def test_interactive_ctrl_t_switches_run_view_without_cancel(
     )
     key_monitor = _FakeRunningKeyMonitor((RunningKeyAction.TOGGLE_ACTIVITY,))
 
-    result = await interactive_command._submit_interactive_turn_handling_sigint(
+    result = await session_execution._submit_interactive_turn_handling_sigint(
         host=cast(Host, fake_host),
         runtime=runtime,
         invocation=invocation,
         session_id="session-1",
         turn_index=1,
         user_prompt="请总结收入变化",
-        run_overrides=interactive_command.ServiceRunOverrides(),
+        run_overrides=ServiceRunOverrides(),
         sigint_monitor=_NoopSigintMonitor(),
         run_view=run_view,
         key_monitor=key_monitor,
@@ -1553,7 +1600,7 @@ async def test_interactive_second_sigint_exits_after_cancel_request(
     """运行态第二次 SIGINT 应本地退出 130，且已有 run 必须已发 cancel。"""
 
     runtime = await _prepare_interactive_runtime(tmp_path)
-    invocation = interactive_command.new_cli_invocation(
+    invocation = session_execution.new_cli_invocation(
         command_name="interactive",
         scenario="interactive",
         display_user="本地 CLI 用户",
@@ -1565,14 +1612,14 @@ async def test_interactive_second_sigint_exits_after_cancel_request(
         block_cancel_after_record=True,
     )
 
-    result = await interactive_command._submit_interactive_turn_handling_sigint(
+    result = await session_execution._submit_interactive_turn_handling_sigint(
         host=cast(Host, fake_host),
         runtime=runtime,
         invocation=invocation,
         session_id="session-1",
         turn_index=1,
         user_prompt="请总结收入变化",
-        run_overrides=interactive_command.ServiceRunOverrides(),
+        run_overrides=ServiceRunOverrides(),
         sigint_monitor=_SecondSigintAfterCancelMonitor(fake_host),
     )
 
@@ -1588,7 +1635,7 @@ async def test_interactive_repl_returns_130_on_second_sigint(
     """REPL 中第二次 SIGINT 应返回 130。"""
 
     runtime = await _prepare_interactive_runtime(tmp_path)
-    invocation = interactive_command.new_cli_invocation(
+    invocation = session_execution.new_cli_invocation(
         command_name="interactive",
         scenario="interactive",
         display_user="本地 CLI 用户",
@@ -1600,13 +1647,13 @@ async def test_interactive_repl_returns_130_on_second_sigint(
         block_cancel_after_record=True,
     )
 
-    exit_code = await interactive_command._run_interactive_repl(
+    exit_code = await session_execution._run_interactive_repl(
         host=cast(Host, fake_host),
         runtime=runtime,
         workspace_root=tmp_path,
         invocation=invocation,
         session_id="session-1",
-        run_overrides=interactive_command.ServiceRunOverrides(),
+        run_overrides=ServiceRunOverrides(),
         input_reader=_input_reader(("请总结收入变化",)),
         sigint_monitor_factory=lambda: _SecondSigintAfterCancelMonitor(fake_host),
     )
@@ -1713,18 +1760,18 @@ async def test_interactive_sigint_monitor_waits_for_notification() -> None:
 async def test_wait_for_run_id_returns_none_when_second_sigint_wins() -> None:
     """run id 尚未 accepted 时第二次 SIGINT 应取消 submit task 并返回本地退出 outcome。"""
 
-    accepted_run = interactive_command._AcceptedRunState()
+    accepted_run = session_execution._InteractiveAcceptedRunState()
     submit_task = asyncio.create_task(_never_finishes_terminal())
     monitor = _ImmediateSecondSigintMonitor()
 
-    result = await interactive_command._wait_for_run_id_or_local_exit(
+    result = await session_execution._wait_for_run_id_or_local_exit(
         accepted_run=accepted_run,
         submit_task=submit_task,
         sigint_monitor=monitor,
         observed_sigint_count=1,
     )
 
-    assert isinstance(result, interactive_command._LocalExitRequested)
+    assert isinstance(result, session_execution._LocalExitRequested)
     assert submit_task.cancelled()
 
 
@@ -1732,12 +1779,12 @@ async def test_wait_for_run_id_returns_none_when_second_sigint_wins() -> None:
 async def test_wait_for_run_id_returns_submit_terminal_when_submit_completes_first() -> None:
     """等待 run id 阶段 submit task 先返回成功终态时不得映射成本地 130。"""
 
-    accepted_run = interactive_command._AcceptedRunState()
+    accepted_run = session_execution._InteractiveAcceptedRunState()
     terminal = _terminal_result(status=HostTerminalStatus.SUCCEEDED)
     submit_task = asyncio.create_task(_already_terminal(terminal))
     await asyncio.sleep(0)
 
-    result = await interactive_command._wait_for_run_id_or_local_exit(
+    result = await session_execution._wait_for_run_id_or_local_exit(
         accepted_run=accepted_run,
         submit_task=submit_task,
         sigint_monitor=_NeverSigintMonitor(),
@@ -1746,7 +1793,7 @@ async def test_wait_for_run_id_returns_submit_terminal_when_submit_completes_fir
 
     assert isinstance(
         result,
-        interactive_command._SubmitCompletedWhileWaitingForRunId,
+        session_execution._SubmitCompletedWhileWaitingForRunId,
     )
     assert result.terminal is terminal
 
@@ -1755,12 +1802,12 @@ async def test_wait_for_run_id_returns_submit_terminal_when_submit_completes_fir
 async def test_wait_for_run_id_propagates_submit_failure_when_submit_fails_first() -> None:
     """等待 run id 阶段 submit task 先失败时必须向上透传 Host/API fatal。"""
 
-    accepted_run = interactive_command._AcceptedRunState()
+    accepted_run = session_execution._InteractiveAcceptedRunState()
     submit_task = asyncio.create_task(_raise_runtime_error_terminal())
     await asyncio.sleep(0)
 
     with pytest.raises(RuntimeError, match="host fatal"):
-        await interactive_command._wait_for_run_id_or_local_exit(
+        await session_execution._wait_for_run_id_or_local_exit(
             accepted_run=accepted_run,
             submit_task=submit_task,
             sigint_monitor=_NeverSigintMonitor(),
@@ -1772,7 +1819,7 @@ async def test_wait_for_run_id_propagates_submit_failure_when_submit_fails_first
 async def test_cancel_after_first_sigint_returns_completed_submit_terminal() -> None:
     """第一次 SIGINT 竞争中若 submit 已终态，应直接返回 submit terminal。"""
 
-    accepted_run = interactive_command._AcceptedRunState()
+    accepted_run = session_execution._InteractiveAcceptedRunState()
     accepted_run.record("run-1")
     submit_task = asyncio.create_task(_already_terminal(_terminal_result(status=HostTerminalStatus.SUCCEEDED)))
     await asyncio.sleep(0)
@@ -1782,9 +1829,9 @@ async def test_cancel_after_first_sigint_returns_completed_submit_terminal() -> 
         options=CliThinkingRendererOptions(enabled=True),
     )
 
-    result = await interactive_command._cancel_interactive_turn_after_first_sigint(
+    result = await session_execution._cancel_interactive_turn_after_first_sigint(
         host=cast(Host, _FakeHost()),
-        invocation=interactive_command.new_cli_invocation(
+        invocation=session_execution.new_cli_invocation(
             command_name="interactive",
             scenario="interactive",
             display_user="本地 CLI 用户",
@@ -1815,14 +1862,14 @@ async def _prepare_interactive_runtime(tmp_path: Path) -> EntrypointRuntimeResul
     :raises Exception: runtime assembly 失败时向上抛出。
     """
 
-    return await interactive_command.prepare_entrypoint_runtime(
+    return await session_execution.prepare_entrypoint_runtime(
         EntrypointRuntimeRequest(
             workspace_root=tmp_path,
             package_config_root=package_config_root(),
             explicit_config_dir=None,
             scene_id="interactive",
             context_slot_values={_CURRENT_TIME_SLOT: _CURRENT_TIME_TEXT},
-            assembly_overrides=interactive_command.ServiceAssemblyOverrides(model_id=_MODEL_ID),
+            assembly_overrides=ServiceAssemblyOverrides(model_id=_MODEL_ID),
             env={"DEEPSEEK_API_KEY": _API_KEY},
         )
     )
@@ -1886,7 +1933,7 @@ class _NeverSigintMonitor(CliSigintMonitor):
         return observed_count
 
 
-async def _never_finishes_terminal() -> interactive_command.EntrypointRunTerminalResult:
+async def _never_finishes_terminal() -> EntrypointRunTerminalResult:
     """构造永不完成的 terminal task。
 
     :returns: 正常路径不会返回。
@@ -1898,8 +1945,8 @@ async def _never_finishes_terminal() -> interactive_command.EntrypointRunTermina
 
 
 async def _already_terminal(
-    result: interactive_command.EntrypointRunTerminalResult,
-) -> interactive_command.EntrypointRunTerminalResult:
+    result: EntrypointRunTerminalResult,
+) -> EntrypointRunTerminalResult:
     """返回已完成 terminal result。
 
     :param result: 待返回的 terminal result。
@@ -1910,7 +1957,7 @@ async def _already_terminal(
     return result
 
 
-async def _raise_runtime_error_terminal() -> interactive_command.EntrypointRunTerminalResult:
+async def _raise_runtime_error_terminal() -> EntrypointRunTerminalResult:
     """构造抛出 RuntimeError 的 terminal task。
 
     :returns: 正常路径不会返回。
@@ -2068,7 +2115,7 @@ def _entrypoint_thinking(
     )
 
 
-def _terminal_result(*, status: HostTerminalStatus) -> interactive_command.EntrypointRunTerminalResult:
+def _terminal_result(*, status: HostTerminalStatus) -> EntrypointRunTerminalResult:
     """构造 interactive terminal result。
 
     :param status: terminal status。
@@ -2076,7 +2123,7 @@ def _terminal_result(*, status: HostTerminalStatus) -> interactive_command.Entry
     :raises Exception: 不主动抛出异常。
     """
 
-    return interactive_command.EntrypointRunTerminalResult(
+    return EntrypointRunTerminalResult(
         source=EntrypointTerminalSource.LIVE_EVENT,
         session_id="session-1",
         run_id="run-1",

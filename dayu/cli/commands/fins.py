@@ -43,13 +43,9 @@ from dayu.cli.output import (
     render_fins_direct_local_exit_after_cancel,
 )
 from dayu.fins.direct_events import (
-    FINS_RESULT_EXIT_CANCELLED,
-    FINS_RESULT_EXIT_FAILURE,
     FinsErrorKind,
     FinsEvent,
     FinsEventDetail,
-    FinsEventType,
-    FinsOperationKind,
     FinsResultStatus,
     FinsResultSummary,
 )
@@ -95,6 +91,20 @@ _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 class CliFinsUsageError(ValueError):
     """Fins direct CLI 用法错误。"""
+
+
+class FinsDirectStreamContractViolation(RuntimeError):
+    """CLI 观察到 Fins direct Service stream contract 被破坏。"""
+
+
+@dataclass(frozen=True, slots=True)
+class _CliDirectLocalExit:
+    """CLI 本地 direct command 退出状态。
+
+    :param exit_code: 当前 CLI command 应返回的进程退出码。
+    """
+
+    exit_code: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -650,14 +660,14 @@ async def _wait_for_terminal_handling_sigint(
     cancellation_token: _CliFinsCancellationToken,
     sigint_monitor: _FinsSigintMonitor,
     command_name: str,
-) -> FinsResultSummary:
+) -> FinsResultSummary | _CliDirectLocalExit:
     """等待 direct stream 终态并处理运行中 SIGINT。
 
     :param events: Fins direct event stream。
     :param cancellation_token: 当前 operation 的取消 token。
     :param sigint_monitor: SIGINT 观察器。
     :param command_name: 用户可见命令名，用于诊断。
-    :returns: direct stream 终态摘要。
+    :returns: direct stream 终态摘要，或 CLI 本地退出状态。
     :raises Exception: stream 消费失败时向上抛出。
     """
 
@@ -692,7 +702,7 @@ async def _wait_for_terminal_handling_sigint(
                 else:
                     return terminal_result
                 render_fins_direct_local_exit_after_cancel()
-                return _cancelled_result_summary()
+                return _CliDirectLocalExit(exit_code=EXIT_KEYBOARD_INTERRUPT)
     finally:
         sigint_monitor.close()
         sigint_task.cancel()
@@ -707,7 +717,7 @@ async def _consume_fins_direct_events(
 
     :param events: Fins direct event stream。
     :returns: event stream 产出的 terminal result summary。
-    :raises RuntimeError: event stream 结束但没有 terminal result 时抛出。
+    :raises FinsDirectStreamContractViolation: Service stream 结束但没有 terminal result 时抛出。
     :raises Exception: Service stream 或输出失败时向上抛出。
     """
 
@@ -723,12 +733,9 @@ async def _consume_fins_direct_events(
                 event.result.exit_code,
             )
             return event.result
-    missing_result = _missing_result_event()
-    render_fins_direct_event(missing_result)
-    result = missing_result.result
-    if result is None:
-        raise RuntimeError("missing-result event did not contain result")
-    return result
+    raise FinsDirectStreamContractViolation(
+        "Fins direct Service stream ended without RESULT"
+    )
 
 
 def _log_fins_direct_event_received(event: FinsEvent) -> None:
@@ -894,50 +901,6 @@ def _bounded_diagnostic_text(value: str) -> str:
     return value[
         : _FINS_DIAGNOSTIC_TEXT_MAX_CHARS - len(_FINS_DIAGNOSTIC_TRUNCATED_SUFFIX)
     ] + _FINS_DIAGNOSTIC_TRUNCATED_SUFFIX
-
-
-def _missing_result_event() -> FinsEvent:
-    """构造 direct stream 无 RESULT 时的 failure event。
-
-    :returns: failure RESULT 事件。
-    :raises ValueError: 构造出的事件违反 direct contract 时抛出。
-    """
-
-    return FinsEvent(
-        event_type=FinsEventType.RESULT,
-        operation_kind=FinsOperationKind.PREPROCESS,
-        message="Fins direct stream ended without result",
-        emitted_at=datetime.now(timezone.utc),
-        ticker=None,
-        filing_kind=None,
-        document_label=None,
-        progress=None,
-        result=FinsResultSummary(
-            status=FinsResultStatus.FAILURE,
-            exit_code=FINS_RESULT_EXIT_FAILURE,
-            title="Fins direct operation failed",
-            details=(),
-            error_kind=FinsErrorKind.EXECUTION,
-            error_message="Fins direct stream ended without result",
-        ),
-    )
-
-
-def _cancelled_result_summary() -> FinsResultSummary:
-    """构造 CLI 本地取消终态摘要。
-
-    :returns: cancelled result summary。
-    :raises ValueError: 构造出的摘要违反 direct contract 时抛出。
-    """
-
-    return FinsResultSummary(
-        status=FinsResultStatus.CANCELLED,
-        exit_code=FINS_RESULT_EXIT_CANCELLED,
-        title="Fins direct operation cancelled",
-        details=(FinsEventDetail(label="reason", value="keyboard_interrupt"),),
-        error_kind=FinsErrorKind.CANCELLED,
-        error_message="cancelled",
-    )
 
 
 def _raise_for_unsupported_flags(args: ParsedCliArgs) -> None:
