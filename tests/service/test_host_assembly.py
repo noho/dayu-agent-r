@@ -79,6 +79,7 @@ from dayu.runtime.scene_prepare import (
     SceneToolSelectionResult,
     prepare_scene,
 )
+from dayu.runtime.workspace_paths import resolve_workspace_path
 from dayu.service.host_assembly import (
     ServiceAssemblyOverrides,
     ServiceDiscoveredTools,
@@ -91,7 +92,6 @@ from dayu.service.host_assembly import (
     _render_headers,
     _is_fins_workspace_bound_provider_config,
     _resolve_prompt_asset_path,
-    _resolve_project_path,
     _runner_spec_from_model,
     _tool_discovery_spec,
     _tooling_options_from_discovery,
@@ -100,11 +100,17 @@ from dayu.service.host_assembly import (
     compose_submit_followup_request,
     compose_submit_followup_request_with_overrides,
     discover_service_tools,
+    with_entrypoint_wait_poller_policy,
 )
 
 _PACKAGE_CONFIG_ROOT = Path(__file__).resolve().parents[2] / "dayu" / "config"
 _SCENE_ID = "smoke_host_public_multiturn"
 _CUSTOM_COMPACTOR_SCENE_ID = "custom_compactor_scene"
+_CURRENT_TIME_TEXT = (
+    "# 当前时间\n"
+    "现在是 2026年7月7日 17:20（Asia/Shanghai，星期二）。\n"
+    "这是对话开始时的当前时间；回答“现在/今天/当前时间”默认使用它；该时间不会自动更新。"
+)
 _MODEL_ID = "deepseek-v4-flash"
 _RUNNER_HINT_ID = "interactive"
 _API_KEY = "test-provider-key"
@@ -174,7 +180,7 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
     _write_tool_discovery_overlay(tmp_path)
     _write_host_runtime_overlay(tmp_path)
     locations = resolve_runtime_locations(
-        project_root=tmp_path,
+        workspace_root=tmp_path,
         package_config_root=_PACKAGE_CONFIG_ROOT,
     )
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
@@ -187,9 +193,9 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
             scene_manifest_root=locations.scene_manifest_root,
             prompt_asset_root=locations.prompt_asset_root,
             context_slot_values={
+                "current_time": _CURRENT_TIME_TEXT,
                 "fins_default_subject": "测试财报主体",
-                "base_user": "service-assembly-test",
-            },
+                },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
     )
@@ -281,7 +287,7 @@ def test_compose_open_host_options_passes_explicit_wait_poller_policy(
 
     _write_tool_discovery_overlay(tmp_path)
     locations = resolve_runtime_locations(
-        project_root=tmp_path,
+        workspace_root=tmp_path,
         package_config_root=_PACKAGE_CONFIG_ROOT,
     )
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
@@ -294,9 +300,9 @@ def test_compose_open_host_options_passes_explicit_wait_poller_policy(
             scene_manifest_root=locations.scene_manifest_root,
             prompt_asset_root=locations.prompt_asset_root,
             context_slot_values={
+                "current_time": _CURRENT_TIME_TEXT,
                 "fins_default_subject": "测试财报主体",
-                "base_user": "service-assembly-test",
-            },
+                },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
     )
@@ -326,6 +332,100 @@ def test_compose_open_host_options_passes_explicit_wait_poller_policy(
     assert result.options.wait_poller_policy is policy
 
 
+def test_entrypoint_wait_poller_policy_enabled_for_selected_fins_awaiting_tools(
+    tmp_path: Path,
+) -> None:
+    """entrypoint scene 实际选择 Fins awaiting 工具时应自动启用 poller。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises AssertionError: 未按 scene 工具选择补齐 poller policy 时抛出。
+    """
+
+    locations = resolve_runtime_locations(
+        workspace_root=tmp_path,
+        package_config_root=_PACKAGE_CONFIG_ROOT,
+    )
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
+        workspace_config_dir=locations.config_overlay_dir
+    )
+    discovered_tools = _discover_service_tools_for_workspace(
+        config,
+        workspace_root=tmp_path,
+    )
+    scene_inputs = prepare_scene(
+        ScenePrepareRequest(
+            scene_id="interactive",
+            scene_manifest_root=locations.scene_manifest_root,
+            prompt_asset_root=locations.prompt_asset_root,
+            context_slot_values={"current_time": _CURRENT_TIME_TEXT},
+            available_tools=_scene_tool_catalog(discovered_tools),
+        )
+    )
+    overrides = ServiceAssemblyOverrides(
+        model_id=_MODEL_ID,
+        runner_option_hint_id=_RUNNER_HINT_ID,
+    )
+
+    updated = with_entrypoint_wait_poller_policy(
+        overrides=overrides,
+        scene_inputs=scene_inputs,
+        discovered_tools=discovered_tools,
+    )
+
+    assert overrides.wait_poller_policy is None
+    assert updated.wait_poller_policy is not None
+    assert updated.wait_poller_policy.enabled
+
+
+def test_entrypoint_wait_poller_policy_keeps_prompt_scene_no_poller(
+    tmp_path: Path,
+) -> None:
+    """entrypoint scene 未选择 Fins awaiting 工具时不应启动 poller。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises AssertionError: prompt scene 被误启用 poller 时抛出。
+    """
+
+    locations = resolve_runtime_locations(
+        workspace_root=tmp_path,
+        package_config_root=_PACKAGE_CONFIG_ROOT,
+    )
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
+        workspace_config_dir=locations.config_overlay_dir
+    )
+    discovered_tools = _discover_service_tools_for_workspace(
+        config,
+        workspace_root=tmp_path,
+    )
+    scene_inputs = prepare_scene(
+        ScenePrepareRequest(
+            scene_id="prompt",
+            scene_manifest_root=locations.scene_manifest_root,
+            prompt_asset_root=locations.prompt_asset_root,
+            context_slot_values={
+                "current_time": _CURRENT_TIME_TEXT,
+                "fins_default_subject": "测试财报主体",
+            },
+            available_tools=_scene_tool_catalog(discovered_tools),
+        )
+    )
+    overrides = ServiceAssemblyOverrides(
+        model_id=_MODEL_ID,
+        runner_option_hint_id="prompt",
+    )
+
+    updated = with_entrypoint_wait_poller_policy(
+        overrides=overrides,
+        scene_inputs=scene_inputs,
+        discovered_tools=discovered_tools,
+    )
+
+    assert updated is overrides
+    assert updated.wait_poller_policy is None
+
+
 def test_compose_open_host_options_reads_compactor_scene_id_from_profile(
     tmp_path: Path,
 ) -> None:
@@ -338,7 +438,7 @@ def test_compose_open_host_options_reads_compactor_scene_id_from_profile(
 
     _write_tool_discovery_overlay(tmp_path)
     locations = resolve_runtime_locations(
-        project_root=tmp_path,
+        workspace_root=tmp_path,
         package_config_root=_PACKAGE_CONFIG_ROOT,
     )
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
@@ -351,9 +451,9 @@ def test_compose_open_host_options_reads_compactor_scene_id_from_profile(
             scene_manifest_root=locations.scene_manifest_root,
             prompt_asset_root=locations.prompt_asset_root,
             context_slot_values={
+                "current_time": _CURRENT_TIME_TEXT,
                 "fins_default_subject": "测试财报主体",
-                "base_user": "service-assembly-test",
-            },
+                },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
     )
@@ -414,7 +514,7 @@ def test_compose_submit_followup_request_uses_prepared_system_prompt(
 
     _write_tool_discovery_overlay(tmp_path)
     locations = resolve_runtime_locations(
-        project_root=tmp_path,
+        workspace_root=tmp_path,
         package_config_root=_PACKAGE_CONFIG_ROOT,
     )
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
@@ -427,9 +527,9 @@ def test_compose_submit_followup_request_uses_prepared_system_prompt(
             scene_manifest_root=locations.scene_manifest_root,
             prompt_asset_root=locations.prompt_asset_root,
             context_slot_values={
+                "current_time": _CURRENT_TIME_TEXT,
                 "fins_default_subject": "测试财报主体",
-                "base_user": "service-assembly-test",
-            },
+                },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
     )
@@ -456,7 +556,7 @@ def test_compose_submit_followup_request_with_overrides_sets_typed_fields(
 
     _write_tool_discovery_overlay(tmp_path)
     locations = resolve_runtime_locations(
-        project_root=tmp_path,
+        workspace_root=tmp_path,
         package_config_root=_PACKAGE_CONFIG_ROOT,
     )
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
@@ -471,9 +571,9 @@ def test_compose_submit_followup_request_with_overrides_sets_typed_fields(
             scene_manifest_root=locations.scene_manifest_root,
             prompt_asset_root=locations.prompt_asset_root,
             context_slot_values={
+                "current_time": _CURRENT_TIME_TEXT,
                 "fins_default_subject": "测试财报主体",
-                "base_user": "service-assembly-test",
-            },
+                },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
     )
@@ -1248,7 +1348,7 @@ def test_web_tool_discovery_config_survives_service_mapping() -> None:
         "fetch_truncate_chars": 4321,
         "allow_private_network_url": True,
         "playwright_channel": "msedge",
-        "playwright_storage_state_dir": "workspace/storage-states",
+        "playwright_storage_state_dir": "storage-states",
     }
     provider = ToolDiscoveryProviderConfig(
         provider_id="web-tools",
@@ -1264,6 +1364,36 @@ def test_web_tool_discovery_config_survives_service_mapping() -> None:
 
     assert spec.spec_id == "web-tools"
     assert spec.config == web_config
+
+
+def test_default_web_storage_state_dir_resolves_under_workspace_root(
+    tmp_path: Path,
+) -> None:
+    """默认 Web storage state 目录不得解析到 nested workspace。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises AssertionError: 默认 storage state 路径未按 workspace root 解析时抛出。
+    """
+
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load()
+
+    effective_providers = assemble_effective_tool_provider_configs(
+        tuple(config.tool_discovery.providers.values()),
+        workspace_root=tmp_path,
+    )
+    web_provider = next(
+        provider_config
+        for provider_config in effective_providers
+        if provider_config.provider_id == "web-tools"
+    )
+
+    assert web_provider.config["playwright_storage_state_dir"] == str(
+        (tmp_path / ".dayu" / "web_tools_storage_states").resolve(strict=False)
+    )
+    assert not str(web_provider.config["playwright_storage_state_dir"]).startswith(
+        str((tmp_path / "workspace").resolve(strict=False))
+    )
 
 
 def test_fins_tool_discovery_spec_injects_runtime_workspace_root(
@@ -1346,7 +1476,7 @@ def test_fins_tool_discovery_spec_resolves_relative_workspace_root(
         source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
         source_id="dayu.fins.tools.provider",
         enabled=True,
-        config={"workspace_root": "workspace/", "limits": {}},
+        config={"workspace_root": "fins-data/", "limits": {}},
     )
 
     effective_providers = assemble_effective_tool_provider_configs(
@@ -1356,9 +1486,9 @@ def test_fins_tool_discovery_spec_resolves_relative_workspace_root(
     spec = _tool_discovery_spec(effective_providers[0])
 
     assert spec.config["workspace_root"] == str(
-        (runtime_workspace / "workspace").resolve(strict=False)
+        (runtime_workspace / "fins-data").resolve(strict=False)
     )
-    assert provider.config["workspace_root"] == "workspace/"
+    assert provider.config["workspace_root"] == "fins-data/"
 
 
 def test_fins_tool_discovery_spec_rejects_non_string_workspace_root() -> None:
@@ -1421,7 +1551,7 @@ def test_fins_tool_discovery_spec_rejects_relative_workspace_root_without_runtim
         source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
         source_id="dayu.fins.tools.provider",
         enabled=True,
-        config={"workspace_root": "workspace/", "limits": {}},
+        config={"workspace_root": "fins-data/", "limits": {}},
     )
 
     with pytest.raises(
@@ -1515,7 +1645,7 @@ def test_discover_service_tools_carries_effective_fins_config_into_compose(
     """
 
     fins_workspace = (tmp_path / "fins-workspace").resolve(strict=False)
-    overlay_dir = tmp_path / "workspace" / "config"
+    overlay_dir = tmp_path / "config"
     _write_json(
         overlay_dir / "tool_discovery.json",
         {
@@ -1532,7 +1662,7 @@ def test_discover_service_tools_carries_effective_fins_config_into_compose(
         },
     )
     locations = resolve_runtime_locations(
-        project_root=tmp_path,
+        workspace_root=tmp_path,
         package_config_root=_PACKAGE_CONFIG_ROOT,
     )
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
@@ -1599,7 +1729,7 @@ def test_config_loader_and_service_discover_web_tools_with_overlay_config(
     :raises AssertionError: Web config 未进入生产式工具发现链路时抛出。
     """
 
-    overlay_dir = tmp_path / "workspace" / "config"
+    overlay_dir = tmp_path / "config"
     _write_json(
         overlay_dir / "tool_discovery.json",
         {
@@ -1617,7 +1747,7 @@ def test_config_loader_and_service_discover_web_tools_with_overlay_config(
                         "fetch_truncate_chars": 9876,
                         "allow_private_network_url": True,
                         "playwright_channel": "chrome",
-                        "playwright_storage_state_dir": "workspace/web-state",
+                        "playwright_storage_state_dir": ".dayu/web-state",
                     },
                 }
             }
@@ -1638,6 +1768,14 @@ def test_config_loader_and_service_discover_web_tools_with_overlay_config(
         "provider=web-tools,spec=web-tools,version=web-tools-provider-v1,tools=search_web,fetch_web_page"
         in discovered_tools.provider_reports
     )
+    discovered_provider = next(
+        provider_config
+        for provider_config in discovered_tools.effective_provider_configs
+        if provider_config.provider_id == "web-tools"
+    )
+    assert discovered_provider.config["playwright_storage_state_dir"] == str(
+        (tmp_path / ".dayu" / "web-state").resolve(strict=False)
+    )
 
 
 def test_truncation_manager_enabled_is_derived_from_execution_profile(
@@ -1653,7 +1791,7 @@ def test_truncation_manager_enabled_is_derived_from_execution_profile(
     _write_tool_discovery_overlay(tmp_path)
     _write_execution_profile_overlay(tmp_path, truncation_enabled=False)
     locations = resolve_runtime_locations(
-        project_root=tmp_path,
+        workspace_root=tmp_path,
         package_config_root=_PACKAGE_CONFIG_ROOT,
     )
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
@@ -1666,9 +1804,9 @@ def test_truncation_manager_enabled_is_derived_from_execution_profile(
             scene_manifest_root=locations.scene_manifest_root,
             prompt_asset_root=locations.prompt_asset_root,
             context_slot_values={
+                "current_time": _CURRENT_TIME_TEXT,
                 "fins_default_subject": "测试财报主体",
-                "base_user": "service-assembly-test",
-            },
+                },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
     )
@@ -1707,7 +1845,7 @@ def test_memory_projection_context_window_uses_effective_model_window(
     _write_tool_discovery_overlay(tmp_path)
     _write_execution_profile_overlay(tmp_path, truncation_enabled=True)
     locations = resolve_runtime_locations(
-        project_root=tmp_path,
+        workspace_root=tmp_path,
         package_config_root=_PACKAGE_CONFIG_ROOT,
     )
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
@@ -1720,9 +1858,9 @@ def test_memory_projection_context_window_uses_effective_model_window(
             scene_manifest_root=locations.scene_manifest_root,
             prompt_asset_root=locations.prompt_asset_root,
             context_slot_values={
+                "current_time": _CURRENT_TIME_TEXT,
                 "fins_default_subject": "测试财报主体",
-                "base_user": "service-assembly-test",
-            },
+                },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
     )
@@ -1771,7 +1909,7 @@ def test_tool_duplicate_governance_policy_is_derived_from_execution_profile(
         duplicate_default_decision="hint",
     )
     locations = resolve_runtime_locations(
-        project_root=tmp_path,
+        workspace_root=tmp_path,
         package_config_root=_PACKAGE_CONFIG_ROOT,
     )
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
@@ -1784,9 +1922,9 @@ def test_tool_duplicate_governance_policy_is_derived_from_execution_profile(
             scene_manifest_root=locations.scene_manifest_root,
             prompt_asset_root=locations.prompt_asset_root,
             context_slot_values={
+                "current_time": _CURRENT_TIME_TEXT,
                 "fins_default_subject": "测试财报主体",
-                "base_user": "service-assembly-test",
-            },
+                },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
     )
@@ -1857,7 +1995,7 @@ def test_explicit_1m_profile_with_256k_model_fails_fast(
         model_id="ollama",
     )
     locations = resolve_runtime_locations(
-        project_root=tmp_path,
+        workspace_root=tmp_path,
         package_config_root=_PACKAGE_CONFIG_ROOT,
     )
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
@@ -1870,9 +2008,9 @@ def test_explicit_1m_profile_with_256k_model_fails_fast(
             scene_manifest_root=locations.scene_manifest_root,
             prompt_asset_root=locations.prompt_asset_root,
             context_slot_values={
+                "current_time": _CURRENT_TIME_TEXT,
                 "fins_default_subject": "测试财报主体",
-                "base_user": "service-assembly-test",
-            },
+                },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
     )
@@ -1909,7 +2047,7 @@ def test_default_profile_does_not_auto_switch_for_1m_model(
 
     _write_tool_discovery_overlay(tmp_path)
     locations = resolve_runtime_locations(
-        project_root=tmp_path,
+        workspace_root=tmp_path,
         package_config_root=_PACKAGE_CONFIG_ROOT,
     )
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
@@ -1922,9 +2060,9 @@ def test_default_profile_does_not_auto_switch_for_1m_model(
             scene_manifest_root=locations.scene_manifest_root,
             prompt_asset_root=locations.prompt_asset_root,
             context_slot_values={
+                "current_time": _CURRENT_TIME_TEXT,
                 "fins_default_subject": "测试财报主体",
-                "base_user": "service-assembly-test",
-            },
+                },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
     )
@@ -1953,19 +2091,29 @@ def test_default_profile_does_not_auto_switch_for_1m_model(
     assert result.diagnostics.compactor_profile_compatibility.selected_model_id == "deepseek-v4-flash"
 
 
-def test_resolve_project_path_rejects_relative_escape(tmp_path: Path) -> None:
-    """Service project path 相对配置不得逃逸 workspace root。"""
+def test_resolve_workspace_path_rejects_relative_escape(tmp_path: Path) -> None:
+    """公共 workspace path 相对配置不得逃逸 workspace root。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises AssertionError: 未拒绝逃逸路径时抛出。
+    """
 
     with pytest.raises(ValueError, match="escapes workspace root"):
-        _resolve_project_path(tmp_path, "../outside.sqlite3")
+        resolve_workspace_path(tmp_path, "../outside.sqlite3")
 
 
-def test_resolve_project_path_keeps_absolute_path(tmp_path: Path) -> None:
-    """Service project path 绝对路径保持原有语义。"""
+def test_resolve_workspace_path_keeps_absolute_path(tmp_path: Path) -> None:
+    """公共 workspace path 绝对路径保持原有语义。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises AssertionError: 绝对路径被错误改写时抛出。
+    """
 
     absolute_path = tmp_path.parent / "outside.sqlite3"
 
-    assert _resolve_project_path(tmp_path, str(absolute_path)) == absolute_path
+    assert resolve_workspace_path(tmp_path, str(absolute_path)) == absolute_path
 
 
 def _duplicate_governance_policy_config() -> ToolDuplicateGovernancePolicyConfig:
@@ -2012,7 +2160,7 @@ def _write_tool_discovery_overlay(workspace_root: Path) -> None:
     """
 
     _write_json(
-        workspace_root / "workspace" / "config" / "tool_discovery.json",
+        workspace_root / "config" / "tool_discovery.json",
         {
             "providers": {
                 "financial-tools": {
@@ -2037,15 +2185,15 @@ def _write_host_runtime_overlay(workspace_root: Path) -> None:
     """
 
     _write_json(
-        workspace_root / "workspace" / "config" / "host_runtime.json",
+        workspace_root / "config" / "host_runtime.json",
         {
             "default_host_runtime_id": "local",
             "runtimes": {
                 "local": {
-                    "store_root": "workspace/.dayu/host",
-                    "artifact_root": "workspace/.dayu/artifacts",
+                    "store_root": ".dayu/host",
+                    "artifact_root": ".dayu/artifacts",
                     "sqlite": {
-                        "path": "workspace/.dayu/host/dayu_host.sqlite3",
+                        "path": ".dayu/host/dayu_host.sqlite3",
                         "busy_timeout_seconds": 5.0,
                         "write_busy_retry_count": 3,
                         "write_retry_initial_delay_seconds": 0.002,
@@ -2092,7 +2240,7 @@ def _write_execution_profile_overlay(
     """
 
     _write_json(
-        workspace_root / "workspace" / "config" / "execution_profiles.json",
+        workspace_root / "config" / "execution_profiles.json",
         {
             "default_execution_profile_id": profile_id,
             "execution_profiles": {
@@ -2108,7 +2256,7 @@ def _write_execution_profile_overlay(
                         "scene_id": "conversation_compaction",
                         "runner_option_hint_id": "conversation_compaction",
                         "user_prompt_template_path": ("scenes/conversation_compaction_user.md"),
-                        "artifact_root": "workspace/.dayu/artifacts/compaction",
+                        "artifact_root": ".dayu/artifacts/compaction",
                     },
                     "context_budget_policy": {
                         "soft_threshold_context_ratio": 0.65,

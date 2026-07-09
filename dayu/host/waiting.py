@@ -18,6 +18,9 @@ from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_await import ToolAwaitSpec
 from dayu.host._event_payload import (
     attempt_suspended_payload,
+    llm_safe_replay_arguments,
+    payload_object,
+    required_payload_text,
     resume_requested_payload,
     run_waiting_payload,
     tool_awaiting_payload,
@@ -39,6 +42,7 @@ from dayu.host.api import (
     WaitProviderStatusRef,
 )
 from dayu.host.durable.codec import (
+    canonical_json_dumps,
     format_utc_timestamp,
     is_sha256_digest,
     sha256_digest_json,
@@ -55,6 +59,10 @@ from dayu.host.durable.idempotency import (
     IdempotencyResultRef,
     IdempotencyScope,
     IdempotencyStore,
+)
+from dayu.host.durable.schema import (
+    TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
+    TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT,
 )
 from dayu.host.durable.run_transition import (
     ResumeRunFromWaitingInput,
@@ -84,6 +92,13 @@ from dayu.host.durable.state import (
     WorkerKind,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.evidence import (
+    AcceptedEvidenceEnvelope,
+    AcceptedEvidenceResultRef,
+    AcceptedEvidenceToolQuery,
+    accepted_evidence_envelope_to_json_value,
+    derive_accepted_evidence_id,
+)
 from dayu.host.durable.wait_resolution_digest import (
     WAIT_RESOLUTION_OUTCOME_KIND_CANCELLED as _TOOL_FACT_KIND_CANCELLED,
     WAIT_RESOLUTION_OUTCOME_KIND_COMPLETED as _TOOL_FACT_KIND_COMPLETED,
@@ -106,6 +121,7 @@ from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 _LOGGER = logging.getLogger(__name__)
 _TOOL_AWAITING_ACCEPT_SCOPE_KIND = "tool_awaiting_accept"
 _TOOL_AWAITING_ACCEPT_RESULT_KIND = "tool_awaiting_accept_ack"
+_EVENT_TYPE_TOOL_CALL_REQUESTED = "TOOL_CALL_REQUESTED"
 _EVENT_TYPE_TOOL_AWAITING = "TOOL_AWAITING"
 _EVENT_TYPE_RUN_WAITING = "RUN_WAITING"
 _EVENT_TYPE_ATTEMPT_SUSPENDED = "ATTEMPT_SUSPENDED"
@@ -115,6 +131,7 @@ _WAIT_LATE_REJECTION_SCOPE_KIND = "wait_late_rejection"
 _WAIT_LATE_REJECTION_RESULT_KIND = "wait_late_rejection_diagnostic"
 _AWAITING_ACCEPT_ACTOR = "host.tool_runtime"
 _AWAITING_ACCEPT_SOURCE = "host.tool_runtime.awaiting_accept"
+_EVENT_ID_TOOL_CALL_REQUESTED_PREFIX = "event-tool-call-requested-awaiting-"
 _EVENT_ID_TOOL_AWAITING_PREFIX = "event-tool-awaiting-"
 _EVENT_ID_RUN_WAITING_PREFIX = "event-run-waiting-"
 _EVENT_ID_ATTEMPT_SUSPENDED_PREFIX = "event-attempt-suspended-"
@@ -198,6 +215,7 @@ class ToolAwaitingAcceptCandidate:
     :param tool_schema_digest: 工具 schema digest。
     :param tool_identity_digest: 工具身份 digest。
     :param normalized_arguments_digest: 规范化参数 digest。
+    :param accepted_arguments: 与 ``normalized_arguments_digest`` 同源的工具参数。
     :param await_spec: 工具等待规约。
     :param snapshot_ref: 可选等待快照引用。
     :param binding: Host 选择的等待 adapter binding。
@@ -217,6 +235,7 @@ class ToolAwaitingAcceptCandidate:
     tool_schema_digest: str
     tool_identity_digest: str
     normalized_arguments_digest: str
+    accepted_arguments: Mapping[str, JsonValue]
     await_spec: ToolAwaitSpec
     snapshot_ref: WaitSnapshotRef | None
     binding: WaitAdapterBinding
@@ -261,6 +280,11 @@ class ToolAwaitingAcceptCandidate:
             and self.external_job_ref.adapter_key != self.binding.adapter_key
         ):
             raise ValueError("external_job_ref adapter_key must match binding")
+        if (
+            sha256_digest_json({"arguments": dict(self.accepted_arguments)})
+            != self.normalized_arguments_digest
+        ):
+            raise ValueError("accepted_arguments digest mismatch")
 
 
 @dataclass(frozen=True, slots=True)
@@ -501,6 +525,12 @@ class DefaultHostToolAwaitingAcceptPort(HostToolAwaitingAcceptPort):
 
         plan = _event_plan(candidate)
         occurred_at = datetime.now(UTC)
+        tool_call_requested = self._event_log_store.append_event(
+            transaction,
+            _tool_call_requested_event_request(
+                candidate, plan.tool_call_requested_id, occurred_at
+            ),
+        ).row
         tool_awaiting = self._event_log_store.append_event(
             transaction,
             _tool_awaiting_event_request(candidate, plan.tool_awaiting_id, occurred_at),
@@ -563,6 +593,7 @@ class DefaultHostToolAwaitingAcceptPort(HostToolAwaitingAcceptPort):
         )
         return _accepted_ack_from_rows(
             candidate=candidate,
+            tool_call_requested=tool_call_requested,
             tool_awaiting=tool_awaiting,
             run_waiting=run_waiting,
             attempt_suspended=attempt_suspended,
@@ -944,6 +975,7 @@ class DefaultHostResolveWaitService:
                     event_plan=event_plan,
                 ),
                 tool_result_payload=_tool_result_resolution_payload(
+                    transaction=transaction,
                     wait_record=wait_record,
                     request=request,
                     payload_plan=payload_plan,
@@ -990,6 +1022,9 @@ class DefaultHostResolveWaitService:
         :returns: resolve 结果。
         """
 
+        outcome = request.outcome
+        if not isinstance(outcome, ResolveWaitFailedOutcome):
+            raise TypeError("resolve wait failed path received non-failed outcome")
         transition = fail_run_from_waiting_in_transaction(
             transaction,
             self._event_log_store,
@@ -1005,9 +1040,11 @@ class DefaultHostResolveWaitService:
                 actor=request.context.actor,
                 source=_WAIT_RESOLUTION_SOURCE,
                 reason=_WAIT_TERMINAL_REASON_FAILED,
+                message=_failed_wait_terminal_message(outcome),
                 resolution_idempotency_key=request.idempotency_key,
                 resolution_digest=resolution_digest,
                 tool_result_payload=_tool_result_resolution_payload(
+                    transaction=transaction,
                     wait_record=wait_record,
                     request=request,
                     payload_plan=payload_plan,
@@ -1052,6 +1089,9 @@ class DefaultHostResolveWaitService:
         :returns: resolve 结果。
         """
 
+        outcome = request.outcome
+        if not isinstance(outcome, ResolveWaitLostOutcome):
+            raise TypeError("resolve wait lost path received non-lost outcome")
         transition = mark_run_lost_from_waiting_in_transaction(
             transaction,
             self._event_log_store,
@@ -1067,9 +1107,11 @@ class DefaultHostResolveWaitService:
                 actor=request.context.actor,
                 source=_WAIT_RESOLUTION_SOURCE,
                 reason=_WAIT_TERMINAL_REASON_LOST,
+                message=outcome.message,
                 resolution_idempotency_key=request.idempotency_key,
                 resolution_digest=resolution_digest,
                 tool_result_payload=_tool_result_resolution_payload(
+                    transaction=transaction,
                     wait_record=wait_record,
                     request=request,
                     payload_plan=payload_plan,
@@ -1098,6 +1140,7 @@ class DefaultHostResolveWaitService:
 class _AwaitingEventPlan:
     """awaiting accept path 的稳定事件 id 规划。"""
 
+    tool_call_requested_id: str
     tool_awaiting_id: str
     run_waiting_id: str
     attempt_suspended_id: str
@@ -1311,6 +1354,19 @@ def _wait_resolution_payload_plan(
     raise TypeError("unsupported resolve wait outcome")
 
 
+def _failed_wait_terminal_message(outcome: ResolveWaitFailedOutcome) -> str:
+    """从 failed wait outcome 构造同源 Run terminal 明文说明。
+
+    :param outcome: failed wait resolution outcome。
+    :returns: 用户可读 terminal message，包含 outcome message 与可选 hint。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if outcome.result.hint is None:
+        return outcome.result.message
+    return f"{outcome.result.message} {outcome.result.hint}"
+
+
 def _completed_payload_digest(outcome: ResolveWaitCompletedOutcome) -> str:
     """计算 completed outcome payload digest。
 
@@ -1357,6 +1413,7 @@ def _resume_requested_payload(
 
 def _tool_result_resolution_payload(
     *,
+    transaction: HostTransaction,
     wait_record: WaitRecordRow,
     request: ResolveWaitRequest,
     payload_plan: _WaitResolutionPayloadPlan,
@@ -1366,6 +1423,7 @@ def _tool_result_resolution_payload(
 ) -> JsonValue:
     """构造 resolve wait ``TOOL_RESULT_ACCEPTED`` payload。
 
+    :param transaction: 当前 Host transaction。
     :param wait_record: active wait record。
     :param request: resolve wait 请求。
     :param payload_plan: payload 规划。
@@ -1375,6 +1433,15 @@ def _tool_result_resolution_payload(
     :returns: JSON payload。
     """
 
+    tool_call_requested = _wait_tool_call_requested_event(transaction, wait_record)
+    request_payload = payload_object(tool_call_requested)
+    accepted_evidence_envelope = _wait_resolution_evidence_envelope(
+        wait_record=wait_record,
+        payload_plan=payload_plan,
+        event_plan=event_plan,
+        tool_call_requested=tool_call_requested,
+        request_payload=request_payload,
+    )
     return tool_result_wait_resolution_payload(
         tool_fact_id=event_plan.tool_fact_id,
         session_id=wait_record.session_id,
@@ -1384,12 +1451,15 @@ def _tool_result_resolution_payload(
         iteration_id=wait_record.wait_id,
         tool_call_id=wait_record.tool_call_id,
         tool_name=wait_record.tool_name,
-        tool_schema_digest=wait_record.resolve_semantic_digest
-        or payload_plan.outcome_digest,
-        tool_identity_digest=wait_record.resolve_semantic_digest
-        or payload_plan.outcome_digest,
-        normalized_arguments_digest=wait_record.resolve_semantic_digest
-        or payload_plan.outcome_digest,
+        tool_schema_digest=required_payload_text(
+            request_payload, field_name="tool_schema_digest"
+        ),
+        tool_identity_digest=required_payload_text(
+            request_payload, field_name="tool_identity_digest"
+        ),
+        normalized_arguments_digest=required_payload_text(
+            request_payload, field_name="normalized_arguments_digest"
+        ),
         tool_fact_kind=payload_plan.tool_fact_kind,
         outcome_digest=payload_plan.outcome_digest,
         payload_digest=payload_plan.payload_digest,
@@ -1415,7 +1485,148 @@ def _tool_result_resolution_payload(
         resume_dispatch_record_id=(
             event_plan.resume_dispatch_record_id if resume else None
         ),
+        accepted_evidence_envelope=accepted_evidence_envelope_to_json_value(
+            accepted_evidence_envelope
+        ),
+        raw_tool_outcome=payload_plan.result_json,
     )
+
+
+def _wait_tool_call_requested_event(
+    transaction: HostTransaction, wait_record: WaitRecordRow
+) -> EventLogRow:
+    """读取 wait 对应的 canonical ``TOOL_CALL_REQUESTED`` request atom。
+
+    :param transaction: 当前 Host transaction。
+    :param wait_record: active wait record。
+    :returns: 对应 request atom row。
+    :raises HostDurableError: request atom 缺失或身份不匹配时抛出。
+    """
+
+    event_id = _tool_call_requested_event_id_from_wait_id(wait_record.wait_id)
+    row = EventLogStore().read_event_by_id(transaction, event_id)
+    if row is None:
+        raise HostDurableError("wait tool call request atom is missing")
+    if (
+        row.event_type != _EVENT_TYPE_TOOL_CALL_REQUESTED
+        or row.session_id != wait_record.session_id
+        or row.run_id != wait_record.run_id
+        or row.attempt_id != wait_record.attempt_id
+        or row.execution_id != wait_record.execution_id
+    ):
+        raise HostDurableError("wait tool call request atom identity mismatch")
+    payload = payload_object(row)
+    if (
+        required_payload_text(payload, field_name="tool_call_id")
+        != wait_record.tool_call_id
+        or required_payload_text(payload, field_name="tool_name")
+        != wait_record.tool_name
+    ):
+        raise HostDurableError("wait tool call request atom tool mismatch")
+    _validate_wait_request_arguments_digest(
+        transaction,
+        wait_record=wait_record,
+        request_payload=payload,
+    )
+    return row
+
+
+def _validate_wait_request_arguments_digest(
+    transaction: HostTransaction,
+    *,
+    wait_record: WaitRecordRow,
+    request_payload: Mapping[str, JsonValue],
+) -> None:
+    """校验 wait request atom 与 awaiting accept 事实的参数 digest 同源。
+
+    :param transaction: 当前 Host transaction。
+    :param wait_record: active wait record。
+    :param request_payload: ``TOOL_CALL_REQUESTED`` payload。
+    :returns: ``None``。
+    :raises HostDurableError: awaiting 事实缺失、身份错误或参数 digest 不一致时抛出。
+    """
+
+    awaiting = EventLogStore().read_event_by_id(transaction, wait_record.created_event_id)
+    if awaiting is None:
+        raise HostDurableError("wait created event is missing")
+    if (
+        awaiting.event_type != _EVENT_TYPE_TOOL_AWAITING
+        or awaiting.session_id != wait_record.session_id
+        or awaiting.run_id != wait_record.run_id
+        or awaiting.attempt_id != wait_record.attempt_id
+        or awaiting.execution_id != wait_record.execution_id
+    ):
+        raise HostDurableError("wait created event identity mismatch")
+    awaiting_payload = payload_object(awaiting)
+    awaiting_digest = required_payload_text(
+        awaiting_payload, field_name="normalized_arguments_digest"
+    )
+    request_digest = required_payload_text(
+        request_payload, field_name="normalized_arguments_digest"
+    )
+    if request_digest != awaiting_digest:
+        raise HostDurableError("wait tool call request atom arguments digest mismatch")
+
+
+def _wait_resolution_evidence_envelope(
+    *,
+    wait_record: WaitRecordRow,
+    payload_plan: _WaitResolutionPayloadPlan,
+    event_plan: _ResolveWaitEventPlan,
+    tool_call_requested: EventLogRow,
+    request_payload: Mapping[str, JsonValue],
+) -> AcceptedEvidenceEnvelope:
+    """构造 wait-resolution accepted result 的 evidence envelope。
+
+    :param wait_record: active wait record。
+    :param payload_plan: resolution payload 规划。
+    :param event_plan: resolution event id 规划。
+    :param tool_call_requested: 同一等待工具调用的 request atom。
+    :param request_payload: request atom payload。
+    :returns: accepted evidence envelope。
+    """
+
+    return AcceptedEvidenceEnvelope(
+        evidence_id=derive_accepted_evidence_id(event_plan.tool_result_event_id),
+        producer_event_ref=event_plan.tool_result_event_id,
+        tool_name=wait_record.tool_name,
+        tool_call_id=wait_record.tool_call_id,
+        tool_query=AcceptedEvidenceToolQuery(
+            tool_call_requested_event_ref=tool_call_requested.event_id,
+            normalized_arguments_digest=required_payload_text(
+                request_payload, field_name="normalized_arguments_digest"
+            ),
+            semantic_input_digest=required_payload_text(
+                request_payload, field_name="semantic_input_digest"
+            ),
+        ),
+        result_ref=AcceptedEvidenceResultRef(
+            payload_ref=(
+                payload_plan.payload_ref.payload_ref
+                if payload_plan.payload_ref is not None
+                else None
+            ),
+            payload_digest=payload_plan.payload_digest,
+            outcome_digest=payload_plan.outcome_digest,
+            truncation_applied=False,
+        ),
+        source_refs=(),
+        locator_refs=(),
+    )
+
+
+def _tool_call_requested_event_id_from_wait_id(wait_id: str) -> str:
+    """从 Host wait id 派生 awaiting request atom event id。
+
+    :param wait_id: ``wait-<awaiting-accept-digest>`` 形式的 wait id。
+    :returns: request atom event id。
+    :raises HostDurableError: wait id 非 awaiting accept 派生形态时抛出。
+    """
+
+    prefix = "wait-"
+    if not wait_id.startswith(prefix) or len(wait_id) <= len(prefix):
+        raise HostDurableError("wait id cannot derive tool call request atom")
+    return f"{_EVENT_ID_TOOL_CALL_REQUESTED_PREFIX}{wait_id.removeprefix(prefix)}"
 
 
 def _wait_late_result_rejected_event_request(
@@ -1647,6 +1858,7 @@ def _event_plan(candidate: ToolAwaitingAcceptCandidate) -> _AwaitingEventPlan:
 
     digest = candidate.semantic_input_digest.removeprefix("sha256:")
     return _AwaitingEventPlan(
+        tool_call_requested_id=f"{_EVENT_ID_TOOL_CALL_REQUESTED_PREFIX}{digest}",
         tool_awaiting_id=f"{_EVENT_ID_TOOL_AWAITING_PREFIX}{digest}",
         run_waiting_id=f"{_EVENT_ID_RUN_WAITING_PREFIX}{digest}",
         attempt_suspended_id=f"{_EVENT_ID_ATTEMPT_SUSPENDED_PREFIX}{digest}",
@@ -1692,6 +1904,105 @@ def _invalid_awaiting_precondition(
     return None
 
 
+def _tool_call_requested_event_request(
+    candidate: ToolAwaitingAcceptCandidate,
+    event_id: str,
+    occurred_at: datetime,
+) -> EventLogAppendRequest:
+    """构造 awaiting 工具调用的 ``TOOL_CALL_REQUESTED`` append request。
+
+    :param candidate: awaiting candidate。
+    :param event_id: 事件 id。
+    :param occurred_at: 事件发生时间。
+    :returns: EventLog append request。
+    """
+
+    safe_arguments = llm_safe_replay_arguments(candidate.accepted_arguments)
+    arguments_json = _accepted_arguments_json(safe_arguments)
+    arguments_payload_digest = sha256_digest_json(arguments_json)
+    semantic_query_text = _awaiting_semantic_query_text(
+        tool_name=candidate.tool_name,
+        safe_arguments=safe_arguments,
+    )
+    return EventLogAppendRequest(
+        event_id=event_id,
+        event_class=EventClass.CANONICAL_FACT,
+        session_id=candidate.session_id,
+        run_id=candidate.run_id,
+        attempt_id=candidate.attempt_id,
+        execution_id=candidate.execution_id,
+        event_type=_EVENT_TYPE_TOOL_CALL_REQUESTED,
+        occurred_at=occurred_at,
+        actor=_AWAITING_ACCEPT_ACTOR,
+        source=_AWAITING_ACCEPT_SOURCE,
+        client_request_id=None,
+        idempotency_key=candidate.accept_idempotency_key,
+        policy_decision=None,
+        reason={"reason": "tool_call_requested"},
+        payload_json={
+            "session_id": candidate.session_id,
+            "run_id": candidate.run_id,
+            "attempt_id": candidate.attempt_id,
+            "execution_id": candidate.execution_id,
+            "iteration_id": candidate.iteration_id,
+            "tool_call_id": candidate.tool_call_id,
+            "tool_name": candidate.tool_name,
+            "tool_schema_digest": candidate.tool_schema_digest,
+            "tool_identity_digest": candidate.tool_identity_digest,
+            "normalized_arguments_digest": candidate.normalized_arguments_digest,
+            "arguments_json_size_bytes": _payload_size_bytes(arguments_json),
+            "arguments_storage_kind": TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
+            "arguments_inline_json": arguments_json,
+            "arguments_payload_ref": None,
+            "arguments_payload_digest": arguments_payload_digest,
+            "tool_fact_kind": "awaiting",
+            "accept_idempotency_key": candidate.accept_idempotency_key,
+            "semantic_input_digest": candidate.semantic_input_digest,
+            "semantic_query_storage_kind": TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT,
+            "semantic_query_text": semantic_query_text,
+            "semantic_query_payload_ref": None,
+            "semantic_query_digest": sha256_digest_json(
+                {"semantic_query_text": semantic_query_text}
+            ),
+        },
+        payload_ref=None,
+        payload_digest=None,
+    )
+
+
+def _accepted_arguments_json(arguments: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
+    """构造 request atom 使用的 accepted arguments canonical JSON。
+
+    :param arguments: 已接受参数。
+    :returns: canonical arguments JSON object。
+    """
+
+    return {"arguments": dict(arguments)}
+
+
+def _awaiting_semantic_query_text(
+    *, tool_name: str, safe_arguments: Mapping[str, JsonValue]
+) -> str:
+    """构造 awaiting 工具调用的业务可读请求摘要。
+
+    :param tool_name: 工具名。
+    :param safe_arguments: 已脱敏的工具参数投影。
+    :returns: 不含 Host 等待治理概念的 LLM-facing query 文本。
+    """
+
+    return f"工具 {tool_name} 请求参数：{canonical_json_dumps(dict(safe_arguments))}"
+
+
+def _payload_size_bytes(payload: Mapping[str, JsonValue]) -> int:
+    """计算 canonical JSON payload 的 UTF-8 字节数。
+
+    :param payload: JSON payload。
+    :returns: 字节数。
+    """
+
+    return len(canonical_json_dumps(payload).encode("utf-8"))
+
+
 def _tool_awaiting_event_request(
     candidate: ToolAwaitingAcceptCandidate, event_id: str, occurred_at: datetime
 ) -> EventLogAppendRequest:
@@ -1727,6 +2038,8 @@ def _tool_awaiting_event_request(
             wait_id=candidate.wait_id,
             tool_call_id=candidate.tool_call_id,
             tool_name=candidate.tool_name,
+            normalized_arguments_digest=candidate.normalized_arguments_digest,
+            accepted_arguments=candidate.accepted_arguments,
             await_spec=candidate.await_spec,
             adapter_key=candidate.binding.adapter_key.value,
             resume_policy=candidate.binding.resume_policy.value,
@@ -1919,6 +2232,9 @@ def _accepted_ack_from_existing(
     """
 
     plan = _event_plan(candidate)
+    tool_call_requested = event_log_store.read_event_by_id(
+        transaction, plan.tool_call_requested_id
+    )
     tool_awaiting = event_log_store.read_event_by_id(
         transaction, plan.tool_awaiting_id
     )
@@ -1926,12 +2242,18 @@ def _accepted_ack_from_existing(
     attempt_suspended = event_log_store.read_event_by_id(
         transaction, plan.attempt_suspended_id
     )
-    if tool_awaiting is None or run_waiting is None or attempt_suspended is None:
+    if (
+        tool_call_requested is None
+        or tool_awaiting is None
+        or run_waiting is None
+        or attempt_suspended is None
+    ):
         raise RuntimeError("accepted tool awaiting event is missing")
     if read_wait_record_by_id(transaction, candidate.wait_id) is None:
         raise RuntimeError("accepted tool awaiting wait record is missing")
     return _accepted_ack_from_rows(
         candidate=candidate,
+        tool_call_requested=tool_call_requested,
         tool_awaiting=tool_awaiting,
         run_waiting=run_waiting,
         attempt_suspended=attempt_suspended,
@@ -1942,6 +2264,7 @@ def _accepted_ack_from_existing(
 def _accepted_ack_from_rows(
     *,
     candidate: ToolAwaitingAcceptCandidate,
+    tool_call_requested: EventLogRow,
     tool_awaiting: EventLogRow,
     run_waiting: EventLogRow,
     attempt_suspended: EventLogRow,
@@ -1950,6 +2273,7 @@ def _accepted_ack_from_rows(
     """从 EventLog rows 组装 accepted ack。
 
     :param candidate: awaiting candidate。
+    :param tool_call_requested: ``TOOL_CALL_REQUESTED`` row。
     :param tool_awaiting: ``TOOL_AWAITING`` row。
     :param run_waiting: ``RUN_WAITING`` row。
     :param attempt_suspended: ``ATTEMPT_SUSPENDED`` row。
@@ -1957,11 +2281,13 @@ def _accepted_ack_from_rows(
     :returns: accepted ack。
     """
 
+    tool_call_requested_ref = _event_ref_from_row(tool_call_requested)
     tool_awaiting_ref = _event_ref_from_row(tool_awaiting)
     run_waiting_ref = _event_ref_from_row(run_waiting)
     attempt_suspended_ref = _event_ref_from_row(attempt_suspended)
     return ToolAwaitingAcceptedAck(
         accepted_event_refs=(
+            tool_call_requested_ref,
             tool_awaiting_ref,
             run_waiting_ref,
             attempt_suspended_ref,

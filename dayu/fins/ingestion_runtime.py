@@ -2701,6 +2701,9 @@ class FinsIngestionRuntime:
                 _PAYLOAD_SOURCE: request.source,
             },
         )
+        if context.cancellation_checker():
+            self._emit_direct_cancelled_result(context)
+            return
         summary = self._execute_download_request(context, normalized, request)
         if context.cancellation_checker():
             self._emit_direct_cancelled_result(context)
@@ -2756,6 +2759,9 @@ class FinsIngestionRuntime:
                 _PAYLOAD_SOURCE_KIND: request.source_kind.value,
             },
         )
+        if context.cancellation_checker():
+            self._emit_direct_cancelled_result(context)
+            return
         summary = self._execute_preprocess_request(context, request)
         if context.cancellation_checker():
             self._emit_direct_cancelled_result(context)
@@ -2814,6 +2820,9 @@ class FinsIngestionRuntime:
             document_id=_upload_request_document_id(request),
             payload=_upload_context_request_progress_payload(context, request),
         )
+        if context.cancellation_checker():
+            self._emit_direct_cancelled_result(context)
+            return
         if self.upload_runner is None:
             self._emit_direct_result(
                 context,
@@ -4721,11 +4730,10 @@ def _download_result_details(summary: FinsDownloadResultSummary) -> tuple[FinsEv
     """
 
     bounded = _bounded_download_summary(summary)
-    displayed_skipped_count = max(bounded.skipped_count - bounded.rejected_count, 0)
     return (
         FinsEventDetail("discovered", str(bounded.discovered_count)),
         FinsEventDetail("downloaded", str(bounded.downloaded_count)),
-        FinsEventDetail("skipped", str(displayed_skipped_count)),
+        FinsEventDetail("skipped", str(bounded.skipped_count)),
         FinsEventDetail("rejected", str(bounded.rejected_count)),
         FinsEventDetail("failed", str(bounded.failed_count)),
         FinsEventDetail("written documents", str(len(bounded.written_document_ids))),

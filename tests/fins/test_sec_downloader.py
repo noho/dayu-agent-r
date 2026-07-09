@@ -6,7 +6,7 @@ from dayu.contracts.json_value import JsonValue
 
 import asyncio
 import hashlib
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from io import BytesIO
 from io import StringIO
 from itertools import repeat
@@ -314,18 +314,22 @@ def test_resolve_company_success_and_not_found(tmp_path: Path, monkeypatch: pyte
     monkeypatch.setattr(
         downloader,
         "_http_get_json",
-        lambda url: {
+        lambda url, cancellation_checker=None: {
             "0": {"ticker": "AAPL", "cik_str": "320193", "title": "Apple"},
             "1": {"ticker": "MSFT", "cik_str": "789019", "title": "Microsoft"},
         },
     )
     assert _run(downloader.resolve_company("aapl")) == ("320193", "Apple", "0000320193")
 
-    monkeypatch.setattr(downloader, "_http_get_json", lambda url: {"0": {"ticker": "MSFT"}})
+    monkeypatch.setattr(
+        downloader,
+        "_http_get_json",
+        lambda url, cancellation_checker=None: {"0": {"ticker": "MSFT"}},
+    )
     monkeypatch.setattr(
         downloader,
         "_http_get_bytes",
-        lambda url: b"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+        lambda url, cancellation_checker=None: b"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <feed xmlns=\"http://www.w3.org/2005/Atom\"></feed>""",
     )
     with pytest.raises(RuntimeError, match="无法在 SEC ticker map 中找到"):
@@ -342,7 +346,7 @@ def test_resolve_company_uses_hyphenated_class_share_canonical(
     monkeypatch.setattr(
         downloader,
         "_http_get_json",
-        lambda url: {
+        lambda url, cancellation_checker=None: {
             "0": {"ticker": "BRK-B", "cik_str": "1067983", "title": "BERKSHIRE HATHAWAY INC"},
             "1": {"ticker": "BRK-A", "cik_str": "1067983", "title": "BERKSHIRE HATHAWAY INC"},
         },
@@ -350,7 +354,9 @@ def test_resolve_company_uses_hyphenated_class_share_canonical(
     monkeypatch.setattr(
         downloader,
         "_http_get_bytes",
-        lambda url: (_ for _ in ()).throw(AssertionError(f"不应访问 browse-edgar: {url}")),
+        lambda url, cancellation_checker=None: (_ for _ in ()).throw(
+            AssertionError(f"不应访问 browse-edgar: {url}")
+        ),
     )
 
     expected = ("1067983", "BERKSHIRE HATHAWAY INC", "0001067983")
@@ -366,7 +372,11 @@ def test_resolve_company_fallback_via_browse_edgar(
 
     downloader = _create_downloader(tmp_path)
 
-    def _fake_get_json(url: str) -> dict[str, JsonValue]:
+    def _fake_get_json(
+        url: str,
+        cancellation_checker: Callable[[], bool] | None = None,
+    ) -> dict[str, JsonValue]:
+        del cancellation_checker
         if url.endswith("company_tickers.json"):
             return {"0": {"ticker": "MSFT", "cik_str": "789019", "title": "Microsoft"}}
         if "CIK0000814052.json" in url:
@@ -380,7 +390,7 @@ def test_resolve_company_fallback_via_browse_edgar(
     monkeypatch.setattr(
         downloader,
         "_http_get_bytes",
-        lambda url: b"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+        lambda url, cancellation_checker=None: b"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <feed xmlns=\"http://www.w3.org/2005/Atom\">
   <entry>
     <title>20-F - Annual report</title>
@@ -399,7 +409,11 @@ def test_fetch_wrappers_and_blank_filenum(tmp_path: Path, monkeypatch: pytest.Mo
     downloader = _create_downloader(tmp_path)
     captured_urls: list[str] = []
 
-    def _fake_get_json(url: str) -> dict[str, JsonValue]:
+    def _fake_get_json(
+        url: str,
+        cancellation_checker: Callable[[], bool] | None = None,
+    ) -> dict[str, JsonValue]:
+        del cancellation_checker
         captured_urls.append(url)
         return {"ok": True}
 
@@ -426,7 +440,11 @@ SUBJECT COMPANY:
 </SEC-HEADER>
 """
 
-    async def _fake_get_bytes(url: str) -> bytes:
+    async def _fake_get_bytes(
+        url: str,
+        cancellation_checker: Callable[[], bool] | None = None,
+    ) -> bytes:
+        del cancellation_checker
         captured_urls.append(url)
         return payload
 
@@ -465,8 +483,11 @@ def test_fetch_sc13_party_roles_network_failure_returns_none(
 
     downloader = _create_downloader(tmp_path)
 
-    async def _raise_error(url: str) -> bytes:
-        del url
+    async def _raise_error(
+        url: str,
+        cancellation_checker: Callable[[], bool] | None = None,
+    ) -> bytes:
+        del url, cancellation_checker
         raise RuntimeError("boom")
 
     monkeypatch.setattr(downloader, "_http_get_bytes", _raise_error)
@@ -490,7 +511,7 @@ def test_list_filing_files_includes_xbrl_and_exhibits(
     monkeypatch.setattr(
         downloader,
         "_try_fetch_index_items",
-        lambda cik, accession_no_dash: [
+        lambda cik, accession_no_dash, cancellation_checker=None: [
             {"name": "sample-6k.htm"},
             {"name": "sample-6k_htm.xml"},
             {"name": "sample-6k.xsd"},
@@ -500,7 +521,7 @@ def test_list_filing_files_includes_xbrl_and_exhibits(
     monkeypatch.setattr(
         downloader,
         "_try_fetch_index_header_documents",
-        lambda cik, accession_no_dash: [
+        lambda cik, accession_no_dash, cancellation_checker=None: [
             {"name": "form6kcover.htm", "type": "6-K", "description": "FORM 6-K"},
             {"name": "q12025pressrelease.htm", "type": "EX-99.1", "description": "EX-99.1"},
         ],
@@ -508,7 +529,7 @@ def test_list_filing_files_includes_xbrl_and_exhibits(
     monkeypatch.setattr(
         downloader,
         "_http_head",
-        lambda url, allow_redirects: type(
+        lambda url, allow_redirects, cancellation_checker=None: type(
             "_Resp",
             (),
             {
@@ -562,11 +583,18 @@ def test_list_filing_files_without_http_metadata_skips_head(
     monkeypatch.setattr(
         downloader,
         "_try_fetch_index_items",
-        lambda cik, accession_no_dash: [{"name": "sample-10k.htm"}, {"name": "sample-10k_htm.xml"}],
+        lambda cik, accession_no_dash, cancellation_checker=None: [
+            {"name": "sample-10k.htm"},
+            {"name": "sample-10k_htm.xml"},
+        ],
     )
 
-    async def _unexpected_head(url: str, allow_redirects: bool) -> None:
-        del url, allow_redirects
+    async def _unexpected_head(
+        url: str,
+        allow_redirects: bool,
+        cancellation_checker: Callable[[], bool] | None = None,
+    ) -> None:
+        del url, allow_redirects, cancellation_checker
         raise AssertionError("include_http_metadata=False 时不应触发 HEAD")
 
     monkeypatch.setattr(downloader, "_http_head", _unexpected_head)
@@ -593,12 +621,24 @@ def test_list_filing_files_includes_primary_linked_html_exhibits(
     """验证 6-K 主文档中的同 filing 相对 HTML 链接会补入下载列表。"""
 
     downloader = _create_downloader(tmp_path)
-    monkeypatch.setattr(downloader, "_try_fetch_index_items", lambda cik, accession_no_dash: [])
-    monkeypatch.setattr(downloader, "_try_fetch_index_header_documents", lambda cik, accession_no_dash: [])
+    monkeypatch.setattr(
+        downloader,
+        "_try_fetch_index_items",
+        lambda cik, accession_no_dash, cancellation_checker=None: [],
+    )
+    monkeypatch.setattr(
+        downloader,
+        "_try_fetch_index_header_documents",
+        lambda cik, accession_no_dash, cancellation_checker=None: [],
+    )
 
-    async def _fake_get_bytes(url: str) -> bytes:
+    async def _fake_get_bytes(
+        url: str,
+        cancellation_checker: Callable[[], bool] | None = None,
+    ) -> bytes:
         """模拟返回带相对 exhibit 链接的 6-K cover。"""
 
+        del cancellation_checker
         assert url.endswith("/sample-6k.htm")
         return b"""
 <html>
@@ -615,7 +655,7 @@ def test_list_filing_files_includes_primary_linked_html_exhibits(
     monkeypatch.setattr(
         downloader,
         "_http_head",
-        lambda url, allow_redirects: type(
+        lambda url, allow_redirects, cancellation_checker=None: type(
             "_Resp",
             (),
             {
@@ -682,8 +722,13 @@ def test_download_files_stream_304_downloaded_and_failed(
         ),
     ]
 
-    async def _fake_conditional(url: str, etag: Optional[str], last_modified: Optional[str]) -> tuple[int, Optional[bytes]]:
-        del etag, last_modified
+    async def _fake_conditional(
+        url: str,
+        etag: Optional[str],
+        last_modified: Optional[str],
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> tuple[int, Optional[bytes]]:
+        del etag, last_modified, cancellation_checker
         if url.endswith("a.htm"):
             return 304, None
         if url.endswith("b.htm"):
@@ -719,6 +764,53 @@ def test_download_files_stream_304_downloaded_and_failed(
     assert "未修改" in str(events[1].reason_message)
     assert events[5].reason_code == "empty_response"
     assert events[5].reason_message == "下载失败，未返回内容"
+
+
+def test_download_files_stream_cancel_stops_without_failed_event(tmp_path: Path) -> None:
+    """验证 SEC 文件循环取消后停止后续下载且不生成失败事件。"""
+
+    downloader = _create_downloader(tmp_path)
+    store_stub = StoreStub()
+    descriptors = [
+        RemoteFileDescriptor(
+            name="a.htm",
+            source_url="https://example.com/a.htm",
+            http_etag=None,
+            http_last_modified=None,
+            remote_size=1,
+            http_status=200,
+        ),
+        RemoteFileDescriptor(
+            name="b.htm",
+            source_url="https://example.com/b.htm",
+            http_etag=None,
+            http_last_modified=None,
+            remote_size=1,
+            http_status=200,
+        ),
+    ]
+    checks = 0
+
+    def _cancel_after_first_check() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks > 1
+
+    async def _collect() -> list[DownloaderEvent]:
+        events: list[DownloaderEvent] = []
+        async for event in downloader.download_files_stream(
+            remote_files=descriptors,
+            overwrite=False,
+            store_file=store_stub,
+            cancellation_checker=_cancel_after_first_check,
+        ):
+            events.append(event)
+        return events
+
+    events = _run(_collect())
+
+    assert [event.event_type for event in events] == ["file_download_started"]
+    assert store_stub.calls == []
 
 
 def test_download_files_stream_http_error_with_overwrite_false(
@@ -763,10 +855,11 @@ def test_download_files_stream_http_error_with_overwrite_false(
         url: str,
         etag: Optional[str],
         last_modified: Optional[str],
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> tuple[int, Optional[bytes]]:
         """模拟下载，对 failed.xml 抛出 503 错误。"""
 
-        del etag, last_modified
+        del etag, last_modified, cancellation_checker
         if url.endswith("failed.xml"):
             raise RuntimeError(
                 "下载失败: url=https://example.com/failed.xml "
@@ -819,7 +912,7 @@ def test_download_files_aggregates_results(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.setattr(
         downloader,
         "_http_download_if_modified",
-        lambda url, etag, last_modified: (200, b"dummy"),
+        lambda url, etag, last_modified, cancellation_checker=None: (200, b"dummy"),
     )
     results = _run(
         downloader.download_files(
@@ -844,7 +937,9 @@ def test_resolve_primary_document_failure_and_fetch_file_bytes(
     monkeypatch.setattr(
         downloader,
         "_http_get_json",
-        lambda url: {"directory": {"item": [{"name": ""}, {"type": "10-K"}, {"other": "x"}]}},
+        lambda url, cancellation_checker=None: {
+            "directory": {"item": [{"name": ""}, {"type": "10-K"}, {"other": "x"}]}
+        },
     )
     with pytest.raises(RuntimeError, match="无法解析 primary_document"):
         _run(
@@ -855,7 +950,11 @@ def test_resolve_primary_document_failure_and_fetch_file_bytes(
             )
         )
 
-    monkeypatch.setattr(downloader, "_http_download", lambda url: b"payload")
+    monkeypatch.setattr(
+        downloader,
+        "_http_download",
+        lambda url, cancellation_checker=None: b"payload",
+    )
     assert _run(downloader.fetch_file_bytes("https://example.com/file.bin")) == b"payload"
 
 
@@ -863,6 +962,21 @@ def test_close_owned_client(tmp_path: Path) -> None:
     """验证 close 可正常关闭内部 client。"""
 
     downloader = _create_downloader(tmp_path)
+    _run(downloader.close())
+
+
+def test_owned_client_refreshes_across_asyncio_run_boundaries(tmp_path: Path) -> None:
+    """验证 owned HTTP client 不跨已关闭事件循环复用。"""
+
+    downloader = _create_downloader(tmp_path)
+
+    _run(downloader._refresh_owned_client_for_current_loop())
+    first_client = downloader._client
+    first_event_loop = downloader._client_event_loop
+    _run(downloader._refresh_owned_client_for_current_loop())
+
+    assert downloader._client is not first_client
+    assert downloader._client_event_loop is not first_event_loop
     _run(downloader.close())
 
 
@@ -944,7 +1058,11 @@ def test_fetch_browse_edgar_filenum_non_empty(tmp_path: Path, monkeypatch: pytes
 </feed>
 """
 
-    async def _fake_get_bytes(url: str) -> bytes:
+    async def _fake_get_bytes(
+        url: str,
+        cancellation_checker: Callable[[], bool] | None = None,
+    ) -> bytes:
+        del cancellation_checker
         captured_urls.append(url)
         return payload
 
@@ -991,7 +1109,11 @@ def test_download_files_stream_overwrite_with_failure(tmp_path: Path, monkeypatc
     ]
     store_stub = StoreStub()
 
-    async def _fake_download(url: str) -> bytes:
+    async def _fake_download(
+        url: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> bytes:
+        del cancellation_checker
         if url.endswith("bad.htm"):
             raise RuntimeError("network down")
         return b"ok"
@@ -1064,10 +1186,11 @@ def test_download_files_stream_zero_byte_overwrite_false(
         url: str,
         etag: Optional[str],
         last_modified: Optional[str],
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> tuple[int, Optional[bytes]]:
         """模拟下载，对 empty.htm 返回 0 字节内容。"""
 
-        del etag, last_modified
+        del etag, last_modified, cancellation_checker
         if url.endswith("empty.htm"):
             return 200, b""
         return 200, b"content"
@@ -1137,9 +1260,13 @@ def test_download_files_stream_zero_byte_overwrite_true(
         ),
     ]
 
-    async def _fake_download(url: str) -> bytes:
+    async def _fake_download(
+        url: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> bytes:
         """模拟下载，对 empty.htm 返回 0 字节内容。"""
 
+        del cancellation_checker
         if url.endswith("empty.htm"):
             return b""
         return b"content"
@@ -1220,9 +1347,13 @@ def test_download_files_stream_zero_byte_primary_aborts_remaining(
 
     download_calls: list[str] = []
 
-    async def _fake_download(url: str) -> bytes:
+    async def _fake_download(
+        url: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> bytes:
         """记录调用，primary 返回 0 字节，其余返回正常内容。"""
 
+        del cancellation_checker
         download_calls.append(url)
         if url.endswith(".htm") and "x20f.htm" in url:
             return b""
@@ -1326,7 +1457,11 @@ def test_http_download_if_modified_branches(tmp_path: Path, monkeypatch: pytest.
 
     downloader = _create_downloader(tmp_path)
 
-    async def _fake_download(url: str) -> bytes:
+    async def _fake_download(
+        url: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> bytes:
+        del cancellation_checker
         return f"payload:{url}".encode("utf-8")
 
     monkeypatch.setattr(downloader, "_http_download", _fake_download)
@@ -1579,13 +1714,20 @@ def test_try_fetch_index_items_and_helper_paths(tmp_path: Path, monkeypatch: pyt
 
     downloader = _create_downloader(tmp_path)
 
-    async def _raise_runtime(url: str) -> dict[str, JsonValue]:
-        del url
+    async def _raise_runtime(
+        url: str,
+        cancellation_checker: Callable[[], bool] | None = None,
+    ) -> dict[str, JsonValue]:
+        del url, cancellation_checker
         raise RuntimeError("bad index")
 
     monkeypatch.setattr(downloader, "_http_get_json", _raise_runtime)
     assert _run(downloader._try_fetch_index_items("320193", "000032019325000001")) == []
-    monkeypatch.setattr(downloader, "_http_get_bytes", lambda url: b"")
+    monkeypatch.setattr(
+        downloader,
+        "_http_get_bytes",
+        lambda url, cancellation_checker=None: b"",
+    )
     assert _run(downloader._try_fetch_index_header_documents("320193", "000032019325000001")) == []
 
     assert downloader._build_headers()["User-Agent"] == "UA"

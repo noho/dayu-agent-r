@@ -1,8 +1,7 @@
-"""Fins 预处理 awaiting tool 定义。
+"""Fins 预处理工具定义。
 
-本模块把 Fins shared ingestion runtime 的预处理 observation 入口适配为当前
-``ToolDefinition``。工具只启动外部长事务并返回等待 outcome，不实现状态
-查询、取消轮询或 Host wait adapter。
+本模块把 Fins 预处理能力适配为当前 ``ToolDefinition``，负责参数解析、
+启动预处理任务并把启动结果交还给上层工具执行框架。
 """
 
 from __future__ import annotations
@@ -162,10 +161,8 @@ def build_fins_preprocess_tool(runtime: FinsIngestionRuntime) -> ToolDefinition:
             function=ToolFunctionSchema(
                 name=PREPROCESS_TOOL_NAME,
                 description=(
-                    "Start a financial document preprocess operation for source documents "
-                    "already stored in the Fins workspace. The tool returns "
-                    "immediately with an external-job wait state after a lightweight "
-                    "observation handle is registered; it does not wait for processing to finish."
+                    "处理本地已有的财报源文件，使其可用于章节读取、表格读取和财务数据查询。"
+                    "调用后等待工具结果返回；结果会说明选中、处理、跳过和失败的文档数量。"
                 ),
                 parameters=_preprocess_parameters_schema(),
             ),
@@ -194,27 +191,27 @@ def _preprocess_parameters_schema() -> ToolParametersSchema:
     properties: dict[str, JsonValue] = {
         "ticker": {
             "type": "string",
-            "description": "Company ticker or exchange-qualified ticker whose stored source documents should be processed.",
+            "description": "要处理财报的股票代码，可包含交易所后缀。",
         },
         "source_kind": {
             "type": "string",
-            "description": "Stored source document category to process.",
+            "description": "要处理的本地源文件类别。",
             "enum": [SourceKind.FILING.value, SourceKind.MATERIAL.value],
             "default": _DEFAULT_SOURCE_KIND.value,
         },
         "document_ids": {
             "type": "array",
-            "description": "Optional source document ids to process. Omit or pass an empty list to let the runtime select stored documents for the ticker.",
+            "description": "可选文档 ID 列表；省略或传空数组表示处理该股票代码下符合条件的本地源文件。",
             "items": {"type": "string"},
         },
         "form_types": {
             "type": "array",
-            "description": "Optional form filters such as 10-K or annual-report. Omit or pass an empty list for all forms.",
+            "description": "可选表单过滤条件，例如 10-K 或 annual-report；省略或传空数组表示不过滤。",
             "items": {"type": "string"},
         },
         "rebuild_processed": {
             "type": "boolean",
-            "description": "Whether existing processed outputs may be rebuilt instead of skipped.",
+            "description": "是否允许重新处理已经处理过的文档；为 false 时会跳过已有处理结果。",
             "default": False,
         },
     }

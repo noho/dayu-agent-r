@@ -43,6 +43,12 @@ from dayu.host.durable.schema import (
 )
 from dayu.host.durable.tool_trace import read_tool_trace_hot_row
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.evidence import (
+    AcceptedEvidenceEnvelope,
+    AcceptedEvidenceResultRef,
+    AcceptedEvidenceToolQuery,
+    accepted_evidence_envelope_to_json_value,
+)
 from dayu.host.open_host import _default_tool_trace_cold_jsonl_path
 from dayu.host.projection import ProjectionRunner
 from dayu.host.projection import projection_event_view_from_row
@@ -291,18 +297,60 @@ def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> Non
 
     cold_path = tmp_path / "trace" / "cold.jsonl"
     lock_path = tmp_path / "locks" / "tool-trace-cold.jsonl.lock"
+    request_event_id = "event-requested"
+    result_event_id = "event-result"
+    arguments_json: Mapping[str, JsonValue] = {
+        "arguments": {
+            "ticker": "AAPL",
+            "filing_type": "10-K",
+        }
+    }
+    arguments_digest = sha256_digest_json(arguments_json)
+    semantic_query_text = '工具 lookup_filing 请求参数：{"ticker":"AAPL","filing_type":"10-K"}'
+    semantic_query_digest = sha256_digest_json(
+        {"semantic_query_text": semantic_query_text}
+    )
+    outcome_digest = sha256_digest_json({"result": "filing found"})
+    envelope = AcceptedEvidenceEnvelope(
+        evidence_id=f"evidence:{result_event_id}",
+        producer_event_ref=result_event_id,
+        tool_name="lookup_filing",
+        tool_call_id="tool-call-1",
+        tool_query=AcceptedEvidenceToolQuery(
+            tool_call_requested_event_ref=request_event_id,
+            normalized_arguments_digest=arguments_digest,
+            semantic_input_digest=semantic_query_digest,
+        ),
+        result_ref=AcceptedEvidenceResultRef(
+            payload_ref=None,
+            payload_digest=None,
+            outcome_digest=outcome_digest,
+            truncation_applied=False,
+        ),
+        source_refs=(),
+        locator_refs=(),
+    )
     with open_host_durable_store(_options(tmp_path)) as store:
         requested = _append_tool_event(
             store.transaction_runner,
-            event_id="event-requested",
+            event_id=request_event_id,
             event_type="TOOL_CALL_REQUESTED",
             payload={
                 "tool_call_id": "tool-call-1",
                 "tool_name": "lookup_filing",
                 "tool_schema_digest": "sha256:schema",
                 "tool_identity_digest": "sha256:identity",
-                "normalized_arguments_digest": "sha256:args",
-                "semantic_input_digest": "sha256:semantic",
+                "normalized_arguments_digest": arguments_digest,
+                "arguments_json_size_bytes": 48,
+                "arguments_storage_kind": "inline_json",
+                "arguments_inline_json": arguments_json,
+                "arguments_payload_ref": None,
+                "arguments_payload_digest": arguments_digest,
+                "semantic_input_digest": semantic_query_digest,
+                "semantic_query_storage_kind": "inline_text",
+                "semantic_query_text": semantic_query_text,
+                "semantic_query_payload_ref": None,
+                "semantic_query_digest": semantic_query_digest,
             },
         )
         governed = _append_tool_event(
@@ -326,14 +374,14 @@ def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> Non
         )
         result = _append_tool_event(
             store.transaction_runner,
-            event_id="event-result",
+            event_id=result_event_id,
             event_type="TOOL_RESULT_ACCEPTED",
             payload={
                 "tool_call_id": "tool-call-1",
                 "tool_name": "lookup_filing",
-                "normalized_arguments_digest": "sha256:args",
-                "semantic_input_digest": "sha256:semantic",
-                "outcome_digest": "sha256:outcome",
+                "normalized_arguments_digest": arguments_digest,
+                "semantic_input_digest": semantic_query_digest,
+                "outcome_digest": outcome_digest,
                 "payload_ref": {
                     "payload_ref": "artifact://tool-result",
                     "payload_digest": (
@@ -346,6 +394,23 @@ def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> Non
                     "operation_name": "analyze_filing",
                     "business_domain": "financial_report",
                     "business_object_id": "AAPL-10K-2025",
+                },
+                "accepted_evidence_envelope": (
+                    accepted_evidence_envelope_to_json_value(envelope)
+                ),
+                "raw_tool_outcome": {
+                    "kind": "completed",
+                    "result": {
+                        "ok": True,
+                        "value": {
+                            "details": [
+                                {"label": "ticker", "value": "AAPL"},
+                                {"label": "filing", "value": "10-K"},
+                                {"label": "status", "value": "found"},
+                            ],
+                            "document_id": "aapl-10k-2025",
+                        },
+                    },
                 },
                 "raw_result": {
                     "unbounded_text": "raw payload must stay in EventLog only"
@@ -377,8 +442,12 @@ def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> Non
         assert requested_row is not None
         assert requested_row.tool_call_id == "tool-call-1"
         assert requested_row.tool_name == "lookup_filing"
-        assert requested_row.normalized_arguments_digest == "sha256:args"
-        assert requested_row.semantic_input_digest == "sha256:semantic"
+        assert requested_row.normalized_arguments_digest == arguments_digest
+        assert requested_row.semantic_input_digest == semantic_query_digest
+        requested_summary = requested_row.trace_summary["tool_request"]
+        assert isinstance(requested_summary, Mapping)
+        assert requested_summary["query_text"] == semantic_query_text
+        assert "ticker=AAPL" in str(requested_summary["arguments_summary_text"])
         assert governed_row is not None
         assert governed_row.diagnostic_ref == "diag-duplicate"
         assert governed_row.trace_summary["duplicate_decision"] == "reuse"
@@ -387,8 +456,17 @@ def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> Non
             "attempt_id": "attempt-trace",
         }
         assert result_row is not None
-        assert result_row.result_digest == "sha256:outcome"
+        assert result_row.result_digest == outcome_digest
         assert result_row.diagnostic_ref == "diag-result"
+        result_request = result_row.trace_summary["tool_request"]
+        result_summary = result_row.trace_summary["tool_result"]
+        assert isinstance(result_request, Mapping)
+        assert isinstance(result_summary, Mapping)
+        assert "ticker=AAPL" in str(result_request["arguments_summary_text"])
+        assert result_summary["result_status"] == "completed"
+        assert "ticker=AAPL" in str(result_summary["result_details"])
+        assert "filing=10-K" in str(result_summary["result_details"])
+        assert "ticker=AAPL" in str(result_summary["result_summary_text"])
         assert checkpoint is not None
         assert checkpoint.checkpoint_event_sequence == result.event_sequence
         assert lock_path.exists()
@@ -425,6 +503,140 @@ def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> Non
             "kind": "attempt",
             "attempt_id": "attempt-trace",
         }
+
+
+def test_wait_resolution_tool_trace_summarizes_request_and_result_details(
+    tmp_path: Path,
+) -> None:
+    """wait-resolution tool trace 应自解释工具请求与结果 details。"""
+
+    cold_path = tmp_path / "trace" / "wait-resolution.jsonl"
+    arguments_json: Mapping[str, JsonValue] = {
+        "arguments": {
+            "ticker": "ATAT",
+            "source": "auto",
+            "api_token": "<redacted>",
+        }
+    }
+    arguments_digest = sha256_digest_json(arguments_json)
+    semantic_query_text = '工具 start_fins_download 请求参数：{"ticker":"ATAT","source":"auto"}'
+    semantic_query_digest = sha256_digest_json(
+        {"semantic_query_text": semantic_query_text}
+    )
+    result_event_id = "event-tool-result-wait-resolution-atat"
+    request_event_id = "event-tool-call-requested-atat"
+    envelope = AcceptedEvidenceEnvelope(
+        evidence_id=f"evidence:{result_event_id}",
+        producer_event_ref=result_event_id,
+        tool_name="start_fins_download",
+        tool_call_id="tool-call-atat",
+        tool_query=AcceptedEvidenceToolQuery(
+            tool_call_requested_event_ref=request_event_id,
+            normalized_arguments_digest=arguments_digest,
+            semantic_input_digest=semantic_query_digest,
+        ),
+        result_ref=AcceptedEvidenceResultRef(
+            payload_ref=None,
+            payload_digest=None,
+            outcome_digest=sha256_digest_json({"result": "atat"}),
+            truncation_applied=False,
+        ),
+        source_refs=(),
+        locator_refs=(),
+    )
+    raw_outcome: JsonValue = {
+        "kind": "completed",
+        "result": {
+            "ok": True,
+            "value": {
+                "details": [
+                    {"label": "discovered", "value": "27"},
+                    {"label": "downloaded", "value": "12"},
+                    {"label": "skipped", "value": "0"},
+                    {"label": "rejected", "value": "15"},
+                    {"label": "failed", "value": "0"},
+                    {"label": "written documents", "value": "12"},
+                ],
+                "written": 12,
+            },
+        },
+    }
+    with open_host_durable_store(_options(tmp_path)) as store:
+        _append_tool_event(
+            store.transaction_runner,
+            event_id=request_event_id,
+            event_type="TOOL_CALL_REQUESTED",
+            payload={
+                "tool_call_id": "tool-call-atat",
+                "tool_name": "start_fins_download",
+                "tool_schema_digest": "sha256:schema",
+                "tool_identity_digest": "sha256:identity",
+                "normalized_arguments_digest": arguments_digest,
+                "arguments_json_size_bytes": 72,
+                "arguments_storage_kind": "inline_json",
+                "arguments_inline_json": arguments_json,
+                "arguments_payload_ref": None,
+                "arguments_payload_digest": arguments_digest,
+                "semantic_input_digest": semantic_query_digest,
+                "semantic_query_storage_kind": "inline_text",
+                "semantic_query_text": semantic_query_text,
+                "semantic_query_payload_ref": None,
+                "semantic_query_digest": semantic_query_digest,
+            },
+        )
+        _append_tool_event(
+            store.transaction_runner,
+            event_id=result_event_id,
+            event_type="TOOL_RESULT_ACCEPTED",
+            payload={
+                "wait_id": "wait-atat-should-not-project",
+                "tool_call_id": "tool-call-atat",
+                "tool_name": "start_fins_download",
+                "normalized_arguments_digest": arguments_digest,
+                "semantic_input_digest": semantic_query_digest,
+                "resolution_kind": "completed",
+                "tool_fact_kind": "completed",
+                "outcome_digest": sha256_digest_json({"result": "atat"}),
+                "accepted_evidence_envelope": (
+                    accepted_evidence_envelope_to_json_value(envelope)
+                ),
+                "raw_tool_outcome": raw_outcome,
+            },
+        )
+
+        _run_trace_once(store.transaction_runner, cold_path)
+        request_row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(transaction, request_event_id)
+        )
+        result_row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(transaction, result_event_id)
+        )
+        cold_lines = _json_lines(cold_path)
+
+        assert request_row is not None
+        request_summary = request_row.trace_summary["tool_request"]
+        assert isinstance(request_summary, Mapping)
+        assert request_summary["tool_name"] == "start_fins_download"
+        assert request_summary["query_text"] == semantic_query_text
+        assert "ticker=ATAT" in str(request_summary["arguments_summary_text"])
+        assert "<redacted>" in json.dumps(request_summary, ensure_ascii=False)
+        assert result_row is not None
+        result_request = result_row.trace_summary["tool_request"]
+        result_summary = result_row.trace_summary["tool_result"]
+        assert isinstance(result_request, Mapping)
+        assert isinstance(result_summary, Mapping)
+        assert result_request["tool_name"] == "start_fins_download"
+        assert "ticker=ATAT" in str(result_request["arguments_summary_text"])
+        assert result_summary["result_status"] == "completed"
+        assert "discovered=27" in str(result_summary["result_details"])
+        assert "downloaded=12" in str(result_summary["result_details"])
+        assert "downloaded=12" in str(result_summary["result_summary_text"])
+        cold_text = json.dumps(cold_lines, ensure_ascii=False, sort_keys=True)
+        assert "ticker=ATAT" in cold_text
+        assert "discovered=27" in cold_text
+        assert "wait-atat-should-not-project" not in cold_text
+        assert "observation handle" not in cold_text
+        assert "runtime" not in cold_text
 
 
 def test_tool_trace_copies_optional_summary_signal_objects(

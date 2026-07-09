@@ -55,7 +55,7 @@ Engine 公共入口由 `dayu.engine.agent` 提供，并通过 `dayu.engine.__ini
 
 若 `EngineEvent stream` 结束但没有产出 terminal event，聚合入口返回 `EngineRunOutcomeFailed(error_code="missing_terminal")`。
 
-包根 `dayu.engine` 同时导出 Engine 专属契约和调用 Engine 必需的 Dayu Agent 公共契约，例如工具 schema、工具执行协议、工具 outcome、JSON 值与取消 token。当前包根也导出 Runner 请求身份与输入观测相关公共契约，包括 `ClientCorrelationPolicy`、`RunnerRequestIdentity`、`build_runner_request_identity`、`RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION` 与 `runner_role_sequence_digest`。`_AsyncAgent` 与 `AsyncOpenAIRunner` 是当前实现类，不属于包根稳定导出；调用方依赖函数式入口与 contracts。
+包根 `dayu.engine` 同时导出 Engine 专属契约和调用 Engine 必需的 Dayu Agent 公共契约，例如工具 schema、工具执行协议、工具 outcome、JSON 值与取消 token。当前包根也导出 Runner 请求身份与输入观测相关公共契约，包括 `ClientCorrelationPolicy`、`RunnerRequestIdentity`、`build_runner_request_identity`、`RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION`、`RunnerInputMessageProjection`、`RunnerInputToolCallProjection` 与 `runner_role_sequence_digest`。`_AsyncAgent` 与 `AsyncOpenAIRunner` 是当前实现类，不属于包根稳定导出；调用方依赖函数式入口与 contracts。
 
 ## 3. Run-Scoped 生命周期
 
@@ -326,7 +326,7 @@ Host / ToolRuntime 可以用 `@tool(...)` 在工具现场同源声明 `ToolSchem
 - `ToolAwaitingOutcome(await_spec: ToolAwaitSpec, snapshot: ToolAwaitSnapshot | None)`
 - `ToolCancelledOutcome(reason, message, hint, meta)`
 
-completed / failed / cancelled outcome 会进入 `tool_result_accepted`。无 awaiting 的 batch 会被投影为 LLM-facing tool messages。awaiting outcome 不进入普通工具结果信封，而是触发挂起流程。
+completed / failed / cancelled outcome 会进入 `tool_result_accepted`。无 awaiting 的 batch 会被投影为 LLM-facing tool messages。awaiting outcome 不进入普通工具结果信封，而是触发挂起流程。进入模型上下文的工具 schema 与 prompt 只能描述业务请求、输入、输出和等待工具结果返回的行为，不得要求模型执行 polling、解析 Host wait id、observation handle、runtime 状态或其它等待治理标识。
 
 工具结果信封只表达 completed / failed：
 
@@ -384,7 +384,7 @@ Outbound roundtrip 分两条独立通道：
 
 awaiting 路径不产出 `tool_calls_batch_done`。`tool_calls_batch_done` 只表示本批不含 awaiting，completed / failed / cancelled outcome 已全部接受，可进入下一轮 Runner。
 
-Engine 不等待外部长事务完成，不轮询 job，不持久化 wait record，不保留可恢复的 in-memory Agent 或 Runner。恢复不是恢复旧 Engine 实例；调用方在外部长事务结束后构造新的 `AgentRunRequest`，把同一 assistant tool-call 批次、已接受工具事实、工具终态结果或恢复输入显式放入新 run 的 `messages`。
+Engine 不等待外部长事务完成，不轮询 job，不持久化 wait record，不保留可恢复的 in-memory Agent 或 Runner。恢复不是恢复旧 Engine 实例；调用方在外部长事务结束后构造新的 `AgentRunRequest`，把同一 assistant tool-call 批次、已接受工具事实、工具终态结果或恢复输入显式放入新 run 的 `messages`。这些恢复输入必须是 LLM-facing 的业务可读消息，例如原工具请求和工具结果摘要；不能要求模型理解 wait record、poll adapter、external job lifecycle、observation handle 或 Host/ToolRuntime 治理术语。
 
 `run_agent_messages` 调用方需要消费并保存 `tool_awaiting` / `run_suspended` 中的恢复事实。`run_agent_and_wait` 调用方通过 `EngineRunOutcomeSuspended` 获取同一组结构化事实。
 
@@ -469,7 +469,7 @@ Terminal event 类型固定为：
 
 `tool_call_requested` 是观测事件，不是外部二次执行命令。工具执行由 Agent 状态机在事件之后继续调用 `ToolExecutor.execute` 完成。
 
-`iteration_started` 携带 Engine 对本次真实 Runner 输入的直接观察：`message_count`、按实际 message role 顺序计算的 `role_sequence_digest`，以及 `runner_input_serializer_schema_version`。这些字段只描述 Engine 可见输入形态，不包含 Host-owned runner call index、manifest ref、source refs、memory / compact refs、tool schema refs 或 provider raw request。
+`iteration_started` 携带 Engine 对本次真实 Runner 输入的直接观察：`message_count`、按实际 message role 顺序计算的 `role_sequence_digest`、`runner_input_serializer_schema_version`，以及 `input_projection`。`input_projection` 是按实际 Runner 输入顺序排列的中性 LLM-facing message projection，包含 message `index`、`role`、`content` / tool call id、assistant tool call 名称和参数；它不包含 Host-owned runner call index、manifest ref、source refs、memory / compact refs、tool schema refs、provider headers、Authorization/API key 或 provider raw request/response。
 
 工具事件分层如下：
 

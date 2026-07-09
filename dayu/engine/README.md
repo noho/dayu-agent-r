@@ -450,7 +450,7 @@ Runner 的 `runner_done` 只表示本次 RunnerEvent stream 结束；提升到 E
 - `tool_calls_batch_done`：本批不含 awaiting 时，accepted outcome 已全部接受，可进入下一轮 Runner。
 - `tool_awaiting` + `run_suspended`：本批包含 awaiting outcome 时的挂起路径；该路径不产出 `tool_calls_batch_done`。
 
-`iteration_started` 携带 Engine 对本次真实 Runner 输入的直接观察：`message_count`、按实际 message role 顺序计算的 `role_sequence_digest`，以及 `runner_input_serializer_schema_version`。这些字段只描述 Engine 可见输入形态，不包含 Host-owned runner call index、manifest ref、source refs、memory / compact refs、tool schema refs 或 provider raw request。
+`iteration_started` 携带 Engine 对本次真实 Runner 输入的直接观察：`message_count`、按实际 message role 顺序计算的 `role_sequence_digest`、`runner_input_serializer_schema_version`，以及 `input_projection`。`input_projection` 是按实际 Runner 输入顺序排列的中性 LLM-facing message projection，包含 message `index`、`role`、`content` / tool call id、assistant tool call 名称和参数；它不包含 Host-owned runner call index、manifest ref、source refs、memory / compact refs、tool schema refs、provider headers、Authorization/API key 或 provider raw request/response。
 
 ## 关键机制
 

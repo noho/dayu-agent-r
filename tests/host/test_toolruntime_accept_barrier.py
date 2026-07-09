@@ -200,6 +200,11 @@ def test_tool_result_accepted_payload_carries_accepted_evidence_envelope(
         assert len(result_rows) == 1
         payload = payload_object(result_rows[0])
         envelope_json = payload["accepted_evidence_envelope"]
+        envelope_mapping = cast(Mapping[str, JsonValue], envelope_json)
+        tool_query_mapping = cast(
+            Mapping[str, JsonValue],
+            envelope_mapping["tool_query"],
+        )
         envelope = accepted_evidence_envelope_from_json_value(envelope_json)
         assert envelope.evidence_id == (
             f"evidence:{result.tool_result_event_ref.event_id}"
@@ -216,6 +221,7 @@ def test_tool_result_accepted_payload_carries_accepted_evidence_envelope(
         assert envelope.tool_query.semantic_input_digest == (
             candidate.idempotency.semantic_input_digest
         )
+        assert "query_text" not in tool_query_mapping
         candidate_result = _required_result(candidate)
         assert envelope.result_ref.payload_ref is None
         assert envelope.result_ref.payload_digest == candidate_result.payload_digest

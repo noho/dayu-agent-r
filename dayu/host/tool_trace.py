@@ -34,6 +34,8 @@ from dayu.host.durable.tool_trace import (
     insert_tool_trace_hot_row_if_absent,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.evidence import accepted_evidence_envelope_from_payload
+from dayu.host.payload_resolution import event_payload_object
 from dayu.host.projection import (
     ProjectionApplyResult,
     ProjectionApplyStatus,
@@ -66,7 +68,9 @@ from dayu.host.tool_trace_signals import (
     TOOL_TIMING_STATUS_MISSING_META as _TOOL_TIMING_STATUS_MISSING_META,
     TRACE_SIGNAL_BOUNDED_TEXT_MAX_CHARS as _TRACE_SIGNAL_BOUNDED_TEXT_MAX_CHARS,
 )
+from dayu.runtime.diagnostic_text import truncate_diagnostic_text
 from dayu.runtime.filelock import file_lock
+from dayu.runtime.json_redaction import redact_sensitive_json_fields
 
 TOOL_TRACE_CONSUMER_ID = ProjectionConsumerId("host.tool-trace")
 """Tool Trace projection consumer id。"""
@@ -151,6 +155,8 @@ _FIELD_RUN_ID = "run_id"
 _FIELD_OPERATION_CONTEXT_REFS = "operation_context_refs"
 _FIELD_OPERATION_CONTEXT_DIGEST = "operation_context_digest"
 _FIELD_TRACE_SUMMARY = "trace_summary"
+_FIELD_TOOL_REQUEST = "tool_request"
+_FIELD_TOOL_RESULT = "tool_result"
 _FIELD_SOURCE_PAYLOAD_REF = "source_payload_ref"
 _FIELD_SOURCE_PAYLOAD_DIGEST = "source_payload_digest"
 _FIELD_RUNNER_CALL_INDEX = "runner_call_index"
@@ -161,6 +167,11 @@ _FIELD_MANIFEST_DIGEST = "manifest_digest"
 _FIELD_MESSAGE_COUNT = "message_count"
 _FIELD_ROLE_SEQUENCE_DIGEST = "role_sequence_digest"
 _FIELD_INPUT_PROJECTION_DIGEST = "input_projection_digest"
+_FIELD_RUNNER_CALL_PROJECTION_REF = "runner_call_projection_artifact_ref"
+_FIELD_RUNNER_CALL_PROJECTION_DIGEST = "runner_call_projection_artifact_digest"
+_FIELD_RUNNER_CALL_PROJECTION_SIZE_BYTES = (
+    "runner_call_projection_artifact_size_bytes"
+)
 _FIELD_PROJECTOR_METADATA_SUMMARY = "projector_metadata_summary"
 _FIELD_VALIDATION_STATUS = "validation_status"
 _FIELD_DIAGNOSTIC = "diagnostic"
@@ -220,6 +231,11 @@ _DIAGNOSTIC_EVENT_TYPES: tuple[str, ...] = (
 _PROJECTION_SIGNAL_EVENT_TYPES: tuple[str, ...] = (_EVENT_TYPE_USAGE_REPORTED,)
 _JSONL_LINE_SEPARATOR = "\n"
 _LOCK_TIMEOUT_SECONDS = 5.0
+_TOOL_TRACE_READABLE_SCHEMA_VERSION = 1
+_TOOL_TRACE_SUMMARY_TEXT_MAX_CHARS = 1200
+_TOOL_TRACE_ARGUMENTS_TEXT_MAX_CHARS = 800
+_TOOL_TRACE_RESULT_TEXT_MAX_CHARS = 1600
+_TRUNCATED_SUFFIX = "...[truncated]"
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,12 +320,16 @@ class _TraceSummarySignals:
     :param tool_timing: 可选工具耗时 signal JSON object。
     :param failure_metadata: 可选失败元数据 signal JSON object。
     :param partial_tool_call_signal: 可选 partial tool-call signal JSON object。
+    :param tool_request: 可选工具业务请求摘要。
+    :param tool_result: 可选工具结果摘要。
     """
 
     context_pressure: Mapping[str, JsonValue] | None = None
     tool_timing: Mapping[str, JsonValue] | None = None
     failure_metadata: Mapping[str, JsonValue] | None = None
     partial_tool_call_signal: Mapping[str, JsonValue] | None = None
+    tool_request: Mapping[str, JsonValue] | None = None
+    tool_result: Mapping[str, JsonValue] | None = None
 
     def present_items(self) -> tuple[tuple[str, Mapping[str, JsonValue]], ...]:
         """返回非空 signal 字段和值。
@@ -329,6 +349,10 @@ class _TraceSummarySignals:
             items.append(
                 (_FIELD_PARTIAL_TOOL_CALL_SIGNAL, self.partial_tool_call_signal)
             )
+        if self.tool_request is not None:
+            items.append((_FIELD_TOOL_REQUEST, self.tool_request))
+        if self.tool_result is not None:
+            items.append((_FIELD_TOOL_RESULT, self.tool_result))
         return tuple(items)
 
 
@@ -699,6 +723,15 @@ def _runner_call_trace_summary(event: ProjectionEventView) -> Mapping[str, JsonV
         ),
         _FIELD_INPUT_PROJECTION_DIGEST: _optional_text(
             payload, _FIELD_INPUT_PROJECTION_DIGEST
+        ),
+        _FIELD_RUNNER_CALL_PROJECTION_REF: _optional_text(
+            payload, _FIELD_RUNNER_CALL_PROJECTION_REF
+        ),
+        _FIELD_RUNNER_CALL_PROJECTION_DIGEST: _optional_text(
+            payload, _FIELD_RUNNER_CALL_PROJECTION_DIGEST
+        ),
+        _FIELD_RUNNER_CALL_PROJECTION_SIZE_BYTES: _optional_int(
+            payload, _FIELD_RUNNER_CALL_PROJECTION_SIZE_BYTES
         ),
         _FIELD_PROJECTOR_METADATA_SUMMARY: list(
             _runner_call_projector_metadata_summary(payload)
@@ -1223,7 +1256,240 @@ def _canonical_trace_summary_signals(
             ),
             partial_tool_call_signal=copied.partial_tool_call_signal,
         )
+    if event.event_type == _EVENT_TYPE_TOOL_CALL_REQUESTED:
+        return _TraceSummarySignals(
+            context_pressure=copied.context_pressure,
+            tool_timing=copied.tool_timing,
+            failure_metadata=copied.failure_metadata,
+            partial_tool_call_signal=copied.partial_tool_call_signal,
+            tool_request=_tool_request_summary_from_payload(payload),
+        )
+    if event.event_type == _EVENT_TYPE_TOOL_RESULT_ACCEPTED:
+        return _TraceSummarySignals(
+            context_pressure=copied.context_pressure,
+            tool_timing=copied.tool_timing,
+            failure_metadata=copied.failure_metadata,
+            partial_tool_call_signal=copied.partial_tool_call_signal,
+            tool_request=_tool_request_summary_from_tool_result(
+                transaction,
+                event,
+                payload,
+            ),
+            tool_result=_tool_result_summary_from_payload(payload),
+        )
     return copied
+
+
+def _tool_request_summary_from_tool_result(
+    transaction: HostTransaction,
+    event: ProjectionEventView,
+    payload: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    """从 accepted result envelope 回读工具业务请求摘要。
+
+    :param transaction: 当前 Host transaction。
+    :param event: 当前 ``TOOL_RESULT_ACCEPTED`` projection event。
+    :param payload: 当前 result payload。
+    :returns: request atom 可读时返回同源摘要；缺失时返回有限摘要。
+    :raises HostDurableError: envelope 结构损坏时抛出。
+    """
+
+    try:
+        envelope = accepted_evidence_envelope_from_payload(
+            payload,
+            producer_event_ref=event.event_id,
+        )
+    except ValueError as exc:
+        raise HostDurableError("tool trace accepted evidence envelope is invalid") from exc
+    if envelope is None or envelope.tool_query.tool_call_requested_event_ref is None:
+        return _tool_request_limited_summary(
+            payload,
+            reason="request_atom_unavailable",
+        )
+    request_row = read_event_by_id(
+        transaction,
+        envelope.tool_query.tool_call_requested_event_ref,
+    )
+    if request_row is None or request_row.event_type != _EVENT_TYPE_TOOL_CALL_REQUESTED:
+        return _tool_request_limited_summary(
+            payload,
+            reason="request_atom_unavailable",
+        )
+    request_payload = event_payload_object(
+        transaction,
+        request_row,
+        payload_label=_EVENT_TYPE_TOOL_CALL_REQUESTED,
+    )
+    summary = _tool_request_summary_from_payload(request_payload)
+    if (
+        _optional_text(request_payload, _FIELD_TOOL_CALL_ID) != envelope.tool_call_id
+        or _optional_text(request_payload, _FIELD_TOOL_NAME) != envelope.tool_name
+        or _optional_text(request_payload, _FIELD_NORMALIZED_ARGUMENTS_DIGEST)
+        != envelope.tool_query.normalized_arguments_digest
+    ):
+        return _tool_request_limited_summary(
+            payload,
+            reason="request_atom_identity_mismatch",
+        )
+    return summary
+
+
+def _tool_request_limited_summary(
+    payload: Mapping[str, JsonValue], *, reason: str
+) -> Mapping[str, JsonValue]:
+    """构造缺少 request atom 时的有限工具请求摘要。
+
+    :param payload: 当前 result payload。
+    :param reason: 有限摘要原因。
+    :returns: 不含治理细节的 request summary。
+    """
+
+    tool_name = _optional_text(payload, _FIELD_TOOL_NAME)
+    tool_call_id = _optional_text(payload, _FIELD_TOOL_CALL_ID)
+    return {
+        _FIELD_SCHEMA_VERSION: _TOOL_TRACE_READABLE_SCHEMA_VERSION,
+        "status": "limited_signal",
+        "reason": reason,
+        _FIELD_TOOL_NAME: tool_name,
+        _FIELD_TOOL_CALL_ID: tool_call_id,
+        "summary_text": _bounded_text(
+            _join_summary_parts(
+                (
+                    f"tool={tool_name}" if tool_name is not None else None,
+                    "request details unavailable in tool trace",
+                )
+            ),
+            max_chars=_TOOL_TRACE_SUMMARY_TEXT_MAX_CHARS,
+        ),
+        "query_text": None,
+        "arguments_summary_text": None,
+        "arguments": None,
+        _FIELD_NORMALIZED_ARGUMENTS_DIGEST: _optional_text(
+            payload, _FIELD_NORMALIZED_ARGUMENTS_DIGEST
+        ),
+        "arguments_payload_ref": None,
+        "arguments_payload_digest": None,
+    }
+
+
+def _tool_request_summary_from_payload(
+    payload: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    """从 ``TOOL_CALL_REQUESTED`` payload 构造业务可读请求摘要。
+
+    :param payload: request atom payload。
+    :returns: LLM-safe request summary。
+    :raises HostDurableError: 已命名字段类型非法时抛出。
+    """
+
+    tool_name = _optional_text(payload, _FIELD_TOOL_NAME)
+    tool_call_id = _optional_text(payload, _FIELD_TOOL_CALL_ID)
+    arguments_json = _inline_arguments_json(payload)
+    arguments = _arguments_object(arguments_json)
+    redacted_arguments = _redacted_json(arguments) if arguments is not None else None
+    arguments_text = (
+        _bounded_json_text(redacted_arguments, max_chars=_TOOL_TRACE_ARGUMENTS_TEXT_MAX_CHARS)
+        if redacted_arguments is not None
+        else None
+    )
+    arguments_summary_text = (
+        _arguments_summary_text(redacted_arguments)
+        if redacted_arguments is not None
+        else _descriptor_arguments_summary(payload)
+    )
+    query_text = _optional_text(payload, "semantic_query_text")
+    summary_text = _join_summary_parts(
+        (
+            f"tool={tool_name}" if tool_name is not None else None,
+            query_text,
+            arguments_summary_text,
+        )
+    )
+    return {
+        _FIELD_SCHEMA_VERSION: _TOOL_TRACE_READABLE_SCHEMA_VERSION,
+        "status": "available",
+        _FIELD_TOOL_NAME: tool_name,
+        _FIELD_TOOL_CALL_ID: tool_call_id,
+        "summary_text": _bounded_text(
+            summary_text,
+            max_chars=_TOOL_TRACE_SUMMARY_TEXT_MAX_CHARS,
+        ),
+        "query_text": _bounded_optional_text(
+            query_text,
+            max_chars=_TOOL_TRACE_SUMMARY_TEXT_MAX_CHARS,
+        ),
+        "arguments_summary_text": arguments_summary_text,
+        "arguments": (
+            redacted_arguments
+            if arguments_text is not None
+            and not arguments_text.endswith(_TRUNCATED_SUFFIX)
+            else None
+        ),
+        "arguments_text": arguments_text,
+        "arguments_storage_kind": _optional_text(payload, "arguments_storage_kind"),
+        _FIELD_NORMALIZED_ARGUMENTS_DIGEST: _optional_text(
+            payload, _FIELD_NORMALIZED_ARGUMENTS_DIGEST
+        ),
+        "arguments_payload_ref": _optional_text(payload, "arguments_payload_ref"),
+        "arguments_payload_digest": _optional_text(payload, "arguments_payload_digest"),
+        "semantic_query_digest": _optional_text(payload, "semantic_query_digest"),
+    }
+
+
+def _tool_result_summary_from_payload(
+    payload: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    """从 accepted result payload 构造业务可读结果摘要。
+
+    :param payload: ``TOOL_RESULT_ACCEPTED`` payload。
+    :returns: bounded result summary。
+    :raises HostDurableError: 已命名字段类型非法时抛出。
+    """
+
+    raw_outcome = payload.get("raw_tool_outcome")
+    result_status = _tool_result_status(payload, raw_outcome)
+    if raw_outcome is None:
+        return {
+            _FIELD_SCHEMA_VERSION: _TOOL_TRACE_READABLE_SCHEMA_VERSION,
+            "status": "limited_signal",
+            "reason": "raw_tool_outcome_unavailable",
+            "result_status": result_status,
+            "result_summary_text": "tool result details unavailable in tool trace",
+            "result_details": None,
+            "result_text": None,
+            "raw_outcome_digest": None,
+            _FIELD_OUTCOME_DIGEST: _optional_text(payload, _FIELD_OUTCOME_DIGEST),
+            _FIELD_PAYLOAD_REF: _payload_ref_from_payload(payload),
+            _FIELD_PAYLOAD_DIGEST: _payload_digest_from_payload(payload),
+        }
+    redacted = _redacted_json(raw_outcome)
+    details = _result_details_text(redacted)
+    result_text = _bounded_json_text(redacted, max_chars=_TOOL_TRACE_RESULT_TEXT_MAX_CHARS)
+    summary_text = _join_summary_parts(
+        (
+            f"status={result_status}" if result_status is not None else None,
+            details,
+        )
+    )
+    return {
+        _FIELD_SCHEMA_VERSION: _TOOL_TRACE_READABLE_SCHEMA_VERSION,
+        "status": "available",
+        "result_status": result_status,
+        "result_summary_text": _bounded_text(
+            summary_text,
+            max_chars=_TOOL_TRACE_SUMMARY_TEXT_MAX_CHARS,
+        ),
+        "result_details": _bounded_optional_text(
+            details,
+            max_chars=_TOOL_TRACE_SUMMARY_TEXT_MAX_CHARS,
+        ),
+        "result_text": result_text,
+        "result_truncated": result_text.endswith(_TRUNCATED_SUFFIX),
+        "raw_outcome_digest": sha256_digest_json(redacted),
+        _FIELD_OUTCOME_DIGEST: _optional_text(payload, _FIELD_OUTCOME_DIGEST),
+        _FIELD_PAYLOAD_REF: _payload_ref_from_payload(payload),
+        _FIELD_PAYLOAD_DIGEST: _payload_digest_from_payload(payload),
+    }
 
 
 def _context_compaction_failed_pressure(
@@ -1651,6 +1917,250 @@ def _is_bare_sha256_hex(value: str) -> bool:
     if len(value) != _PARTIAL_ARGUMENTS_SHA256_HEX_LENGTH:
         return False
     return all(character in _LOWER_HEX_CHARS for character in value)
+
+
+def _inline_arguments_json(
+    payload: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue] | None:
+    """读取 inline tool call arguments JSON。
+
+    :param payload: ``TOOL_CALL_REQUESTED`` payload。
+    :returns: inline arguments JSON object；非 inline 时返回 ``None``。
+    :raises HostDurableError: inline 字段存在但不是 object 时抛出。
+    """
+
+    value = payload.get("arguments_inline_json")
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise HostDurableError("tool trace arguments_inline_json must be object")
+    return cast(Mapping[str, JsonValue], value)
+
+
+def _arguments_object(
+    arguments_json: Mapping[str, JsonValue] | None,
+) -> Mapping[str, JsonValue] | None:
+    """从 arguments JSON 中读取实际工具参数 object。
+
+    :param arguments_json: request atom 中的 arguments JSON。
+    :returns: 参数 object；缺失时返回 ``None``。
+    :raises HostDurableError: ``arguments`` 字段存在但不是 object 时抛出。
+    """
+
+    if arguments_json is None:
+        return None
+    value = arguments_json.get("arguments")
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise HostDurableError("tool trace arguments field must be object")
+    return cast(Mapping[str, JsonValue], value)
+
+
+def _descriptor_arguments_summary(payload: Mapping[str, JsonValue]) -> str | None:
+    """构造 descriptor 参数的有限摘要。
+
+    :param payload: request atom payload。
+    :returns: 有限摘要或 ``None``。
+    """
+
+    payload_ref = _optional_text(payload, "arguments_payload_ref")
+    digest = _optional_text(payload, "arguments_payload_digest")
+    if payload_ref is None and digest is None:
+        return None
+    return _join_summary_parts(
+        (
+            "arguments stored in payload descriptor",
+            f"arguments_payload_ref={payload_ref}" if payload_ref is not None else None,
+            f"arguments_payload_digest={digest}" if digest is not None else None,
+        )
+    )
+
+
+def _arguments_summary_text(arguments: JsonValue) -> str:
+    """把参数 JSON 投影成短的 key=value 摘要。
+
+    :param arguments: 已脱敏参数 JSON。
+    :returns: bounded 参数摘要。
+    """
+
+    if not isinstance(arguments, Mapping):
+        return _bounded_json_text(arguments, max_chars=_TOOL_TRACE_ARGUMENTS_TEXT_MAX_CHARS)
+    parts: list[str] = []
+    for key in sorted(arguments):
+        value = arguments[key]
+        if (
+            isinstance(value, str)
+            or isinstance(value, int)
+            or isinstance(value, float)
+            or isinstance(value, bool)
+            or value is None
+        ):
+            parts.append(f"{key}={value}")
+            continue
+        parts.append(f"{key}={_bounded_json_text(value, max_chars=160)}")
+    return _bounded_text(
+        ", ".join(parts),
+        max_chars=_TOOL_TRACE_ARGUMENTS_TEXT_MAX_CHARS,
+    )
+
+
+def _tool_result_status(
+    payload: Mapping[str, JsonValue], raw_outcome: JsonValue | None
+) -> str | None:
+    """读取工具结果状态。
+
+    :param payload: result payload。
+    :param raw_outcome: raw outcome JSON。
+    :returns: 状态文本或 ``None``。
+    """
+
+    for field_name in ("resolution_kind", "tool_fact_kind"):
+        value = _optional_text(payload, field_name)
+        if value is not None:
+            return value
+    if isinstance(raw_outcome, Mapping):
+        kind = raw_outcome.get("kind")
+        if isinstance(kind, str) and kind.strip() != "":
+            return kind
+        result = raw_outcome.get("result")
+        if isinstance(result, Mapping):
+            ok = result.get("ok")
+            if isinstance(ok, bool):
+                return "completed" if ok else "failed"
+    return None
+
+
+def _result_details_text(value: JsonValue) -> str | None:
+    """从 result JSON 中抽取业务 details / summary 文本。
+
+    :param value: 已脱敏 result JSON。
+    :returns: details 文本；找不到时返回 ``None``。
+    """
+
+    if isinstance(value, Mapping):
+        for key in ("details", "summary", "message", "error"):
+            item = value.get(key)
+            if isinstance(item, str) and item.strip() != "":
+                return item
+            details_text = _structured_details_text(item)
+            if details_text is not None:
+                return details_text
+        for key in ("value", "result", "data"):
+            nested = value.get(key)
+            nested_text = _result_details_text(nested)
+            if nested_text is not None:
+                return nested_text
+    if isinstance(value, list):
+        for item in value:
+            nested_text = _result_details_text(item)
+            if nested_text is not None:
+                return nested_text
+    return None
+
+
+def _structured_details_text(value: JsonValue) -> str | None:
+    """把结构化 details JSON 转成短业务摘要。
+
+    :param value: details / summary 字段值。
+    :returns: 可读摘要文本；没有可读条目时返回 ``None``。
+    """
+
+    if isinstance(value, Mapping):
+        label = value.get("label")
+        detail_value = value.get("value")
+        if isinstance(label, str) and label.strip() != "":
+            return f"{label}={_detail_scalar_text(detail_value)}"
+        return None
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            item_text = _structured_details_text(item)
+            if item_text is not None:
+                parts.append(item_text)
+        if parts:
+            return _bounded_text(
+                ", ".join(parts),
+                max_chars=_TOOL_TRACE_SUMMARY_TEXT_MAX_CHARS,
+            )
+    return None
+
+
+def _detail_scalar_text(value: JsonValue) -> str:
+    """把单个 detail value 格式化为短文本。
+
+    :param value: JSON detail value。
+    :returns: 短文本。
+    """
+
+    if (
+        isinstance(value, str)
+        or isinstance(value, int)
+        or isinstance(value, float)
+        or isinstance(value, bool)
+        or value is None
+    ):
+        return str(value)
+    return _bounded_json_text(value, max_chars=160)
+
+
+def _redacted_json(value: JsonValue) -> JsonValue:
+    """对 JSON 值做敏感字段脱敏。
+
+    :param value: 原始 JSON。
+    :returns: 脱敏 JSON。
+    """
+
+    return redact_sensitive_json_fields(value)
+
+
+def _bounded_json_text(value: JsonValue, *, max_chars: int) -> str:
+    """把 JSON 值序列化为 bounded canonical 文本。
+
+    :param value: JSON 值。
+    :param max_chars: 最大字符数。
+    :returns: bounded JSON 文本。
+    """
+
+    return _bounded_text(canonical_json_dumps(value), max_chars=max_chars)
+
+
+def _bounded_optional_text(value: str | None, *, max_chars: int) -> str | None:
+    """截断可选文本。
+
+    :param value: 可选文本。
+    :param max_chars: 最大字符数。
+    :returns: bounded 文本或 ``None``。
+    """
+
+    if value is None:
+        return None
+    return _bounded_text(value, max_chars=max_chars)
+
+
+def _bounded_text(value: str, *, max_chars: int) -> str:
+    """截断工具 trace 可读文本。
+
+    :param value: 原始文本。
+    :param max_chars: 最大字符数。
+    :returns: bounded 文本。
+    """
+
+    return truncate_diagnostic_text(
+        value,
+        max_chars=max_chars,
+        truncated_suffix=_TRUNCATED_SUFFIX,
+    )
+
+
+def _join_summary_parts(parts: tuple[str | None, ...]) -> str:
+    """拼接非空摘要片段。
+
+    :param parts: 可选摘要片段。
+    :returns: 摘要文本。
+    """
+
+    return "; ".join(part for part in parts if part is not None and part.strip() != "")
 
 
 def _require_failure_source(actual: str, expected: str) -> None:

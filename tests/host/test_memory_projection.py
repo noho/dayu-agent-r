@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Mapping
-from dataclasses import fields, replace
+from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -50,6 +50,9 @@ from dayu.host.durable.projection import read_projection_checkpoint
 from dayu.host.durable.schema import (
     TABLE_HOST_MEMORY_ITEMS,
     TABLE_HOST_MEMORY_SNAPSHOTS,
+    TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
+    TOOL_CALL_SEMANTIC_QUERY_STORAGE_ABSENT,
+    TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction
 from dayu.host.evidence import (
@@ -59,6 +62,7 @@ from dayu.host.evidence import (
     accepted_evidence_envelope_to_json_value,
 )
 from dayu.host.memory import (
+    ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT,
     CONVERSATION_MEMORY_CONSUMER_ID,
     ConversationMemorySnapshotVNext,
     MemoryDiagnosticReason,
@@ -84,6 +88,10 @@ _ATTEMPT_ID = "attempt-1"
 _EXECUTION_ID = "execution-1"
 _NOW = "2026-05-16T00:00:00.000000Z"
 _OCCURRED_AT = datetime(2026, 5, 16, tzinfo=UTC)
+_REQUEST_PAYLOAD_KIND_VALID = "valid"
+_REQUEST_PAYLOAD_KIND_INVALID = "invalid"
+_FAIL_SAFE_QUERY_TEXT = "这个 request query 不应进入 memory"
+_FAIL_SAFE_LIMITED_QUERY_TEXT = ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT
 
 _POLICY_FIELDS = (
     "context_window_size",
@@ -124,6 +132,34 @@ _SNAPSHOT_FIELDS = (
     "built_at",
     "snapshot_digest",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolQueryFailSafeCase:
+    """工具 evidence query fail-safe 分支测试参数。
+
+    :param append_request: 是否写入 request row。
+    :param request_session_id: request row session id。
+    :param request_event_class: request row event class。
+    :param request_event_type: request row event type。
+    :param request_payload_kind: request payload 构造类型。
+    :param request_tool_call_id: request atom 中的 tool call id。
+    :param request_tool_name: request atom 中的工具名。
+    :param envelope_tool_call_id: result envelope 中的 tool call id。
+    :param envelope_tool_name: result envelope 中的工具名。
+    :param envelope_arguments_digest: 可选 result envelope 参数 digest 覆写。
+    """
+
+    append_request: bool = True
+    request_session_id: str = _SESSION_ID
+    request_event_class: EventClass = EventClass.CANONICAL_FACT
+    request_event_type: str = "TOOL_CALL_REQUESTED"
+    request_payload_kind: str = _REQUEST_PAYLOAD_KIND_VALID
+    request_tool_call_id: str = "tool-call-fail-safe-memory"
+    request_tool_name: str = "list_documents"
+    envelope_tool_call_id: str = "tool-call-fail-safe-memory"
+    envelope_tool_name: str = "list_documents"
+    envelope_arguments_digest: str | None = None
 
 
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
@@ -177,6 +213,7 @@ def _event(
     payload: dict[str, JsonValue],
     *,
     run_id: str | None = _RUN_ID,
+    evidence_query_text: str | None = None,
 ) -> MemoryProjectionEvent:
     """构造 memory projection event。
 
@@ -185,6 +222,7 @@ def _event(
     :param event_type: event type。
     :param payload: canonical payload。
     :param run_id: Host Run id。
+    :param evidence_query_text: 可选 LLM-safe 工具 request / query 文本。
     :returns: memory projection event。
     """
 
@@ -201,7 +239,31 @@ def _event(
         payload_ref=None,
         payload_digest=None,
         payload=payload,
+        evidence_query_text=evidence_query_text,
     )
+
+
+def _llm_facing_memory_text_view(
+    snapshot: ConversationMemorySnapshotVNext,
+) -> tuple[
+    tuple[tuple[SelectedRecentWindowRole, str], ...],
+    tuple[tuple[SelectedRecentWindowRole, str], ...],
+]:
+    """提取 LLM-facing memory 的稳定 role/text 等价视图。
+
+    :param snapshot: conversation memory snapshot。
+    :returns: selected recent window 与 recent evidence 的 role/text 视图。
+    """
+
+    selected = tuple(
+        (item.role, item.text)
+        for item in snapshot.trace_memory.selected_recent_window
+    )
+    recent_evidence = tuple(
+        (item.role, item.text)
+        for item in snapshot.evidence_fact_memory.recent_evidence_items
+    )
+    return selected, recent_evidence
 
 
 def _accepted_compact_payload(
@@ -252,6 +314,292 @@ def _accepted_compact_payload(
         "accepted_evidence_mapping_refs": ["event:tool-1"],
         "compact_artifact_ref": "artifact:compact-1",
     }
+
+
+def _tool_call_requested_payload(
+    *,
+    tool_call_id: str,
+    tool_name: str,
+    arguments_json: Mapping[str, JsonValue],
+    semantic_input_digest: str,
+    semantic_query_text: str | None,
+) -> dict[str, JsonValue]:
+    """构造最小合法 ``TOOL_CALL_REQUESTED`` payload。
+
+    :param tool_call_id: 工具调用 id。
+    :param tool_name: 工具名。
+    :param arguments_json: accepted arguments canonical JSON。
+    :param semantic_input_digest: Host accept semantic input digest。
+    :param semantic_query_text: 可选业务可读 semantic query 文本。
+    :returns: EventLog payload JSON object。
+    """
+
+    arguments_digest = sha256_digest_json(arguments_json)
+    payload: dict[str, JsonValue] = {
+        "tool_call_id": tool_call_id,
+        "tool_name": tool_name,
+        "normalized_arguments_digest": arguments_digest,
+        "arguments_payload_digest": arguments_digest,
+        "arguments_storage_kind": TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
+        "arguments_inline_json": arguments_json,
+        "arguments_payload_ref": None,
+        "arguments_json_size_bytes": len(
+            canonical_json_dumps(arguments_json).encode("utf-8")
+        ),
+        "semantic_input_digest": semantic_input_digest,
+    }
+    if semantic_query_text is None:
+        payload.update(
+            {
+                "semantic_query_storage_kind": (
+                    TOOL_CALL_SEMANTIC_QUERY_STORAGE_ABSENT
+                ),
+                "semantic_query_text": None,
+                "semantic_query_payload_ref": None,
+                "semantic_query_digest": None,
+            }
+        )
+        return payload
+    payload.update(
+        {
+            "semantic_query_storage_kind": TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT,
+            "semantic_query_text": semantic_query_text,
+            "semantic_query_payload_ref": None,
+            "semantic_query_digest": sha256_digest_json(
+                {"semantic_query_text": semantic_query_text}
+            ),
+        }
+    )
+    return payload
+
+
+def _accepted_tool_result_payload(
+    *,
+    result_event_id: str,
+    request_event_id: str | None,
+    tool_call_id: str,
+    tool_name: str,
+    arguments_digest: str,
+    semantic_input_digest: str,
+    raw_tool_outcome: JsonValue,
+) -> dict[str, JsonValue]:
+    """构造带 accepted evidence envelope 的工具结果 payload。
+
+    :param result_event_id: ``TOOL_RESULT_ACCEPTED`` event id。
+    :param request_event_id: 对应 ``TOOL_CALL_REQUESTED`` event id；缺失时为
+        ``None``。
+    :param tool_call_id: 工具调用 id。
+    :param tool_name: 工具名。
+    :param arguments_digest: accepted arguments digest。
+    :param semantic_input_digest: Host accept semantic input digest。
+    :param raw_tool_outcome: 原始工具响应 JSON 值。
+    :returns: EventLog payload JSON object。
+    """
+
+    envelope = AcceptedEvidenceEnvelope(
+        evidence_id=f"evidence:{result_event_id}",
+        producer_event_ref=result_event_id,
+        tool_name=tool_name,
+        tool_call_id=tool_call_id,
+        tool_query=AcceptedEvidenceToolQuery(
+            tool_call_requested_event_ref=request_event_id,
+            normalized_arguments_digest=arguments_digest,
+            semantic_input_digest=semantic_input_digest,
+        ),
+        result_ref=AcceptedEvidenceResultRef(
+            payload_ref=None,
+            payload_digest=None,
+            outcome_digest=sha256_digest_json(raw_tool_outcome),
+            truncation_applied=False,
+        ),
+        source_refs=(),
+        locator_refs=(),
+    )
+    return {
+        "accepted_evidence_envelope": accepted_evidence_envelope_to_json_value(
+            envelope
+        ),
+        "raw_tool_outcome": raw_tool_outcome,
+    }
+
+
+def _append_tool_request_and_result_events(
+    transaction: HostTransaction,
+    *,
+    request_event_id: str,
+    result_event_id: str,
+    request_payload: dict[str, JsonValue],
+    result_payload: dict[str, JsonValue],
+    append_request: bool = True,
+    request_session_id: str = _SESSION_ID,
+    request_event_class: EventClass = EventClass.CANONICAL_FACT,
+    request_event_type: str = "TOOL_CALL_REQUESTED",
+    request_run_id: str | None = _RUN_ID,
+    request_attempt_id: str | None = _ATTEMPT_ID,
+    request_execution_id: str | None = _EXECUTION_ID,
+    result_run_id: str | None = _RUN_ID,
+    result_attempt_id: str | None = _ATTEMPT_ID,
+    result_execution_id: str | None = _EXECUTION_ID,
+) -> None:
+    """追加一组 request/result canonical EventLog facts。
+
+    :param transaction: Host transaction。
+    :param request_event_id: ``TOOL_CALL_REQUESTED`` event id。
+    :param result_event_id: ``TOOL_RESULT_ACCEPTED`` event id。
+    :param request_payload: request payload。
+    :param result_payload: result payload。
+    :param append_request: 是否写入 request row。
+    :param request_session_id: request row session id。
+    :param request_event_class: request row event class。
+    :param request_event_type: request row event type。
+    :param request_run_id: request row run id。
+    :param request_attempt_id: request row attempt id。
+    :param request_execution_id: request row execution id。
+    :param result_run_id: result row run id。
+    :param result_attempt_id: result row attempt id。
+    :param result_execution_id: result row execution id。
+    :returns: ``None``。
+    """
+
+    if append_request:
+        append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=request_event_id,
+                event_class=request_event_class,
+                session_id=request_session_id,
+                run_id=request_run_id,
+                attempt_id=request_attempt_id,
+                execution_id=request_execution_id,
+                event_type=request_event_type,
+                occurred_at=_OCCURRED_AT,
+                actor="pytest",
+                source="pytest",
+                client_request_id=None,
+                idempotency_key=None,
+                policy_decision=None,
+                reason=None,
+                payload_json=request_payload,
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        )
+    append_event(
+        transaction,
+        EventLogAppendRequest(
+            event_id=result_event_id,
+            event_class=EventClass.CANONICAL_FACT,
+            session_id=_SESSION_ID,
+            run_id=result_run_id,
+            attempt_id=result_attempt_id,
+            execution_id=result_execution_id,
+            event_type="TOOL_RESULT_ACCEPTED",
+            occurred_at=_OCCURRED_AT,
+            actor="pytest",
+            source="pytest",
+            client_request_id=None,
+            idempotency_key=None,
+            policy_decision=None,
+            reason=None,
+            payload_json=result_payload,
+            payload_ref=None,
+            payload_digest=None,
+        ),
+    )
+
+
+def _fail_safe_request_payload(
+    case: _ToolQueryFailSafeCase,
+    *,
+    arguments_json: Mapping[str, JsonValue],
+    semantic_input_digest: str,
+) -> dict[str, JsonValue]:
+    """按 fail-safe case 构造 request payload。
+
+    :param case: fail-safe case。
+    :param arguments_json: accepted arguments canonical JSON。
+    :param semantic_input_digest: Host accept semantic input digest。
+    :returns: request payload。
+    :raises ValueError: 未知 request payload 类型时抛出。
+    """
+
+    if case.request_payload_kind == _REQUEST_PAYLOAD_KIND_VALID:
+        return _tool_call_requested_payload(
+            tool_call_id=case.request_tool_call_id,
+            tool_name=case.request_tool_name,
+            arguments_json=arguments_json,
+            semantic_input_digest=semantic_input_digest,
+            semantic_query_text=_FAIL_SAFE_QUERY_TEXT,
+        )
+    if case.request_payload_kind == _REQUEST_PAYLOAD_KIND_INVALID:
+        return {"tool_call_id": case.request_tool_call_id}
+    raise ValueError("unknown fail-safe request payload kind")
+
+
+def _project_tool_query_fail_safe_case(
+    tmp_path: Path,
+    case: _ToolQueryFailSafeCase,
+) -> str:
+    """运行单个工具 query fail-safe projection case 并返回 memory 文本。
+
+    :param tmp_path: pytest 临时目录。
+    :param case: fail-safe case。
+    :returns: selected recent window 中的工具 evidence 文本。
+    """
+
+    policy = _policy()
+    request_event_id = "event-tool-call-requested-query-fail-safe-memory"
+    result_event_id = "event-tool-result-query-fail-safe-memory"
+    arguments_json: Mapping[str, JsonValue] = {"arguments": {"ticker": "COIN"}}
+    arguments_digest = sha256_digest_json(arguments_json)
+    semantic_input_digest = sha256_digest_json({"semantic_input": "COIN"})
+    envelope_arguments_digest = (
+        arguments_digest
+        if case.envelope_arguments_digest is None
+        else case.envelope_arguments_digest
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: _append_tool_request_and_result_events(
+                transaction,
+                request_event_id=request_event_id,
+                result_event_id=result_event_id,
+                request_payload=_fail_safe_request_payload(
+                    case,
+                    arguments_json=arguments_json,
+                    semantic_input_digest=semantic_input_digest,
+                ),
+                result_payload=_accepted_tool_result_payload(
+                    result_event_id=result_event_id,
+                    request_event_id=request_event_id,
+                    tool_call_id=case.envelope_tool_call_id,
+                    tool_name=case.envelope_tool_name,
+                    arguments_digest=envelope_arguments_digest,
+                    semantic_input_digest=semantic_input_digest,
+                    raw_tool_outcome={"status": "raw outcome retained"},
+                ),
+                append_request=case.append_request,
+                request_session_id=case.request_session_id,
+                request_event_class=case.request_event_class,
+                request_event_type=case.request_event_type,
+            )
+        )
+        consumer = ConversationMemoryProjectionConsumer(policy)
+        ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
+            consumer.consumer_id,
+            limit=10,
+        )
+        latest = store.transaction_runner.run_read(
+            lambda transaction: read_latest_memory_snapshot(
+                transaction,
+                session_id=_SESSION_ID,
+                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                policy_digest=digest_memory_projection_policy(policy),
+            )
+        )
+        assert latest is not None
+        return latest.snapshot.trace_memory.selected_recent_window[0].text
+    raise AssertionError("tool query fail-safe projection did not return memory text")
 
 
 def _fact(claim_text: str) -> dict[str, JsonValue]:
@@ -332,6 +680,116 @@ def test_pre_compact_projection_only_builds_selected_recent_window() -> None:
     assert snapshot.evidence_fact_memory.evidence_backed_facts == ()
     assert snapshot.answer_anchor_memory.anchors == ()
     assert snapshot.forward_intent_memory.intents == ()
+
+
+def test_tool_awaiting_does_not_project_llm_facing_memory() -> None:
+    """TOOL_AWAITING 不应形成 awaiting 专属 LLM-facing memory。"""
+
+    policy = _policy()
+    arguments = {"ticker": "CRCL"}
+    arguments_digest = sha256_digest_json({"arguments": arguments})
+    snapshot = build_conversation_memory_snapshot_from_events(
+        events=(
+            _event(1, "user-1", "USER_INPUT_ACCEPTED", {"display_text": "下载Circle财报"}),
+            _event(
+                2,
+                "awaiting-1",
+                "TOOL_AWAITING",
+                {
+                    "tool_name": "start_fins_download",
+                    "accepted_arguments": arguments,
+                    "accepted_arguments_source_digest": arguments_digest,
+                    "normalized_arguments_digest": arguments_digest,
+                },
+            ),
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+
+    selected = snapshot.trace_memory.selected_recent_window
+    evidence = snapshot.evidence_fact_memory.recent_evidence_items
+    assert tuple(item.role for item in selected) == (SelectedRecentWindowRole.USER,)
+    assert evidence == ()
+    memory_text = "\n".join(
+        item.text for item in snapshot.trace_memory.selected_recent_window
+    )
+    forbidden_fragments = (
+        "等待",
+        "awaiting",
+        "外部工具",
+        "任务",
+        "启动",
+        "取消",
+        "abandoned",
+        "poll",
+        "已接受",
+    )
+    for fragment in forbidden_fragments:
+        assert fragment not in memory_text
+    assert "start_fins_download" not in memory_text
+    assert "CRCL" not in memory_text
+
+
+def test_tool_awaiting_presence_does_not_change_llm_facing_memory_semantics() -> None:
+    """有无 TOOL_AWAITING 时，相同普通事实应生成相同 LLM-facing memory。"""
+
+    policy = _policy()
+    ordinary_events = (
+        _event(1, "user-1", "USER_INPUT_ACCEPTED", {"display_text": "下载Circle财报"}),
+        _event(
+            3,
+            "tool-result-1",
+            "TOOL_RESULT_ACCEPTED",
+            {"display_text": "下载工具返回：已保存 Circle 2024 10-K。"},
+        ),
+        _event(4, "run-1", "RUN_SUCCEEDED", {"final_answer": "Circle 财报已保存。"}),
+    )
+    arguments = {"ticker": "CRCL"}
+    arguments_digest = sha256_digest_json({"arguments": arguments})
+    with_awaiting_events = (
+        ordinary_events[0],
+        _event(
+            2,
+            "awaiting-1",
+            "TOOL_AWAITING",
+            {
+                "tool_name": "start_fins_download",
+                "accepted_arguments": arguments,
+                "accepted_arguments_source_digest": arguments_digest,
+                "normalized_arguments_digest": arguments_digest,
+            },
+        ),
+        ordinary_events[1],
+        ordinary_events[2],
+    )
+
+    ordinary_snapshot = build_conversation_memory_snapshot_from_events(
+        events=ordinary_events,
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+    with_awaiting_snapshot = build_conversation_memory_snapshot_from_events(
+        events=with_awaiting_events,
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+
+    assert (
+        _llm_facing_memory_text_view(with_awaiting_snapshot)
+        == _llm_facing_memory_text_view(ordinary_snapshot)
+    )
+    selected_view, evidence_view = _llm_facing_memory_text_view(with_awaiting_snapshot)
+    memory_text = "\n".join(text for _, text in selected_view + evidence_view)
+    assert "TOOL_AWAITING" not in memory_text
+    assert "start_fins_download" not in memory_text
+    assert "CRCL" not in memory_text
 
 
 def test_selected_recent_window_floor_protects_recent_run_groups() -> None:
@@ -706,11 +1164,11 @@ def test_memory_direct_consumer_does_not_follow_terminal_descriptor() -> None:
     assert snapshot.evidence_fact_memory.evidence_backed_facts == ()
 
 
-def test_accepted_tool_evidence_uses_raw_outcome_not_preview_or_refs() -> None:
-    """accepted tool evidence 只把原始工具响应投影给 selected recent window。
+def test_accepted_tool_evidence_includes_query_and_raw_outcome_without_refs() -> None:
+    """accepted tool evidence 投影自解释 query 与原始工具响应。
 
     :returns: ``None``。
-    :raises AssertionError: memory 错误读取 preview、event id 或 payload ref 时抛出。
+    :raises AssertionError: memory 错误读取 preview、内部 id 或 payload ref 时抛出。
     """
 
     policy = _policy()
@@ -755,6 +1213,7 @@ def test_accepted_tool_evidence_uses_raw_outcome_not_preview_or_refs() -> None:
                         "text": "tool fact accepted",
                     },
                 },
+                evidence_query_text="查询 DAYU 的业务事实",
             ),
         ),
         session_id=_SESSION_ID,
@@ -766,12 +1225,83 @@ def test_accepted_tool_evidence_uses_raw_outcome_not_preview_or_refs() -> None:
     selected = snapshot.trace_memory.selected_recent_window
     assert len(selected) == 1
     text = selected[0].text
+    assert "lookup_mock_fact" in text
+    assert "查询 DAYU 的业务事实" in text
     assert "tool fact accepted" in text
     assert "preview display" not in text
     assert "preview content" not in text
     assert event_id not in text
+    assert "event-tool-call-raw-memory" not in text
+    assert "tool-call-raw-memory" not in text
     assert "payload-tool-result-raw-memory" not in text
     assert "sha256:" not in text
+
+
+def test_accepted_tool_evidence_disambiguates_raw_result_with_request_query() -> None:
+    """raw tool outcome 含义不完整时，memory 文本必须带 request/query 语义。"""
+
+    policy = _policy()
+    event_id = "event-tool-result-ambiguous-memory"
+    envelope = AcceptedEvidenceEnvelope(
+        evidence_id="evidence:tool-result-ambiguous-memory",
+        producer_event_ref=event_id,
+        tool_name="list_documents",
+        tool_call_id="tool-call-ambiguous-memory",
+        tool_query=AcceptedEvidenceToolQuery(
+            tool_call_requested_event_ref="event-tool-call-ambiguous-memory",
+            normalized_arguments_digest=sha256_digest_json({"query": "COIN"}),
+            semantic_input_digest=sha256_digest_json("COIN"),
+        ),
+        result_ref=AcceptedEvidenceResultRef(
+            payload_ref="payload-tool-result-ambiguous-memory",
+            payload_digest=sha256_digest_json({"total": 0, "documents": []}),
+            outcome_digest=sha256_digest_json({"total": 0, "documents": []}),
+            truncation_applied=False,
+        ),
+        locator_refs=(),
+        source_refs=(),
+    )
+    snapshot = build_conversation_memory_snapshot_from_events(
+        events=(
+            _event(
+                1,
+                event_id,
+                "TOOL_RESULT_ACCEPTED",
+                {
+                    "accepted_evidence_envelope": (
+                        accepted_evidence_envelope_to_json_value(envelope)
+                    ),
+                    "raw_tool_outcome": {"total": 0, "documents": []},
+                },
+                evidence_query_text="读取 ticker=COIN 的财报列表",
+            ),
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+
+    text = snapshot.trace_memory.selected_recent_window[0].text
+    assert "list_documents" in text
+    assert "读取 ticker=COIN 的财报列表" in text
+    assert '"total":0' in text
+    forbidden_fragments = (
+        "tool-call-ambiguous-memory",
+        "event-tool-call-ambiguous-memory",
+        event_id,
+        "payload-tool-result-ambiguous-memory",
+        "sha256:",
+        "wait",
+        "awaiting",
+        "poll",
+        "cancel",
+        "EventLog",
+        "payload ref",
+        "artifact ref",
+    )
+    for fragment in forbidden_fragments:
+        assert fragment not in text
 
 
 def test_accepted_tool_evidence_rejects_result_preview() -> None:
@@ -822,6 +1352,7 @@ def test_accepted_tool_evidence_rejects_result_preview() -> None:
                         },
                         "result_preview": "preview must be rejected",
                     },
+                    evidence_query_text="查询 DAYU 的业务事实",
                 ),
             ),
             session_id=_SESSION_ID,
@@ -1249,6 +1780,427 @@ def test_projection_consumer_applies_event_and_writes_durable_vnext_snapshot(
         }
 
 
+def test_projection_consumer_pairs_tool_result_with_requested_query(
+    tmp_path: Path,
+) -> None:
+    """工具结果 memory 从对应 request row 回读 query 语义。"""
+
+    policy = _policy()
+    tool_call_id = "tool-call-query-memory"
+    request_event_id = "event-tool-call-requested-query-memory"
+    result_event_id = "event-tool-result-query-memory"
+    arguments_json: Mapping[str, JsonValue] = {"arguments": {"ticker": "COIN"}}
+    arguments_digest = sha256_digest_json(arguments_json)
+    semantic_input_digest = sha256_digest_json({"semantic_input": "COIN"})
+    query_text = "读取 ticker=COIN 的财报列表"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: _append_tool_request_and_result_events(
+                transaction,
+                request_event_id=request_event_id,
+                result_event_id=result_event_id,
+                request_payload=_tool_call_requested_payload(
+                    tool_call_id=tool_call_id,
+                    tool_name="list_documents",
+                    arguments_json=arguments_json,
+                    semantic_input_digest=semantic_input_digest,
+                    semantic_query_text=query_text,
+                ),
+                result_payload=_accepted_tool_result_payload(
+                    result_event_id=result_event_id,
+                    request_event_id=request_event_id,
+                    tool_call_id=tool_call_id,
+                    tool_name="list_documents",
+                    arguments_digest=arguments_digest,
+                    semantic_input_digest=semantic_input_digest,
+                    raw_tool_outcome={"total": 0, "documents": []},
+                ),
+            )
+        )
+        consumer = ConversationMemoryProjectionConsumer(policy)
+        ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
+            consumer.consumer_id,
+            limit=10,
+        )
+        latest = store.transaction_runner.run_read(
+            lambda transaction: read_latest_memory_snapshot(
+                transaction,
+                session_id=_SESSION_ID,
+                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                policy_digest=digest_memory_projection_policy(policy),
+            )
+        )
+
+        assert latest is not None
+        text = latest.snapshot.trace_memory.selected_recent_window[0].text
+        assert "list_documents" in text
+        assert query_text in text
+        assert '"documents":[]' in text
+        forbidden_fragments = (
+            tool_call_id,
+            request_event_id,
+            result_event_id,
+            "sha256:",
+            "payload",
+            "artifact",
+            "wait",
+            "awaiting",
+            "abandoned",
+            "poll",
+            "cancel",
+        )
+        for fragment in forbidden_fragments:
+            assert fragment not in text
+
+
+def test_projection_consumer_uses_limited_query_without_semantic_query(
+    tmp_path: Path,
+) -> None:
+    """缺少 semantic query 时，不从 arguments 合成 query 文本。"""
+
+    policy = _policy()
+    tool_call_id = "tool-call-argument-summary-memory"
+    request_event_id = "event-tool-call-requested-argument-summary-memory"
+    result_event_id = "event-tool-result-argument-summary-memory"
+    arguments_json: Mapping[str, JsonValue] = {"arguments": {"ticker": "MSFT"}}
+    arguments_digest = sha256_digest_json(arguments_json)
+    semantic_input_digest = sha256_digest_json({"semantic_input": "MSFT"})
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: _append_tool_request_and_result_events(
+                transaction,
+                request_event_id=request_event_id,
+                result_event_id=result_event_id,
+                request_payload=_tool_call_requested_payload(
+                    tool_call_id=tool_call_id,
+                    tool_name="list_documents",
+                    arguments_json=arguments_json,
+                    semantic_input_digest=semantic_input_digest,
+                    semantic_query_text=None,
+                ),
+                result_payload=_accepted_tool_result_payload(
+                    result_event_id=result_event_id,
+                    request_event_id=request_event_id,
+                    tool_call_id=tool_call_id,
+                    tool_name="list_documents",
+                    arguments_digest=arguments_digest,
+                    semantic_input_digest=semantic_input_digest,
+                    raw_tool_outcome={"total": 1},
+                ),
+            )
+        )
+        consumer = ConversationMemoryProjectionConsumer(policy)
+        ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
+            consumer.consumer_id,
+            limit=10,
+        )
+        latest = store.transaction_runner.run_read(
+            lambda transaction: read_latest_memory_snapshot(
+                transaction,
+                session_id=_SESSION_ID,
+                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                policy_digest=digest_memory_projection_policy(policy),
+            )
+        )
+
+        assert latest is not None
+        text = latest.snapshot.trace_memory.selected_recent_window[0].text
+        assert _FAIL_SAFE_LIMITED_QUERY_TEXT in text
+        assert '"total":1' in text
+        assert "MSFT" not in text
+        assert "arguments" not in text
+        assert "ticker" not in text
+        assert request_event_id not in text
+        assert result_event_id not in text
+        assert tool_call_id not in text
+        assert "sha256:" not in text
+
+
+@pytest.mark.parametrize(
+    ("request_run_id", "request_attempt_id", "request_execution_id"),
+    (
+        ("run-other", _ATTEMPT_ID, _EXECUTION_ID),
+        (_RUN_ID, "attempt-other", _EXECUTION_ID),
+        (_RUN_ID, _ATTEMPT_ID, "execution-other"),
+    ),
+)
+def test_projection_consumer_fails_safe_on_request_result_execution_mismatch(
+    tmp_path: Path,
+    request_run_id: str,
+    request_attempt_id: str,
+    request_execution_id: str,
+) -> None:
+    """request/result 执行上下文错配时不回读 request query。"""
+
+    policy = _policy()
+    tool_call_id = "tool-call-execution-mismatch-memory"
+    request_event_id = "event-tool-call-requested-execution-mismatch-memory"
+    result_event_id = "event-tool-result-execution-mismatch-memory"
+    arguments_json: Mapping[str, JsonValue] = {"arguments": {"ticker": "COIN"}}
+    arguments_digest = sha256_digest_json(arguments_json)
+    semantic_input_digest = sha256_digest_json({"semantic_input": "COIN"})
+    query_text = "这个 request query 不应进入 memory"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: _append_tool_request_and_result_events(
+                transaction,
+                request_event_id=request_event_id,
+                result_event_id=result_event_id,
+                request_payload=_tool_call_requested_payload(
+                    tool_call_id=tool_call_id,
+                    tool_name="list_documents",
+                    arguments_json=arguments_json,
+                    semantic_input_digest=semantic_input_digest,
+                    semantic_query_text=query_text,
+                ),
+                result_payload=_accepted_tool_result_payload(
+                    result_event_id=result_event_id,
+                    request_event_id=request_event_id,
+                    tool_call_id=tool_call_id,
+                    tool_name="list_documents",
+                    arguments_digest=arguments_digest,
+                    semantic_input_digest=semantic_input_digest,
+                    raw_tool_outcome={"total": 0},
+                ),
+                request_run_id=request_run_id,
+                request_attempt_id=request_attempt_id,
+                request_execution_id=request_execution_id,
+            )
+        )
+        consumer = ConversationMemoryProjectionConsumer(policy)
+        ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
+            consumer.consumer_id,
+            limit=10,
+        )
+        latest = store.transaction_runner.run_read(
+            lambda transaction: read_latest_memory_snapshot(
+                transaction,
+                session_id=_SESSION_ID,
+                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                policy_digest=digest_memory_projection_policy(policy),
+            )
+        )
+
+        assert latest is not None
+        text = latest.snapshot.trace_memory.selected_recent_window[0].text
+        assert _FAIL_SAFE_LIMITED_QUERY_TEXT in text
+        assert '"total":0' in text
+        assert query_text not in text
+        assert request_event_id not in text
+        assert result_event_id not in text
+        assert tool_call_id not in text
+        assert "run-other" not in text
+        assert "attempt-other" not in text
+        assert "execution-other" not in text
+
+
+def test_projection_consumer_fails_safe_when_requested_event_ref_missing(
+    tmp_path: Path,
+) -> None:
+    """result envelope 缺少 request ref 时不合成内部引用文本。"""
+
+    policy = _policy()
+    tool_call_id = "tool-call-missing-request-ref-memory"
+    request_event_id = "event-tool-call-requested-missing-ref-memory"
+    result_event_id = "event-tool-result-missing-request-ref-memory"
+    arguments_json: Mapping[str, JsonValue] = {"arguments": {"ticker": "COIN"}}
+    arguments_digest = sha256_digest_json(arguments_json)
+    semantic_input_digest = sha256_digest_json({"semantic_input": "COIN"})
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: _append_tool_request_and_result_events(
+                transaction,
+                request_event_id=request_event_id,
+                result_event_id=result_event_id,
+                request_payload=_tool_call_requested_payload(
+                    tool_call_id=tool_call_id,
+                    tool_name="list_documents",
+                    arguments_json=arguments_json,
+                    semantic_input_digest=semantic_input_digest,
+                    semantic_query_text="缺失 ref 时不应读取这个 query",
+                ),
+                result_payload=_accepted_tool_result_payload(
+                    result_event_id=result_event_id,
+                    request_event_id=None,
+                    tool_call_id=tool_call_id,
+                    tool_name="list_documents",
+                    arguments_digest=arguments_digest,
+                    semantic_input_digest=semantic_input_digest,
+                    raw_tool_outcome={"total": 0},
+                ),
+            )
+        )
+        consumer = ConversationMemoryProjectionConsumer(policy)
+        ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
+            consumer.consumer_id,
+            limit=10,
+        )
+        latest = store.transaction_runner.run_read(
+            lambda transaction: read_latest_memory_snapshot(
+                transaction,
+                session_id=_SESSION_ID,
+                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                policy_digest=digest_memory_projection_policy(policy),
+            )
+        )
+
+        assert latest is not None
+        text = latest.snapshot.trace_memory.selected_recent_window[0].text
+        assert _FAIL_SAFE_LIMITED_QUERY_TEXT in text
+        assert "缺失 ref 时不应读取这个 query" not in text
+        assert request_event_id not in text
+        assert result_event_id not in text
+        assert tool_call_id not in text
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        pytest.param(
+            _ToolQueryFailSafeCase(append_request=False),
+            id="requested-event-row-missing",
+        ),
+        pytest.param(
+            _ToolQueryFailSafeCase(request_session_id="session-other"),
+            id="request-session-mismatch",
+        ),
+        pytest.param(
+            _ToolQueryFailSafeCase(request_event_class=EventClass.DIAGNOSTIC),
+            id="request-event-class-not-canonical",
+        ),
+        pytest.param(
+            _ToolQueryFailSafeCase(request_event_type="TOOL_CALL_GOVERNED"),
+            id="request-event-type-mismatch",
+        ),
+        pytest.param(
+            _ToolQueryFailSafeCase(
+                request_payload_kind=_REQUEST_PAYLOAD_KIND_INVALID,
+            ),
+            id="request-atoms-unreadable",
+        ),
+        pytest.param(
+            _ToolQueryFailSafeCase(
+                envelope_tool_call_id="tool-call-envelope-mismatch-memory",
+            ),
+            id="tool-call-id-mismatch",
+        ),
+        pytest.param(
+            _ToolQueryFailSafeCase(envelope_tool_name="lookup_documents"),
+            id="tool-name-mismatch",
+        ),
+        pytest.param(
+            _ToolQueryFailSafeCase(
+                envelope_arguments_digest=sha256_digest_json(
+                    {"arguments": {"ticker": "MSFT"}}
+                ),
+            ),
+            id="arguments-digest-mismatch",
+        ),
+    ),
+)
+def test_projection_consumer_fails_safe_for_request_query_source_mismatch(
+    tmp_path: Path,
+    case: _ToolQueryFailSafeCase,
+) -> None:
+    """request query 来源不可校验时统一降级且保留 raw outcome。"""
+
+    text = _project_tool_query_fail_safe_case(tmp_path, case)
+
+    assert _FAIL_SAFE_LIMITED_QUERY_TEXT in text
+    assert "raw outcome retained" in text
+    assert _FAIL_SAFE_QUERY_TEXT not in text
+    forbidden_fragments = (
+        "event-tool-call-requested-query-fail-safe-memory",
+        "event-tool-result-query-fail-safe-memory",
+        case.request_tool_call_id,
+        case.envelope_tool_call_id,
+        "sha256:",
+        "payload",
+        "artifact",
+        "wait",
+        "awaiting",
+        "abandoned",
+        "poll",
+        "cancel",
+    )
+    for fragment in forbidden_fragments:
+        assert fragment not in text
+
+
+def test_projection_consumer_uses_limited_query_for_unsafe_argument_fallback(
+    tmp_path: Path,
+) -> None:
+    """缺少 semantic query 时，unsafe 参数不裸露进入 memory。"""
+
+    policy = _policy()
+    tool_call_id = "tool-call-unsafe-argument-memory"
+    request_event_id = "event-tool-call-requested-unsafe-memory"
+    result_event_id = "event-tool-result-unsafe-memory"
+    secret = "sk-live-secret"
+    local_path = "/Users/leo/private/report.pdf"
+    arguments_json: Mapping[str, JsonValue] = {
+        "arguments": {
+            "api_key": secret,
+            "input_path": local_path,
+            "ticker": "COIN",
+        }
+    }
+    arguments_digest = sha256_digest_json(arguments_json)
+    semantic_input_digest = sha256_digest_json({"semantic_input": "unsafe"})
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: _append_tool_request_and_result_events(
+                transaction,
+                request_event_id=request_event_id,
+                result_event_id=result_event_id,
+                request_payload=_tool_call_requested_payload(
+                    tool_call_id=tool_call_id,
+                    tool_name="lookup_private_file",
+                    arguments_json=arguments_json,
+                    semantic_input_digest=semantic_input_digest,
+                    semantic_query_text=None,
+                ),
+                result_payload=_accepted_tool_result_payload(
+                    result_event_id=result_event_id,
+                    request_event_id=request_event_id,
+                    tool_call_id=tool_call_id,
+                    tool_name="lookup_private_file",
+                    arguments_digest=arguments_digest,
+                    semantic_input_digest=semantic_input_digest,
+                    raw_tool_outcome={"status": "ok"},
+                ),
+            )
+        )
+        consumer = ConversationMemoryProjectionConsumer(policy)
+        ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
+            consumer.consumer_id,
+            limit=10,
+        )
+        latest = store.transaction_runner.run_read(
+            lambda transaction: read_latest_memory_snapshot(
+                transaction,
+                session_id=_SESSION_ID,
+                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                policy_digest=digest_memory_projection_policy(policy),
+            )
+        )
+
+        assert latest is not None
+        text = latest.snapshot.trace_memory.selected_recent_window[0].text
+        assert _FAIL_SAFE_LIMITED_QUERY_TEXT in text
+        assert '"status":"ok"' in text
+        assert secret not in text
+        assert local_path not in text
+        assert "arguments" not in text
+        assert "api_key" not in text
+        assert "input_path" not in text
+        assert "ticker" not in text
+        assert "COIN" not in text
+        assert request_event_id not in text
+        assert result_event_id not in text
+        assert tool_call_id not in text
+
+
 def test_conversation_memory_consumer_uses_shared_projection_event_filter() -> None:
     """Conversation Memory consumer 直接使用模块级 projection filter 真源。"""
 
@@ -1256,6 +2208,9 @@ def test_conversation_memory_consumer_uses_shared_projection_event_filter() -> N
     consumer = ConversationMemoryProjectionConsumer(policy)
 
     assert consumer.event_filter == conversation_memory_projection_event_filter()
+    event_types = consumer.event_filter.class_filters[0].event_types
+    assert event_types is not None
+    assert "TOOL_AWAITING" not in event_types
 
 
 def test_projection_consumer_skips_failed_compact_without_memory_snapshot(

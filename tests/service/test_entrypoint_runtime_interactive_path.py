@@ -30,7 +30,6 @@ from dayu.host.api import (
     RunStatus,
     SubmitFollowupRequest,
 )
-from dayu.runtime.scene_prepare import ScenePrepareError
 from dayu.service.entrypoint_runtime import (
     EntrypointRuntimeRequest,
     EntrypointRuntimeResult,
@@ -45,6 +44,15 @@ _MODEL_ID = "deepseek-v4-flash"
 _RUNNER_HINT_ID = "interactive"
 _API_KEY = "test-provider-key"
 _DEFAULT_INTERACTIVE_TOOL_NAME = "get_financial_statement"
+_DEFAULT_TIME_TOOL_NAME = "get_current_time"
+_DEFAULT_DOWNLOAD_TOOL_NAME = "start_fins_download"
+_DEFAULT_PREPROCESS_TOOL_NAME = "start_fins_preprocess"
+_EXCLUDED_UPLOAD_TOOL_NAME = "start_fins_upload"
+_INTERACTIVE_CURRENT_TIME_TEXT = (
+    "# 当前时间\n"
+    "现在是 2026年7月7日 17:20（Asia/Shanghai，星期二）。\n"
+    "这是对话开始时的当前时间；回答“现在/今天/当前时间”默认使用它；该时间不会自动更新。"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,9 +153,7 @@ class _FakeHost:
         self.watchers.append(watcher)
         return watcher
 
-    async def submit_followup(
-        self, session_id: str, request: SubmitFollowupRequest
-    ) -> FollowupSnapshot:
+    async def submit_followup(self, session_id: str, request: SubmitFollowupRequest) -> FollowupSnapshot:
         """记录 submit 请求并推入成功终态。
 
         :param session_id: 目标 Session id。
@@ -160,9 +166,7 @@ class _FakeHost:
         self.submit_requests.append(request)
         self._submit_index += 1
         run_id = f"run-{self._submit_index}"
-        await self.watchers[-1].push(
-            _terminal_event(run_id=run_id, event_sequence=self._submit_index + 1)
-        )
+        await self.watchers[-1].push(_terminal_event(run_id=run_id, event_sequence=self._submit_index + 1))
         await asyncio.sleep(0)
         return FollowupSnapshot(
             accepted_input_ref=f"input-{self._submit_index}",
@@ -226,49 +230,59 @@ class _FakeHost:
 async def test_interactive_runtime_uses_real_manifest_required_slots(
     tmp_path: Path,
 ) -> None:
-    """真实 interactive scene 应要求并消费 fins_default_subject/base_user slots。"""
+    """真实 interactive scene 应只要求并消费当前 manifest 所需 slots。"""
 
-    result = await _prepare_interactive_runtime(
-        tmp_path,
-        fins_default_subject="测试公司",
-        base_user="本地 CLI 用户",
-    )
-    changed_subject_result = await _prepare_interactive_runtime(
-        tmp_path,
-        fins_default_subject="另一家公司",
-        base_user="本地 CLI 用户",
-    )
+    result = await _prepare_interactive_runtime(tmp_path)
 
     assert result.scene_inputs.tool_selection.tool_names is not None
     assert _DEFAULT_INTERACTIVE_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
-    assert result.scene_inputs.content_digest != (
-        changed_subject_result.scene_inputs.content_digest
+    assert _DEFAULT_TIME_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
+    assert _DEFAULT_DOWNLOAD_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
+    assert _DEFAULT_PREPROCESS_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
+    assert _EXCLUDED_UPLOAD_TOOL_NAME not in result.scene_inputs.tool_selection.tool_names
+    assert result.host_assembly.options.wait_poller_policy is not None
+    assert result.host_assembly.options.wait_poller_policy.enabled
+    assert result.host_assembly.options.tooling_options is not None
+    assert (
+        result.host_assembly.options.tooling_options.wait_poll_adapter_registry
+        is not None
     )
+    assert "财报工具指引" in result.scene_inputs.system_prompt
+    assert _DEFAULT_TIME_TOOL_NAME in result.scene_inputs.system_prompt
+    assert _DEFAULT_DOWNLOAD_TOOL_NAME in result.scene_inputs.system_prompt
+    assert _DEFAULT_PREPROCESS_TOOL_NAME in result.scene_inputs.system_prompt
+    assert _EXCLUDED_UPLOAD_TOOL_NAME not in result.scene_inputs.system_prompt
+    assert "<when_tag" not in result.scene_inputs.system_prompt
+    assert "</when_tag>" not in result.scene_inputs.system_prompt
+    assert "<when_tool" not in result.scene_inputs.system_prompt
+    assert "</when_tool>" not in result.scene_inputs.system_prompt
     assert result.host_assembly.diagnostics.model_id == _MODEL_ID
     assert result.host_assembly.diagnostics.runner_option_hint_id == _RUNNER_HINT_ID
 
 
 @pytest.mark.asyncio
-async def test_interactive_runtime_rejects_missing_required_context_slot(
+async def test_interactive_runtime_requires_current_time_context_slot(
     tmp_path: Path,
 ) -> None:
-    """真实 interactive scene 缺 required slot 时必须 fail closed。"""
+    """真实 interactive scene 只要求当前时间，不要求入口身份类 context slot。"""
 
-    with pytest.raises(ScenePrepareError, match="fins_default_subject"):
-        await prepare_entrypoint_runtime(
-            EntrypointRuntimeRequest(
-                workspace_root=tmp_path,
-                package_config_root=_PACKAGE_CONFIG_ROOT,
-                explicit_config_dir=None,
-                scene_id="interactive",
-                context_slot_values={"base_user": "本地 CLI 用户"},
-                assembly_overrides=ServiceAssemblyOverrides(
-                    model_id=_MODEL_ID,
-                    runner_option_hint_id=_RUNNER_HINT_ID,
-                ),
-                env={"DEEPSEEK_API_KEY": _API_KEY},
-            )
+    runtime = await prepare_entrypoint_runtime(
+        EntrypointRuntimeRequest(
+            workspace_root=tmp_path,
+            package_config_root=_PACKAGE_CONFIG_ROOT,
+            explicit_config_dir=None,
+            scene_id="interactive",
+            context_slot_values={"current_time": _INTERACTIVE_CURRENT_TIME_TEXT},
+            assembly_overrides=ServiceAssemblyOverrides(
+                model_id=_MODEL_ID,
+                runner_option_hint_id=_RUNNER_HINT_ID,
+            ),
+            env={"DEEPSEEK_API_KEY": _API_KEY},
         )
+    )
+
+    assert runtime.scene_inputs.tool_selection.tool_names is not None
+    assert _DEFAULT_INTERACTIVE_TOOL_NAME in runtime.scene_inputs.tool_selection.tool_names
 
 
 @pytest.mark.asyncio
@@ -277,11 +291,7 @@ async def test_interactive_two_turns_have_independent_terminal_wait_state(
 ) -> None:
     """interactive 两轮应各自 attach/close watcher 且不复用 wait state。"""
 
-    runtime = await _prepare_interactive_runtime(
-        tmp_path,
-        fins_default_subject="测试公司",
-        base_user="本地 CLI 用户",
-    )
+    runtime = await _prepare_interactive_runtime(tmp_path)
     fake_host = _FakeHost()
 
     first = await submit_entrypoint_turn_and_wait(
@@ -312,15 +322,10 @@ async def test_interactive_two_turns_have_independent_terminal_wait_state(
 
 async def _prepare_interactive_runtime(
     tmp_path: Path,
-    *,
-    fins_default_subject: str,
-    base_user: str,
 ) -> EntrypointRuntimeResult:
     """构造真实 interactive runtime assembly 测试结果。
 
     :param tmp_path: pytest 临时 workspace root。
-    :param fins_default_subject: 财报默认主体 context slot。
-    :param base_user: 用户展示名 context slot。
     :returns: entrypoint runtime result。
     :raises Exception: runtime assembly 失败时向上抛出。
     """
@@ -331,10 +336,7 @@ async def _prepare_interactive_runtime(
             package_config_root=_PACKAGE_CONFIG_ROOT,
             explicit_config_dir=None,
             scene_id="interactive",
-            context_slot_values={
-                "fins_default_subject": fins_default_subject,
-                "base_user": base_user,
-            },
+            context_slot_values={"current_time": _INTERACTIVE_CURRENT_TIME_TEXT},
             assembly_overrides=ServiceAssemblyOverrides(
                 model_id=_MODEL_ID,
                 runner_option_hint_id=_RUNNER_HINT_ID,

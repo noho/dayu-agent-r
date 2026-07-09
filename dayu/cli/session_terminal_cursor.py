@@ -19,10 +19,9 @@ from typing import Final, cast
 from dayu.contracts import JsonValue
 from dayu.host.api import OutboxTerminalCursor
 from dayu.runtime.filelock import file_lock
+from dayu.runtime.workspace_paths import workspace_paths
 
 CLI_TERMINAL_CURSOR_SEEN_IDS_MAX_SIZE: Final[int] = 200
-_CURSOR_DIR_PARTS: Final[tuple[str, ...]] = ("workspace", ".dayu", "cli")
-_CURSOR_FILE_NAME: Final[str] = "terminal_cursors.json"
 _CURSOR_LOCK_FILE_NAME: Final[str] = "terminal_cursors.json.lock"
 _TEMP_FILE_PREFIX: Final[str] = ".terminal_cursors."
 _JSON_SESSION_SEQUENCE_FIELD: Final[str] = "last_seen_terminal_event_sequence"
@@ -86,10 +85,7 @@ def cli_terminal_cursor_file_path(workspace_root: Path) -> Path:
     :raises Exception: 不主动抛出异常。
     """
 
-    path = workspace_root
-    for part in _CURSOR_DIR_PARTS:
-        path = path / part
-    return path / _CURSOR_FILE_NAME
+    return workspace_paths(workspace_root).cli_terminal_cursor_file
 
 
 async def read_cli_terminal_cursor(

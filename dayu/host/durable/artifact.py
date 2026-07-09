@@ -197,6 +197,39 @@ def delete_artifact_file(artifact_root: Path, relative_path: str) -> bool:
         raise HostArtifactWriteError("Artifact file delete failed") from exc
 
 
+def read_artifact_bytes(artifact_root: Path, artifact_ref: LocalArtifactRef) -> bytes:
+    """读取已发布 artifact bytes 并校验引用完整性。
+
+    :param artifact_root: artifact 根目录。
+    :param artifact_ref: 已发布 artifact 引用。
+    :returns: artifact 原始 bytes。
+    :raises HostArtifactWriteError: 路径非法、文件缺失、读取失败或 digest/size
+        不匹配时抛出。
+    """
+
+    try:
+        validate_artifact_ref(artifact_ref)
+        _validate_published_artifact_relative_path(
+            artifact_ref.artifact_relative_path
+        )
+        path = _path_from_posix_relative(
+            artifact_root,
+            artifact_ref.artifact_relative_path,
+        )
+        _ensure_contained(artifact_root, path)
+        content = path.read_bytes()
+    except HostDurableError as exc:
+        raise HostArtifactWriteError("Artifact ref is invalid") from exc
+    except OSError as exc:
+        raise HostArtifactWriteError("Artifact file read failed") from exc
+    actual_digest = sha256_digest_bytes(content)
+    if actual_digest != artifact_ref.artifact_digest:
+        raise HostDigestMismatchError("Artifact read digest mismatch")
+    if len(content) != artifact_ref.artifact_size_bytes:
+        raise HostArtifactWriteError("Artifact read size mismatch")
+    return content
+
+
 def _artifact_relative_path_for_digest(digest: str) -> str:
     """根据 digest 生成稳定 artifact 相对路径。
 

@@ -48,6 +48,8 @@ COMMAND_HELP_EXPECTATIONS: dict[str, tuple[str, ...]] = {
     "interactive": (
         "--ticker",
         "--label",
+        "--detail",
+        "--no-detail",
         "--model-name",
         "--temperature",
     ),
@@ -997,11 +999,11 @@ def test_default_namespace_initializes_reset_false() -> None:
     assert init_args.reset is False
     assert init_args.overwrite is False
     assert prompt_args.reset is False
-    assert prompt_args.detail is False
+    assert prompt_args.detail is True
 
 
-def test_prompt_detail_defaults_to_no_detail() -> None:
-    """验证 prompt 默认不显示运行态细节。
+def test_prompt_detail_defaults_to_detail() -> None:
+    """验证 prompt 默认显示运行态细节。
 
     :returns: ``None``。
     :raises AssertionError: ``detail`` 默认值不符合契约时抛出。
@@ -1009,7 +1011,20 @@ def test_prompt_detail_defaults_to_no_detail() -> None:
 
     args = parse_cli_args(("prompt", "hello"))
 
-    assert args.detail is False
+    assert args.detail is True
+    assert args.log_level == "info"
+
+
+def test_interactive_detail_defaults_to_detail() -> None:
+    """验证 interactive 默认显示运行态细节。
+
+    :returns: ``None``。
+    :raises AssertionError: ``detail`` 默认值不符合契约时抛出。
+    """
+
+    args = parse_cli_args(("interactive",))
+
+    assert args.detail is True
     assert args.log_level == "info"
 
 
@@ -1054,17 +1069,20 @@ def test_parse_cli_args_debug_stream_and_quiet_runtime_precedence() -> None:
     (
         (("prompt", "hello", "--detail"), True, "info"),
         (("prompt", "hello", "--no-detail"), False, "info"),
-        (("prompt", "hello", "--verbose"), False, "verbose"),
-        (("prompt", "hello", "--debug"), False, "debug"),
+        (("prompt", "hello", "--verbose"), True, "verbose"),
+        (("prompt", "hello", "--debug"), True, "debug"),
         (("prompt", "hello", "--detail", "--verbose"), True, "verbose"),
+        (("interactive", "--detail"), True, "info"),
+        (("interactive", "--no-detail"), False, "info"),
+        (("interactive", "--debug"), True, "debug"),
     ),
 )
-def test_prompt_detail_flags_are_orthogonal_to_log_level(
+def test_agent_detail_flags_are_orthogonal_to_log_level(
     argv: tuple[str, ...],
     expected_detail: bool,
     expected_log_level: str,
 ) -> None:
-    """验证 prompt detail flag 与日志等级互不隐式联动。
+    """验证 Agent detail flag 与日志等级互不隐式联动。
 
     :param argv: 待解析的 CLI 参数。
     :param expected_detail: 预期 detail 值。
@@ -1088,5 +1106,18 @@ def test_prompt_detail_flags_are_mutually_exclusive() -> None:
 
     with pytest.raises(SystemExit) as raised:
         parse_cli_args(("prompt", "hello", "--detail", "--no-detail"))
+
+    assert raised.value.code == EXIT_USAGE_ERROR
+
+
+def test_interactive_detail_flags_are_mutually_exclusive() -> None:
+    """验证 interactive ``--detail`` 与 ``--no-detail`` 互斥。
+
+    :returns: ``None``。
+    :raises AssertionError: argparse 未拒绝互斥参数时抛出。
+    """
+
+    with pytest.raises(SystemExit) as raised:
+        parse_cli_args(("interactive", "--detail", "--no-detail"))
 
     assert raised.value.code == EXIT_USAGE_ERROR

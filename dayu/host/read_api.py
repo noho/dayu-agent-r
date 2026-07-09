@@ -33,6 +33,7 @@ from dayu.host.api import (
     HostFinalAnswerView,
     HostStreamCursor,
     HostTerminalStatus,
+    HostThinkingView,
     ListSessionsResult,
     OutboxProjectionStatus,
     OutboxTerminalCursor,
@@ -105,6 +106,7 @@ _EVENT_TYPE_CONTEXT_COMPACTED = "CONTEXT_COMPACTED"
 _EVENT_TYPE_CONTEXT_COMPACTION_FAILED = "CONTEXT_COMPACTION_FAILED"
 _EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED = "CONTEXT_COMPACTION_ATTEMPT_REJECTED"
 _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR = "PROVIDER_PROTOCOL_ERROR"
+_EVENT_TYPE_REASONING_DELTA = "REASONING_DELTA"
 _PAYLOAD_FIELD_TERMINAL_SUMMARY_REF = "terminal_summary_ref"
 _PAYLOAD_FIELD_TERMINAL_SUMMARY_DIGEST = "terminal_summary_digest"
 _PAYLOAD_FIELD_CONTENT = "content"
@@ -116,6 +118,7 @@ _PAYLOAD_FIELD_REASON = "reason"
 _PAYLOAD_FIELD_PROVIDER_REQUEST_ID = "provider_request_id"
 _PAYLOAD_FIELD_CLIENT_CORRELATION_ID = "client_correlation_id"
 _PAYLOAD_FIELD_TERMINAL_STATUS = "terminal_status"
+_PAYLOAD_FIELD_DELTA = "delta"
 _PAYLOAD_FIELD_EFFECTIVE_TOOL_SET = "effective_tool_set"
 _PAYLOAD_FIELD_EFFECTIVE_TOOL_DISPLAY_NAMES = "effective_tool_display_names"
 _PAYLOAD_FIELD_TOOL_NAME = "tool_name"
@@ -883,6 +886,7 @@ def _host_event_from_row(transaction: HostTransaction, row: EventLogRow) -> Host
         event_type=row.event_type,
         kind=HostEventKind.PROGRESS,
         activity=_activity_from_row(transaction, row),
+        thinking=_thinking_from_row(row),
         dedupe_key=row.event_id,
         terminal_status=None,
         final_answer=None,
@@ -1075,7 +1079,6 @@ def _activity_from_row(
         _EVENT_TYPE_RUN_ACCEPTED,
         _EVENT_TYPE_RUN_QUEUED,
         _EVENT_TYPE_RUN_STARTED,
-        _EVENT_TYPE_ATTEMPT_STARTED,
         _EVENT_TYPE_RUN_RECOVERING,
     ):
         return _run_lifecycle_activity(row)
@@ -1085,7 +1088,7 @@ def _activity_from_row(
         return _tool_result_accepted_activity(transaction, row)
     if row.event_type == _EVENT_TYPE_TOOL_CALLS_BATCH_DONE:
         return _tool_calls_batch_done_activity(row)
-    if row.event_type in (_EVENT_TYPE_TOOL_AWAITING, _EVENT_TYPE_RUN_WAITING):
+    if row.event_type == _EVENT_TYPE_TOOL_AWAITING:
         return _tool_awaiting_activity(transaction, row)
     if row.event_type in (
         _EVENT_TYPE_CONTEXT_COMPACTION_REQUESTED,
@@ -1099,6 +1102,23 @@ def _activity_from_row(
     return None
 
 
+def _thinking_from_row(row: EventLogRow) -> HostThinkingView | None:
+    """把 reasoning delta row 投影为运行态 thinking 展示视图。
+
+    :param row: EventLog durable row。
+    :returns: thinking 展示视图；非 reasoning delta 或 payload 非法时返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if row.event_type != _EVENT_TYPE_REASONING_DELTA:
+        return None
+    payload = _activity_payload_without_descriptor(row)
+    delta = payload.get(_PAYLOAD_FIELD_DELTA)
+    if not isinstance(delta, str) or delta.strip() == "":
+        return None
+    return HostThinkingView(text_delta=delta)
+
+
 def _run_lifecycle_activity(row: EventLogRow) -> HostActivityView | None:
     """把必要 Run lifecycle event 投影为 activity。
 
@@ -1110,7 +1130,7 @@ def _run_lifecycle_activity(row: EventLogRow) -> HostActivityView | None:
     if row.event_type in (_EVENT_TYPE_RUN_ACCEPTED, _EVENT_TYPE_RUN_QUEUED):
         status = HostActivityStatus.STARTED
         title = "运行已接受"
-    elif row.event_type in (_EVENT_TYPE_RUN_STARTED, _EVENT_TYPE_ATTEMPT_STARTED):
+    elif row.event_type == _EVENT_TYPE_RUN_STARTED:
         status = HostActivityStatus.IN_PROGRESS
         title = "运行已开始"
     elif row.event_type == _EVENT_TYPE_RUN_RECOVERING:
@@ -1154,14 +1174,16 @@ def _run_lifecycle_activity(row: EventLogRow) -> HostActivityView | None:
 def _tool_call_requested_activity(
     transaction: HostTransaction, row: EventLogRow
 ) -> HostActivityView | None:
-    """投影 ``TOOL_CALL_REQUESTED`` activity。
+    """投影 preview ``TOOL_CALL_REQUESTED`` activity。
 
     :param transaction: 当前 Host transaction。
     :param row: TOOL_CALL_REQUESTED EventLog row。
-    :returns: 工具调用开始 activity；payload 缺关键字段时返回 ``None``。
+    :returns: 工具调用开始 activity；canonical request atom 或 payload 缺关键字段时返回 ``None``。
     :raises: 无主动抛出。
     """
 
+    if row.event_class is not EventClass.PREVIEW:
+        return None
     payload = _activity_payload(transaction, row)
     if payload is None:
         return None
@@ -1264,8 +1286,8 @@ def _tool_awaiting_activity(
     """投影工具等待 activity。
 
     :param transaction: 当前 Host transaction。
-    :param row: TOOL_AWAITING 或 RUN_WAITING EventLog row。
-    :returns: 等待 activity；未知等待 payload 时返回通用等待 activity。
+    :param row: TOOL_AWAITING EventLog row。
+    :returns: 等待 activity；未知工具 payload 时返回通用等待 activity。
     :raises: 无主动抛出。
     """
 

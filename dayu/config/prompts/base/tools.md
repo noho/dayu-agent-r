@@ -36,7 +36,7 @@
 - 含 `ref` 的章节优先走 `read_file_section`。
 </when_tag>
 
-<when_tag fins>
+<when_tag fins-read>
 ## 财报工具指引
 
 ### 工作流
@@ -64,12 +64,23 @@
   - 一旦 `document_id` 变化，先前在旧文档拿到的所有 `ref` / `table_ref` 一律作废，禁止跨文档复用。
 </when_tag>
 
-<when_tag ingestion>
-## 数据摄取工具指引
+<when_tool start_fins_download>
+## start_fins_download
 
-- `start_*` 后按 `next_step.action` 决定轮询或结束。
+- 用途：下载用户所需公司的财报源文件。
+- 调用后等待工具结果；结果会说明发现、下载、跳过、拒绝、失败和写入数量。
+- 工具结果返回前不要自行编造下载完成结论；工具结果返回后按结果摘要回答用户。
 - 除非用户明确要求，不要主动取消任务。
-</when_tag>
+</when_tool>
+
+<when_tool start_fins_preprocess>
+## start_fins_preprocess
+
+- 用途：处理本地已有财报源文件，使后续章节、表格和财务数据工具可读取。
+- 调用后等待工具结果；结果会说明选中、处理、跳过和失败数量。
+- 工具结果返回前不要自行编造处理完成结论；工具结果返回后按结果摘要回答用户。
+- 除非用户明确要求，不要主动取消任务。
+</when_tool>
 
 <when_tag web>
 ## 联网工具指引
@@ -80,5 +91,10 @@
 
 <when_tool get_current_time>
 ## get_current_time
-- 仅在需要实时时间时使用；不要用它推断文件内容或外部事实。
+- 用途：获取调用这一刻的当前时间。
+- 调用条件：只有用户明确要求获取此刻最新时间，或要求在等待、查询、下载、上传、处理等动作完成后再确认时间时才调用。
+- 普通“现在 / 今天 / 当前时间”问题如果不需要重新确认，就使用已给出的当前时间，不调用本工具。
+- 参数：`timezone` 可省略；如填写，只能是 `Asia/Shanghai`。
+- 返回：`time` 是中文格式时间，`timezone` 是时区，`weekday` 是星期几，`iso` 是 ISO 8601 时间。
+- 禁止用途：不要用它推断财报、文件、网页、新闻或其它外部事实；这些事实必须来自相应工具或用户输入。
 </when_tool>

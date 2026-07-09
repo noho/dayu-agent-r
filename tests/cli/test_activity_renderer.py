@@ -115,6 +115,46 @@ def test_activity_renderer_cancel_messages() -> None:
     assert "local process exiting" in output
 
 
+def test_activity_renderer_finish_non_tty_keeps_readable_activity() -> None:
+    """非 TTY 收尾应保留可读 activity 且不输出 ANSI 控制符。"""
+
+    stderr = StringIO()
+    renderer = CliActivityRenderer(
+        stderr=stderr,
+        options=CliActivityRendererOptions(visible=True, enabled=True),
+    )
+
+    renderer.record(_activity(dedupe_key="activity-1", event_sequence=1))
+    renderer.finish_runtime_display()
+
+    output = stderr.getvalue()
+    assert "Activity:" in output
+    assert "工具批次完成" in output
+    assert "\x1b[" not in output
+
+
+def test_activity_renderer_finish_tty_clears_rendered_activity_lines() -> None:
+    """TTY 收尾应清除已输出的 activity 行。"""
+
+    stderr = StringIO()
+    renderer = CliActivityRenderer(
+        stderr=stderr,
+        options=CliActivityRendererOptions(
+            visible=True,
+            enabled=True,
+            terminal_control=True,
+            terminal_columns=1000,
+        ),
+    )
+
+    renderer.record(_activity(dedupe_key="activity-1", event_sequence=1))
+    renderer.finish_runtime_display()
+
+    output = stderr.getvalue()
+    assert "Activity:" in output
+    assert output.endswith("\x1b[1A\r\x1b[2K")
+
+
 def _activity(*, dedupe_key: str, event_sequence: int) -> EntrypointActivity:
     """构造测试 activity。
 

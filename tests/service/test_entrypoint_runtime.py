@@ -35,6 +35,7 @@ from dayu.host.api import (
     HostFinalAnswerView,
     HostStreamCursor,
     HostTerminalStatus,
+    HostThinkingView,
     OperationContext,
     OutboxProjectionStatus,
     OutboxTerminalCursor,
@@ -55,6 +56,7 @@ from dayu.service.entrypoint_runtime import (
     EntrypointActivityKind,
     EntrypointActivitySeverity,
     EntrypointActivityStatus,
+    EntrypointThinking,
     EntrypointCancelRequest,
     EntrypointRuntimeRequest,
     EntrypointRuntimeResult,
@@ -70,12 +72,167 @@ from dayu.service.entrypoint_runtime import (
     _close_watcher,
 )
 from dayu.service.host_assembly import ServiceAssemblyOverrides, ServiceRunOverrides
+from dayu.service.scene_context import (
+    CURRENT_TIME_SLOT,
+    FINS_DEFAULT_SUBJECT_SLOT,
+    EntrypointContextSlotRequest,
+    build_entrypoint_context_slot_values,
+    current_time,
+    fins_default_subject,
+)
+import dayu.service.scene_context as scene_context
+from dayu.fins.resolver import FmpCompanyInfo, FmpCompanyInfoResolutionError
 
 _PACKAGE_CONFIG_ROOT = Path(__file__).resolve().parents[2] / "dayu" / "config"
 _NOW = datetime(2026, 6, 14, 8, 0, 0, tzinfo=UTC)
 _MODEL_ID = "deepseek-v4-flash"
 _RUNNER_HINT_ID = "interactive"
 _API_KEY = "test-provider-key"
+
+
+class _FakeSceneContextFmpResolver:
+    """scene context 测试用 FMP resolver。"""
+
+    api_key: str
+    timeout_seconds: float
+
+    def __init__(self, *, api_key: str, timeout_seconds: float) -> None:
+        """初始化 fake resolver。
+
+        :param api_key: 调用方传入的 FMP API key。
+        :param timeout_seconds: 调用方传入的 FMP timeout。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.api_key = api_key
+        self.timeout_seconds = timeout_seconds
+
+    def resolve_company_info(self, canonical_ticker: str) -> FmpCompanyInfo:
+        """返回固定公司信息。
+
+        :param canonical_ticker: canonical ticker。
+        :returns: fake 公司信息。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return FmpCompanyInfo(
+            canonical_ticker=canonical_ticker,
+            company_name="Visa Inc.",
+            ticker_aliases=(canonical_ticker,),
+        )
+
+
+class _FailingSceneContextFmpResolver:
+    """scene context 测试用失败 FMP resolver。"""
+
+    def __init__(self, *, api_key: str, timeout_seconds: float) -> None:
+        """初始化失败 resolver。
+
+        :param api_key: 调用方传入的 FMP API key。
+        :param timeout_seconds: 调用方传入的 FMP timeout。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        del api_key, timeout_seconds
+
+    def resolve_company_info(self, canonical_ticker: str) -> FmpCompanyInfo:
+        """模拟 FMP 解析失败。
+
+        :param canonical_ticker: canonical ticker。
+        :returns: 不返回；始终抛出异常。
+        :raises FmpCompanyInfoResolutionError: 始终抛出。
+        """
+
+        del canonical_ticker
+        raise FmpCompanyInfoResolutionError("boom")
+
+
+def test_scene_context_formats_subject_and_current_time() -> None:
+    """scene context helper 应生成自解释的 LLM-facing 中文 slot 文本。"""
+
+    assert fins_default_subject(None) == ""
+    assert fins_default_subject(" v ") == "# 当前分析对象\n你正在分析的是 V。"
+    assert (
+        fins_default_subject("V", company_name="Visa Inc.")
+        == "# 当前分析对象\n你正在分析的是 V（Visa Inc.）。"
+    )
+    assert (
+        current_time(datetime(2026, 7, 7, 15, 8, tzinfo=UTC))
+        == "# 当前时间\n"
+        "现在是 2026年7月7日 23:08（Asia/Shanghai，星期二）。\n"
+        "这是对话开始时的当前时间；回答“现在/今天/当前时间”默认使用它；该时间不会自动更新。"
+    )
+    assert (
+        current_time(datetime(2026, 7, 7, 15, 8))
+        == "# 当前时间\n"
+        "现在是 2026年7月7日 15:08（Asia/Shanghai，星期二）。\n"
+        "这是对话开始时的当前时间；回答“现在/今天/当前时间”默认使用它；该时间不会自动更新。"
+    )
+
+
+def test_build_entrypoint_context_slot_values_resolves_fmp_company_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """有 FMP key 时 Service helper 应用公司名增强 subject 文本。"""
+
+    monkeypatch.setattr(scene_context, "FmpCompanyInfoResolver", _FakeSceneContextFmpResolver)
+
+    values = build_entrypoint_context_slot_values(
+        EntrypointContextSlotRequest(
+            ticker="V",
+            now=datetime(2026, 7, 7, 15, 8),
+            fmp_api_key="test-fmp-key",
+            fmp_timeout_seconds=2.0,
+        )
+    )
+
+    assert values[FINS_DEFAULT_SUBJECT_SLOT] == "# 当前分析对象\n你正在分析的是 V（Visa Inc.）。"
+    assert (
+        values[CURRENT_TIME_SLOT]
+        == "# 当前时间\n"
+        "现在是 2026年7月7日 15:08（Asia/Shanghai，星期二）。\n"
+        "这是对话开始时的当前时间；回答“现在/今天/当前时间”默认使用它；该时间不会自动更新。"
+    )
+
+
+def test_build_entrypoint_context_slot_values_falls_back_without_fmp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """缺 key 或 FMP 失败时 subject 应回退到 ticker-only 且不暴露错误文本。"""
+
+    no_key_values = build_entrypoint_context_slot_values(
+        EntrypointContextSlotRequest(
+            ticker=None,
+            now=datetime(2026, 7, 7, 15, 8),
+            fmp_api_key=None,
+        )
+    )
+    assert no_key_values[FINS_DEFAULT_SUBJECT_SLOT] == ""
+    assert "未指定具体公司" not in str(no_key_values[FINS_DEFAULT_SUBJECT_SLOT])
+
+    no_key_bad_timeout_values = build_entrypoint_context_slot_values(
+        EntrypointContextSlotRequest(
+            ticker="V",
+            now=datetime(2026, 7, 7, 15, 8),
+            fmp_api_key=None,
+            fmp_timeout_seconds=0,
+        )
+    )
+    assert no_key_bad_timeout_values[FINS_DEFAULT_SUBJECT_SLOT] == "# 当前分析对象\n你正在分析的是 V。"
+
+    monkeypatch.setattr(scene_context, "FmpCompanyInfoResolver", _FailingSceneContextFmpResolver)
+    failed_values = build_entrypoint_context_slot_values(
+        EntrypointContextSlotRequest(
+            ticker="V",
+            now=datetime(2026, 7, 7, 15, 8),
+            fmp_api_key="test-fmp-key",
+        )
+    )
+
+    assert failed_values[FINS_DEFAULT_SUBJECT_SLOT] == "# 当前分析对象\n你正在分析的是 V。"
+    assert "boom" not in str(failed_values[FINS_DEFAULT_SUBJECT_SLOT])
 
 
 @dataclass(frozen=True, slots=True)
@@ -455,7 +612,7 @@ async def test_prepare_entrypoint_runtime_assembles_scene_tools_and_host(
     result = await _prepare_runtime(tmp_path)
 
     assert isinstance(result, EntrypointRuntimeResult)
-    assert result.locations.config_overlay_dir == tmp_path / "workspace" / "config"
+    assert result.locations.config_overlay_dir == tmp_path / "config"
     assert result.scene_inputs.tool_selection.tool_names == frozenset({"record_smoke_fact"})
     assert result.host_assembly.options.ordinary_run_baseline.runner_options.stream is True
 
@@ -670,6 +827,43 @@ async def test_submit_entrypoint_turn_emits_host_public_activity(
     assert activity.counts.completed == 2
     assert activity.counts.failed == 0
     assert activity.counts.cancelled == 0
+
+
+@pytest.mark.asyncio
+async def test_submit_entrypoint_turn_emits_host_public_thinking(
+    tmp_path: Path,
+) -> None:
+    """submit helper 应把目标 Run 的 Host public thinking 投影给 callback。"""
+
+    runtime = await _prepare_runtime(tmp_path)
+    thinking_events: list[EntrypointThinking] = []
+    fake_host = _FakeHost(
+        submit_events=(
+            _thinking_event(
+                event_sequence=2,
+                run_id="run-1",
+                dedupe_key="thinking-run-1",
+            ),
+            _terminal_event(event_sequence=3, run_id="run-1"),
+        )
+    )
+
+    result = await submit_entrypoint_turn_and_wait(
+        cast(Host, fake_host),
+        request=_turn_request(),
+        scene_inputs=runtime.scene_inputs,
+        host_assembly=runtime.host_assembly,
+        on_thinking=thinking_events.append,
+    )
+
+    assert result.source is EntrypointTerminalSource.LIVE_EVENT
+    assert result.terminal_event_id == "terminal-run-1-3"
+    assert len(thinking_events) == 1
+    thinking = thinking_events[0]
+    assert thinking.run_id == "run-1"
+    assert thinking.event_sequence == 2
+    assert thinking.dedupe_key == "thinking-run-1"
+    assert thinking.text_delta == "正在分析收入变化"
 
 
 @pytest.mark.asyncio
@@ -1630,8 +1824,8 @@ async def _prepare_runtime(tmp_path: Path) -> EntrypointRuntimeResult:
             explicit_config_dir=None,
             scene_id="smoke_host_public_multiturn",
             context_slot_values={
+                CURRENT_TIME_SLOT: current_time(_NOW),
                 "fins_default_subject": "测试财报主体",
-                "base_user": "service-entrypoint-test",
             },
             assembly_overrides=ServiceAssemblyOverrides(
                 host_runtime_id="local",
@@ -1652,7 +1846,7 @@ def _write_tool_discovery_overlay(workspace_root: Path) -> None:
     :raises OSError: 目录或文件写入失败时抛出。
     """
 
-    target_path = workspace_root / "workspace" / "config" / "tool_discovery.json"
+    target_path = workspace_root / "config" / "tool_discovery.json"
     target_path.parent.mkdir(parents=True, exist_ok=True)
     target_path.write_text(
         json.dumps(
@@ -1889,6 +2083,39 @@ def _activity_event(
                 cancelled=0,
             ),
         ),
+        dedupe_key=dedupe_key,
+        terminal_status=None,
+        final_answer=None,
+        error_message=None,
+        cancel_reason=None,
+    )
+
+
+def _thinking_event(
+    *,
+    event_sequence: int,
+    run_id: str,
+    dedupe_key: str,
+) -> HostEvent:
+    """构造带 Host public thinking 的 progress HostEvent。
+
+    :param event_sequence: event sequence。
+    :param run_id: Run id。
+    :param dedupe_key: Host public dedupe key。
+    :returns: HostEvent。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return HostEvent(
+        event_id=f"thinking-{run_id}-{event_sequence}",
+        event_sequence=event_sequence,
+        session_id="session-1",
+        run_id=run_id,
+        event_class=HostEventClass.PREVIEW,
+        event_type="REASONING_DELTA",
+        kind=HostEventKind.PROGRESS,
+        activity=None,
+        thinking=HostThinkingView(text_delta="正在分析收入变化"),
         dedupe_key=dedupe_key,
         terminal_status=None,
         final_answer=None,

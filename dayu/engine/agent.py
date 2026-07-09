@@ -69,6 +69,8 @@ from dayu.engine.contracts.engine_events import (
     RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION,
     RUN_SUSPENDED_REASON_TOOL_AWAITING,
     ReasoningDeltaData,
+    RunnerInputMessageProjection,
+    RunnerInputToolCallProjection,
     RunCancelledData,
     RunFailedData,
     RunSuspendedData,
@@ -253,6 +255,78 @@ def _message_role_values(messages: Sequence[AgentMessage]) -> tuple[str, ...]:
     """
 
     return tuple(message.role.value for message in messages)
+
+
+def _runner_input_projection(
+    messages: Sequence[AgentMessage],
+) -> tuple[RunnerInputMessageProjection, ...]:
+    """构造本轮实际 Runner 输入消息的中性投影。
+
+    :param messages: 即将传给 Runner 的消息序列。
+    :returns: 按原顺序排列的 LLM-facing message 投影。
+    :raises AssertionError: AgentMessage 封闭联合出现未处理成员时抛出。
+    """
+
+    return tuple(
+        _runner_input_message_projection(index=index, message=message)
+        for index, message in enumerate(messages)
+    )
+
+
+def _runner_input_message_projection(
+    *,
+    index: int,
+    message: AgentMessage,
+) -> RunnerInputMessageProjection:
+    """构造单条 Runner 输入消息投影。
+
+    :param index: 消息顺序。
+    :param message: Runner 输入消息。
+    :returns: 单条 message projection。
+    :raises AssertionError: AgentMessage 封闭联合出现未处理成员时抛出。
+    """
+
+    match message:
+        case SystemMessage(content=content):
+            return RunnerInputMessageProjection(
+                index=index,
+                role=message.role.value,
+                content=content,
+                tool_call_id=None,
+                tool_calls=(),
+            )
+        case UserMessage(content=content):
+            return RunnerInputMessageProjection(
+                index=index,
+                role=message.role.value,
+                content=content,
+                tool_call_id=None,
+                tool_calls=(),
+            )
+        case AssistantMessage(content=content, tool_calls=tool_calls):
+            return RunnerInputMessageProjection(
+                index=index,
+                role=message.role.value,
+                content=content,
+                tool_call_id=None,
+                tool_calls=tuple(
+                    RunnerInputToolCallProjection(
+                        tool_call_id=tool_call.id,
+                        name=tool_call.name,
+                        arguments=dict(tool_call.arguments),
+                    )
+                    for tool_call in tool_calls
+                ),
+            )
+        case ToolMessage(tool_call_id=tool_call_id, content=content):
+            return RunnerInputMessageProjection(
+                index=index,
+                role=message.role.value,
+                content=content,
+                tool_call_id=tool_call_id,
+                tool_calls=(),
+            )
+    assert_never(message)
 
 
 def _fallback_error_message(error_code: str) -> str:
@@ -1125,6 +1199,7 @@ class _AsyncAgent:
                 runner_input_serializer_schema_version=(
                     RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
                 ),
+                input_projection=_runner_input_projection(messages),
             ),
             occurred_at=_utc_now(),
         )

@@ -1281,17 +1281,17 @@ async def test_direct_download_projects_adapter_file_progress_events(
 
 
 @pytest.mark.asyncio
-async def test_direct_download_result_details_do_not_double_display_rejected_skips(
+async def test_direct_download_result_details_preserve_exclusive_skipped_count(
     tmp_path: Path,
 ) -> None:
-    """direct download summary 展示应避免 skipped/rejected 重复表达同一批拒绝项。"""
+    """direct download summary 展示应保留互斥 skipped 计数。"""
 
     workspace_root = tmp_path / "fins-workspace"
     adapter = _PersistedSummaryDownloadAdapter(
         FinsDownloadResultSummary(
-            discovered_count=17,
+            discovered_count=18,
             downloaded_count=15,
-            skipped_count=2,
+            skipped_count=1,
             rejected_count=2,
             failed_count=0,
             written_document_ids=tuple(f"fil-{index}" for index in range(15)),
@@ -1310,9 +1310,9 @@ async def test_direct_download_result_details_do_not_double_display_rejected_ski
 
     assert result_event.result is not None
     assert {detail.label: detail.value for detail in result_event.result.details} == {
-        "discovered": "17",
+        "discovered": "18",
         "downloaded": "15",
-        "skipped": "0",
+        "skipped": "1",
         "rejected": "2",
         "failed": "0",
         "written documents": "15",
@@ -2236,6 +2236,44 @@ def test_abandon_cancelled_prepared_observation_releases_handle_before_activatio
     assert cancelled.status is FinsObservationStatus.CANCELLED
     assert polled.status is FinsObservationStatus.LOST
     assert executor.operations == []
+
+
+def test_abandoned_observation_does_not_pollute_repeat_download_observation(
+    tmp_path: Path,
+) -> None:
+    """旧 observation abandon 后，第二次同类下载 observation 应独立完成。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    adapter = _FakeDownloadAdapter()
+    runtime = _build_ingestion_runtime(
+        workspace_root,
+        executor=executor,
+        download_adapters={("fake", "US"): adapter},
+    )
+    first = runtime.prepare_observed_download(
+        FinsDownloadRequest(ticker="AAPL", source="fake"),
+        cancellation_token=_NeverCancelledToken(),
+    )
+
+    runtime.activate_observation(first)
+    first_cancelled = asyncio.run(runtime.cancel_observation(first))
+    asyncio.run(runtime.abandon_observation(first))
+    second = runtime.prepare_observed_download(
+        FinsDownloadRequest(ticker="AAPL", source="fake"),
+        cancellation_token=_NeverCancelledToken(),
+    )
+    runtime.activate_observation(second)
+    executor.run_all()
+    first_polled = asyncio.run(runtime.poll_observation(first))
+    second_polled = asyncio.run(runtime.poll_observation(second))
+
+    assert first_cancelled.status is FinsObservationStatus.PENDING
+    assert first_polled.status is FinsObservationStatus.LOST
+    assert second_polled.status is FinsObservationStatus.SUCCEEDED
+    assert second_polled.result is not None
+    assert second_polled.result.status is FinsResultStatus.SUCCESS
+    assert [request.source for request in adapter.requests] == ["fake"]
 
 
 def test_abandon_submitted_observation_cancels_and_keeps_storage_artifacts(

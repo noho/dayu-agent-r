@@ -24,15 +24,11 @@ from dayu.cli.exit_codes import (
     EXIT_USAGE_ERROR,
 )
 from dayu.runtime.config_loader import config_file_names, legacy_config_file_names
+from dayu.runtime.workspace_paths import WorkspacePaths, workspace_paths
 
 _BASE_OPTION: Final[str] = "--base"
 _PACKAGE_CONFIG_ROOT: Final[Path] = Path(__file__).resolve().parents[2] / "config"
-_WORKSPACE_CONFIG_DIR_NAME: Final[str] = "config"
 _PROMPTS_DIR_NAME: Final[str] = "prompts"
-_DAYU_DIR_NAME: Final[str] = ".dayu"
-_HOST_DIR_NAME: Final[str] = "host"
-_ARTIFACTS_DIR_NAME: Final[str] = "artifacts"
-_WEB_TOOLS_STORAGE_STATES_DIR_NAME: Final[str] = "web_tools_storage_states"
 _TEMP_FILE_PREFIX: Final[str] = ".dayu-init-"
 _RESET_CONTAINMENT_ERROR_TEMPLATE: Final[str] = (
     "dayu-cli init: reset whitelist path escapes workspace: {path}"
@@ -84,10 +80,11 @@ def run_init_command(args: ParsedCliArgs) -> int:
     try:
         workspace_root = _resolve_workspace_root(args.workspace_root)
         _ensure_workspace_root(workspace_root)
+        paths = workspace_paths(workspace_root)
         if args.reset:
-            removed_count = _reset_workspace_paths(workspace_root=workspace_root)
+            removed_count = _reset_workspace_paths(paths=paths)
             print(_RESET_TEMPLATE.format(count=removed_count))
-        config_dir = workspace_root / _WORKSPACE_CONFIG_DIR_NAME
+        config_dir = paths.config_dir
         _copy_current_config_assets(
             workspace_config_dir=config_dir,
             package_config_root=_PACKAGE_CONFIG_ROOT,
@@ -146,7 +143,7 @@ def _copy_current_config_assets(
 ) -> None:
     """复制当前 schema 配置文件与 prompt assets 到 workspace。
 
-    :param workspace_config_dir: workspace/config 目标目录。
+    :param workspace_config_dir: workspace root 下的 config 目标目录。
     :param package_config_root: 包内 dayu/config 根目录。
     :param overwrite: 是否允许覆盖已有目标文件。
     :returns: ``None``。
@@ -171,7 +168,7 @@ def _collect_current_config_assets(
 ) -> tuple[_CopyAsset, ...]:
     """收集当前 schema 需要复制的配置资产。
 
-    :param workspace_config_dir: workspace/config 目标目录。
+    :param workspace_config_dir: workspace root 下的 config 目标目录。
     :param package_config_root: 包内 dayu/config 根目录。
     :returns: 待复制文件列表。
     :raises CliInitOperationError: 必需源文件或 prompts 目录缺失时抛出。
@@ -265,18 +262,18 @@ def _copy_file_atomic(*, source: Path, destination: Path) -> None:
         raise
 
 
-def _reset_workspace_paths(*, workspace_root: Path) -> int:
+def _reset_workspace_paths(*, paths: WorkspacePaths) -> int:
     """按硬编码白名单删除 workspace 内可重建路径。
 
-    :param workspace_root: 已解析的 workspace root。
+    :param paths: workspace 路径公共契约。
     :returns: 实际删除的路径数量。
     :raises CliInitUsageError: 白名单路径 symlink 或 resolve 后逃逸时抛出。
     :raises OSError: 删除失败时抛出。
     """
 
-    reset_paths = _reset_whitelist_paths(workspace_root)
+    reset_paths = _reset_whitelist_paths(paths)
     _validate_reset_whitelist_paths(
-        workspace_root=workspace_root,
+        workspace_root=paths.workspace_root,
         reset_paths=reset_paths,
     )
     removed_count = 0
@@ -288,20 +285,19 @@ def _reset_workspace_paths(*, workspace_root: Path) -> int:
     return removed_count
 
 
-def _reset_whitelist_paths(workspace_root: Path) -> tuple[Path, ...]:
+def _reset_whitelist_paths(paths: WorkspacePaths) -> tuple[Path, ...]:
     """返回 reset 允许删除的硬编码路径。
 
-    :param workspace_root: workspace root。
+    :param paths: workspace 路径公共契约。
     :returns: reset 白名单路径元组。
     :raises Exception: 不主动抛出异常。
     """
 
-    dayu_root = workspace_root / _DAYU_DIR_NAME
     return (
-        workspace_root / _WORKSPACE_CONFIG_DIR_NAME,
-        dayu_root / _HOST_DIR_NAME,
-        dayu_root / _ARTIFACTS_DIR_NAME,
-        dayu_root / _WEB_TOOLS_STORAGE_STATES_DIR_NAME,
+        paths.config_dir,
+        paths.host_dir,
+        paths.artifact_root,
+        paths.web_tools_storage_state_dir,
     )
 
 

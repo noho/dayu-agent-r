@@ -11,7 +11,12 @@ from pathlib import Path
 from typing import BinaryIO, Optional, cast
 
 from dayu.fins.domain.document_models import FileObjectMeta
-from dayu.fins.downloaders.sec_downloader import DownloaderEvent, RemoteFileDescriptor, SecDownloader
+from dayu.fins.downloaders.sec_downloader import (
+    DownloaderEvent,
+    RemoteFileDescriptor,
+    SecDownloadCancelledError,
+    SecDownloader,
+)
 from dayu.fins.ingestion_runtime import FinsDownloadProgressEvent
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.pipelines.sec_pipeline import (
@@ -59,16 +64,46 @@ class StreamStubDownloader(SecDownloader):
 
         return ticker.strip().upper()
 
-    async def resolve_company(self, ticker: str) -> tuple[str, str, str]:
-        """返回固定公司信息。"""
+    async def resolve_company(
+        self,
+        ticker: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> tuple[str, str, str]:
+        """返回固定公司信息。
 
-        del ticker
+        Args:
+            ticker: 股票代码。
+            cancellation_checker: 可选取消检查器。
+
+        Returns:
+            `(cik, company_name, cik10)`。
+
+        Raises:
+            无。
+        """
+
+        del ticker, cancellation_checker
         return ("320193", "Apple Inc.", "0000320193")
 
-    async def fetch_submissions(self, cik10: str) -> dict[str, JsonValue]:
-        """返回固定 submissions。"""
+    async def fetch_submissions(
+        self,
+        cik10: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> dict[str, JsonValue]:
+        """返回固定 submissions。
 
-        del cik10
+        Args:
+            cik10: 10 位 CIK。
+            cancellation_checker: 可选取消检查器。
+
+        Returns:
+            submissions JSON。
+
+        Raises:
+            无。
+        """
+
+        del cik10, cancellation_checker
         return {
             "filings": {
                 "recent": {
@@ -91,10 +126,37 @@ class StreamStubDownloader(SecDownloader):
         include_xbrl: bool = True,
         include_exhibits: bool = True,
         include_http_metadata: bool = True,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> list[RemoteFileDescriptor]:
-        """返回固定远端文件列表。"""
+        """返回固定远端文件列表。
 
-        del cik, accession_no_dash, primary_document, form_type, include_xbrl, include_exhibits, include_http_metadata
+        Args:
+            cik: CIK。
+            accession_no_dash: accession。
+            primary_document: 主文件名。
+            form_type: 表单类型。
+            include_xbrl: 是否包含 XBRL。
+            include_exhibits: 是否包含 exhibits。
+            include_http_metadata: 是否拉取 HTTP 元数据。
+            cancellation_checker: 可选取消检查器。
+
+        Returns:
+            远端文件描述列表。
+
+        Raises:
+            无。
+        """
+
+        del (
+            cik,
+            accession_no_dash,
+            primary_document,
+            form_type,
+            include_xbrl,
+            include_exhibits,
+            include_http_metadata,
+            cancellation_checker,
+        )
         return [
             RemoteFileDescriptor(
                 name="sample-10k.htm",
@@ -113,10 +175,11 @@ class StreamStubDownloader(SecDownloader):
         store_file: Callable[[str, BinaryIO], FileObjectMeta],
         existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
         primary_document: Optional[str] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> AsyncIterator[DownloaderEvent]:
         """输出单文件下载事件。"""
 
-        del overwrite, existing_files, primary_document
+        del overwrite, existing_files, primary_document, cancellation_checker
         descriptor = remote_files[0]
         yield DownloaderEvent(
             event_type="file_download_started",
@@ -150,10 +213,37 @@ class StreamXbrlStubDownloader(StreamStubDownloader):
         include_xbrl: bool = True,
         include_exhibits: bool = True,
         include_http_metadata: bool = True,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> list[RemoteFileDescriptor]:
-        """返回 HTML 与 XBRL instance 两个远端文件。"""
+        """返回 HTML 与 XBRL instance 两个远端文件。
 
-        del cik, accession_no_dash, primary_document, form_type, include_xbrl, include_exhibits, include_http_metadata
+        Args:
+            cik: CIK。
+            accession_no_dash: accession。
+            primary_document: 主文件名。
+            form_type: 表单类型。
+            include_xbrl: 是否包含 XBRL。
+            include_exhibits: 是否包含 exhibits。
+            include_http_metadata: 是否拉取 HTTP 元数据。
+            cancellation_checker: 可选取消检查器。
+
+        Returns:
+            远端文件描述列表。
+
+        Raises:
+            无。
+        """
+
+        del (
+            cik,
+            accession_no_dash,
+            primary_document,
+            form_type,
+            include_xbrl,
+            include_exhibits,
+            include_http_metadata,
+            cancellation_checker,
+        )
         return [
             RemoteFileDescriptor(
                 name="sample-10k.htm",
@@ -180,10 +270,11 @@ class StreamXbrlStubDownloader(StreamStubDownloader):
         store_file: Callable[[str, BinaryIO], FileObjectMeta],
         existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
         primary_document: Optional[str] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> AsyncIterator[DownloaderEvent]:
         """输出 HTML 与 XBRL instance 两个下载事件。"""
 
-        del overwrite, existing_files, primary_document
+        del overwrite, existing_files, primary_document, cancellation_checker
         payload_by_name = {
             "sample-10k.htm": b"<html>payload</html>",
             "sample_htm.xml": b"<xbrl></xbrl>",
@@ -209,6 +300,114 @@ class StreamXbrlStubDownloader(StreamStubDownloader):
             )
 
 
+class CancelAwareCollectionDownloader(StreamStubDownloader):
+    """用于验证 collection 阶段取消传播的下载器桩。"""
+
+    def __init__(self) -> None:
+        """初始化下载器桩。"""
+
+        super().__init__()
+        self.fetch_json_calls: list[str] = []
+        self.list_filing_files_called = False
+
+    async def fetch_submissions(
+        self,
+        cik10: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> dict[str, JsonValue]:
+        """返回带历史 submissions 文件的响应。
+
+        Args:
+            cik10: 10 位 CIK。
+            cancellation_checker: 可选取消检查器。
+
+        Returns:
+            submissions JSON。
+
+        Raises:
+            无。
+        """
+
+        del cik10, cancellation_checker
+        return {
+            "filings": {
+                "recent": {
+                    "form": ["10-K"],
+                    "filingDate": ["2025-02-01"],
+                    "reportDate": ["2024-12-31"],
+                    "accessionNumber": ["0000000000-25-000001"],
+                    "primaryDocument": ["sample-10k.htm"],
+                },
+                "files": [{"name": "CIK0000320193-submissions-001.json"}],
+            }
+        }
+
+    async def fetch_json(
+        self,
+        url: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> dict[str, JsonValue]:
+        """在历史 submissions 补拉处观察取消。
+
+        Args:
+            url: 请求 URL。
+            cancellation_checker: 可选取消检查器。
+
+        Returns:
+            JSON 字典。
+
+        Raises:
+            SecDownloadCancelledError: 取消检查器命中时抛出。
+        """
+
+        self.fetch_json_calls.append(url)
+        if cancellation_checker is not None and cancellation_checker():
+            raise SecDownloadCancelledError("cancelled during history fetch")
+        return {}
+
+    async def list_filing_files(
+        self,
+        cik: str,
+        accession_no_dash: str,
+        primary_document: str,
+        form_type: str,
+        include_xbrl: bool = True,
+        include_exhibits: bool = True,
+        include_http_metadata: bool = True,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> list[RemoteFileDescriptor]:
+        """记录不应到达的 filing 文件列表调用。
+
+        Args:
+            cik: CIK。
+            accession_no_dash: accession。
+            primary_document: 主文件名。
+            form_type: 表单类型。
+            include_xbrl: 是否包含 XBRL。
+            include_exhibits: 是否包含 exhibits。
+            include_http_metadata: 是否拉取 HTTP 元数据。
+            cancellation_checker: 可选取消检查器。
+
+        Returns:
+            远端文件描述列表。
+
+        Raises:
+            无。
+        """
+
+        self.list_filing_files_called = True
+        return await super().list_filing_files(
+            cik=cik,
+            accession_no_dash=accession_no_dash,
+            primary_document=primary_document,
+            form_type=form_type,
+            include_xbrl=include_xbrl,
+            include_exhibits=include_exhibits,
+            include_http_metadata=include_http_metadata,
+            cancellation_checker=cancellation_checker,
+        )
+
+
 class _SpySourceRepository(FsSourceDocumentRepository):
     """记录 has_filing_xbrl_instance 调用的源文档仓储 spy。"""
 
@@ -225,11 +424,31 @@ class _SpySourceRepository(FsSourceDocumentRepository):
         return super().has_filing_xbrl_instance(ticker, document_id)
 
 
-async def _collect_events(pipeline: SecPipeline, ticker: str) -> list[DownloadEvent]:
-    """收集异步下载事件。"""
+async def _collect_events(
+    pipeline: SecPipeline,
+    ticker: str,
+    cancel_checker: Optional[Callable[[], bool]] = None,
+) -> list[DownloadEvent]:
+    """收集异步下载事件。
+
+    Args:
+        pipeline: 待执行的 SEC pipeline。
+        ticker: 下载 ticker。
+        cancel_checker: 可选取消检查函数。
+
+    Returns:
+        下载事件列表。
+
+    Raises:
+        ValueError: pipeline 参数非法时由下游抛出。
+    """
 
     events: list[DownloadEvent] = []
-    async for event in pipeline.download_stream(ticker=ticker, overwrite=False):
+    async for event in pipeline.download_stream(
+        ticker=ticker,
+        overwrite=False,
+        cancel_checker=cancel_checker,
+    ):
         events.append(event)
     return events
 
@@ -262,6 +481,78 @@ def test_download_stream_emits_ordered_events(tmp_path: Path) -> None:
     assert event_types[-1] == "pipeline_completed"
     final_result = _event_pipeline_result(events[-1])
     assert final_result["summary"]["downloaded"] == 1
+
+
+def test_download_stream_final_status_does_not_recheck_cancel_token(
+    tmp_path: Path,
+) -> None:
+    """最终状态只使用已记录取消路径，不在收尾阶段重读取消 token。"""
+
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=StreamStubDownloader(),
+        processor_registry=build_fins_processor_registry(),
+    )
+    call_count = 0
+
+    def _cancel_on_second_call() -> bool:
+        """第二次读取时才返回取消。
+
+        Args:
+            无。
+
+        Returns:
+            第二次及之后调用返回 ``True``。
+
+        Raises:
+            无。
+        """
+
+        nonlocal call_count
+        call_count += 1
+        return call_count >= 2
+
+    import asyncio
+
+    events = asyncio.run(
+        _collect_events(
+            pipeline,
+            ticker="AAPL",
+            cancel_checker=_cancel_on_second_call,
+        )
+    )
+    final_result = _event_pipeline_result(events[-1])
+
+    assert final_result["status"] == "ok"
+    assert call_count == 1
+
+
+def test_download_stream_cancel_stops_during_collection_before_filing_requests(
+    tmp_path: Path,
+) -> None:
+    """collection 阶段取消后不应继续进入 filing 文件列表请求。"""
+
+    downloader = CancelAwareCollectionDownloader()
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+
+    import asyncio
+
+    events = asyncio.run(
+        _collect_events(
+            pipeline,
+            ticker="AAPL",
+            cancel_checker=lambda: True,
+        )
+    )
+    final_result = _event_pipeline_result(events[-1])
+
+    assert final_result["status"] == "cancelled"
+    assert downloader.fetch_json_calls
+    assert downloader.list_filing_files_called is False
 
 
 def test_download_sync_wrapper_aggregates_stream_result(tmp_path: Path) -> None:

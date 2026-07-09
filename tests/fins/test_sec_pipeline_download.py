@@ -137,11 +137,16 @@ class StubDownloader:
             raise ValueError("ticker 不能为空")
         return normalized
 
-    def resolve_company(self, ticker: str) -> tuple[str, str, str]:
+    def resolve_company(
+        self,
+        ticker: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> tuple[str, str, str]:
         """返回固定公司信息。
 
         Args:
             ticker: 股票代码。
+            cancellation_checker: 可选取消检查器。
 
         Returns:
             `(cik, company_name, cik10)`。
@@ -150,13 +155,19 @@ class StubDownloader:
             无。
         """
 
+        del ticker, cancellation_checker
         return ("320193", "Test Inc.", "0000320193")
 
-    def fetch_submissions(self, cik10: str) -> dict[str, JsonValue]:
+    def fetch_submissions(
+        self,
+        cik10: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> dict[str, JsonValue]:
         """返回固定 submissions。
 
         Args:
             cik10: 10 位 CIK。
+            cancellation_checker: 可选取消检查器。
 
         Returns:
             submissions JSON。
@@ -165,6 +176,7 @@ class StubDownloader:
             无。
         """
 
+        del cik10, cancellation_checker
         return self._submissions
 
     def list_filing_files(
@@ -176,6 +188,7 @@ class StubDownloader:
         include_xbrl: bool = True,
         include_exhibits: bool = True,
         include_http_metadata: bool = True,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> list[RemoteFileDescriptor]:
         """返回固定远端文件列表。
 
@@ -187,6 +200,7 @@ class StubDownloader:
             include_xbrl: 是否含 XBRL。
             include_exhibits: 是否含 exhibits。
             include_http_metadata: 是否拉取 HTTP 元数据。
+            cancellation_checker: 可选取消检查器。
 
         Returns:
             远端文件描述列表。
@@ -196,7 +210,16 @@ class StubDownloader:
         """
 
         self.list_filing_files_call_count += 1
-        del cik, accession_no_dash, primary_document, form_type, include_xbrl, include_exhibits, include_http_metadata
+        del (
+            cik,
+            accession_no_dash,
+            primary_document,
+            form_type,
+            include_xbrl,
+            include_exhibits,
+            include_http_metadata,
+            cancellation_checker,
+        )
         return self._remote_files
 
     def download_files(
@@ -206,6 +229,7 @@ class StubDownloader:
         store_file: Callable[[str, BinaryIO], FileObjectMeta],
         existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
         primary_document: Optional[str] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> list[DownloadFileResult]:
         """模拟下载并返回文件元数据。
 
@@ -214,6 +238,8 @@ class StubDownloader:
             overwrite: 是否覆盖。
             store_file: 文件存储回调。
             existing_files: 既有文件映射。
+            primary_document: 主文档文件名。
+            cancellation_checker: 可选取消检查器。
 
         Returns:
             下载结果列表。
@@ -223,7 +249,7 @@ class StubDownloader:
         """
 
         self.download_files_called = True
-        del remote_files, overwrite, existing_files, primary_document
+        del remote_files, overwrite, existing_files, primary_document, cancellation_checker
         results: list[DownloadFileResult] = []
         for item in self._download_results:
             name = str(item.get("name", ""))
@@ -237,11 +263,16 @@ class StubDownloader:
                 results.append(item)
         return results
 
-    def fetch_file_bytes(self, url: str) -> bytes:
+    def fetch_file_bytes(
+        self,
+        url: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> bytes:
         """模拟预下载文件内容。
 
         Args:
             url: 文件 URL。
+            cancellation_checker: 可选取消检查器。
 
         Returns:
             文件内容字节。
@@ -250,15 +281,23 @@ class StubDownloader:
             无。
         """
 
+        del cancellation_checker
         self.fetch_file_calls.append(url)
         filename = url.rsplit("/", 1)[-1]
         return self._content_by_name.get(filename, f"prefetch:{filename}".encode("utf-8"))
 
-    def fetch_browse_edgar_filenum(self, filenum: str) -> list[BrowseEdgarFiling]:
+    def fetch_browse_edgar_filenum(
+        self,
+        filenum: str,
+        count: int = 100,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> list[BrowseEdgarFiling]:
         """模拟 browse-edgar 拉取。
 
         Args:
             filenum: filenum。
+            count: 拉取条数上限。
+            cancellation_checker: 可选取消检查器。
 
         Returns:
             filings 列表。
@@ -267,11 +306,18 @@ class StubDownloader:
             无。
         """
 
+        del count, cancellation_checker
         self.browse_calls.append(filenum)
         return self._browse_entries
 
 
-    def resolve_primary_document(self, cik: str, accession_no_dash: str, form_type: str) -> str:
+    def resolve_primary_document(
+        self,
+        cik: str,
+        accession_no_dash: str,
+        form_type: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> str:
         """模拟解析 primary_document。
 
         Args:
@@ -286,10 +332,16 @@ class StubDownloader:
             无。
         """
 
+        del cancellation_checker
         key = f"{cik}:{accession_no_dash}:{form_type}"
         return self._primary_documents.get(key, "primary.htm")
 
-    def fetch_sc13_party_roles(self, archive_cik: str, accession_number: str) -> Optional[Sc13PartyRoles]:
+    def fetch_sc13_party_roles(
+        self,
+        archive_cik: str,
+        accession_number: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> Optional[Sc13PartyRoles]:
         """模拟解析 SC13 方向角色。
 
         Args:
@@ -303,7 +355,7 @@ class StubDownloader:
             无。
         """
 
-        del archive_cik
+        del archive_cik, cancellation_checker
         self.sc13_role_calls.append(accession_number)
         if accession_number in self._sc13_roles_by_accession:
             role_pair = self._sc13_roles_by_accession[accession_number]
@@ -325,6 +377,7 @@ class StreamStubDownloader(StubDownloader):
         store_file: Callable[[str, BinaryIO], FileObjectMeta],
         existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
         primary_document: Optional[str] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> AsyncIterator[DownloaderEvent]:
         """模拟流式下载并在每个文件结果前产出 started 事件。
 
@@ -334,6 +387,7 @@ class StreamStubDownloader(StubDownloader):
             store_file: 文件存储回调。
             existing_files: 既有文件映射。
             primary_document: 主文档文件名。
+            cancellation_checker: 可选取消检查器。
 
         Yields:
             文件 started 事件与终态文件事件。
@@ -343,7 +397,7 @@ class StreamStubDownloader(StubDownloader):
         """
 
         self.download_files_called = True
-        del remote_files, overwrite, existing_files, primary_document
+        del remote_files, overwrite, existing_files, primary_document, cancellation_checker
         for item in self._download_results:
             name = str(item.get("name", ""))
             source_url = str(item.get("source_url", ""))
@@ -438,37 +492,47 @@ class RebuildOnlyDownloader:
             raise ValueError("ticker 不能为空")
         return normalized
 
-    def resolve_company(self, ticker: str) -> tuple[str, str, str]:
+    def resolve_company(
+        self,
+        ticker: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> tuple[str, str, str]:
         """重建模式不应触发远端公司解析。
 
         Args:
             ticker: 股票代码。
+            cancellation_checker: 可选取消检查器。
 
         Returns:
-            无。
+            不返回；被调用时会抛出异常。
 
         Raises:
             AssertionError: 被调用时抛出。
         """
 
-        del ticker
+        del ticker, cancellation_checker
         self.network_called = True
         raise AssertionError("rebuild 模式不应调用 resolve_company")
 
-    def fetch_submissions(self, cik10: str) -> dict[str, JsonValue]:
+    def fetch_submissions(
+        self,
+        cik10: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> dict[str, JsonValue]:
         """重建模式不应触发 submissions 拉取。
 
         Args:
             cik10: 10 位 CIK。
+            cancellation_checker: 可选取消检查器。
 
         Returns:
-            无。
+            不返回；被调用时会抛出异常。
 
         Raises:
             AssertionError: 被调用时抛出。
         """
 
-        del cik10
+        del cik10, cancellation_checker
         self.network_called = True
         raise AssertionError("rebuild 模式不应调用 fetch_submissions")
 
@@ -1395,6 +1459,77 @@ def test_sec_download_adapter_counts_6k_filtered_as_rejected_in_persisted_summar
     assert summary.rejected_count == 1
     assert summary.skipped_count == 0
     assert summary.downloaded_count == 0
+
+
+def test_sec_download_adapter_summary_classifies_skipped_and_rejected_exclusively() -> None:
+    """SEC adapter summary 应互斥统计真实跳过与 rejected filing。"""
+
+    result: sec_pipeline.SecPipelineDownloadResult = {
+        "pipeline": "sec_download",
+        "action": "download",
+        "status": "ok",
+        "ticker": "ATAT",
+        "market_profile": {},
+        "filters": {},
+        "warnings": [],
+        "filings": [
+            {
+                "document_id": "fil-downloaded",
+                "status": "downloaded",
+            },
+            {
+                "document_id": "fil-already-complete",
+                "status": "skipped",
+                "skip_reason": "already_downloaded_complete",
+                "reason_code": "already_downloaded_complete",
+            },
+            {
+                "document_id": "fil-filtered-6k",
+                "status": "skipped",
+                "skip_reason": "6k_filtered",
+                "reason_code": "6k_filtered",
+            },
+            {
+                "document_id": "fil-failed",
+                "status": "failed",
+            },
+            {
+                "document_id": "fil-unknown-status",
+                "status": "provider_new_status",
+            },
+        ],
+        "summary": {
+            "total": 999,
+            "downloaded": 1,
+            "skipped": 2,
+            "rejected": 1,
+            "failed": 99,
+            "elapsed_ms": 42,
+            "reused_downloads": 0,
+            "converted": 0,
+        },
+    }
+
+    summary = sec_pipeline._summary_from_pipeline_result(result)
+
+    assert summary.discovered_count == 5
+    assert summary.downloaded_count == 1
+    assert summary.skipped_count == 1
+    assert summary.rejected_count == 1
+    assert summary.failed_count == 2
+    assert summary.discovered_count == (
+        summary.downloaded_count
+        + summary.skipped_count
+        + summary.rejected_count
+        + summary.failed_count
+    )
+    assert (
+        summary.discovered_count
+        == summary.downloaded_count
+        + summary.skipped_count
+        + summary.rejected_count
+        + summary.failed_count
+    )
 
 
 def test_sec_pipeline_keeps_6k_results_release(tmp_path: Path) -> None:

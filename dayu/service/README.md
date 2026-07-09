@@ -11,6 +11,7 @@
 - `dayu.service.host_assembly.compose_submit_followup_request_with_overrides(...)`：在同一 assembly 真源内把可映射的单次 Run override 合并为完整 `runner_options` 与 `agent_policy`。
 - `dayu.service.wait_callback_endpoint.handle_wait_callback_completion(...)`：framework-neutral wait callback completion transport mapper；真实 Web router 只把 path wait id、headers 与已解析 JSON body 传入该函数，mapper 负责 transport 校验、Host callback envelope 构造和 HTTP-like status/body 映射，不注册真实路由。
 - `dayu.service.entrypoint_runtime`：为 product entrypoint 提供 reusable Agent runtime helper，覆盖 runtime 准备、Session ensure/create、submit 前 live watcher attach、terminal observation outbox fallback、interactive existing-session startup reconnect、cancel request 构造与 watcher failure 诊断；该模块不解析 CLI 参数，不保存 CLI cursor，不处理 stdout/stderr，也不安装 signal handler。
+- `dayu.service.scene_context`：为 product entrypoint 生成 LLM-facing context slot 文本，覆盖财报分析对象、当前时间、显式 FMP key 下的公司名增强和 FMP 失败时的 ticker-only fallback；该模块不读取 CLI 参数，不向 LLM 投影 FMP 错误文本。
 - `dayu.service.fins_direct`：为 product entrypoint 提供 reusable Fins direct stream helper，覆盖 download / preprocess / upload 的 typed request 构造、`AsyncIterator[FinsEvent]` 透传、terminal result 收口和 operation-scoped cancellation；该模块不解析 CLI 参数，不处理 stdout/stderr，也不读取 Fins storage。
 
 `compose_open_host_options(request)` 会把选中的 execution profile 映射为 Host typed inputs：`tool_truncation_policy` 决定 ToolRuntime 截断默认值，`tool_duplicate_governance_policy` 决定 `HostToolingOptions.duplicate_governance_policy`，`agent_policy` 决定 ordinary run baseline 的 Agent loop policy。
@@ -20,7 +21,9 @@ Service 从模型配置构造 `RunnerSpec` 时默认启用 OpenAI-compatible cli
 
 `discover_service_tools(...)` 返回的 `ServiceDiscoveredTools` 会携带本次 discovery 实际使用的 effective provider configs。`compose_open_host_options(...)` 复用这份结果绑定 Host tooling / wait adapter，避免工具闭包和等待适配器从两份 raw config 各自推断运行时参数。
 
-`entrypoint_runtime` 的 terminal observation 只使用 Host public API：submit 路径先 attach `watch_session_events(session_id)` 再提交 Run，并可在 Host 接受 Run 后把 `accepted_run_id` 通知调用方用于运行中取消；cancel 路径先通过 `get_run(...)` 读取 public snapshot，已终态时跳过 `cancel_run(...)` 并走 outbox terminal fallback，非终态时在 `cancel_run(...)` 前 attach watcher。Service 不读取 Host durable internals，终态来源会明确标记为 live event 或 outbox read；watcher drain 失败会进入 terminal result 或 observation error 的诊断消息。
+`entrypoint_runtime` 在完成工具发现与 scene prepare 后，会按本次 `PreparedSceneInputs.tool_selection.tool_names` 判断 product entrypoint 是否实际暴露 Fins download / preprocess / upload awaiting 长事务工具；命中时自动为 Host opener 补齐 production `WaitPollerRuntimePolicy`，并复用同一 discovery 结果中的 `HostToolingOptions.wait_poll_adapter_registry`。未选择这些长事务工具的 scene（例如 prompt）保持 no-poller；Host 的默认 `OpenHostOptions.wait_poller_policy=None` 契约不变。
+
+`entrypoint_runtime` 的 terminal observation 只使用 Host public API：submit 路径先 attach `watch_session_events(session_id)` 再提交 Run，并可在 Host 接受 Run 后把 `accepted_run_id` 通知调用方用于运行中取消；cancel 路径先通过 `get_run(...)` 读取 public snapshot，已终态时跳过 `cancel_run(...)` 并走 outbox terminal fallback，非终态时在 `cancel_run(...)` 前 attach watcher。Service 不读取 Host durable internals，终态来源会明确标记为 live event 或 outbox read；watcher drain 失败会进入 terminal result 或 observation error 的诊断消息。submit helper 可把 Host public activity 和 thinking view 分别投影给调用方回调，是否展示由 UI adapter 决定。
 
 `entrypoint_runtime` 的 interactive startup reconnect helper 只编排 Host public API：先 attach `watch_session_events(session_id)` 并缓存 live events，再用调用方提供的 terminal cursor 做 session-scoped Outbox backfill，随后处理 selected Session 的 active Run 与 queued-only bounded promotion barrier；进入输入态前会在 idle snapshot 后再做 tail outbox closure 并 drain watcher，避免 startup terminal 在 idle 边界丢失。Service 不保存 CLI cursor，不按单个 Run 过滤 startup backfill，不把 queued-only 状态静默视为 idle。
 

@@ -145,6 +145,7 @@ from dayu.service.host_assembly import (
     compose_submit_followup_request,
     discover_service_tools,
 )
+from dayu.service.scene_context import CURRENT_TIME_SLOT, current_time
 from utils.smoke_host_public_diagnostics import (
     print_duplicate_governance_diagnostics,
 )
@@ -619,7 +620,7 @@ class PressureMode(StrEnum):
 class SmokeArgs:
     """命令行参数。
 
-    :param workspace_root: workspace / 项目根目录。
+    :param workspace_root: workspace 根目录。
     :param scene_id: 需要装配的 scene id。
     :param execution_profile_id: 可选 execution profile 显式覆盖。
     :param host_runtime_id: 可选 Host runtime 显式覆盖。
@@ -3180,7 +3181,7 @@ def _prepare_runtime_assembly(args: SmokeArgs, *, env: Mapping[str, str]) -> Run
     """
 
     locations = resolve_runtime_locations(
-        project_root=args.workspace_root,
+        workspace_root=args.workspace_root,
         package_config_root=_PACKAGE_CONFIG_ROOT,
     )
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
@@ -3195,7 +3196,7 @@ def _prepare_runtime_assembly(args: SmokeArgs, *, env: Mapping[str, str]) -> Run
             scene_id=args.scene_id,
             scene_manifest_root=locations.scene_manifest_root,
             prompt_asset_root=locations.prompt_asset_root,
-            context_slot_values={},
+            context_slot_values={CURRENT_TIME_SLOT: current_time()},
             available_tools=SceneToolCatalog.from_tool_bundle(discovered_tools.tool_bundle),
         )
     )
@@ -3334,6 +3335,7 @@ def _discover_smoke_service_tools(
             ),
         ),
         effective_provider_configs=discovered.effective_provider_configs,
+        fins_awaiting_runtime=discovered.fins_awaiting_runtime,
     )
 
 

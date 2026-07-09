@@ -17,6 +17,10 @@ from dayu.host.api import HostPayloadRef, WaitProviderStatusRef
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import EventLogRow
 from dayu.host.durable.state import ExternalJobRef, WaitSnapshotRef
+from dayu.runtime.json_redaction import redact_sensitive_json_fields
+
+_PAYLOAD_FIELD_ACCEPTED_ARGUMENTS = "accepted_arguments"
+_PAYLOAD_FIELD_ACCEPTED_ARGUMENTS_SOURCE_DIGEST = "accepted_arguments_source_digest"
 
 
 def tool_awaiting_payload(
@@ -29,6 +33,8 @@ def tool_awaiting_payload(
     wait_id: str,
     tool_call_id: str,
     tool_name: str,
+    normalized_arguments_digest: str,
+    accepted_arguments: Mapping[str, JsonValue],
     await_spec: ToolAwaitSpec,
     adapter_key: str,
     resume_policy: str,
@@ -47,6 +53,9 @@ def tool_awaiting_payload(
     :param wait_id: Host wait record id。
     :param tool_call_id: 工具调用 id。
     :param tool_name: 工具名。
+    :param normalized_arguments_digest: 规范化参数 digest。
+    :param accepted_arguments: 已接受的工具调用参数；payload 只保存 LLM-safe replay
+        投影，原始参数只通过 digest 与 ``normalized_arguments_digest`` 关联。
     :param await_spec: 工具等待规约。
     :param adapter_key: Host 选择的等待适配器键。
     :param resume_policy: wait resume policy 文本。
@@ -66,6 +75,11 @@ def tool_awaiting_payload(
         "wait_id": wait_id,
         "tool_call_id": tool_call_id,
         "tool_name": tool_name,
+        "normalized_arguments_digest": normalized_arguments_digest,
+        _PAYLOAD_FIELD_ACCEPTED_ARGUMENTS: llm_safe_replay_arguments(
+            accepted_arguments
+        ),
+        _PAYLOAD_FIELD_ACCEPTED_ARGUMENTS_SOURCE_DIGEST: normalized_arguments_digest,
         "await_spec": _await_spec_json(await_spec),
         "adapter_key": adapter_key,
         "resume_policy": resume_policy,
@@ -101,6 +115,22 @@ def run_waiting_payload(
         "wait_id": wait_id,
         "tool_awaiting_event_ref": dict(tool_awaiting_event_ref),
     }
+
+
+def llm_safe_replay_arguments(
+    arguments: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    """把工具参数投影为可用于 LLM replay 的安全参数。
+
+    :param arguments: Host 已接受的原始工具参数。
+    :returns: 字段名命中敏感片段时已递归脱敏的参数 object。
+    :raises HostDurableError: 脱敏 helper 返回非 object 时抛出。
+    """
+
+    redacted = redact_sensitive_json_fields(arguments)
+    if not isinstance(redacted, Mapping):
+        raise HostDurableError("accepted arguments replay projection must be object")
+    return dict(redacted)
 
 
 def attempt_suspended_payload(
@@ -217,6 +247,8 @@ def tool_result_wait_resolution_payload(
     provider_status_ref: WaitProviderStatusRef | None,
     resume_attempt_id: str | None,
     resume_dispatch_record_id: str | None,
+    accepted_evidence_envelope: JsonValue,
+    raw_tool_outcome: JsonValue,
 ) -> JsonValue:
     """构造 resolve wait 产生的 ``TOOL_RESULT_ACCEPTED`` payload。
 
@@ -251,6 +283,8 @@ def tool_result_wait_resolution_payload(
     :param provider_status_ref: provider 状态引用。
     :param resume_attempt_id: resume Attempt id；不恢复时为 ``None``。
     :param resume_dispatch_record_id: resume dispatch id；不恢复时为 ``None``。
+    :param accepted_evidence_envelope: accepted tool evidence envelope JSON。
+    :param raw_tool_outcome: 与 ``resolution_result`` 同源的原始工具结果 JSON。
     :returns: 可写入 EventLog 的 JSON payload。
     """
 
@@ -277,6 +311,8 @@ def tool_result_wait_resolution_payload(
         "tool_idempotency_key": resolution_idempotency_key,
         "diagnostic_refs": [],
         "accepted_event_refs": [],
+        "accepted_evidence_envelope": accepted_evidence_envelope,
+        "raw_tool_outcome": raw_tool_outcome,
         "result": resolution_result,
         "wait_id": wait_id,
         "resolution_source": resolution_source,
@@ -373,9 +409,7 @@ def payload_object(event: EventLogRow) -> Mapping[str, JsonValue]:
     return cast(Mapping[str, JsonValue], value)
 
 
-def required_payload_text(
-    payload: Mapping[str, JsonValue], *, field_name: str
-) -> str:
+def required_payload_text(payload: Mapping[str, JsonValue], *, field_name: str) -> str:
     """读取 payload 中的必填文本字段。
 
     :param payload: payload 映射。
@@ -390,9 +424,7 @@ def required_payload_text(
     return value
 
 
-def optional_payload_text(
-    payload: Mapping[str, JsonValue], *, field_name: str
-) -> str | None:
+def optional_payload_text(payload: Mapping[str, JsonValue], *, field_name: str) -> str | None:
     """读取 payload 中的可选文本字段。
 
     字段缺失或显式为 ``null`` 时返回 ``None``；字段存在但不是非空文本时
@@ -421,11 +453,7 @@ def _await_spec_json(await_spec: ToolAwaitSpec) -> JsonValue:
 
     return {
         "await_kind": await_spec.await_kind.value,
-        "deadline": (
-            await_spec.deadline.isoformat()
-            if await_spec.deadline is not None
-            else None
-        ),
+        "deadline": (await_spec.deadline.isoformat() if await_spec.deadline is not None else None),
         "resume_token": await_spec.resume_token,
     }
 

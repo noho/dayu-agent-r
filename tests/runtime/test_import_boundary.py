@@ -115,6 +115,13 @@ def test_runtime_import_boundary_scan_covers_location_module() -> None:
     assert "location.py" in scanned_names
 
 
+def test_runtime_import_boundary_scan_covers_workspace_paths_module() -> None:
+    """runtime import 边界扫描必须覆盖 ``workspace_paths.py``。"""
+
+    scanned_names = {file_path.name for file_path in _iter_python_files()}
+    assert "workspace_paths.py" in scanned_names
+
+
 def test_runtime_import_boundary_scan_covers_scene_prepare_module() -> None:
     """runtime import 边界扫描必须覆盖 ``scene_prepare.py``。"""
 

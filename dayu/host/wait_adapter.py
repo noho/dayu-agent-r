@@ -25,8 +25,8 @@ from dayu.host.api import (
     WaitAdapterKey,
     WaitResolutionSource,
 )
+from dayu.host.durable.codec import format_utc_timestamp, parse_utc_timestamp
 from dayu.host.durable.codec import sha256_digest_json
-from dayu.host.durable.codec import format_utc_timestamp
 from dayu.host.durable.state import (
     ExternalJobRef,
     StateMutationStatus,
@@ -36,10 +36,12 @@ from dayu.host.durable.state import (
     WaitResumePolicy,
     claim_wait_record_for_poll,
     mark_wait_record_poll_abandoned,
+    read_next_wait_record_poll_due_at,
     read_wait_record_by_id,
     release_wait_record_poll_claim,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 if TYPE_CHECKING:
     from dayu.host.waiting import ToolAwaitingAcceptedAck
@@ -53,6 +55,12 @@ _POLL_CLAIM_TTL_SECONDS = 60.0
 
 _POLL_BACKOFF_INITIAL_DELAY_SECONDS = 30.0
 """poll retry 初始退避秒数。"""
+
+_POLL_NOT_READY_OBSERVE_INTERVAL_SECONDS = 1.0
+"""外部 job 正常运行中时的下一次观察间隔秒数。"""
+
+_POLL_IDLE_INTERVAL_SECONDS = 5.0
+"""没有可 claim wait record 时的空闲轮询间隔秒数。"""
 
 _POLL_BACKOFF_MAX_DELAY_SECONDS = 300.0
 """poll retry 最大退避秒数。"""
@@ -339,6 +347,10 @@ class WaitPollerRuntimePolicy:
     :param backoff_initial_delay_seconds: retry 初始退避秒数。
     :param backoff_multiplier: retry 指数退避倍率。
     :param backoff_max_delay_seconds: retry 最大退避秒数。
+    :param not_ready_observe_interval_seconds: adapter 返回正常运行中
+        ``not_ready`` 后的下一次观察间隔秒数。
+    :param idle_poll_interval_seconds: 单轮没有 claim 到任何 wait record 时的
+        空闲轮询间隔秒数。
     :param close_drain_timeout_seconds: close drain 首次诊断超时秒数；
         ``None`` 表示不做首次超时诊断，直接等待 in-flight poll 收口。
     """
@@ -350,6 +362,8 @@ class WaitPollerRuntimePolicy:
     backoff_initial_delay_seconds: float = _POLL_BACKOFF_INITIAL_DELAY_SECONDS
     backoff_multiplier: float = _POLL_BACKOFF_MULTIPLIER
     backoff_max_delay_seconds: float = _POLL_BACKOFF_MAX_DELAY_SECONDS
+    not_ready_observe_interval_seconds: float = _POLL_NOT_READY_OBSERVE_INTERVAL_SECONDS
+    idle_poll_interval_seconds: float = _POLL_IDLE_INTERVAL_SECONDS
     close_drain_timeout_seconds: float | None = 5.0
 
     def __post_init__(self) -> None:
@@ -377,6 +391,14 @@ class WaitPollerRuntimePolicy:
         _require_positive_float(
             self.backoff_max_delay_seconds, field_name="backoff_max_delay_seconds"
         )
+        _require_positive_float(
+            self.not_ready_observe_interval_seconds,
+            field_name="not_ready_observe_interval_seconds",
+        )
+        _require_positive_float(
+            self.idle_poll_interval_seconds,
+            field_name="idle_poll_interval_seconds",
+        )
         if self.close_drain_timeout_seconds is not None:
             _require_positive_float(
                 self.close_drain_timeout_seconds,
@@ -396,6 +418,8 @@ class WaitPollOnceResult:
     :param adapter_errors: adapter 调用失败的数。
     :param claim_conflicts: claim / release / abandon CAS 冲突数。
     :param shutdown_skipped: close gate 触发后跳过 resolve / abandon 的数。
+    :param next_poll_delay_seconds: 本轮结束时已知下一次 due wait 的等待秒数；
+        没有 active wait 或本轮没有产生可推导 due 时为 ``None``。
     """
 
     observed: int
@@ -406,6 +430,7 @@ class WaitPollOnceResult:
     adapter_errors: int
     claim_conflicts: int = 0
     shutdown_skipped: int = 0
+    next_poll_delay_seconds: float | None = None
 
 
 class WaitPollerLoopStatus(StrEnum):
@@ -464,6 +489,18 @@ class _ClaimedWaitRecord:
 
     record: WaitRecordRow
     claim_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ReleaseNotReadySummary:
+    """释放 not-ready wait claim 的结果摘要。
+
+    :param claim_conflicts: release CAS 冲突计数。
+    :param next_poll_delay_seconds: release 成功时的下一次观察等待秒数。
+    """
+
+    claim_conflicts: int
+    next_poll_delay_seconds: float | None
 
 
 class _SystemUtcClock:
@@ -598,6 +635,22 @@ class _ReadWaitRecordOperation:
         """
 
         return read_wait_record_by_id(transaction, self.wait_id)
+
+
+@dataclass(frozen=True, slots=True)
+class _ReadNextPollDueAtOperation:
+    """读取 active poll wait 下一次 due 时间的 transaction operation。"""
+
+    now: str
+
+    def __call__(self, transaction: HostTransaction) -> str | None:
+        """读取下一次 due 时间。
+
+        :param transaction: Host transaction。
+        :returns: UTC timestamp 文本；没有 active poll wait 时为 ``None``。
+        """
+
+        return read_next_wait_record_poll_due_at(transaction, now=self.now)
 
 
 @dataclass(frozen=True, slots=True)
@@ -818,6 +871,15 @@ class WaitPoller:
                 claim_conflicts += 1
                 continue
             claimed_records.append(claim)
+        if claimed_records or claim_conflicts > 0:
+            _LOGGER.log(
+                VERBOSE_LOG_LEVEL,
+                "host.wait_poller.poll_once.claimed owner_id=%s claimed=%s "
+                "claim_conflicts=%s",
+                self._owner_id,
+                len(claimed_records),
+                claim_conflicts,
+            )
 
         not_ready = 0
         resolved = 0
@@ -825,6 +887,7 @@ class WaitPoller:
         abandoned = 0
         adapter_errors = 0
         shutdown_skipped = 0
+        next_poll_delay_seconds: float | None = None
         for claimed in claimed_records:
             record = claimed.record
             claim_id = claimed.claim_id
@@ -877,14 +940,24 @@ class WaitPoller:
                     error_message=exc.__class__.__name__,
                 )
                 continue
+            poll_result_kind = _poll_result_kind(poll_result)
+            _LOGGER.log(
+                VERBOSE_LOG_LEVEL,
+                "host.wait_poller.observe wait_id=%s adapter_key=%s outcome=%s",
+                record.wait_id,
+                record.adapter_key.value,
+                poll_result_kind,
+            )
             if isinstance(poll_result, WaitPollNotReady):
                 not_ready += 1
-                claim_conflicts += self._release_with_backoff(
+                release_summary = self._release_not_ready(
                     record,
                     claim_id,
-                    outcome=WaitPollLastOutcome.NOT_READY,
-                    error_code=None,
-                    error_message=None,
+                )
+                claim_conflicts += release_summary.claim_conflicts
+                next_poll_delay_seconds = _min_optional_delay_seconds(
+                    next_poll_delay_seconds,
+                    release_summary.next_poll_delay_seconds,
                 )
                 continue
             if self._lifecycle_gate.is_closed():
@@ -892,6 +965,15 @@ class WaitPoller:
                 claim_conflicts += self._release_shutdown_skipped(record, claim_id)
                 continue
             resolve_status = self._resolve_claimed_wait(record, poll_result)
+            _LOGGER.log(
+                VERBOSE_LOG_LEVEL,
+                "host.wait_poller.resolve wait_id=%s adapter_key=%s outcome=%s "
+                "resolve_status=%s",
+                record.wait_id,
+                record.adapter_key.value,
+                poll_result_kind,
+                resolve_status.value,
+            )
             if resolve_status is StateMutationStatus.UPDATED:
                 if isinstance(poll_result, WaitPollLost):
                     lost += 1
@@ -909,7 +991,7 @@ class WaitPoller:
                 error_code=_POLL_ERROR_CODE_RESOLVE_EXCEPTION,
                 error_message=resolve_status.value,
             )
-        return WaitPollOnceResult(
+        result = WaitPollOnceResult(
             observed=len(claimed_records),
             not_ready=not_ready,
             resolved=resolved,
@@ -918,7 +1000,29 @@ class WaitPoller:
             adapter_errors=adapter_errors,
             claim_conflicts=claim_conflicts,
             shutdown_skipped=shutdown_skipped,
+            next_poll_delay_seconds=self._next_poll_delay_seconds(
+                observed=len(claimed_records),
+                claim_conflicts=claim_conflicts,
+                known_delay_seconds=next_poll_delay_seconds,
+            ),
         )
+        if _poll_result_has_activity(result):
+            _LOGGER.log(
+                VERBOSE_LOG_LEVEL,
+                "host.wait_poller.poll_once.done owner_id=%s observed=%s not_ready=%s "
+                "resolved=%s lost=%s abandoned=%s adapter_errors=%s "
+                "claim_conflicts=%s shutdown_skipped=%s",
+                self._owner_id,
+                result.observed,
+                result.not_ready,
+                result.resolved,
+                result.lost,
+                result.abandoned,
+                result.adapter_errors,
+                result.claim_conflicts,
+                result.shutdown_skipped,
+            )
+        return result
 
     def _claim_next_wait_record(self) -> _ClaimedWaitRecord | StateMutationStatus | None:
         """claim 下一条 eligible wait record。
@@ -947,6 +1051,36 @@ class WaitPoller:
         if status is StateMutationStatus.NOT_FOUND:
             return None
         return status
+
+    def _next_poll_delay_seconds(
+        self,
+        *,
+        observed: int,
+        claim_conflicts: int,
+        known_delay_seconds: float | None,
+    ) -> float | None:
+        """计算或读取下一次 active wait due 的等待秒数。
+
+        :param observed: 本轮实际 claim 到的 wait 数。
+        :param claim_conflicts: 本轮 claim / release 冲突数。
+        :param known_delay_seconds: 本轮已从成功 release 推导出的下一次 due
+            等待秒数。
+        :returns: 下一次 due 的等待秒数；没有 active wait 或无法推导时为
+            ``None``。
+        """
+
+        if known_delay_seconds is not None:
+            return max(known_delay_seconds, 0.0)
+        if observed > 0 or claim_conflicts > 0:
+            return None
+        now = self._clock.now()
+        next_due_at = self._transaction_runner.run_read(
+            _ReadNextPollDueAtOperation(format_utc_timestamp(now))
+        )
+        if next_due_at is None:
+            return None
+        delay_seconds = (parse_utc_timestamp(next_due_at) - now).total_seconds()
+        return max(delay_seconds, 0.0)
 
     def _abandon_cancelled_wait(
         self, record: WaitRecordRow, claim_id: str
@@ -1098,6 +1232,42 @@ class WaitPoller:
             return 0
         return 1
 
+    def _release_not_ready(
+        self, record: WaitRecordRow, claim_id: str
+    ) -> _ReleaseNotReadySummary:
+        """释放正常运行中 wait 的 claim 并安排短间隔复查。
+
+        :param record: 已 claim 的 wait record。
+        :param claim_id: 当前 claim id。
+        :returns: release 摘要。
+        """
+
+        now = self._clock.now()
+        delay_seconds = _not_ready_delay_seconds(self._policy)
+        status = self._transaction_runner.run_write(
+            _ReleaseWaitRecordClaimOperation(
+                wait_id=record.wait_id,
+                claim_id=claim_id,
+                next_observe_at=format_utc_timestamp(
+                    now + timedelta(seconds=delay_seconds)
+                ),
+                backoff_attempt=0,
+                last_outcome=WaitPollLastOutcome.NOT_READY,
+                last_error_code=None,
+                last_error_message=None,
+                updated_at=format_utc_timestamp(now),
+            )
+        )
+        if status is StateMutationStatus.UPDATED:
+            return _ReleaseNotReadySummary(
+                claim_conflicts=0,
+                next_poll_delay_seconds=delay_seconds,
+            )
+        return _ReleaseNotReadySummary(
+            claim_conflicts=1,
+            next_poll_delay_seconds=None,
+        )
+
     def _release_shutdown_skipped(
         self, record: WaitRecordRow, claim_id: str
     ) -> int:
@@ -1148,6 +1318,7 @@ class WaitPollerSupervisor:
         self._owner_id = resolved_owner_id
         self._poller_factory = poller_factory
         self._close_event = threading.Event()
+        self._wakeup_event = threading.Event()
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._opened = False
@@ -1180,6 +1351,14 @@ class WaitPollerSupervisor:
             thread = self._thread
         thread.start()
 
+    def wakeup(self) -> None:
+        """唤醒 background poll loop 立即重试。
+
+        :returns: ``None``。
+        """
+
+        self._wakeup_event.set()
+
     def close(self) -> None:
         """关闭 supervisor 并等待当前 poll round 收口。
 
@@ -1195,6 +1374,7 @@ class WaitPollerSupervisor:
             ):
                 self._thread = None
                 self._close_event.set()
+                self._wakeup_event.set()
                 return
             if thread is None:
                 if self._diagnostics.status is not WaitPollerLoopStatus.FAILED:
@@ -1212,6 +1392,7 @@ class WaitPollerSupervisor:
                     self._diagnostics, WaitPollerLoopStatus.CLOSING
                 )
             self._close_event.set()
+            self._wakeup_event.set()
         close_drain_timeout_seconds = self._policy.close_drain_timeout_seconds
         if close_drain_timeout_seconds is None:
             thread.join()
@@ -1275,7 +1456,7 @@ class WaitPollerSupervisor:
                 self._record_poll_result(result)
                 if self._close_event.is_set():
                     break
-                self._close_event.wait(self._policy.poll_interval_seconds)
+                self._sleep_until_next_poll(result)
         except Exception as exc:
             failed = True
             _LOGGER.exception(
@@ -1288,6 +1469,7 @@ class WaitPollerSupervisor:
                     self._diagnostics, exc
                 )
             self._close_event.set()
+            self._wakeup_event.set()
         finally:
             if not failed:
                 with self._lock:
@@ -1304,6 +1486,18 @@ class WaitPollerSupervisor:
 
         poller = self._poller_factory.create_wait_poller(self)
         return poller.poll_once()
+
+    def _sleep_until_next_poll(self, result: WaitPollOnceResult) -> None:
+        """按单轮结果等待下一次 poll，支持 wakeup 与 close 立即打断。
+
+        :param result: 刚完成的单轮 poll result。
+        :returns: ``None``。
+        """
+
+        interval_seconds = _next_loop_interval_seconds(result, self._policy)
+        was_woken = self._wakeup_event.wait(interval_seconds)
+        if was_woken:
+            self._wakeup_event.clear()
 
     def _record_poll_result(self, result: WaitPollOnceResult) -> None:
         """累加 poll result 到 diagnostics。
@@ -1334,6 +1528,23 @@ def _poll_idempotency_key(wait_record: WaitRecordRow) -> str:
     return f"poll-{digest}"
 
 
+def _poll_result_kind(result: WaitPollResult) -> str:
+    """返回日志安全的 poll 结果类别。
+
+    :param result: adapter 返回的 poll 结果。
+    :returns: ``not_ready``、``ready`` 或 ``lost``。
+    :raises TypeError: 收到未知 poll 结果类型时抛出。
+    """
+
+    if isinstance(result, WaitPollNotReady):
+        return "not_ready"
+    if isinstance(result, WaitPollReady):
+        return "ready"
+    if isinstance(result, WaitPollLost):
+        return "lost"
+    raise TypeError("unsupported wait poll result")
+
+
 def _backoff_delay_seconds(
     backoff_attempt: int, policy: WaitPollerRuntimePolicy
 ) -> float:
@@ -1351,6 +1562,74 @@ def _backoff_delay_seconds(
         policy.backoff_multiplier ** (backoff_attempt - 1)
     )
     return min(delay, policy.backoff_max_delay_seconds)
+
+
+def _not_ready_delay_seconds(policy: WaitPollerRuntimePolicy) -> float:
+    """返回正常 not-ready wait 的下一次观察间隔。
+
+    :param policy: runtime policy。
+    :returns: 间隔秒数。
+    """
+
+    return policy.not_ready_observe_interval_seconds
+
+
+def _next_loop_interval_seconds(
+    result: WaitPollOnceResult, policy: WaitPollerRuntimePolicy
+) -> float:
+    """根据单轮结果计算 supervisor 下一次唤醒间隔。
+
+    :param result: 单轮 poll result。
+    :param policy: runtime policy。
+    :returns: 下一次 loop sleep 秒数。
+    """
+
+    if not _poll_result_has_activity(result):
+        if result.next_poll_delay_seconds is not None:
+            return min(
+                max(result.next_poll_delay_seconds, 0.0),
+                policy.idle_poll_interval_seconds,
+            )
+        return policy.idle_poll_interval_seconds
+    if result.next_poll_delay_seconds is not None:
+        return max(result.next_poll_delay_seconds, 0.0)
+    return policy.poll_interval_seconds
+
+
+def _min_optional_delay_seconds(
+    current: float | None, candidate: float | None
+) -> float | None:
+    """合并可选 delay，返回最短的已知等待秒数。
+
+    :param current: 当前已知 delay；未知时为 ``None``。
+    :param candidate: 候选 delay；未知时为 ``None``。
+    :returns: 两者中更短的已知 delay；都未知时为 ``None``。
+    """
+
+    if candidate is None:
+        return current
+    if current is None:
+        return candidate
+    return min(current, candidate)
+
+
+def _poll_result_has_activity(result: WaitPollOnceResult) -> bool:
+    """判断单轮 poll result 是否包含需要逐轮记录的活动。
+
+    :param result: 单轮 poll result。
+    :returns: 有 claim、resolve、错误或关闭跳过等活动时返回 ``True``。
+    """
+
+    return (
+        result.observed > 0
+        or result.not_ready > 0
+        or result.resolved > 0
+        or result.lost > 0
+        or result.abandoned > 0
+        or result.adapter_errors > 0
+        or result.claim_conflicts > 0
+        or result.shutdown_skipped > 0
+    )
 
 
 def _last_outcome_for_lifecycle_result(

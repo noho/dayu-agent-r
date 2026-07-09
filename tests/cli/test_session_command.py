@@ -85,6 +85,8 @@ class _FakeResumeCapture:
     interactive_prepare_calls: list[str]
     prompt_execute_sessions: list[str]
     interactive_execute_sessions: list[str]
+    prompt_display_flags: list[tuple[bool, bool]]
+    interactive_display_flags: list[tuple[bool, bool]]
 
 
 class _FakeHostContext:
@@ -757,6 +759,7 @@ def test_session_resume_prompt_by_session_id_resolves_and_submits_without_create
     assert host.submit_requests[0][1].user_prompt == "hello"
     assert resume_capture.prompt_prepare_calls == ["hello"]
     assert resume_capture.prompt_execute_sessions == ["session-1"]
+    assert resume_capture.prompt_display_flags == [(True, True)]
 
 
 def test_session_resume_interactive_by_label_resolves_and_reuses_session(
@@ -819,6 +822,102 @@ def test_session_resume_interactive_by_label_resolves_and_reuses_session(
     assert host.close_cancel_calls == 0
     assert resume_capture.interactive_prepare_calls == ["interactive"]
     assert resume_capture.interactive_execute_sessions == ["session-A"]
+    assert resume_capture.interactive_display_flags == [(True, True)]
+
+
+def test_session_resume_prompt_passes_display_flags_to_existing_session_executor(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """prompt resume 必须把 detail/thinking 展示参数传给 existing-session 入口。
+
+    :param capsys: pytest 标准输出捕获夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param tmp_path: 测试 workspace 根目录。
+    :returns: ``None``。
+    :raises AssertionError: 展示参数未传递时抛出。
+    """
+
+    host = _FakeSessionHost(list_result=ListSessionsResult(sessions=()))
+    _install_fake_open_host(monkeypatch, host)
+    resume_capture = _install_fake_resume_execution(monkeypatch)
+
+    exit_code = cli_main.main(
+        (
+            "session",
+            "resume",
+            "--session-id",
+            "session-1",
+            "--mode",
+            "prompt",
+            "--no-detail",
+            "--no-thinking",
+            "--base",
+            str(tmp_path),
+            "hello",
+        )
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_SUCCESS
+    assert captured.err == ""
+    assert resume_capture.prompt_execute_sessions == ["session-1"]
+    assert resume_capture.prompt_display_flags == [(False, False)]
+
+
+def test_session_resume_interactive_passes_display_flags_to_existing_session_executor(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """interactive resume 必须把 detail/thinking 展示参数传给 existing-session 入口。
+
+    :param capsys: pytest 标准输出捕获夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param tmp_path: 测试 workspace 根目录。
+    :returns: ``None``。
+    :raises AssertionError: 展示参数未传递时抛出。
+    """
+
+    host = _FakeSessionHost(
+        list_result=ListSessionsResult(
+            sessions=(
+                _session_list_item(
+                    session_id="session-A",
+                    slot=SessionSlotRef(
+                        scope="cli.interactive",
+                        slot_key="cli.interactive.proj.v1",
+                    ),
+                ),
+            )
+        )
+    )
+    _install_fake_open_host(monkeypatch, host)
+    resume_capture = _install_fake_resume_execution(monkeypatch)
+
+    exit_code = cli_main.main(
+        (
+            "session",
+            "resume",
+            "--label",
+            "proj.v1",
+            "--kind",
+            "interactive",
+            "--mode",
+            "interactive",
+            "--no-detail",
+            "--no-thinking",
+            "--base",
+            str(tmp_path),
+        )
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_SUCCESS
+    assert captured.err == ""
+    assert resume_capture.interactive_execute_sessions == ["session-A"]
+    assert resume_capture.interactive_display_flags == [(False, False)]
 
 
 def test_session_resume_closed_session_returns_usage_error_without_submit(
@@ -1000,12 +1099,16 @@ def test_session_resume_interactive_startup_error_includes_selector_and_session(
         host: Host,
         prepared: interactive_command._PreparedInteractiveExistingSessionExecution,
         session_id: str,
+        detail: bool = True,
+        thinking: bool = True,
     ) -> int:
         """模拟 interactive startup barrier 失败。
 
         :param host: fake Host。
         :param prepared: fake interactive prepared execution。
         :param session_id: 目标 Session id。
+        :param detail: 是否显示运行态 activity stream。
+        :param thinking: 是否显示运行态 thinking 增量。
         :returns: 不返回；始终抛出。
         :raises EntrypointRuntimeError: 始终抛出 startup 失败。
         """
@@ -1170,6 +1273,8 @@ def _install_fake_resume_execution(
         interactive_prepare_calls=[],
         prompt_execute_sessions=[],
         interactive_execute_sessions=[],
+        prompt_display_flags=[],
+        interactive_display_flags=[],
     )
 
     async def fake_prepare_prompt_existing_session_execution(
@@ -1212,6 +1317,8 @@ def _install_fake_resume_execution(
         prepared: prompt_command._PreparedPromptExistingSessionExecution,
         session_id: str,
         sigint_monitor: CliSigintMonitor,
+        detail: bool = True,
+        thinking: bool = True,
     ) -> int:
         """在 fake Host 上提交一轮 prompt。
 
@@ -1219,12 +1326,15 @@ def _install_fake_resume_execution(
         :param prepared: fake prompt prepared execution。
         :param session_id: 目标 Session id。
         :param sigint_monitor: prompt SIGINT monitor。
+        :param detail: 是否显示运行态 activity stream。
+        :param thinking: 是否显示运行态 thinking 增量。
         :returns: CLI 成功退出码。
         :raises HostApiError: fake Host 配置 submit 失败时抛出。
         """
 
         sigint_monitor.close()
         capture.prompt_execute_sessions.append(session_id)
+        capture.prompt_display_flags.append((detail, thinking))
         await host.submit_followup(
             session_id,
             _submit_request(
@@ -1276,6 +1386,8 @@ def _install_fake_resume_execution(
         session_id: str,
         input_reader: Callable[[str], str] | None = None,
         sigint_monitor_factory: Callable[[], CliSigintMonitor] | None = None,
+        detail: bool = True,
+        thinking: bool = True,
     ) -> int:
         """在 fake Host 上提交两轮 interactive 输入。
 
@@ -1284,11 +1396,14 @@ def _install_fake_resume_execution(
         :param session_id: 目标 Session id。
         :param input_reader: 未使用的输入读取器。
         :param sigint_monitor_factory: 未使用的 SIGINT monitor 工厂。
+        :param detail: 是否显示运行态 activity stream。
+        :param thinking: 是否显示运行态 thinking 增量。
         :returns: CLI 成功退出码。
         :raises HostApiError: fake Host 配置 submit 失败时抛出。
         """
 
         capture.interactive_execute_sessions.append(session_id)
+        capture.interactive_display_flags.append((detail, thinking))
         for user_prompt in ("first interactive turn", "second interactive turn"):
             await host.submit_followup(
                 session_id,
@@ -1378,5 +1493,5 @@ def _assert_session_runtime_uses_prompt_carrier(
     assert len(capture.requests) == 1
     request = capture.requests[0]
     assert request.scene_id == "prompt"
-    assert request.context_slot_values["fins_default_subject"] == "未指定具体公司"
-    assert request.context_slot_values["base_user"] == "本地 CLI 用户"
+    assert request.context_slot_values["fins_default_subject"] == ""
+    assert "Asia/Shanghai" in str(request.context_slot_values["current_time"])

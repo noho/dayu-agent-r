@@ -13,6 +13,7 @@ from dayu.fins.domain.enums import SourceKind
 from dayu.fins.downloaders.sec_downloader import (
     DownloaderEvent,
     RemoteFileDescriptor,
+    SecDownloadCancelledError,
     SecDownloader,
     accession_to_no_dash,
     build_source_fingerprint,
@@ -88,6 +89,7 @@ class SecDownloadFilingWorkflowHost(Protocol):
         primary_document: str,
         ticker: str,
         document_id: str,
+        cancel_checker: Callable[[], bool] | None = None,
     ) -> Awaitable[tuple[bool, str, str]]:
         """执行 6-K 预筛选。"""
 
@@ -105,6 +107,7 @@ class SecDownloadFilingWorkflowHost(Protocol):
         rejection_category: str,
         selected_primary_document: str,
         source_fingerprint: str,
+        cancel_checker: Callable[[], bool] | None = None,
     ) -> Awaitable[tuple[bool, Optional[str]]]:
         """持久化 rejected filing artifact。"""
 
@@ -160,6 +163,7 @@ async def run_download_single_filing_stream(
     resolve_download_fiscal_fields: Callable[..., tuple[Optional[int], Optional[str]]],
     index_file_entries: Callable[[Optional[dict[str, JsonValue]]], dict[str, dict[str, JsonValue]]],
     download_version: str,
+    cancel_checker: Callable[[], bool] | None = None,
 ) -> AsyncIterator[DownloadEvent]:
     """下载单个 filing 并流式产出事件。
 
@@ -181,6 +185,7 @@ async def run_download_single_filing_stream(
         resolve_download_fiscal_fields: fiscal 字段解析 helper。
         index_file_entries: 旧文件条目索引 helper。
         download_version: 当前下载版本号。
+        cancel_checker: 可选协作式取消检查器。
 
     Yields:
         文件级与 filing 级事件。
@@ -244,17 +249,21 @@ async def run_download_single_filing_stream(
         )
         return
 
-    remote_files = await _maybe_await(
-        host._downloader.list_filing_files(
-            cik=cik,
-            accession_no_dash=accession_no_dash,
-            primary_document=filing.primary_document,
-            form_type=filing.form_type,
-            include_xbrl=True,
-            include_exhibits=True,
-            include_http_metadata=(previous_meta is not None and not overwrite),
+    try:
+        remote_files = await _maybe_await(
+            host._downloader.list_filing_files(
+                cik=cik,
+                accession_no_dash=accession_no_dash,
+                primary_document=filing.primary_document,
+                form_type=filing.form_type,
+                include_xbrl=True,
+                include_exhibits=True,
+                include_http_metadata=(previous_meta is not None and not overwrite),
+                cancellation_checker=cancel_checker,
+            )
         )
-    )
+    except SecDownloadCancelledError:
+        return
     source_fingerprint = build_source_fingerprint(remote_files)
     skip_reason = host._can_skip(
         previous_meta,
@@ -297,6 +306,7 @@ async def run_download_single_filing_stream(
             primary_document=filing.primary_document,
             ticker=ticker,
             document_id=document_id,
+            cancel_checker=cancel_checker,
         )
         if not keep:
             if category == "DOWNLOAD_FAILED":
@@ -332,17 +342,21 @@ async def run_download_single_filing_stream(
                 ),
                 module=host.MODULE,
             )
-            artifact_saved, artifact_error = await host._persist_rejected_filing_artifact(
-                ticker=ticker,
-                cik=cik,
-                filing=filing,
-                remote_files=remote_files,
-                overwrite=overwrite,
-                rejection_reason="6k_filtered",
-                rejection_category=category,
-                selected_primary_document=selected_name or filing.primary_document,
-                source_fingerprint=source_fingerprint,
-            )
+            try:
+                artifact_saved, artifact_error = await host._persist_rejected_filing_artifact(
+                    ticker=ticker,
+                    cik=cik,
+                    filing=filing,
+                    remote_files=remote_files,
+                    overwrite=overwrite,
+                    rejection_reason="6k_filtered",
+                    rejection_category=category,
+                    selected_primary_document=selected_name or filing.primary_document,
+                    source_fingerprint=source_fingerprint,
+                    cancel_checker=cancel_checker,
+                )
+            except SecDownloadCancelledError:
+                return
             if not artifact_saved:
                 filing_result = {
                     "document_id": document_id,
@@ -411,6 +425,7 @@ async def run_download_single_filing_stream(
             store_file=host._build_store_file(source_handle=source_handle),
             existing_files=existing_files,
             primary_document=filing.primary_document,
+            cancellation_checker=cancel_checker,
         ):
             if event.event_type == DownloadEventType.FILE_DOWNLOAD_STARTED.value:
                 yield DownloadEvent(
@@ -446,6 +461,7 @@ async def run_download_single_filing_stream(
                 store_file=host._build_store_file(source_handle=source_handle),
                 existing_files=existing_files,
                 primary_document=filing.primary_document,
+                cancellation_checker=cancel_checker,
             )
         )
         for item in legacy_file_results:

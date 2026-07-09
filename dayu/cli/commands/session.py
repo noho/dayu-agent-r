@@ -75,12 +75,13 @@ from dayu.service.entrypoint_runtime import (
     prepare_entrypoint_runtime,
 )
 from dayu.service.host_assembly import ServiceAssemblyOverrides
+from dayu.service.scene_context import (
+    EntrypointContextSlotRequest,
+    build_entrypoint_context_slot_values,
+)
 
-DEFAULT_FINS_SUBJECT: Final[str] = "未指定具体公司"
-DEFAULT_BASE_USER: Final[str] = "本地 CLI 用户"
+DEFAULT_DISPLAY_USER: Final[str] = "本地 CLI 用户"
 DEFAULT_PURGE_REASON: Final[str] = "cli_session_purge"
-CONTEXT_SLOT_FINS_DEFAULT_SUBJECT: Final[str] = "fins_default_subject"
-CONTEXT_SLOT_BASE_USER: Final[str] = "base_user"
 _SESSION_CONTEXT_SCENARIO: Final[str] = "session"
 _SESSION_ID_OPTION: Final[str] = "--session-id"
 _LABEL_OPTION: Final[str] = "--label"
@@ -171,7 +172,7 @@ async def _run_session_command_async(args: ParsedCliArgs) -> int:
     invocation = new_cli_invocation(
         command_name=COMMAND_SESSION,
         scenario=_SESSION_CONTEXT_SCENARIO,
-        display_user=DEFAULT_BASE_USER,
+        display_user=DEFAULT_DISPLAY_USER,
         ticker=None,
     )
     runtime = await _prepare_session_runtime(args)
@@ -261,6 +262,8 @@ async def _run_session_resume(args: ParsedCliArgs) -> int:
                     prepared=prepared,
                     session_id=target.session_id,
                     sigint_monitor=CliSigintMonitor(),
+                    detail=args.detail,
+                    thinking=args.thinking,
                 )
             except HostApiError as exc:
                 render_cli_error(_resume_host_error_message(target=target, error=exc))
@@ -281,6 +284,8 @@ async def _run_session_resume(args: ParsedCliArgs) -> int:
                 host=host,
                 prepared=prepared_interactive,
                 session_id=target.session_id,
+                detail=args.detail,
+                thinking=args.thinking,
             )
         except HostApiError as exc:
             render_cli_error(_resume_host_error_message(target=target, error=exc))
@@ -649,10 +654,9 @@ def _session_context_slot_values() -> dict[str, JsonValue]:
     :raises Exception: 不主动抛出异常。
     """
 
-    return {
-        CONTEXT_SLOT_FINS_DEFAULT_SUBJECT: DEFAULT_FINS_SUBJECT,
-        CONTEXT_SLOT_BASE_USER: DEFAULT_BASE_USER,
-    }
+    return build_entrypoint_context_slot_values(
+        EntrypointContextSlotRequest(ticker=None)
+    )
 
 
 __all__: tuple[str, ...] = ("run_session_command",)

@@ -746,7 +746,7 @@ def test_workspace_overlay_enables_split_fins_providers(tmp_path: Path) -> None:
     workspace_root = _build_workspace(tmp_path)
     _write_split_fins_provider_overlay(tmp_path, workspace_root)
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
-        workspace_config_dir=tmp_path / "workspace" / "config"
+        workspace_config_dir=tmp_path / "config"
     )
 
     for provider_id in (_READ_SPEC_ID, _DOWNLOAD_SPEC_ID, _PREPROCESS_SPEC_ID, _UPLOAD_SPEC_ID):
@@ -1445,6 +1445,16 @@ def test_ingestion_tool_schemas_hide_host_internal_fields(tmp_path: Path) -> Non
         assert "raw job record" not in schema_text
         assert "internal governance" not in schema_text
         assert "Host" not in schema_text
+        lowered_schema_text = schema_text.lower()
+        assert "external-job" not in lowered_schema_text
+        assert "observation handle" not in lowered_schema_text
+        assert "runtime" not in lowered_schema_text
+        assert "next_step" not in lowered_schema_text
+        assert "poll" not in lowered_schema_text
+        assert "local file paths to upload" not in lowered_schema_text
+        assert "whether the upload" not in lowered_schema_text
+        assert "required for filing uploads" not in lowered_schema_text
+        assert "optional explicit material" not in lowered_schema_text
 
 
 def test_fins_wait_adapter_registry_binds_download_preprocess_and_upload_tools(
@@ -2033,7 +2043,7 @@ def _write_split_fins_provider_overlay(
             },
         }
     }
-    _write_json(tmp_path / "workspace" / "config" / "tool_discovery.json", payload)
+    _write_json(tmp_path / "config" / "tool_discovery.json", payload)
 
 
 def _provider_specs_from_loaded_config(

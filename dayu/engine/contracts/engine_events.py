@@ -58,6 +58,39 @@ class EngineEventType(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class RunnerInputToolCallProjection:
+    """Runner 输入中 assistant tool call 的可观察投影。
+
+    :param tool_call_id: provider/模型返回的工具调用 id。
+    :param name: 工具名称。
+    :param arguments: 工具参数 JSON 映射。
+    """
+
+    tool_call_id: str
+    name: str
+    arguments: Mapping[str, JsonValue]
+
+
+@dataclass(frozen=True, slots=True)
+class RunnerInputMessageProjection:
+    """Runner 输入消息的 LLM-facing 可观察投影。
+
+    :param index: 消息在本轮 Runner 输入中的顺序。
+    :param role: 消息 role 文本。
+    :param content: 实际传给 Runner 的消息正文；assistant 无正文时为
+        ``None``。
+    :param tool_call_id: tool role 消息关联的工具调用 id。
+    :param tool_calls: assistant role 消息携带的工具调用列表。
+    """
+
+    index: int
+    role: str
+    content: str | None
+    tool_call_id: str | None
+    tool_calls: tuple[RunnerInputToolCallProjection, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class IterationStartedData:
     """LLM 迭代开始事件 data。
 
@@ -67,6 +100,8 @@ class IterationStartedData:
     :param role_sequence_digest: 按实际 messages role 顺序计算的 digest。
     :param runner_input_serializer_schema_version: role digest 序列化 schema
         版本。
+    :param input_projection: Engine 对本轮实际 Runner 输入 messages 的中性
+        LLM-facing 投影。调用方负责决定是否持久化以及如何脱敏。
     """
 
     iteration_id: str
@@ -74,6 +109,7 @@ class IterationStartedData:
     message_count: int
     role_sequence_digest: str
     runner_input_serializer_schema_version: str
+    input_projection: tuple[RunnerInputMessageProjection, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -499,6 +535,8 @@ __all__ = [
     "RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION",
     "RUN_SUSPENDED_REASON_TOOL_AWAITING",
     "EngineEventType",
+    "RunnerInputToolCallProjection",
+    "RunnerInputMessageProjection",
     "IterationStartedData",
     "ContentDeltaData",
     "ReasoningDeltaData",

@@ -27,7 +27,14 @@ _REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 _PACKAGE_PROMPT_ROOT: Final[Path] = _REPO_ROOT / "dayu" / "config" / "prompts"
 _PACKAGE_MANIFEST_ROOT: Final[Path] = _PACKAGE_PROMPT_ROOT / "manifests"
 _START_FINS_UPLOAD_TOOL_NAME: Final[str] = "start_fins_upload"
-_DEFAULT_FINS_NON_UPLOAD_TOOL_NAMES: Final[frozenset[str]] = frozenset(
+_START_FINS_DOWNLOAD_TOOL_NAME: Final[str] = "start_fins_download"
+_START_FINS_PREPROCESS_TOOL_NAME: Final[str] = "start_fins_preprocess"
+_CURRENT_TIME_TEXT: Final[str] = (
+    "# 当前时间\n"
+    "现在是 2026年7月7日 17:20（Asia/Shanghai，星期二）。\n"
+    "这是对话开始时的当前时间；回答“现在/今天/当前时间”默认使用它；该时间不会自动更新。"
+)
+_DEFAULT_FINS_READ_TOOL_NAMES: Final[frozenset[str]] = frozenset(
     {
         "list_documents",
         "get_document_sections",
@@ -38,9 +45,16 @@ _DEFAULT_FINS_NON_UPLOAD_TOOL_NAMES: Final[frozenset[str]] = frozenset(
         "get_page_content",
         "get_financial_statement",
         "query_xbrl_facts",
-        "start_fins_download",
-        "start_fins_preprocess",
     }
+)
+_DEFAULT_FINS_LONG_TRANSACTION_TOOL_NAMES: Final[frozenset[str]] = frozenset(
+    {
+        _START_FINS_DOWNLOAD_TOOL_NAME,
+        _START_FINS_PREPROCESS_TOOL_NAME,
+    }
+)
+_DEFAULT_FINS_NON_UPLOAD_TOOL_NAMES: Final[frozenset[str]] = (
+    _DEFAULT_FINS_READ_TOOL_NAMES | _DEFAULT_FINS_LONG_TRANSACTION_TOOL_NAMES
 )
 _DEFAULT_NON_UPLOAD_SCENE_IDS: Final[tuple[str, ...]] = (
     "confirm",
@@ -55,7 +69,7 @@ _DEFAULT_NON_UPLOAD_SCENE_IDS: Final[tuple[str, ...]] = (
     "write",
 )
 _DEFAULT_WEB_SCENE_IDS: Final[frozenset[str]] = frozenset(
-    scene_id for scene_id in _DEFAULT_NON_UPLOAD_SCENE_IDS if scene_id != "infer"
+    _DEFAULT_NON_UPLOAD_SCENE_IDS
 )
 _DEFAULT_WEB_TOOL_NAMES: Final[frozenset[str]] = frozenset(
     {"search_web", "fetch_web_page"}
@@ -243,13 +257,23 @@ def _default_manifest_tool_catalog() -> SceneToolCatalog:
     """
 
     tools = [
-        SceneToolInfo(name=tool_name, tags=frozenset({"fins"}))
-        for tool_name in sorted(_DEFAULT_FINS_NON_UPLOAD_TOOL_NAMES)
+        SceneToolInfo(name=tool_name, tags=frozenset({"fins", "fins-read"}))
+        for tool_name in sorted(_DEFAULT_FINS_READ_TOOL_NAMES)
     ]
-    tools.append(
-        SceneToolInfo(
-            name=_START_FINS_UPLOAD_TOOL_NAME,
-            tags=frozenset({"fins", "fins-upload"}),
+    tools.extend(
+        (
+            SceneToolInfo(
+                name=_START_FINS_DOWNLOAD_TOOL_NAME,
+                tags=frozenset({"fins", "fins-download"}),
+            ),
+            SceneToolInfo(
+                name=_START_FINS_PREPROCESS_TOOL_NAME,
+                tags=frozenset({"fins", "fins-preprocess"}),
+            ),
+            SceneToolInfo(
+                name=_START_FINS_UPLOAD_TOOL_NAME,
+                tags=frozenset({"fins", "fins-upload"}),
+            ),
         )
     )
     tools.extend(
@@ -259,7 +283,6 @@ def _default_manifest_tool_catalog() -> SceneToolCatalog:
         )
     )
     return SceneToolCatalog(tools=tuple(tools))
-
 
 def _prepare_single_scene(tmp_path: Path) -> PreparedSceneInputs:
     """准备单 scene 成功装配 fixture。
@@ -374,8 +397,8 @@ def test_default_non_upload_scenes_do_not_select_upload_tool() -> None:
                 scene_manifest_root=_PACKAGE_MANIFEST_ROOT,
                 prompt_asset_root=_PACKAGE_PROMPT_ROOT,
                 context_slot_values={
+                    "current_time": _CURRENT_TIME_TEXT,
                     "fins_default_subject": "测试财报主体",
-                    "base_user": "scene-prepare-test",
                 },
                 available_tools=available_tools,
             )
@@ -383,9 +406,97 @@ def test_default_non_upload_scenes_do_not_select_upload_tool() -> None:
         selected = result.tool_selection.tool_names
         assert selected is not None
         assert _START_FINS_UPLOAD_TOOL_NAME not in selected
-        assert _DEFAULT_FINS_NON_UPLOAD_TOOL_NAMES.issubset(selected)
+        assert _DEFAULT_FINS_READ_TOOL_NAMES.issubset(selected)
+        if scene_id in ("interactive", "wechat"):
+            assert _DEFAULT_FINS_LONG_TRANSACTION_TOOL_NAMES.issubset(selected)
+        else:
+            assert _START_FINS_DOWNLOAD_TOOL_NAME not in selected
+            assert _START_FINS_PREPROCESS_TOOL_NAME not in selected
         if scene_id in _DEFAULT_WEB_SCENE_IDS:
             assert _DEFAULT_WEB_TOOL_NAMES.issubset(selected)
+
+
+def test_condition_blocks_use_actual_selected_tools_and_tags(tmp_path: Path) -> None:
+    """条件块必须基于实际 selected tools 及其 catalog tags 过滤。"""
+
+    _write_text(
+        tmp_path / "prompts" / "tools.md",
+        (
+            "开始\n"
+            "<when_tool lookup_filing>\n显式工具说明\n</when_tool>\n"
+            "<when_tool news_search>\n未选工具说明\n</when_tool>\n"
+            "<when_tag read>\n显式工具携带 tag 说明\n</when_tag>\n"
+            "<when_tag news>\n未选 tag 说明\n</when_tag>\n"
+            "结束"
+        ),
+    )
+    _write_json(
+        tmp_path / "manifests" / "conditions.json",
+        _manifest(
+            "conditions",
+            tool_selection={
+                "mode": "select",
+                "tool_names": ["lookup_filing"],
+                "tool_tags_any": [],
+            },
+            fragments=[_fragment("tools", "tools.md", 1)],
+        ),
+    )
+
+    result = prepare_scene(
+        _request(
+            tmp_path,
+            "conditions",
+            tools=(SceneToolInfo(name="lookup_filing", tags=frozenset({"read"})),),
+        )
+    )
+
+    assert "显式工具说明" in result.system_prompt
+    assert "显式工具携带 tag 说明" in result.system_prompt
+    assert "未选工具说明" not in result.system_prompt
+    assert "未选 tag 说明" not in result.system_prompt
+    assert "<when_tool" not in result.system_prompt
+    assert "</when_tool>" not in result.system_prompt
+    assert "<when_tag" not in result.system_prompt
+    assert "</when_tag>" not in result.system_prompt
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "<when_tool lookup_filing>未闭合",
+        "</when_tool>",
+        "<when_tool lookup_filing>错配</when_tag>",
+        "<when_tool lookup_filing><when_tag read>嵌套</when_tag></when_tool>",
+        "<when_tool >空名</when_tool>",
+        "<when_tool lookup_filing extra>多参数</when_tool>",
+    ],
+)
+def test_condition_blocks_malformed_markers_fail_closed(tmp_path: Path, content: str) -> None:
+    """条件块 marker 非法、错配、未闭合或嵌套时必须 fail closed。"""
+
+    _write_text(tmp_path / "prompts" / "tools.md", content)
+    _write_json(
+        tmp_path / "manifests" / "bad_conditions.json",
+        _manifest(
+            "bad_conditions",
+            fragments=[_fragment("tools", "tools.md", 1)],
+            tool_selection={
+                "mode": "select",
+                "tool_names": ["lookup_filing"],
+                "tool_tags_any": [],
+            },
+        ),
+    )
+
+    with pytest.raises(ScenePrepareError, match="conditional"):
+        prepare_scene(
+            _request(
+                tmp_path,
+                "bad_conditions",
+                tools=(SceneToolInfo(name="lookup_filing", tags=frozenset({"read"})),),
+            )
+        )
 
 
 def test_content_digest_changes_when_runner_option_hint_id_changes(

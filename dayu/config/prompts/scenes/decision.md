@@ -24,3 +24,7 @@
 ## 输出要求
 - 只输出该章节正文。
 - 本章末尾必须包含“### 证据与出处”。
+
+{{current_time}}
+
+{{fins_default_subject}}

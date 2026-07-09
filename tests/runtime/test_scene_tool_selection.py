@@ -30,6 +30,19 @@ def _write_json(path: Path, value: JsonValue) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _write_text(path: Path, value: str) -> None:
+    """写入文本 fixture。
+
+    :param path: 目标路径。
+    :param value: 文本内容。
+    :returns: ``None``。
+    :raises OSError: 写入失败时抛出。
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(value, encoding="utf-8")
+
+
 def _manifest(scene_id: str, tool_selection: JsonValue) -> dict[str, JsonValue]:
     """构造只有工具选择差异的 scene manifest。
 
@@ -51,6 +64,26 @@ def _manifest(scene_id: str, tool_selection: JsonValue) -> dict[str, JsonValue]:
         "fragments": [],
         "context_slots": [],
     }
+
+
+def _manifest_with_fragment(scene_id: str, tool_selection: JsonValue) -> dict[str, JsonValue]:
+    """构造带单个 fragment 的 scene manifest。
+
+    :param scene_id: scene id。
+    :param tool_selection: tool selection JSON object。
+    :returns: manifest JSON object。
+    """
+
+    manifest = _manifest(scene_id, tool_selection)
+    manifest["fragments"] = [
+        {
+            "id": "tools",
+            "path": "tools.md",
+            "order": 1,
+            "required": True,
+        }
+    ]
+    return manifest
 
 
 def _request(tmp_path: Path, scene_id: str) -> ScenePrepareRequest:
@@ -231,3 +264,37 @@ def test_tool_selection_allow_empty_allows_empty_select(tmp_path: Path) -> None:
     result = prepare_scene(_request(tmp_path, "allow_empty"))
 
     assert result.tool_selection.tool_names == frozenset()
+
+
+def test_condition_blocks_respect_all_and_none_tool_selection_modes(tmp_path: Path) -> None:
+    """mode=all/none 应分别按全量或空工具集合过滤条件块。"""
+
+    _write_text(
+        tmp_path / "prompts" / "tools.md",
+        (
+            "<when_tool lookup_filing>工具命中</when_tool>\n"
+            "<when_tag read>标签命中</when_tag>"
+        ),
+    )
+    _write_json(
+        tmp_path / "manifests" / "all_condition_tools.json",
+        _manifest_with_fragment(
+            "all_condition_tools",
+            {"mode": "all", "tool_names": [], "tool_tags_any": []},
+        ),
+    )
+    _write_json(
+        tmp_path / "manifests" / "no_condition_tools.json",
+        _manifest_with_fragment(
+            "no_condition_tools",
+            {"mode": "none", "tool_names": [], "tool_tags_any": []},
+        ),
+    )
+
+    all_result = prepare_scene(_request(tmp_path, "all_condition_tools"))
+    none_result = prepare_scene(_request(tmp_path, "no_condition_tools"))
+
+    assert "工具命中" in all_result.system_prompt
+    assert "标签命中" in all_result.system_prompt
+    assert "工具命中" not in none_result.system_prompt
+    assert "标签命中" not in none_result.system_prompt

@@ -521,9 +521,11 @@ def test_read_transaction_keeps_stale_snapshot_until_commit(
             runner_b = HostTransactionRunner(
                 connection_b,
                 options.sqlite_policy,
+                artifact_root=options.payload_policy.artifact_root,
                 payload_inline_threshold_bytes=(
                     options.payload_policy.payload_inline_threshold_bytes
                 ),
+                create_artifact_root=options.payload_policy.create_artifact_root,
             )
 
             def append_from_connection_b(transaction: HostTransaction) -> None:
@@ -792,9 +794,11 @@ def test_runner_can_be_constructed_with_independent_connection(
             runner = HostTransactionRunner(
                 connection,
                 options.sqlite_policy,
+                artifact_root=options.payload_policy.artifact_root,
                 payload_inline_threshold_bytes=(
                     options.payload_policy.payload_inline_threshold_bytes
                 ),
+                create_artifact_root=options.payload_policy.create_artifact_root,
             )
 
             def operation(transaction: HostTransaction) -> None:
@@ -825,9 +829,11 @@ def test_commit_failure_with_rollback_failure_marks_runner_unusable(
     runner = HostTransactionRunner(
         cast(sqlite3.Connection, connection),
         options.sqlite_policy,
+        artifact_root=options.payload_policy.artifact_root,
         payload_inline_threshold_bytes=(
             options.payload_policy.payload_inline_threshold_bytes
         ),
+        create_artifact_root=options.payload_policy.create_artifact_root,
     )
 
     def operation(transaction: HostTransaction) -> str:

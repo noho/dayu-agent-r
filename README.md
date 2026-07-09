@@ -299,14 +299,15 @@ dayu-cli <subcommand> [参数]
 | `--label` | `prompt` `interactive` | 把当前对话绑定到可恢复 label |
 | `--new-session` | `interactive` | 不续接上一次 interactive 多轮会话，改为从头开始一个新会话 |
 | `--web-provider` | `prompt` `interactive` `write` | 指定联网检索 provider，如 `auto`、`tavily`、`serper`、`duckduckgo` |
-| `--thinking` / `--no-thinking` | `prompt` `interactive` | 控制是否在终端回显模型思考过程 |
-| `--detail` / `--no-detail` | `prompt` | 控制是否显示运行态 activity stream；默认 `--no-detail` |
+| `--thinking` / `--no-thinking` | `prompt` `interactive` `session resume` | 控制是否在终端回显运行态思考展示；默认 `--thinking` |
+| `--detail` / `--no-detail` | `prompt` `interactive` `session resume` | 控制是否显示运行态 activity stream；默认 `--detail` |
 
 说明：
 - `--log-level`、`--debug`、`--verbose`、`--info`、`--quiet` 是同一组日志参数，使用其一即可。
 - `--debug` 适合查看普通诊断，例如 Host 打开、命令提交、调度、Runner HTTP 请求和终态收口；默认不会输出逐 token / 逐 delta 级别的 stream 诊断。
 - `--debug-stream` 用于排查高频流式链路问题，例如 stream delta、stream idle heartbeat、SSE 完成标记和 Host 逐 delta ingest 诊断；单独使用 `--debug-stream` 时已经包含普通 `--debug` 诊断。
 - CLI 的用户可见输出和诊断日志默认分离：回答、进度、错误提示仍走 stdout / stderr；Python logging 诊断默认写入系统临时目录下的 `dayu-cli-*.log`。需要固定日志位置时使用 `--log-file <path>`，它只改变诊断日志位置，不改变用户可见输出通道。
+- `--thinking` 和 `--detail` 都是 CLI 终端展示开关，不会启用或关闭模型侧思考能力，也不会改变本次运行的模型配置裁决；当底层 runner 产生 thinking 增量时，`--thinking` 会在运行中回显。TTY 终端里拿到最终回答前会清除运行态 thinking / activity 展示，最终只留下回答；非 TTY 捕获流会保留可读的运行态文本，不输出 ANSI 清屏控制符。
 - `--detail` 显示的是终端里的运行态 activity stream；它与 `--debug` / `--debug-stream` 的诊断日志相互独立，activity stream 不会写入 `--log-file`。
 - 全局参数可以写在子命令前，也可以写在子命令后。例如 `dayu-cli --debug prompt "问题"` 和 `dayu-cli prompt "问题" --debug` 等价；`--log-file` 也同理。
 - `prompt`、`interactive`、`write` 还支持更多 Agent 运行参数，例如 `--tool-timeout-seconds`、`--max-iterations`、`--doc-limits-json`、`--fins-limits-json`；需要时可用 `dayu-cli <subcommand> --help` 查看完整列表。
@@ -376,10 +377,6 @@ dayu-wechat <command> [参数]
 | `--model-name` | `run` `service install` | 指定模型配置名称 |
 | `--temperature` | `run` `service install` | 覆盖模型 temperature |
 | `--web-provider` | `run` `service install` | 指定联网检索 provider |
-| `--debug-sse` | `run` `service install` | 开启 SSE 高频调试日志 |
-| `--debug-tool-delta` | `run` `service install` | 开启工具调用参数增量日志 |
-| `--debug-sse-sample-rate` | `run` `service install` | 设置 SSE 调试日志采样率 |
-| `--debug-sse-throttle-sec` | `run` `service install` | 设置 SSE 调试日志节流窗口 |
 | `--tool-timeout-seconds` | `run` `service install` | 覆盖工具超时 |
 | `--max-iterations` | `run` `service install` | 覆盖 Agent 最大迭代次数 |
 | `--fallback-mode` | `run` `service install` | 覆盖超限处理模式 |
@@ -544,8 +541,8 @@ dayu-cli upload_material \
 | `--label` | 可选，把本次提问绑定到可恢复 conversation |
 | `--model-name` | 可选，指定模型配置 |
 | `--temperature` | 可选，覆盖模型 temperature |
-| `--thinking` / `--no-thinking` | 可选，控制是否回显模型思考过程 |
-| `--detail` / `--no-detail` | 可选，控制是否显示运行态 activity stream，默认不显示 |
+| `--thinking` / `--no-thinking` | 可选，控制是否回显运行态思考展示，默认显示 |
+| `--detail` / `--no-detail` | 可选，控制是否显示运行态 activity stream，默认显示 |
 | `--debug` / `--debug-stream` / `--verbose` | 可选，仅调整诊断日志级别，不改变会话行为 |
 
 命令示例：
@@ -558,12 +555,12 @@ dayu-cli prompt "总结苹果最新财报中的主要风险"
 
 ```bash
 dayu-cli prompt "总结最新财报中的主要风险" --ticker AAPL
-dayu-cli prompt "总结苹果最新财报中的主要风险" --thinking
+dayu-cli prompt "总结苹果最新财报中的主要风险" --no-thinking
 dayu-cli prompt --label apple "先总结苹果最新财报中的主要风险"
 dayu-cli prompt "总结苹果最新财报中的主要风险" --model-name mimo-v2.5-pro
 dayu-cli prompt "总结苹果最新财报中的主要风险" --debug
 dayu-cli prompt "总结苹果最新财报中的主要风险" --debug-stream
-dayu-cli prompt "总结苹果最新财报中的主要风险" --detail
+dayu-cli prompt "总结苹果最新财报中的主要风险" --no-detail
 ```
 
 命令说明：
@@ -571,8 +568,8 @@ dayu-cli prompt "总结苹果最新财报中的主要风险" --detail
 - 两种写法都可以：要么在问题里直接写公司名或股票代码，要么用 `--ticker` 明确指定研究对象；一般不需要两边重复写。
 - 不带 `--label` 时，`prompt` 保持 one-shot，不承诺后续恢复；带 `--label` 时，本次提问会挂到该 label 对应的可恢复 conversation 上，后续可继续用 `prompt --label <label>` 或 `interactive --label <label>` 接着问。
 - 带 `--label` 的 prompt 在本轮拿到最终回答前会独占该 label；如果另一个进程此时也尝试复用同一个 label，CLI 会直接报错并提示等待当前对话结束，或改用新的 `--label`。
-- 默认不回显模型思考过程；如需在终端查看，显式传 `--thinking`。
-- 默认不显示运行态 activity stream；如需查看工具调用、运行状态等过程信息，显式传 `--detail`。
+- 默认会显示运行态思考展示和 activity stream；如果底层 runner 产生 thinking 增量，`--thinking` 会在运行中回显这些增量。TTY 终端里最终回答出现前会清除运行态展示；非 TTY 捕获流会保留可读的运行态文本。若完全不想看到对应运行态展示，使用 `--no-thinking` 或 `--no-detail` 关闭。
+- `--thinking` / `--no-thinking` 只控制 CLI 终端展示，不会改变模型配置或 provider 请求参数。
 - `--debug-stream` 用于排查流式输出、SSE 和逐 delta ingest 问题；普通排障优先使用 `--debug`。
 
 ### 3.4 交互式对话：`interactive`
@@ -586,7 +583,8 @@ dayu-cli prompt "总结苹果最新财报中的主要风险" --detail
 |------|------|
 | `--model-name` | 可选，指定模型配置 |
 | `--temperature` | 可选，覆盖模型 temperature |
-| `--thinking` / `--no-thinking` | 可选，控制是否回显模型思考过程 |
+| `--thinking` / `--no-thinking` | 可选，控制是否回显运行态思考展示，默认显示 |
+| `--detail` / `--no-detail` | 可选，控制是否显示运行态 activity stream，默认显示 |
 | `--label` | 可选，恢复或创建指定 label 的可复用 conversation；首次创建时 scene 为 `interactive` |
 | `--new-session` | 可选，不续接上一次多轮会话，改为从头开始一个新会话 |
 | `--debug` / `--debug-stream` / `--verbose` | 可选，仅调整诊断日志级别，不改变会话行为 |
@@ -602,7 +600,8 @@ dayu-cli interactive
 ```bash
 dayu-cli interactive --model-name mimo-v2.5-pro
 dayu-cli interactive --temperature 0.2
-dayu-cli interactive --thinking
+dayu-cli interactive --no-thinking
+dayu-cli interactive --no-detail
 dayu-cli interactive --label apple
 dayu-cli interactive --new-session
 dayu-cli interactive --verbose
@@ -617,8 +616,10 @@ dayu-cli interactive --debug-stream
 - 如果你想显式复用某条长期对话，使用 `--label`。同一个 label 可在 `prompt --label` 与 `interactive --label` 之间互通；之后恢复时沿用首次创建时的会话绑定。
 - 带 `--label` 的 CLI 启动时，会明确提示当前是“新创建标签”还是“恢复标签”；`prompt --label` 在回答末尾还会再次打印标签提示框，方便你后续继续复用同一个 label。
 - 同一个 label 在任意时刻只能被一个 CLI 进程占用：`interactive --label` 会在整个 REPL 生命周期内持有该 label，直到双 `Ctrl+D` 完整退出；`prompt --label` 会在本轮返回最终回答前持有该 label。若命中占用中的 label，CLI 会提示你等待当前对话结束后重试，或改用新的 `--label`。
+- 在空的 `dayu>` 提示符下，第一次按 `Ctrl+C` 会回到一个干净的新提示符，连续第二次按 `Ctrl+C` 才会退出；如果中间提交了正常输入，之后的 `Ctrl+C` 会重新按第一次处理。
 - 如果你在 workspace 本地覆写了带 label 会命中的 scene manifest，必须使用当前 `ScenePrepare` 支持的 scene-only schema。
-- 默认不回显模型思考过程；如需在终端查看，显式传 `--thinking`。
+- 默认会显示运行态思考展示和 activity stream；如果底层 runner 产生 thinking 增量，`--thinking` 会在运行中回显这些增量。TTY 终端里最终回答出现前会清除运行态展示；非 TTY 捕获流会保留可读的运行态文本。若完全不想看到对应运行态展示，使用 `--no-thinking` 或 `--no-detail` 关闭。
+- `--thinking` / `--no-thinking` 只控制 CLI 终端展示，不会改变模型配置或 provider 请求参数。
 
 ### 3.5 微信对话 daemon：
 
@@ -630,8 +631,8 @@ dayu-cli interactive --debug-stream
 | 命令 | 关键参数 | 说明 |
 |------|------|------|
 | `login` | `--label` `--relogin` `--qrcode-timeout-sec` | 建立或刷新登录态 |
-| `run` | `--model-name` `--temperature` `--web-provider` `--debug-sse` `--fallback-mode` | 在当前终端以前台方式运行 |
-| `service install` | `--label` `--model-name` `--temperature` `--web-provider` `--debug-sse` `--fallback-mode` | 安装后台服务 |
+| `run` | `--model-name` `--temperature` `--web-provider` `--fallback-mode` | 在当前终端以前台方式运行 |
+| `service install` | `--label` `--model-name` `--temperature` `--web-provider` `--fallback-mode` | 安装后台服务 |
 | `service start` | `--label` | 启动后台服务 |
 | `service restart` | `--label` | 重启后台服务 |
 | `service stop` | `--label` | 停止后台服务 |
@@ -996,7 +997,7 @@ dayu-cli process --ticker AAPL --ci --document-id fil_001 --document-id fil_002
 
 ### 5.1 Host public 多轮闭环 smoke
 
-`utils/smoke_host_public_multiturn.py` 用于人工观察真实生产式 runtime assembly 是否能只通过 Host public interface / contract 完成多轮会话闭环。脚本默认使用 `workspace/tmp/` 下的 fresh smoke workspace，避免历史 durable DB schema 污染；需要复用已有 workspace 时显式传 `--workspace-root`。脚本使用 runtime location resolver 解析所选 workspace 的 `workspace/config` overlay、prompt asset root 与 scene manifest root，再通过 `ConfigLoader`、`ToolsDiscovery`、`ScenePrepare` 和 `dayu.service.host_assembly` 映射为 `open_host(options)` 与每轮 `submit_followup` typed input。打开后脚本只调用 public Host handle。脚本把 Dayu 日志默认打开到 `VERBOSE`，便于观察 Host command、dispatch、EngineEvent ingest、ToolRuntime、memory catch-up 与 context compact 主路径。默认每次运行使用 fresh session slot；需要在同一个 durable session 内复用时显式加 `--workspace-root` 和 `--reuse-session`。
+`utils/smoke_host_public_multiturn.py` 用于人工观察真实生产式 runtime assembly 是否能只通过 Host public interface / contract 完成多轮会话闭环。脚本默认使用 `workspace/tmp/` 下的 fresh smoke workspace，避免历史 durable DB schema 污染；需要复用已有 workspace 时显式传 `--workspace-root`。脚本使用 runtime location resolver 解析所选 workspace root 下的 `config` overlay、prompt asset root 与 scene manifest root，再通过 `ConfigLoader`、`ToolsDiscovery`、`ScenePrepare` 和 `dayu.service.host_assembly` 映射为 `open_host(options)` 与每轮 `submit_followup` typed input。打开后脚本只调用 public Host handle。脚本把 Dayu 日志默认打开到 `VERBOSE`，便于观察 Host command、dispatch、EngineEvent ingest、ToolRuntime、memory catch-up 与 context compact 主路径。默认每次运行使用 fresh session slot；需要在同一个 durable session 内复用时显式加 `--workspace-root` 和 `--reuse-session`。
 
 ```bash
 source .venv/bin/activate

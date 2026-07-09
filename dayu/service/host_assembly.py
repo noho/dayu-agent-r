@@ -106,6 +106,7 @@ from dayu.runtime.tools_discovery import (
     ToolsDiscoveryProviderSpec,
     resolve_provider_callable,
 )
+from dayu.runtime.workspace_paths import resolve_workspace_path
 
 _ENV_PLACEHOLDER_PATTERN: Final[re.Pattern[str]] = re.compile(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}")
 _WORKER_BACKEND_LOCAL: Final[str] = "local"
@@ -153,6 +154,14 @@ _FINS_PREPROCESS_SOURCE_IDS: Final[frozenset[str]] = frozenset(
 )
 _FINS_UPLOAD_SOURCE_IDS: Final[frozenset[str]] = frozenset(
     {_FINS_UPLOAD_SOURCE_ID}
+)
+_WEB_TOOLS_PROVIDER_IDS: Final[frozenset[str]] = frozenset({"web-tools"})
+_WEB_TOOLS_IMPORT_PATHS: Final[frozenset[str]] = frozenset(
+    {"dayu.tools.web:discover_tools"}
+)
+_WEB_TOOLS_SOURCE_IDS: Final[frozenset[str]] = frozenset({"dayu.tools.web"})
+_WEB_PLAYWRIGHT_STORAGE_STATE_DIR_CONFIG_FIELD: Final[str] = (
+    "playwright_storage_state_dir"
 )
 
 
@@ -255,11 +264,37 @@ class ServiceDiscoveredTools:
     fins_awaiting_runtime: FinsObservationRuntime | None = None
 
 
+def with_entrypoint_wait_poller_policy(
+    *,
+    overrides: ServiceAssemblyOverrides,
+    scene_inputs: PreparedSceneInputs,
+    discovered_tools: ServiceDiscoveredTools,
+) -> ServiceAssemblyOverrides:
+    """按 product entrypoint 实际工具选择补齐 production wait poller policy。
+
+    :param overrides: 调用方显式 assembly override；若已提供
+        ``wait_poller_policy``，该显式值保持原样。
+    :param scene_inputs: 本次 entrypoint 已装配的 scene 输入。
+    :param discovered_tools: 本次 entrypoint 已发现的工具集合与 provider 配置。
+    :returns: 原 override 或补齐 wait poller policy 后的新 override。
+    :raises ValueError: Fins awaiting provider 配置中的 workspace root 非法时抛出。
+    """
+
+    if overrides.wait_poller_policy is not None:
+        return overrides
+    if not _scene_selects_fins_awaiting_tools(
+        scene_inputs=scene_inputs,
+        discovered_tools=discovered_tools,
+    ):
+        return overrides
+    return replace(overrides, wait_poller_policy=WaitPollerRuntimePolicy())
+
+
 @dataclass(frozen=True, slots=True)
 class ServiceOpenHostAssemblyRequest:
     """Service 组合 ``OpenHostOptions`` 的请求。
 
-    :param workspace_root: workspace / 项目根目录，用于解析相对配置路径。
+    :param workspace_root: workspace 根目录，用于解析相对配置路径。
     :param config: ``ConfigLoader`` 输出的 runtime typed config。
     :param locations: runtime location resolver 输出的位置。
     :param scene_inputs: ``ScenePrepare`` 输出。
@@ -758,8 +793,8 @@ def _compose_options(
     if host_runtime.worker_backend != _WORKER_BACKEND_LOCAL:
         raise ValueError(f"unsupported host worker_backend: {host_runtime.worker_backend}")
     return OpenHostOptions(
-        db_path=_resolve_project_path(request.workspace_root, host_runtime.sqlite.path),
-        artifact_root=_resolve_project_path(
+        db_path=resolve_workspace_path(request.workspace_root, host_runtime.sqlite.path),
+        artifact_root=resolve_workspace_path(
             request.workspace_root,
             host_runtime.artifact_root,
         ),
@@ -770,7 +805,7 @@ def _compose_options(
         sqlite_write_retry_backoff_multiplier=(host_runtime.sqlite.write_retry_backoff_multiplier),
         sqlite_write_retry_max_delay_seconds=(host_runtime.sqlite.write_retry_max_delay_seconds),
         payload_inline_threshold_bytes=host_runtime.payload_inline_threshold_bytes,
-        lane_db_path=_resolve_project_path(
+        lane_db_path=resolve_workspace_path(
             request.workspace_root,
             request.config.runtime_lanes.coordinator.db_path,
         ),
@@ -824,7 +859,7 @@ def _compose_options(
             compactor_agent_policy=compactor_prompts.agent_policy,
             compactor_system_prompt=compactor_prompts.system_prompt,
             compactor_user_prompt_template=compactor_prompts.user_prompt_template,
-            compact_artifact_root=_resolve_project_path(
+            compact_artifact_root=resolve_workspace_path(
                 request.workspace_root,
                 execution_profile.compactor_baseline.artifact_root,
             ),
@@ -1228,20 +1263,33 @@ def _effective_tool_provider_config(
     :param provider_config: ConfigLoader 产出的 provider typed config。
     :param workspace_root: 当前运行时 workspace root；为 ``None`` 时不注入。
     :returns: provider 可直接消费的 effective config。
-    :raises ValueError: Fins workspace root 配置类型非法，或相对路径缺少
-        解析基准时抛出。
+    :raises ValueError: Fins workspace root 或 Web storage state 目录配置类型
+        非法，或相对路径缺少解析基准时抛出。
     """
 
-    if not _is_fins_workspace_bound_provider_config(provider_config):
-        return provider_config.config
-    effective_workspace_root = _effective_fins_workspace_root_config_value(
+    effective_config: dict[str, JsonValue] = dict(provider_config.config)
+    changed = False
+    if _is_fins_workspace_bound_provider_config(provider_config):
+        effective_workspace_root = _effective_fins_workspace_root_config_value(
+            provider_config,
+            workspace_root=workspace_root,
+        )
+        if effective_workspace_root is not None:
+            effective_config[_FINS_WORKSPACE_ROOT_CONFIG_FIELD] = (
+                effective_workspace_root
+            )
+            changed = True
+    effective_storage_state_dir = _effective_web_storage_state_dir_config_value(
         provider_config,
         workspace_root=workspace_root,
     )
-    if effective_workspace_root is None:
+    if effective_storage_state_dir is not None:
+        effective_config[_WEB_PLAYWRIGHT_STORAGE_STATE_DIR_CONFIG_FIELD] = (
+            effective_storage_state_dir
+        )
+        changed = True
+    if not changed:
         return provider_config.config
-    effective_config: dict[str, JsonValue] = dict(provider_config.config)
-    effective_config[_FINS_WORKSPACE_ROOT_CONFIG_FIELD] = effective_workspace_root
     return effective_config
 
 
@@ -1287,7 +1335,51 @@ def _effective_fins_workspace_root_config_value(
             "Fins provider "
             f"{provider_config.provider_id} relative config.workspace_root requires runtime workspace_root"
         )
-    return str(_resolve_project_path(workspace_root, stripped_workspace_root))
+    return str(resolve_workspace_path(workspace_root, stripped_workspace_root))
+
+
+def _effective_web_storage_state_dir_config_value(
+    provider_config: ToolDiscoveryProviderConfig,
+    *,
+    workspace_root: pathlib.Path | None,
+) -> str | None:
+    """解析 Web provider effective storage state 目录。
+
+    :param provider_config: ConfigLoader 产出的 provider typed config。
+    :param workspace_root: 当前运行时 workspace root；为 ``None`` 时无法解析
+        相对路径。
+    :returns: 需要写入 effective config 的绝对目录字符串；返回 ``None`` 表示
+        保留原始 config。
+    :raises ValueError: 已配置 storage state 目录不是字符串，或相对路径缺少
+        解析基准时抛出。
+    """
+
+    if not _is_web_tools_provider_config(provider_config):
+        return None
+    configured_dir = provider_config.config.get(
+        _WEB_PLAYWRIGHT_STORAGE_STATE_DIR_CONFIG_FIELD
+    )
+    if configured_dir is None:
+        return None
+    if not isinstance(configured_dir, str):
+        raise ValueError(
+            "Web provider "
+            f"{provider_config.provider_id} config.playwright_storage_state_dir "
+            "must be a string"
+        )
+    stripped_dir = configured_dir.strip()
+    if stripped_dir == "":
+        return configured_dir
+    configured_path = pathlib.Path(stripped_dir).expanduser()
+    if configured_path.is_absolute():
+        return str(configured_path.resolve(strict=False))
+    if workspace_root is None:
+        raise ValueError(
+            "Web provider "
+            f"{provider_config.provider_id} relative "
+            "config.playwright_storage_state_dir requires runtime workspace_root"
+        )
+    return str(resolve_workspace_path(workspace_root, stripped_dir))
 
 
 def _is_fins_workspace_bound_provider_config(
@@ -1307,6 +1399,23 @@ def _is_fins_workspace_bound_provider_config(
     ):
         return True
     return _fins_awaiting_tool_name_from_provider_config(provider_config) is not None
+
+
+def _is_web_tools_provider_config(
+    provider_config: ToolDiscoveryProviderConfig,
+) -> bool:
+    """判断 provider 是否是 Web tools provider。
+
+    :param provider_config: ConfigLoader 产出的 provider typed config。
+    :returns: 是 Web tools provider 时返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return (
+        provider_config.provider_id in _WEB_TOOLS_PROVIDER_IDS
+        or provider_config.import_path in _WEB_TOOLS_IMPORT_PATHS
+        or provider_config.source_id in _WEB_TOOLS_SOURCE_IDS
+    )
 
 
 def _tool_bundle_with_effective_truncation(
@@ -1904,6 +2013,37 @@ def _fins_awaiting_registry_inputs_from_provider_configs(
     )
 
 
+def _scene_selects_fins_awaiting_tools(
+    *,
+    scene_inputs: PreparedSceneInputs,
+    discovered_tools: ServiceDiscoveredTools,
+) -> bool:
+    """判断当前 scene 是否实际暴露 Fins awaiting 长事务工具。
+
+    :param scene_inputs: 本次 scene prepare 输出。
+    :param discovered_tools: 本次工具发现输出。
+    :returns: 当前 scene 会暴露任一 Fins awaiting 工具时返回 ``True``。
+    :raises ValueError: Fins awaiting provider 配置中的 workspace root 非法时抛出。
+    """
+
+    available_tool_names = frozenset(
+        definition.name for definition in discovered_tools.tool_bundle.definitions
+    )
+    registry_inputs = _fins_awaiting_registry_inputs_from_provider_configs(
+        discovered_tools.effective_provider_configs,
+        available_tool_names=available_tool_names,
+    )
+    if registry_inputs is None:
+        return False
+    selected_tool_names = scene_inputs.tool_selection.tool_names
+    if selected_tool_names is None:
+        return True
+    if not selected_tool_names:
+        return False
+    fins_awaiting_tool_names = frozenset(registry_inputs.tool_names)
+    return bool(selected_tool_names.intersection(fins_awaiting_tool_names))
+
+
 def _fins_awaiting_tool_name_from_provider_config(
     provider_config: ToolDiscoveryProviderConfig,
 ) -> str | None:
@@ -2039,27 +2179,6 @@ def _duplicate_decision_from_config(value: str) -> DuplicateDecisionKind:
         raise ValueError(
             f"unsupported duplicate governance decision: {value}"
         ) from exc
-
-
-def _resolve_project_path(workspace_root: pathlib.Path, configured_path: str) -> pathlib.Path:
-    """把配置路径解析为 workspace-root 相对路径或绝对路径。
-
-    :param workspace_root: workspace / 项目根目录。
-    :param configured_path: 配置中的路径字符串。
-    :returns: 解析后的路径。
-    :raises ValueError: 相对路径逃逸 workspace root 时抛出。
-    """
-
-    path = pathlib.Path(configured_path)
-    if path.is_absolute():
-        return path
-    resolved_root = workspace_root.resolve()
-    resolved_path = (resolved_root / path).resolve()
-    try:
-        resolved_path.relative_to(resolved_root)
-    except ValueError as exc:
-        raise ValueError("configured project path escapes workspace root") from exc
-    return resolved_path
 
 
 def _provider_extension_status(model: ModelConfig) -> str:

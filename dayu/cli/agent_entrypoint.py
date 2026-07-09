@@ -238,18 +238,8 @@ def unsupported_execution_option_names(args: ParsedCliArgs) -> tuple[str, ...]:
     """
 
     names: list[str] = []
-    if args.thinking is not None:
-        names.append("--thinking/--no-thinking")
     if args.web_provider is not None:
         names.append("--web-provider")
-    if args.debug_sse:
-        names.append("--debug-sse")
-    if args.debug_tool_delta:
-        names.append("--debug-tool-delta")
-    if args.debug_sse_sample_rate is not None:
-        names.append("--debug-sse-sample-rate")
-    if args.debug_sse_throttle_sec is not None:
-        names.append("--debug-sse-throttle-sec")
     if args.enable_tool_trace:
         names.append("--enable-tool-trace")
     if args.tool_trace_dir is not None:

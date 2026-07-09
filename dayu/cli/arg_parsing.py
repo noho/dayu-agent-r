@@ -138,13 +138,9 @@ class ParsedCliArgs(argparse.Namespace):
     ticker: str | None
     label: str | None
     model_name: str | None
-    thinking: bool | None
+    thinking: bool
     web_provider: str | None
     temperature: float | None
-    debug_sse: bool
-    debug_tool_delta: bool
-    debug_sse_sample_rate: float | None
-    debug_sse_throttle_sec: float | None
     tool_timeout_seconds: float | None
     enable_tool_trace: bool
     tool_trace_dir: str | None
@@ -250,17 +246,13 @@ def _new_default_namespace() -> ParsedCliArgs:
     namespace.log_level = DEFAULT_LOG_LEVEL
     namespace.debug_stream = False
     namespace.log_file = None
-    namespace.detail = False
+    namespace.detail = True
     namespace.ticker = None
     namespace.label = None
     namespace.model_name = None
-    namespace.thinking = None
+    namespace.thinking = True
     namespace.web_provider = None
     namespace.temperature = None
-    namespace.debug_sse = False
-    namespace.debug_tool_delta = False
-    namespace.debug_sse_sample_rate = None
-    namespace.debug_sse_throttle_sec = None
     namespace.tool_timeout_seconds = None
     namespace.enable_tool_trace = False
     namespace.tool_trace_dir = None
@@ -325,7 +317,7 @@ def _build_global_arguments_parent() -> argparse.ArgumentParser:
         "--config",
         dest="config_dir",
         default=argparse.SUPPRESS,
-        help="显式配置目录；未提供时使用 workspace/config 或随包默认配置。",
+        help="显式配置目录；未提供时使用 <base>/config 或随包默认配置。",
     )
     parser.add_argument(
         "--log-level",
@@ -454,21 +446,7 @@ def _register_prompt_command(
     parser.add_argument("prompt", type=_non_empty_prompt, help="本轮用户问题。")
     parser.add_argument("--ticker", help="可选公司代码或财报主体。")
     parser.add_argument("--label", help="复用或绑定的本地会话标签。")
-    detail_group = parser.add_mutually_exclusive_group()
-    detail_group.add_argument(
-        "--detail",
-        dest="detail",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help="显示运行态 activity stream。",
-    )
-    detail_group.add_argument(
-        "--no-detail",
-        dest="detail",
-        action="store_false",
-        default=argparse.SUPPRESS,
-        help="不显示运行态 activity stream。",
-    )
+    _add_detail_display_arguments(parser)
     _add_agent_execution_arguments(parser)
 
 
@@ -492,6 +470,7 @@ def _register_interactive_command(
     )
     parser.add_argument("--ticker", help="可选公司代码或财报主体。")
     parser.add_argument("--label", help="复用或绑定的本地会话标签。")
+    _add_detail_display_arguments(parser)
     _add_agent_execution_arguments(parser)
 
 
@@ -607,6 +586,7 @@ def _register_session_resume_action(
         type=_non_empty_prompt,
         help="prompt 模式下一轮用户问题。",
     )
+    _add_detail_display_arguments(parser)
     _add_agent_execution_arguments(parser)
 
 
@@ -673,34 +653,18 @@ def _add_agent_execution_arguments(parser: argparse.ArgumentParser) -> None:
         "--thinking",
         dest="thinking",
         action="store_true",
-        default=None,
-        help="请求启用模型思考能力；执行期按当前配置裁决。",
+        default=argparse.SUPPRESS,
+        help="在终端显示运行态思考展示。",
     )
     thinking_group.add_argument(
         "--no-thinking",
         dest="thinking",
         action="store_false",
-        default=None,
-        help="请求关闭模型思考能力；执行期按当前配置裁决。",
+        default=argparse.SUPPRESS,
+        help="不在终端显示运行态思考展示。",
     )
     parser.add_argument("--web-provider", help="Web 工具 provider 覆盖标识。")
     parser.add_argument("--temperature", type=float, help="本轮模型采样温度覆盖值。")
-    parser.add_argument("--debug-sse", action="store_true", help="保留的 SSE 调试开关。")
-    parser.add_argument(
-        "--debug-tool-delta",
-        action="store_true",
-        help="保留的工具增量调试开关。",
-    )
-    parser.add_argument(
-        "--debug-sse-sample-rate",
-        type=float,
-        help="保留的 SSE 调试采样率。",
-    )
-    parser.add_argument(
-        "--debug-sse-throttle-sec",
-        type=float,
-        help="保留的 SSE 调试节流秒数。",
-    )
     parser.add_argument(
         "--tool-timeout-seconds",
         type=float,
@@ -731,6 +695,31 @@ def _add_agent_execution_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--doc-limits-json", help="保留的文档工具限制 JSON。")
     parser.add_argument("--fins-limits-json", help="保留的财报工具限制 JSON。")
+
+
+def _add_detail_display_arguments(parser: argparse.ArgumentParser) -> None:
+    """为 Agent 类命令追加运行态 activity 展示参数。
+
+    :param parser: 目标命令解析器。
+    :returns: ``None``。
+    :raises ValueError: argparse 参数注册失败时透传底层异常。
+    """
+
+    detail_group = parser.add_mutually_exclusive_group()
+    detail_group.add_argument(
+        "--detail",
+        dest="detail",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="显示运行态 activity stream。",
+    )
+    detail_group.add_argument(
+        "--no-detail",
+        dest="detail",
+        action="store_false",
+        default=argparse.SUPPRESS,
+        help="不显示运行态 activity stream。",
+    )
 
 
 def _non_empty_prompt(value: str) -> str:

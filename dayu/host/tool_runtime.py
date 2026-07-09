@@ -24,6 +24,7 @@ from types import MappingProxyType
 from typing import Protocol, cast
 
 from dayu.contracts.json_value import JsonValue
+from dayu.contracts.tool_await import ToolAwaitSnapshot
 from dayu.contracts.tool_call import (
     BatchToolExecutionContext,
     BatchToolExecutionRequest,
@@ -69,6 +70,7 @@ from dayu.contracts.tool_source import ToolBundleSourceRef
 from dayu.host.api import AttemptStatus, HostPayloadRef, RunStatus
 from dayu.host.durable.codec import (
     canonical_json_dumps,
+    format_utc_timestamp,
     is_sha256_digest,
     sha256_digest_json,
 )
@@ -6939,6 +6941,7 @@ def _tool_awaiting_accept_candidate(
         tool_schema_digest=tool_schema_digest,
         tool_identity_digest=tool_identity_digest,
         normalized_arguments_digest=normalized_arguments_digest,
+        accepted_arguments=call.arguments,
         await_spec=awaiting_outcome.await_spec,
         snapshot_ref=snapshot_ref,
         binding=binding,
@@ -6961,7 +6964,22 @@ def _wait_snapshot_ref(outcome: ToolAwaitingOutcome) -> WaitSnapshotRef | None:
     return WaitSnapshotRef(
         snapshot_id=outcome.snapshot.snapshot_id,
         captured_at=outcome.snapshot.captured_at,
-        snapshot_digest=None,
+        snapshot_digest=_wait_snapshot_digest(outcome.snapshot),
+    )
+
+
+def _wait_snapshot_digest(snapshot: ToolAwaitSnapshot) -> str:
+    """计算 Engine awaiting snapshot 的 Host durable 引用 digest。
+
+    :param snapshot: Engine 透传的等待时点快照引用。
+    :returns: Host durable 标准 sha256 digest。
+    """
+
+    return sha256_digest_json(
+        {
+            "captured_at": format_utc_timestamp(snapshot.captured_at),
+            "snapshot_id": snapshot.snapshot_id,
+        }
     )
 
 

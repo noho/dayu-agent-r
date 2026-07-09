@@ -150,6 +150,7 @@ _SEC_FORMS_ADAPTER_JOINER: Final[str] = ","
 _SEC_STATUS_DOWNLOADED: Final[str] = "downloaded"
 _SEC_STATUS_REJECTED: Final[str] = "rejected"
 _SEC_STATUS_SKIPPED: Final[str] = "skipped"
+_SEC_STATUS_FAILED: Final[str] = "failed"
 _SEC_REASON_6K_FILTERED: Final[str] = "6k_filtered"
 _ADAPTER_PROGRESS_FILING_STARTED: Final[str] = "download.filing_started"
 _ADAPTER_PROGRESS_FILING_COMPLETED: Final[str] = "download.filing_completed"
@@ -1026,6 +1027,7 @@ class SecPipeline:
         filing: FilingRecord,
         overwrite: bool,
         rejection_registry: Optional[dict[str, dict[str, str]]] = None,
+        cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> AsyncIterator[DownloadEvent]:
         """下载单个 SEC filing 并产出事件。
 
@@ -1035,6 +1037,7 @@ class SecPipeline:
             filing: filing 记录。
             overwrite: 是否覆盖。
             rejection_registry: 拒绝注册表。
+            cancel_checker: 可选协作式取消检查器。
 
         Yields:
             文件级和 filing 级事件。
@@ -1050,6 +1053,7 @@ class SecPipeline:
             filing=filing,
             overwrite=overwrite,
             rejection_registry=rejection_registry,
+            cancel_checker=cancel_checker,
             is_rejected=_is_rejected,
             record_rejection=_record_rejection,
             build_download_filing_event_payload=build_download_filing_event_payload,
@@ -1111,6 +1115,7 @@ class SecPipeline:
         sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
         rejection_registry: Optional[dict[str, dict[str, str]]] = None,
         overwrite: bool = False,
+        cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> tuple[list[FilingRecord], set[str]]:
         """过滤 filings 并收集 filenum。
 
@@ -1123,6 +1128,7 @@ class SecPipeline:
             sc13_direction_cache: SC13 方向缓存。
             rejection_registry: 拒绝注册表。
             overwrite: 是否覆盖。
+            cancel_checker: 可选协作式取消检查器。
 
         Returns:
             过滤后的 filing 列表与 filenum 集合。
@@ -1156,7 +1162,10 @@ class SecPipeline:
             else:
                 history_url = f"https://data.sec.gov/submissions/{filename}"
                 try:
-                    history_json = await self._downloader.fetch_json(history_url)
+                    history_json = await self._downloader.fetch_json(
+                        history_url,
+                        cancellation_checker=cancel_checker,
+                    )
                 except RuntimeError as exc:
                     Log.warn(f"历史 filings 文件抓取失败: {history_url} error={exc}", module=self.MODULE)
                     continue
@@ -1183,6 +1192,7 @@ class SecPipeline:
                 sc13_direction_cache=sc13_direction_cache,
                 rejection_registry=rejection_registry,
                 overwrite=overwrite,
+                cancel_checker=cancel_checker,
             ),
         )
         deduplicated_records = cast(
@@ -1210,6 +1220,7 @@ class SecPipeline:
         sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
         rejection_registry: Optional[dict[str, dict[str, str]]] = None,
         overwrite: bool = False,
+        cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> list[FilingRecord]:
         """通过 browse-edgar 补齐 SC13 filing。
 
@@ -1223,6 +1234,7 @@ class SecPipeline:
             sc13_direction_cache: SC13 方向缓存。
             rejection_registry: 拒绝注册表。
             overwrite: 是否覆盖。
+            cancel_checker: 可选协作式取消检查器。
 
         Returns:
             合并后的 filings。
@@ -1253,6 +1265,7 @@ class SecPipeline:
                 sc13_direction_cache=sc13_direction_cache,
                 rejection_registry=rejection_registry,
                 overwrite=overwrite,
+                cancel_checker=cancel_checker,
             ),
         )
 
@@ -1268,6 +1281,7 @@ class SecPipeline:
         sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
         rejection_registry: Optional[dict[str, dict[str, str]]] = None,
         overwrite: bool = False,
+        cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> list[FilingRecord]:
         """SC13 为空时执行渐进式回溯。
 
@@ -1282,6 +1296,7 @@ class SecPipeline:
             sc13_direction_cache: SC13 方向缓存。
             rejection_registry: 拒绝注册表。
             overwrite: 是否覆盖。
+            cancel_checker: 可选协作式取消检查器。
 
         Returns:
             可能补齐后的 filings。
@@ -1304,6 +1319,7 @@ class SecPipeline:
                 sc13_direction_cache=sc13_direction_cache,
                 rejection_registry=rejection_registry,
                 overwrite=overwrite,
+                cancel_checker=cancel_checker,
             ),
         )
 
@@ -1316,6 +1332,7 @@ class SecPipeline:
         sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
         rejection_registry: Optional[dict[str, dict[str, str]]] = None,
         overwrite: bool = False,
+        cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> bool:
         """判断单条 SC13 是否满足别人持股当前 ticker 的方向。
 
@@ -1327,6 +1344,7 @@ class SecPipeline:
             sc13_direction_cache: SC13 方向缓存。
             rejection_registry: 拒绝注册表。
             overwrite: 是否覆盖。
+            cancel_checker: 可选协作式取消检查器。
 
         Returns:
             应保留时返回 ``True``。
@@ -1345,6 +1363,7 @@ class SecPipeline:
             sc13_direction_cache=sc13_direction_cache,
             rejection_registry=rejection_registry,
             overwrite=overwrite,
+            cancel_checker=cancel_checker,
         )
 
     def _can_skip_fast(self, previous_meta: Optional[dict[str, JsonValue]], overwrite: bool) -> Optional[str]:
@@ -1583,6 +1602,7 @@ class SecPipeline:
         rejection_category: str,
         selected_primary_document: str,
         source_fingerprint: str,
+        cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> tuple[bool, Optional[str]]:
         """下载并保存 rejected filing artifact。
 
@@ -1596,6 +1616,7 @@ class SecPipeline:
             rejection_category: 拒绝分类。
             selected_primary_document: 当前规则选中的主文件。
             source_fingerprint: 来源指纹。
+            cancel_checker: 可选协作式取消检查器。
 
         Returns:
             成功标记与失败原因。
@@ -1627,6 +1648,7 @@ class SecPipeline:
             build_file_result_from_downloader_event=build_file_result_from_downloader_event,
             normalize_download_file_result=normalize_download_file_result,
             summarize_failed_download_file_reasons=summarize_failed_download_file_reasons,
+            cancellation_checker=cancel_checker,
         )
 
     def _mark_processed_reprocess_required(self, ticker: str, document_id: str) -> None:
@@ -1655,6 +1677,7 @@ class SecPipeline:
         primary_document: str,
         ticker: str,
         document_id: str,
+        cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> tuple[bool, str, str]:
         """预先应用 6-K 筛选规则。
 
@@ -1663,6 +1686,7 @@ class SecPipeline:
             primary_document: 主文件名。
             ticker: 股票代码。
             document_id: 文档 ID。
+            cancel_checker: 可选协作式取消检查器。
 
         Returns:
             是否保留、分类标签、选中主文件名。
@@ -1702,6 +1726,7 @@ class SecPipeline:
                 primary_document,
                 self._downloader,
                 max_lines=120,
+                cancellation_checker=cancel_checker,
             )
         except RuntimeError as exc:
             Log.warn(
@@ -1834,9 +1859,10 @@ class SecDownloadAdapter(FinsSourceDownloadAdapter):
                 progress_sink=request.progress_sink,
             )
         )
+        persisted_summary = _summary_from_pipeline_result(result)
         return FinsSourceDownloadAdapterResult(
-            discovered_count=_summary_int(result, "total"),
-            persisted_summary=_summary_from_pipeline_result(result),
+            discovered_count=persisted_summary.discovered_count,
+            persisted_summary=persisted_summary,
         )
 
 
@@ -1875,24 +1901,35 @@ def _summary_from_pipeline_result(result: SecPipelineDownloadResult) -> FinsDown
     if not isinstance(filings, list):
         raise ValueError("SEC 下载结果 filings 字段必须是列表")
     written_document_ids: list[str] = []
+    downloaded_count = 0
+    skipped_count = 0
     rejected_count = 0
+    failed_count = 0
     for item in filings:
         if not isinstance(item, dict):
+            failed_count += 1
             continue
-        if item.get("status") == _SEC_STATUS_DOWNLOADED:
+        status = str(item.get("status", "")).strip()
+        if status == _SEC_STATUS_DOWNLOADED:
+            downloaded_count += 1
             document_id = str(item.get("document_id", "")).strip()
             if document_id:
                 written_document_ids.append(document_id)
+            continue
         if _is_rejected_filing_result(item):
             rejected_count += 1
-    summary = result.get("summary", {})
-    if not isinstance(summary, dict):
-        summary = {}
-    failed_count = _json_int(summary.get("failed"), "summary.failed")
+            continue
+        if status == _SEC_STATUS_SKIPPED:
+            skipped_count += 1
+            continue
+        if status == _SEC_STATUS_FAILED:
+            failed_count += 1
+            continue
+        failed_count += 1
     return FinsDownloadResultSummary(
-        discovered_count=_summary_int(result, "total"),
-        downloaded_count=_json_int(summary.get("downloaded"), "summary.downloaded"),
-        skipped_count=_json_int(summary.get("skipped"), "summary.skipped"),
+        discovered_count=len(filings),
+        downloaded_count=downloaded_count,
+        skipped_count=skipped_count,
         rejected_count=rejected_count,
         failed_count=failed_count,
         written_document_ids=tuple(written_document_ids),
@@ -1920,26 +1957,6 @@ def _is_rejected_filing_result(item: dict[str, JsonValue]) -> bool:
     skip_reason = str(item.get("skip_reason", "")).strip()
     reason_code = str(item.get("reason_code", "")).strip()
     return skip_reason == _SEC_REASON_6K_FILTERED or reason_code == _SEC_REASON_6K_FILTERED
-
-
-def _summary_int(result: SecPipelineDownloadResult, field_name: str) -> int:
-    """从 OLD 下载结果读取 summary 整数。
-
-    Args:
-        result: OLD pipeline 下载结果。
-        field_name: summary 字段名。
-
-    Returns:
-        非负整数；缺失时返回 0。
-
-    Raises:
-        ValueError: 字段无法转换为非负整数时抛出。
-    """
-
-    summary = result.get("summary", {})
-    if not isinstance(summary, dict):
-        return 0
-    return _json_int(summary.get(field_name), f"summary.{field_name}")
 
 
 def build_sec_download_adapter(

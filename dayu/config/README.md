@@ -1,13 +1,13 @@
 # Dayu 配置说明
 
-本手册只说明当前 `dayu/config/` 的默认配置、`workspace/config/` 覆盖关系与 prompts 目录职责。Engine、Host、Service 和财报领域能力的内部机制不在这里展开。
+本手册只说明当前 `dayu/config/` 的默认配置、workspace root 下 `config/` 覆盖关系与 prompts 目录职责。Engine、Host、Service 和财报领域能力的内部机制不在这里展开。
 
 ## 配置层级
 
 Dayu runtime assembly 配置分两层：
 
 1. 包内默认配置：`dayu/config/`
-2. 工作区覆盖配置：`workspace/config/`
+2. 工作区覆盖配置：`<workspace>/config/`
 
 `dayu-cli init --base <workspace>` 会创建目标 workspace，并把当前包内默认配置文件和 `prompts/`
 资产复制到 `<workspace>/config/`。该命令只生成当前 schema 所需的 `models.json`、
@@ -15,7 +15,7 @@ Dayu runtime assembly 配置分两层：
 和 prompts 资产；不会生成旧 `llm_models.json` / `run.json`，也不会写入明文 API key。
 目标配置文件已存在时默认失败，传 `--overwrite` 才会替换。
 
-`dayu.runtime.location.resolve_runtime_locations` 负责把项目根目录解析为 runtime assembly 位置：`workspace/config` 存在时输出 `config_overlay_dir`，不存在时输出 `None`；prompt assets 与 scene manifests 优先使用 workspace 中已存在的对应目录，否则使用包内默认资产。`ConfigLoader` 只接收调用方显式传入的配置目录，不猜测 workspace 路径。
+`dayu.runtime.location.resolve_runtime_locations` 负责把 workspace root 解析为 runtime assembly 位置：`<workspace>/config` 存在时输出 `config_overlay_dir`，不存在时输出 `None`；prompt assets 与 scene manifests 优先使用 workspace 中已存在的对应目录，否则使用包内默认资产。`ConfigLoader` 只接收调用方显式传入的配置目录，不猜测 workspace 路径。
 
 `dayu.runtime.config_loader.ConfigLoader` 默认加载包内配置；调用方可以显式传入 workspace 配置目录。ConfigLoader 不解析环境变量，不替换 secret，不脱敏，也不 import Host、Engine、Service、UI、Fins 或具体业务工具包。
 
@@ -191,11 +191,13 @@ provider 字段：
 
 包内默认 `doc-tools` provider 指向 `dayu.tools.doc_provider:discover_tools`，默认 `enabled=false` 且 `allowed_paths=[]`。只有在 workspace overlay 启用并在 `config.allowed_paths` 中显式配置可访问文件或目录根时才注册可执行文档工具。白名单为空时 provider 会 fail fast。Doc provider 的 packaged `config.limits` 显式写入默认值：`list_files_max=200`、`get_sections_max=200`、`search_files_max_results=50`、`read_file_max_chars=80000` 与 `read_file_section_max_chars=50000`；workspace overlay 可用同名正整数字段覆盖这些 Doc limits。
 
-包内默认 `web-tools` provider 指向 `dayu.tools.web:discover_tools`，默认 `enabled=true`，并默认拒绝 private / local network URL。Provider 只暴露 `search_web` 与 `fetch_web_page`；`config` 可设置 `provider`（`auto` / `tavily` / `serper` / `duckduckgo`）、`request_timeout_seconds`、`max_search_results`、`fetch_truncate_chars`、`allow_private_network_url`、`playwright_channel` 与 `playwright_storage_state_dir`。默认 `playwright_storage_state_dir` 指向 `workspace/.dayu/web_tools_storage_states`；只有该目录下存在目标 host 对应的 storage state 文件时，Playwright fallback 才会注入登录态。只有显式设置 `allow_private_network_url=true` 时，fetch/search URL safety 才允许内网或本地 URL。
+包内默认 `web-tools` provider 指向 `dayu.tools.web:discover_tools`，默认 `enabled=true`，并默认拒绝 private / local network URL。Provider 只暴露 `search_web` 与 `fetch_web_page`；`config` 可设置 `provider`（`auto` / `tavily` / `serper` / `duckduckgo`）、`request_timeout_seconds`、`max_search_results`、`fetch_truncate_chars`、`allow_private_network_url`、`playwright_channel` 与 `playwright_storage_state_dir`。默认 `playwright_storage_state_dir` 在配置中是 `.dayu/web_tools_storage_states`，Service discovery 会按当前 workspace root 解析为 `<workspace>/.dayu/web_tools_storage_states`；只有该目录下存在目标 host 对应的 storage state 文件时，Playwright fallback 才会注入登录态。只有显式设置 `allow_private_network_url=true` 时，fetch/search URL safety 才允许内网或本地 URL。
+
+包内默认 `utils-tools` provider 指向 `dayu.tools.utils:discover_tools`，默认 `enabled=true`。Provider 当前只暴露 `get_current_time`，用于需要实时时钟的场景；工具只支持 `timezone="Asia/Shanghai"` 或省略该参数，并返回 `time`、`timezone`、`weekday` 与 `iso` 字段。该工具不提供财报、网页或文件事实。
 
 ## prompts 目录职责
 
-`workspace/config/prompts/` 与包内 `dayu/config/prompts/` 用于放置 prompt fragments 和 scene manifests。包内默认资产按目录分为：
+`<workspace>/config/prompts/` 与包内 `dayu/config/prompts/` 用于放置 prompt fragments 和 scene manifests。包内默认资产按目录分为：
 
 | 路径 | 职责 |
 |---|---|
@@ -207,7 +209,13 @@ Scene manifest 由 `dayu.runtime.scene_prepare` 解释；ConfigLoader 不读取�
 
 Scene manifest 第一版是单 Run 场景装配输入。允许的顶层字段固定为 `schema_version`、`scene`、`version`、`description`、`capability_tags`、`extends`、`model`、`agent_policy`、`tool_selection`、`defaults`、`fragments` 与 `context_slots`。调用方显式传入 manifest root、prompt asset root、typed context slot values 与可用工具目录；ScenePrepare 只读取 manifest 直接引用的 fragments，执行确定性的文本替换，并输出 system messages、已拼接的 system prompt、工具选择结果、model hints、typed agent policy override、fragment refs、source refs 与 content digest。
 
-默认非上传 scene 不使用 broad `"fins"` tag 选择 Fins 工具；它们显式列出 Fins read / download / preprocess 工具名，并在需要联网能力时继续用 `"web"` tag。这样即使 upload provider 默认注册 `start_fins_upload`，也不会被非上传 scene 通过泛化 Fins tag 意外选中。`tool_selection.allow_empty` 只控制 scene 工具选择空匹配语义，和 ToolsDiscovery provider 是否允许空输出无关。
+Prompt fragment 可以使用条件块 marker 控制工具说明是否进入最终 system prompt。`<when_tag TAG>...</when_tag>` 只在当前 scene 选中对应工具 tag 时保留正文；`<when_tool NAME>...</when_tool>` 只在当前 scene 选中对应工具名时保留正文。条件块 marker 是 ScenePrepare 解释的 prompt asset 控制语法，渲染后的 LLM-facing system prompt 不应包含这些 marker。
+
+默认非上传 scene 不使用 broad `"fins"` tag 选择 Fins 工具，也不在 packaged manifest 中列出具体工具名；它们通过窄标签 `"fins-read"`、`"fins-download"`、`"fins-preprocess"` 选择财报 read / download / preprocess 工具。除 `conversation_compaction` 这类压缩 scene 外，包内 scene manifest 都声明 required `current_time` context slot，并在 scene prompt 的主要执行契约正文之后渲染 `{{current_time}}`。`current_time` 是 LLM-facing 当前时间文本，表示对话开始时的当前时间；回答普通“现在 / 今天 / 当前时间”问题默认使用它，且该时间不会自动更新。它不等同于工具暴露。
+
+`prompt` 是单轮问答 scene，不暴露 download / preprocess / upload 这类长事务工具；需要模型在对话中触发 download / preprocess 时，使用 `interactive` 或 `wechat` scene。
+
+只有 `interactive` 与 `wechat` manifest 通过 `"utils"` tag 选择 `get_current_time` 工具，使模型在用户明确要求获取此刻最新时间，或要求在等待、查询、下载、上传、处理等动作完成后再确认时间时可以主动调用工具。`prompt` 与其它 scene 即使需要当前时间，也只消费 `current_time` context slot，不通过 `"utils"` tag 暴露该工具。manifest 不写 `"time"` tag 或具体工具名也能通过 `"utils"` tag 获得默认实时时钟能力。这样即使 upload provider 默认注册 `start_fins_upload`，也不会被非上传 scene 通过泛化 Fins tag 意外选中。`tool_selection.allow_empty` 只控制 scene 工具选择空匹配语义，和 ToolsDiscovery provider 是否允许空输出无关。
 
 `conversation_compaction` 是会话压缩专用 scene。该 scene 使用一个 required fragment 作为 compactor system prompt，并在 scene 的 `agent_policy` block 中声明 compactor AgentPolicy。user prompt template 由 execution profile 的 `compactor_baseline.user_prompt_template_path` 指向 prompt asset；template 使用 `<<compaction_request>>` 作为运行期请求数据块占位符，该占位符不是 ScenePrepare context slot，不能写成 `{{...}}`。
 

@@ -17,7 +17,9 @@ import dayu.cli.main as cli_main
 from dayu.cli.composer import InputReaderComposer
 from dayu.cli.run_keys import RunningKeyAction
 from dayu.cli.run_view import InteractiveRunViewOptions, TerminalInteractiveRunView
+from dayu.cli.runtime_display import RuntimeDisplayController
 from dayu.cli.session_terminal_cursor import read_cli_terminal_cursor
+from dayu.cli.thinking import CliThinkingRenderer, CliThinkingRendererOptions
 from dayu.cli.agent_entrypoint import (
     CliSigintMonitor,
     package_config_root,
@@ -49,6 +51,7 @@ from dayu.host.api import (
     HostFinalAnswerView,
     HostStreamCursor,
     HostTerminalStatus,
+    HostThinkingView,
     OutboxProjectionStatus,
     OutboxTerminalCursor,
     OutboxTerminalItemsBatch,
@@ -61,6 +64,7 @@ from dayu.host.api import (
     SubmitFollowupRequest,
 )
 from dayu.service.entrypoint_runtime import (
+    EntrypointThinking,
     EntrypointRunTerminalResult,
     EntrypointRuntimeRequest,
     EntrypointRuntimeResult,
@@ -70,6 +74,18 @@ from dayu.service.entrypoint_runtime import (
 )
 
 _MODEL_ID = "deepseek-v4-flash"
+_CURRENT_TIME_SLOT = "current_time"
+_CURRENT_TIME_TEXT = (
+    "# 当前时间\n"
+    "现在是 2026年7月7日 17:20（Asia/Shanghai，星期二）。\n"
+    "这是对话开始时的当前时间；回答“现在/今天/当前时间”默认使用它；该时间不会自动更新。"
+)
+_REMOVED_INTERACTIVE_DEBUG_OPTIONS: tuple[tuple[str, ...], ...] = (
+    ("--debug-sse",),
+    ("--debug-tool-delta",),
+    ("--debug-sse-sample-rate", "0.5"),
+    ("--debug-sse-throttle-sec", "1.0"),
+)
 _API_KEY = "test-provider-key"
 
 
@@ -148,6 +164,7 @@ class _FakeHost:
     read_outbox_requests: list[ReadOutboxTerminalItemsRequest]
     _submit_statuses: tuple[HostTerminalStatus | None, ...]
     _submit_activities: tuple[bool, ...]
+    _submit_thinking: tuple[bool, ...]
     _cancel_status: HostTerminalStatus | None
     _run_statuses: tuple[RunStatus, ...]
     _submit_index: int
@@ -159,6 +176,7 @@ class _FakeHost:
         *,
         submit_statuses: tuple[HostTerminalStatus | None, ...] = (),
         submit_activities: tuple[bool, ...] = (),
+        submit_thinking: tuple[bool, ...] = (),
         cancel_status: HostTerminalStatus | None = None,
         run_statuses: tuple[RunStatus, ...] = (RunStatus.SUCCEEDED,),
         block_cancel_after_record: bool = False,
@@ -168,6 +186,7 @@ class _FakeHost:
         :param submit_statuses: 每轮 submit 返回前推入 watcher 的 terminal
             状态；``None`` 表示该轮 watcher 不产生 terminal。
         :param submit_activities: 每轮 submit 是否先推入 activity event。
+        :param submit_thinking: 每轮 submit 是否先推入 thinking event。
         :param cancel_status: cancel 返回前推入 watcher 的 terminal 状态。
         :param run_statuses: ``get_run`` 依次返回的状态。
         :param block_cancel_after_record: 是否在记录 cancel 后阻塞。
@@ -184,6 +203,7 @@ class _FakeHost:
         self.read_outbox_requests = []
         self._submit_statuses = submit_statuses
         self._submit_activities = submit_activities
+        self._submit_thinking = submit_thinking
         self._cancel_status = cancel_status
         self._run_statuses = run_statuses
         self._submit_index = 0
@@ -251,6 +271,10 @@ class _FakeHost:
         if status_index < len(self._submit_statuses):
             status = self._submit_statuses[status_index]
         if status is not None:
+            if status_index < len(self._submit_thinking) and self._submit_thinking[
+                status_index
+            ]:
+                await self.watchers[-1].push(_thinking_event(run_id=run_id))
             if status_index < len(self._submit_activities) and self._submit_activities[status_index]:
                 await self.watchers[-1].push(_activity_event(run_id=run_id))
             await self.watchers[-1].push(_terminal_event(run_id=run_id, status=status))
@@ -417,6 +441,51 @@ class _KeyboardInterruptInputReader:
         """
 
         raise KeyboardInterrupt
+
+
+@dataclass(frozen=True, slots=True)
+class _ComposerReadInterrupt:
+    """测试 composer 读取异常步骤。"""
+
+    exception_type: type[BaseException]
+
+
+_ComposerReadStep = str | _ComposerReadInterrupt
+
+
+class _ScriptedComposer:
+    """按脚本返回输入或抛出异常的测试 composer。"""
+
+    prompt_calls: list[str]
+    _remaining: list[_ComposerReadStep]
+
+    def __init__(self, steps: tuple[_ComposerReadStep, ...]) -> None:
+        """初始化 scripted composer。
+
+        :param steps: 每次读取的返回文本或异常步骤。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.prompt_calls = []
+        self._remaining = list(steps)
+
+    async def read(self, prompt: str) -> str:
+        """读取下一条脚本输入。
+
+        :param prompt: 输入提示文本。
+        :returns: 脚本中的输入文本。
+        :raises EOFError: 脚本耗尽或脚本要求 EOF 时抛出。
+        :raises KeyboardInterrupt: 脚本要求输入态中断时抛出。
+        """
+
+        self.prompt_calls.append(prompt)
+        if not self._remaining:
+            raise EOFError
+        step = self._remaining.pop(0)
+        if isinstance(step, str):
+            return step
+        raise step.exception_type()
 
 
 class _AutoSigintMonitor(CliSigintMonitor):
@@ -633,10 +702,8 @@ def test_interactive_label_reuses_host_slot_and_fills_context_slots(
     assert exit_code == EXIT_SUCCESS
     assert captured.out.strip() == "answer for run-1"
     assert captured_requests[0].scene_id == "interactive"
-    assert captured_requests[0].context_slot_values == {
-        "fins_default_subject": "AAPL",
-        "base_user": "本地 CLI 用户",
-    }
+    assert tuple(captured_requests[0].context_slot_values) == (_CURRENT_TIME_SLOT,)
+    assert "Asia/Shanghai" in str(captured_requests[0].context_slot_values[_CURRENT_TIME_SLOT])
     assert fake_host.ensure_requests[0].scope == "cli.interactive"
     assert fake_host.ensure_requests[0].slot_key == "cli.interactive.earnings"
     assert fake_host.create_requests == []
@@ -674,6 +741,13 @@ async def test_interactive_existing_session_execution_does_not_create_or_ensure(
         args,
         command_name="session",
         scenario="interactive",
+    )
+    assert prepared.runtime.host_assembly.options.wait_poller_policy is not None
+    assert prepared.runtime.host_assembly.options.wait_poller_policy.enabled
+    assert prepared.runtime.host_assembly.options.tooling_options is not None
+    assert (
+        prepared.runtime.host_assembly.options.tooling_options.wait_poll_adapter_registry
+        is not None
     )
     fake_host = _FakeHost(
         submit_statuses=(
@@ -859,11 +933,49 @@ def test_interactive_verbose_debug_diagnostics_do_not_pollute_stdout(
     assert "[DEBUG]" not in captured.out
 
 
-def test_interactive_input_keyboard_interrupt_exits_without_run_requests(
+@pytest.mark.asyncio
+async def test_interactive_first_idle_keyboard_interrupt_redisplays_prompt_without_exit(
+    tmp_path: Path,
+) -> None:
+    """输入态第一次空 prompt Ctrl-C 应重绘 prompt，且不得发 submit / cancel。"""
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    invocation = interactive_command.new_cli_invocation(
+        command_name="interactive",
+        scenario="interactive",
+        display_user="本地 CLI 用户",
+        ticker="AAPL",
+    )
+    fake_host = _FakeHost()
+    composer = _ScriptedComposer(
+        (
+            _ComposerReadInterrupt(KeyboardInterrupt),
+            _ComposerReadInterrupt(EOFError),
+        )
+    )
+
+    exit_code = await interactive_command._run_interactive_repl(
+        host=cast(Host, fake_host),
+        runtime=runtime,
+        workspace_root=tmp_path,
+        invocation=invocation,
+        session_id="session-1",
+        run_overrides=interactive_command.ServiceRunOverrides(),
+        composer=composer,
+        sigint_monitor_factory=_NoopSigintMonitor,
+    )
+
+    assert exit_code == EXIT_SUCCESS
+    assert composer.prompt_calls == ["dayu> ", "dayu> "]
+    assert fake_host.submit_requests == []
+    assert fake_host.cancel_requests == []
+
+
+def test_interactive_second_consecutive_input_keyboard_interrupt_exits_without_run_requests(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """输入态 Ctrl-C 应退出当前 command，且不发 submit / cancel。"""
+    """输入态连续两次空 prompt Ctrl-C 应退出当前 command，且不发 submit / cancel。"""
 
     fake_host = _FakeHost()
     monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
@@ -882,6 +994,47 @@ def test_interactive_input_keyboard_interrupt_exits_without_run_requests(
 
     assert exit_code == EXIT_KEYBOARD_INTERRUPT
     assert fake_host.submit_requests == []
+    assert fake_host.cancel_requests == []
+
+
+@pytest.mark.asyncio
+async def test_interactive_normal_input_resets_idle_keyboard_interrupt_exit_pending(
+    tmp_path: Path,
+) -> None:
+    """输入态第一次 Ctrl-C 后提交正常输入，应重置本地退出待确认状态。"""
+
+    runtime = await _prepare_interactive_runtime(tmp_path)
+    invocation = interactive_command.new_cli_invocation(
+        command_name="interactive",
+        scenario="interactive",
+        display_user="本地 CLI 用户",
+        ticker="AAPL",
+    )
+    fake_host = _FakeHost(submit_statuses=(HostTerminalStatus.SUCCEEDED,))
+    composer = _ScriptedComposer(
+        (
+            _ComposerReadInterrupt(KeyboardInterrupt),
+            "请总结收入变化",
+            _ComposerReadInterrupt(KeyboardInterrupt),
+            _ComposerReadInterrupt(EOFError),
+        )
+    )
+
+    exit_code = await interactive_command._run_interactive_repl(
+        host=cast(Host, fake_host),
+        runtime=runtime,
+        workspace_root=tmp_path,
+        invocation=invocation,
+        session_id="session-1",
+        run_overrides=interactive_command.ServiceRunOverrides(),
+        composer=composer,
+        sigint_monitor_factory=_NoopSigintMonitor,
+    )
+
+    assert exit_code == EXIT_SUCCESS
+    assert composer.prompt_calls == ["dayu> ", "dayu> ", "dayu> ", "dayu> "]
+    assert len(fake_host.submit_requests) == 1
+    assert fake_host.submit_requests[0].user_prompt == "请总结收入变化"
     assert fake_host.cancel_requests == []
 
 
@@ -1032,7 +1185,7 @@ def test_interactive_activity_uses_run_view_buffer_before_next_prompt(
     monkeypatch.setattr(
         interactive_command,
         "new_interactive_run_view",
-        lambda: run_view,
+        lambda show_activity=False: run_view,
     )
 
     exit_code = cli_main.main(("interactive", "--base", str(tmp_path)))
@@ -1044,6 +1197,102 @@ def test_interactive_activity_uses_run_view_buffer_before_next_prompt(
     assert len(run_view.activity_lines) == 2
     assert all("工具批次完成" in line for line in run_view.activity_lines)
     assert run_view.transcript_lines == ("answer for run-1", "answer for run-2")
+
+
+def test_interactive_no_detail_omits_activity_and_keeps_final_answer_stdout(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--no-detail`` 不注册 activity callback，final answer 仍写 stdout。"""
+
+    fake_host = _FakeHost(
+        submit_statuses=(HostTerminalStatus.SUCCEEDED,),
+        submit_activities=(True,),
+    )
+    run_view_factory_calls: list[bool] = []
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        interactive_command,
+        "open_host",
+        lambda _options: _FakeOpenHostContext(fake_host),
+    )
+    monkeypatch.setattr(
+        interactive_command,
+        "_read_user_input",
+        _input_reader(("第一轮",)),
+    )
+    monkeypatch.setattr(
+        interactive_command,
+        "new_interactive_run_view",
+        lambda show_activity=False: run_view_factory_calls.append(show_activity),
+    )
+
+    exit_code = cli_main.main(("interactive", "--base", str(tmp_path), "--no-detail"))
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_SUCCESS
+    assert captured.out.strip() == "answer for run-1"
+    assert "Activity:" not in captured.err
+    assert run_view_factory_calls == []
+
+
+def test_interactive_thinking_flag_outputs_reasoning_delta_and_no_thinking_suppresses_it(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """有 thinking event 时，``--thinking`` 与 ``--no-thinking`` 输出必须不同。"""
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        interactive_command,
+        "_read_user_input",
+        _input_reader(("第一轮",)),
+    )
+    monkeypatch.setattr(
+        interactive_command,
+        "open_host",
+        lambda _options: _FakeOpenHostContext(
+            _FakeHost(
+                submit_statuses=(HostTerminalStatus.SUCCEEDED,),
+                submit_thinking=(True,),
+            )
+        ),
+    )
+
+    thinking_exit = cli_main.main(
+        ("interactive", "--base", str(tmp_path), "--thinking")
+    )
+    thinking_captured = capsys.readouterr()
+
+    monkeypatch.setattr(
+        interactive_command,
+        "_read_user_input",
+        _input_reader(("第一轮",)),
+    )
+    monkeypatch.setattr(
+        interactive_command,
+        "open_host",
+        lambda _options: _FakeOpenHostContext(
+            _FakeHost(
+                submit_statuses=(HostTerminalStatus.SUCCEEDED,),
+                submit_thinking=(True,),
+            )
+        ),
+    )
+
+    no_thinking_exit = cli_main.main(
+        ("interactive", "--base", str(tmp_path), "--no-thinking")
+    )
+    no_thinking_captured = capsys.readouterr()
+
+    assert thinking_exit == EXIT_SUCCESS
+    assert no_thinking_exit == EXIT_SUCCESS
+    assert thinking_captured.out.strip() == "answer for run-1"
+    assert no_thinking_captured.out.strip() == "answer for run-1"
+    assert "Thinking: 正在分析收入变化" in thinking_captured.err
+    assert "Thinking:" not in no_thinking_captured.err
 
 
 def test_interactive_skips_blank_input_before_submit(
@@ -1198,11 +1447,29 @@ async def test_interactive_esc_requests_cancel_after_run_id(
     stderr = io.StringIO()
     run_view = TerminalInteractiveRunView(
         stderr=stderr,
-        options=InteractiveRunViewOptions(enabled=True),
+        options=InteractiveRunViewOptions(
+            enabled=True,
+            terminal_control=True,
+            terminal_columns=80,
+        ),
+    )
+    thinking_renderer = CliThinkingRenderer(
+        stderr=stderr,
+        options=CliThinkingRendererOptions(
+            enabled=True,
+            terminal_control=True,
+            terminal_columns=80,
+        ),
     )
     key_monitor = _FakeRunningKeyMonitor(
         (RunningKeyAction.CANCEL_RUN,),
         delay_ticks=2,
+    )
+    thinking_renderer.record(
+        _entrypoint_thinking(
+            dedupe_key="thinking-before-esc",
+            text_delta="The user is asking",
+        )
     )
 
     result = await interactive_command._submit_interactive_turn_handling_sigint(
@@ -1215,6 +1482,7 @@ async def test_interactive_esc_requests_cancel_after_run_id(
         run_overrides=interactive_command.ServiceRunOverrides(),
         sigint_monitor=_NoopSigintMonitor(),
         run_view=run_view,
+        thinking_renderer=thinking_renderer,
         key_monitor=key_monitor,
     )
 
@@ -1222,7 +1490,11 @@ async def test_interactive_esc_requests_cancel_after_run_id(
     assert result.terminal_status is HostTerminalStatus.CANCELLED
     assert len(fake_host.cancel_requests) == 1
     assert fake_host.cancel_requests[0].client_request_id.endswith(":turn-1:run-run-1:cancel:cli_sigint")
-    assert "Interactive: cancel requested" in stderr.getvalue()
+    assert "Thinking: The user is asking\r\x1b[2KInteractive: cancel requested" in (
+        stderr.getvalue()
+    )
+    thinking_renderer.record(_entrypoint_thinking(dedupe_key="thinking-after-esc"))
+    assert stderr.getvalue().count("Thinking:") == 1
     assert key_monitor.started_count == 1
     assert key_monitor.closed_count == 1
 
@@ -1343,17 +1615,22 @@ async def test_interactive_repl_returns_130_on_second_sigint(
     assert len(fake_host.cancel_requests) == 1
 
 
-def test_interactive_unsupported_old_flag_exits_with_usage_error(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """unsupported 旧执行参数应 fail fast。"""
+def test_interactive_thinking_flags_are_display_options_not_execution_overrides() -> None:
+    """``--thinking`` / ``--no-thinking`` 不进入旧执行参数拒绝集合。
 
-    exit_code = cli_main.main(("interactive", "--thinking"))
-    captured = capsys.readouterr()
+    :returns: ``None``。
+    :raises AssertionError: thinking 展示参数被错误列为 unsupported 时抛出。
+    """
 
-    assert exit_code == EXIT_USAGE_ERROR
-    assert "unsupported option" in captured.err
-    assert "--thinking/--no-thinking" in captured.err
+    thinking_args = parse_cli_args(("interactive", "--thinking"))
+    no_thinking_args = parse_cli_args(("interactive", "--no-thinking"))
+
+    assert thinking_args.thinking is True
+    assert no_thinking_args.thinking is False
+    assert "--thinking/--no-thinking" not in unsupported_execution_option_names(thinking_args)
+    assert "--thinking/--no-thinking" not in unsupported_execution_option_names(
+        no_thinking_args
+    )
 
 
 def test_interactive_debug_stream_is_not_unsupported_execution_option() -> None:
@@ -1368,6 +1645,27 @@ def test_interactive_debug_stream_is_not_unsupported_execution_option() -> None:
     assert "--debug-stream" not in unsupported_execution_option_names(args)
 
 
+@pytest.mark.parametrize("removed_args", _REMOVED_INTERACTIVE_DEBUG_OPTIONS)
+def test_interactive_removed_debug_options_are_argparse_unknown(
+    removed_args: tuple[str, ...],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """已删除 debug 参数应由 argparse 作为未知参数拒绝。
+
+    :param removed_args: 单个已删除 debug 参数及其取值。
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: 参数未按未知参数返回用法错误时抛出。
+    """
+
+    exit_code = cli_main.main(("interactive", *removed_args))
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_USAGE_ERROR
+    assert "unrecognized arguments" in captured.err
+    assert removed_args[0] in captured.err
+
+
 def test_interactive_reports_all_unsupported_old_execution_flags(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -1376,12 +1674,6 @@ def test_interactive_reports_all_unsupported_old_execution_flags(
     exit_code = cli_main.main(
         (
             "interactive",
-            "--debug-sse",
-            "--debug-tool-delta",
-            "--debug-sse-sample-rate",
-            "0.5",
-            "--debug-sse-throttle-sec",
-            "1.0",
             "--tool-trace-dir",
             "trace",
             "--max-duplicate-tool-calls",
@@ -1396,10 +1688,6 @@ def test_interactive_reports_all_unsupported_old_execution_flags(
 
     assert exit_code == EXIT_USAGE_ERROR
     for expected in (
-        "--debug-sse",
-        "--debug-tool-delta",
-        "--debug-sse-sample-rate",
-        "--debug-sse-throttle-sec",
         "--tool-trace-dir",
         "--max-duplicate-tool-calls",
         "--duplicate-tool-hint-prompt",
@@ -1488,6 +1776,11 @@ async def test_cancel_after_first_sigint_returns_completed_submit_terminal() -> 
     accepted_run.record("run-1")
     submit_task = asyncio.create_task(_already_terminal(_terminal_result(status=HostTerminalStatus.SUCCEEDED)))
     await asyncio.sleep(0)
+    stderr = io.StringIO()
+    thinking_renderer = CliThinkingRenderer(
+        stderr=stderr,
+        options=CliThinkingRendererOptions(enabled=True),
+    )
 
     result = await interactive_command._cancel_interactive_turn_after_first_sigint(
         host=cast(Host, _FakeHost()),
@@ -1502,10 +1795,16 @@ async def test_cancel_after_first_sigint_returns_completed_submit_terminal() -> 
         submit_task=submit_task,
         sigint_monitor=_ImmediateSecondSigintMonitor(),
         observed_sigint_count=1,
+        runtime_display=RuntimeDisplayController(
+            activity_display=None,
+            thinking_display=thinking_renderer,
+        ),
     )
 
     assert result is not None
     assert result.terminal_status is HostTerminalStatus.SUCCEEDED
+    thinking_renderer.record(_entrypoint_thinking(dedupe_key="thinking-1"))
+    assert stderr.getvalue() == ""
 
 
 async def _prepare_interactive_runtime(tmp_path: Path) -> EntrypointRuntimeResult:
@@ -1522,10 +1821,7 @@ async def _prepare_interactive_runtime(tmp_path: Path) -> EntrypointRuntimeResul
             package_config_root=package_config_root(),
             explicit_config_dir=None,
             scene_id="interactive",
-            context_slot_values={
-                "fins_default_subject": "AAPL",
-                "base_user": "本地 CLI 用户",
-            },
+            context_slot_values={_CURRENT_TIME_SLOT: _CURRENT_TIME_TEXT},
             assembly_overrides=interactive_command.ServiceAssemblyOverrides(model_id=_MODEL_ID),
             env={"DEEPSEEK_API_KEY": _API_KEY},
         )
@@ -1722,6 +2018,53 @@ def _activity_event(*, run_id: str) -> HostEvent:
         final_answer=None,
         error_message=None,
         cancel_reason=None,
+    )
+
+
+def _thinking_event(*, run_id: str) -> HostEvent:
+    """构造 Host thinking event。
+
+    :param run_id: Run id。
+    :returns: HostEvent。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return HostEvent(
+        event_id=f"thinking-{run_id}",
+        event_sequence=int(run_id.removeprefix("run-")),
+        session_id="session-1",
+        run_id=run_id,
+        event_class=HostEventClass.PREVIEW,
+        event_type="REASONING_DELTA",
+        kind=HostEventKind.PROGRESS,
+        activity=None,
+        thinking=HostThinkingView(text_delta="正在分析收入变化"),
+        dedupe_key=f"thinking-{run_id}",
+        terminal_status=None,
+        final_answer=None,
+        error_message=None,
+        cancel_reason=None,
+    )
+
+
+def _entrypoint_thinking(
+    *,
+    dedupe_key: str,
+    text_delta: str = "取消后不应输出",
+) -> EntrypointThinking:
+    """构造 Service entrypoint thinking。
+
+    :param dedupe_key: thinking dedupe key。
+    :param text_delta: thinking 文本增量。
+    :returns: Service entrypoint thinking。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return EntrypointThinking(
+        run_id="run-1",
+        event_sequence=1,
+        dedupe_key=dedupe_key,
+        text_delta=text_delta,
     )
 
 

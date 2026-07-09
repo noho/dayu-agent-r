@@ -44,6 +44,8 @@ from dayu.host import (
     HostEvent,
     HostEventClass,
     HostEventKind,
+    HostTerminalStatus,
+    HostThinkingView,
     HostToolingOptions,
     LocalEngineWorker,
     LocalWorkerHandle,
@@ -262,6 +264,32 @@ async def test_tool_activity_uses_admission_display_snapshot(
     assert display_names == {"lookup_filing": "查财报"}
 
 
+def test_canonical_tool_call_request_atom_does_not_project_activity(
+    tmp_path: pathlib.Path,
+) -> None:
+    """canonical TOOL_CALL_REQUESTED request atom 不产生 public activity。"""
+
+    event = _project_event(
+        tmp_path,
+        _row(
+            event_id="event-tool-call-request-atom",
+            event_class=EventClass.CANONICAL_FACT,
+            session_id="session-direct",
+            run_id="run-direct",
+            event_type="TOOL_CALL_REQUESTED",
+            payload={
+                "tool_name": "lookup_filing",
+                "argument_key_count": 2,
+            },
+        ),
+    )
+
+    assert event.kind is HostEventKind.PROGRESS
+    assert event.event_class is HostEventClass.CANONICAL_FACT
+    assert event.event_type == "TOOL_CALL_REQUESTED"
+    assert event.activity is None
+
+
 @pytest.mark.asyncio
 async def test_tool_activity_falls_back_to_stable_name_without_display(
     tmp_path: pathlib.Path,
@@ -397,10 +425,10 @@ def test_tool_result_completed_and_cancelled_outcomes(
     assert cancelled_activity.summary == "结果状态：cancelled"
 
 
-def test_tool_awaiting_and_run_waiting_activity_projection(
+def test_tool_awaiting_projects_activity_and_run_waiting_stays_silent(
     tmp_path: pathlib.Path,
 ) -> None:
-    """TOOL_AWAITING / RUN_WAITING 投影等待 activity。"""
+    """TOOL_AWAITING 是唯一工具等待 activity，RUN_WAITING 不重复投影。"""
 
     tool_awaiting = _project_event(
         tmp_path,
@@ -435,13 +463,7 @@ def test_tool_awaiting_and_run_waiting_activity_projection(
     assert tool_activity.title == "等待工具完成：lookup_filing"
     assert tool_activity.tool_name == "lookup_filing"
     assert tool_activity.tool_display_name == "lookup_filing"
-    run_activity = run_waiting.activity
-    assert run_activity is not None
-    assert run_activity.kind is HostActivityKind.TOOL_AWAITING
-    assert run_activity.status is HostActivityStatus.WAITING
-    assert run_activity.title == "等待工具完成"
-    assert run_activity.tool_name is None
-    assert run_activity.tool_display_name is None
+    assert run_waiting.activity is None
 
 
 def test_context_compaction_activity_projection(tmp_path: pathlib.Path) -> None:
@@ -506,7 +528,7 @@ def test_context_compaction_activity_projection(tmp_path: pathlib.Path) -> None:
 def test_non_terminal_run_lifecycle_activity_projection(
     tmp_path: pathlib.Path,
 ) -> None:
-    """RUN_ACCEPTED / RUN_STARTED 等非终态 lifecycle 投影 activity。"""
+    """RUN lifecycle 投影 activity，ATTEMPT governance event 默认静默。"""
 
     accepted = _project_event(
         tmp_path,
@@ -530,6 +552,17 @@ def test_non_terminal_run_lifecycle_activity_projection(
             payload={},
         ),
     )
+    attempt_started = _project_event(
+        tmp_path,
+        _row(
+            event_id="event-attempt-started",
+            event_class=EventClass.CANONICAL_FACT,
+            session_id="session-direct",
+            run_id="run-direct",
+            event_type="ATTEMPT_STARTED",
+            payload={},
+        ),
+    )
 
     accepted_activity = accepted.activity
     assert accepted_activity is not None
@@ -543,6 +576,7 @@ def test_non_terminal_run_lifecycle_activity_projection(
     assert started_activity.kind is HostActivityKind.RUN_LIFECYCLE
     assert started_activity.status is HostActivityStatus.IN_PROGRESS
     assert started_activity.title == "运行已开始"
+    assert attempt_started.activity is None
 
 
 def test_provider_protocol_error_activity_is_bounded(tmp_path: pathlib.Path) -> None:
@@ -754,9 +788,33 @@ def test_delta_and_unknown_events_keep_identity_without_activity(
     assert content.activity is None
     assert reasoning.event_type == "REASONING_DELTA"
     assert reasoning.activity is None
+    assert reasoning.thinking is not None
+    assert reasoning.thinking.text_delta == "hidden reasoning"
     assert unknown.event_class is HostEventClass.PROJECTION_SIGNAL
     assert unknown.event_type == "FUTURE_PROGRESS"
     assert unknown.activity is None
+
+
+def test_terminal_host_event_rejects_thinking_payload() -> None:
+    """terminal HostEvent 防卫性拒绝 thinking payload。"""
+
+    with pytest.raises(ValueError, match="terminal kind must not include thinking"):
+        HostEvent(
+            event_id="event-failed-with-thinking",
+            event_sequence=1,
+            session_id="session-direct",
+            run_id="run-direct",
+            event_class=HostEventClass.CANONICAL_FACT,
+            event_type="RUN_FAILED",
+            kind=HostEventKind.FAILED,
+            activity=None,
+            dedupe_key="event-failed-with-thinking",
+            terminal_status=HostTerminalStatus.FAILED,
+            final_answer=None,
+            error_message="provider failed safely",
+            cancel_reason=None,
+            thinking=HostThinkingView(text_delta="hidden reasoning"),
+        )
 
 
 def _project_event(tmp_path: pathlib.Path, row: EventLogRow) -> HostEvent:

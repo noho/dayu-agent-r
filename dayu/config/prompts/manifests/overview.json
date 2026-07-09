@@ -51,12 +51,12 @@
   ],
   "context_slots": [
     {
-      "name": "fins_default_subject",
+      "name": "current_time",
       "value_type": "string",
       "required": true
     },
     {
-      "name": "base_user",
+      "name": "fins_default_subject",
       "value_type": "string",
       "required": true
     }

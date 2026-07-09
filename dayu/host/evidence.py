@@ -1,8 +1,8 @@
 """Host accepted evidence envelope typed contract。
 
 本模块定义工具结果被 Host accept barrier 接受后写入 EventLog 的中立证据
-信封。信封只描述 Host 可校验的事件、工具调用、digest 与不透明 refs，不
-解析财报业务 source / locator 语义。
+信封。信封描述 Host 可校验的事件、工具调用、digest 与不透明 refs；
+它不解析财报业务 source / locator 语义，也不复制 request / query 正文。
 """
 
 from __future__ import annotations

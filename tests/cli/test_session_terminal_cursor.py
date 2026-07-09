@@ -53,6 +53,29 @@ async def test_advance_then_read_cursor_record(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_cursor_store_uses_workspace_root_dayu_dir(tmp_path: Path) -> None:
+    """terminal cursor 不得在已解析 workspace root 下再创建 workspace 子目录。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises AssertionError: cursor 路径或创建目录不符合预期时抛出。
+    """
+
+    await advance_cli_terminal_cursor(
+        workspace_root=tmp_path,
+        session_id="session-1",
+        terminal_event_id="terminal-1",
+        event_sequence=1,
+    )
+
+    assert cli_terminal_cursor_file_path(tmp_path) == (
+        tmp_path / ".dayu" / "cli" / "terminal_cursors.json"
+    )
+    assert cli_terminal_cursor_file_path(tmp_path).is_file()
+    assert not (tmp_path / "workspace").exists()
+
+
+@pytest.mark.asyncio
 async def test_advance_does_not_move_sequence_backward(tmp_path: Path) -> None:
     """低 sequence 更新不得回退已保存 watermark。"""
 

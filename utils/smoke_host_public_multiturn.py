@@ -84,6 +84,7 @@ from dayu.service.host_assembly import (
     compose_submit_followup_request,
     discover_service_tools,
 )
+from dayu.service.scene_context import CURRENT_TIME_SLOT, current_time
 from utils.smoke_host_public_diagnostics import (
     print_duplicate_governance_diagnostics,
 )
@@ -101,7 +102,7 @@ _DEFAULT_WORKSPACE_PARENT: Final[pathlib.Path] = _PROJECT_ROOT / "workspace" / "
 _DEFAULT_WORKSPACE_PREFIX: Final[str] = "host-public-multiturn-smoke"
 _DEFAULT_SCENE_ID: Final[str] = "smoke_host_public_multiturn"
 _DEFAULT_SUBJECT: Final[str] = "Dayu Host public runtime assembly smoke"
-_DEFAULT_USER: Final[str] = "manual-smoke-operator"
+_DEFAULT_ACTOR: Final[str] = "manual-smoke-operator"
 _SMOKE_TOOL_NAME: Final[str] = "record_smoke_fact"
 _SMOKE_TOOL_TAG: Final[str] = "manual-smoke"
 _SMOKE_PROVIDER_SPEC_ID: Final[str] = "host-public-multiturn-smoke"
@@ -125,14 +126,13 @@ _TERMINAL_WAIT_TIMEOUT_SECONDS: Final[float] = 600.0
 class SmokeArgs:
     """命令行参数。
 
-    :param workspace_root: workspace / 项目根目录，用于 location resolver。
+    :param workspace_root: workspace 根目录，用于 location resolver。
     :param scene_id: 需要装配的 scene id。
     :param execution_profile_id: 可选 execution profile 显式 override。
     :param host_runtime_id: 可选 Host runtime 显式 override。
     :param model_id: 可选 Run/UI 模型显式 override。
     :param runner_option_hint_id: 可选 Run/UI runner option hint 显式 override。
     :param fins_default_subject: scene context slot 的研究主体。
-    :param base_user: scene context slot 的用户标识。
     :param log_level: Dayu 日志级别。
     :param reuse_session: 是否复用稳定 slot key；默认每次使用 fresh slot。
     :param keep_workspace: 是否在输出中显式标记保留 workspace。
@@ -145,7 +145,6 @@ class SmokeArgs:
     model_id: str | None
     runner_option_hint_id: str | None
     fins_default_subject: str
-    base_user: str
     log_level: LogLevel
     reuse_session: bool
     keep_workspace: bool
@@ -303,11 +302,6 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
         help="传给 scene context slot 的默认研究主体。",
     )
     parser.add_argument(
-        "--base-user",
-        default=_DEFAULT_USER,
-        help="传给 scene context slot 的用户标识。",
-    )
-    parser.add_argument(
         "--log-level",
         choices=tuple(level.name for level in LogLevel),
         default=LogLevel.VERBOSE.name,
@@ -334,7 +328,6 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
     model_id: str | None = namespace.model_id
     runner_option_hint_id: str | None = namespace.runner_option_hint_id
     fins_default_subject: str = namespace.fins_default_subject
-    base_user: str = namespace.base_user
     log_level_text: str = namespace.log_level
     reuse_session: bool = namespace.reuse_session
     keep_workspace: bool = namespace.keep_workspace
@@ -346,7 +339,6 @@ def parse_args(argv: Sequence[str]) -> SmokeArgs:
         model_id=model_id,
         runner_option_hint_id=runner_option_hint_id,
         fins_default_subject=fins_default_subject,
-        base_user=base_user,
         log_level=LogLevel[log_level_text],
         reuse_session=reuse_session,
         keep_workspace=keep_workspace,
@@ -462,7 +454,7 @@ def _prepare_runtime_assembly(
     """
 
     locations = resolve_runtime_locations(
-        project_root=args.workspace_root,
+        workspace_root=args.workspace_root,
         package_config_root=_PACKAGE_CONFIG_ROOT,
     )
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
@@ -478,8 +470,8 @@ def _prepare_runtime_assembly(
             scene_manifest_root=locations.scene_manifest_root,
             prompt_asset_root=locations.prompt_asset_root,
             context_slot_values={
+                CURRENT_TIME_SLOT: current_time(),
                 "fins_default_subject": args.fins_default_subject,
-                "base_user": args.base_user,
             },
             available_tools=SceneToolCatalog.from_tool_bundle(
                 discovered_tools.tool_bundle
@@ -563,6 +555,7 @@ def _discover_smoke_service_tools(
             ),
         ),
         effective_provider_configs=discovered.effective_provider_configs,
+        fins_awaiting_runtime=discovered.fins_awaiting_runtime,
     )
 
 
@@ -683,7 +676,7 @@ def _host_context(request_id: str) -> HostCallContext:
     """
 
     return HostCallContext(
-        actor=_DEFAULT_USER,
+        actor=_DEFAULT_ACTOR,
         source="utils.smoke_host_public_multiturn",
         request_id=request_id,
         authorization_claims=(

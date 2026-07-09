@@ -7,6 +7,7 @@ projection，不是事实真源，也不导入 Engine / Service / UI / Fins。
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -98,6 +99,8 @@ _PAYLOAD_FIELD_DIAGNOSTICS = "diagnostics"
 _PAYLOAD_FIELD_MESSAGE = "message"
 _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS = "accepted_evidence_mapping_refs"
 _PAYLOAD_FIELD_COMPACT_ARTIFACT_REF = "compact_artifact_ref"
+ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT = "查询语义不可用；参数未安全展开。"
+"""Accepted tool evidence 缺少 LLM-safe request / query 语义时的文本。"""
 
 _MemoryItemT = TypeVar("_MemoryItemT", bound="_MemoryItemWithId")
 
@@ -965,6 +968,7 @@ class MemoryProjectionEvent:
     :param payload_ref: 可选 payload ref。
     :param payload_digest: 可选 payload digest。
     :param payload: 已解析 canonical payload。
+    :param evidence_query_text: 可选 LLM-safe 工具 request / query 文本。
     """
 
     event_sequence: int
@@ -979,6 +983,7 @@ class MemoryProjectionEvent:
     payload_ref: str | None
     payload_digest: str | None
     payload: Mapping[str, JsonValue]
+    evidence_query_text: str | None = None
 
     def __post_init__(self) -> None:
         """校验 projection event。
@@ -1001,6 +1006,7 @@ class MemoryProjectionEvent:
         _require_optional_non_empty(self.payload_digest, "payload_digest")
         if (self.payload_ref is None) != (self.payload_digest is None):
             raise ValueError("payload_ref and payload_digest must be paired")
+        _require_optional_non_empty(self.evidence_query_text, "evidence_query_text")
 
 
 def default_memory_projection_policy(
@@ -1688,9 +1694,41 @@ def _selected_evidence_text(event: MemoryProjectionEvent) -> str:
     if envelope is not None:
         raw_text = accepted_tool_raw_outcome_text_from_payload(event.payload)
         if raw_text is not None:
-            return raw_text
+            return _accepted_evidence_readable_text(
+                tool_name=envelope.tool_name,
+                query_text=(
+                    event.evidence_query_text
+                    if event.evidence_query_text is not None
+                    else ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT
+                ),
+                response_text=raw_text,
+            )
         raise ValueError("TOOL_RESULT_ACCEPTED raw_tool_outcome is missing")
     return "工具结果已接受；原始工具响应不可用。"
+
+
+def _accepted_evidence_readable_text(
+    *, tool_name: str, query_text: str, response_text: str
+) -> str:
+    """构造自解释的 LLM-facing accepted evidence 文本。
+
+    :param tool_name: 工具名。
+    :param query_text: LLM-safe request / query 文本。
+    :param response_text: 工具结果响应文本。
+    :returns: 自解释工具证据文本。
+    :raises ValueError: 任一文本为空时抛出。
+    """
+
+    _require_non_empty(tool_name, "tool_name")
+    _require_non_empty(query_text, "query_text")
+    _require_non_empty(response_text, "response_text")
+    return "\n".join(
+        (
+            f"工具：{tool_name}",
+            f"查询：{query_text}",
+            f"结果：{response_text}",
+        )
+    )
 
 
 def _accepted_candidate_mapping(
@@ -3277,6 +3315,7 @@ def _required_mapping_list(
 
 
 __all__ = [
+    "ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT",
     "CONVERSATION_MEMORY_CONSUMER_ID",
     "CONVERSATION_MEMORY_SNAPSHOT_SCHEMA_VERSION",
     "DEFAULT_ANSWER_ANCHOR_CHAR_CAP",

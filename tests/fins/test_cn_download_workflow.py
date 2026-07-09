@@ -12,7 +12,9 @@ from types import TracebackType
 
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.pipelines import cn_download_workflow as _cn_download_workflow
 from dayu.fins.pipelines.cn_download_models import (
+    CnDownloadCancelledError,
     CnCompanyProfile,
     CnFiscalPeriod,
     CnReportCandidate,
@@ -131,6 +133,55 @@ class _FakeConverter:
         del raw_data, stream_name
         self.calls += 1
         return _DOCLING_BYTES
+
+
+@dataclass
+class _CancelAfterConvertConverter:
+    """转换完成后触发取消的 Docling fake。"""
+
+    cancel_state: "_CancelState"
+    calls: int = 0
+
+    def __call__(self, raw_data: bytes, stream_name: str) -> bytes:
+        """返回固定 Docling JSON 并设置取消状态。
+
+        Args:
+            raw_data: PDF 字节。
+            stream_name: 流名称。
+
+        Returns:
+            Docling JSON 字节。
+
+        Raises:
+            无。
+        """
+
+        del raw_data, stream_name
+        self.calls += 1
+        self.cancel_state.cancelled = True
+        return _DOCLING_BYTES
+
+
+@dataclass
+class _CancelState:
+    """测试用取消状态。"""
+
+    cancelled: bool = False
+
+    def __call__(self) -> bool:
+        """返回当前取消状态。
+
+        Args:
+            无。
+
+        Returns:
+            已取消时返回 ``True``。
+
+        Raises:
+            无。
+        """
+
+        return self.cancelled
 
 
 @dataclass
@@ -280,7 +331,7 @@ def _build_pipeline(
     *,
     tmp_path: Path,
     discovery: _FakeDiscoveryClient,
-    converter: _FakeConverter,
+    converter: Callable[[bytes, str], bytes],
     pdf_download_gate: CnDownloadPdfGateProtocol | None = None,
 ) -> CnPipeline:
     """构造注入 fake downloader / converter 的 CnPipeline。
@@ -320,6 +371,7 @@ def _collect_events(
     *,
     form_type: str = "FY",
     overwrite: bool = False,
+    cancel_checker: Callable[[], bool] | None = None,
 ) -> list[DownloadEvent]:
     """同步收集 download_stream 事件。
 
@@ -327,6 +379,7 @@ def _collect_events(
         pipeline: 待执行 pipeline。
         form_type: form 过滤。
         overwrite: 是否覆盖。
+        cancel_checker: 可选取消检查函数。
 
     Returns:
         下载事件列表。
@@ -343,6 +396,7 @@ def _collect_events(
             start_date="2024",
             end_date="2026",
             overwrite=overwrite,
+            cancel_checker=cancel_checker,
         )
     )
 
@@ -355,6 +409,7 @@ async def _collect_events_async(
     start_date: str,
     end_date: str,
     overwrite: bool,
+    cancel_checker: Callable[[], bool] | None = None,
 ) -> list[DownloadEvent]:
     """异步收集 download_stream 事件。
 
@@ -365,6 +420,7 @@ async def _collect_events_async(
         start_date: 开始日期。
         end_date: 结束日期。
         overwrite: 是否覆盖。
+        cancel_checker: 可选取消检查函数。
 
     Returns:
         下载事件列表。
@@ -380,6 +436,7 @@ async def _collect_events_async(
         start_date=start_date,
         end_date=end_date,
         overwrite=overwrite,
+        cancel_checker=cancel_checker,
     ):
         events.append(event)
     return events
@@ -485,6 +542,122 @@ def test_cn_download_pdf_gate_does_not_cover_docling_convert(tmp_path: Path) -> 
     assert gate.exit_count == 1
     assert gate.active is False
     assert converter.calls == 1
+
+
+def test_cn_download_cancel_after_pdf_download_does_not_start_docling(
+    tmp_path: Path,
+) -> None:
+    """PDF 已下载后取消时不应启动 Docling，也不计为 failed filing。"""
+
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(_candidate(),))
+    converter = _FakeConverter()
+    pipeline = _build_pipeline(tmp_path=tmp_path, discovery=discovery, converter=converter)
+    cancel_state = _CancelState()
+
+    async def _collect_with_event_cancel() -> list[DownloadEvent]:
+        """收集事件并在 PDF 下载事件后触发取消。
+
+        Args:
+            无。
+
+        Returns:
+            下载事件列表。
+
+        Raises:
+            AssertionError: 下游断言失败时由测试抛出。
+        """
+
+        events: list[DownloadEvent] = []
+        async for event in pipeline.download_stream(
+            ticker="600519",
+            form_type="FY",
+            start_date="2024",
+            end_date="2026",
+            overwrite=False,
+            cancel_checker=cancel_state,
+        ):
+            events.append(event)
+            if event.event_type is DownloadEventType.FILE_DOWNLOADED:
+                cancel_state.cancelled = True
+        return events
+
+    events = asyncio.run(_collect_with_event_cancel())
+    result = _final_result(events)
+    summary = result["summary"]
+
+    assert result["status"] == "cancelled"
+    assert isinstance(summary, dict)
+    assert summary["failed"] == 0
+    assert discovery.download_calls == 1
+    assert converter.calls == 0
+    assert DownloadEventType.CONVERSION_STARTED not in {
+        event.event_type for event in events
+    }
+
+
+def test_cn_download_cancel_after_docling_convert_skips_source_commit(
+    tmp_path: Path,
+) -> None:
+    """Docling convert 后取消时保留 staging，不提交完成态 source。"""
+
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(_candidate(),))
+    cancel_state = _CancelState()
+    converter = _CancelAfterConvertConverter(cancel_state=cancel_state)
+    pipeline = _build_pipeline(tmp_path=tmp_path, discovery=discovery, converter=converter)
+
+    events = _collect_events(pipeline, cancel_checker=cancel_state)
+    result = _final_result(events)
+    summary = result["summary"]
+    document_id, _ = build_cn_filing_ids(
+        ticker="600519",
+        form_type="FY",
+        fiscal_year=2024,
+        fiscal_period="FY",
+        amended=False,
+    )
+    source_meta = pipeline.source_repository.get_source_meta(
+        "600519",
+        document_id,
+        SourceKind.FILING,
+    )
+
+    assert result["status"] == "cancelled"
+    assert isinstance(summary, dict)
+    assert summary["failed"] == 0
+    assert converter.calls == 1
+    assert source_meta["ingest_complete"] is False
+    assert source_meta["primary_document"] == f"{document_id}.pdf"
+    assert DownloadEventType.FILING_COMPLETED not in {
+        event.event_type for event in events
+    }
+
+
+def test_cn_cancel_checker_preserves_cancel_exception_object() -> None:
+    """取消检查器主动抛出的 CN/HK 取消异常应原样传播。"""
+
+    expected = CnDownloadCancelledError("caller cancelled")
+
+    def _raise_cancelled() -> bool:
+        """抛出预构造取消异常。
+
+        Args:
+            无。
+
+        Returns:
+            不返回。
+
+        Raises:
+            CnDownloadCancelledError: 始终抛出预构造异常。
+        """
+
+        raise expected
+
+    try:
+        _cn_download_workflow._is_cancel_requested(_raise_cancelled)
+    except CnDownloadCancelledError as exc:
+        assert exc is expected
+    else:
+        raise AssertionError("应传播原始 CnDownloadCancelledError")
 
 
 def test_cn_download_fast_skip_uses_remote_fingerprint(tmp_path: Path) -> None:

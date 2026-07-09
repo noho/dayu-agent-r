@@ -19,6 +19,7 @@ from dayu.runtime.config_loader import (
     config_file_names,
     legacy_config_file_names,
 )
+from dayu.runtime.location import resolve_runtime_locations
 
 
 def test_init_empty_workspace_copies_current_config(
@@ -237,6 +238,29 @@ def test_init_generated_workspace_config_loads_with_config_loader(
     assert config.models.models
     assert config.execution_profiles.default_execution_profile_id
     assert config.host_runtime.default_host_runtime_id
+
+
+def test_init_base_workspace_aligns_with_runtime_location_default(
+    tmp_path: Path,
+) -> None:
+    """init 生成的 config 必须被 runtime location 默认 overlay 选中。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: resolver 未对齐 init 目录布局时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+
+    assert cli_main.main(("init", "--base", str(workspace_root))) == EXIT_SUCCESS
+    locations = resolve_runtime_locations(
+        workspace_root=workspace_root,
+        package_config_root=Path(__file__).resolve().parents[2] / "dayu" / "config",
+    )
+
+    assert locations.config_overlay_dir == workspace_root / "config"
+    assert locations.prompt_asset_root == workspace_root / "config" / "prompts"
+    assert not (workspace_root / "workspace").exists()
 
 
 def test_init_does_not_generate_legacy_config_files(tmp_path: Path) -> None:

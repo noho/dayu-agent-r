@@ -37,6 +37,8 @@ from dayu.engine.contracts.engine_events import (
     ProviderProtocolErrorData,
     ReasoningDeltaData,
     RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION,
+    RunnerInputMessageProjection,
+    RunnerInputToolCallProjection,
     RunCancelledData,
     RunFailedData,
     RunSuspendedData,
@@ -117,7 +119,7 @@ from dayu.host.durable.options import (
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
-from dayu.host.durable.payload import PayloadStore
+from dayu.host.durable.payload import PayloadKind, PayloadStore
 from dayu.host.durable.run_transition import (
     AcceptWorkerRunningInput,
     ActiveCancelWatchdogCloseoutInput,
@@ -130,6 +132,7 @@ from dayu.host.durable.run_transition import (
     create_running_run_with_starting_attempt_in_transaction,
     request_active_attempt_cancel_in_transaction,
 )
+from dayu.host.durable.tool_trace import read_tool_trace_json_payload
 from dayu.host.payload_resolution import sqlite_payload_object
 from dayu.host.durable.schema import (
     RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
@@ -1386,6 +1389,8 @@ def test_run_suspended_only_writes_diagnostic_and_duplicate_is_idempotent(
 
         assert first.status == EngineIngestStatus.ACCEPTED
         assert second.status == EngineIngestStatus.DUPLICATE
+        assert first.stop_worker_stream is False
+        assert second.stop_worker_stream is False
         assert [event.event_type for event in first.events] == [
             "ENGINE_EVENT_DIAGNOSTIC",
         ]
@@ -1455,6 +1460,7 @@ def test_tool_awaiting_confirms_only_matching_host_accepted_wait_refs(
 
         assert result.status == EngineIngestStatus.ACCEPTED
         assert result.reason == "waiting_event_confirmation"
+        assert result.stop_worker_stream is True
         payload = _payload(result.events[0])
         assert payload["waiting_confirmation_accepted"] is True
         assert payload["waiting_confirmation_mismatch_reason"] is None
@@ -2188,10 +2194,10 @@ def test_tool_call_requested_and_result_accepted_are_preview(
         assert attempt_status == AttemptStatus.RUNNING
 
 
-def test_delta_events_are_accepted_without_event_log_rows(
+def test_non_reasoning_delta_events_are_accepted_without_event_log_rows(
     tmp_path: Path,
 ) -> None:
-    """Engine content、reasoning 与 tool-call delta 默认不写主 EventLog。"""
+    """Engine content 与 tool-call delta 默认不写主 EventLog。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
@@ -2206,15 +2212,6 @@ def test_delta_events_are_accepted_without_event_log_rows(
             _candidate(
                 seeded,
                 worker_event_index=12,
-                data=ReasoningDeltaData(
-                    iteration_id="iter-delta",
-                    delta="reasoning",
-                ),
-                event_type=EngineEventType.REASONING_DELTA,
-            ),
-            _candidate(
-                seeded,
-                worker_event_index=13,
                 data=ToolCallDeltaData(
                     iteration_id="iter-tool",
                     tool_call_index=0,
@@ -2231,12 +2228,39 @@ def test_delta_events_are_accepted_without_event_log_rows(
         assert [result.status for result in results] == [
             EngineIngestStatus.ACCEPTED,
             EngineIngestStatus.ACCEPTED,
-            EngineIngestStatus.ACCEPTED,
         ]
-        assert [result.events for result in results] == [(), (), ()]
+        assert [result.events for result in results] == [(), ()]
         assert _event_count(store.transaction_runner, "CONTENT_DELTA") == 0
-        assert _event_count(store.transaction_runner, "REASONING_DELTA") == 0
         assert _event_count(store.transaction_runner, "TOOL_CALL_DELTA") == 0
+
+
+def test_reasoning_delta_is_accepted_as_preview_for_live_display(
+    tmp_path: Path,
+) -> None:
+    """Engine reasoning delta 应写 PREVIEW row 供 live thinking 展示。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
+
+        result = ingestor.ingest(
+            _candidate(
+                seeded,
+                worker_event_index=12,
+                data=ReasoningDeltaData(
+                    iteration_id="iter-delta",
+                    delta="reasoning",
+                ),
+                event_type=EngineEventType.REASONING_DELTA,
+            )
+        )
+
+        assert result.status == EngineIngestStatus.ACCEPTED
+        assert len(result.events) == 1
+        assert result.events[0].event_class is EventClass.PREVIEW
+        assert result.events[0].event_type == "REASONING_DELTA"
+        assert _payload(result.events[0])["delta"] == "reasoning"
+        assert _event_count(store.transaction_runner, "REASONING_DELTA") == 1
 
 
 def test_tool_batch_events_stay_preview_not_canonical(
@@ -2326,10 +2350,10 @@ def test_late_terminal_event_is_rejected_after_closeout(tmp_path: Path) -> None:
         assert _payload(result.events[0])["reason"] == "terminal_already_closed"
 
 
-def test_late_transient_delta_is_rejected_before_no_row_short_circuit(
+def test_late_reasoning_delta_is_rejected_before_preview_append(
     tmp_path: Path,
 ) -> None:
-    """终态后的 transient delta 仍先经过 late-event governance。"""
+    """终态后的 reasoning delta 仍先经过 late-event governance。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
@@ -3545,6 +3569,135 @@ def test_iteration_started_writes_limited_runner_call_manifest_for_continuation(
         assert validation["observed_digest"] == role_digest
 
 
+def test_iteration_started_continuation_with_projection_writes_complete_manifest(
+    tmp_path: Path,
+) -> None:
+    """tool-loop continuation 携带 observed projection 时写 complete manifest。"""
+
+    role_digest = runner_role_sequence_digest(
+        ("system", "user", "assistant", "tool")
+    )
+    input_projection = (
+        RunnerInputMessageProjection(
+            index=0,
+            role="system",
+            content="# 当前时间\n2026-07-07\n# 当前分析对象\nV（Visa Inc.）",
+            tool_call_id=None,
+            tool_calls=(),
+        ),
+        RunnerInputMessageProjection(
+            index=1,
+            role="user",
+            content="分析 Visa",
+            tool_call_id=None,
+            tool_calls=(),
+        ),
+        RunnerInputMessageProjection(
+            index=2,
+            role="assistant",
+            content=None,
+            tool_call_id=None,
+            tool_calls=(
+                RunnerInputToolCallProjection(
+                    tool_call_id="call-time",
+                    name="get_current_time",
+                    arguments={"timezone": "Asia/Shanghai"},
+                ),
+            ),
+        ),
+        RunnerInputMessageProjection(
+            index=3,
+            role="tool",
+            content='{"current_time":"2026-07-07 19:18:11","payload":"'
+            + ("y" * 5000)
+            + '"}',
+            tool_call_id="call-time",
+            tool_calls=(),
+        ),
+    )
+    with open_host_durable_store(
+        _options(tmp_path, payload_inline_threshold_bytes=4096)
+    ) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        _append_prior_iteration_started_preview(
+            store.transaction_runner,
+            seeded,
+            event_id="event-prior-iteration-preview-complete",
+            iteration_id="iter-prior-complete",
+            iteration_index=0,
+        )
+        candidate = _candidate(
+            seeded,
+            worker_event_index=25,
+            data=IterationStartedData(
+                iteration_id="iter-continuation-complete",
+                iteration_index=1,
+                message_count=4,
+                role_sequence_digest=role_digest,
+                runner_input_serializer_schema_version=(
+                    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+                ),
+                input_projection=input_projection,
+            ),
+            event_type=EngineEventType.ITERATION_STARTED,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.ACCEPTED
+        manifest_hot = _payload(result.events[0])
+        preview_payload = _payload(result.events[1])
+        validation = preview_payload["runner_call_manifest_validation"]
+        assert isinstance(validation, Mapping)
+        assert manifest_hot["validation_status"] == "complete"
+        hot_diagnostic = _json_object(manifest_hot["diagnostic"])
+        assert hot_diagnostic["status"] == "complete"
+        assert hot_diagnostic["reason"] is None
+        assert manifest_hot["runner_call_projection_artifact_ref"] is not None
+        assert validation["status"] == "complete"
+        assert validation["continuation_limited_signal"] is False
+        manifest_body = store.transaction_runner.run_read(
+            lambda transaction: event_payload_object(
+                transaction,
+                result.events[0],
+                payload_label="runner-call manifest",
+            )
+        )
+        message_entries = _json_object_sequence(manifest_body["message_entries"])
+        assert len(message_entries) == 4
+        projection_ref = manifest_hot["runner_call_projection_artifact_ref"]
+        projection_digest = manifest_hot["runner_call_projection_artifact_digest"]
+        assert isinstance(projection_ref, str)
+        assert isinstance(projection_digest, str)
+        projection_descriptor = store.transaction_runner.run_read(
+            lambda transaction: PayloadStore().read_payload_descriptor(
+                transaction,
+                projection_ref,
+            )
+        )
+        assert projection_descriptor is not None
+        assert projection_descriptor.payload_kind is PayloadKind.ARTIFACT_REF
+        projection_payload = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_json_payload(
+                transaction,
+                projection_ref,
+                expected_digest=projection_digest,
+            )
+        )
+        projection_messages = _json_object_sequence(
+            projection_payload.payload["messages"]
+        )
+        assert len(projection_messages) == len(message_entries)
+        for message, entry in zip(projection_messages, message_entries, strict=True):
+            assert message["index"] == entry["index"]
+            assert message["role"] == entry["role"]
+            assert message["content_digest"] == entry["content_digest"]
+            assert entry["projection_artifact_ref"] == projection_ref
+            assert entry["projection_artifact_digest"] == projection_digest
+
+
 def test_iteration_completed_preview_includes_client_correlation_id(
     tmp_path: Path,
 ) -> None:
@@ -3575,16 +3728,22 @@ def test_iteration_completed_preview_includes_client_correlation_id(
         assert payload["client_correlation_id"] == "client-iteration"
 
 
-def _options(tmp_path: Path) -> HostDurableStoreOptions:
+def _options(
+    tmp_path: Path, *, payload_inline_threshold_bytes: int = 65536
+) -> HostDurableStoreOptions:
     """构造测试 durable store options。
 
     :param tmp_path: pytest 临时目录。
+    :param payload_inline_threshold_bytes: payload inline 阈值。
     :returns: Host durable store options。
     """
 
     return HostDurableStoreOptions(
         db_path=tmp_path / "durable.sqlite3",
-        payload_policy=PayloadStoragePolicy(artifact_root=tmp_path / "artifacts"),
+        payload_policy=PayloadStoragePolicy(
+            artifact_root=tmp_path / "artifacts",
+            payload_inline_threshold_bytes=payload_inline_threshold_bytes,
+        ),
         sqlite_policy=HostSQLiteStoragePolicy(
             busy_timeout_seconds=0.25,
             write_busy_retry_count=3,
@@ -4138,7 +4297,10 @@ def _awaiting_accept_candidate(seeded: _SeededRun) -> ToolAwaitingAcceptCandidat
         tool_name="lookup",
         tool_schema_digest=sha256_digest_json({"schema": "lookup"}),
         tool_identity_digest=sha256_digest_json({"identity": "lookup"}),
-        normalized_arguments_digest=sha256_digest_json({"arguments": "lookup"}),
+        normalized_arguments_digest=sha256_digest_json(
+            {"arguments": {"query": "lookup"}}
+        ),
+        accepted_arguments={"query": "lookup"},
         await_spec=await_spec,
         snapshot_ref=None,
         binding=binding,
@@ -4686,6 +4848,34 @@ def _payload(row: EventLogRow) -> Mapping[str, JsonValue]:
     value = cast(JsonValue, json.loads(row.payload_json))
     assert isinstance(value, Mapping)
     return cast(Mapping[str, JsonValue], value)
+
+
+def _json_object_sequence(value: JsonValue) -> tuple[Mapping[str, JsonValue], ...]:
+    """断言 JSON 值是 object 列表。
+
+    :param value: JSON 值。
+    :returns: JSON object 元组。
+    :raises AssertionError: value 不是 object 列表时抛出。
+    """
+
+    assert isinstance(value, list)
+    objects: list[Mapping[str, JsonValue]] = []
+    for item in value:
+        assert isinstance(item, Mapping)
+        objects.append(item)
+    return tuple(objects)
+
+
+def _json_object(value: JsonValue) -> Mapping[str, JsonValue]:
+    """断言 JSON 值是 object。
+
+    :param value: JSON 值。
+    :returns: JSON object。
+    :raises AssertionError: value 不是 object 时抛出。
+    """
+
+    assert isinstance(value, Mapping)
+    return value
 
 
 def _legacy_provider_protocol_diagnostic_view(

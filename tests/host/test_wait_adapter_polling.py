@@ -44,6 +44,7 @@ from dayu.host.wait_adapter import (
     WaitPoller,
     WaitResolvePort,
 )
+from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 from tests.host.test_resolve_wait_command import (
     _context,
     _options,
@@ -447,10 +448,51 @@ def test_poll_adapter_ready_result_resolves_wait(
         host.close()
 
 
+def test_poll_adapter_ready_result_logs_status_chain_without_payload(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """poller 在正常 ready 路径输出排障状态链且不记录结果正文。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        adapter = _SequenceAdapter(
+            (
+                WaitPollReady(
+                    ResolveWaitCompletedOutcome(
+                        result=ToolResultSuccess(
+                            ok=True,
+                            value={"payload_secret": "do-not-log"},
+                            meta=None,
+                        ),
+                        payload_ref=None,
+                    )
+                ),
+            )
+        )
+        poller = _poller(host, adapter, seeded.wait_id)
+
+        with caplog.at_level(VERBOSE_LOG_LEVEL, logger="dayu.host.wait_adapter"):
+            result = poller.poll_once()
+
+        assert result.resolved == 1
+        assert "host.wait_poller.poll_once.claimed" in caplog.text
+        assert "host.wait_poller.observe" in caplog.text
+        assert "outcome=ready" in caplog.text
+        assert "host.wait_poller.resolve" in caplog.text
+        assert "resolve_status=updated" in caplog.text
+        assert "host.wait_poller.poll_once.done" in caplog.text
+        assert seeded.wait_id in caplog.text
+        assert "payload_secret" not in caplog.text
+        assert "do-not-log" not in caplog.text
+    finally:
+        host.close()
+
+
 def test_poll_adapter_not_ready_leaves_wait_active(
     tmp_path: Path,
 ) -> None:
-    """poll adapter not-ready 不调用 resolve_wait，并写入 durable backoff。"""
+    """poll adapter not-ready 不调用 resolve_wait，并安排短间隔复查。"""
 
     host = create_host_command_handle(_options(tmp_path))
     try:
@@ -467,8 +509,33 @@ def test_poll_adapter_not_ready_leaves_wait_active(
         assert adapter.poll_count == 1
         assert wait_record.status is WaitRecordStatus.WAITING
         assert wait_record.poll_next_observe_at is not None
-        assert wait_record.poll_backoff_attempt == 1
+        assert wait_record.poll_backoff_attempt == 0
         assert wait_record.poll_last_outcome is WaitPollLastOutcome.NOT_READY
+    finally:
+        host.close()
+
+
+def test_poll_adapter_empty_round_does_not_log_poll_summary(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """poller 无可处理 wait 时不刷逐轮空摘要日志。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        poller = WaitPoller(
+            transaction_runner=host._transaction_runner(),
+            adapter_registry=WaitPollAdapterRegistry(()),
+            resolver=_NoResolveResolver(),
+            context=_context("poller"),
+            clock=_FixedClock(),
+        )
+
+        with caplog.at_level(VERBOSE_LOG_LEVEL, logger="dayu.host.wait_adapter"):
+            result = poller.poll_once()
+
+        assert result.observed == 0
+        assert "host.wait_poller.poll_once.claimed" not in caplog.text
+        assert "host.wait_poller.poll_once.done" not in caplog.text
     finally:
         host.close()
 

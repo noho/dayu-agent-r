@@ -41,10 +41,19 @@ from dayu.service.entrypoint_runtime import (
 from dayu.service.host_assembly import ServiceAssemblyOverrides, ServiceRunOverrides
 
 DEFAULT_PROMPT_TOOL_NAME: str = "get_financial_statement"
+DEFAULT_TIME_TOOL_NAME: str = "get_current_time"
+DEFAULT_DOWNLOAD_TOOL_NAME: str = "start_fins_download"
+DEFAULT_PREPROCESS_TOOL_NAME: str = "start_fins_preprocess"
+EXCLUDED_UPLOAD_TOOL_NAME: str = "start_fins_upload"
 _PACKAGE_CONFIG_ROOT = Path(__file__).resolve().parents[2] / "dayu" / "config"
 _MODEL_ID = "deepseek-v4-flash"
 _RUNNER_HINT_ID = "prompt"
 _API_KEY = "test-provider-key"
+_PROMPT_CURRENT_TIME_TEXT = (
+    "# 当前时间\n"
+    "现在是 2026年6月14日 16:00（Asia/Shanghai，星期日）。\n"
+    "这是对话开始时的当前时间；回答“现在/今天/当前时间”默认使用它；该时间不会自动更新。"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,9 +150,7 @@ class _FakeHost:
         self.watchers.append(watcher)
         return watcher
 
-    async def submit_followup(
-        self, session_id: str, request: SubmitFollowupRequest
-    ) -> FollowupSnapshot:
+    async def submit_followup(self, session_id: str, request: SubmitFollowupRequest) -> FollowupSnapshot:
         """记录 submit 请求并推入成功终态。
 
         :param session_id: 目标 Session id。
@@ -217,24 +224,34 @@ class _FakeHost:
 async def test_prompt_runtime_uses_real_prompt_manifest_required_slots(
     tmp_path: Path,
 ) -> None:
-    """真实 prompt scene 应要求并消费 fins_default_subject/base_user slots。"""
+    """真实 prompt scene 应要求并消费财报主体 context slot。"""
 
     result = await _prepare_prompt_runtime(
         tmp_path,
         fins_default_subject="测试公司",
-        base_user="本地 CLI 用户",
     )
     changed_subject_result = await _prepare_prompt_runtime(
         tmp_path,
         fins_default_subject="另一家公司",
-        base_user="本地 CLI 用户",
     )
 
     assert result.scene_inputs.tool_selection.tool_names is not None
     assert DEFAULT_PROMPT_TOOL_NAME in result.scene_inputs.tool_selection.tool_names
-    assert result.scene_inputs.content_digest != (
-        changed_subject_result.scene_inputs.content_digest
-    )
+    assert DEFAULT_TIME_TOOL_NAME not in result.scene_inputs.tool_selection.tool_names
+    assert DEFAULT_DOWNLOAD_TOOL_NAME not in result.scene_inputs.tool_selection.tool_names
+    assert DEFAULT_PREPROCESS_TOOL_NAME not in result.scene_inputs.tool_selection.tool_names
+    assert EXCLUDED_UPLOAD_TOOL_NAME not in result.scene_inputs.tool_selection.tool_names
+    assert result.host_assembly.options.wait_poller_policy is None
+    assert "财报工具指引" in result.scene_inputs.system_prompt
+    assert DEFAULT_TIME_TOOL_NAME not in result.scene_inputs.system_prompt
+    assert DEFAULT_DOWNLOAD_TOOL_NAME not in result.scene_inputs.system_prompt
+    assert DEFAULT_PREPROCESS_TOOL_NAME not in result.scene_inputs.system_prompt
+    assert EXCLUDED_UPLOAD_TOOL_NAME not in result.scene_inputs.system_prompt
+    assert "<when_tag" not in result.scene_inputs.system_prompt
+    assert "</when_tag>" not in result.scene_inputs.system_prompt
+    assert "<when_tool" not in result.scene_inputs.system_prompt
+    assert "</when_tool>" not in result.scene_inputs.system_prompt
+    assert result.scene_inputs.content_digest != (changed_subject_result.scene_inputs.content_digest)
     assert result.host_assembly.diagnostics.model_id == _MODEL_ID
     assert result.host_assembly.diagnostics.runner_option_hint_id == _RUNNER_HINT_ID
 
@@ -252,7 +269,9 @@ async def test_prompt_runtime_rejects_missing_required_context_slot(
                 package_config_root=_PACKAGE_CONFIG_ROOT,
                 explicit_config_dir=None,
                 scene_id="prompt",
-                context_slot_values={"base_user": "本地 CLI 用户"},
+                context_slot_values={
+                    "current_time": _PROMPT_CURRENT_TIME_TEXT,
+                },
                 assembly_overrides=ServiceAssemblyOverrides(
                     model_id=_MODEL_ID,
                     runner_option_hint_id=_RUNNER_HINT_ID,
@@ -271,7 +290,6 @@ async def test_submit_entrypoint_turn_reports_accepted_run_id(
     runtime = await _prepare_prompt_runtime(
         tmp_path,
         fins_default_subject="测试公司",
-        base_user="本地 CLI 用户",
     )
     accepted_run_ids: list[str] = []
     fake_host = _FakeHost()
@@ -303,13 +321,11 @@ async def _prepare_prompt_runtime(
     tmp_path: Path,
     *,
     fins_default_subject: str,
-    base_user: str,
 ) -> EntrypointRuntimeResult:
     """准备真实 prompt scene 的 entrypoint runtime。
 
     :param tmp_path: pytest 临时 workspace root。
     :param fins_default_subject: prompt scene 财报主体 slot 值。
-    :param base_user: prompt scene base_user slot 值。
     :returns: entrypoint runtime result。
     :raises Exception: runtime assembly 失败时向上抛出。
     """
@@ -322,7 +338,7 @@ async def _prepare_prompt_runtime(
             scene_id="prompt",
             context_slot_values={
                 "fins_default_subject": fins_default_subject,
-                "base_user": base_user,
+                "current_time": _PROMPT_CURRENT_TIME_TEXT,
             },
             assembly_overrides=ServiceAssemblyOverrides(
                 model_id=_MODEL_ID,

@@ -19,3 +19,7 @@
 ## 执行方式
 - 需要工具时直接调用工具；若要读财报，先 `list_documents`，再按需要读取最新年报相关内容。
 - 最终只输出一个 JSON 对象，不写解释性前缀或 Markdown 包装。
+
+{{current_time}}
+
+{{fins_default_subject}}

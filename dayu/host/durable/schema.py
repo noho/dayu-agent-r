@@ -235,6 +235,28 @@ RUNNER_CALL_INPUT_MANIFEST_MEDIA_TYPE = (
 )
 """RUNNER_CALL_INPUT_ASSEMBLED manifest body media type。"""
 
+RUNNER_CALL_INPUT_PROJECTION_DESCRIPTOR_KIND = "runner_call_input_projection"
+"""RUNNER_CALL_INPUT_ASSEMBLED LLM-facing input projection descriptor kind。"""
+
+RUNNER_CALL_INPUT_PROJECTION_SCHEMA_VERSION = "runner_call_input_projection.v1"
+"""RUNNER_CALL_INPUT_ASSEMBLED LLM-facing input projection schema version。"""
+
+RUNNER_CALL_INPUT_PROJECTION_MEDIA_TYPE = (
+    "application/vnd.dayu.runner-call-input-projection+json"
+)
+"""RUNNER_CALL_INPUT_ASSEMBLED LLM-facing input projection media type。"""
+
+SELECTED_TOOL_SCHEMA_SNAPSHOT_DESCRIPTOR_KIND = "selected_tool_schema_snapshot"
+"""Runner-call selected tool schema full JSON snapshot descriptor kind。"""
+
+SELECTED_TOOL_SCHEMA_SNAPSHOT_SCHEMA_VERSION = "selected_tool_schema_snapshot.v1"
+"""Runner-call selected tool schema full JSON snapshot schema version。"""
+
+SELECTED_TOOL_SCHEMA_SNAPSHOT_MEDIA_TYPE = (
+    "application/vnd.dayu.selected-tool-schema-snapshot+json"
+)
+"""Runner-call selected tool schema full JSON snapshot media type。"""
+
 COMPACTOR_INPUT_PROJECTION_DESCRIPTOR_KIND = "compactor_input_projection"
 """compactor proposal input projection payload descriptor kind。"""
 

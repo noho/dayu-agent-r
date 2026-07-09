@@ -35,10 +35,9 @@ class ToolCallRequestAtoms:
 
     :param tool_call_id: 工具调用 id。
     :param tool_name: 工具名。
-    :param arguments_json: 与 ``normalized_arguments_digest`` 同源的参数
-        canonical JSON preimage。
+    :param arguments_json: 可安全进入 LLM replay 的参数 JSON 投影。
     :param normalized_arguments_digest: 参数 canonical digest。
-    :param arguments_payload_digest: accepted 参数 payload digest。
+    :param arguments_payload_digest: 安全参数 JSON 投影 digest。
     :param semantic_input_digest: Host accept semantic input digest。
     :param semantic_query_text: 可选业务可读 semantic query。
     :param semantic_query_digest: semantic query digest；缺失时为 ``None``。
@@ -133,8 +132,6 @@ def tool_call_request_atoms(
     tool_name = _required_text(payload, "tool_name")
     normalized_digest = _required_text(payload, "normalized_arguments_digest")
     arguments_payload_digest = _required_text(payload, "arguments_payload_digest")
-    if arguments_payload_digest != normalized_digest:
-        raise HostDurableError("tool call arguments digest mismatch")
     arguments_json = _read_arguments_json(
         transaction,
         payload,

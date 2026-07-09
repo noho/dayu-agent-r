@@ -79,6 +79,7 @@ _UNCONFIGURED_USER_AGENT: Final[str] = "DayuAgent/1.0 unconfigured@example.com"
 DEFAULT_REQUEST_TIMEOUT_SECONDS: Final[int] = 30
 DEFAULT_MAX_RETRIES: Final[int] = 3
 RETRY_BACKOFF_BASE_SECONDS: Final[float] = 0.8
+_CANCEL_CHECK_SLEEP_SLICE_SECONDS: Final[float] = 0.1
 _GLOBAL_SEC_THROTTLE_STATE_FILENAME: Final[str] = "state.json"
 _GLOBAL_SEC_THROTTLE_LOCK_FILENAME: Final[str] = "state.lock"
 _SEC_THROTTLE_RELATIVE_DIR: Final[Path] = Path(".dayu") / "sec_throttle"
@@ -151,6 +152,10 @@ class DownloaderEvent:
     reason_code: Optional[str] = None
     reason_message: Optional[str] = None
     error: Optional[str] = None
+
+
+class SecDownloadCancelledError(Exception):
+    """SEC 下载在协作式检查点观察到取消请求。"""
 
 
 @dataclass(frozen=True)
@@ -852,6 +857,7 @@ class SecDownloader:
         self.workspace_root = workspace_root.resolve()
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient()
+        self._client_event_loop: asyncio.AbstractEventLoop | None = None
         self._sleep_seconds = DEFAULT_SLEEP_SECONDS
         self._request_timeout_seconds = DEFAULT_REQUEST_TIMEOUT_SECONDS
         self._max_retries = DEFAULT_MAX_RETRIES
@@ -880,6 +886,7 @@ class SecDownloader:
 
         if self._owns_client:
             await self._client.aclose()
+            self._client_event_loop = None
 
     def normalize_ticker(self, ticker: str) -> str:
         """标准化 ticker。
@@ -938,21 +945,32 @@ class SecDownloader:
             module=self.MODULE,
         )
 
-    async def resolve_company(self, ticker: str) -> tuple[str, str, str]:
+    async def resolve_company(
+        self,
+        ticker: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> tuple[str, str, str]:
         """解析 ticker 对应的 CIK 与公司名。
 
         Args:
             ticker: 股票代码。
+            cancellation_checker: 可选协作式取消检查器。
 
         Returns:
             `(cik, company_name, cik10)`。
 
         Raises:
             RuntimeError: ticker 不存在时抛出。
+            SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
         """
 
         normalized = self.normalize_ticker(ticker)
-        mapping = await _await_if_needed(self._http_get_json(SEC_TICKER_MAP_URL))
+        mapping = await _await_if_needed(
+            self._http_get_json(
+                SEC_TICKER_MAP_URL,
+                cancellation_checker=cancellation_checker,
+            )
+        )
         for row in mapping.values():
             row_mapping = _json_mapping(row)
             if str(row_mapping.get("ticker", "")).upper() != normalized:
@@ -962,7 +980,12 @@ class SecDownloader:
             if cik.isdigit():
                 cik10 = str(int(cik)).zfill(10)
                 return cik, company_name, cik10
-        fallback_result = await _await_if_needed(self._resolve_company_via_browse_edgar_ticker(normalized))
+        fallback_result = await _await_if_needed(
+            self._resolve_company_via_browse_edgar_ticker(
+                normalized,
+                cancellation_checker=cancellation_checker,
+            )
+        )
         if fallback_result is not None:
             return fallback_result
         raise RuntimeError(f"无法在 SEC ticker map 中找到 ticker={normalized}")
@@ -971,18 +994,20 @@ class SecDownloader:
         self,
         ticker: str,
         count: int = 40,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> Optional[tuple[str, str, str]]:
         """通过 browse-edgar 反查 ticker 对应公司信息。
 
         Args:
             ticker: 已标准化的大写 ticker。
             count: browse-edgar 拉取条数上限。
+            cancellation_checker: 可选协作式取消检查器。
 
         Returns:
             命中时返回 `(cik, company_name, cik10)`，否则返回 `None`。
 
         Raises:
-            无。
+            SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
         """
 
         normalized_ticker = ticker.strip().upper()
@@ -990,7 +1015,11 @@ class SecDownloader:
             return None
         url = BROWSE_EDGAR_TICKER_ATOM_URL.format(ticker=normalized_ticker, count=count)
         try:
-            payload = await _await_if_needed(self._http_get_bytes(url))
+            payload = await _await_if_needed(
+                self._http_get_bytes(url, cancellation_checker=cancellation_checker)
+            )
+        except SecDownloadCancelledError:
+            raise
         except RuntimeError as exc:
             Log.warn(
                 f"browse-edgar ticker 反查失败: ticker={normalized_ticker} error={exc}",
@@ -1015,7 +1044,12 @@ class SecDownloader:
             cik = str(int(raw_cik))
             cik10 = cik.zfill(10)
             try:
-                submissions = await _await_if_needed(self.fetch_submissions(cik10))
+                submissions = await _await_if_needed(
+                    self.fetch_submissions(
+                        cik10,
+                        cancellation_checker=cancellation_checker,
+                    )
+                )
             except RuntimeError as exc:
                 Log.warn(
                     (
@@ -1029,60 +1063,81 @@ class SecDownloader:
             return cik, (company_name or normalized_ticker), cik10
         return None
 
-    async def fetch_submissions(self, cik10: str) -> dict[str, JsonValue]:
+    async def fetch_submissions(
+        self,
+        cik10: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> dict[str, JsonValue]:
         """拉取 submissions JSON。
 
         Args:
             cik10: 10 位 CIK 字符串。
+            cancellation_checker: 可选协作式取消检查器。
 
         Returns:
             submissions JSON 字典。
 
         Raises:
             RuntimeError: 请求失败时抛出。
+            SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
         """
 
         url = SEC_SUBMISSIONS_URL.format(cik10=cik10)
-        return await _await_if_needed(self._http_get_json(url))
+        return await _await_if_needed(
+            self._http_get_json(url, cancellation_checker=cancellation_checker)
+        )
 
-    async def fetch_json(self, url: str) -> dict[str, JsonValue]:
+    async def fetch_json(
+        self,
+        url: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> dict[str, JsonValue]:
         """拉取任意 JSON URL。
 
         Args:
             url: 目标 JSON URL。
+            cancellation_checker: 可选协作式取消检查器。
 
         Returns:
             JSON 字典。
 
         Raises:
             RuntimeError: 请求失败时抛出。
+            SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
         """
 
-        return await _await_if_needed(self._http_get_json(url))
+        return await _await_if_needed(
+            self._http_get_json(url, cancellation_checker=cancellation_checker)
+        )
 
     async def fetch_browse_edgar_filenum(
         self,
         filenum: str,
         count: int = 100,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> list[BrowseEdgarFiling]:
         """通过 browse-edgar 拉取 filenum 对应的 filings。
 
         Args:
             filenum: SEC 文件编号（如 005-XXXX）。
             count: 拉取条数上限。
+            cancellation_checker: 可选协作式取消检查器。
 
         Returns:
             filings 列表。
 
         Raises:
             RuntimeError: 请求失败时抛出。
+            SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
         """
 
         normalized = filenum.strip()
         if not normalized:
             return []
         url = BROWSE_EDGAR_ATOM_URL.format(filenum=normalized, count=count)
-        payload = await _await_if_needed(self._http_get_bytes(url))
+        payload = await _await_if_needed(
+            self._http_get_bytes(url, cancellation_checker=cancellation_checker)
+        )
         return _parse_browse_edgar_atom(payload)
 
     async def resolve_primary_document(
@@ -1090,6 +1145,7 @@ class SecDownloader:
         cik: str,
         accession_no_dash: str,
         form_type: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> str:
         """根据 index.json 推断主文件名。
 
@@ -1097,16 +1153,20 @@ class SecDownloader:
             cik: CIK（无前导零）。
             accession_no_dash: 无连字符 accession。
             form_type: 表单类型。
+            cancellation_checker: 可选协作式取消检查器。
 
         Returns:
             主文件名。
 
         Raises:
             RuntimeError: 无法定位主文件时抛出。
+            SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
         """
 
         index_url = ARCHIVES_INDEX_JSON.format(cik=str(int(cik)), accession_no_dash=accession_no_dash)
-        index_json = await _await_if_needed(self._http_get_json(index_url))
+        index_json = await _await_if_needed(
+            self._http_get_json(index_url, cancellation_checker=cancellation_checker)
+        )
         directory = _json_mapping(index_json.get("directory"))
         items = _json_mapping_list(directory.get("item"))
         primary = _select_primary_from_index_items(items, form_type)
@@ -1118,6 +1178,7 @@ class SecDownloader:
         self,
         archive_cik: str,
         accession_number: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> Optional[Sc13PartyRoles]:
         """解析 SC 13 filing 的申报方与被申报方 CIK。
 
@@ -1127,12 +1188,13 @@ class SecDownloader:
         Args:
             archive_cik: archive 路径中的 CIK（无前导零或有前导零均可）。
             accession_number: accession（含连字符）。
+            cancellation_checker: 可选协作式取消检查器。
 
         Returns:
             解析成功时返回 `Sc13PartyRoles`；网络失败或字段缺失返回 `None`。
 
         Raises:
-            无。
+            SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
         """
 
         normalized_archive_cik = _normalize_cik_value(archive_cik)
@@ -1146,7 +1208,11 @@ class SecDownloader:
             accession=normalized_accession,
         )
         try:
-            payload = await _await_if_needed(self._http_get_bytes(url))
+            payload = await _await_if_needed(
+                self._http_get_bytes(url, cancellation_checker=cancellation_checker)
+            )
+        except SecDownloadCancelledError:
+            raise
         except RuntimeError as exc:
             Log.warn(
                 (
@@ -1158,20 +1224,28 @@ class SecDownloader:
             return None
         return _parse_sc13_party_roles_from_index_headers(payload)
 
-    async def fetch_file_bytes(self, url: str) -> bytes:
+    async def fetch_file_bytes(
+        self,
+        url: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> bytes:
         """下载文件并返回字节内容。
 
         Args:
             url: 文件 URL。
+            cancellation_checker: 可选协作式取消检查器。
 
         Returns:
             文件内容字节。
 
         Raises:
             RuntimeError: 下载失败时抛出。
+            SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
         """
 
-        return await _await_if_needed(self._http_download(url))
+        return await _await_if_needed(
+            self._http_download(url, cancellation_checker=cancellation_checker)
+        )
 
     async def list_filing_files(
         self,
@@ -1182,6 +1256,7 @@ class SecDownloader:
         include_xbrl: bool = True,
         include_exhibits: bool = True,
         include_http_metadata: bool = True,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> list[RemoteFileDescriptor]:
         """列出 filing 相关的远端文件。
 
@@ -1193,27 +1268,37 @@ class SecDownloader:
             include_xbrl: 是否包含 XBRL 文件。
             include_exhibits: 是否包含 exhibit 文件（6-K）。
             include_http_metadata: 是否额外拉取文件级 HTTP 元数据。
+            cancellation_checker: 可选协作式取消检查器。
 
         Returns:
             远端文件描述列表。
 
         Raises:
             RuntimeError: 网络请求连续失败时抛出。
+            SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
         """
 
+        _raise_if_download_cancelled(cancellation_checker)
         archive_base = ARCHIVES_BASE.format(cik=str(int(cik)), accession_no_dash=accession_no_dash)
         filenames: list[str] = [primary_document]
         index_items: list[dict[str, JsonValue]] = []
         index_header_documents: list[dict[str, JsonValue]] = []
         if include_xbrl or include_exhibits:
+            _raise_if_download_cancelled(cancellation_checker)
             index_items = await _await_if_needed(
-                self._try_fetch_index_items(cik=cik, accession_no_dash=accession_no_dash)
+                self._try_fetch_index_items(
+                    cik=cik,
+                    accession_no_dash=accession_no_dash,
+                    cancellation_checker=cancellation_checker,
+                )
             )
         if include_exhibits and form_type == "6-K":
+            _raise_if_download_cancelled(cancellation_checker)
             index_header_documents = await _await_if_needed(
                 self._try_fetch_index_header_documents(
                     cik=cik,
                     accession_no_dash=accession_no_dash,
+                    cancellation_checker=cancellation_checker,
                 )
             )
         if include_xbrl:
@@ -1226,11 +1311,13 @@ class SecDownloader:
             filenames.extend(pick_form_document_files(index_header_documents, form_type))
             filenames.extend(pick_exhibit_files(index_items))
             filenames.extend(pick_exhibit_files(index_header_documents))
+            _raise_if_download_cancelled(cancellation_checker)
             filenames.extend(
                 await _await_if_needed(
                     self._try_fetch_primary_linked_html_files(
                         archive_base=archive_base,
                         primary_document=primary_document,
+                        cancellation_checker=cancellation_checker,
                     )
                 )
             )
@@ -1242,11 +1329,18 @@ class SecDownloader:
         )
         descriptors: list[RemoteFileDescriptor] = []
         for filename in unique_filenames:
+            _raise_if_download_cancelled(cancellation_checker)
             source_url = archive_base + filename
             metadata = file_meta_map.get(filename, {})
             head_response: Optional[httpx.Response] = None
             if include_http_metadata:
-                head_response = await _await_if_needed(self._http_head(source_url, allow_redirects=True))
+                head_response = await _await_if_needed(
+                    self._http_head(
+                        source_url,
+                        allow_redirects=True,
+                        cancellation_checker=cancellation_checker,
+                    )
+                )
             descriptors.append(
                 RemoteFileDescriptor(
                     name=filename,
@@ -1268,6 +1362,7 @@ class SecDownloader:
         store_file: Callable[[str, BinaryIO], FileObjectMeta],
         existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
         primary_document: Optional[str] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> AsyncIterator[DownloaderEvent]:
         """下载远端文件列表并流式返回文件级事件。
 
@@ -1278,6 +1373,7 @@ class SecDownloader:
             existing_files: 既有文件元数据映射（按文件名）。
             primary_document: 主文档文件名（如 *.htm）；若指定且该文件下载为 0 字节，
                 立即停止生成器，后续文件不再下载，确保整个 filing 不落盘。
+            cancellation_checker: 可选协作式取消检查器。
 
         Yields:
             文件级下载事件。
@@ -1288,6 +1384,7 @@ class SecDownloader:
 
         previous_map = existing_files or {}
         for descriptor in remote_files:
+            _raise_if_download_cancelled(cancellation_checker)
             yield DownloaderEvent(
                 event_type="file_download_started",
                 name=descriptor.name,
@@ -1308,8 +1405,11 @@ class SecDownloader:
                             url=descriptor.source_url,
                             etag=previous_etag,
                             last_modified=previous_last_modified,
+                            cancellation_checker=cancellation_checker,
                         )
                     )
+                except SecDownloadCancelledError:
+                    return
                 except RuntimeError as exc:
                     # 捕获下载异常（如503等HTTP错误），转换为file_failed事件
                     yield DownloaderEvent(
@@ -1349,6 +1449,7 @@ class SecDownloader:
                         error="下载失败，未返回内容",
                     )
                     continue
+                _raise_if_download_cancelled(cancellation_checker)
                 if len(payload) == 0:
                     yield _build_empty_content_failure_event(descriptor, status_code)
                     if _should_abort_after_empty_primary(descriptor.name, primary_document):
@@ -1356,6 +1457,7 @@ class SecDownloader:
                         return
                     continue
                 file_meta = store_file(descriptor.name, _to_binary_stream(payload))
+                _raise_if_download_cancelled(cancellation_checker)
                 yield DownloaderEvent(
                     event_type="file_downloaded",
                     name=descriptor.name,
@@ -1367,7 +1469,13 @@ class SecDownloader:
                 )
                 continue
             try:
-                payload = await _await_if_needed(self._http_download(descriptor.source_url))
+                payload = await _await_if_needed(
+                    self._http_download(
+                        descriptor.source_url,
+                        cancellation_checker=cancellation_checker,
+                    )
+                )
+                _raise_if_download_cancelled(cancellation_checker)
                 if len(payload) == 0:
                     yield _build_empty_content_failure_event(descriptor, descriptor.http_status)
                     if _should_abort_after_empty_primary(descriptor.name, primary_document):
@@ -1375,6 +1483,7 @@ class SecDownloader:
                         return
                     continue
                 file_meta = store_file(descriptor.name, _to_binary_stream(payload))
+                _raise_if_download_cancelled(cancellation_checker)
                 yield DownloaderEvent(
                     event_type="file_downloaded",
                     name=descriptor.name,
@@ -1384,6 +1493,8 @@ class SecDownloader:
                     http_status=descriptor.http_status,
                     file_meta=file_meta,
                 )
+            except SecDownloadCancelledError:
+                return
             except RuntimeError as exc:
                 yield DownloaderEvent(
                     event_type="file_failed",
@@ -1404,6 +1515,7 @@ class SecDownloader:
         store_file: Callable[[str, BinaryIO], FileObjectMeta],
         existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
         primary_document: Optional[str] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> list[DownloadFileResult]:
         """下载远端文件列表并聚合返回结果。
 
@@ -1413,6 +1525,7 @@ class SecDownloader:
             store_file: 文件存储回调（入参：文件名、二进制流）。
             existing_files: 既有文件元数据映射（按文件名）。
             primary_document: 主文档文件名，转发给 download_files_stream。
+            cancellation_checker: 可选协作式取消检查器。
 
         Returns:
             单文件下载结果列表。
@@ -1428,6 +1541,7 @@ class SecDownloader:
             store_file=store_file,
             existing_files=existing_files,
             primary_document=primary_document,
+            cancellation_checker=cancellation_checker,
         ):
             if event.event_type == "file_download_started":
                 continue
@@ -1483,6 +1597,7 @@ class SecDownloader:
         failure_prefix: str,
         extra_headers: Optional[dict[str, str]] = None,
         allow_redirects: bool = False,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> _HttpResultT:
         """执行带 SEC 限流与重试策略的 HTTP 请求。
 
@@ -1495,12 +1610,14 @@ class SecDownloader:
             failure_prefix: 重试耗尽后的异常前缀。
             extra_headers: 额外请求头。
             allow_redirects: `HEAD` 请求是否跟随重定向。
+            cancellation_checker: 可选协作式取消检查器。
 
         Returns:
             `response_handler` 产出的结果。
 
         Raises:
             RuntimeError: 重试耗尽后抛出。
+            SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
             OSError: 共享限流状态读写失败时抛出。
         """
 
@@ -1511,7 +1628,12 @@ class SecDownloader:
         throttle_retries_remaining = _SEC_THROTTLE_MAX_RETRIES
         attempt_index = 0
         while attempt_index < self._max_retries:
-            throttle_reservation = await self._rate_limit()
+            _raise_if_download_cancelled(cancellation_checker)
+            await self._refresh_owned_client_for_current_loop()
+            throttle_reservation = await self._rate_limit(
+                cancellation_checker=cancellation_checker
+            )
+            _raise_if_download_cancelled(cancellation_checker)
             Log.debug(
                 f"{_SEC_REQUEST_RESERVED_LOG_EVENT}: method={method} url={url} "
                 f"attempt={attempt_index + 1} max_retries={self._max_retries} "
@@ -1553,9 +1675,11 @@ class SecDownloader:
                         f"SEC 限流 {response.status_code}: url={url} 等待 {delay:.1f}s",
                         module=self.MODULE,
                     )
-                    await asyncio.sleep(delay)
+                    await _sleep_with_cancel_check(delay, cancellation_checker)
                     continue
-                return response_handler(response)
+                result = response_handler(response)
+                _raise_if_download_cancelled(cancellation_checker)
+                return result
             except handled_exceptions as exc:
                 last_exception = exc
                 Log.debug(
@@ -1566,15 +1690,48 @@ class SecDownloader:
                     f"cooldown_hit={throttle_reservation.cooldown_hit} error={exc}",
                     module=self.MODULE,
                 )
-                await self._retry_backoff(attempt_index)
+                await self._retry_backoff(
+                    attempt_index,
+                    cancellation_checker=cancellation_checker,
+                )
                 attempt_index += 1
         raise RuntimeError(f"{failure_prefix}: url={url} error={last_exception}")
+
+    async def _refresh_owned_client_for_current_loop(self) -> None:
+        """确保 owned HTTP client 不跨已关闭事件循环复用。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            RuntimeError: 当前线程没有运行中的事件循环时抛出。
+        """
+
+        if not self._owns_client:
+            return
+        if not isinstance(self._client, httpx.AsyncClient):
+            return
+        current_loop = asyncio.get_running_loop()
+        if self._client_event_loop is None:
+            self._client_event_loop = current_loop
+            return
+        if self._client_event_loop is current_loop:
+            return
+        previous_client = self._client
+        self._client = httpx.AsyncClient()
+        self._client_event_loop = current_loop
+        with contextlib.suppress(Exception):
+            await previous_client.aclose()
 
     async def _http_download_if_modified(
         self,
         url: str,
         etag: Optional[str],
         last_modified: Optional[str],
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> tuple[int, Optional[bytes]]:
         """按条件请求下载文件，未修改时返回 304。
 
@@ -1582,21 +1739,27 @@ class SecDownloader:
             url: 文件 URL。
             etag: 远端 ETag（可选）。
             last_modified: 远端 Last-Modified（可选）。
+            cancellation_checker: 可选协作式取消检查器。
 
         Returns:
             (HTTP 状态码, 内容字节)；`304` 表示未修改且内容为空。
 
         Raises:
             RuntimeError: 下载失败时抛出。
+            SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
         """
 
+        _raise_if_download_cancelled(cancellation_checker)
         conditional_headers: dict[str, str] = {}
         if etag:
             conditional_headers["If-None-Match"] = etag
         if last_modified:
             conditional_headers["If-Modified-Since"] = last_modified
         if not conditional_headers:
-            return 200, await self._http_download(url=url)
+            return 200, await self._http_download(
+                url=url,
+                cancellation_checker=cancellation_checker,
+            )
 
         return await self._execute_sec_request(
             url=url,
@@ -1606,19 +1769,26 @@ class SecDownloader:
             attempt_log_prefix="条件下载失败",
             failure_prefix="条件下载失败",
             extra_headers=conditional_headers,
+            cancellation_checker=cancellation_checker,
         )
 
-    async def _http_get_json(self, url: str) -> dict[str, JsonValue]:
+    async def _http_get_json(
+        self,
+        url: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> dict[str, JsonValue]:
         """执行 GET JSON 请求。
 
         Args:
             url: 请求地址。
+            cancellation_checker: 可选协作式取消检查器。
 
         Returns:
             JSON 字典。
 
         Raises:
             RuntimeError: 请求失败时抛出。
+            SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
         """
 
         return await self._execute_sec_request(
@@ -1628,20 +1798,28 @@ class SecDownloader:
             handled_exceptions=(httpx.HTTPError, ValueError),
             attempt_log_prefix="GET JSON 失败",
             failure_prefix="GET JSON 失败",
+            cancellation_checker=cancellation_checker,
         )
 
-    async def _http_head(self, url: str, allow_redirects: bool) -> Optional[httpx.Response]:
+    async def _http_head(
+        self,
+        url: str,
+        allow_redirects: bool,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> Optional[httpx.Response]:
         """执行 HEAD 请求。
 
         Args:
             url: 请求地址。
             allow_redirects: 是否跟随重定向。
+            cancellation_checker: 可选协作式取消检查器。
 
         Returns:
             Response 对象；失败时返回 `None`。
 
         Raises:
             OSError: 共享限流状态读写失败时抛出。
+            SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
         """
 
         try:
@@ -1653,21 +1831,28 @@ class SecDownloader:
                 attempt_log_prefix="HEAD 失败",
                 failure_prefix="HEAD 失败",
                 allow_redirects=allow_redirects,
+                cancellation_checker=cancellation_checker,
             )
         except RuntimeError:
             return None
 
-    async def _http_download(self, url: str) -> bytes:
+    async def _http_download(
+        self,
+        url: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> bytes:
         """下载文件并返回内容。
 
         Args:
             url: 文件 URL。
+            cancellation_checker: 可选协作式取消检查器。
 
         Returns:
             文件内容字节。
 
         Raises:
             RuntimeError: 下载失败时抛出。
+            SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
         """
 
         return await self._execute_sec_request(
@@ -1677,19 +1862,26 @@ class SecDownloader:
             handled_exceptions=(httpx.HTTPError,),
             attempt_log_prefix="下载失败",
             failure_prefix="下载失败",
+            cancellation_checker=cancellation_checker,
         )
 
-    async def _http_get_bytes(self, url: str) -> bytes:
+    async def _http_get_bytes(
+        self,
+        url: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> bytes:
         """执行 GET 请求并返回字节内容。
 
         Args:
             url: 请求地址。
+            cancellation_checker: 可选协作式取消检查器。
 
         Returns:
             响应体字节。
 
         Raises:
             RuntimeError: 请求失败时抛出。
+            SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
         """
 
         return await self._execute_sec_request(
@@ -1699,20 +1891,27 @@ class SecDownloader:
             handled_exceptions=(httpx.HTTPError,),
             attempt_log_prefix="GET bytes 失败",
             failure_prefix="GET bytes 失败",
+            cancellation_checker=cancellation_checker,
         )
 
-    async def _try_fetch_index_items(self, cik: str, accession_no_dash: str) -> list[dict[str, JsonValue]]:
+    async def _try_fetch_index_items(
+        self,
+        cik: str,
+        accession_no_dash: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> list[dict[str, JsonValue]]:
         """尝试拉取 index.json 中的 item 列表。
 
         Args:
             cik: CIK（无前导零）。
             accession_no_dash: 无连字符 accession。
+            cancellation_checker: 可选协作式取消检查器。
 
         Returns:
             index.json 的 item 列表；失败时返回空列表。
 
         Raises:
-            无。
+            SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
         """
 
         index_url = ARCHIVES_INDEX_JSON.format(
@@ -1720,7 +1919,11 @@ class SecDownloader:
             accession_no_dash=accession_no_dash,
         )
         try:
-            index_json = await _await_if_needed(self._http_get_json(index_url))
+            index_json = await _await_if_needed(
+                self._http_get_json(index_url, cancellation_checker=cancellation_checker)
+            )
+        except SecDownloadCancelledError:
+            raise
         except RuntimeError as exc:
             Log.warn(f"读取 index.json 失败: {index_url} error={exc}", module=self.MODULE)
             return []
@@ -1731,18 +1934,20 @@ class SecDownloader:
         self,
         cik: str,
         accession_no_dash: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> list[dict[str, JsonValue]]:
         """尝试从 index-headers 页面解析文档条目。
 
         Args:
             cik: CIK（无前导零）。
             accession_no_dash: 无连字符 accession。
+            cancellation_checker: 可选协作式取消检查器。
 
         Returns:
             文档条目列表；请求失败或解析失败时返回空列表。
 
         Raises:
-            无。
+            SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
         """
 
         accession = _format_accession_with_dash(accession_no_dash)
@@ -1752,7 +1957,14 @@ class SecDownloader:
             accession=accession,
         )
         try:
-            payload = await _await_if_needed(self._http_get_bytes(index_headers_url))
+            payload = await _await_if_needed(
+                self._http_get_bytes(
+                    index_headers_url,
+                    cancellation_checker=cancellation_checker,
+                )
+            )
+        except SecDownloadCancelledError:
+            raise
         except RuntimeError as exc:
             Log.warn(
                 f"读取 index-headers 失败: {index_headers_url} error={exc}",
@@ -1765,23 +1977,32 @@ class SecDownloader:
         self,
         archive_base: str,
         primary_document: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> list[str]:
         """尝试从主文档补链同 filing 的相对 HTML 文件。
 
         Args:
             archive_base: filing archive 基础 URL。
             primary_document: 主文档文件名。
+            cancellation_checker: 可选协作式取消检查器。
 
         Returns:
             归一化后的相对 HTML 文件名列表；请求失败时返回空列表。
 
         Raises:
-            无。
+            SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
         """
 
         primary_document_url = archive_base + primary_document
         try:
-            payload = await _await_if_needed(self._http_get_bytes(primary_document_url))
+            payload = await _await_if_needed(
+                self._http_get_bytes(
+                    primary_document_url,
+                    cancellation_checker=cancellation_checker,
+                )
+            )
+        except SecDownloadCancelledError:
+            raise
         except RuntimeError as exc:
             Log.warn(
                 f"读取主文档补链失败: {primary_document_url} error={exc}",
@@ -1892,22 +2113,27 @@ class SecDownloader:
             )
             _save_sec_throttle_state(self._throttle_state_path, next_state)
 
-    async def _rate_limit(self) -> _SecThrottleReservation:
+    async def _rate_limit(
+        self,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> _SecThrottleReservation:
         """基于单调时钟的请求速率限制器。
 
         确保相邻请求间隔 ≥ max(_SEC_MIN_REQUEST_INTERVAL_SECONDS, sleep_seconds)。
         在每次 HTTP 请求 **之前** 调用。
 
         Args:
-            无。
+            cancellation_checker: 可选协作式取消检查器。
 
         Returns:
             本次请求的共享限流预留诊断。
 
         Raises:
+            SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
             OSError: 共享限流状态读写失败时抛出。
         """
 
+        _raise_if_download_cancelled(cancellation_checker)
         min_interval = max(_SEC_MIN_REQUEST_INTERVAL_SECONDS, self._sleep_seconds)
         if min_interval <= 0:
             return _SecThrottleReservation(
@@ -1919,31 +2145,98 @@ class SecDownloader:
         now = time.monotonic()
         elapsed = now - self._last_request_time
         if elapsed < min_interval:
-            await asyncio.sleep(min_interval - elapsed)
+            await _sleep_with_cancel_check(
+                min_interval - elapsed,
+                cancellation_checker,
+            )
         # 再执行跨进程共享限流，确保同一工作区下所有下载进程共用节流状态。
         reservation = self._reserve_global_request_slot(min_interval)
         if reservation.shared_wait_seconds > 0:
-            await asyncio.sleep(reservation.shared_wait_seconds)
+            await _sleep_with_cancel_check(
+                reservation.shared_wait_seconds,
+                cancellation_checker,
+            )
+        _raise_if_download_cancelled(cancellation_checker)
         self._last_request_time = time.monotonic()
         return reservation
 
-    async def _retry_backoff(self, attempt_index: int) -> None:
+    async def _retry_backoff(
+        self,
+        attempt_index: int,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> None:
         """执行指数退避。
 
         Args:
             attempt_index: 重试序号（从 0 开始）。
+            cancellation_checker: 可选协作式取消检查器。
 
         Returns:
             无。
 
         Raises:
-            无。
+            SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
         """
 
         if attempt_index >= self._max_retries - 1:
             return
         delay = RETRY_BACKOFF_BASE_SECONDS * (2**attempt_index)
-        await asyncio.sleep(delay)
+        await _sleep_with_cancel_check(delay, cancellation_checker)
+
+
+async def _sleep_with_cancel_check(
+    seconds: float,
+    cancellation_checker: Optional[Callable[[], bool]],
+) -> None:
+    """按小片段睡眠并在片段间检查取消。
+
+    Args:
+        seconds: 目标睡眠秒数；非正数时只检查一次取消。
+        cancellation_checker: 可选协作式取消检查器。
+
+    Returns:
+        无。
+
+    Raises:
+        SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
+    """
+
+    remaining = max(seconds, 0.0)
+    _raise_if_download_cancelled(cancellation_checker)
+    if cancellation_checker is None:
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+        return
+    while remaining > 0:
+        interval = min(remaining, _CANCEL_CHECK_SLEEP_SLICE_SECONDS)
+        await asyncio.sleep(interval)
+        remaining -= interval
+        _raise_if_download_cancelled(cancellation_checker)
+
+
+def _raise_if_download_cancelled(
+    cancellation_checker: Optional[Callable[[], bool]],
+) -> None:
+    """检查 SEC 下载取消信号。
+
+    Args:
+        cancellation_checker: 可选协作式取消检查器。
+
+    Returns:
+        无。
+
+    Raises:
+        SecDownloadCancelledError: 取消检查命中或检查器主动抛出取消异常时抛出。
+    """
+
+    if cancellation_checker is None:
+        return
+    try:
+        cancelled = cancellation_checker()
+    except SecDownloadCancelledError:
+        raise
+    if cancelled:
+        raise SecDownloadCancelledError("SEC 下载已取消")
 
 
 def _parse_retry_after(response: httpx.Response) -> float:

@@ -1,8 +1,7 @@
-"""Fins 上传 awaiting tool 定义。
+"""Fins 上传工具定义。
 
-本模块把 Fins shared ingestion runtime 的上传 observation 入口适配为当前
-``ToolDefinition``。工具只负责参数解析、本地上传文件形态校验和外部长
-事务启动，不复制 SEC/CN/HK 上传业务规则，也不等待 Docling 或仓储长事务完成。
+本模块把 Fins 上传能力适配为当前 ``ToolDefinition``，负责参数解析、
+本地上传文件形态校验和上传任务启动，不复制 SEC/CN/HK 上传业务规则。
 """
 
 from __future__ import annotations
@@ -151,11 +150,8 @@ def build_fins_upload_tool(runtime: FinsIngestionRuntime) -> ToolDefinition:
             function=ToolFunctionSchema(
                 name=UPLOAD_TOOL_NAME,
                 description=(
-                    "Start a financial filing or material upload operation for one company. "
-                    "The tool returns immediately with an external-job wait state after "
-                    "a lightweight observation handle is registered; it does not wait "
-                    "for file conversion or storage writes to finish. Use only for local files that the user has asked to "
-                    "ingest into the Fins workspace."
+                    "为一家公司上传本地财报文件或补充材料。调用后等待工具结果返回；"
+                    "结果会说明上传、删除、转换或失败情况。仅在用户明确要求使用本地文件补充财报资料时调用。"
                 ),
                 parameters=_upload_parameters_schema(),
             ),
@@ -213,73 +209,73 @@ def _upload_parameters_schema() -> ToolParametersSchema:
     properties: dict[str, JsonValue] = {
         "ticker": {
             "type": "string",
-            "description": "Company ticker or exchange-qualified ticker for the uploaded financial document.",
+            "description": "要归属上传文件的股票代码，可包含交易所后缀。",
         },
         "upload_kind": {
             "type": "string",
-            "description": "Whether the upload is a periodic filing or a supporting material.",
+            "description": "上传文件类别：定期财报 filing，或补充材料 material。",
             "enum": upload_kind_enum,
         },
         "action": {
             "type": "string",
-            "description": "Upload action. Use auto for normal uploads; delete removes the matching stored source document and must not include files.",
+            "description": "上传动作。普通上传使用 auto；delete 表示删除匹配的已存源文件，且不能同时提供 files。",
             "enum": upload_action_enum,
             "default": _DEFAULT_ACTION,
         },
         "files": {
             "type": "array",
-            "description": "Local file paths to upload. Each path must point to an existing non-empty regular file. Required for auto, create and update; forbidden for delete.",
+            "description": "要上传的本地文件路径列表。每个路径必须指向已存在、非空的普通文件；auto、create、update 必填，delete 禁止提供。",
             "items": string_items_schema,
         },
         "fiscal_year": {
             "type": "integer",
-            "description": "Fiscal year. Required for filing uploads; optional for material uploads.",
+            "description": "财年。上传 filing 时必填；上传 material 时可选。",
         },
         "fiscal_period": {
             "type": "string",
-            "description": "Fiscal period such as FY, Q1, Q2, Q3 or Q4. Required for filing uploads; optional for material uploads.",
+            "description": "财报期间，例如 FY、Q1、Q2、Q3 或 Q4。上传 filing 时必填；上传 material 时可选。",
         },
         "form_type": {
             "type": "string",
-            "description": "Material form type such as 8-K or MATERIAL_OTHER. Required for material uploads.",
+            "description": "补充材料类型，例如 8-K 或 MATERIAL_OTHER。上传 material 时必填。",
         },
         "material_name": {
             "type": "string",
-            "description": "Material display name. Required for material uploads.",
+            "description": "补充材料显示名称。上传 material 时必填。",
         },
         "document_id": {
             "type": "string",
-            "description": "Optional explicit material document id. Omit unless the user supplied a precise stored id.",
+            "description": "可选的补充材料文档 ID。只有用户明确提供已存文档 ID 时才填写。",
         },
         "internal_document_id": {
             "type": "string",
-            "description": "Optional explicit material internal document id. Omit unless the user supplied a precise source id.",
+            "description": "可选的补充材料内部源文件 ID。只有用户明确提供精确源文件 ID 时才填写。",
         },
         "amended": {
             "type": "boolean",
-            "description": "Whether the uploaded document is an amended version.",
+            "description": "上传文件是否为修订版本。",
             "default": False,
         },
         "filing_date": {
             "type": "string",
-            "description": "Optional filing date in YYYY-MM-DD form.",
+            "description": "可选披露日期，格式 YYYY-MM-DD。",
         },
         "report_date": {
             "type": "string",
-            "description": "Optional report date in YYYY-MM-DD form.",
+            "description": "可选报告期日期，格式 YYYY-MM-DD。",
         },
         "company_name": {
             "type": "string",
-            "description": "Optional company name to store with upload metadata.",
+            "description": "可选公司名称，用于随上传元数据保存。",
         },
         "ticker_aliases": {
             "type": "array",
-            "description": "Optional company ticker aliases.",
+            "description": "可选股票代码别名列表。",
             "items": string_items_schema,
         },
         "overwrite": {
             "type": "boolean",
-            "description": "Whether the upload may replace an existing source document.",
+            "description": "是否允许本次上传替换已有源文件。",
             "default": False,
         },
     }

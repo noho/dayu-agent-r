@@ -9,7 +9,7 @@ import signal
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
@@ -17,7 +17,7 @@ import pytest
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
-from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
+from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSnapshot, ToolAwaitSpec
 from dayu.contracts.tool_call import (
     BatchToolExecutionContext,
     BatchToolExecutionRequest,
@@ -360,12 +360,14 @@ class _BlockingCallable:
 class _AwaitingCallable:
     """返回 awaiting outcome 的 fake 工具。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, snapshot: ToolAwaitSnapshot | None = None) -> None:
         """初始化 fake callable。
 
+        :param snapshot: 可选等待时点快照引用。
         :returns: ``None``。
         """
 
+        self._snapshot = snapshot
         self.call_count = 0
 
     async def __call__(
@@ -388,7 +390,7 @@ class _AwaitingCallable:
                 deadline=None,
                 resume_token="resume-token",
             ),
-            snapshot=None,
+            snapshot=self._snapshot,
         )
 
 
@@ -2171,6 +2173,46 @@ async def test_awaiting_outcome_returns_only_after_awaiting_accepted_ack(
         awaiting_accept_port.candidates[0].wait_id
     )
     assert recorded_reasons == []
+
+
+@pytest.mark.asyncio
+async def test_awaiting_outcome_with_snapshot_builds_complete_wait_snapshot_ref() -> None:
+    """awaiting outcome 携带 snapshot 时生成可落库的完整 wait snapshot ref。
+
+    :returns: ``None``。
+    """
+
+    snapshot = ToolAwaitSnapshot(
+        snapshot_id="fins-observation-start-test",
+        captured_at=datetime(2026, 5, 16, 1, 2, 3, 456789, tzinfo=UTC),
+    )
+    callable_ = _AwaitingCallable(snapshot=snapshot)
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    awaiting_accept_port = _AwaitingAcceptPort()
+    activation_adapter = _SpyWaitActivationAdapter()
+    executor = _executor(
+        callable_,
+        accept_port,
+        awaiting_accept_port=awaiting_accept_port,
+        wait_adapter_registry=_wait_adapter_registry(),
+        wait_activation_registry=_wait_activation_registry(activation_adapter),
+    )
+
+    outcome = await executor.execute(_request(_call("tool-call-1")))
+
+    record = outcome.records[0]
+    assert isinstance(record.outcome, ToolAwaitingOutcome)
+    assert len(awaiting_accept_port.candidates) == 1
+    snapshot_ref = awaiting_accept_port.candidates[0].snapshot_ref
+    assert snapshot_ref is not None
+    assert snapshot_ref.snapshot_id == snapshot.snapshot_id
+    assert snapshot_ref.captured_at == snapshot.captured_at
+    assert snapshot_ref.snapshot_digest == sha256_digest_json(
+        {
+            "captured_at": "2026-05-16T01:02:03.456789Z",
+            "snapshot_id": "fins-observation-start-test",
+        }
+    )
 
 
 @pytest.mark.asyncio
