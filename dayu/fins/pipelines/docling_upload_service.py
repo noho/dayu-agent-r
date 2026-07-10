@@ -250,10 +250,21 @@ class DoclingUploadService:
             return _build_cancelled_result(document_id=document_id, internal_document_id=internal_document_id)
         stored_entries: list[JsonObject] = []
         file_events: list[UploadFileEventPayload] = list(conversion_events)
-        handle = SourceHandle(
+        current_version = _resolve_document_version(previous_meta, source_fingerprint)
+        staging_meta = self._build_upsert_meta(
+            previous_meta=previous_meta,
+            source_fingerprint=source_fingerprint,
+            document_version=current_version,
+            base_meta=meta,
+        )
+        handle = self._acknowledge_source_before_blob_write(
             ticker=normalized_ticker,
+            source_kind=source_kind,
             document_id=document_id,
-            source_kind=source_kind.value,
+            internal_document_id=internal_document_id,
+            form_type=form_type,
+            previous_meta=previous_meta,
+            meta=staging_meta,
         )
         for asset in pending_assets:
             if _is_cancelled(cancellation_checker):
@@ -280,13 +291,6 @@ class DoclingUploadService:
         primary_document = _pick_primary_docling_file(stored_entries)
         if primary_document is None:
             raise RuntimeError("未生成 docling 主文件，无法写入 primary_document")
-        current_version = _resolve_document_version(previous_meta, source_fingerprint)
-        merged_meta = self._build_upsert_meta(
-            previous_meta=previous_meta,
-            source_fingerprint=source_fingerprint,
-            document_version=current_version,
-            base_meta=meta,
-        )
         upsert_mode = _resolve_upsert_mode(
             action=normalized_action,
             previous_meta=previous_meta,
@@ -301,7 +305,7 @@ class DoclingUploadService:
             form_type=form_type,
             primary_document=primary_document,
             file_entries=stored_entries,
-            meta=merged_meta,
+            meta=staging_meta,
         )
         Log.verbose(
             (
@@ -415,6 +419,59 @@ class DoclingUploadService:
                 document_id=document_id,
                 source_kind=source_kind.value,
             )
+        )
+
+    def _acknowledge_source_before_blob_write(
+        self,
+        *,
+        ticker: str,
+        source_kind: SourceKind,
+        document_id: str,
+        internal_document_id: str,
+        form_type: str,
+        previous_meta: JsonObject | None,
+        meta: JsonObject,
+    ) -> SourceHandle:
+        """在上传 blob 写入前确认 source repository 已承认该 source。
+
+        Args:
+            ticker: 已规范化股票代码。
+            source_kind: 文档来源类型。
+            document_id: 文档 ID。
+            internal_document_id: 内部文档 ID。
+            form_type: 文档 form type。
+            previous_meta: 旧 source meta；不存在或未完成时必须通过 staging 校验。
+            meta: 本次上传 source meta 事实。
+
+        Returns:
+            可用于 blob repository 的 source handle。
+
+        Raises:
+            FileExistsError: 既有 staging 与本次 source 稳定字段冲突时抛出。
+            KeyError: meta 缺少必需溯源字段时抛出。
+            ValueError: meta 溯源字段非法时抛出。
+            OSError: 仓储写入失败时抛出。
+        """
+
+        if previous_meta is None or not bool(previous_meta.get("ingest_complete", False)):
+            staging_meta = dict(meta)
+            staging_meta["ingest_complete"] = False
+            return self._source_repository.stage_source_document(
+                SourceDocumentUpsertRequest(
+                    ticker=ticker,
+                    document_id=document_id,
+                    internal_document_id=internal_document_id,
+                    form_type=form_type,
+                    primary_document=None,
+                    file_entries=[],
+                    meta=staging_meta,
+                ),
+                source_kind=source_kind,
+            )
+        return SourceHandle(
+            ticker=ticker,
+            document_id=document_id,
+            source_kind=source_kind.value,
         )
 
     def _build_original_assets(self, files: list[Path]) -> list[_PendingFileAsset]:

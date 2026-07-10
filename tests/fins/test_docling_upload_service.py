@@ -4,10 +4,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO, Optional
 
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.fins.domain.document_models import (
+    DocumentHandle,
+    FileObjectMeta,
+    ProcessedHandle,
+    SourceDocumentUpsertRequest,
+    SourceHandle,
+)
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.pipelines.docling_upload_service import (
     DoclingUploadService,
@@ -27,7 +35,7 @@ from dayu.fins.storage import (
     FsDocumentBlobRepository,
     FsSourceDocumentRepository,
 )
-from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
+from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 
 
 @dataclass(frozen=True)
@@ -37,6 +45,86 @@ class _UploadServiceContext:
     source_repository: FsSourceDocumentRepository
     blob_repository: FsDocumentBlobRepository
     service: DoclingUploadService
+
+
+class _SpyUploadSourceRepository(FsSourceDocumentRepository):
+    """记录上传 source staging 调用的仓储 spy。"""
+
+    def __init__(self, workspace_root: Path, repository_set: _FsRepositorySet, events: list[str]) -> None:
+        """初始化 source 仓储 spy。"""
+
+        super().__init__(workspace_root, repository_set=repository_set)
+        self._events = events
+
+    def stage_source_document(
+        self,
+        req: SourceDocumentUpsertRequest,
+        source_kind: SourceKind,
+    ) -> SourceHandle:
+        """记录 staging 后转发到真实仓储。"""
+
+        self._events.append("stage")
+        return super().stage_source_document(req, source_kind)
+
+
+class _FailingFinalUploadSourceRepository(_SpyUploadSourceRepository):
+    """在 final create 阶段失败的 source 仓储 spy。"""
+
+    def create_source_document(
+        self,
+        req: SourceDocumentUpsertRequest,
+        source_kind: SourceKind,
+    ) -> DocumentHandle:
+        """模拟 staging 后 final source commit 失败。"""
+
+        del req, source_kind
+        self._events.append("create_failed")
+        raise RuntimeError("forced final upsert failure")
+
+
+class _StagingAwareUploadBlobRepository(FsDocumentBlobRepository):
+    """记录 blob 写入时 source meta 是否已被 staging 承认。"""
+
+    def __init__(
+        self,
+        workspace_root: Path,
+        repository_set: _FsRepositorySet,
+        source_repository: FsSourceDocumentRepository,
+        events: list[str],
+    ) -> None:
+        """初始化 blob 仓储 spy。"""
+
+        super().__init__(workspace_root, repository_set=repository_set)
+        self._source_repository = source_repository
+        self._events = events
+        self.observed_ingest_complete: list[bool] = []
+
+    def store_file(
+        self,
+        handle: SourceHandle | ProcessedHandle,
+        filename: str,
+        data: BinaryIO,
+        *,
+        content_type: Optional[str] = None,
+        metadata: Optional[dict[str, str]] = None,
+    ) -> FileObjectMeta:
+        """记录 source meta 承认事实后转发真实 blob 写入。"""
+
+        if isinstance(handle, SourceHandle):
+            meta = self._source_repository.get_source_meta(
+                handle.ticker,
+                handle.document_id,
+                SourceKind(handle.source_kind),
+            )
+            self.observed_ingest_complete.append(bool(meta.get("ingest_complete", False)))
+        self._events.append(f"store:{filename}")
+        return super().store_file(
+            handle,
+            filename,
+            data,
+            content_type=content_type,
+            metadata=metadata,
+        )
 
 
 def _convert_docling_stub(raw_data: bytes, stream_name: str) -> dict[str, JsonValue]:
@@ -122,6 +210,78 @@ def test_execute_upload_create_material_success(tmp_path: Path) -> None:
     assert str(meta["primary_document"]).endswith("_docling.json")
     assert meta["source_provider"] == "user_upload"
     assert len(meta["files"]) == 2
+
+
+def test_execute_upload_stages_source_before_first_blob_write(tmp_path: Path) -> None:
+    """上传 create 首个 blob 写入前必须先创建 incomplete source meta。"""
+
+    events: list[str] = []
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source_repository = _SpyUploadSourceRepository(tmp_path, repository_set, events)
+    blob_repository = _StagingAwareUploadBlobRepository(tmp_path, repository_set, source_repository, events)
+    service = DoclingUploadService(
+        source_repository=source_repository,
+        blob_repository=blob_repository,
+        convert_with_docling=_convert_docling_stub,
+    )
+    sample_file = tmp_path / "deck.pdf"
+    sample_file.write_text("hello", encoding="utf-8")
+
+    result = service.execute_upload(
+        ticker="AAPL",
+        source_kind=SourceKind.MATERIAL,
+        action="create",
+        document_id="mat_staged",
+        internal_document_id="mat_staged",
+        form_type="MATERIAL_OTHER",
+        files=[sample_file],
+        overwrite=False,
+        meta={"material_name": "Deck", "ingest_method": "upload"},
+    )
+    meta = source_repository.get_source_meta("AAPL", "mat_staged", SourceKind.MATERIAL)
+
+    assert result.status == "uploaded"
+    assert events[0] == "stage"
+    assert events[1].startswith("store:")
+    assert blob_repository.observed_ingest_complete == [False, False]
+    assert meta["ingest_complete"] is True
+
+
+def test_execute_upload_final_upsert_failure_keeps_acknowledged_staging(tmp_path: Path) -> None:
+    """final upsert 失败时允许留下 incomplete source meta，但 blob 不得 ownerless。"""
+
+    events: list[str] = []
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source_repository = _FailingFinalUploadSourceRepository(tmp_path, repository_set, events)
+    blob_repository = _StagingAwareUploadBlobRepository(tmp_path, repository_set, source_repository, events)
+    service = DoclingUploadService(
+        source_repository=source_repository,
+        blob_repository=blob_repository,
+        convert_with_docling=_convert_docling_stub,
+    )
+    sample_file = tmp_path / "deck.pdf"
+    sample_file.write_text("hello", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="forced final upsert failure"):
+        service.execute_upload(
+            ticker="AAPL",
+            source_kind=SourceKind.MATERIAL,
+            action="create",
+            document_id="mat_failed",
+            internal_document_id="mat_failed",
+            form_type="MATERIAL_OTHER",
+            files=[sample_file],
+            overwrite=False,
+            meta={"material_name": "Deck", "ingest_method": "upload"},
+        )
+    meta = source_repository.get_source_meta("AAPL", "mat_failed", SourceKind.MATERIAL)
+    handle = SourceHandle(ticker="AAPL", document_id="mat_failed", source_kind=SourceKind.MATERIAL.value)
+
+    assert events[0] == "stage"
+    assert events[-1] == "create_failed"
+    assert blob_repository.observed_ingest_complete == [False, False]
+    assert meta["ingest_complete"] is False
+    assert {entry.name for entry in blob_repository.list_entries(handle)} == {"deck.pdf", "deck_docling.json", "meta.json"}
 
 
 def test_execute_upload_skips_when_source_fingerprint_matches(tmp_path: Path) -> None:

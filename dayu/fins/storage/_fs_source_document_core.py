@@ -762,13 +762,28 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         meta_path = document_dir / _SOURCE_META_FILENAME
 
         meta_exists = meta_path.exists()
+        existing_staging_meta: DocumentMeta | None = None
         if is_create and meta_exists:
-            raise FileExistsError(f"文档已存在: {meta_path}")
+            existing_meta = _read_json_object(meta_path)
+            existing_provenance = SourceDocumentProvenance.from_meta(existing_meta, source_kind)
+            if existing_provenance.ingest_complete:
+                raise FileExistsError(f"文档已存在: {meta_path}")
+            existing_staging_meta = existing_meta
         if not is_create and not meta_exists:
             raise FileNotFoundError(f"文档不存在: {meta_path}")
 
         document_dir.mkdir(parents=True, exist_ok=True)
         previous_meta = _read_json_object(meta_path) if meta_path.exists() else {}
+        if not is_create and previous_meta.get("ingest_complete") is False:
+            previous_provenance = SourceDocumentProvenance.from_meta(previous_meta, source_kind)
+            if not previous_provenance.ingest_complete:
+                existing_staging_meta = previous_meta
+        if existing_staging_meta is not None and not _staging_completion_stable_fields_match(
+            existing_meta=existing_staging_meta,
+            req=req,
+            ticker=ticker,
+        ):
+            raise FileExistsError(f"staging source meta 稳定字段冲突: {meta_path}")
 
         previous_files = _extract_file_payloads(previous_meta)
         if req.file_entries is not None:
@@ -1060,6 +1075,50 @@ def _staging_stable_fields_match(
         if not existing_has_value and not requested_has_value:
             continue
         if existing_has_value != requested_has_value:
+            return False
+        if existing_value != requested_value:
+            return False
+    return True
+
+
+def _staging_completion_stable_fields_match(
+    *,
+    existing_meta: DocumentMeta,
+    req: SourceDocumentUpsertRequest,
+    ticker: str,
+) -> bool:
+    """判断 final commit 是否延续既有 staging 已声明的 source 稳定事实。
+
+    completion 阶段允许补充 staging 时尚不可知的稳定字段，例如 CN/HK 在
+    Docling 转换后才得到的 ``source_fingerprint``；但不允许改变 staging
+    已经声明过的 provider、remote fingerprint 或 company id 等事实。
+
+    Args:
+        existing_meta: 已落盘的 staging source meta。
+        req: 本次 final commit 请求。
+        ticker: 已规范化的 ticker。
+
+    Returns:
+        已声明稳定字段一致时返回 ``True``，否则返回 ``False``。
+
+    Raises:
+        无。
+    """
+
+    if str(existing_meta.get("ticker", "")).strip() != ticker:
+        return False
+    if str(existing_meta.get("document_id", "")).strip() != req.document_id:
+        return False
+    if str(existing_meta.get("internal_document_id", "")).strip() != req.internal_document_id:
+        return False
+    for field_name in _STAGING_STABLE_META_FIELDS:
+        existing_value = existing_meta.get(field_name)
+        existing_has_value = existing_value is not None and existing_value != ""
+        if not existing_has_value:
+            continue
+        requested_value = req.meta.get(field_name)
+        requested_has_value = requested_value is not None and requested_value != ""
+        if not requested_has_value:
             return False
         if existing_value != requested_value:
             return False

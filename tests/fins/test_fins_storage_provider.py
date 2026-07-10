@@ -54,6 +54,7 @@ from dayu.fins.domain.document_models import (
     DocumentMeta,
     FinsSourceProvider,
     SourceDocumentUpsertRequest,
+    SourceHandle,
     now_iso8601,
 )
 from dayu.fins.domain.enums import SourceKind
@@ -897,6 +898,104 @@ def test_stage_source_document_requires_existing_stable_fields_on_retry(tmp_path
         source_repository.stage_source_document(omitted_fingerprint_request, SourceKind.FILING)
 
 
+def test_stage_source_document_lifecycle_and_blob_acknowledgement(tmp_path: Path) -> None:
+    """source staging 是 SourceHandle blob 写入的唯一前置承认事实。"""
+
+    workspace_root = tmp_path / "fins-staging-ack-workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    request = SourceDocumentUpsertRequest(
+        ticker="AAPL",
+        document_id="fil_ack",
+        internal_document_id="fil_ack",
+        form_type="10-K",
+        meta={
+            "ingest_method": "download",
+            "source_provider": "sec_edgar",
+            "source_fingerprint": "fingerprint-v1",
+            "company_id": "0000320193",
+            "ingest_complete": False,
+        },
+    )
+    missing_handle = SourceHandle(ticker="AAPL", document_id="fil_missing", source_kind=SourceKind.FILING.value)
+
+    with pytest.raises(FileNotFoundError):
+        blob_repository.store_file(missing_handle, "orphan.htm", io.BytesIO(b"orphan"))
+    assert blob_repository.list_entries(missing_handle) == []
+
+    first_handle = source_repository.stage_source_document(request, SourceKind.FILING)
+    matching_handle = source_repository.stage_source_document(request, SourceKind.FILING)
+    staged_meta = source_repository.get_source_meta("AAPL", "fil_ack", SourceKind.FILING)
+    file_meta = blob_repository.store_file(first_handle, "filing.htm", io.BytesIO(b"payload"))
+
+    assert first_handle == SourceHandle(ticker="AAPL", document_id="fil_ack", source_kind=SourceKind.FILING.value)
+    assert matching_handle == first_handle
+    assert staged_meta["ingest_complete"] is False
+    assert staged_meta["files"] == []
+    assert blob_repository.read_file_bytes(first_handle, "filing.htm") == b"payload"
+    with pytest.raises(FileExistsError, match="稳定字段冲突"):
+        source_repository.create_source_document(
+            SourceDocumentUpsertRequest(
+                ticker="AAPL",
+                document_id="fil_ack",
+                internal_document_id="fil_ack",
+                form_type="10-K",
+                primary_document="filing.htm",
+                file_entries=[
+                    {
+                        "name": "filing.htm",
+                        "uri": file_meta.uri,
+                        "size": file_meta.size,
+                        "content_type": file_meta.content_type,
+                        "sha256": file_meta.sha256,
+                    }
+                ],
+                meta={
+                    "ingest_method": "download",
+                    "source_provider": "sec_edgar",
+                    "source_fingerprint": "fingerprint-v2",
+                    "company_id": "0000320193",
+                    "ingest_complete": True,
+                },
+            ),
+            SourceKind.FILING,
+        )
+
+    source_repository.create_source_document(
+        SourceDocumentUpsertRequest(
+            ticker="AAPL",
+            document_id="fil_ack",
+            internal_document_id="fil_ack",
+            form_type="10-K",
+            primary_document="filing.htm",
+            file_entries=[
+                {
+                    "name": "filing.htm",
+                    "uri": file_meta.uri,
+                    "size": file_meta.size,
+                    "content_type": file_meta.content_type,
+                    "sha256": file_meta.sha256,
+                }
+            ],
+            meta={
+                "ingest_method": "download",
+                "source_provider": "sec_edgar",
+                "source_fingerprint": "fingerprint-v1",
+                "company_id": "0000320193",
+                "ingest_complete": True,
+            },
+        ),
+        SourceKind.FILING,
+    )
+    completed_meta = source_repository.get_source_meta("AAPL", "fil_ack", SourceKind.FILING)
+
+    assert completed_meta["ingest_complete"] is True
+    assert completed_meta["files"][0]["name"] == "filing.htm"
+    with pytest.raises(FileExistsError, match="完成态"):
+        source_repository.stage_source_document(request, SourceKind.FILING)
+
+
 def test_read_runtime_citation_projects_provider_owned_source_types(tmp_path: Path) -> None:
     """read runtime citation 应只从 repository provenance 投影来源分类。"""
 
@@ -957,7 +1056,9 @@ def test_read_runtime_citation_rejects_incomplete_source_meta(tmp_path: Path) ->
     """read runtime citation 不得投影未完成 staging source meta。"""
 
     runtime = _build_read_runtime_with_provenance_documents(tmp_path)
+    documents = runtime._collect_source_documents_by_kind("AAPL", SourceKind.FILING)
 
+    assert "fil_incomplete" not in {str(item["document_id"]) for item in documents}
     with pytest.raises(FileNotFoundError, match="尚未完成入库"):
         runtime._build_citation(ticker="AAPL", document_id="fil_incomplete")
 

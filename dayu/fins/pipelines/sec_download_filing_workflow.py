@@ -21,7 +21,10 @@ from dayu.fins.downloaders.sec_downloader import (
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.pipelines.sec_6k_primary_document_repair import reconcile_active_6k_primary_document
 from dayu.fins.pipelines.sec_download_event_mapping import DownloadFileResult, build_download_file_event_payload
-from dayu.fins.pipelines.sec_download_source_upsert import upsert_downloaded_filing_source_document
+from dayu.fins.pipelines.sec_download_source_upsert import (
+    stage_downloaded_filing_source_document,
+    upsert_downloaded_filing_source_document,
+)
 from dayu.fins.pipelines.sec_filing_collection import FilingRecord
 from dayu.fins.storage import SourceDocumentRepositoryProtocol
 from dayu.fins._log import Log
@@ -406,13 +409,20 @@ async def run_download_single_filing_stream(
             return
         preferred_primary = selected_name
 
-    source_handle = SourceHandle(
-        ticker=ticker,
-        document_id=document_id,
-        source_kind=SourceKind.FILING.value,
-    )
     existing_files = index_file_entries(previous_meta)
     file_results: list[DownloadFileResult] = []
+    source_handle = stage_downloaded_filing_source_document(
+        ticker=ticker,
+        cik=cik,
+        document_id=document_id,
+        internal_document_id=internal_document_id,
+        filing=filing,
+        previous_meta=previous_meta,
+        source_fingerprint=source_fingerprint,
+        download_version=download_version,
+        source_repository=host._source_repository,
+        resolve_document_version=host._resolve_document_version,
+    )
     download_stream_func = getattr(host._downloader, "download_files_stream", None)
     if callable(download_stream_func):
         download_stream = cast(

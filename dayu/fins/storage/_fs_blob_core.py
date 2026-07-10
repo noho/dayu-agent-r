@@ -134,12 +134,15 @@ class _FsBlobMixin(_FsStorageInfra):
 
         Raises:
             FileNotFoundError: 句柄对应文档不存在时抛出。
+            ValueError: 文件名为空时抛出。
             OSError: 写入失败时抛出。
         """
 
         normalized_filename = str(filename).strip()
         if not normalized_filename:
             raise ValueError("filename 不能为空")
+        if isinstance(handle, SourceHandle):
+            self._get_handle_meta(handle)
         normalized_ticker = _normalize_ticker(handle.ticker)
         key = self._build_store_key(handle, normalized_filename)
         file_store = self._build_file_store(normalized_ticker)

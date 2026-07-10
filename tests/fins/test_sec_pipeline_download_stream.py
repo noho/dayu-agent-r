@@ -10,12 +10,21 @@ from io import BytesIO
 from pathlib import Path
 from typing import BinaryIO, Optional, cast
 
-from dayu.fins.domain.document_models import FileObjectMeta
+from dayu.fins.domain.document_models import (
+    FinsIngestMethod,
+    FinsSourceProvider,
+    FileObjectMeta,
+    ProcessedHandle,
+    SourceDocumentUpsertRequest,
+    SourceHandle,
+)
+from dayu.fins.domain.enums import SourceKind
 from dayu.fins.downloaders.sec_downloader import (
     DownloaderEvent,
     RemoteFileDescriptor,
     SecDownloadCancelledError,
     SecDownloader,
+    build_source_fingerprint,
 )
 from dayu.fins.ingestion_runtime import FinsDownloadProgressEvent
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
@@ -27,6 +36,8 @@ from dayu.fins.pipelines.sec_pipeline import (
 )
 from dayu.fins.processors.registry import build_fins_processor_registry
 from dayu.fins.storage.fs_source_document_repository import FsSourceDocumentRepository
+from dayu.fins.storage import FsDocumentBlobRepository
+from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 
 
 def _event_pipeline_result(event: DownloadEvent) -> SecPipelineDownloadResult:
@@ -300,6 +311,154 @@ class StreamXbrlStubDownloader(StreamStubDownloader):
             )
 
 
+class FailingStreamStubDownloader(StreamStubDownloader):
+    """下载文件失败且不调用 store_file 的下载器桩。"""
+
+    async def download_files_stream(
+        self,
+        remote_files: list[RemoteFileDescriptor],
+        overwrite: bool,
+        store_file: Callable[[str, BinaryIO], FileObjectMeta],
+        existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
+        primary_document: Optional[str] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> AsyncIterator[DownloaderEvent]:
+        """输出失败事件，不写入 blob。"""
+
+        del overwrite, store_file, existing_files, primary_document, cancellation_checker
+        descriptor = remote_files[0]
+        yield DownloaderEvent(
+            event_type="file_download_started",
+            name=descriptor.name,
+            source_url=descriptor.source_url,
+            http_etag=descriptor.http_etag,
+            http_last_modified=descriptor.http_last_modified,
+            http_status=descriptor.http_status,
+        )
+        yield DownloaderEvent(
+            event_type="file_failed",
+            name=descriptor.name,
+            source_url=descriptor.source_url,
+            http_etag=descriptor.http_etag,
+            http_last_modified=descriptor.http_last_modified,
+            http_status=descriptor.http_status,
+            reason_code="download_error",
+            reason_message="forced download failure",
+            error="forced download failure",
+        )
+
+
+class LegacyDownloadOnlyStubDownloader:
+    """只提供 legacy download_files 聚合接口的下载器桩。"""
+
+    def __init__(self) -> None:
+        """初始化 legacy 下载器桩。"""
+
+        self.configure_called = False
+
+    def configure(self, user_agent: Optional[str], sleep_seconds: float, max_retries: int) -> None:
+        """记录配置调用。"""
+
+        del user_agent, sleep_seconds, max_retries
+        self.configure_called = True
+
+    def normalize_ticker(self, ticker: str) -> str:
+        """标准化 ticker。"""
+
+        return ticker.strip().upper()
+
+    async def resolve_company(
+        self,
+        ticker: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> tuple[str, str, str]:
+        """返回固定公司信息。"""
+
+        del ticker, cancellation_checker
+        return ("320193", "Apple Inc.", "0000320193")
+
+    async def fetch_submissions(
+        self,
+        cik10: str,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> dict[str, JsonValue]:
+        """返回固定 submissions。"""
+
+        del cik10, cancellation_checker
+        return {
+            "filings": {
+                "recent": {
+                    "form": ["10-K"],
+                    "filingDate": ["2025-02-01"],
+                    "reportDate": ["2024-12-31"],
+                    "accessionNumber": ["0000000000-25-000001"],
+                    "primaryDocument": ["sample-10k.htm"],
+                },
+                "files": [],
+            }
+        }
+
+    async def list_filing_files(
+        self,
+        cik: str,
+        accession_no_dash: str,
+        primary_document: str,
+        form_type: str,
+        include_xbrl: bool = True,
+        include_exhibits: bool = True,
+        include_http_metadata: bool = True,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> list[RemoteFileDescriptor]:
+        """返回固定远端文件列表。"""
+
+        del (
+            cik,
+            accession_no_dash,
+            primary_document,
+            form_type,
+            include_xbrl,
+            include_exhibits,
+            include_http_metadata,
+            cancellation_checker,
+        )
+        return [
+            RemoteFileDescriptor(
+                name="sample-10k.htm",
+                source_url="https://example.com/sample-10k.htm",
+                http_etag="etag-v1",
+                http_last_modified="Mon, 01 Jan 2025 00:00:00 GMT",
+                remote_size=100,
+                http_status=200,
+            )
+        ]
+
+    async def download_files(
+        self,
+        remote_files: list[RemoteFileDescriptor],
+        overwrite: bool,
+        store_file: Callable[[str, BinaryIO], FileObjectMeta],
+        existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
+        primary_document: Optional[str] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> list[dict[str, JsonValue | FileObjectMeta]]:
+        """通过 legacy 聚合接口写入单文件并返回结果。"""
+
+        del overwrite, existing_files, primary_document, cancellation_checker
+        descriptor = remote_files[0]
+        file_meta = store_file(descriptor.name, BytesIO(b"legacy-payload"))
+        return [
+            {
+                "name": descriptor.name,
+                "status": "downloaded",
+                "file_meta": file_meta,
+                "source_url": descriptor.source_url,
+                "http_etag": descriptor.http_etag,
+                "http_last_modified": descriptor.http_last_modified,
+                "http_status": descriptor.http_status,
+            }
+        ]
+
+
 class CancelAwareCollectionDownloader(StreamStubDownloader):
     """用于验证 collection 阶段取消传播的下载器桩。"""
 
@@ -409,19 +568,83 @@ class CancelAwareCollectionDownloader(StreamStubDownloader):
 
 
 class _SpySourceRepository(FsSourceDocumentRepository):
-    """记录 has_filing_xbrl_instance 调用的源文档仓储 spy。"""
+    """记录 SEC source repository 调用的源文档仓储 spy。"""
 
-    def __init__(self, workspace_root: Path) -> None:
+    def __init__(
+        self,
+        workspace_root: Path,
+        repository_set: _FsRepositorySet | None = None,
+        events: list[str] | None = None,
+    ) -> None:
         """初始化 spy。"""
 
-        super().__init__(workspace_root)
+        super().__init__(workspace_root, repository_set=repository_set)
         self.has_filing_xbrl_instance_calls: list[tuple[str, str]] = []
+        self.stage_calls = 0
+        self._events = events
 
     def has_filing_xbrl_instance(self, ticker: str, document_id: str) -> bool:
         """记录调用后转发到真实实现。"""
 
         self.has_filing_xbrl_instance_calls.append((ticker, document_id))
         return super().has_filing_xbrl_instance(ticker, document_id)
+
+    def stage_source_document(
+        self,
+        req: SourceDocumentUpsertRequest,
+        source_kind: SourceKind,
+    ) -> SourceHandle:
+        """记录 staging 调用后转发到真实实现。"""
+
+        self.stage_calls += 1
+        if self._events is not None:
+            self._events.append("stage")
+        return super().stage_source_document(req, source_kind)
+
+
+class _StagingAwareSecBlobRepository(FsDocumentBlobRepository):
+    """记录 SEC blob 写入前 source meta 是否已被 staging 承认。"""
+
+    def __init__(
+        self,
+        workspace_root: Path,
+        repository_set: _FsRepositorySet,
+        source_repository: FsSourceDocumentRepository,
+        events: list[str],
+    ) -> None:
+        """初始化 SEC blob 仓储 spy。"""
+
+        super().__init__(workspace_root, repository_set=repository_set)
+        self._source_repository = source_repository
+        self._events = events
+        self.observed_ingest_complete: list[bool] = []
+
+    def store_file(
+        self,
+        handle: SourceHandle | ProcessedHandle,
+        filename: str,
+        data: BinaryIO,
+        *,
+        content_type: Optional[str] = None,
+        metadata: Optional[dict[str, str]] = None,
+    ) -> FileObjectMeta:
+        """记录 source meta 承认事实后转发真实 blob 写入。"""
+
+        if isinstance(handle, SourceHandle):
+            meta = self._source_repository.get_source_meta(
+                handle.ticker,
+                handle.document_id,
+                SourceKind(handle.source_kind),
+            )
+            self.observed_ingest_complete.append(bool(meta.get("ingest_complete", False)))
+        self._events.append(f"store:{filename}")
+        return super().store_file(
+            handle,
+            filename,
+            data,
+            content_type=content_type,
+            metadata=metadata,
+        )
 
 
 async def _collect_events(
@@ -481,6 +704,134 @@ def test_download_stream_emits_ordered_events(tmp_path: Path) -> None:
     assert event_types[-1] == "pipeline_completed"
     final_result = _event_pipeline_result(events[-1])
     assert final_result["summary"]["downloaded"] == 1
+
+
+def test_download_stream_stages_source_before_blob_write(tmp_path: Path) -> None:
+    """SEC stream 下载路径在 downloader store_file 回调前必须完成 source staging。"""
+
+    events_log: list[str] = []
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source_repository = _SpySourceRepository(tmp_path, repository_set, events_log)
+    blob_repository = _StagingAwareSecBlobRepository(tmp_path, repository_set, source_repository, events_log)
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=StreamStubDownloader(),
+        source_repository=source_repository,
+        blob_repository=blob_repository,
+        processor_registry=build_fins_processor_registry(),
+    )
+    import asyncio
+
+    events = asyncio.run(_collect_events(pipeline, ticker="AAPL"))
+    final_result = _event_pipeline_result(events[-1])
+    meta = source_repository.get_source_meta("AAPL", "fil_0000000000-25-000001", SourceKind.FILING)
+
+    assert final_result["summary"]["downloaded"] == 1
+    assert events_log[0] == "stage"
+    assert events_log[1] == "store:sample-10k.htm"
+    assert blob_repository.observed_ingest_complete == [False]
+    assert meta["ingest_complete"] is True
+
+
+def test_download_legacy_path_stages_source_before_blob_write(tmp_path: Path) -> None:
+    """SEC legacy download_files 路径在 store_file 回调前必须完成 source staging。"""
+
+    events_log: list[str] = []
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source_repository = _SpySourceRepository(tmp_path, repository_set, events_log)
+    blob_repository = _StagingAwareSecBlobRepository(tmp_path, repository_set, source_repository, events_log)
+    legacy_downloader = LegacyDownloadOnlyStubDownloader()
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=cast(SecDownloader, legacy_downloader),
+        source_repository=source_repository,
+        blob_repository=blob_repository,
+        processor_registry=build_fins_processor_registry(),
+    )
+    import asyncio
+
+    events = asyncio.run(_collect_events(pipeline, ticker="AAPL"))
+    final_result = _event_pipeline_result(events[-1])
+    meta = source_repository.get_source_meta("AAPL", "fil_0000000000-25-000001", SourceKind.FILING)
+
+    assert final_result["summary"]["downloaded"] == 1
+    assert events_log[0] == "stage"
+    assert events_log[1] == "store:sample-10k.htm"
+    assert blob_repository.observed_ingest_complete == [False]
+    assert meta["ingest_complete"] is True
+
+
+def test_failed_sec_download_leaves_incomplete_staging_and_retry_completes(tmp_path: Path) -> None:
+    """失败下载不产生完成态 source；重试复用匹配 staging 并完成同一 source。"""
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source_repository = _SpySourceRepository(tmp_path, repository_set)
+    blob_repository = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    document_id = "fil_0000000000-25-000001"
+    remote_file = RemoteFileDescriptor(
+        name="sample-10k.htm",
+        source_url="https://example.com/sample-10k.htm",
+        http_etag="etag-v1",
+        http_last_modified="Mon, 01 Jan 2025 00:00:00 GMT",
+        remote_size=100,
+        http_status=200,
+    )
+    failing_pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=FailingStreamStubDownloader(),
+        source_repository=source_repository,
+        blob_repository=blob_repository,
+        processor_registry=build_fins_processor_registry(),
+    )
+    import asyncio
+
+    failed_events = asyncio.run(_collect_events(failing_pipeline, ticker="AAPL"))
+    failed_result = _event_pipeline_result(failed_events[-1])
+    failed_handle = SourceHandle(ticker="AAPL", document_id=document_id, source_kind=SourceKind.FILING.value)
+    try:
+        failed_meta = source_repository.get_source_meta("AAPL", document_id, SourceKind.FILING)
+    except FileNotFoundError:
+        failed_meta = None
+
+    assert failed_result["summary"]["failed"] == 1
+    assert failed_meta is None or failed_meta["ingest_complete"] is False
+    assert {entry.name for entry in blob_repository.list_entries(failed_handle)} <= {"meta.json"}
+    assert source_repository.stage_calls == 1
+    if failed_meta is None:
+        source_repository.stage_source_document(
+            SourceDocumentUpsertRequest(
+                ticker="AAPL",
+                document_id=document_id,
+                internal_document_id="0000000000-25-000001",
+                form_type="10-K",
+                meta={
+                    "ingest_method": FinsIngestMethod.DOWNLOAD.to_storage_value(),
+                    "source_provider": FinsSourceProvider.SEC_EDGAR.to_storage_value(),
+                    "source_fingerprint": build_source_fingerprint([remote_file]),
+                    "company_id": "320193",
+                    "download_version": SEC_PIPELINE_DOWNLOAD_VERSION,
+                    "ingest_complete": False,
+                },
+            ),
+            SourceKind.FILING,
+        )
+    stage_calls_before_retry = source_repository.stage_calls
+
+    retry_pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=StreamStubDownloader(),
+        source_repository=source_repository,
+        blob_repository=blob_repository,
+        processor_registry=build_fins_processor_registry(),
+    )
+    retry_events = asyncio.run(_collect_events(retry_pipeline, ticker="AAPL"))
+    retry_result = _event_pipeline_result(retry_events[-1])
+    completed_meta = source_repository.get_source_meta("AAPL", document_id, SourceKind.FILING)
+
+    assert retry_result["summary"]["downloaded"] == 1
+    assert source_repository.stage_calls == stage_calls_before_retry + 1
+    assert completed_meta["ingest_complete"] is True
+    assert completed_meta["files"][0]["name"] == "sample-10k.htm"
 
 
 def test_download_stream_final_status_does_not_recheck_cancel_token(

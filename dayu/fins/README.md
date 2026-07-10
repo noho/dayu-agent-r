@@ -96,6 +96,8 @@ Fins 与其它层的稳定边界如下：
 
 source document meta 中的 `source_provider` 是来源提供方真源，当前支持 SEC EDGAR、巨潮资讯、港交所披露易与用户上传。`SourceDocumentRepositoryProtocol` 负责把 source meta 投影为 typed provenance；read runtime 的 citation 只消费该 provenance 来生成 LLM-facing `source_type` 与 `source_provider`。
 
+source document acknowledgement 由 source repository 持有：完成态 source meta 或 `stage_source_document(...)` 写入的 `ingest_complete=false` staging meta 都表示该 source 已被仓储承认。`DocumentBlobRepositoryProtocol.store_file(SourceHandle, ...)` 只能在 source meta 已存在后写入 blob；下载与上传 pipeline 在首次 blob 写入前必须通过 source repository staging 或既有完成态 meta 获得承认。
+
 ### Resolver
 
 `dayu.fins.resolver` 是公司信息等财报业务标识解析能力的 public subpackage。`dayu.fins` 包根不 re-export resolver 符号，调用方应显式导入子包。
@@ -442,6 +444,8 @@ Fins workspace 规则固定如下：
 ### Storage
 
 Storage 是财报文件系统的唯一访问边界。仓储协议按职责拆分为 company meta、source document、processed document、blob、filing maintenance 与 batching，避免把所有能力塞进单个宽仓储。文件系统实现通过 shared repository set 复用路径、锁和批处理事务语义。
+
+source repository 拥有 source document acknowledgement 与 provenance；blob repository 拥有最终文件写入边界，并在 `SourceHandle` 写入时拒绝未被 source repository 承认的 source。pipeline 可以请求 staging，但不能绕过 `stage_source_document(...)` 自行发明第二份 staging 真源。
 
 ### Processors
 

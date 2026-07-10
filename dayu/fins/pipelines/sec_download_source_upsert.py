@@ -12,6 +12,8 @@ from dayu.fins.domain.document_models import (
     FinsSourceProvider,
     FilingCreateRequest,
     FilingUpdateRequest,
+    SourceDocumentUpsertRequest,
+    SourceHandle,
     now_iso8601,
 )
 from dayu.fins.domain.enums import SourceKind
@@ -60,6 +62,79 @@ class DownloadedFilingRecord(Protocol):
         """
 
         ...
+
+
+def stage_downloaded_filing_source_document(
+    *,
+    ticker: str,
+    cik: str,
+    document_id: str,
+    internal_document_id: str,
+    filing: DownloadedFilingRecord,
+    previous_meta: Optional[dict[str, JsonValue]],
+    source_fingerprint: str,
+    download_version: str,
+    source_repository: SourceDocumentRepositoryProtocol,
+    resolve_document_version: Callable[[Optional[dict[str, JsonValue]], str], str],
+) -> SourceHandle:
+    """在 SEC blob 下载写入前创建或复用未完成 source meta。
+
+    Args:
+        ticker: 股票代码。
+        cik: 公司 CIK。
+        document_id: 文档 ID。
+        internal_document_id: 内部文档 ID。
+        filing: filing 记录。
+        previous_meta: 历史 filing source meta。
+        source_fingerprint: 当前远端文件指纹。
+        download_version: 当前下载链路版本号。
+        source_repository: source 仓储。
+        resolve_document_version: 文档版本计算函数。
+
+    Returns:
+        已被 source repository 承认的 source handle。
+
+    Raises:
+        FileExistsError: 既有完成态 meta 存在或 staging 稳定字段冲突时抛出。
+        KeyError: meta 缺少必需溯源字段时抛出。
+        ValueError: meta 溯源字段非法时抛出。
+        OSError: 仓储写入失败时抛出。
+    """
+
+    if previous_meta is not None and bool(previous_meta.get("ingest_complete", False)):
+        return SourceHandle(
+            ticker=ticker,
+            document_id=document_id,
+            source_kind=SourceKind.FILING.value,
+        )
+    document_version = resolve_document_version(previous_meta, source_fingerprint)
+    meta_payload = _build_downloaded_filing_meta_payload(
+        ticker=ticker,
+        cik=cik,
+        document_id=document_id,
+        internal_document_id=internal_document_id,
+        filing=filing,
+        previous_meta=previous_meta,
+        source_fingerprint=source_fingerprint,
+        download_version=download_version,
+        has_xbrl=False,
+        inferred_fiscal_year=None,
+        inferred_fiscal_period=None,
+        document_version=document_version,
+    )
+    meta_payload["ingest_complete"] = False
+    return source_repository.stage_source_document(
+        SourceDocumentUpsertRequest(
+            ticker=ticker,
+            document_id=document_id,
+            internal_document_id=internal_document_id,
+            form_type=filing.form_type,
+            primary_document=None,
+            file_entries=[],
+            meta=meta_payload,
+        ),
+        source_kind=SourceKind.FILING,
+    )
 
 
 def upsert_downloaded_filing_source_document(
