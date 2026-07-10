@@ -3199,6 +3199,7 @@ def promote_queued_run_row(
         current_attempt_id=current_attempt_id,
         updated_at=updated_at,
     )
+    status_clause, status_params = run_status_in_clause(START_BLOCKING_RUN_STATUSES)
     result = transaction.execute(
         f"""
         UPDATE {TABLE_HOST_RUNS}
@@ -3216,7 +3217,7 @@ def promote_queued_run_row(
             FROM {TABLE_HOST_RUNS} active_run
             WHERE active_run.session_id = ?
               AND active_run.run_id <> ?
-              AND active_run.status IN (?, ?, ?, ?, ?)
+              AND active_run.status {status_clause}
           )
         """,
         (
@@ -3230,11 +3231,7 @@ def promote_queued_run_row(
             serialize_run_status(RunStatus.QUEUED),
             session_id,
             run_id,
-            serialize_run_status(RunStatus.ACCEPTED),
-            serialize_run_status(RunStatus.RUNNING),
-            serialize_run_status(RunStatus.WAITING),
-            serialize_run_status(RunStatus.CANCELLING),
-            serialize_run_status(RunStatus.RECOVERING),
+            *status_params,
         ),
     )
     return _run_mutation_result(
@@ -3281,6 +3278,7 @@ def start_unstarted_run_row(
         current_attempt_id=current_attempt_id,
         updated_at=updated_at,
     )
+    status_clause, status_params = run_status_in_clause(START_BLOCKING_RUN_STATUSES)
     result = transaction.execute(
         f"""
         UPDATE {TABLE_HOST_RUNS}
@@ -3302,7 +3300,7 @@ def start_unstarted_run_row(
             FROM {TABLE_HOST_RUNS} active_run
             WHERE active_run.session_id = ?
               AND active_run.run_id <> ?
-              AND active_run.status IN (?, ?, ?, ?, ?)
+              AND active_run.status {status_clause}
           )
         """,
         (
@@ -3316,11 +3314,7 @@ def start_unstarted_run_row(
             serialize_run_status(expected_status),
             session_id,
             run_id,
-            serialize_run_status(RunStatus.ACCEPTED),
-            serialize_run_status(RunStatus.RUNNING),
-            serialize_run_status(RunStatus.WAITING),
-            serialize_run_status(RunStatus.CANCELLING),
-            serialize_run_status(RunStatus.RECOVERING),
+            *status_params,
         ),
     )
     return _run_mutation_result(
@@ -3750,6 +3744,7 @@ def resume_waiting_run_row(
         updated_at=updated_at,
     )
     _require_non_empty_text(suspended_attempt_id, field_name="suspended_attempt_id")
+    status_clause, status_params = run_status_in_clause(START_BLOCKING_RUN_STATUSES)
     result = transaction.execute(
         f"""
         UPDATE {TABLE_HOST_RUNS}
@@ -3769,7 +3764,7 @@ def resume_waiting_run_row(
             FROM {TABLE_HOST_RUNS} active_run
             WHERE active_run.session_id = ?
               AND active_run.run_id <> ?
-              AND active_run.status IN (?, ?, ?, ?, ?)
+              AND active_run.status {status_clause}
           )
         """,
         (
@@ -3784,11 +3779,7 @@ def resume_waiting_run_row(
             suspended_attempt_id,
             session_id,
             run_id,
-            serialize_run_status(RunStatus.ACCEPTED),
-            serialize_run_status(RunStatus.RUNNING),
-            serialize_run_status(RunStatus.WAITING),
-            serialize_run_status(RunStatus.CANCELLING),
-            serialize_run_status(RunStatus.RECOVERING),
+            *status_params,
         ),
     )
     return _run_mutation_result(
@@ -4029,6 +4020,7 @@ def start_recovering_run_row(
         updated_at=updated_at,
     )
     _require_non_empty_text(source_attempt_id, field_name="source_attempt_id")
+    status_clause, status_params = run_status_in_clause(START_BLOCKING_RUN_STATUSES)
     result = transaction.execute(
         f"""
         UPDATE {TABLE_HOST_RUNS}
@@ -4048,7 +4040,7 @@ def start_recovering_run_row(
             FROM {TABLE_HOST_RUNS} active_run
             WHERE active_run.session_id = ?
               AND active_run.run_id <> ?
-              AND active_run.status IN (?, ?, ?, ?, ?)
+              AND active_run.status {status_clause}
           )
         """,
         (
@@ -4063,11 +4055,7 @@ def start_recovering_run_row(
             source_attempt_id,
             session_id,
             run_id,
-            serialize_run_status(RunStatus.ACCEPTED),
-            serialize_run_status(RunStatus.RUNNING),
-            serialize_run_status(RunStatus.WAITING),
-            serialize_run_status(RunStatus.CANCELLING),
-            serialize_run_status(RunStatus.RECOVERING),
+            *status_params,
         ),
     )
     return _run_mutation_result(
@@ -6478,23 +6466,17 @@ def _read_active_run_id(transaction: HostTransaction, session_id: str) -> str | 
     :raises HostDurableError: row 字段无效时抛出。
     """
 
+    status_clause, status_params = run_status_in_clause(START_BLOCKING_RUN_STATUSES)
     row = transaction.fetchone(
         f"""
         SELECT run_id
         FROM {TABLE_HOST_RUNS}
         WHERE session_id = ?
-          AND status IN (?, ?, ?, ?, ?)
+          AND status {status_clause}
         ORDER BY accepted_event_sequence ASC, run_id ASC
         LIMIT 1
         """,
-        (
-            session_id,
-            serialize_run_status(RunStatus.ACCEPTED),
-            serialize_run_status(RunStatus.RUNNING),
-            serialize_run_status(RunStatus.WAITING),
-            serialize_run_status(RunStatus.CANCELLING),
-            serialize_run_status(RunStatus.RECOVERING),
-        ),
+        (session_id, *status_params),
     )
     if row is None:
         return None

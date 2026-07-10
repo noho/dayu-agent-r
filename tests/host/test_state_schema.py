@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import sqlite3
+from enum import StrEnum
 from pathlib import Path
 
 import pytest
 
 from dayu.host.api import AttemptStatus, RunStatus, SessionStatus
+from dayu.host.durable import state as state_module
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
 from dayu.host.durable._row_rules import (
     TERMINAL_ATTEMPT_STATUS_VALUES,
@@ -31,8 +33,10 @@ from dayu.host.durable.schema import (
 from dayu.host.durable.state import (
     DispatchRecordStatus,
     NON_TERMINAL_RUN_STATUSES,
+    RunMutationResult,
     RunStartReason,
     START_BLOCKING_RUN_STATUSES,
+    StateMutationStatus,
     TERMINAL_ATTEMPT_STATUSES,
     TERMINAL_RUN_STATUSES,
     WorkerKind,
@@ -44,10 +48,14 @@ from dayu.host.durable.state import (
     dispatch_record_row_from_host_row,
     is_terminal_attempt_status,
     is_terminal_run_status,
+    promote_queued_run_row,
     read_active_run_for_session,
     read_cancelling_runs,
     read_non_terminal_runs,
     read_non_terminal_runs_for_session,
+    read_run_by_id,
+    read_session_by_id,
+    resume_waiting_run_row,
     run_status_in_clause,
     run_row_from_host_row,
     serialize_attempt_status,
@@ -57,7 +65,10 @@ from dayu.host.durable.state import (
     serialize_session_status,
     serialized_run_status_values,
     serialize_worker_kind,
+    session_snapshot_from_rows,
     session_row_from_host_row,
+    start_recovering_run_row,
+    start_unstarted_run_row,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction
 
@@ -77,6 +88,15 @@ _STARTED_RUN_STATUSES = (
 )
 
 
+class _StartTransitionKind(StrEnum):
+    """测试覆盖的四类 start transition。"""
+
+    PROMOTE_QUEUED = "promote_queued"
+    START_UNSTARTED = "start_unstarted"
+    RESUME_WAITING = "resume_waiting"
+    START_RECOVERING = "start_recovering"
+
+
 def _options(
     tmp_path: Path,
     *,
@@ -94,6 +114,79 @@ def _options(
         payload_policy=PayloadStoragePolicy(artifact_root=tmp_path / "artifacts"),
         sqlite_policy=HostSQLiteStoragePolicy(busy_timeout_seconds=busy_timeout_seconds),
     )
+
+
+def _apply_start_transition(
+    transaction: HostTransaction,
+    *,
+    transition_kind: _StartTransitionKind,
+    session_id: str,
+    run_id: str,
+    source_status: RunStatus,
+    source_attempt_id: str,
+    next_attempt_id: str,
+    started_event_id: str,
+    started_event_sequence: int,
+) -> RunMutationResult:
+    """按指定类别执行一次底层 start transition。
+
+    :param transaction: Host transaction。
+    :param transition_kind: transition 类别。
+    :param session_id: Run 所属 Session id。
+    :param run_id: 目标 Run id。
+    :param source_status: 目标 Run 的源状态。
+    :param source_attempt_id: resume / recovery 的旧 Attempt id。
+    :param next_attempt_id: 新 Attempt id。
+    :param started_event_id: 新 ``RUN_STARTED`` event id。
+    :param started_event_sequence: 新 ``RUN_STARTED`` event sequence。
+    :returns: 底层 Run mutation 结果。
+    :raises AssertionError: ``transition_kind`` 不属于受测封闭集合时抛出。
+    """
+
+    if transition_kind is _StartTransitionKind.PROMOTE_QUEUED:
+        return promote_queued_run_row(
+            transaction,
+            session_id=session_id,
+            run_id=run_id,
+            started_event_id=started_event_id,
+            started_event_sequence=started_event_sequence,
+            current_attempt_id=next_attempt_id,
+            updated_at=_TIMESTAMP,
+        )
+    if transition_kind is _StartTransitionKind.START_UNSTARTED:
+        return start_unstarted_run_row(
+            transaction,
+            session_id=session_id,
+            run_id=run_id,
+            expected_status=source_status,
+            started_event_id=started_event_id,
+            started_event_sequence=started_event_sequence,
+            current_attempt_id=next_attempt_id,
+            updated_at=_TIMESTAMP,
+        )
+    if transition_kind is _StartTransitionKind.RESUME_WAITING:
+        return resume_waiting_run_row(
+            transaction,
+            session_id=session_id,
+            run_id=run_id,
+            suspended_attempt_id=source_attempt_id,
+            resumed_attempt_id=next_attempt_id,
+            started_event_id=started_event_id,
+            started_event_sequence=started_event_sequence,
+            updated_at=_TIMESTAMP,
+        )
+    if transition_kind is _StartTransitionKind.START_RECOVERING:
+        return start_recovering_run_row(
+            transaction,
+            session_id=session_id,
+            run_id=run_id,
+            source_attempt_id=source_attempt_id,
+            recovered_attempt_id=next_attempt_id,
+            started_event_id=started_event_id,
+            started_event_sequence=started_event_sequence,
+            updated_at=_TIMESTAMP,
+        )
+    raise AssertionError(f"unknown transition: {transition_kind}")
 
 
 def test_terminal_run_statuses_derive_from_row_rules() -> None:
@@ -415,6 +508,194 @@ def test_run_status_in_clause_matches_durable_read_queries(tmp_path: Path) -> No
             True,
             True,
             True,
+        )
+
+
+def test_session_snapshot_active_run_matches_owner_derived_public_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session snapshot 与公开 active read 动态消费同一个 owner status set。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest 属性替换夹具，用于精确替换 owner set。
+    :returns: ``None``。
+    :raises AssertionError: snapshot 与公开 read 不同源或 owner material 未生效时抛出。
+    """
+
+    owner_statuses = frozenset((RunStatus.QUEUED,))
+    monkeypatch.setattr(
+        state_module,
+        "START_BLOCKING_RUN_STATUSES",
+        owner_statuses,
+    )
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def seed(transaction: HostTransaction) -> None:
+            """写入只会被替换后 owner set 选中的 queued Run。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            :raises HostDurableError: 测试事实无法写入 durable store 时抛出。
+            """
+
+            _insert_session_tx(transaction, session_id="session-owner-read")
+            _insert_run_tx(
+                transaction,
+                run_id="run-owner-read-queued",
+                session_id="session-owner-read",
+                status=RunStatus.QUEUED,
+                client_request_id="request-owner-read-queued",
+            )
+
+        def verify(transaction: HostTransaction) -> tuple[str | None, str | None]:
+            """比较 public durable read 与 SessionSnapshot 投影结果。
+
+            :param transaction: Host transaction。
+            :returns: public read 与 snapshot 的 active Run id。
+            :raises AssertionError: Session row 缺失时抛出。
+            """
+
+            session = read_session_by_id(transaction, "session-owner-read")
+            assert session is not None
+            active = read_active_run_for_session(transaction, "session-owner-read")
+            snapshot = session_snapshot_from_rows(transaction, session, None)
+            return (
+                active.run_id if active is not None else None,
+                snapshot.active_run_id,
+            )
+
+        store.transaction_runner.run_write(seed)
+        assert serialized_run_status_values(owner_statuses) == (
+            serialize_run_status(RunStatus.QUEUED),
+        )
+        assert store.transaction_runner.run_read(verify) == (
+            "run-owner-read-queued",
+            "run-owner-read-queued",
+        )
+
+
+@pytest.mark.parametrize(
+    ("transition_kind", "target_status"),
+    (
+        (_StartTransitionKind.PROMOTE_QUEUED, RunStatus.QUEUED),
+        (_StartTransitionKind.START_UNSTARTED, RunStatus.ACCEPTED),
+        (_StartTransitionKind.RESUME_WAITING, RunStatus.WAITING),
+        (_StartTransitionKind.START_RECOVERING, RunStatus.RECOVERING),
+    ),
+)
+def test_start_transition_guards_derive_blocking_material_from_owner_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transition_kind: _StartTransitionKind,
+    target_status: RunStatus,
+) -> None:
+    """四条 start transition guard 从 owner set 派生阻塞参数并保持 happy path。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest 属性替换夹具，用于精确替换 owner set。
+    :param transition_kind: 本次验证的 transition 类别。
+    :param target_status: transition 目标 Run 的源状态。
+    :returns: ``None``。
+    :raises AssertionError: guard 未阻塞 owner status 或无冲突路径未成功时抛出。
+    """
+
+    owner_statuses = frozenset((RunStatus.QUEUED,))
+    monkeypatch.setattr(
+        state_module,
+        "START_BLOCKING_RUN_STATUSES",
+        owner_statuses,
+    )
+    session_id = f"session-owner-guard-{transition_kind.value}"
+    target_run_id = f"run-owner-guard-{transition_kind.value}"
+    blocker_run_id = f"run-owner-blocker-{transition_kind.value}"
+    started_event_id = f"event-owner-started-{transition_kind.value}"
+    source_attempt_id = f"attempt-owner-source-{transition_kind.value}"
+    next_attempt_id = f"attempt-owner-next-{transition_kind.value}"
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(
+            transaction: HostTransaction,
+        ) -> tuple[StateMutationStatus, StateMutationStatus, RunStatus | None]:
+            """先验证 owner blocker 触发 CAS_LOST，再删除 blocker 验证成功路径。
+
+            :param transaction: Host transaction。
+            :returns: 阻塞结果、无冲突结果与最终 Run 状态。
+            :raises AssertionError: transition 名称未知或 mutation row 缺失时抛出。
+            """
+
+            _insert_session_tx(transaction, session_id=session_id)
+            _insert_run_tx(
+                transaction,
+                run_id=target_run_id,
+                session_id=session_id,
+                status=target_status,
+                client_request_id=f"request-owner-target-{transition_kind.value}",
+            )
+            _insert_run_tx(
+                transaction,
+                run_id=blocker_run_id,
+                session_id=session_id,
+                status=RunStatus.QUEUED,
+                client_request_id=f"request-owner-blocker-{transition_kind.value}",
+            )
+            if target_status in (RunStatus.WAITING, RunStatus.RECOVERING):
+                transaction.execute(
+                    f"UPDATE {TABLE_HOST_RUNS} SET current_attempt_id = ? WHERE run_id = ?",
+                    (source_attempt_id, target_run_id),
+                )
+            started_event_sequence = _insert_event_tx(
+                transaction,
+                event_id=started_event_id,
+                session_id=session_id,
+                run_id=target_run_id,
+            )
+
+            blocked_result = _apply_start_transition(
+                transaction,
+                transition_kind=transition_kind,
+                session_id=session_id,
+                run_id=target_run_id,
+                source_status=target_status,
+                source_attempt_id=source_attempt_id,
+                next_attempt_id=next_attempt_id,
+                started_event_id=started_event_id,
+                started_event_sequence=started_event_sequence,
+            )
+
+            transaction.execute(
+                f"DELETE FROM {TABLE_HOST_RUNS} WHERE run_id = ?",
+                (blocker_run_id,),
+            )
+
+            updated_result = _apply_start_transition(
+                transaction,
+                transition_kind=transition_kind,
+                session_id=session_id,
+                run_id=target_run_id,
+                source_status=target_status,
+                source_attempt_id=source_attempt_id,
+                next_attempt_id=next_attempt_id,
+                started_event_id=started_event_id,
+                started_event_sequence=started_event_sequence,
+            )
+
+            final_row = read_run_by_id(transaction, target_run_id)
+            return (
+                blocked_result.status,
+                updated_result.status,
+                final_row.status if final_row is not None else None,
+            )
+
+        assert serialized_run_status_values(owner_statuses) == (
+            serialize_run_status(RunStatus.QUEUED),
+        )
+        assert store.transaction_runner.run_write(operation) == (
+            StateMutationStatus.CAS_LOST,
+            StateMutationStatus.UPDATED,
+            RunStatus.RUNNING,
         )
 
 
