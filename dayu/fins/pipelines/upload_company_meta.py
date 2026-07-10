@@ -1,7 +1,7 @@
 """上传场景公司元数据写入助手。
 
-本模块聚合 upload 相关的 company meta 写入逻辑，保持 OLD create/update
-场景的公司元数据解析与已存在 meta 优先规则。
+本模块聚合 upload 相关的 company meta 写入逻辑，以 upload resolver
+版本作为既有元数据 freshness 真源。
 """
 
 from __future__ import annotations
@@ -50,7 +50,10 @@ def upsert_company_meta_for_upload(
         return
 
     existing_meta = _load_existing_company_meta(repository=repository, ticker=ticker)
-    if existing_meta is not None:
+    if existing_meta is not None and _existing_company_meta_is_fresh(
+        existing_meta=existing_meta,
+        resolver_version=RESOLVER_VERSION,
+    ):
         _warn_ignored_company_meta_args(
             ticker=existing_meta.ticker,
             company_id=company_id,
@@ -170,6 +173,23 @@ def _normalize_ticker_aliases(
             continue
         normalized_aliases.append(normalized_alias)
     return normalized_aliases
+
+
+def _existing_company_meta_is_fresh(*, existing_meta: CompanyMeta, resolver_version: str) -> bool:
+    """判断既有 upload company meta 是否由当前 resolver 语义产生。
+
+    Args:
+        existing_meta: 仓储中已存在的公司元数据。
+        resolver_version: 当前 upload company identity resolver 版本。
+
+    Returns:
+        当既有元数据的 resolver 版本与当前版本一致时返回 ``True``。
+
+    Raises:
+        无。
+    """
+
+    return existing_meta.resolver_version == resolver_version
 
 
 def _warn_ignored_company_meta_args(

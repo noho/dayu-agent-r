@@ -10,6 +10,7 @@ import pytest
 
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.downloaders.hkexnews_downloader import HkexnewsDiscoveryClient
+from dayu.fins.domain.document_models import CompanyMeta, now_iso8601
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.pipelines.cn_download_models import (
     CnCompanyProfile,
@@ -19,6 +20,7 @@ from dayu.fins.pipelines.cn_download_models import (
 )
 from dayu.fins.pipelines.cn_pipeline import CnPipeline
 from dayu.fins.pipelines.download_events import DownloadEventType
+from dayu.fins.pipelines.upload_company_meta import RESOLVER_VERSION
 from dayu.fins.pipelines.upload_filing_events import UploadFilingEventType
 from dayu.fins.pipelines.upload_material_events import UploadMaterialEventType
 
@@ -245,6 +247,41 @@ def _convert_docling_stub(raw_data: bytes, stream_name: str) -> dict[str, JsonVa
     return {"name": stream_name, "format": "docling"}
 
 
+def _seed_cn_upload_company_meta(
+    *,
+    pipeline: CnPipeline,
+    company_name: str,
+    resolver_version: str,
+    ticker_aliases: list[str],
+) -> None:
+    """写入 CN upload 测试用公司元数据。
+
+    Args:
+        pipeline: CN pipeline 实例。
+        company_name: 公司名称。
+        resolver_version: 元数据 resolver 版本。
+        ticker_aliases: ticker alias 列表。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: 仓储写入失败时抛出。
+    """
+
+    pipeline._company_repository.upsert_company_meta(
+        CompanyMeta(
+            company_id="600519_CN",
+            company_name=company_name,
+            ticker="600519",
+            market="CN",
+            resolver_version=resolver_version,
+            updated_at=now_iso8601(),
+            ticker_aliases=ticker_aliases,
+        )
+    )
+
+
 def test_download_runs_cn_workflow_with_injected_discovery_client(tmp_path: Path) -> None:
     """同步 ``download`` wrapper 应调用真实 CN workflow 且不访问网络。
 
@@ -460,6 +497,56 @@ async def test_upload_filing_stream_uploads_files_with_docling(tmp_path: Path) -
     )
     assert str(meta["primary_document"]).endswith("_docling.json")
     assert meta["report_kind"] == "annual"
+
+
+@pytest.mark.asyncio
+async def test_upload_filing_stream_refreshes_stale_company_meta(tmp_path: Path) -> None:
+    """CN filing upload 遇到旧 resolver 版本公司元数据时应刷新。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 断言失败时抛出。
+    """
+
+    pipeline = CnPipeline(workspace_root=tmp_path)
+    pipeline._upload_service._convert_with_docling = _convert_docling_stub
+    _seed_cn_upload_company_meta(
+        pipeline=pipeline,
+        company_name="旧贵州茅台",
+        resolver_version="market_resolver_v0.9.0",
+        ticker_aliases=["600519", "OLD"],
+    )
+    filing_file = tmp_path / "annual.pdf"
+    filing_file.write_text("demo cn filing", encoding="utf-8")
+
+    events = [
+        event
+        async for event in pipeline.upload_filing_stream(
+            ticker="600519",
+            action="create",
+            files=[filing_file],
+            fiscal_year=2024,
+            fiscal_period="FY",
+            amended=False,
+            filing_date="2025-04-01",
+            report_date="2024-12-31",
+            company_name="贵州茅台",
+            ticker_aliases=["600519", "贵州茅台"],
+            overwrite=False,
+        )
+    ]
+
+    assert events[-1].event_type == UploadFilingEventType.UPLOAD_COMPLETED
+    company_meta = pipeline._company_repository.get_company_meta("600519")
+    assert company_meta.company_id == "600519_SSE"
+    assert company_meta.company_name == "贵州茅台"
+    assert company_meta.resolver_version == RESOLVER_VERSION
+    assert company_meta.ticker_aliases == ["600519", "贵州茅台"]
 
 
 @pytest.mark.asyncio

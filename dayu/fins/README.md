@@ -98,6 +98,8 @@ source document meta 中的 `source_provider` 是来源提供方真源，当前�
 
 source document acknowledgement 由 source repository 持有：完成态 source meta 或 `stage_source_document(...)` 写入的 `ingest_complete=false` staging meta 都表示该 source 已被仓储承认。`DocumentBlobRepositoryProtocol.store_file(SourceHandle, ...)` 只能在 source meta 已存在后写入 blob；下载与上传 pipeline 在首次 blob 写入前必须通过 source repository staging 或既有完成态 meta 获得承认。
 
+上传链路的 company meta freshness 由 `dayu.fins.pipelines.upload_company_meta` 持有：只有既有 meta 的 `resolver_version` 等于当前 upload resolver 版本时才可保留；版本不一致时必须用本次上传字段重新校验并写入。`updated_at` 仅是审计时间，不是 freshness TTL。SEC/CN/HK 下载链路仍由各自 producer 写入公司元数据，不经上传 freshness 逻辑；read runtime 只读取仓储中的 company meta，不刷新或推断 freshness。
+
 ### Resolver
 
 `dayu.fins.resolver` 是公司信息等财报业务标识解析能力的 public subpackage。`dayu.fins` 包根不 re-export resolver 符号，调用方应显式导入子包。
