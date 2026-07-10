@@ -4,11 +4,11 @@
 ``Content-Type: application/json`` 一次性返回完整 chat completion。
 本模块把该 JSON 响应归一为 :class:`RunnerEvent` 序列：
 
-- ``choices[0].message.content`` 与 ``reasoning_content`` 合并为
+- 唯一合法 ``choices`` 的 ``message.content`` 与 ``reasoning_content`` 合并为
   :class:`RunnerContentCompletedData`（无 tool_calls 时）。
   Gemini ``include_thoughts`` 协议下，``content`` 中的
   ``<thought>...</thought>`` 段会被剥离并并入 ``reasoning_content``。
-- ``choices[0].message.tool_calls`` 解析为
+- 唯一合法 ``choices`` 的 ``message.tool_calls`` 解析为
   :class:`RunnerToolCallsCompletedData`（含 ``provider_state`` 还原）；
   fatal tool call 协议错误（缺 id / 缺 name / 非合法 JSON 对象 args）→
   :class:`RunnerProtocolErrorData` + :class:`RunnerDoneData(ERROR)`。
@@ -44,7 +44,13 @@ from dayu.engine.runners.openai._types import (
     _OpenAIToolCallFunction,
     _ReasoningProtocolHook,
 )
+from dayu.engine.runners.openai._choice_policy import (
+    ChoicePolicyError,
+    validate_non_stream_choice,
+    validate_non_stream_content_terminal_finish,
+)
 from dayu.engine.runners.openai.diagnostic_payload import (
+    protocol_object_diagnostic_payload,
     provider_error_diagnostic_payload,
 )
 from dayu.engine.runners.openai.tool_call_aggregator import ToolCallAggregator
@@ -53,21 +59,12 @@ from dayu.engine.runners.openai.xml_tag_extractor import (
     StreamingXMLTagExtractor,
 )
 
-_FINISH_REASON_MAP: dict[str, FinishReason] = {
-    "stop": FinishReason.STOP,
-    "length": FinishReason.LENGTH,
-    "tool_calls": FinishReason.TOOL_CALLS,
-    "content_filter": FinishReason.CONTENT_FILTER,
-}
-
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 _ERROR_FIELD: str = "error"
 _ERROR_MESSAGE_FIELD: str = "message"
 _INVALID_UTF8_CODE: str = "invalid_utf8"
 _INVALID_JSON_CODE: str = "non_stream_invalid_json"
 _PAYLOAD_NOT_OBJECT_CODE: str = "non_stream_payload_not_object"
-_MISSING_CHOICES_CODE: str = "non_stream_missing_choices"
-_CHOICE_NOT_OBJECT_CODE: str = "non_stream_choice_not_object"
 _PROVIDER_ERROR_CODE: str = "non_stream_provider_error"
 _TOOL_CALL_NOT_OBJECT_CODE: str = "non_stream_tool_call_not_object"
 _TOOL_CALLS_EMPTY_AFTER_FILTER_CODE: str = "non_stream_tool_calls_empty_after_filter"
@@ -249,41 +246,16 @@ def _emit_from_dict(
         )
         return
 
-    choices = parsed.get("choices")
-    if not isinstance(choices, list) or not choices:
-        yield _make_event(
-            RunnerProtocolErrorData(
-                error_code=_MISSING_CHOICES_CODE,
-                message="non-stream response missing choices",
-                provider_request_id=provider_request_id,
-                raw_payload=None,
-            )
-        )
-        yield _make_event(
-            RunnerDoneData(
-                finish_reason=FinishReason.ERROR,
-                provider_request_id=provider_request_id,
-            )
+    selection = validate_non_stream_choice(parsed)
+    if isinstance(selection, ChoicePolicyError):
+        yield from _emit_choice_policy_error(
+            selection,
+            parsed=parsed,
+            provider_request_id=provider_request_id,
         )
         return
-    choice = choices[0]
-    if not isinstance(choice, dict):
-        yield _make_event(
-            RunnerProtocolErrorData(
-                error_code=_CHOICE_NOT_OBJECT_CODE,
-                message="non-stream choice is not a JSON object",
-                provider_request_id=provider_request_id,
-                raw_payload=None,
-            )
-        )
-        yield _make_event(
-            RunnerDoneData(
-                finish_reason=FinishReason.ERROR,
-                provider_request_id=provider_request_id,
-            )
-        )
-        return
-    finish_reason = _resolve_finish_reason(choice)
+    choice = selection.choice
+    finish_reason = selection.finish_reason
     message = choice.get("message")
     tool_calls_emitted = False
     content: str | None = None
@@ -330,6 +302,17 @@ def _emit_from_dict(
             )
             tool_calls_emitted = True
     if not tool_calls_emitted:
+        terminal_error = validate_non_stream_content_terminal_finish(
+            choice,
+            finish_reason=finish_reason,
+        )
+        if terminal_error is not None:
+            yield from _emit_choice_policy_error(
+                terminal_error,
+                parsed=parsed,
+                provider_request_id=provider_request_id,
+            )
+            return
         yield _make_event(
             RunnerContentCompletedData(
                 content=content,
@@ -361,10 +344,49 @@ def _emit_from_dict(
                 )
             )
     if tool_calls_emitted:
-        finish_reason = FinishReason.TOOL_CALLS
+        done_finish_reason = FinishReason.TOOL_CALLS
+    else:
+        assert finish_reason is not None, "content terminal finish_reason checked"
+        done_finish_reason = finish_reason
     yield _make_event(
         RunnerDoneData(
-            finish_reason=finish_reason,
+            finish_reason=done_finish_reason,
+            provider_request_id=provider_request_id,
+        )
+    )
+
+
+def _emit_choice_policy_error(
+    error: ChoicePolicyError,
+    *,
+    parsed: dict[str, JsonValue],
+    provider_request_id: str | None,
+) -> Iterator[RunnerEvent]:
+    """choice policy fatal error → 协议错误 + Done(ERROR) 收口。
+
+    :param error: choice policy 返回的错误事实。
+    :param parsed: 触发错误的 provider JSON object。
+    :param provider_request_id: 当前 response header 提供的 request id。
+    :returns: fatal provider protocol error 与 Done(ERROR)。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    _LOGGER.warning("non_stream.protocol_error code=%s", error.error_code)
+    yield _make_event(
+        RunnerProtocolErrorData(
+            error_code=error.error_code,
+            message=error.message,
+            provider_request_id=provider_request_id,
+            raw_payload=protocol_object_diagnostic_payload(
+                parsed,
+                source=error.error_code,
+                reason=error.diagnostic_reason,
+            ),
+        )
+    )
+    yield _make_event(
+        RunnerDoneData(
+            finish_reason=FinishReason.ERROR,
             provider_request_id=provider_request_id,
         )
     )
@@ -385,27 +407,6 @@ def _provider_error_message(error_payload: JsonValue) -> str:
         if isinstance(message, str) and message.strip() != "":
             return message
     return "non-stream provider returned an error object"
-
-
-def _resolve_finish_reason(choice: dict[str, JsonValue]) -> FinishReason:
-    """把 choice 的 ``finish_reason`` 字段映射为枚举。
-
-    :param choice: 非流式响应中的单个 choice object。
-    :returns: 映射后的 :class:`FinishReason`；缺失或未知时返回 ``STOP``。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    raw = choice.get("finish_reason")
-    if isinstance(raw, str):
-        mapped = _FINISH_REASON_MAP.get(raw)
-        if mapped is not None:
-            return mapped
-        _LOGGER.warning(
-            "non_stream.protocol_diagnostic code=unknown_finish_reason "
-            "finish_reason=%s",
-            raw,
-        )
-    return FinishReason.STOP
 
 
 @dataclass(frozen=True, slots=True)

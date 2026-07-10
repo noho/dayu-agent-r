@@ -7,6 +7,7 @@ import logging
 
 import pytest
 
+from dayu.contracts.json_value import JsonValue
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.runner_events import (
     RunnerContentCompletedData,
@@ -20,6 +21,18 @@ from dayu.engine.runners.openai.non_stream_parser import (
     parse_non_stream_response,
 )
 from tests.engine.runners.openai._sse_helpers import make_no_thought_hook
+
+
+def _diagnostic_payload(raw_payload: JsonValue | None) -> dict[str, JsonValue]:
+    """把协议错误 raw payload 收窄为诊断 JSON object。
+
+    :param raw_payload: 协议错误携带的 raw payload 字段。
+    :returns: 诊断 JSON object。
+    :raises AssertionError: ``raw_payload`` 不是 JSON object 时由 pytest 抛出。
+    """
+
+    assert isinstance(raw_payload, dict)
+    return raw_payload
 
 
 def test_non_stream_content_completed_and_usage_and_done() -> None:
@@ -176,10 +189,10 @@ def test_non_stream_negative_usage_logs_warning_and_omits_usage(
     )
 
 
-def test_non_stream_unknown_finish_reason_logs_diagnostic(
+def test_non_stream_invalid_finish_reason_fails_closed(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """非流式未知 finish_reason 保留 STOP 回落，同时记录诊断日志。"""
+    """非流式未知 finish_reason 必须 fatal，不得回落 STOP。"""
 
     caplog.set_level(
         logging.WARNING, logger="dayu.engine.runners.openai.non_stream_parser"
@@ -201,15 +214,86 @@ def test_non_stream_unknown_finish_reason_logs_diagnostic(
         )
     )
 
-    completed = events[0].data
-    assert isinstance(completed, RunnerContentCompletedData)
+    assert [event.type for event in events] == [
+        RunnerEventType.PROVIDER_PROTOCOL_ERROR,
+        RunnerEventType.RUNNER_DONE,
+    ]
+    error = events[0].data
+    assert isinstance(error, RunnerProtocolErrorData)
+    assert error.error_code == "non_stream_invalid_finish_reason"
     done = events[-1].data
     assert isinstance(done, RunnerDoneData)
-    assert done.finish_reason is FinishReason.STOP
+    assert done.finish_reason is FinishReason.ERROR
     assert any(
-        "unknown_finish_reason" in record.getMessage()
+        "non_stream_invalid_finish_reason" in record.getMessage()
         for record in caplog.records
     )
+
+
+@pytest.mark.parametrize(
+    "finish_reason_field",
+    (
+        {},
+        {"finish_reason": None},
+    ),
+)
+def test_non_stream_content_missing_or_null_finish_reason_fails_closed(
+    finish_reason_field: dict[str, JsonValue],
+) -> None:
+    """content-only 非流式响应缺失或 null finish_reason 不得默认 STOP。
+
+    :param finish_reason_field: 要合入 choice 的 finish_reason 字段片段。
+    :returns: 无返回值。
+    :raises AssertionError: 未按协议错误收口时由 pytest 抛出。
+    """
+
+    choice = {
+        **finish_reason_field,
+        "message": {"role": "assistant", "content": "answer"},
+    }
+    payload = json.dumps({"choices": [choice]}).encode("utf-8")
+
+    events = list(
+        parse_non_stream_response(
+            payload, hook=make_no_thought_hook(), provider_request_id=None
+        )
+    )
+
+    assert [event.type for event in events] == [
+        RunnerEventType.PROVIDER_PROTOCOL_ERROR,
+        RunnerEventType.RUNNER_DONE,
+    ]
+    error = events[0].data
+    assert isinstance(error, RunnerProtocolErrorData)
+    assert error.error_code == "non_stream_missing_finish_reason"
+    done = events[-1].data
+    assert isinstance(done, RunnerDoneData)
+    assert done.finish_reason is FinishReason.ERROR
+
+
+def test_non_stream_choice_without_message_or_finish_reason_fails_closed() -> None:
+    """单 choice 同时缺 message 与 finish_reason 时必须协议错误收口。"""
+
+    payload = json.dumps({"choices": [{}]}).encode("utf-8")
+
+    events = list(
+        parse_non_stream_response(
+            payload, hook=make_no_thought_hook(), provider_request_id=None
+        )
+    )
+
+    assert [event.type for event in events] == [
+        RunnerEventType.PROVIDER_PROTOCOL_ERROR,
+        RunnerEventType.RUNNER_DONE,
+    ]
+    error = events[0].data
+    assert isinstance(error, RunnerProtocolErrorData)
+    assert error.error_code == "non_stream_invalid_choice_shape"
+    diagnostic = _diagnostic_payload(error.raw_payload)
+    assert diagnostic["reason"] == "message_missing"
+    done = events[1].data
+    assert isinstance(done, RunnerDoneData)
+    assert done.finish_reason is FinishReason.ERROR
 
 
 def test_non_stream_tool_calls_emitted() -> None:

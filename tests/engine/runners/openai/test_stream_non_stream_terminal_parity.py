@@ -16,6 +16,7 @@ import json
 
 import pytest
 
+from dayu.contracts.json_value import JsonValue
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.runner_events import (
     RunnerContentCompletedData,
@@ -80,6 +81,18 @@ def _extract_protocol_error_and_done(
     assert protocol_error is not None, "PROVIDER_PROTOCOL_ERROR missing"
     assert done is not None, "RUNNER_DONE missing"
     return protocol_error, done
+
+
+def _sse_chunk(payload: dict[str, JsonValue]) -> bytes:
+    """把 JSON object 包装为单条 SSE data chunk。
+
+    :param payload: 要序列化的 provider JSON object。
+    :returns: UTF-8 编码后的 SSE chunk。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    payload_json = json.dumps(payload, separators=(",", ":"))
+    return f"data: {payload_json}\n\n".encode("utf-8")
 
 
 @pytest.mark.asyncio
@@ -266,3 +279,212 @@ async def test_stream_and_non_stream_provider_error_object_parity() -> None:
             "type": "invalid_request_error",
         }
     )
+
+
+@pytest.mark.parametrize(
+    "raw_finish_reason",
+    (
+        "safety_stop",
+        "",
+        1,
+        True,
+        ["stop"],
+        {"kind": "stop"},
+    ),
+)
+@pytest.mark.asyncio
+async def test_stream_and_non_stream_invalid_finish_reason_fail_closed(
+    raw_finish_reason: JsonValue,
+) -> None:
+    """非法 finish_reason 在 stream / non-stream 路径都必须 fatal。
+
+    :param raw_finish_reason: provider wire finish_reason 原始值。
+    :returns: 无返回值。
+    :raises AssertionError: 任一路径未 fail closed 时由 pytest 抛出。
+    """
+
+    stream_choice: dict[str, JsonValue] = {
+        "finish_reason": raw_finish_reason,
+        "delta": {},
+    }
+    stream_events = await parse_sse(
+        [
+            b'data: {"choices":[{"delta":{"content":"answer"}}]}\n\n',
+            _sse_chunk({"choices": [stream_choice]}),
+            b"data: [DONE]\n\n",
+        ],
+        hook=make_no_thought_hook(),
+    )
+    stream_error, stream_done = _extract_protocol_error_and_done(stream_events)
+
+    non_stream_choice: dict[str, JsonValue] = {
+        "finish_reason": raw_finish_reason,
+        "message": {"role": "assistant", "content": "answer"},
+    }
+    non_stream_events = list(
+        parse_non_stream_response(
+            json.dumps({"choices": [non_stream_choice]}).encode("utf-8"),
+            hook=make_no_thought_hook(),
+            provider_request_id=None,
+        )
+    )
+    ns_error, ns_done = _extract_protocol_error_and_done(non_stream_events)
+
+    assert stream_error.error_code == "sse_invalid_finish_reason"
+    assert ns_error.error_code == "non_stream_invalid_finish_reason"
+    assert stream_done.finish_reason is ns_done.finish_reason is FinishReason.ERROR
+    assert RunnerEventType.RUNNER_CONTENT_COMPLETED not in {
+        event.type for event in stream_events
+    }
+    assert RunnerEventType.RUNNER_CONTENT_COMPLETED not in {
+        event.type for event in non_stream_events
+    }
+
+
+@pytest.mark.asyncio
+async def test_stream_and_non_stream_multi_choice_fail_closed() -> None:
+    """stream / non-stream 多个 assistant choices 都必须 fatal。"""
+
+    stream_events = await parse_sse(
+        [
+            (
+                b'data: {"choices":[{"delta":{"content":"a"}},'
+                b'{"delta":{"content":"b"}}]}\n\n'
+            ),
+            b"data: [DONE]\n\n",
+        ],
+        hook=make_no_thought_hook(),
+    )
+    stream_error, stream_done = _extract_protocol_error_and_done(stream_events)
+
+    non_stream_payload = json.dumps(
+        {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "a"},
+                },
+                {
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "b"},
+                },
+            ]
+        }
+    ).encode("utf-8")
+    non_stream_events = list(
+        parse_non_stream_response(
+            non_stream_payload,
+            hook=make_no_thought_hook(),
+            provider_request_id=None,
+        )
+    )
+    ns_error, ns_done = _extract_protocol_error_and_done(non_stream_events)
+
+    assert [event.type for event in stream_events] == [
+        RunnerEventType.PROVIDER_PROTOCOL_ERROR,
+        RunnerEventType.RUNNER_DONE,
+    ]
+    assert stream_error.error_code == "sse_multiple_valid_choices"
+    assert ns_error.error_code == "non_stream_multiple_choices"
+    assert stream_done.finish_reason is ns_done.finish_reason is FinishReason.ERROR
+
+
+@pytest.mark.asyncio
+async def test_stream_and_non_stream_explicit_non_zero_index_fail_closed() -> None:
+    """显式非零 choice index 在 stream / non-stream 路径都必须 fatal。"""
+
+    stream_events = await parse_sse(
+        [
+            b'data: {"choices":[{"index":1,"delta":{"content":"a"}}]}\n\n',
+            b"data: [DONE]\n\n",
+        ],
+        hook=make_no_thought_hook(),
+    )
+    stream_error, stream_done = _extract_protocol_error_and_done(stream_events)
+
+    non_stream_payload = json.dumps(
+        {
+            "choices": [
+                {
+                    "index": 1,
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "a"},
+                }
+            ]
+        }
+    ).encode("utf-8")
+    non_stream_events = list(
+        parse_non_stream_response(
+            non_stream_payload,
+            hook=make_no_thought_hook(),
+            provider_request_id=None,
+        )
+    )
+    ns_error, ns_done = _extract_protocol_error_and_done(non_stream_events)
+
+    assert stream_error.error_code == "sse_choice_index_non_zero"
+    assert ns_error.error_code == "non_stream_choice_index_non_zero"
+    assert stream_done.finish_reason is ns_done.finish_reason is FinishReason.ERROR
+
+
+@pytest.mark.asyncio
+async def test_sse_empty_delta_plus_one_valid_choice_uses_only_valid_choice() -> None:
+    """empty delta choice 不算 valid assistant choice，也不制造多 choice。"""
+
+    events = await parse_sse(
+        [
+            (
+                b'data: {"choices":[{"index":0,"delta":{}},'
+                b'{"delta":{"content":"ok"}}]}\n\n'
+            ),
+            b'data: {"choices":[{"finish_reason":"stop","delta":{}}]}\n\n',
+            b"data: [DONE]\n\n",
+        ],
+        hook=make_no_thought_hook(),
+    )
+
+    completed, done = _extract_completed_and_done(events)
+    assert completed.content == "ok"
+    assert done.finish_reason is FinishReason.STOP
+
+
+@pytest.mark.asyncio
+async def test_sse_conflicting_terminal_finish_reason_fail_closed() -> None:
+    """跨 chunk 终态 finish_reason 冲突必须 fatal。"""
+
+    events = await parse_sse(
+        [
+            b'data: {"choices":[{"delta":{"content":"answer"}}]}\n\n',
+            b'data: {"choices":[{"finish_reason":"length","delta":{}}]}\n\n',
+            b'data: {"choices":[{"finish_reason":"stop","delta":{}}]}\n\n',
+            b"data: [DONE]\n\n",
+        ],
+        hook=make_no_thought_hook(),
+    )
+
+    error, done = _extract_protocol_error_and_done(events)
+    assert error.error_code == "sse_conflicting_finish_reason"
+    assert done.finish_reason is FinishReason.ERROR
+    assert RunnerEventType.RUNNER_CONTENT_COMPLETED not in {
+        event.type for event in events
+    }
+
+
+@pytest.mark.asyncio
+async def test_sse_content_without_terminal_finish_reason_fail_closed() -> None:
+    """SSE content-only 成功路径缺 terminal finish_reason 必须 fatal。"""
+
+    events = await parse_sse(
+        [
+            b'data: {"choices":[{"delta":{"content":"answer"}}]}\n\n',
+            b"data: [DONE]\n\n",
+        ],
+        hook=make_no_thought_hook(),
+    )
+
+    error, done = _extract_protocol_error_and_done(events)
+    assert error.error_code == "sse_missing_finish_reason"
+    assert done.finish_reason is FinishReason.ERROR
+    assert RunnerEventType.RUNNER_CONTENT_COMPLETED not in {
+        event.type for event in events
+    }

@@ -249,9 +249,9 @@ Engine contract 的细粒度测试，当前覆盖：
 OpenAI-compatible Runner 的 provider 协议测试，覆盖从 payload 构建、provider 响应解析到 RunnerEvent 事件流的行为：
 
 - payload：消息、工具 schema、reasoning content、provider 扩展、stream usage gating、禁止额外 payload 袋。
-- SSE：content delta、reasoning delta、tool call delta、tool call 聚合、usage、malformed usage 非终止诊断、`[DONE]`、多行 data、单行 / data 行数缓冲上限、跨 chunk UTF-8、非法 UTF-8、尾部无换行、空 choices + usage、HTTP 200 `Content-Type` 白名单分流和缺失 `Content-Type` fallback。
+- SSE：content delta、reasoning delta、tool call delta、tool call 聚合、usage、malformed usage 非终止诊断、`[DONE]`、多行 data、单行 / data 行数缓冲上限、跨 chunk UTF-8、非法 UTF-8、尾部无换行、空 choices + usage、单 chunk choice policy fail-closed、HTTP 200 `Content-Type` 白名单分流和缺失 `Content-Type` fallback。
 - diagnostics：覆盖 Runner HTTP attempt / response 等普通 debug 诊断、stream idle heartbeat 与 SSE done-token 的 stream-debug gating，以及 stream-debug 不输出完整 prompt、headers、API key 或响应正文。
-- non-stream：非流式响应、thought 标签处理、stream / non-stream 终态语义一致性，且 finish reason 只在 Runner done 边界断言。
+- non-stream：非流式响应、response-level choice policy fail-closed、thought 标签处理、stream / non-stream 终态语义一致性，且 finish reason 只在 Runner done 边界断言。
 - 错误与重试：协议错误、HTTP error 分类、context overflow classifier、未知状态码、retry backoff、重试耗尽后的事件收口。
 - request identity header：覆盖 OpenAI-compatible Runner 在 `ClientCorrelationPolicy.OPENAI_X_CLIENT_REQUEST_ID` 且 `request_identity` 存在时发送 `X-Client-Request-Id`，policy disabled 或 identity 缺失时不发送，policy 开启时拒绝静态 `X-Client-Request-Id` header 冲突，并确认 transport retry 复用同一个客户端关联 header；provider request id 从 `x-request-id` 或 DeepSeek `x-ds-trace-id` 提取且优先标准 `x-request-id`，基础设施 tracing header 不映射为 provider id，既有 `runner.http.response` DEBUG 行只输出实际存在的 provider request id header，全部缺失时输出 `x-request-id=None`。
 - 取消与资源：取消边界、取消后不补 done 事件、close 释放资源、已完成 read task 异常消费。

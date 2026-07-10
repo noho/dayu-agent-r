@@ -49,6 +49,11 @@ from dayu.engine.runners.openai._types import (
     _OpenAIToolCallFunction,
     _ReasoningProtocolHook,
 )
+from dayu.engine.runners.openai._choice_policy import (
+    ChoicePolicyError,
+    SSEChoiceSelection,
+    validate_sse_chunk_choices,
+)
 from dayu.engine.runners.openai.diagnostic_payload import (
     invalid_utf8_diagnostic_payload,
     protocol_object_diagnostic_payload,
@@ -69,7 +74,6 @@ _DATA_PREFIX: str = "data:"
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 _ERROR_FIELD: str = "error"
 _ERROR_MESSAGE_FIELD: str = "message"
-_MISSING_CHOICES_CODE: str = "sse_missing_choices"
 _PROVIDER_ERROR_CODE: str = "sse_provider_error"
 _INVALID_JSON_CODE: str = "sse_invalid_json"
 _PAYLOAD_NOT_OBJECT_CODE: str = "sse_payload_not_object"
@@ -77,16 +81,10 @@ _INVALID_UTF8_CODE: str = "invalid_utf8"
 _TRUNCATED_UTF8_TAIL_CODE: str = "truncated_utf8_tail"
 _LINE_TOO_LONG_CODE: str = "sse_line_too_long"
 _DATA_LINES_TOO_MANY_CODE: str = "sse_data_lines_too_many"
-_MISSING_CHOICES_AND_USAGE_REASON: str = "missing_choices_and_usage"
-_NO_VALID_CHOICE_OBJECT_REASON: str = "no_valid_choice_object"
+_MISSING_TERMINAL_FINISH_REASON_CODE: str = "sse_missing_finish_reason"
+_MISSING_TERMINAL_FINISH_REASON: str = "missing_terminal_finish_reason"
 _MAX_SSE_LINE_CHARS: int = 1024 * 1024
 _MAX_SSE_DATA_LINES: int = 256
-_FINISH_REASON_MAP: dict[str, FinishReason] = {
-    "stop": FinishReason.STOP,
-    "length": FinishReason.LENGTH,
-    "tool_calls": FinishReason.TOOL_CALLS,
-    "content_filter": FinishReason.CONTENT_FILTER,
-}
 
 
 def _make_event(data: RunnerEventData) -> RunnerEvent:
@@ -429,83 +427,79 @@ class SSEParser:
             )
             return
 
-        choices = parsed.get("choices")
         usage = parsed.get("usage")
-        has_valid_choices = isinstance(choices, list) and len(choices) > 0
         has_valid_usage = isinstance(usage, dict)
-        if not has_valid_choices and not has_valid_usage:
-            _LOGGER.warning(
-                "sse.protocol_error code=%s choices_type=%s usage_type=%s",
-                _MISSING_CHOICES_CODE,
-                type(choices).__name__,
-                type(usage).__name__,
-            )
-            self._terminated = True
-            yield _make_event(
-                RunnerProtocolErrorData(
-                    error_code=_MISSING_CHOICES_CODE,
-                    message=("SSE data line must contain non-empty choices or " "valid usage"),
-                    provider_request_id=self._provider_request_id,
-                    raw_payload=protocol_object_diagnostic_payload(
-                        parsed,
-                        source=_MISSING_CHOICES_CODE,
-                        reason=_MISSING_CHOICES_AND_USAGE_REASON,
-                    ),
-                    partial_tool_calls=self._aggregator.partial_summaries(),
-                )
-            )
-            yield _make_event(
-                RunnerDoneData(
-                    finish_reason=FinishReason.ERROR,
-                    provider_request_id=self._provider_request_id,
-                )
-            )
+
+        selection = validate_sse_chunk_choices(
+            parsed,
+            has_valid_usage=has_valid_usage,
+            current_finish_reason=self._finish_reason,
+        )
+        if isinstance(selection, ChoicePolicyError):
+            async for event in self._handle_choice_policy_error(
+                selection, parsed=parsed
+            ):
+                yield event
             return
-        if isinstance(choices, list) and choices:
-            handled_choice = False
-            for index, choice in enumerate(choices):
-                if not isinstance(choice, dict):
-                    _LOGGER.warning(
-                        "sse.protocol_diagnostic " "code=sse_choice_not_object index=%d type=%s",
-                        index,
-                        type(choice).__name__,
-                    )
-                    continue
-                handled_choice = True
-                async for event in self._handle_choice(choice):
-                    yield event
-            if not handled_choice:
-                _LOGGER.warning(
-                    "sse.protocol_error code=%s choices_type=list " "valid_choice_count=0",
-                    _MISSING_CHOICES_CODE,
-                )
-                self._terminated = True
-                yield _make_event(
-                    RunnerProtocolErrorData(
-                        error_code=_MISSING_CHOICES_CODE,
-                        message="SSE data line choices must contain an object choice",
-                        provider_request_id=self._provider_request_id,
-                        raw_payload=protocol_object_diagnostic_payload(
-                            parsed,
-                            source=_MISSING_CHOICES_CODE,
-                            reason=_NO_VALID_CHOICE_OBJECT_REASON,
-                        ),
-                        partial_tool_calls=self._aggregator.partial_summaries(),
-                    )
-                )
-                yield _make_event(
-                    RunnerDoneData(
-                        finish_reason=FinishReason.ERROR,
-                        provider_request_id=self._provider_request_id,
-                    )
-                )
-                return
+        if isinstance(selection, SSEChoiceSelection) and selection.choice is not None:
+            async for event in self._handle_choice(
+                selection.choice,
+                finish_reason=selection.finish_reason,
+            ):
+                yield event
         if usage is not None and isinstance(usage, dict):
             async for event in self._handle_usage(usage):
                 yield event
 
-    async def _handle_choice(self, choice: dict[str, JsonValue]) -> AsyncIterator[RunnerEvent]:
-        """处理单个 choice 对象。"""
+    async def _handle_choice_policy_error(
+        self,
+        error: ChoicePolicyError,
+        *,
+        parsed: dict[str, JsonValue],
+    ) -> AsyncIterator[RunnerEvent]:
+        """choice policy fatal error → 协议错误 + Done(ERROR) 收口。
+
+        :param error: choice policy 返回的错误事实。
+        :param parsed: 触发错误的 provider JSON object。
+        :returns: fatal provider protocol error 与 Done(ERROR)。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        _LOGGER.warning("sse.protocol_error code=%s", error.error_code)
+        self._terminated = True
+        yield _make_event(
+            RunnerProtocolErrorData(
+                error_code=error.error_code,
+                message=error.message,
+                provider_request_id=self._provider_request_id,
+                raw_payload=protocol_object_diagnostic_payload(
+                    parsed,
+                    source=error.error_code,
+                    reason=error.diagnostic_reason,
+                ),
+                partial_tool_calls=self._aggregator.partial_summaries(),
+            )
+        )
+        yield _make_event(
+            RunnerDoneData(
+                finish_reason=FinishReason.ERROR,
+                provider_request_id=self._provider_request_id,
+            )
+        )
+
+    async def _handle_choice(
+        self,
+        choice: dict[str, JsonValue],
+        *,
+        finish_reason: FinishReason | None,
+    ) -> AsyncIterator[RunnerEvent]:
+        """处理单个已通过 policy 校验的 choice 对象。
+
+        :param choice: 已校验为唯一合法的 provider choice object。
+        :param finish_reason: 已规范化的终态原因；未携带时为 ``None``。
+        :returns: 当前 choice 派生的 Runner delta 事件。
+        :raises Exception: 不主动抛出异常。
+        """
 
         delta = choice.get("delta")
         if isinstance(delta, dict):
@@ -535,16 +529,8 @@ class SSEParser:
                     event_data = self._tool_call_delta_event(typed_delta, resolved_index=resolved_index)
                     if event_data is not None:
                         yield _make_event(event_data)
-        finish_reason = choice.get("finish_reason")
-        if isinstance(finish_reason, str):
-            mapped = _FINISH_REASON_MAP.get(finish_reason)
-            if mapped is not None:
-                self._finish_reason = mapped
-            else:
-                _LOGGER.warning(
-                    "sse.protocol_diagnostic code=unknown_finish_reason " "finish_reason=%s",
-                    finish_reason,
-                )
+        if finish_reason is not None:
+            self._finish_reason = finish_reason
 
     def _coerce_tool_call_delta(self, raw: dict[str, JsonValue]) -> _OpenAIToolCallDelta:
         """把原始 dict 转成强类型 :class:`_OpenAIToolCallDelta`。
@@ -695,7 +681,30 @@ class SSEParser:
                     reasoning_content="".join(self._reasoning_buffer) or None,
                 )
             )
+            finish = FinishReason.TOOL_CALLS
         else:
+            if self._finish_reason is None:
+                yield _make_event(
+                    RunnerProtocolErrorData(
+                        error_code=_MISSING_TERMINAL_FINISH_REASON_CODE,
+                        message="SSE content response missing terminal finish_reason",
+                        provider_request_id=self._provider_request_id,
+                        raw_payload=protocol_object_diagnostic_payload(
+                            {},
+                            source=_MISSING_TERMINAL_FINISH_REASON_CODE,
+                            reason=_MISSING_TERMINAL_FINISH_REASON,
+                        ),
+                        partial_tool_calls=self._aggregator.partial_summaries(),
+                    )
+                )
+                self._terminated = True
+                yield _make_event(
+                    RunnerDoneData(
+                        finish_reason=FinishReason.ERROR,
+                        provider_request_id=self._provider_request_id,
+                    )
+                )
+                return
             content = "".join(self._content_buffer) or None
             reasoning = "".join(self._reasoning_buffer) or None
             yield _make_event(
@@ -704,7 +713,7 @@ class SSEParser:
                     reasoning_content=reasoning,
                 )
             )
-        finish = FinishReason.TOOL_CALLS if self._tool_calls_seen else self._finish_reason or FinishReason.STOP
+            finish = self._finish_reason
         self._terminated = True
         yield _make_event(
             RunnerDoneData(
