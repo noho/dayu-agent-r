@@ -830,6 +830,42 @@ async def test_submit_entrypoint_turn_emits_host_public_activity(
 
 
 @pytest.mark.asyncio
+async def test_submit_entrypoint_turn_preserves_provider_protocol_error_activity(
+    tmp_path: Path,
+) -> None:
+    """submit helper 保留 fatal provider protocol error activity kind。"""
+
+    runtime = await _prepare_runtime(tmp_path)
+    activities: list[EntrypointActivity] = []
+    fake_host = _FakeHost(
+        submit_events=(
+            _activity_event(
+                event_sequence=2,
+                run_id="run-1",
+                dedupe_key="activity-provider-protocol-error",
+                activity_kind=HostActivityKind.PROVIDER_PROTOCOL_ERROR,
+                activity_status=HostActivityStatus.FAILED,
+            ),
+            _terminal_event(event_sequence=3, run_id="run-1"),
+        )
+    )
+
+    await submit_entrypoint_turn_and_wait(
+        cast(Host, fake_host),
+        request=_turn_request(),
+        scene_inputs=runtime.scene_inputs,
+        host_assembly=runtime.host_assembly,
+        on_activity=activities.append,
+    )
+
+    assert len(activities) == 1
+    activity = activities[0]
+    assert activity.kind is EntrypointActivityKind.PROVIDER_PROTOCOL_ERROR
+    assert activity.status is EntrypointActivityStatus.FAILED
+    assert activity.dedupe_key == "activity-provider-protocol-error"
+
+
+@pytest.mark.asyncio
 async def test_submit_entrypoint_turn_emits_host_public_thinking(
     tmp_path: Path,
 ) -> None:
@@ -2050,12 +2086,16 @@ def _activity_event(
     event_sequence: int,
     run_id: str,
     dedupe_key: str,
+    activity_kind: HostActivityKind = HostActivityKind.TOOL_BATCH,
+    activity_status: HostActivityStatus = HostActivityStatus.COMPLETED,
 ) -> HostEvent:
     """构造带 Host public activity 的 progress HostEvent。
 
     :param event_sequence: event sequence。
     :param run_id: Run id。
     :param dedupe_key: Host public dedupe key。
+    :param activity_kind: Host public activity kind。
+    :param activity_status: Host public activity status。
     :returns: HostEvent。
     :raises Exception: 不主动抛出异常。
     """
@@ -2069,8 +2109,8 @@ def _activity_event(
         event_type="IGNORED_BY_SERVICE_UI_BRANCHING",
         kind=HostEventKind.PROGRESS,
         activity=HostActivityView(
-            kind=HostActivityKind.TOOL_BATCH,
-            status=HostActivityStatus.COMPLETED,
+            kind=activity_kind,
+            status=activity_status,
             title="工具批次完成",
             summary="完成 2 个工具调用。",
             severity=HostActivitySeverity.INFO,

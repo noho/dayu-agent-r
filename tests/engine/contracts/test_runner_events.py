@@ -16,8 +16,12 @@ from datetime import datetime, timezone
 
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.runner_events import (
+    ContextOverflowDetection,
+    ContextOverflowDetectionKind,
     RunnerContentCompletedData,
     RunnerContentDeltaData,
+    RunnerDiagnosticSeverity,
+    RunnerDiagnosticSource,
     RunnerDoneData,
     RunnerEvent,
     RunnerEventData,
@@ -25,6 +29,7 @@ from dayu.engine.contracts.runner_events import (
     RunnerHTTPErrorCode,
     RunnerHTTPErrorData,
     RunnerProtocolErrorData,
+    RunnerProviderDiagnosticData,
     RunnerReasoningDeltaData,
     RunnerToolCallDeltaData,
     RunnerToolCallsCompletedData,
@@ -58,6 +63,43 @@ def test_runner_http_error_data_field_set() -> None:
         "raw_payload",
         "attempt",
         "retried",
+        "context_overflow_detection",
+    }
+
+
+def test_runner_provider_diagnostic_contract_fields() -> None:
+    """非致命 provider diagnostic 字段集合必须符合契约。"""
+
+    fields = {f.name for f in dataclasses.fields(RunnerProviderDiagnosticData)}
+    assert fields == {
+        "diagnostic_code",
+        "severity",
+        "message",
+        "provider_request_id",
+        "raw_payload",
+        "partial_tool_calls",
+        "diagnostic_source",
+    }
+
+
+def test_runner_provider_diagnostic_enums_are_closed() -> None:
+    """diagnostic severity/source 枚举值必须锁定。"""
+
+    assert {item.value for item in RunnerDiagnosticSeverity} == {
+        "info",
+        "warning",
+    }
+    assert {item.value for item in RunnerDiagnosticSource} == {
+        "http_adapter",
+        "sse_parser",
+        "non_stream_parser",
+        "tool_call_aggregator",
+        "context_overflow_classifier",
+    }
+    assert {item.value for item in ContextOverflowDetectionKind} == {
+        "structured_code",
+        "message_marker_fallback",
+        "not_overflow",
     }
 
 
@@ -72,6 +114,9 @@ def test_runner_http_error_data_construction() -> None:
         raw_payload={"error": "throttle"},
         attempt=3,
         retried=True,
+        context_overflow_detection=ContextOverflowDetection(
+            kind=ContextOverflowDetectionKind.STRUCTURED_CODE
+        ),
     )
     assert data.error_code is RunnerHTTPErrorCode.RATE_LIMIT_EXCEEDED
     assert data.http_status == 429
@@ -107,6 +152,7 @@ def test_runner_event_type_includes_runner_http_error() -> None:
     """枚举包含 ``RUNNER_HTTP_ERROR`` 成员。"""
 
     assert RunnerEventType.RUNNER_HTTP_ERROR.value == "runner_http_error"
+    assert RunnerEventType.PROVIDER_DIAGNOSTIC.value == "provider_diagnostic"
 
 
 def _classify_event_data(data: RunnerEventData) -> str:
@@ -125,6 +171,8 @@ def _classify_event_data(data: RunnerEventData) -> str:
             return "content_completed"
         case RunnerUsageRecordedData():
             return "usage_recorded"
+        case RunnerProviderDiagnosticData():
+            return "provider_diagnostic"
         case RunnerProtocolErrorData():
             return "protocol_error"
         case RunnerHTTPErrorData():
@@ -146,6 +194,20 @@ def test_runner_event_data_union_match_covers_http_error() -> None:
         retried=False,
     )
     assert _classify_event_data(http_error) == "http_error"
+
+
+def test_runner_event_data_union_match_covers_provider_diagnostic() -> None:
+    """``match`` 必须覆盖非致命 provider diagnostic 分支。"""
+
+    diagnostic = RunnerProviderDiagnosticData(
+        diagnostic_code="usage_field_malformed",
+        severity=RunnerDiagnosticSeverity.WARNING,
+        message="usage ignored",
+        provider_request_id="req-diagnostic",
+        raw_payload=None,
+        diagnostic_source=RunnerDiagnosticSource.SSE_PARSER,
+    )
+    assert _classify_event_data(diagnostic) == "provider_diagnostic"
 
 
 def test_runner_event_with_http_error_data_construction() -> None:

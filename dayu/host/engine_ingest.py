@@ -35,6 +35,7 @@ from dayu.engine.contracts.engine_events import (
     FinalAnswerData,
     IterationCompletedData,
     IterationStartedData,
+    ProviderDiagnosticData,
     ProviderProtocolErrorData,
     RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION,
     RUN_SUSPENDED_REASON_TOOL_AWAITING,
@@ -236,6 +237,7 @@ _HOST_LIFECYCLE_PAYLOAD_ID_PREFIX = "sqlite-payload-host-lifecycle-terminal"
 _EVENT_TYPE_ENGINE_EVENT_REJECTED = "ENGINE_EVENT_REJECTED"
 _EVENT_TYPE_ENGINE_EVENT_DIAGNOSTIC = "ENGINE_EVENT_DIAGNOSTIC"
 _EVENT_TYPE_HOST_LIFECYCLE_DIAGNOSTIC = "HOST_LIFECYCLE_DIAGNOSTIC"
+_EVENT_TYPE_PROVIDER_DIAGNOSTIC = "PROVIDER_DIAGNOSTIC"
 _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR = "PROVIDER_PROTOCOL_ERROR"
 _EVENT_TYPE_RUN_RECOVERING = "RUN_RECOVERING"
 _EVENT_TYPE_TOOL_AWAITING = "TOOL_AWAITING"
@@ -1095,6 +1097,13 @@ class EngineEventIngestor:
             )
         if _is_preview_event(event):
             row = self._append_preview_event(transaction, context)
+            return _single_event_result(row)
+        if event.type == EngineEventType.PROVIDER_DIAGNOSTIC and isinstance(
+            event.data, ProviderDiagnosticData
+        ):
+            row = self._append_provider_diagnostic(
+                transaction, context, event.data
+            )
             return _single_event_result(row)
         if event.type == EngineEventType.PROVIDER_PROTOCOL_ERROR and isinstance(
             event.data, ProviderProtocolErrorData
@@ -3296,6 +3305,68 @@ class EngineEventIngestor:
                 event_type=_EVENT_TYPE_PROVIDER_PROTOCOL_ERROR,
                 payload=payload,
                 reason={"reason": data.error_code},
+            ),
+        ).row
+
+    def _append_provider_diagnostic(
+        self,
+        transaction: HostTransaction,
+        context: _ValidatedCandidate,
+        data: ProviderDiagnosticData,
+    ) -> EventLogRow:
+        """追加 provider 非致命诊断事件。
+
+        :param transaction: 当前 Host transaction。
+        :param context: 已校验 candidate 上下文。
+        :param data: provider diagnostic data。
+        :returns: EventLog row。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        payload_descriptor = self._write_raw_payload(
+            transaction,
+            context=context,
+            raw_payload=data.raw_payload,
+        )
+        payload_ref = (
+            payload_descriptor.payload_ref
+            if payload_descriptor is not None
+            else None
+        )
+        payload_digest = (
+            payload_descriptor.payload_digest
+            if payload_descriptor is not None
+            else None
+        )
+        candidate = context.candidate
+        payload: dict[str, JsonValue] = {
+            "attempt_id": context.attempt.attempt_id,
+            "execution_id": context.attempt.execution_id,
+            "iteration_id": data.iteration_id,
+            "diagnostic_code": data.diagnostic_code,
+            "severity": data.severity.value,
+            "message": data.message,
+            "provider_request_id": data.provider_request_id,
+            "client_correlation_id": data.client_correlation_id,
+            "diagnostic_source": data.diagnostic_source.value,
+            "payload_ref": payload_ref,
+            "payload_digest": payload_digest,
+            "partial_tool_call_count": len(data.partial_tool_calls),
+        }
+        return self._event_log_store.append_event(
+            transaction,
+            _event_request(
+                candidate=candidate,
+                event_id=_event_id(
+                    candidate,
+                    EventClass.DIAGNOSTIC,
+                    _EVENT_TYPE_PROVIDER_DIAGNOSTIC,
+                    0,
+                ),
+                event_class=EventClass.DIAGNOSTIC,
+                event_type=_EVENT_TYPE_PROVIDER_DIAGNOSTIC,
+                payload=payload,
+                reason={"reason": data.diagnostic_code},
             ),
         ).row
 

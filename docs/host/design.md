@@ -1515,6 +1515,7 @@ RUNNER_CALL_INPUT_ITERATION_LINKED
 CONTEXT_COMPACTION_REQUESTED
 CONTEXT_COMPACTED
 CONTEXT_COMPACTION_FAILED
+PROVIDER_DIAGNOSTIC
 PROVIDER_PROTOCOL_ERROR
 ```
 
@@ -1526,9 +1527,12 @@ EngineEvent ingest 的命名 diagnostic event 至少包括：
 
 ```text
 ENGINE_EVENT_REJECTED
+PROVIDER_DIAGNOSTIC
 ```
 
 `ENGINE_EVENT_REJECTED` 不是 Run / Attempt lifecycle fact，只记录 Host 拒绝某个 Engine event 的原因和是否要求停止当前 worker stream。它不得驱动 recovery、memory projection、dispatch decision、resume 或 Run / Attempt 状态迁移。
+
+`PROVIDER_DIAGNOSTIC` 是非致命 provider / adapter diagnostic，EventClass 固定为 `DIAGNOSTIC`。它持久化 bounded `diagnostic_code`、`severity`、`message`、`provider_request_id`、`diagnostic_source`、`payload_ref` 与 `payload_digest`，不得更新 Run / Attempt terminal state，不得写入 failure metadata，不得进入 outbox terminal item、Conversation Memory、final answer、accepted evidence material、compact material 或 LLM-facing prompt messages。Read API 以 `provider_diagnostic` / `info` activity 展示非致命诊断，以独立 `provider_protocol_error` activity 展示 fatal provider protocol error；Tool Trace 可以把 provider diagnostic 作为诊断展示材料。
 
 ### 13.3 Canonical Event Contract Matrix
 
@@ -1554,6 +1558,7 @@ canonical event contract 必须转成 typed dataclass / enum / validation tests�
 | `RUNNER_CALL_INPUT_ITERATION_LINKED` | `session_id`、`host_run_id`、`attempt_id`、`execution_id` | manifest_event_id / manifest_payload_ref / manifest_digest / manifest_schema_version / runner_call_index / runner_call_kind / runner_call_trigger_reason / iteration_id / iteration_index / engine_message_count / engine_role_sequence_digest / runner_input_serializer_schema_version / expected_message_count / expected_role_sequence_digest / validation_status / diagnostic | 无 Run / Attempt 状态副作用；只表达 prepared runner-call manifest 与 Engine `ITERATION_STARTED` observation 的追加式 link / validation fact | resume 不消费；reconstruction consumer 可用 refs / digests / observed-vs-expected summary 判断 Engine link 是否完成 | audit optional / tool trace optional |
 | `CONTEXT_COMPACTION_REQUESTED` | `session_id`、`run_id`；`trigger_source=reactive` 时必须有 `attempt_id`、`execution_id`；`trigger_source=proactive` 时可以没有 | trigger source / budget reason / provider error refs / snapshot refs | 触发 context governance；proactive path 是 pre-dispatch input governance；reactive path 可关闭当前 Attempt 并让 Run -> `RECOVERING` | resume 是；memory projection 按需消费 | audit yes / trace 是 |
 | `CONTEXT_COMPACTED` / `CONTEXT_COMPACTION_FAILED` | `session_id`、`run_id` | compact artifact ref / accepted candidate digest / prompt-local label mapping refs / source boundary refs / quality check / failure reason / fallback decision | compacted 后允许创建新 Attempt；failed 后按 policy 失败或保持 recoverable | resume 是；memory projection 按 policy 消费 accepted compact output | audit yes / trace 是 |
+| `PROVIDER_DIAGNOSTIC` | `session_id`、`run_id`、`attempt_id`、`execution_id` | diagnostic code / severity / message / provider request id / diagnostic source / payload ref + digest | 无 Run / Attempt 状态副作用；非 terminal；不写 failure metadata | resume 不消费；memory 不消费；LLM-facing material 不消费 | audit optional / Host activity optional / tool trace diagnostic |
 | `PROVIDER_PROTOCOL_ERROR` | `session_id`、`run_id`、`attempt_id`、`execution_id` | provider / error code / request ref | Attempt failure or retry input | retry 需要时 resume 消费 | audit yes / Host event stream emit |
 | `ENGINE_EVENT_REJECTED` | `session_id`、`host_run_id`、`attempt_id`、`execution_id`、worker_event_index、engine_event_type | reason / stop_worker_stream / optional diagnostic_refs / optional runner-call link or manifest refs | 无 Run / Attempt 状态副作用；只表达 Host ingest fail-closed 或 unsupported event diagnostic；`stop_worker_stream` 是 worker stream 控制信号，不是 lifecycle transition | resume 不消费；memory 不消费 | audit yes / tool trace optional |
 
@@ -1617,6 +1622,7 @@ tool_calls_batch_done          -> preview or diagnostic
 tool_awaiting                  -> preview / diagnostic / idempotent confirmation with accepted refs; not canonical owner
 context_compaction_requested   -> CONTEXT_COMPACTION_REQUESTED(trigger_source=reactive); must include attempt_id + execution_id
 usage_reported                 -> usage projection input; canonical only if needed for audit policy
+provider_diagnostic            -> PROVIDER_DIAGNOSTIC; diagnostic only, no Run / Attempt terminal state change
 provider_protocol_error        -> PROVIDER_PROTOCOL_ERROR
 iteration_completed            -> preview or diagnostic
 final_answer                   -> RUN_SUCCEEDED + ATTEMPT_SUCCEEDED

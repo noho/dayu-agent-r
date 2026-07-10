@@ -931,6 +931,59 @@ def test_tool_trace_projects_provider_protocol_failure_metadata(
         assert _cold_trace_summary(cold_lines, 0) == row.trace_summary
 
 
+def test_tool_trace_projects_provider_diagnostic_without_failure_metadata(
+    tmp_path: Path,
+) -> None:
+    """PROVIDER_DIAGNOSTIC 只作为诊断展示，不生成失败元数据。"""
+
+    cold_path = tmp_path / "trace" / "provider-diagnostic.jsonl"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        event = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-provider-diagnostic",
+            event_type="PROVIDER_DIAGNOSTIC",
+            event_class=EventClass.DIAGNOSTIC,
+            payload={
+                "provider_request_id": "provider-req-diagnostic",
+                "client_correlation_id": "client-diagnostic",
+                "diagnostic_code": "usage_field_malformed",
+                "severity": "warning",
+                "message": "usage ignored",
+                "diagnostic_source": "sse_parser",
+                "payload_ref": "payload-provider-diagnostic",
+                "payload_digest": (
+                    "sha256:"
+                    "2222222222222222222222222222222222222222222222222222222222222222"
+                ),
+            },
+        )
+
+        _run_trace_once(store.transaction_runner, cold_path)
+        row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(transaction, event.event_id)
+        )
+        cold_lines = _json_lines(cold_path)
+
+        assert row is not None
+        assert row.provider_request_id == "provider-req-diagnostic"
+        assert row.diagnostic_ref == "payload-provider-diagnostic"
+        assert _FIELD_FAILURE_METADATA not in row.trace_summary
+        assert row.trace_summary["client_correlation_id"] == "client-diagnostic"
+        assert row.trace_summary["provider_error_ref"] is None
+        assert row.trace_summary["diagnostic_refs"] == [
+            "payload-provider-diagnostic",
+            "provider-req-diagnostic",
+        ]
+        assert "provider_error_code" not in row.trace_summary
+        assert len(cold_lines) == 1
+        assert cold_lines[0]["diagnostic_refs"] == [
+            "payload-provider-diagnostic",
+            "provider-req-diagnostic",
+        ]
+        assert cold_lines[0]["client_correlation_id"] == "client-diagnostic"
+        assert _cold_trace_summary(cold_lines, 0) == row.trace_summary
+
+
 def test_tool_trace_projects_provider_protocol_partial_tool_call_signal_states(
     tmp_path: Path,
 ) -> None:

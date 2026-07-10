@@ -2534,6 +2534,7 @@ class HostActivityKind(StrEnum):
     TOOL_AWAITING = "tool_awaiting"
     CONTEXT_COMPACTION = "context_compaction"
     PROVIDER_DIAGNOSTIC = "provider_diagnostic"
+    PROVIDER_PROTOCOL_ERROR = "provider_protocol_error"
 
 
 class HostActivityStatus(StrEnum):

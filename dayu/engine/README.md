@@ -421,6 +421,7 @@ Terminal 事件集合由 `TERMINAL_ENGINE_EVENT_TYPES` 定义，当前包括 `fi
 - `tool_awaiting`
 - `context_compaction_requested`
 - `usage_reported`
+- `provider_diagnostic`
 - `provider_protocol_error`
 - `iteration_completed`
 - `final_answer`
@@ -436,6 +437,7 @@ Terminal 事件集合由 `TERMINAL_ENGINE_EVENT_TYPES` 定义，当前包括 `fi
 - `runner_tool_calls_completed`
 - `runner_content_completed`
 - `runner_usage_recorded`
+- `provider_diagnostic`
 - `provider_protocol_error`
 - `runner_http_error`
 - `runner_done`
@@ -469,7 +471,7 @@ Runner 的 `runner_done` 只表示本次 RunnerEvent stream 结束；提升到 E
 
 ### Provider 错误
 
-Runner 解析层错误产出 `provider_protocol_error`；HTTP、网络、timeout 和上下文超限产出 `runner_http_error`。`RunnerHTTPErrorCode.CONTEXT_LENGTH_EXCEEDED` 是 Dayu 的中性错误分类，不是 provider 官方错误码，也不对应固定 HTTP 状态码。OpenAI-compatible Runner 只在 HTTP 失败响应中识别到明确的上下文溢出信号时才归一为该分类：
+Runner 解析层 fatal 错误产出 `provider_protocol_error`；非致命 provider / adapter 诊断产出 `provider_diagnostic`，例如未知 provider tool-call 扩展字段、malformed usage、HTTP 200 缺失 `Content-Type` 或 context overflow marker fallback provenance。`provider_diagnostic` 不设置 Agent 失败候选，不代表 run failure。HTTP、网络、timeout 和上下文超限产出 `runner_http_error`。`RunnerHTTPErrorCode.CONTEXT_LENGTH_EXCEEDED` 是 Dayu 的中性错误分类，不是 provider 官方错误码，也不对应固定 HTTP 状态码。OpenAI-compatible Runner 只在 HTTP 失败响应中识别到明确的上下文溢出信号时才归一为该分类：
 
 - 结构化 payload 的 `error.code == "context_length_exceeded"`。
 - 错误文本命中受控 marker，例如 `maximum context length is`、`total message token length exceed model limit`、`range of input length should be`、`model's maximum context length`、`model requires more context` 或 `context length exceeded`。
@@ -480,7 +482,7 @@ Runner 解析层错误产出 `provider_protocol_error`；HTTP、网络、timeout
 
 `context_window_tokens` 是模型单次请求可容纳的输入、输出预留与 reasoning 等总上下文窗口上限；它不同于 `max_output_tokens` 这类模型输出上限。Engine 不计算或裁决 `context_window_tokens`，只在 Runner 明确报告 provider context overflow 时把该事实提升为 `context_compaction_requested`。
 
-Engine 收到 `CONTEXT_LENGTH_EXCEEDED` 后提升为 `context_compaction_requested`，该事件在 provider overflow 路径中的 `budget_state` 为 `None`，并以可恢复失败候选收口。Compact 治理由 Host 负责：Host ingest 将该事件转为 reactive compact / recovery，并决定预算估算、压缩策略、compact 执行、结果记录和恢复调度。Engine 自身不执行 compact。
+Engine 收到 `CONTEXT_LENGTH_EXCEEDED` 后提升为 `context_compaction_requested`，该事件在 provider overflow 路径中的 `budget_state` 为 `None`，并以可恢复失败候选收口。若 Runner 只通过受控 message marker fallback 识别 overflow，Agent 会额外产出非致命 `provider_diagnostic` 记录 provenance；canonical compact request 仍只来自 typed `RunnerHTTPErrorCode.CONTEXT_LENGTH_EXCEEDED`。Compact 治理由 Host 负责：Host ingest 将该事件转为 reactive compact / recovery，并决定预算估算、压缩策略、compact 执行、结果记录和恢复调度。Engine 自身不执行 compact。
 
 Engine 不做 proactive threshold compaction、compact / retry、provider-aware tokenizer 或 Host budget policy。
 

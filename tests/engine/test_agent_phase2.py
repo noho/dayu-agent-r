@@ -35,6 +35,7 @@ from dayu.engine.contracts.engine_events import (
     EngineEventType,
     FinalAnswerData,
     IterationCompletedData,
+    ProviderDiagnosticData,
     RUN_SUSPENDED_REASON_TOOL_AWAITING,
     RunCancelledData,
     RunFailedData,
@@ -51,6 +52,8 @@ from dayu.engine.contracts.messages import (
 )
 from dayu.engine.contracts.runner import AsyncRunner
 from dayu.engine.contracts.runner_events import (
+    ContextOverflowDetection,
+    ContextOverflowDetectionKind,
     RunnerContentCompletedData,
     RunnerContentDeltaData,
     RunnerDoneData,
@@ -60,6 +63,9 @@ from dayu.engine.contracts.runner_events import (
     RunnerHTTPErrorCode,
     RunnerHTTPErrorData,
     RunnerProtocolErrorData,
+    RunnerProviderDiagnosticData,
+    RunnerDiagnosticSeverity,
+    RunnerDiagnosticSource,
     RunnerReasoningDeltaData,
     RunnerToolCallDeltaData,
     RunnerToolCallsCompletedData,
@@ -720,6 +726,59 @@ async def test_protocol_error_and_error_done_maps_to_run_failed() -> None:
 
 
 @pytest.mark.asyncio
+async def test_provider_diagnostic_does_not_create_failure_candidate() -> None:
+    """Runner 非致命诊断提升为 Engine diagnostic，不影响成功终态。"""
+
+    runner = _ScriptedRunner(
+        events=(
+            _event(
+                RunnerEventType.PROVIDER_DIAGNOSTIC,
+                RunnerProviderDiagnosticData(
+                    diagnostic_code="usage_field_malformed",
+                    severity=RunnerDiagnosticSeverity.WARNING,
+                    message="usage ignored",
+                    provider_request_id="req_diag",
+                    raw_payload={"prompt_tokens_type": "str"},
+                    diagnostic_source=RunnerDiagnosticSource.SSE_PARSER,
+                ),
+            ),
+            _event(
+                RunnerEventType.RUNNER_CONTENT_COMPLETED,
+                RunnerContentCompletedData(
+                    content="ok",
+                    reasoning_content=None,
+                ),
+            ),
+            _event(
+                RunnerEventType.RUNNER_DONE,
+                RunnerDoneData(
+                    finish_reason=FinishReason.STOP,
+                    provider_request_id="req_diag",
+                ),
+            ),
+        )
+    )
+
+    events = await _collect(_AsyncAgent(request=_request(), runner=runner))
+
+    assert [event.type for event in events] == [
+        EngineEventType.ITERATION_STARTED,
+        EngineEventType.PROVIDER_DIAGNOSTIC,
+        EngineEventType.CONTENT_COMPLETED,
+        EngineEventType.ITERATION_COMPLETED,
+        EngineEventType.FINAL_ANSWER,
+    ]
+    diagnostic = events[1].data
+    assert isinstance(diagnostic, ProviderDiagnosticData)
+    assert diagnostic.diagnostic_code == "usage_field_malformed"
+    assert diagnostic.severity is RunnerDiagnosticSeverity.WARNING
+    assert diagnostic.diagnostic_source is RunnerDiagnosticSource.SSE_PARSER
+    assert diagnostic.provider_request_id == "req_diag"
+    assert events[-1].type is EngineEventType.FINAL_ANSWER
+    _assert_single_terminal_at_end(events)
+
+
+@pytest.mark.asyncio
 async def test_http_error_maps_to_run_failed_without_extra_engine_event() -> None:
     """HTTP error 记录失败候选，经迭代完成事件收口 run_failed。"""
 
@@ -806,6 +865,115 @@ async def test_context_overflow_http_error_maps_to_compaction_required_fact() ->
     assert terminal.data.error_code == "context_compaction_required"
     assert terminal.data.provider_request_id == "req_context"
     assert terminal.data.recoverable
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_without_detection_emits_only_compaction_request() -> None:
+    """typed context overflow 无检测来源时不生成 provider diagnostic。"""
+
+    runner = _ScriptedRunner(
+        events=(
+            _event(
+                RunnerEventType.RUNNER_HTTP_ERROR,
+                RunnerHTTPErrorData(
+                    error_code=RunnerHTTPErrorCode.CONTEXT_LENGTH_EXCEEDED,
+                    http_status=400,
+                    message="maximum context length is 128000 tokens",
+                    provider_request_id="req_context_no_detection",
+                    raw_payload=None,
+                    attempt=1,
+                    retried=False,
+                    context_overflow_detection=None,
+                ),
+            ),
+            _event(
+                RunnerEventType.RUNNER_DONE,
+                RunnerDoneData(
+                    finish_reason=FinishReason.ERROR,
+                    provider_request_id="req_context_no_detection",
+                ),
+            ),
+        )
+    )
+
+    events = await _collect(_AsyncAgent(request=_request(), runner=runner))
+
+    assert [event.type for event in events] == [
+        EngineEventType.ITERATION_STARTED,
+        EngineEventType.CONTEXT_COMPACTION_REQUESTED,
+        EngineEventType.ITERATION_COMPLETED,
+        EngineEventType.RUN_FAILED,
+    ]
+    assert EngineEventType.PROVIDER_DIAGNOSTIC not in {
+        event.type for event in events
+    }
+    compact_event = events[1]
+    assert isinstance(compact_event.data, ContextCompactionRequestedData)
+    assert compact_event.data.provider_request_id == "req_context_no_detection"
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_marker_fallback_emits_nonfatal_diagnostic() -> None:
+    """message marker fallback provenance 进入 diagnostic，不替代压缩事实。"""
+
+    runner = _ScriptedRunner(
+        events=(
+            _event(
+                RunnerEventType.RUNNER_HTTP_ERROR,
+                RunnerHTTPErrorData(
+                    error_code=RunnerHTTPErrorCode.CONTEXT_LENGTH_EXCEEDED,
+                    http_status=400,
+                    message="context length exceeded",
+                    provider_request_id="req_context_marker",
+                    raw_payload=None,
+                    attempt=1,
+                    retried=False,
+                    context_overflow_detection=ContextOverflowDetection(
+                        kind=(
+                            ContextOverflowDetectionKind.MESSAGE_MARKER_FALLBACK
+                        ),
+                        diagnostic_code=(
+                            "context_overflow_message_marker_fallback"
+                        ),
+                        message="marker fallback detected context overflow",
+                        raw_payload={"detection_kind": "message_marker_fallback"},
+                    ),
+                ),
+            ),
+            _event(
+                RunnerEventType.RUNNER_DONE,
+                RunnerDoneData(
+                    finish_reason=FinishReason.ERROR,
+                    provider_request_id="req_context_marker",
+                ),
+            ),
+        )
+    )
+
+    events = await _collect(_AsyncAgent(request=_request(), runner=runner))
+
+    assert [event.type for event in events] == [
+        EngineEventType.ITERATION_STARTED,
+        EngineEventType.PROVIDER_DIAGNOSTIC,
+        EngineEventType.CONTEXT_COMPACTION_REQUESTED,
+        EngineEventType.ITERATION_COMPLETED,
+        EngineEventType.RUN_FAILED,
+    ]
+    diagnostic = events[1].data
+    assert isinstance(diagnostic, ProviderDiagnosticData)
+    assert diagnostic.diagnostic_source is (
+        RunnerDiagnosticSource.CONTEXT_OVERFLOW_CLASSIFIER
+    )
+    assert diagnostic.diagnostic_code == (
+        "context_overflow_message_marker_fallback"
+    )
+    compact = events[2].data
+    assert isinstance(compact, ContextCompactionRequestedData)
+    assert compact.provider_request_id == "req_context_marker"
+    terminal = events[-1].data
+    assert isinstance(terminal, RunFailedData)
+    assert terminal.error_code == "context_compaction_required"
+    assert terminal.recoverable
 
 
 @pytest.mark.asyncio

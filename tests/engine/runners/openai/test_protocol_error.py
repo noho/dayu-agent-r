@@ -15,6 +15,7 @@ from dayu.engine.contracts.runner_events import (
     RunnerDoneData,
     RunnerEventType,
     RunnerProtocolErrorData,
+    RunnerProviderDiagnosticData,
     RunnerToolCallsCompletedData,
 )
 from dayu.engine.contracts.partial_tool_call import (
@@ -556,7 +557,7 @@ async def test_sse_partial_tool_call_summary_has_hard_bounds() -> None:
 async def test_sse_usage_malformed_after_tool_delta_logs_and_continues(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """tool call delta 后 malformed usage 只记日志，后续仍可 completed。"""
+    """tool call delta 后 malformed usage 产出诊断，后续仍可 completed。"""
 
     caplog.set_level(
         logging.WARNING, logger="dayu.engine.runners.openai.sse_parser"
@@ -608,15 +609,19 @@ async def test_sse_usage_malformed_after_tool_delta_logs_and_continues(
     types = [e.type for e in events]
     assert types == [
         RunnerEventType.RUNNER_TOOL_CALL_DELTA,
+        RunnerEventType.PROVIDER_DIAGNOSTIC,
         RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED,
         RunnerEventType.RUNNER_DONE,
     ]
-    completed = events[1].data
+    diagnostic = events[1].data
+    assert isinstance(diagnostic, RunnerProviderDiagnosticData)
+    assert diagnostic.diagnostic_code == "usage_field_malformed"
+    completed = events[2].data
     assert isinstance(completed, RunnerToolCallsCompletedData)
     assert len(completed.tool_calls) == 1
     assert completed.tool_calls[0].tool_call_id == "call-1"
     assert completed.tool_calls[0].name == "lookup"
-    done = events[2].data
+    done = events[3].data
     assert isinstance(done, RunnerDoneData)
     assert done.finish_reason is FinishReason.TOOL_CALLS
     assert RunnerEventType.PROVIDER_PROTOCOL_ERROR not in types
@@ -657,6 +662,14 @@ async def test_sse_usage_malformed_before_content_completion_continues(
 
     types = [event.type for event in events]
     assert RunnerEventType.PROVIDER_PROTOCOL_ERROR not in types
+    assert RunnerEventType.PROVIDER_DIAGNOSTIC in types
+    diagnostics = [
+        event.data for event in events
+        if event.type is RunnerEventType.PROVIDER_DIAGNOSTIC
+    ]
+    assert len(diagnostics) == 1
+    assert isinstance(diagnostics[0], RunnerProviderDiagnosticData)
+    assert diagnostics[0].diagnostic_code == "usage_field_malformed"
     assert RunnerEventType.RUNNER_CONTENT_COMPLETED in types
     completed_events = [
         event for event in events
@@ -717,6 +730,13 @@ async def test_sse_bool_usage_logs_warning_and_continues(
         event.type is RunnerEventType.RUNNER_USAGE_RECORDED
         for event in events
     )
+    diagnostics = [
+        event.data for event in events
+        if event.type is RunnerEventType.PROVIDER_DIAGNOSTIC
+    ]
+    assert len(diagnostics) == 1
+    assert isinstance(diagnostics[0], RunnerProviderDiagnosticData)
+    assert diagnostics[0].diagnostic_code == "usage_field_malformed"
     completed_events = [
         event for event in events
         if event.type is RunnerEventType.RUNNER_CONTENT_COMPLETED

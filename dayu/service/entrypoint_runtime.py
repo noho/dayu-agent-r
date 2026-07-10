@@ -101,6 +101,7 @@ class EntrypointActivityKind(StrEnum):
     TOOL_AWAITING = "tool_awaiting"
     CONTEXT_COMPACTION = "context_compaction"
     PROVIDER_DIAGNOSTIC = "provider_diagnostic"
+    PROVIDER_PROTOCOL_ERROR = "provider_protocol_error"
     WATCHER_DIAGNOSTIC = "watcher_diagnostic"
 
 
@@ -1287,6 +1288,8 @@ def _entrypoint_activity_kind_from_host(kind: HostActivityKind) -> EntrypointAct
         return EntrypointActivityKind.CONTEXT_COMPACTION
     if kind is HostActivityKind.PROVIDER_DIAGNOSTIC:
         return EntrypointActivityKind.PROVIDER_DIAGNOSTIC
+    if kind is HostActivityKind.PROVIDER_PROTOCOL_ERROR:
+        return EntrypointActivityKind.PROVIDER_PROTOCOL_ERROR
     raise AssertionError(f"unexpected HostActivityKind: {kind}")
 
 

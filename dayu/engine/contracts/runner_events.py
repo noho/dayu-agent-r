@@ -28,6 +28,7 @@ class RunnerEventType(StrEnum):
     RUNNER_TOOL_CALLS_COMPLETED = "runner_tool_calls_completed"
     RUNNER_CONTENT_COMPLETED = "runner_content_completed"
     RUNNER_USAGE_RECORDED = "runner_usage_recorded"
+    PROVIDER_DIAGNOSTIC = "provider_diagnostic"
     PROVIDER_PROTOCOL_ERROR = "provider_protocol_error"
     RUNNER_HTTP_ERROR = "runner_http_error"
     RUNNER_DONE = "runner_done"
@@ -62,6 +63,48 @@ class RunnerHTTPErrorCode(StrEnum):
     TIMEOUT = "timeout"
     CONTEXT_LENGTH_EXCEEDED = "context_length_exceeded"
     UNKNOWN_HTTP_STATUS = "unknown_http_status"
+
+
+class RunnerDiagnosticSeverity(StrEnum):
+    """Runner 非致命诊断严重级别闭集。"""
+
+    INFO = "info"
+    WARNING = "warning"
+
+
+class RunnerDiagnosticSource(StrEnum):
+    """Runner 非致命诊断来源闭集。"""
+
+    HTTP_ADAPTER = "http_adapter"
+    SSE_PARSER = "sse_parser"
+    NON_STREAM_PARSER = "non_stream_parser"
+    TOOL_CALL_AGGREGATOR = "tool_call_aggregator"
+    CONTEXT_OVERFLOW_CLASSIFIER = "context_overflow_classifier"
+
+
+class ContextOverflowDetectionKind(StrEnum):
+    """provider context overflow 检测来源闭集。"""
+
+    STRUCTURED_CODE = "structured_code"
+    MESSAGE_MARKER_FALLBACK = "message_marker_fallback"
+    NOT_OVERFLOW = "not_overflow"
+
+
+@dataclass(frozen=True, slots=True)
+class ContextOverflowDetection:
+    """provider context overflow 检测结果。
+
+    :param kind: 检测来源分类。只有 ``STRUCTURED_CODE`` 可作为业务真源；
+        ``MESSAGE_MARKER_FALLBACK`` 只提供诊断 provenance。
+    :param diagnostic_code: 需要对外持久化诊断时使用的诊断码。
+    :param message: 需要对外持久化诊断时使用的人类可读摘要。
+    :param raw_payload: 有界诊断载荷；无诊断或无结构化载荷时为 ``None``。
+    """
+
+    kind: ContextOverflowDetectionKind
+    diagnostic_code: str | None = None
+    message: str | None = None
+    raw_payload: JsonValue | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +209,32 @@ class RunnerProtocolErrorData:
 
 
 @dataclass(frozen=True, slots=True)
+class RunnerProviderDiagnosticData:
+    """provider 非致命诊断事件 data。
+
+    :param diagnostic_code: 中性诊断码。
+    :param severity: 诊断严重级别闭集。
+    :param message: 人类可读诊断摘要。
+    :param provider_request_id: provider 侧请求 id；为 ``None`` 表示未提供。
+    :param raw_payload: 有界诊断载荷；为 ``None`` 表示无。不承诺保留
+        provider 原始报错载荷。
+    :param partial_tool_calls: 诊断发生时已解析但未完成的 tool call 有界
+        摘要；不包含 raw argument payload。
+    :param diagnostic_source: 产生诊断的 Runner 内部来源闭集。
+    """
+
+    diagnostic_code: str
+    severity: RunnerDiagnosticSeverity
+    message: str
+    provider_request_id: str | None
+    raw_payload: JsonValue | None
+    partial_tool_calls: tuple[PartialToolCallSummary, ...] = ()
+    diagnostic_source: RunnerDiagnosticSource = (
+        RunnerDiagnosticSource.HTTP_ADAPTER
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class RunnerHTTPErrorData:
     """Runner HTTP / 网络 / 超时终态错误事件 data。
 
@@ -179,6 +248,8 @@ class RunnerHTTPErrorData:
         载荷。
     :param attempt: 触发本错误事件时已经尝试的次数（首次为 1）。
     :param retried: 是否已经发生过至少一次重试。
+    :param context_overflow_detection: HTTP 错误被识别为 context overflow 时
+        的检测 provenance；非 context overflow 时为 ``None``。
 
     本事件**不**与 :class:`RunnerProtocolErrorData` 相互替代：解析层错误
     走协议错误事件，传输层错误走本事件；两者均以
@@ -192,6 +263,7 @@ class RunnerHTTPErrorData:
     raw_payload: JsonValue | None
     attempt: int
     retried: bool
+    context_overflow_detection: ContextOverflowDetection | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +286,7 @@ RunnerEventData: TypeAlias = (
     | RunnerToolCallsCompletedData
     | RunnerContentCompletedData
     | RunnerUsageRecordedData
+    | RunnerProviderDiagnosticData
     | RunnerProtocolErrorData
     | RunnerHTTPErrorData
     | RunnerDoneData
@@ -241,6 +314,10 @@ class RunnerEvent:
 __all__ = [
     "RunnerEventType",
     "RunnerHTTPErrorCode",
+    "RunnerDiagnosticSeverity",
+    "RunnerDiagnosticSource",
+    "ContextOverflowDetectionKind",
+    "ContextOverflowDetection",
     "PartialToolCallSummary",
     "RunnerContentDeltaData",
     "RunnerReasoningDeltaData",
@@ -248,6 +325,7 @@ __all__ = [
     "RunnerToolCallsCompletedData",
     "RunnerContentCompletedData",
     "RunnerUsageRecordedData",
+    "RunnerProviderDiagnosticData",
     "RunnerProtocolErrorData",
     "RunnerHTTPErrorData",
     "RunnerDoneData",

@@ -20,6 +20,10 @@ from typing import TypeAlias
 from dayu.engine.contracts.agent_run import ContextBudgetSnapshot, RunResumeHint
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
+from dayu.engine.contracts.runner_events import (
+    RunnerDiagnosticSeverity,
+    RunnerDiagnosticSource,
+)
 from dayu.engine.contracts.tool_records import (
     AcceptedToolExecutionRecord,
     AwaitingToolExecutionRecord,
@@ -49,6 +53,7 @@ class EngineEventType(StrEnum):
     TOOL_AWAITING = "tool_awaiting"
     CONTEXT_COMPACTION_REQUESTED = "context_compaction_requested"
     USAGE_REPORTED = "usage_reported"
+    PROVIDER_DIAGNOSTIC = "provider_diagnostic"
     PROVIDER_PROTOCOL_ERROR = "provider_protocol_error"
     ITERATION_COMPLETED = "iteration_completed"
     FINAL_ANSWER = "final_answer"
@@ -362,6 +367,38 @@ class ProviderProtocolErrorData:
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderDiagnosticData:
+    """provider 非致命诊断提升事件 data。
+
+    :param iteration_id: 当前迭代 id。
+    :param diagnostic_code: 中性诊断码。
+    :param severity: 诊断严重级别闭集。
+    :param message: 人类可读诊断摘要。
+    :param provider_request_id: provider 侧请求 id；为 ``None`` 表示
+        未提供。
+    :param raw_payload: 有界诊断载荷；为 ``None`` 表示无。不承诺保留
+        provider 原始报错载荷。
+    :param partial_tool_calls: provider stream 诊断发生时已解析但未完成的
+        tool call 有界摘要；不包含 raw argument payload。
+    :param diagnostic_source: 产生诊断的 Runner 内部来源闭集。
+    :param client_correlation_id: 触发诊断的逻辑 Runner 调用客户端关联 id；
+        非 Runner 调用触发时为 ``None``。
+    """
+
+    iteration_id: str
+    diagnostic_code: str
+    severity: RunnerDiagnosticSeverity
+    message: str
+    provider_request_id: str | None
+    raw_payload: JsonValue | None
+    partial_tool_calls: tuple[PartialToolCallSummary, ...] = ()
+    diagnostic_source: RunnerDiagnosticSource = (
+        RunnerDiagnosticSource.HTTP_ADAPTER
+    )
+    client_correlation_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class IterationCompletedData:
     """单次 Engine 迭代完成事件 data。
 
@@ -474,6 +511,7 @@ EngineEventData: TypeAlias = (
     | ToolAwaitingData
     | ContextCompactionRequestedData
     | UsageReportedData
+    | ProviderDiagnosticData
     | ProviderProtocolErrorData
     | IterationCompletedData
     | FinalAnswerData
@@ -550,6 +588,7 @@ __all__ = [
     "ToolAwaitingData",
     "ContextCompactionRequestedData",
     "UsageReportedData",
+    "ProviderDiagnosticData",
     "ProviderProtocolErrorData",
     "PartialToolCallSummary",
     "IterationCompletedData",

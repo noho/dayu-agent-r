@@ -13,6 +13,7 @@ from dayu.engine.contracts.runner_events import (
     RunnerContentCompletedData,
     RunnerDoneData,
     RunnerEventType,
+    RunnerProviderDiagnosticData,
     RunnerProtocolErrorData,
     RunnerToolCallsCompletedData,
     RunnerUsageRecordedData,
@@ -122,12 +123,14 @@ def test_non_stream_bool_usage_logs_warning_and_omits_usage(
         )
     )
 
-    assert [
-        event.type for event in events
-    ] == [
+    assert [event.type for event in events] == [
         RunnerEventType.RUNNER_CONTENT_COMPLETED,
+        RunnerEventType.PROVIDER_DIAGNOSTIC,
         RunnerEventType.RUNNER_DONE,
     ]
+    diagnostic = events[1].data
+    assert isinstance(diagnostic, RunnerProviderDiagnosticData)
+    assert diagnostic.diagnostic_code == "usage_field_malformed"
     done = events[-1].data
     assert isinstance(done, RunnerDoneData)
     assert done.finish_reason is FinishReason.STOP
@@ -173,8 +176,12 @@ def test_non_stream_negative_usage_logs_warning_and_omits_usage(
 
     assert [event.type for event in events] == [
         RunnerEventType.RUNNER_CONTENT_COMPLETED,
+        RunnerEventType.PROVIDER_DIAGNOSTIC,
         RunnerEventType.RUNNER_DONE,
     ]
+    diagnostic = events[1].data
+    assert isinstance(diagnostic, RunnerProviderDiagnosticData)
+    assert diagnostic.diagnostic_code == "usage_field_malformed"
     assert "usage_field_malformed" in caplog.text
     done = events[-1].data
     assert isinstance(done, RunnerDoneData)
@@ -466,7 +473,7 @@ def test_non_stream_tool_call_index_ignores_non_dict_elements() -> None:
 
 
 def test_non_stream_all_non_dict_tool_calls_emit_protocol_error() -> None:
-    """非流式 tool_calls 全部非法时必须暴露明确协议错误。"""
+    """非流式 tool_calls 全部非法时逐项诊断，空结果仍 fatal。"""
 
     payload = json.dumps(
         {
@@ -490,20 +497,25 @@ def test_non_stream_all_non_dict_tool_calls_emit_protocol_error() -> None:
         )
     )
 
+    diagnostics: list[RunnerProviderDiagnosticData] = []
     protocol_errors: list[RunnerProtocolErrorData] = []
     for event in events:
+        if event.type is RunnerEventType.PROVIDER_DIAGNOSTIC:
+            diagnostic = event.data
+            assert isinstance(diagnostic, RunnerProviderDiagnosticData)
+            diagnostics.append(diagnostic)
         if event.type is RunnerEventType.PROVIDER_PROTOCOL_ERROR:
             data = event.data
             assert isinstance(data, RunnerProtocolErrorData)
             protocol_errors.append(data)
-    assert len(protocol_errors) == 3
+    assert len(diagnostics) == 2
+    for diagnostic in diagnostics:
+        assert diagnostic.provider_request_id == "req_bad_tool_calls"
+        assert diagnostic.diagnostic_code == "non_stream_tool_call_not_object"
+    assert len(protocol_errors) == 1
     for error in protocol_errors:
         assert error.provider_request_id == "req_bad_tool_calls"
-    assert [error.error_code for error in protocol_errors] == [
-        "non_stream_tool_call_not_object",
-        "non_stream_tool_call_not_object",
-        "non_stream_tool_calls_empty_after_filter",
-    ]
+    assert protocol_errors[0].error_code == "non_stream_tool_calls_empty_after_filter"
     assert events[-1].type is RunnerEventType.RUNNER_DONE
     done = events[-1].data
     assert isinstance(done, RunnerDoneData)

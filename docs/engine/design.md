@@ -261,11 +261,14 @@ OpenAI-compatible Runner 只有在 policy 为 `OPENAI_X_CLIENT_REQUEST_ID` 且�
 | `runner_tool_calls_completed` | `RunnerToolCallsCompletedData` | 保存完整工具调用请求，等待 iteration 分类 |
 | `runner_content_completed` | `RunnerContentCompletedData` | 保存完整正文与 finish reason，产出 `content_completed` |
 | `runner_usage_recorded` | `RunnerUsageRecordedData` | 产出 `usage_reported` |
+| `provider_diagnostic` | `RunnerProviderDiagnosticData` | 产出非致命 `provider_diagnostic`，不设置失败候选 |
 | `provider_protocol_error` | `RunnerProtocolErrorData` | 产出 `provider_protocol_error`，设置失败候选 |
 | `runner_http_error` | `RunnerHTTPErrorData` | 上下文超限时产出 `context_compaction_requested`，其它 HTTP 错误设置失败候选 |
 | `runner_done` | `RunnerDoneData` | 标记 Runner 完成，产出 `iteration_completed` |
 
 `RunnerEvent` 不含 `session_id` 或 `run_id`。这些字段在 `EngineEvent` 提升阶段补齐。调用方消费 Agent run 时只观察 `EngineEvent`；只有实现或测试 Runner 协议时才直接处理 `RunnerEvent`。
+
+`provider_diagnostic` 只表达 provider / adapter 非致命诊断，例如未知 provider tool-call 扩展字段、malformed usage、HTTP 200 缺失 `Content-Type` 或 context overflow message marker fallback provenance。它携带封闭 `severity`、`diagnostic_source`、诊断码、provider request id、有界 payload ref 所需材料和 partial tool-call 摘要，但不代表 run failure，不进入 Agent failure candidate。
 
 ## 10. 工具调用协议
 
@@ -460,6 +463,7 @@ Terminal event 类型固定为：
 | `tool_awaiting` | `ToolAwaitingData` | 工具进入长事务等待 |
 | `context_compaction_requested` | `ContextCompactionRequestedData` | provider 上下文超限，需要调用方重构上下文后新开 run |
 | `usage_reported` | `UsageReportedData` | provider usage 事实 |
+| `provider_diagnostic` | `ProviderDiagnosticData` | provider / adapter 非致命诊断；不代表 run failure |
 | `provider_protocol_error` | `ProviderProtocolErrorData` | provider 协议解析错误 |
 | `iteration_completed` | `IterationCompletedData` | 本轮 Runner done |
 | `final_answer` | `FinalAnswerData` | 最终回答终态 |
@@ -493,8 +497,11 @@ budget，也不做 proactive threshold compaction、provider-aware tokenizer
 1. 产出 `context_compaction_requested`。
 2. 将 `ContextCompactionRequestedData.budget_state` 设为 `None`，表示
    provider overflow 边界没有可靠预算快照。
-3. 设置失败候选 `context_compaction_required`。
-4. 在 Runner done 后以 `run_failed(recoverable=True)` 收口。
+3. 若 Runner 附带 `ContextOverflowDetection(kind=message_marker_fallback)`，
+   先产出非致命 `provider_diagnostic` 记录 adapter-owned marker fallback
+   provenance；该诊断不是业务事实来源。
+4. 设置失败候选 `context_compaction_required`。
+5. 在 Runner done 后以 `run_failed(recoverable=True)` 收口。
 
 是否压缩、如何压缩、如何重新构造消息、如何记录 before / after
 budget，以及是否再次发起 run，属于调用方在 Engine 之外的职责。

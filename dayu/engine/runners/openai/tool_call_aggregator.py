@@ -32,7 +32,12 @@ from dayu.engine.contracts.partial_tool_call import (
     PARTIAL_TOOL_CALL_ID_MAX_CHARS,
     PartialToolCallSummary,
 )
-from dayu.engine.contracts.runner_events import RunnerProtocolErrorData
+from dayu.engine.contracts.runner_events import (
+    RunnerDiagnosticSeverity,
+    RunnerDiagnosticSource,
+    RunnerProtocolErrorData,
+    RunnerProviderDiagnosticData,
+)
 from dayu.engine.runners.openai._types import _OpenAIToolCallDelta
 
 _GOOGLE_NAMESPACE: str = "google"
@@ -104,14 +109,14 @@ class ToolCallAggregateResult:
         ``tool_call_missing_name``）。出现任一致命错误时调用方必须收口为
         :class:`RunnerDoneData(FinishReason.ERROR)`，**不得**再产出
         :class:`RunnerToolCallsCompletedData`。
-    :param warnings: 非致命警告（例如未知 provider namespace / 未知
+    :param warnings: 非致命诊断（例如未知 provider namespace / 未知
         ``google.*`` 键 / 单条 delta 缺 ``index`` 与 ``id``）。调用方按
         顺序发出但不阻断成功收口。
     """
 
     tool_calls: tuple[ToolCallRequest, ...]
     fatal_errors: tuple[RunnerProtocolErrorData, ...] = field(default_factory=tuple)
-    warnings: tuple[RunnerProtocolErrorData, ...] = field(default_factory=tuple)
+    warnings: tuple[RunnerProviderDiagnosticData, ...] = field(default_factory=tuple)
 
 
 class ToolCallAggregator:
@@ -143,7 +148,7 @@ class ToolCallAggregator:
         self._next_synthetic_index: int = -1
         self._index_by_position: dict[int, int] = {}
         self._fatal_errors: list[RunnerProtocolErrorData] = []
-        self._warnings: list[RunnerProtocolErrorData] = []
+        self._warnings: list[RunnerProviderDiagnosticData] = []
 
     def _allocate_synthetic_index(self) -> int:
         """缺失 ``index`` 但有 ``id`` 时分配的合成顺序键。
@@ -248,12 +253,16 @@ class ToolCallAggregator:
         index = self._resolve_index(delta, position=position)
         if index is None:
             self._warnings.append(
-                RunnerProtocolErrorData(
-                    error_code="tool_call_missing_index_and_id",
+                RunnerProviderDiagnosticData(
+                    diagnostic_code="tool_call_missing_index_and_id",
+                    severity=RunnerDiagnosticSeverity.WARNING,
                     message="tool call delta missing both index and id",
                     provider_request_id=self._provider_request_id,
                     raw_payload=None,
                     partial_tool_calls=self.partial_summaries(),
+                    diagnostic_source=(
+                        RunnerDiagnosticSource.TOOL_CALL_AGGREGATOR
+                    ),
                 )
             )
             return None
@@ -303,24 +312,32 @@ class ToolCallAggregator:
         for namespace, inner in extra_content.items():
             if namespace != _GOOGLE_NAMESPACE:
                 self._warnings.append(
-                    RunnerProtocolErrorData(
-                        error_code="tool_call_unknown_provider_namespace",
+                    RunnerProviderDiagnosticData(
+                        diagnostic_code="tool_call_unknown_provider_namespace",
+                        severity=RunnerDiagnosticSeverity.WARNING,
                         message=(f"unknown provider namespace in tool call " f"extra_content: {namespace}"),
                         provider_request_id=self._provider_request_id,
                         raw_payload=None,
                         partial_tool_calls=self.partial_summaries(),
+                        diagnostic_source=(
+                            RunnerDiagnosticSource.TOOL_CALL_AGGREGATOR
+                        ),
                     )
                 )
                 continue
             for key in inner.keys():
                 if key not in _KNOWN_GEMINI_KEYS:
                     self._warnings.append(
-                        RunnerProtocolErrorData(
-                            error_code="tool_call_unknown_gemini_key",
+                        RunnerProviderDiagnosticData(
+                            diagnostic_code="tool_call_unknown_gemini_key",
+                            severity=RunnerDiagnosticSeverity.WARNING,
                             message=(f"unknown google.* key in tool call " f"extra_content: {key}"),
                             provider_request_id=self._provider_request_id,
                             raw_payload=None,
                             partial_tool_calls=self.partial_summaries(),
+                            diagnostic_source=(
+                                RunnerDiagnosticSource.TOOL_CALL_AGGREGATOR
+                            ),
                         )
                     )
             signature = inner.get(_GEMINI_THOUGHT_SIGNATURE_KEY)

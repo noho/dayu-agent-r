@@ -115,6 +115,50 @@ def _append_terminal_event(
     )
 
 
+def _append_diagnostic_event(
+    transaction_runner: HostTransactionRunner,
+    *,
+    event_id: str,
+    event_type: str,
+    run_id: str,
+    payload: JsonValue,
+) -> EventLogRow:
+    """追加 Outbox projection 测试 diagnostic EventLog row。
+
+    :param transaction_runner: Host durable transaction runner。
+    :param event_id: EventLog id。
+    :param event_type: EventLog type。
+    :param run_id: Run id。
+    :param payload: inline payload。
+    :returns: 已追加 EventLog row。
+    """
+
+    return transaction_runner.run_write(
+        lambda transaction: append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=event_id,
+                event_class=EventClass.DIAGNOSTIC,
+                session_id="session-1",
+                run_id=run_id,
+                attempt_id="attempt-1",
+                execution_id="execution-1",
+                event_type=event_type,
+                occurred_at=_FIXED_NOW,
+                actor="host",
+                source="unit-test",
+                client_request_id=None,
+                idempotency_key=None,
+                policy_decision=None,
+                reason={"reason": "test"},
+                payload_json=payload,
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        ).row
+    )
+
+
 def _run_outbox_once(
     transaction_runner: HostTransactionRunner,
     *,
@@ -230,6 +274,41 @@ def test_terminal_item_idempotency_key_is_stable(tmp_path: Path) -> None:
     assert first == second
     assert first.item_id.startswith("outbox-terminal-")
     assert first.idempotency_key.startswith("sha256:")
+
+
+def test_provider_diagnostic_is_excluded_from_outbox_terminal_projection(
+    tmp_path: Path,
+) -> None:
+    """PROVIDER_DIAGNOSTIC 是 diagnostic，不进入 Outbox terminal queue。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        diagnostic = _append_diagnostic_event(
+            store.transaction_runner,
+            event_id="event-provider-diagnostic",
+            event_type="PROVIDER_DIAGNOSTIC",
+            run_id="run-1",
+            payload={
+                "diagnostic_code": "usage_field_malformed",
+                "severity": "warning",
+                "message": "usage ignored",
+            },
+        )
+
+        result = store.transaction_runner.run_write(
+            lambda transaction: OutboxTerminalProjectionConsumer().apply_event(
+                transaction,
+                projection_event_view_from_row(diagnostic),
+            )
+        )
+        item = store.transaction_runner.run_read(
+            lambda transaction: read_outbox_terminal_item_by_event_id(
+                transaction,
+                diagnostic.event_id,
+            )
+        )
+
+        assert result.status is ProjectionApplyStatus.SKIPPED
+        assert item is None
 
 
 def test_same_terminal_event_replay_does_not_duplicate(tmp_path: Path) -> None:

@@ -600,12 +600,45 @@ def test_provider_protocol_error_activity_is_bounded(tmp_path: pathlib.Path) -> 
 
     activity = event.activity
     assert activity is not None
-    assert activity.kind is HostActivityKind.PROVIDER_DIAGNOSTIC
+    assert activity.kind is HostActivityKind.PROVIDER_PROTOCOL_ERROR
+    assert activity.status is HostActivityStatus.FAILED
     assert activity.severity is HostActivitySeverity.WARNING
     assert activity.summary is not None
     assert "invalid_stream" in activity.summary
     assert "payload-secret-ref" not in activity.summary
     assert len(activity.summary) <= 180
+
+
+def test_provider_diagnostic_activity_is_nonfatal(tmp_path: pathlib.Path) -> None:
+    """provider diagnostic activity 明确显示非致命诊断。"""
+
+    event = _project_event(
+        tmp_path,
+        _row(
+            event_id="event-provider-diagnostic",
+            event_class=EventClass.DIAGNOSTIC,
+            session_id="session-direct",
+            run_id="run-direct",
+            event_type="PROVIDER_DIAGNOSTIC",
+            payload={
+                "diagnostic_code": "usage_field_malformed",
+                "diagnostic_source": "sse_parser",
+                "message": "usage ignored",
+                "payload_ref": "payload-secret-ref",
+            },
+        ),
+    )
+
+    activity = event.activity
+    assert activity is not None
+    assert activity.kind is HostActivityKind.PROVIDER_DIAGNOSTIC
+    assert activity.status is HostActivityStatus.INFO
+    assert activity.severity is HostActivitySeverity.WARNING
+    assert activity.title == "模型非致命诊断"
+    assert activity.summary is not None
+    assert "usage_field_malformed" in activity.summary
+    assert "sse_parser" in activity.summary
+    assert "payload-secret-ref" not in activity.summary
 
 
 @pytest.mark.parametrize(

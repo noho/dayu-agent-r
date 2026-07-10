@@ -42,11 +42,16 @@ from dayu.contracts.tool_schema import ToolSchema
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import AgentMessage
 from dayu.engine.contracts.runner_events import (
+    ContextOverflowDetection,
+    ContextOverflowDetectionKind,
     RunnerDoneData,
+    RunnerDiagnosticSeverity,
+    RunnerDiagnosticSource,
     RunnerEvent,
     RunnerEventType,
     RunnerHTTPErrorCode,
     RunnerHTTPErrorData,
+    RunnerProviderDiagnosticData,
 )
 from dayu.engine.contracts.runner_identity import RunnerRequestIdentity
 from dayu.engine.contracts.runner_spec import (
@@ -99,6 +104,12 @@ _PROVIDER_REQUEST_ID_HEADER_NAMES: tuple[str, ...] = (
 )
 # HTTP error body 只用于诊断与 JSON 错误对象解析，必须显式有界读取。
 _HTTP_ERROR_BODY_MAX_BYTES: int = 65_536
+_MISSING_CONTENT_TYPE_DIAGNOSTIC_CODE: str = "runner.http.missing_content_type"
+_MISSING_CONTENT_TYPE_MESSAGE: str = (
+    "HTTP 200 provider response omitted Content-Type; adapter used fallback parser"
+)
+_PARSE_MODE_SSE_FALLBACK: str = "sse_fallback"
+_PARSE_MODE_JSON_FALLBACK: str = "json_fallback"
 
 _AwaitableResult = TypeVar("_AwaitableResult")
 
@@ -313,6 +324,7 @@ class _AttemptFailedTerminal(Exception):
         message_text: str,
         provider_request_id: str | None,
         raw_payload: JsonValue | None,
+        context_overflow_detection: ContextOverflowDetection | None = None,
     ) -> None:
         super().__init__(message_text)
         self.error_code: RunnerHTTPErrorCode = error_code
@@ -320,6 +332,9 @@ class _AttemptFailedTerminal(Exception):
         self.message_text: str = message_text
         self.provider_request_id: str | None = provider_request_id
         self.raw_payload: JsonValue | None = raw_payload
+        self.context_overflow_detection: ContextOverflowDetection | None = (
+            context_overflow_detection
+        )
 
 
 class AsyncOpenAIRunner:
@@ -479,6 +494,9 @@ class AsyncOpenAIRunner:
                         provider_request_id=failure.provider_request_id,
                         raw_payload=failure.raw_payload,
                         attempt=attempt,
+                        context_overflow_detection=(
+                            failure.context_overflow_detection
+                        ),
                     )
                     event_count += 1
                     yield self._make_done_event(
@@ -687,9 +705,13 @@ class AsyncOpenAIRunner:
                     response.headers.get("Retry-After")
                 )
                 error_body = await self._safe_read_error_body(response)
-                if detect_context_overflow(
+                context_overflow_detection = detect_context_overflow(
                     http_status=response.status,
                     response_text=error_body.message_text,
+                )
+                if (
+                    context_overflow_detection.kind
+                    is not ContextOverflowDetectionKind.NOT_OVERFLOW
                 ):
                     raise _AttemptFailedTerminal(
                         error_code=RunnerHTTPErrorCode.CONTEXT_LENGTH_EXCEEDED,
@@ -698,6 +720,7 @@ class AsyncOpenAIRunner:
                         or f"HTTP {response.status}",
                         provider_request_id=provider_request_id,
                         raw_payload=error_body.raw_payload,
+                        context_overflow_detection=context_overflow_detection,
                     )
                 if is_retriable(error_code):
                     raise _AttemptFailedRetriable(
@@ -720,18 +743,31 @@ class AsyncOpenAIRunner:
             content_type = (
                 response.headers.get("Content-Type") or ""
             ).lower()
-            if options.stream and content_type.strip() == "":
+            missing_content_type = content_type.strip() == ""
+            if missing_content_type:
                 _LOGGER.warning(
-                    "runner.http.missing_content_type stream=true "
+                    "runner.http.missing_content_type stream=%s "
                     "provider_request_id=%s",
+                    options.stream,
                     provider_request_id,
                 )
             hook = detect_reasoning_protocol_hook(
                 self._spec.provider_request
             )
-            if _is_sse_response(
+            parse_as_sse = _is_sse_response(
                 content_type=content_type, stream=options.stream
-            ):
+            )
+            if missing_content_type:
+                yield self._make_missing_content_type_diagnostic(
+                    provider_request_id=provider_request_id,
+                    stream=options.stream,
+                    parse_mode=(
+                        _PARSE_MODE_SSE_FALLBACK
+                        if parse_as_sse
+                        else _PARSE_MODE_JSON_FALLBACK
+                    ),
+                )
+            if parse_as_sse:
                 parser = SSEParser(
                     hook=hook, provider_request_id=provider_request_id
                 )
@@ -1075,6 +1111,7 @@ class AsyncOpenAIRunner:
         provider_request_id: str | None,
         raw_payload: JsonValue | None,
         attempt: int,
+        context_overflow_detection: ContextOverflowDetection | None = None,
     ) -> RunnerEvent:
         """构造 HTTP 错误事件。"""
 
@@ -1086,10 +1123,43 @@ class AsyncOpenAIRunner:
             raw_payload=raw_payload,
             attempt=attempt,
             retried=attempt > 1,
+            context_overflow_detection=context_overflow_detection,
         )
         return RunnerEvent(
             type=RunnerEventType.RUNNER_HTTP_ERROR,
             data=data,
+            occurred_at=datetime.now(tz=timezone.utc),
+        )
+
+    def _make_missing_content_type_diagnostic(
+        self,
+        *,
+        provider_request_id: str | None,
+        stream: bool,
+        parse_mode: str,
+    ) -> RunnerEvent:
+        """构造 HTTP 200 缺失 Content-Type 的非致命诊断事件。
+
+        :param provider_request_id: provider response request id。
+        :param stream: 本次 effective Runner option 是否请求流式。
+        :param parse_mode: adapter 采用的 fallback 解析模式。
+        :returns: Runner provider diagnostic event。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return RunnerEvent(
+            type=RunnerEventType.PROVIDER_DIAGNOSTIC,
+            data=RunnerProviderDiagnosticData(
+                diagnostic_code=_MISSING_CONTENT_TYPE_DIAGNOSTIC_CODE,
+                severity=RunnerDiagnosticSeverity.WARNING,
+                message=_MISSING_CONTENT_TYPE_MESSAGE,
+                provider_request_id=provider_request_id,
+                raw_payload={
+                    "stream_requested": stream,
+                    "fallback_parse_mode": parse_mode,
+                },
+                diagnostic_source=RunnerDiagnosticSource.HTTP_ADAPTER,
+            ),
             occurred_at=datetime.now(tz=timezone.utc),
         )
 

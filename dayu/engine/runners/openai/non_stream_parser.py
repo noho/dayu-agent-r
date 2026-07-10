@@ -33,9 +33,12 @@ from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.runner_events import (
     RunnerContentCompletedData,
     RunnerDoneData,
+    RunnerDiagnosticSeverity,
+    RunnerDiagnosticSource,
     RunnerEvent,
     RunnerEventType,
     RunnerProtocolErrorData,
+    RunnerProviderDiagnosticData,
     RunnerToolCallsCompletedData,
     RunnerUsageRecordedData,
 )
@@ -69,11 +72,16 @@ _PROVIDER_ERROR_CODE: str = "non_stream_provider_error"
 _TOOL_CALL_NOT_OBJECT_CODE: str = "non_stream_tool_call_not_object"
 _TOOL_CALLS_EMPTY_AFTER_FILTER_CODE: str = "non_stream_tool_calls_empty_after_filter"
 _TOOL_CALL_ARGUMENTS_NOT_OBJECT_CODE: str = "tool_call_arguments_not_object"
+_USAGE_FIELD_MALFORMED_CODE: str = "usage_field_malformed"
+_USAGE_FIELD_MALFORMED_MESSAGE: str = (
+    "provider usage fields were missing or malformed; token usage was ignored"
+)
 
 _NonStreamRunnerEventData: TypeAlias = (
     RunnerContentCompletedData
     | RunnerToolCallsCompletedData
     | RunnerUsageRecordedData
+    | RunnerProviderDiagnosticData
     | RunnerProtocolErrorData
     | RunnerDoneData
 )
@@ -94,6 +102,8 @@ def _make_event(data: _NonStreamRunnerEventData) -> RunnerEvent:
             event_type = RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED
         case RunnerUsageRecordedData():
             event_type = RunnerEventType.RUNNER_USAGE_RECORDED
+        case RunnerProviderDiagnosticData():
+            event_type = RunnerEventType.PROVIDER_DIAGNOSTIC
         case RunnerProtocolErrorData():
             event_type = RunnerEventType.PROVIDER_PROTOCOL_ERROR
         case RunnerDoneData():
@@ -334,6 +344,22 @@ def _emit_from_dict(
                 type(completion_tokens).__name__,
                 type(total_tokens).__name__,
             )
+            yield _make_event(
+                RunnerProviderDiagnosticData(
+                    diagnostic_code=_USAGE_FIELD_MALFORMED_CODE,
+                    severity=RunnerDiagnosticSeverity.WARNING,
+                    message=_USAGE_FIELD_MALFORMED_MESSAGE,
+                    provider_request_id=provider_request_id,
+                    raw_payload={
+                        "prompt_tokens_type": type(prompt_tokens).__name__,
+                        "completion_tokens_type": (
+                            type(completion_tokens).__name__
+                        ),
+                        "total_tokens_type": type(total_tokens).__name__,
+                    },
+                    diagnostic_source=RunnerDiagnosticSource.NON_STREAM_PARSER,
+                )
+            )
         else:
             yield _make_event(
                 RunnerUsageRecordedData(
@@ -415,12 +441,12 @@ class _NonStreamToolCallsResult:
 
     :param tool_calls: 成功归一化的工具调用元组。
     :param fatal_errors: 阻止成功收口的 fatal 协议错误。
-    :param warnings: 可恢复的协议告警事件。
+    :param warnings: 可恢复的非致命诊断事件。
     """
 
     tool_calls: tuple[ToolCallRequest, ...]
     fatal_errors: tuple[RunnerProtocolErrorData, ...]
-    warnings: tuple[RunnerProtocolErrorData, ...]
+    warnings: tuple[RunnerProviderDiagnosticData, ...]
 
 
 def _build_tool_calls(
@@ -447,17 +473,21 @@ def _build_tool_calls(
 
     aggregator = ToolCallAggregator(provider_request_id=provider_request_id)
     fatal_errors: list[RunnerProtocolErrorData] = []
-    warnings: list[RunnerProtocolErrorData] = []
+    warnings: list[RunnerProviderDiagnosticData] = []
     index = 0
     valid_raw_count = 0
     for position, raw in enumerate(raw_tool_calls):
         if not isinstance(raw, dict):
             warnings.append(
-                RunnerProtocolErrorData(
-                    error_code=_TOOL_CALL_NOT_OBJECT_CODE,
+                RunnerProviderDiagnosticData(
+                    diagnostic_code=_TOOL_CALL_NOT_OBJECT_CODE,
+                    severity=RunnerDiagnosticSeverity.WARNING,
                     message=f"non-stream tool_calls[{position}] is not a JSON object",
                     provider_request_id=provider_request_id,
                     raw_payload=None,
+                    diagnostic_source=(
+                        RunnerDiagnosticSource.NON_STREAM_PARSER
+                    ),
                 )
             )
             continue

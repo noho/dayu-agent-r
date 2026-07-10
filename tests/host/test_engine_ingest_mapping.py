@@ -34,6 +34,7 @@ from dayu.engine.contracts.engine_events import (
     FinalAnswerData,
     IterationCompletedData,
     IterationStartedData,
+    ProviderDiagnosticData,
     ProviderProtocolErrorData,
     ReasoningDeltaData,
     RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION,
@@ -59,6 +60,10 @@ from dayu.engine.contracts.runner_spec import (
     ClientCorrelationPolicy,
     RunnerCallOptions,
     RunnerSpec,
+)
+from dayu.engine.contracts.runner_events import (
+    RunnerDiagnosticSeverity,
+    RunnerDiagnosticSource,
 )
 from dayu.engine.contracts.tool_records import (
     AcceptedToolExecutionRecord,
@@ -2240,6 +2245,54 @@ def test_provider_protocol_error_is_diagnostic_without_state_change(
             "provider_error_code": "invalid_stream",
             "diagnostic_refs": [payload["raw_payload_ref"], "req-protocol"],
         }
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.RUNNING
+        assert attempt_status == AttemptStatus.RUNNING
+
+
+def test_provider_diagnostic_is_nonfatal_diagnostic_without_failure_metadata(
+    tmp_path: Path,
+) -> None:
+    """provider diagnostic 持久化为非致命诊断，不改变 active Run 状态。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _candidate(
+            seeded,
+            worker_event_index=11,
+            data=ProviderDiagnosticData(
+                iteration_id="iter-diagnostic",
+                diagnostic_code="usage_field_malformed",
+                severity=RunnerDiagnosticSeverity.WARNING,
+                message="usage ignored",
+                provider_request_id="req-diagnostic",
+                raw_payload={"prompt_tokens_type": "str"},
+                partial_tool_calls=(),
+                diagnostic_source=RunnerDiagnosticSource.SSE_PARSER,
+                client_correlation_id="client-diagnostic",
+            ),
+            event_type=EngineEventType.PROVIDER_DIAGNOSTIC,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.terminal_closeout is False
+        assert result.events[0].event_class == EventClass.DIAGNOSTIC
+        assert result.events[0].event_type == "PROVIDER_DIAGNOSTIC"
+        payload = _payload(result.events[0])
+        assert payload["diagnostic_code"] == "usage_field_malformed"
+        assert payload["severity"] == "warning"
+        assert payload["message"] == "usage ignored"
+        assert payload["provider_request_id"] == "req-diagnostic"
+        assert payload["client_correlation_id"] == "client-diagnostic"
+        assert payload["diagnostic_source"] == "sse_parser"
+        assert payload["payload_ref"] is not None
+        assert payload["payload_digest"] is not None
+        assert payload["partial_tool_call_count"] == 0
+        assert "failure_metadata" not in payload
+        assert "provider_error_code" not in payload
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
         assert attempt_status == AttemptStatus.RUNNING

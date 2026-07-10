@@ -108,6 +108,7 @@ _EVENT_TYPE_CONTEXT_COMPACTION_REQUESTED = "CONTEXT_COMPACTION_REQUESTED"
 _EVENT_TYPE_CONTEXT_COMPACTED = "CONTEXT_COMPACTED"
 _EVENT_TYPE_CONTEXT_COMPACTION_FAILED = "CONTEXT_COMPACTION_FAILED"
 _EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED = "CONTEXT_COMPACTION_ATTEMPT_REJECTED"
+_EVENT_TYPE_PROVIDER_DIAGNOSTIC = "PROVIDER_DIAGNOSTIC"
 _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR = "PROVIDER_PROTOCOL_ERROR"
 _EVENT_TYPE_REASONING_DELTA = "REASONING_DELTA"
 _PAYLOAD_FIELD_CONTENT = "content"
@@ -115,6 +116,8 @@ _PAYLOAD_FIELD_FINISH_REASON = "finish_reason"
 _PAYLOAD_FIELD_FILTERED = "filtered"
 _PAYLOAD_FIELD_DEGRADED = "degraded"
 _PAYLOAD_FIELD_MESSAGE = "message"
+_PAYLOAD_FIELD_DIAGNOSTIC_CODE = "diagnostic_code"
+_PAYLOAD_FIELD_DIAGNOSTIC_SOURCE = "diagnostic_source"
 _PAYLOAD_FIELD_REASON = "reason"
 _PAYLOAD_FIELD_PROVIDER_REQUEST_ID = "provider_request_id"
 _PAYLOAD_FIELD_CLIENT_CORRELATION_ID = "client_correlation_id"
@@ -1092,6 +1095,8 @@ def _activity_from_row(
         return _context_compaction_activity(row)
     if row.event_type == _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR:
         return _provider_protocol_error_activity(row)
+    if row.event_type == _EVENT_TYPE_PROVIDER_DIAGNOSTIC:
+        return _provider_diagnostic_activity(row)
     return None
 
 
@@ -1405,10 +1410,10 @@ def _context_compaction_activity(row: EventLogRow) -> HostActivityView | None:
 
 
 def _provider_protocol_error_activity(row: EventLogRow) -> HostActivityView | None:
-    """投影 provider protocol diagnostic activity。
+    """投影 provider fatal protocol error activity。
 
     :param row: PROVIDER_PROTOCOL_ERROR EventLog row。
-    :returns: provider diagnostic activity。
+    :returns: provider protocol error activity。
     :raises: 无主动抛出。
     """
 
@@ -1426,9 +1431,37 @@ def _provider_protocol_error_activity(row: EventLogRow) -> HostActivityView | No
     message = _bounded_summary(_payload_text(payload, _PAYLOAD_FIELD_MESSAGE))
     summary = _join_summary_parts(error_code, message)
     return HostActivityView(
-        kind=HostActivityKind.PROVIDER_DIAGNOSTIC,
+        kind=HostActivityKind.PROVIDER_PROTOCOL_ERROR,
         status=HostActivityStatus.FAILED,
         title="模型协议诊断",
+        summary=summary,
+        severity=HostActivitySeverity.WARNING,
+        tool_name=None,
+        tool_display_name=None,
+        counts=None,
+    )
+
+
+def _provider_diagnostic_activity(row: EventLogRow) -> HostActivityView | None:
+    """投影 provider 非致命诊断 activity。
+
+    :param row: PROVIDER_DIAGNOSTIC EventLog row。
+    :returns: provider diagnostic activity。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    payload = _activity_payload_without_descriptor(row)
+    diagnostic_code = _payload_text(payload, _PAYLOAD_FIELD_DIAGNOSTIC_CODE)
+    message = _bounded_summary(_payload_text(payload, _PAYLOAD_FIELD_MESSAGE))
+    source = _payload_text(payload, _PAYLOAD_FIELD_DIAGNOSTIC_SOURCE)
+    summary = _join_summary_parts(
+        _join_summary_parts(diagnostic_code, source),
+        message,
+    )
+    return HostActivityView(
+        kind=HostActivityKind.PROVIDER_DIAGNOSTIC,
+        status=HostActivityStatus.INFO,
+        title="模型非致命诊断",
         summary=summary,
         severity=HostActivitySeverity.WARNING,
         tool_name=None,

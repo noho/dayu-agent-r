@@ -66,6 +66,7 @@ from dayu.engine.contracts.engine_events import (
     IterationCompletedData,
     IterationStartedData,
     ProviderProtocolErrorData,
+    ProviderDiagnosticData,
     RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION,
     RUN_SUSPENDED_REASON_TOOL_AWAITING,
     ReasoningDeltaData,
@@ -97,14 +98,18 @@ from dayu.engine.contracts.messages import (
 )
 from dayu.engine.contracts.runner import AsyncRunner
 from dayu.engine.contracts.runner_events import (
+    ContextOverflowDetectionKind,
     RunnerContentCompletedData,
     RunnerContentDeltaData,
+    RunnerDiagnosticSeverity,
+    RunnerDiagnosticSource,
     RunnerDoneData,
     RunnerEvent,
     RunnerEventType,
     RunnerHTTPErrorCode,
     RunnerHTTPErrorData,
     RunnerProtocolErrorData,
+    RunnerProviderDiagnosticData,
     RunnerReasoningDeltaData,
     RunnerToolCallDeltaData,
     RunnerToolCallsCompletedData,
@@ -162,6 +167,9 @@ _RUNNER_ERROR_WITHOUT_DETAIL_MESSAGE: str = (
 )
 _CONTEXT_COMPACTION_REQUIRED_MESSAGE: str = (
     "provider context overflow requires Host compaction"
+)
+_CONTEXT_OVERFLOW_MARKER_FALLBACK_CODE: str = (
+    "context_overflow_message_marker_fallback"
 )
 _RUNNER_ABNORMAL_STOP_MESSAGE: str = "runner stopped without done event"
 _MAX_ITERATIONS_EXCEEDED_MESSAGE: str = (
@@ -1215,11 +1223,11 @@ class _AsyncAgent:
                 tools,
                 request_identity=request_identity,
             ):
-                engine_event = self._consume_runner_event(
+                engine_events = self._consume_runner_event(
                     runner_event=runner_event,
                     iteration_id=iteration_id,
                 )
-                if engine_event is not None:
+                for engine_event in engine_events:
                     yield engine_event
                 if self._is_cancelled():
                     yield await self._make_cancelled_terminal_with_close()
@@ -1274,13 +1282,13 @@ class _AsyncAgent:
 
     def _consume_runner_event(
         self, *, runner_event: RunnerEvent, iteration_id: str
-    ) -> EngineEvent | None:
+    ) -> tuple[EngineEvent, ...]:
         """消费单个 RunnerEvent 并按需提升为 EngineEvent。
 
         :param runner_event: Runner 产出的事件。
         :param iteration_id: 当前迭代 id。
-        :returns: 需要向 Host 暴露的 EngineEvent；HTTP error 仅记录失败
-            候选，返回 ``None``。
+        :returns: 需要向 Host 暴露的 EngineEvent 元组；HTTP error 通常仅
+            记录失败候选，返回空元组。
         :raises RuntimeError: 内部迭代状态缺失时抛出。
         """
 
@@ -1291,21 +1299,25 @@ class _AsyncAgent:
         data = runner_event.data
         if isinstance(data, RunnerContentDeltaData):
             state.content_chunks.append(data.delta)
-            return self._make_event(
-                event_type=EngineEventType.CONTENT_DELTA,
-                data=ContentDeltaData(
-                    iteration_id=iteration_id, delta=data.delta
+            return (
+                self._make_event(
+                    event_type=EngineEventType.CONTENT_DELTA,
+                    data=ContentDeltaData(
+                        iteration_id=iteration_id, delta=data.delta
+                    ),
+                    occurred_at=runner_event.occurred_at,
                 ),
-                occurred_at=runner_event.occurred_at,
             )
         if isinstance(data, RunnerReasoningDeltaData):
             state.reasoning_chunks.append(data.delta)
-            return self._make_event(
-                event_type=EngineEventType.REASONING_DELTA,
-                data=ReasoningDeltaData(
-                    iteration_id=iteration_id, delta=data.delta
+            return (
+                self._make_event(
+                    event_type=EngineEventType.REASONING_DELTA,
+                    data=ReasoningDeltaData(
+                        iteration_id=iteration_id, delta=data.delta
+                    ),
+                    occurred_at=runner_event.occurred_at,
                 ),
-                occurred_at=runner_event.occurred_at,
             )
         if isinstance(data, RunnerContentCompletedData):
             state.completed_content = data.content
@@ -1321,14 +1333,16 @@ class _AsyncAgent:
                 data.content is not None,
                 data.reasoning_content is not None,
             )
-            return self._make_event(
-                event_type=EngineEventType.CONTENT_COMPLETED,
-                data=ContentCompleteData(
-                    iteration_id=iteration_id,
-                    content=data.content,
-                    reasoning_content=data.reasoning_content,
+            return (
+                self._make_event(
+                    event_type=EngineEventType.CONTENT_COMPLETED,
+                    data=ContentCompleteData(
+                        iteration_id=iteration_id,
+                        content=data.content,
+                        reasoning_content=data.reasoning_content,
+                    ),
+                    occurred_at=runner_event.occurred_at,
                 ),
-                occurred_at=runner_event.occurred_at,
             )
         if isinstance(data, RunnerUsageRecordedData):
             _LOGGER.debug(
@@ -1345,16 +1359,39 @@ class _AsyncAgent:
                 data.total_tokens,
                 data.provider_request_id,
             )
-            return self._make_event(
-                event_type=EngineEventType.USAGE_REPORTED,
-                data=UsageReportedData(
-                    iteration_id=iteration_id,
-                    prompt_tokens=data.prompt_tokens,
-                    completion_tokens=data.completion_tokens,
-                    total_tokens=data.total_tokens,
-                    provider_request_id=data.provider_request_id,
+            return (
+                self._make_event(
+                    event_type=EngineEventType.USAGE_REPORTED,
+                    data=UsageReportedData(
+                        iteration_id=iteration_id,
+                        prompt_tokens=data.prompt_tokens,
+                        completion_tokens=data.completion_tokens,
+                        total_tokens=data.total_tokens,
+                        provider_request_id=data.provider_request_id,
+                    ),
+                    occurred_at=runner_event.occurred_at,
                 ),
-                occurred_at=runner_event.occurred_at,
+            )
+        if isinstance(data, RunnerProviderDiagnosticData):
+            _LOGGER.debug(
+                "engine.agent.runner_event_classified session_id=%s "
+                "run_id=%s iteration_id=%s event_type=%s diagnostic_code=%s "
+                "provider_request_id=%s diagnostic_source=%s",
+                self._request.session_id,
+                self._request.run_id,
+                iteration_id,
+                runner_event.type.value,
+                data.diagnostic_code,
+                data.provider_request_id,
+                data.diagnostic_source.value,
+            )
+            return (
+                self._provider_diagnostic_event(
+                    data=data,
+                    iteration_id=iteration_id,
+                    occurred_at=runner_event.occurred_at,
+                    state=state,
+                ),
             )
         if isinstance(data, RunnerProtocolErrorData):
             _LOGGER.debug(
@@ -1375,20 +1412,22 @@ class _AsyncAgent:
                 client_correlation_id=_client_correlation_id_from_state(state),
                 recoverable=False,
             )
-            return self._make_event(
-                event_type=EngineEventType.PROVIDER_PROTOCOL_ERROR,
-                data=ProviderProtocolErrorData(
-                    iteration_id=iteration_id,
-                    error_code=data.error_code,
-                    message=data.message,
-                    provider_request_id=data.provider_request_id,
-                    raw_payload=data.raw_payload,
-                    partial_tool_calls=data.partial_tool_calls,
-                    client_correlation_id=_client_correlation_id_from_state(
-                        state
+            return (
+                self._make_event(
+                    event_type=EngineEventType.PROVIDER_PROTOCOL_ERROR,
+                    data=ProviderProtocolErrorData(
+                        iteration_id=iteration_id,
+                        error_code=data.error_code,
+                        message=data.message,
+                        provider_request_id=data.provider_request_id,
+                        raw_payload=data.raw_payload,
+                        partial_tool_calls=data.partial_tool_calls,
+                        client_correlation_id=_client_correlation_id_from_state(
+                            state
+                        ),
                     ),
+                    occurred_at=runner_event.occurred_at,
                 ),
-                occurred_at=runner_event.occurred_at,
             )
         if isinstance(data, RunnerHTTPErrorData):
             _LOGGER.debug(
@@ -1425,18 +1464,11 @@ class _AsyncAgent:
                     ),
                     recoverable=True,
                 )
-                return self._make_event(
-                    event_type=EngineEventType.CONTEXT_COMPACTION_REQUESTED,
-                    data=ContextCompactionRequestedData(
-                        iteration_id=iteration_id,
-                        budget_state=None,
-                        reason=_ERROR_CONTEXT_COMPACTION_REQUIRED,
-                        provider_request_id=data.provider_request_id,
-                        client_correlation_id=_client_correlation_id_from_state(
-                            state
-                        ),
-                    ),
+                return self._context_overflow_engine_events(
+                    data=data,
+                    iteration_id=iteration_id,
                     occurred_at=runner_event.occurred_at,
+                    state=state,
                 )
             state.failure_candidate = RunFailedData(
                 error_code=data.error_code.value,
@@ -1445,7 +1477,7 @@ class _AsyncAgent:
                 client_correlation_id=_client_correlation_id_from_state(state),
                 recoverable=False,
             )
-            return None
+            return ()
         if isinstance(data, RunnerDoneData):
             state.done_seen = True
             state.finish_reason = data.finish_reason
@@ -1461,17 +1493,19 @@ class _AsyncAgent:
                 data.finish_reason.value,
                 data.provider_request_id,
             )
-            return self._make_event(
-                event_type=EngineEventType.ITERATION_COMPLETED,
-                data=IterationCompletedData(
-                    iteration_id=iteration_id,
-                    finish_reason=data.finish_reason,
-                    provider_request_id=data.provider_request_id,
-                    client_correlation_id=_client_correlation_id_from_state(
-                        state
+            return (
+                self._make_event(
+                    event_type=EngineEventType.ITERATION_COMPLETED,
+                    data=IterationCompletedData(
+                        iteration_id=iteration_id,
+                        finish_reason=data.finish_reason,
+                        provider_request_id=data.provider_request_id,
+                        client_correlation_id=_client_correlation_id_from_state(
+                            state
+                        ),
                     ),
+                    occurred_at=runner_event.occurred_at,
                 ),
-                occurred_at=runner_event.occurred_at,
             )
         if isinstance(data, RunnerToolCallDeltaData):
             state.tool_call_signal_seen = True
@@ -1483,16 +1517,18 @@ class _AsyncAgent:
                 iteration_id,
                 runner_event.type.value,
             )
-            return self._make_event(
-                event_type=EngineEventType.TOOL_CALL_DELTA,
-                data=ToolCallDeltaData(
-                    iteration_id=iteration_id,
-                    tool_call_index=data.tool_call_index,
-                    tool_call_id=data.tool_call_id,
-                    name_delta=data.name_delta,
-                    arguments_delta=data.arguments_delta,
+            return (
+                self._make_event(
+                    event_type=EngineEventType.TOOL_CALL_DELTA,
+                    data=ToolCallDeltaData(
+                        iteration_id=iteration_id,
+                        tool_call_index=data.tool_call_index,
+                        tool_call_id=data.tool_call_id,
+                        name_delta=data.name_delta,
+                        arguments_delta=data.arguments_delta,
+                    ),
+                    occurred_at=runner_event.occurred_at,
                 ),
-                occurred_at=runner_event.occurred_at,
             )
         if isinstance(data, RunnerToolCallsCompletedData):
             state.tool_call_signal_seen = True
@@ -1511,8 +1547,103 @@ class _AsyncAgent:
                 data.content is not None,
                 data.reasoning_content is not None,
             )
-            return None
+            return ()
         assert_never(data)
+
+    def _provider_diagnostic_event(
+        self,
+        *,
+        data: RunnerProviderDiagnosticData,
+        iteration_id: str,
+        occurred_at: datetime,
+        state: _IterationState,
+    ) -> EngineEvent:
+        """把 Runner 非致命诊断提升为 Engine diagnostic。
+
+        :param data: Runner 非致命诊断 data。
+        :param iteration_id: 当前迭代 id。
+        :param occurred_at: Runner event 发生时间。
+        :param state: 当前迭代消费状态。
+        :returns: Engine provider diagnostic event。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self._make_event(
+            event_type=EngineEventType.PROVIDER_DIAGNOSTIC,
+            data=ProviderDiagnosticData(
+                iteration_id=iteration_id,
+                diagnostic_code=data.diagnostic_code,
+                severity=data.severity,
+                message=data.message,
+                provider_request_id=data.provider_request_id,
+                raw_payload=data.raw_payload,
+                partial_tool_calls=data.partial_tool_calls,
+                diagnostic_source=data.diagnostic_source,
+                client_correlation_id=_client_correlation_id_from_state(state),
+            ),
+            occurred_at=occurred_at,
+        )
+
+    def _context_overflow_engine_events(
+        self,
+        *,
+        data: RunnerHTTPErrorData,
+        iteration_id: str,
+        occurred_at: datetime,
+        state: _IterationState,
+    ) -> tuple[EngineEvent, ...]:
+        """构造 context overflow 相关 Engine 事件。
+
+        :param data: Runner HTTP error data。
+        :param iteration_id: 当前迭代 id。
+        :param occurred_at: Runner event 发生时间。
+        :param state: 当前迭代消费状态。
+        :returns: 先诊断、后压缩请求的 EngineEvent 元组。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        compaction_event = self._make_event(
+            event_type=EngineEventType.CONTEXT_COMPACTION_REQUESTED,
+            data=ContextCompactionRequestedData(
+                iteration_id=iteration_id,
+                budget_state=None,
+                reason=_ERROR_CONTEXT_COMPACTION_REQUIRED,
+                provider_request_id=data.provider_request_id,
+                client_correlation_id=_client_correlation_id_from_state(state),
+            ),
+            occurred_at=occurred_at,
+        )
+        detection = data.context_overflow_detection
+        if (
+            detection is None
+            or detection.kind
+            is not ContextOverflowDetectionKind.MESSAGE_MARKER_FALLBACK
+        ):
+            return (compaction_event,)
+        diagnostic_code = (
+            detection.diagnostic_code
+            or _CONTEXT_OVERFLOW_MARKER_FALLBACK_CODE
+        )
+        message = detection.message or (
+            "provider context overflow was detected by adapter-owned "
+            "message marker fallback"
+        )
+        diagnostic_event = self._provider_diagnostic_event(
+            data=RunnerProviderDiagnosticData(
+                diagnostic_code=diagnostic_code,
+                severity=RunnerDiagnosticSeverity.WARNING,
+                message=message,
+                provider_request_id=data.provider_request_id,
+                raw_payload=detection.raw_payload,
+                diagnostic_source=(
+                    RunnerDiagnosticSource.CONTEXT_OVERFLOW_CLASSIFIER
+                ),
+            ),
+            iteration_id=iteration_id,
+            occurred_at=occurred_at,
+            state=state,
+        )
+        return (diagnostic_event, compaction_event)
 
     def _classify_iteration(
         self,

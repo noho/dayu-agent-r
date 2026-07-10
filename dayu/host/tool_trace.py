@@ -100,6 +100,7 @@ _EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED = (
 )
 _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED = "RUNNER_CALL_INPUT_ASSEMBLED"
 _EVENT_TYPE_ENGINE_EVENT_DIAGNOSTIC = "ENGINE_EVENT_DIAGNOSTIC"
+_EVENT_TYPE_PROVIDER_DIAGNOSTIC = "PROVIDER_DIAGNOSTIC"
 _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR = "PROVIDER_PROTOCOL_ERROR"
 _EVENT_TYPE_USAGE_REPORTED = "USAGE_REPORTED"
 _FIELD_ATTEMPT_ID = "attempt_id"
@@ -225,6 +226,7 @@ _CANONICAL_EVENT_TYPES: tuple[str, ...] = (
 )
 _DIAGNOSTIC_EVENT_TYPES: tuple[str, ...] = (
     _EVENT_TYPE_ENGINE_EVENT_DIAGNOSTIC,
+    _EVENT_TYPE_PROVIDER_DIAGNOSTIC,
     _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR,
 )
 _PROJECTION_SIGNAL_EVENT_TYPES: tuple[str, ...] = (_EVENT_TYPE_USAGE_REPORTED,)
@@ -946,8 +948,14 @@ def _extract_diagnostic_trace(event: ProjectionEventView) -> _ToolTraceExtract |
         and client_correlation_id is None
     ):
         return None
-    raw_payload_ref = _optional_text(payload, "raw_payload_ref")
-    raw_payload_digest = _optional_text(payload, "raw_payload_digest")
+    raw_payload_ref = _first_text(
+        _optional_text(payload, "raw_payload_ref"),
+        _optional_text(payload, _FIELD_PAYLOAD_REF),
+    )
+    raw_payload_digest = _first_text(
+        _optional_text(payload, "raw_payload_digest"),
+        _optional_text(payload, _FIELD_PAYLOAD_DIGEST),
+    )
     diagnostic_refs = tuple(
         ref for ref in (raw_payload_ref, provider_request_id) if ref is not None
     )
@@ -973,7 +981,11 @@ def _extract_diagnostic_trace(event: ProjectionEventView) -> _ToolTraceExtract |
             reuse_prior_event_refs=None,
             truncation=None,
             diagnostic_refs=diagnostic_refs,
-            provider_error_ref=raw_payload_ref,
+            provider_error_ref=(
+                None
+                if event.event_type == _EVENT_TYPE_PROVIDER_DIAGNOSTIC
+                else raw_payload_ref
+            ),
             engine_event_ref=None,
             terminal_summary_ref=None,
             terminal_summary_digest=None,

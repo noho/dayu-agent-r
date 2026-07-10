@@ -35,10 +35,13 @@ from dayu.engine.contracts.runner_events import (
     RunnerContentCompletedData,
     RunnerContentDeltaData,
     RunnerDoneData,
+    RunnerDiagnosticSeverity,
+    RunnerDiagnosticSource,
     RunnerEvent,
     RunnerEventData,
     RunnerEventType,
     RunnerProtocolErrorData,
+    RunnerProviderDiagnosticData,
     RunnerReasoningDeltaData,
     RunnerToolCallDeltaData,
     RunnerToolCallsCompletedData,
@@ -83,6 +86,10 @@ _LINE_TOO_LONG_CODE: str = "sse_line_too_long"
 _DATA_LINES_TOO_MANY_CODE: str = "sse_data_lines_too_many"
 _MISSING_TERMINAL_FINISH_REASON_CODE: str = "sse_missing_finish_reason"
 _MISSING_TERMINAL_FINISH_REASON: str = "missing_terminal_finish_reason"
+_USAGE_FIELD_MALFORMED_CODE: str = "usage_field_malformed"
+_USAGE_FIELD_MALFORMED_MESSAGE: str = (
+    "provider usage fields were missing or malformed; token usage was ignored"
+)
 _MAX_SSE_LINE_CHARS: int = 1024 * 1024
 _MAX_SSE_DATA_LINES: int = 256
 
@@ -121,6 +128,8 @@ def _event_type_for(data: RunnerEventData) -> RunnerEventType:
             return RunnerEventType.RUNNER_CONTENT_COMPLETED
         case RunnerUsageRecordedData():
             return RunnerEventType.RUNNER_USAGE_RECORDED
+        case RunnerProviderDiagnosticData():
+            return RunnerEventType.PROVIDER_DIAGNOSTIC
         case RunnerProtocolErrorData():
             return RunnerEventType.PROVIDER_PROTOCOL_ERROR
         case RunnerDoneData():
@@ -636,6 +645,23 @@ class SSEParser:
                 type(prompt_tokens).__name__,
                 type(completion_tokens).__name__,
                 type(total_tokens).__name__,
+            )
+            yield _make_event(
+                RunnerProviderDiagnosticData(
+                    diagnostic_code=_USAGE_FIELD_MALFORMED_CODE,
+                    severity=RunnerDiagnosticSeverity.WARNING,
+                    message=_USAGE_FIELD_MALFORMED_MESSAGE,
+                    provider_request_id=self._provider_request_id,
+                    raw_payload={
+                        "prompt_tokens_type": type(prompt_tokens).__name__,
+                        "completion_tokens_type": (
+                            type(completion_tokens).__name__
+                        ),
+                        "total_tokens_type": type(total_tokens).__name__,
+                    },
+                    partial_tool_calls=self._aggregator.partial_summaries(),
+                    diagnostic_source=RunnerDiagnosticSource.SSE_PARSER,
+                )
             )
             return
         yield _make_event(

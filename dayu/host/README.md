@@ -399,6 +399,8 @@ Conversation Memory 是 Session-level projection / read model，只消费 commit
 
 Outbox 从 terminal facts 派生离线 terminal notification item；audit JSONL 记录操作流水和 destructive purge 诊断；tool trace 记录工具执行 hot rows 与诊断，并投影 context pressure、tool timing、failure metadata、runner-call manifest refs / digests 等只读结构化 signal。Tool Trace 在缺少 provider request id 但存在 client correlation id 时仍保留该诊断关联字段，不把客户端关联 id 伪装成 provider request id。Tool Trace 查询层提供 resolver，可从 refs/digests 按需恢复 runner input projection、selected tool schema snapshot、工具参数、工具结果 payload 和 terminal final answer；hot row 与 cold JSONL 会保存 bounded、脱敏、业务可读的工具请求 / 结果摘要，但不内联大明文。`TOOL_CALL_REQUESTED` 摘要来自 request atom；`TOOL_RESULT_ACCEPTED` 摘要通过 accepted evidence envelope 回到同源 request atom，并从 raw tool outcome 派生结果 details。它们都不能反向驱动 Run / Attempt 状态，也不能从 `TOOL_AWAITING` 或 wait / poll 治理状态推断 LLM-facing 业务语义。
 
+`PROVIDER_DIAGNOSTIC` 是非致命诊断，只能作为 Read API `provider_diagnostic` / `info` activity 与 Tool Trace diagnostic 展示，不写 failure metadata，不进入 Outbox terminal item、Conversation Memory、final answer、accepted evidence material、compact material 或 LLM-facing prompt messages。fatal `PROVIDER_PROTOCOL_ERROR` 在 Read API 中使用独立 `provider_protocol_error` activity kind，避免 UI / Service 从 provider diagnostic kind 反推致命错误。
+
 ## 关键执行路径
 
 ### 打开与关闭 Host
@@ -535,7 +537,7 @@ Host EventLog event class 包括：
 
 - `CANONICAL_FACT`：恢复、状态索引、memory、outbox、audit 和 Run terminal truth 的事实来源。
 - `PREVIEW`：面向 UI 流式体验的展示事件，例如 iteration preview、reasoning delta、content completed、tool batch ready / done、tool request / result accepted preview。content / tool-call delta 默认只作为 transient ingest 信号接受，不写入主 EventLog，也不参与 durable replay；reasoning delta 写入 PREVIEW row 只用于 live thinking 展示。
-- `DIAGNOSTIC`：诊断、拒绝、provider protocol、closeout、projection 或 recovery 观察。
+- `DIAGNOSTIC`：诊断、拒绝、非致命 provider diagnostic、provider protocol、closeout、projection 或 recovery 观察。
 - `PROJECTION_SIGNAL`：projection catch-up 与派生视图状态信号。
 
 Host terminal event kind 包括 `SUCCEEDED`、`FAILED`、`CANCELLED`、`LOST`。`HostEvent` 是 Service-facing typed view，携带 `event_id`、`event_sequence`、`session_id`、`run_id`、EventLog public `event_class` / `event_type`、`kind`、可选 `HostActivityView`、可选 `HostThinkingView`、dedupe key、terminal status、final answer 或错误 / cancel 摘要。progress event 不携带 terminal payload；succeeded terminal 必须携带 `HostFinalAnswerView`；failed / cancelled / lost terminal 不携带 final answer。`RUN_LOST` 是 Host terminal / read API 的 `lost` 事实，但 public outbox terminal item 只覆盖 succeeded / failed / cancelled，不把 lost 伪装成可投递 terminal item。`HostActivityView` 只承载 UI / Service 安全展示字段，工具 activity 的展示名来自 Host admission 冻结的 effective tool display snapshot，缺失时 fallback 稳定工具名；content / reasoning delta 不投影 raw delta activity，其中 reasoning delta 通过独立 `HostThinkingView` 暴露给 UI / Service。
@@ -617,7 +619,7 @@ positive orphan proof 需要 durable owner liveness 与本机进程证据支持�
 
 ### EngineEvent ingest
 
-Host ingest 对 Engine-origin final answer、run failed、cancelled、usage、iteration_started、tool awaiting confirmation 与 context compaction request 分别建模；worker lost 属于独立 Host lifecycle path。EngineEvent 进入 Host 前只是 worker 输入，必须匹配 run / attempt / execution identity 与当前 durable state；迟到、错 execution、错状态或无法链接 runner-call manifest 的事件会 fail closed 为 diagnostic / rejected path。Host lifecycle path 同样校验 durable identity，但使用自己的 event namespace、source 与 late-event routing。
+Host ingest 对 Engine-origin final answer、run failed、cancelled、usage、iteration_started、provider diagnostic、tool awaiting confirmation 与 context compaction request 分别建模；worker lost 属于独立 Host lifecycle path。EngineEvent 进入 Host 前只是 worker 输入，必须匹配 run / attempt / execution identity 与当前 durable state；迟到、错 execution、错状态或无法链接 runner-call manifest 的事件会 fail closed 为 diagnostic / rejected path。Host lifecycle path 同样校验 durable identity，但使用自己的 event namespace、source 与 late-event routing。
 
 同步 ingest 不处理需要异步 compact 的 reactive path；异步 ingest 在必要时执行 reactive compact / recovery。`iteration_started` 会显式链接 Host 先前写入的 `RUNNER_CALL_INPUT_ASSEMBLED` manifest；missing、ambiguous、mismatch 或 link conflict 都以 `ENGINE_EVENT_REJECTED` 收口，避免 provider observation 与 Host input manifest 脱节。已有 prior iteration 后的 Engine-only continuation 使用 `iteration_started.input_projection` 保存真实 runner input projection；projection 缺失时保留 limited diagnostic。
 
