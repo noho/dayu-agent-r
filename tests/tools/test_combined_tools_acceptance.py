@@ -583,10 +583,10 @@ def test_web_provider_serial_policy_holds_under_concurrent_calls(
     max_active_calls = 0
 
     def fake_search_public_web(**kwargs: JsonValue) -> Mapping[str, JsonValue]:
-        """记录并发进入次数并返回确定性结果。
+        """记录并发进入次数并返回确定性 provider 事实。
 
         :param kwargs: search_web 投影后的关键字参数。
-        :returns: 当前工具成功响应。
+        :returns: 当前 provider 搜索事实。
         :raises AssertionError: 参数未包含查询时抛出。
         """
 
@@ -600,10 +600,6 @@ def test_web_provider_serial_policy_holds_under_concurrent_calls(
                 "domains": [],
                 "total": 0,
                 "preferred_result": None,
-                "preferred_result_summary": "",
-                "next_action": "refine_query",
-                "next_action_args": {},
-                "hint": "try another query",
                 "results": [],
             }
         finally:

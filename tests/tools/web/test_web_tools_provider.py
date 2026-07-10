@@ -66,7 +66,7 @@ from dayu.runtime.tools_discovery import (
 )
 from dayu.tools.web import discover_tools
 from dayu.tools.web import web_playwright_backend
-from dayu.tools.web import web_cancellation_text
+from dayu.tools.web import web_tool_projection_text
 from dayu.tools.web import web_search_providers
 from dayu.tools.web import web_tools
 
@@ -449,6 +449,23 @@ def test_web_provider_discovers_search_and_fetch() -> None:
     assert result.provider_reports[0].tool_names == _WEB_TOOL_NAMES
 
 
+def test_web_tool_display_and_description_stay_at_declaration_boundary() -> None:
+    """Web 工具展示名和描述应保留在 tool declaration 边界。"""
+
+    definitions = _definitions_by_name(_discover_definitions({}))
+    search_definition = definitions["search_web"]
+    fetch_definition = definitions["fetch_web_page"]
+
+    assert search_definition.display is not None
+    assert search_definition.display.name == "联网搜索"
+    assert search_definition.schema.function.description == "搜索公开网页来源。"
+    assert fetch_definition.display is not None
+    assert fetch_definition.display.name == "抓取网页"
+    assert fetch_definition.schema.function.description == (
+        "抓取网页正文并转成 Markdown。失败时先看 hint 和 next_action，再决定重试、换来源或忽略当前网页。"
+    )
+
+
 def test_web_audit_matrix_context_injection_and_schema_no_leak() -> None:
     """Web 工具 schema 不得暴露 Host 治理字段。"""
 
@@ -718,6 +735,135 @@ def test_web_toolruntime_cancel_real_process_target_has_no_late_accept() -> None
     )
 
 
+def test_search_public_web_provider_result_excludes_llm_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """search provider 边界只返回结构化事实，不生成 LLM guidance 字段。"""
+
+    def fake_search_with_duckduckgo(
+        *,
+        query: str,
+        domains: list[str],
+        max_results: int,
+        timeout_seconds: float,
+        timeout_budget: float | None = None,
+        deadline_monotonic: float | None = None,
+        normalize_whitespace: Callable[[str], str],
+        resolve_timeout_budget: web_search_providers._TimeoutBudgetResolver,
+    ) -> list[web_search_providers.SearchResultRow]:
+        """返回确定性 provider 原始结果。
+
+        :param query: 检索关键词。
+        :param domains: 域名过滤。
+        :param max_results: 返回数量。
+        :param timeout_seconds: HTTP 请求超时秒数。
+        :param timeout_budget: 工具调用总预算。
+        :param deadline_monotonic: 工具调用 deadline。
+        :param normalize_whitespace: 空白规整函数。
+        :param resolve_timeout_budget: timeout 预算解析函数。
+        :returns: 单条 provider 原始结果。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        del (
+            query,
+            domains,
+            max_results,
+            timeout_seconds,
+            timeout_budget,
+            deadline_monotonic,
+            normalize_whitespace,
+            resolve_timeout_budget,
+        )
+        return [
+            {
+                "title": "10-K",
+                "url": "https://www.sec.gov/Archives/example.htm",
+                "snippet": "annual report",
+                "published_date": "",
+            }
+        ]
+
+    def is_safe_public_url(
+        url: str,
+        *,
+        allow_private_network_url: bool = False,
+    ) -> bool:
+        """测试用 URL 安全判断。
+
+        :param url: 候选 URL。
+        :param allow_private_network_url: 是否允许私网 URL。
+        :returns: 始终允许。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        del url, allow_private_network_url
+        return True
+
+    def normalize_whitespace(value: str) -> str:
+        """规整测试文本空白。
+
+        :param value: 原始文本。
+        :returns: 合并连续空白后的文本。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return " ".join(value.split())
+
+    def resolve_timeout_budget(
+        timeout_seconds: float,
+        *,
+        timeout_budget: float | None = None,
+        deadline_monotonic: float | None = None,
+    ) -> float:
+        """返回测试 timeout。
+
+        :param timeout_seconds: 基础 timeout。
+        :param timeout_budget: 工具调用总预算。
+        :param deadline_monotonic: 工具调用 deadline。
+        :returns: 原始 timeout。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        del timeout_budget, deadline_monotonic
+        return timeout_seconds
+
+    monkeypatch.setattr(
+        web_search_providers,
+        "_search_with_duckduckgo",
+        fake_search_with_duckduckgo,
+    )
+
+    result = web_search_providers.search_public_web(
+        query="revenue",
+        domains=["sec.gov"],
+        recency_days=None,
+        max_results=3,
+        max_search_results=10,
+        provider="duckduckgo",
+        request_timeout_seconds=1.0,
+        timeout_budget=None,
+        deadline_monotonic=None,
+        allow_private_network_url=False,
+        is_safe_public_url=is_safe_public_url,
+        normalize_whitespace=normalize_whitespace,
+        resolve_timeout_budget=resolve_timeout_budget,
+    )
+    result_mapping = cast(Mapping[str, JsonValue], result)
+
+    assert set(result_mapping) == {
+        "query",
+        "domains",
+        "total",
+        "preferred_result",
+        "results",
+    }
+    assert "hint" not in result_mapping
+    assert "next_action" not in result_mapping
+    assert "next_action_args" not in result_mapping
+    assert "preferred_result_summary" not in result_mapping
+
+
 def test_search_web_projects_optional_arguments_and_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -726,10 +872,10 @@ def test_search_web_projects_optional_arguments_and_success(
     calls: list[Mapping[str, JsonValue]] = []
 
     def fake_search_public_web(**kwargs: JsonValue) -> Mapping[str, JsonValue]:
-        """记录搜索调用参数并返回确定性结果。
+        """记录搜索调用参数并返回确定性 provider 事实。
 
         :param kwargs: search_web 传入的关键字参数。
-        :returns: 确定性搜索结果。
+        :returns: 确定性 provider 搜索事实。
         """
 
         calls.append(kwargs)
@@ -743,10 +889,6 @@ def test_search_web_projects_optional_arguments_and_success(
                 "snippet": "annual report",
                 "published_date": "",
             },
-            "preferred_result_summary": "10-K annual report",
-            "next_action": "fetch_web_page",
-            "next_action_args": {"url": "https://www.sec.gov/Archives/example.htm"},
-            "hint": "fetch the preferred result",
             "results": [
                 {
                     "title": "10-K",
@@ -778,6 +920,12 @@ def test_search_web_projects_optional_arguments_and_success(
     assert isinstance(outcome, ToolCompletedOutcome)
     value = _mapping_value(outcome.result.value)
     assert value["total"] == 1
+    assert value["preferred_result_summary"] == (
+        "首选结果；标题：10-K；URL：https://www.sec.gov/Archives/example.htm；摘要：annual report"
+    )
+    assert value["next_action"] == "fetch_web_page"
+    assert value["next_action_args"] == {"url": "https://www.sec.gov/Archives/example.htm"}
+    assert "fetch_web_page" in str(value["hint"])
     assert calls[0]["domains"] == ["sec.gov"]
     assert calls[0]["recency_days"] == 7
     assert calls[0]["max_results"] == 3
@@ -797,10 +945,10 @@ def test_search_web_receives_provider_config(
     calls: list[Mapping[str, JsonValue]] = []
 
     def fake_search_public_web(**kwargs: JsonValue) -> Mapping[str, JsonValue]:
-        """记录 search_web 闭包参数。
+        """记录 search_web 闭包参数并返回 provider 事实。
 
         :param kwargs: search_web 传入的关键字参数。
-        :returns: 确定性空搜索结果。
+        :returns: 确定性空 provider 搜索事实。
         """
 
         calls.append(kwargs)
@@ -809,10 +957,6 @@ def test_search_web_receives_provider_config(
             "domains": [],
             "total": 0,
             "preferred_result": None,
-            "preferred_result_summary": "",
-            "next_action": "refine_query",
-            "next_action_args": {},
-            "hint": "refine query",
             "results": [],
         }
 
@@ -863,7 +1007,7 @@ def test_search_web_receives_execution_context_and_passes_cancellation_token(
         normalize_whitespace: Callable[[str], str],
         resolve_timeout_budget: web_search_providers._TimeoutBudgetResolver,
         cancellation_token: CancellationToken | None = None,
-    ) -> web_search_providers.SearchWebOutput:
+    ) -> web_search_providers.SearchWebProviderResult:
         """记录 token identity 并返回确定性搜索结果。
 
         :param query: 检索关键词。
@@ -880,7 +1024,7 @@ def test_search_web_receives_execution_context_and_passes_cancellation_token(
         :param normalize_whitespace: 空白规整函数。
         :param resolve_timeout_budget: timeout 预算解析函数。
         :param cancellation_token: execution context 注入的取消令牌。
-        :returns: 确定性搜索结果。
+        :returns: 确定性 provider 搜索事实。
         :raises Exception: 不主动抛出异常。
         """
 
@@ -903,10 +1047,6 @@ def test_search_web_receives_execution_context_and_passes_cancellation_token(
             "domains": [],
             "total": 0,
             "preferred_result": None,
-            "preferred_result_summary": "",
-            "next_action": "refine_query",
-            "next_action_args": {},
-            "hint": f"returned {max_results} or fewer results",
             "results": [],
         }
 
@@ -949,7 +1089,7 @@ def test_search_web_cancelled_before_provider_returns_host_cancelled(
         normalize_whitespace: Callable[[str], str],
         resolve_timeout_budget: web_search_providers._TimeoutBudgetResolver,
         cancellation_token: CancellationToken | None = None,
-    ) -> web_search_providers.SearchWebOutput:
+    ) -> web_search_providers.SearchWebProviderResult:
         """记录非预期 provider 调用。
 
         :param query: 检索关键词。
@@ -966,7 +1106,7 @@ def test_search_web_cancelled_before_provider_returns_host_cancelled(
         :param normalize_whitespace: 空白规整函数。
         :param resolve_timeout_budget: timeout 预算解析函数。
         :param cancellation_token: execution context 注入的取消令牌。
-        :returns: 空搜索结果。
+        :returns: 空 provider 搜索事实。
         :raises Exception: 不主动抛出异常。
         """
 
@@ -991,10 +1131,6 @@ def test_search_web_cancelled_before_provider_returns_host_cancelled(
             "domains": [],
             "total": 0,
             "preferred_result": None,
-            "preferred_result_summary": "",
-            "next_action": "refine_query",
-            "next_action_args": {},
-            "hint": "unexpected provider call",
             "results": [],
         }
 
@@ -1012,9 +1148,10 @@ def test_search_web_cancelled_before_provider_returns_host_cancelled(
     assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
     assert outcome.meta is not None
     assert outcome.meta.tool_name == "search_web"
+    assert outcome.message == web_tool_projection_text.WEB_SEARCH_CANCELLED_MESSAGE
     _assert_no_governance_text(f"{outcome.message} {outcome.hint or ''}")
     assert outcome.hint is not None
-    assert outcome.hint == web_cancellation_text.WEB_CANCELLED_HINT
+    assert outcome.hint == web_tool_projection_text.WEB_CANCELLED_HINT
     assert search_calls == []
 
 
@@ -1039,7 +1176,7 @@ def test_search_web_deep_cancel_message_is_sanitized(
         normalize_whitespace: Callable[[str], str],
         resolve_timeout_budget: web_search_providers._TimeoutBudgetResolver,
         cancellation_token: CancellationToken | None = None,
-    ) -> web_search_providers.SearchWebOutput:
+    ) -> web_search_providers.SearchWebProviderResult:
         """模拟搜索 provider 在深层 checkpoint 抛出携带治理字段的取消。
 
         :param query: 检索关键词。
@@ -1078,7 +1215,6 @@ def test_search_web_deep_cancel_message_is_sanitized(
         )
         raise web_search_providers.WebSearchCancelledError(
             message="run_id=run-web correlation_id=correlation-web digest=sha256:web",
-            hint="[continue_without_web] Host cancelled.",
         )
 
     monkeypatch.setattr(web_tools, "search_public_web", fake_search_public_web)
@@ -1093,6 +1229,7 @@ def test_search_web_deep_cancel_message_is_sanitized(
 
     assert isinstance(outcome, ToolCancelledOutcome)
     assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
+    assert outcome.message == web_tool_projection_text.WEB_SEARCH_CANCELLED_MESSAGE
     _assert_no_governance_text(f"{outcome.message} {outcome.hint or ''}")
 
 
@@ -1221,8 +1358,9 @@ def test_fetch_web_page_cancelled_before_work_returns_safe_host_cancelled() -> N
     assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
     assert outcome.meta is not None
     assert outcome.meta.tool_name == "fetch_web_page"
+    assert outcome.message == web_tool_projection_text.WEB_FETCH_CANCELLED_MESSAGE
     _assert_no_governance_text(f"{outcome.message} {outcome.hint or ''}")
-    assert outcome.hint == web_cancellation_text.WEB_CANCELLED_HINT
+    assert outcome.hint == web_tool_projection_text.WEB_CANCELLED_HINT
 
 
 def test_fetch_web_page_deep_runtime_cancel_message_is_sanitized(
@@ -1257,6 +1395,7 @@ def test_fetch_web_page_deep_runtime_cancel_message_is_sanitized(
 
     assert isinstance(outcome, ToolCancelledOutcome)
     assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
+    assert outcome.message == web_tool_projection_text.WEB_FETCH_CANCELLED_MESSAGE
     _assert_no_governance_text(f"{outcome.message} {outcome.hint or ''}")
 
 
@@ -1394,8 +1533,9 @@ def test_fetch_playwright_cancel_projects_to_host_cancelled(
     assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
     assert outcome.meta is not None
     assert outcome.meta.tool_name == "fetch_web_page"
+    assert outcome.message == web_tool_projection_text.WEB_FETCH_CANCELLED_MESSAGE
     assert outcome.hint is not None
-    assert outcome.hint == web_cancellation_text.WEB_CANCELLED_HINT
+    assert outcome.hint == web_tool_projection_text.WEB_CANCELLED_HINT
     assert received_playwright_tokens == [token]
 
 
@@ -2067,10 +2207,10 @@ def test_web_provider_serializes_search_and_fetch_business(
     observed_overlap = False
 
     def fake_search_public_web(**kwargs: JsonValue) -> Mapping[str, JsonValue]:
-        """记录搜索业务体进入并返回确定性结果。
+        """记录搜索业务体进入并返回确定性 provider 事实。
 
         :param kwargs: search_web 传入的关键字参数。
-        :returns: 确定性搜索结果。
+        :returns: 确定性 provider 搜索事实。
         :raises Exception: 不主动抛出异常。
         """
 
@@ -2081,10 +2221,6 @@ def test_web_provider_serializes_search_and_fetch_business(
             "domains": [],
             "total": 0,
             "preferred_result": None,
-            "preferred_result_summary": "",
-            "next_action": "refine_query",
-            "next_action_args": {},
-            "hint": "refine query",
             "results": [],
         }
 

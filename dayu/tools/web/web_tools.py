@@ -66,7 +66,6 @@ from .web_challenge_detection import (
     BotChallengeDetectionResult,
     detect_bot_challenge as _detect_bot_challenge,
 )
-from .web_cancellation_text import WEB_CANCELLED_HINT
 from .web_http_encoding import (
     _build_accept_encoding_value,
     _decode_response_text,
@@ -104,11 +103,18 @@ from .web_recovery import (
     normalize_next_action,
     normalize_reason,
 )
+from .web_search_projection import SearchWebOutput, build_search_web_output
 from .web_search_providers import (
-    SearchWebOutput,
+    SearchWebProviderResult,
     WebSearchCancelledError,
     WebSearchProviderUnavailableError,
     search_public_web,
+)
+from .web_tool_projection_text import (
+    WEB_CANCELLED_HINT,
+    WEB_FETCH_CANCELLED_MESSAGE,
+    WEB_SEARCH_PROVIDER_UNAVAILABLE_HINT,
+    WEB_SEARCH_CANCELLED_MESSAGE,
 )
 
 MODULE = "ENGINE.WEB_TOOLS"
@@ -158,14 +164,6 @@ _FETCH_WEB_PAGE_PARAMETERS: Final[ToolParametersSchema] = ToolParametersSchema(
     additional_properties=False,
 )
 _SEARCH_PROVIDER_UNAVAILABLE_ERROR: Final[str] = "search_provider_unavailable"
-_SEARCH_PROVIDER_UNAVAILABLE_HINT: Final[str] = (
-    "[retry_later_or_use_known_source] Search providers are currently unavailable; "
-    "retry later, refine the query, or continue with a known source URL."
-)
-_WEB_SEARCH_CANCELLED_MESSAGE: Final[str] = "网页搜索工具调用已停止。"
-_WEB_FETCH_CANCELLED_MESSAGE: Final[str] = "网页抓取工具调用已停止。"
-
-
 WebPayload: TypeAlias = dict[str, JsonValue]
 WebMapping: TypeAlias = Mapping[str, JsonValue]
 StagePayload: TypeAlias = dict[str, str | bool | int | float | None]
@@ -501,7 +499,7 @@ class _WebProcessTarget:
             return _web_process_failed_envelope(
                 error_type=_SEARCH_PROVIDER_UNAVAILABLE_ERROR,
                 message=failure.message,
-                hint=_SEARCH_PROVIDER_UNAVAILABLE_HINT,
+                hint=WEB_SEARCH_PROVIDER_UNAVAILABLE_HINT,
             )
         except (WebToolCancelledError, WebSearchCancelledError):
             return _web_process_failed_envelope(
@@ -741,7 +739,7 @@ def _raise_fetch_cancelled() -> NoReturn:
     """
 
     raise WebToolCancelledError(
-        message=_WEB_FETCH_CANCELLED_MESSAGE,
+        message=WEB_FETCH_CANCELLED_MESSAGE,
         hint=WEB_CANCELLED_HINT,
     )
 
@@ -1337,7 +1335,7 @@ async def _call_search_web(
         return _host_cancelled_from_token(
             tool_name=_SEARCH_WEB_TOOL_NAME,
             started_at=started_at,
-            message=_WEB_SEARCH_CANCELLED_MESSAGE,
+            message=WEB_SEARCH_CANCELLED_MESSAGE,
             hint=WEB_CANCELLED_HINT,
         )
 
@@ -1356,7 +1354,7 @@ async def _call_search_web(
                 return _host_cancelled_from_token(
                     tool_name=_SEARCH_WEB_TOOL_NAME,
                     started_at=started_at,
-                    message=_WEB_SEARCH_CANCELLED_MESSAGE,
+                    message=WEB_SEARCH_CANCELLED_MESSAGE,
                     hint=WEB_CANCELLED_HINT,
                 )
             value = await asyncio.to_thread(
@@ -1374,7 +1372,7 @@ async def _call_search_web(
             tool_name=_SEARCH_WEB_TOOL_NAME,
             started_at=started_at,
             finished_at=datetime.now(UTC),
-            message=_WEB_SEARCH_CANCELLED_MESSAGE,
+            message=WEB_SEARCH_CANCELLED_MESSAGE,
             hint=WEB_CANCELLED_HINT,
         )
     except WebSearchProviderUnavailableError as exc:
@@ -1382,7 +1380,7 @@ async def _call_search_web(
             tool_name=_SEARCH_WEB_TOOL_NAME,
             error=_SEARCH_PROVIDER_UNAVAILABLE_ERROR,
             message=exc.message,
-            hint=_SEARCH_PROVIDER_UNAVAILABLE_HINT,
+            hint=WEB_SEARCH_PROVIDER_UNAVAILABLE_HINT,
             started_at=started_at,
             finished_at=datetime.now(UTC),
         )
@@ -1436,7 +1434,7 @@ async def _call_fetch_web_page(
         return _host_cancelled_from_token(
             tool_name=_FETCH_WEB_PAGE_TOOL_NAME,
             started_at=started_at,
-            message=_WEB_FETCH_CANCELLED_MESSAGE,
+            message=WEB_FETCH_CANCELLED_MESSAGE,
             hint=WEB_CANCELLED_HINT,
         )
 
@@ -1447,7 +1445,7 @@ async def _call_fetch_web_page(
                 return _host_cancelled_from_token(
                     tool_name=_FETCH_WEB_PAGE_TOOL_NAME,
                     started_at=started_at,
-                    message=_WEB_FETCH_CANCELLED_MESSAGE,
+                    message=WEB_FETCH_CANCELLED_MESSAGE,
                     hint=WEB_CANCELLED_HINT,
                 )
             value = await asyncio.to_thread(
@@ -1515,7 +1513,7 @@ def _search_web_business(
     """
 
     _raise_if_host_cancelled(cancellation_token)
-    return search_public_web(
+    provider_result: SearchWebProviderResult = search_public_web(
         query=query,
         domains=domains,
         recency_days=recency_days,
@@ -1531,6 +1529,7 @@ def _search_web_business(
         resolve_timeout_budget=_resolve_timeout_budget,
         cancellation_token=cancellation_token,
     )
+    return build_search_web_output(provider_result)
 
 
 def _execute_web_process_business_value(

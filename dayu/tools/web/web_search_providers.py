@@ -1,7 +1,8 @@
-"""联网检索 provider 与结果组装。
+"""联网检索 provider 与结构化事实组装。
 
 本模块只负责 `search_web` 的 provider 选择、请求发送、结果解析与
-返回结果组装，不承载网页抓取、HTML 转换或浏览器回退逻辑。
+返回结构化检索事实，不承载网页抓取、HTML 转换、浏览器回退逻辑或
+面向 LLM 的下一步动作提示。
 """
 
 from __future__ import annotations
@@ -16,17 +17,13 @@ from bs4 import BeautifulSoup
 
 from dayu.contracts.cancellation import CancellationToken
 
-from .web_cancellation_text import WEB_CANCELLED_HINT
-
 MODULE = "ENGINE.WEB_SEARCH"
 _LOGGER = logging.getLogger(__name__)
 SERPER_API_KEY_ENV = "SERPER_API_KEY"
 TAVILY_API_KEY_ENV = "TAVILY_API_KEY"
 
-_SEARCH_WEB_SNIPPET_PREVIEW_CHARS = 240
-_SEARCH_WEB_NEXT_ACTION_FETCH_PAGE = "fetch_web_page"
-_SEARCH_WEB_NEXT_ACTION_REFINE_QUERY = "refine_query"
 _ALL_PROVIDERS_UNAVAILABLE_MESSAGE: Final[str] = "联网检索失败：所有 provider 均不可用"
+_SEARCH_CANCELLED_MESSAGE: Final[str] = "工具调用已取消"
 
 
 class Log:
@@ -69,47 +66,40 @@ class SearchResultRow(TypedDict):
     published_date: str
 
 
-class SearchWebOutput(TypedDict):
-    """`search_web` 对外返回结构。"""
+class SearchWebProviderResult(TypedDict):
+    """联网检索 provider 返回的结构化事实。"""
 
     query: str
     domains: list[str]
     total: int
     preferred_result: SearchResultRow | None
-    preferred_result_summary: str
-    next_action: str
-    next_action_args: dict[str, str]
-    hint: str
     results: list[SearchResultRow]
 
 
 class WebSearchCancelledError(Exception):
     """联网检索观察到 Host 取消时的模块内异常。
 
-    :param message: 面向 LLM 的取消说明。
-    :param hint: 恢复提示。
+    :param message: 中性的取消说明；不包含 Host 治理字段或恢复提示。
     :returns: 无。
     :raises Exception: 构造期不主动抛出异常。
     """
 
-    def __init__(self, message: str, hint: str) -> None:
+    def __init__(self, message: str) -> None:
         """初始化取消异常。
 
-        :param message: 取消说明。
-        :param hint: 恢复提示。
+        :param message: 中性的取消说明。
         :returns: ``None``。
         :raises Exception: 构造期不主动抛出异常。
         """
 
         super().__init__(message)
         self.message = message
-        self.hint = hint
 
 
 class WebSearchProviderUnavailableError(RuntimeError):
     """所有搜索 provider 均不可用时的稳定业务失败。
 
-    :param message: 面向 LLM 的失败说明。
+    :param message: 稳定业务失败说明。
     :returns: 无。
     :raises Exception: 构造期不主动抛出异常。
     """
@@ -117,7 +107,7 @@ class WebSearchProviderUnavailableError(RuntimeError):
     def __init__(self, message: str) -> None:
         """初始化 provider 不可用异常。
 
-        :param message: 失败说明。
+        :param message: 稳定业务失败说明。
         :returns: ``None``。
         :raises Exception: 构造期不主动抛出异常。
         """
@@ -195,8 +185,8 @@ def search_public_web(
     normalize_whitespace: Callable[[str], str],
     resolve_timeout_budget: _TimeoutBudgetResolver,
     cancellation_token: CancellationToken | None = None,
-) -> SearchWebOutput:
-    """执行公开网页检索并组装 tool 输出。
+) -> SearchWebProviderResult:
+    """执行公开网页检索并组装结构化 provider 事实。
 
     Args:
         query: 原始查询文本。
@@ -215,7 +205,7 @@ def search_public_web(
         cancellation_token: 当前工具调用取消令牌。
 
     Returns:
-        `search_web` 对外返回字典。
+        结构化联网检索事实，尚未包含面向 LLM 的下一步动作提示。
 
     Raises:
         ValueError: 当 query 或 domains 非法时抛出。
@@ -289,16 +279,6 @@ def search_public_web(
             "domains": normalized_domains,
             "total": len(visible_results),
             "preferred_result": preferred_result,
-            "preferred_result_summary": _build_search_web_preferred_summary(
-                preferred_result=preferred_result,
-                normalize_whitespace=normalize_whitespace,
-            ),
-            "next_action": _build_search_web_next_action(preferred_result=preferred_result),
-            "next_action_args": _build_search_web_next_action_args(preferred_result=preferred_result),
-            "hint": _build_search_web_hint(
-                preferred_result=preferred_result,
-                normalize_whitespace=normalize_whitespace,
-            ),
             "results": visible_results,
         }
 
@@ -320,10 +300,8 @@ def _raise_if_search_cancelled(cancellation_token: CancellationToken | None) -> 
 
     if cancellation_token is None or not cancellation_token.is_cancelled():
         return
-    raise WebSearchCancelledError(
-        message=cancellation_token.cancel_reason() or "工具调用已取消",
-        hint=WEB_CANCELLED_HINT,
-    )
+    _ = cancellation_token.cancel_reason()
+    raise WebSearchCancelledError(message=_SEARCH_CANCELLED_MESSAGE)
 
 
 def _is_search_cancelled_error(error: Exception) -> bool:
@@ -789,7 +767,7 @@ def _resolve_duckduckgo_result_url(raw_url: str) -> str:
 def _build_search_web_preferred_result(
     results: list[SearchResultRow],
 ) -> SearchResultRow | None:
-    """提取 `search_web` 的首选结果。
+    """提取 `search_web` 的首个可见结果。
 
     Args:
         results: 已完成安全过滤与数量裁剪的结果列表。
@@ -810,116 +788,3 @@ def _build_search_web_preferred_result(
         "snippet": first_result["snippet"],
         "published_date": first_result["published_date"],
     }
-
-
-def _build_search_web_preferred_summary(
-    *,
-    preferred_result: SearchResultRow | None,
-    normalize_whitespace: Callable[[str], str],
-) -> str:
-    """构建 `search_web` 的首选结果摘要。
-
-    Args:
-        preferred_result: 首选结果；无结果时为 `None`。
-        normalize_whitespace: 文本空白规整函数。
-
-    Returns:
-        面向 LLM 的单行摘要。
-
-    Raises:
-        无。
-    """
-
-    if preferred_result is None:
-        return "未找到可直接抓取正文的公开网页结果。"
-
-    title = normalize_whitespace(preferred_result["title"].strip())
-    url = preferred_result["url"].strip()
-    published_date = preferred_result["published_date"].strip()
-    snippet = normalize_whitespace(preferred_result["snippet"].strip())
-    snippet_preview = snippet[:_SEARCH_WEB_SNIPPET_PREVIEW_CHARS]
-    if len(snippet) > _SEARCH_WEB_SNIPPET_PREVIEW_CHARS:
-        snippet_preview = f"{snippet_preview}..."
-
-    summary_parts = ["首选结果"]
-    if title:
-        summary_parts.append(f"标题：{title}")
-    if published_date:
-        summary_parts.append(f"日期：{published_date}")
-    if url:
-        summary_parts.append(f"URL：{url}")
-    if snippet_preview:
-        summary_parts.append(f"摘要：{snippet_preview}")
-    return "；".join(summary_parts)
-
-
-def _build_search_web_next_action(*, preferred_result: SearchResultRow | None) -> str:
-    """构建 `search_web` 的下一步动作。
-
-    Args:
-        preferred_result: 首选结果；无结果时为 `None`。
-
-    Returns:
-        下一步动作名称。
-
-    Raises:
-        无。
-    """
-
-    if preferred_result is None:
-        return _SEARCH_WEB_NEXT_ACTION_REFINE_QUERY
-    return _SEARCH_WEB_NEXT_ACTION_FETCH_PAGE
-
-
-def _build_search_web_next_action_args(
-    *,
-    preferred_result: SearchResultRow | None,
-) -> dict[str, str]:
-    """构建 `search_web` 的下一步动作参数。
-
-    Args:
-        preferred_result: 首选结果；无结果时为 `None`。
-
-    Returns:
-        下一步动作参数字典。
-
-    Raises:
-        无。
-    """
-
-    if preferred_result is None:
-        return {}
-    return {"url": preferred_result["url"].strip()}
-
-
-def _build_search_web_hint(
-    *,
-    preferred_result: SearchResultRow | None,
-    normalize_whitespace: Callable[[str], str],
-) -> str:
-    """构建 `search_web` 成功返回的下一步提示。
-
-    Args:
-        preferred_result: 首选结果；无结果时为 `None`。
-        normalize_whitespace: 文本空白规整函数。
-
-    Returns:
-        直接指向下一步动作的提示文案。
-
-    Raises:
-        无。
-    """
-
-    if preferred_result is None:
-        return (
-            "当前没有可直接抓取的网页正文。下一步应改写 query，或放宽 domains/recency_days 后重新调用 "
-            "search_web；不要对空结果调用 fetch_web_page。"
-        )
-
-    url = preferred_result["url"].strip()
-    title = normalize_whitespace(preferred_result["title"].strip())
-    target_label = f"《{title}》" if title else url
-    return (
-        f"优先抓取首选结果正文：下一步直接调用 fetch_web_page(url='{url}') 读取 {target_label}。"
-        "只有当首选结果抓取失败或正文不相关时，再回看 results 中其他候选。"
-    )
