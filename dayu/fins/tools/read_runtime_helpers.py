@@ -27,7 +27,7 @@ from dayu.documents.processors.base import (
 )
 from .result_types import NotSupportedResult
 from dayu.fins.domain.enums import SourceKind
-from dayu.fins.processors.form_type_utils import normalize_form_type
+from dayu.fins.domain.filing_semantics import normalize_sec_form_type_for_matching
 
 # ---------------------------------------------------------------------------
 # 预编译正则
@@ -510,7 +510,7 @@ def _normalize_form_type_for_matching(value: Any) -> Optional[str]:
     normalized = normalize_optional_text(value)
     if normalized is None:
         return None
-    normalized_form = normalize_form_type(normalized)
+    normalized_form = normalize_sec_form_type_for_matching(normalized)
     normalized_text = normalize_optional_text(normalized_form)
     if normalized_text is None:
         return None

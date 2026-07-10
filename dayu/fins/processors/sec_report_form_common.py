@@ -23,7 +23,7 @@ from dayu.documents.processors.text_utils import (
     normalize_whitespace as _normalize_whitespace,
 )
 
-from .form_type_utils import normalize_form_type as _normalize_report_form_type
+from dayu.fins.domain.filing_semantics import normalize_sec_form_type_for_matching as _parse_report_sec_form
 from .sec_form_section_common import (
     _VirtualSection,
     _VirtualSectionProcessorMixin,
@@ -362,7 +362,7 @@ class _BaseSecReportFormProcessor(_VirtualSectionProcessorMixin, SecProcessor):
             OSError: 文件访问失败时可能抛出。
         """
 
-        normalized_form = _normalize_report_form_type(form_type)
+        normalized_form = _parse_report_sec_form(form_type)
         if normalized_form not in cls._SUPPORTED_FORMS:
             return False
         # 复用 SecProcessor 的文件类型与底层可解析能力判断。
@@ -1396,7 +1396,6 @@ def _looks_like_inline_item_reference(full_text: str, position: int) -> bool:
 
 __all__ = [
     "_BaseSecReportFormProcessor",
-    "_normalize_report_form_type",
     "_find_table_of_contents_cutoff",
     "_find_toc_cluster_end",
     "_looks_like_inline_toc_snippet",

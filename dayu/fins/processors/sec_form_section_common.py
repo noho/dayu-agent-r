@@ -46,7 +46,7 @@ from dayu.documents.processors.text_utils import (
     normalize_whitespace as _normalize_whitespace,
 )
 from dayu.fins._log import Log
-from dayu.fins.processors.form_type_utils import normalize_form_type as _normalize_form_type
+from dayu.fins.domain.filing_semantics import normalize_sec_form_type_for_matching as _parse_section_sec_form
 from dayu.fins.processors.sec_processor import SecProcessor
 
 # --- 跨 Form 共享的正则常量 ---
@@ -2980,7 +2980,7 @@ def _check_special_form_support(
     Returns:
         该处理器是否支持此文档。
     """
-    normalized_form = _normalize_form_type(form_type)
+    normalized_form = _parse_section_sec_form(form_type)
     if normalized_form not in supported_forms:
         return False
     if base_supports_fn(source, form_type=form_type, media_type=media_type):
@@ -3005,7 +3005,6 @@ __all__ = [
     "_find_lettered_marker_after",
     "_safe_virtual_document_text",
     "_is_table_placeholder_dominant_text",
-    "_normalize_form_type",
     "_infer_suffix_from_uri",
     "_normalize_optional_string",
     "_normalize_whitespace",

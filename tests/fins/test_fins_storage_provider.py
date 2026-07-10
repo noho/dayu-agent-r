@@ -52,6 +52,7 @@ from dayu.documents.processors.source import Source
 from dayu.fins.domain.document_models import (
     CompanyMeta,
     DocumentMeta,
+    DocumentSummary,
     FinsSourceProvider,
     SourceDocumentUpsertRequest,
     SourceHandle,
@@ -729,6 +730,40 @@ def test_storage_repositories_list_and_read_fixture_documents(tmp_path: Path) ->
     assert document_ids == ["aapl-2024-10k"]
     assert "Annual recurring revenue increased" in content
     assert source.media_type == "text/markdown"
+
+
+def test_document_summary_decode_rejects_invalid_fiscal_period_and_quality() -> None:
+    """验证文档摘要 decode 在 domain 边界拒绝非法财期与质量。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 断言失败时抛出。
+    """
+
+    valid_summary = {
+        "document_id": "fil_0001",
+        "internal_document_id": "0001",
+        "source_kind": "filing",
+        "form_type": "10-K",
+        "fiscal_period": "FY",
+        "quality": "full",
+    }
+    assert DocumentSummary.from_dict(valid_summary).fiscal_period == "FY"
+
+    invalid_period = dict(valid_summary)
+    invalid_period["fiscal_period"] = "Q5"
+    with pytest.raises(ValueError, match="fiscal_period 非法"):
+        DocumentSummary.from_dict(invalid_period)
+
+    invalid_quality = dict(valid_summary)
+    invalid_quality["quality"] = "xbrl"
+    with pytest.raises(ValueError, match="quality 非法"):
+        DocumentSummary.from_dict(invalid_quality)
 
 
 def test_source_repository_projects_source_document_provenance(tmp_path: Path) -> None:

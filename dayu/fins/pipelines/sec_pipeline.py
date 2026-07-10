@@ -96,8 +96,8 @@ from dayu.fins.pipelines.sec_form_utils import (
     LOOKBACK_YEARS_BY_FORM,
     expand_form_aliases,
     increment_document_version,
-    normalize_form,
     parse_date,
+    parse_sec_pipeline_form,
     split_form_input,
     subtract_years,
 )
@@ -976,7 +976,7 @@ class SecPipeline:
             expand_form_aliases=expand_form_aliases,
             split_form_input=split_form_input,
             parse_date=parse_date,
-            normalize_form=normalize_form,
+            parse_sec_form=parse_sec_pipeline_form,
             overwrite_rebuilt_meta=_overwrite_rebuilt_meta_impl,
         )
 

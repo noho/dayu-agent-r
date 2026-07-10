@@ -28,8 +28,8 @@ from dayu.documents.processors.bs_processor import BSProcessor
 from dayu.documents.processors.source import Source
 from dayu.documents.processors.table_utils import parse_html_table_dataframe
 
+from dayu.fins.domain.filing_semantics import normalize_sec_form_type_for_matching as _parse_report_sec_form
 from .fins_bs_processor import FinsBSProcessor
-from .form_type_utils import normalize_form_type as _normalize_report_form_type
 from .sec_form_section_common import _VirtualSectionProcessorMixin
 
 # XBRL 辅助函数直接从拆分后的 sec_xbrl_query 模块导入（这些函数与 edgartools
@@ -153,7 +153,7 @@ class _BaseBsReportFormProcessor(_VirtualSectionProcessorMixin, FinsBSProcessor)
             OSError: 文件访问失败时可能抛出。
         """
 
-        normalized_form = _normalize_report_form_type(form_type)
+        normalized_form = _parse_report_sec_form(form_type)
         if normalized_form not in cls._SUPPORTED_FORMS:
             return False
         # 复用 BSProcessor 的文件类型可解析能力判断

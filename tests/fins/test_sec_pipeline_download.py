@@ -26,8 +26,15 @@ from dayu.fins.ingestion_runtime import FinsSourceDownloadAdapterRequest
 from dayu.fins.pipelines import sec_download_filing_workflow as _sec_download_filing_workflow
 from dayu.fins.pipelines import sec_6k_primary_document_repair as _sec_6k_primary_repair
 from dayu.fins.pipelines import sec_pipeline
+from dayu.fins.domain.filing_semantics import (
+    expand_sec_form_aliases,
+    normalize_document_quality,
+    normalize_financial_data_quality,
+    normalize_fiscal_period,
+    parse_sec_form_filter_value,
+    parse_sec_form_type,
+)
 from dayu.fins.processors.registry import build_fins_processor_registry
-from dayu.fins.pipelines.sec_form_utils import normalize_form as _normalize_form
 from dayu.fins.pipelines.sec_download_event_mapping import DownloadFileResult
 from dayu.fins.pipelines.sec_pipeline import (
     SEC_PIPELINE_DOWNLOAD_VERSION,
@@ -1921,8 +1928,8 @@ def test_sec_pipeline_keeps_provisional_primary_when_reconcile_raises(
     assert meta["primary_document"] == "d123dex991.htm"
 
 
-def test_normalize_form_accepts_schedule_13d_13g() -> None:
-    """验证 SCHEDULE 13D/13G 表单可归一化为 SC 13D/G。
+def test_sec_form_domain_parser_accepts_supported_aliases() -> None:
+    """验证 SEC form domain parser 接受当前支持的别名。
 
     Args:
         无。
@@ -1934,10 +1941,37 @@ def test_normalize_form_accepts_schedule_13d_13g() -> None:
         AssertionError: 断言失败时抛出。
     """
 
-    assert _normalize_form("SCHEDULE 13D") == "SC 13D"
-    assert _normalize_form("SCHEDULE 13D/A") == "SC 13D/A"
-    assert _normalize_form("SCHEDULE 13G") == "SC 13G"
-    assert _normalize_form("SCHEDULE 13G/A") == "SC 13G/A"
+    assert parse_sec_form_type("10K") == "10-K"
+    assert parse_sec_form_type("10-K/A") == "10-K/A"
+    assert parse_sec_form_type("def 14a") == "DEF 14A"
+    assert parse_sec_form_filter_value("SC13D/G") == "SC 13D/G"
+    assert expand_sec_form_aliases(["SC13D/G"]) == ["SC 13D", "SC 13D/A", "SC 13G", "SC 13G/A"]
+    assert parse_sec_form_type("SCHEDULE 13D") == "SC 13D"
+
+
+def test_shared_domain_parsers_reject_invalid_values() -> None:
+    """验证共享 domain parser 对非法业务值 fail closed。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 断言失败时抛出。
+    """
+
+    with pytest.raises(ValueError, match="form_type 不能为空"):
+        parse_sec_form_type("")
+    with pytest.raises(ValueError, match="form_type 不支持"):
+        parse_sec_form_type("F-1")
+    with pytest.raises(ValueError, match="fiscal_period 非法"):
+        normalize_fiscal_period("Q5")
+    with pytest.raises(ValueError, match="quality 非法"):
+        normalize_document_quality("xbrl")
+    with pytest.raises(ValueError, match="data_quality 非法"):
+        normalize_financial_data_quality("raw")
 
 
 def test_sec_pipeline_warns_missing_sc13(tmp_path: Path) -> None:

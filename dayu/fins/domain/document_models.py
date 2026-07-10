@@ -23,6 +23,11 @@ from typing import Any, Literal, Optional
 
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.domain.filing_semantics import (
+    normalize_document_quality,
+    normalize_fiscal_period,
+    parse_sec_form_type,
+)
 
 
 DocumentMeta = dict[str, Any]
@@ -554,7 +559,7 @@ class RejectedFilingArtifact:
             internal_document_id=str(data["internal_document_id"]).strip(),
             accession_number=str(data["accession_number"]).strip(),
             company_id=str(data["company_id"]).strip(),
-            form_type=str(data["form_type"]).strip(),
+            form_type=parse_sec_form_type(str(data["form_type"])),
             filing_date=str(data["filing_date"]).strip(),
             report_date=_optional_str(data.get("report_date")),
             primary_document=str(data["primary_document"]).strip(),
@@ -569,7 +574,7 @@ class RejectedFilingArtifact:
                 if isinstance(item, dict)
             ],
             fiscal_year=int(data["fiscal_year"]) if isinstance(data.get("fiscal_year"), int) else None,
-            fiscal_period=_optional_str(data.get("fiscal_period")),
+            fiscal_period=normalize_fiscal_period(_optional_str(data.get("fiscal_period"))),
             report_kind=_optional_str(data.get("report_kind")),
             amended=bool(data.get("amended", False)),
             has_xbrl=data.get("has_xbrl") if isinstance(data.get("has_xbrl"), bool) else None,
@@ -719,16 +724,16 @@ class DocumentSummary:
             document_id=str(data["document_id"]),
             internal_document_id=str(data.get("internal_document_id", "")),
             source_kind=str(data.get("source_kind", "filing")),
-            form_type=data.get("form_type"),
+            form_type=_optional_str(data.get("form_type")),
             material_name=data.get("material_name"),
             fiscal_year=data.get("fiscal_year"),
-            fiscal_period=data.get("fiscal_period"),
+            fiscal_period=normalize_fiscal_period(_optional_str(data.get("fiscal_period"))),
             report_date=data.get("report_date"),
             filing_date=data.get("filing_date"),
             amended=bool(data.get("amended", False)),
             is_deleted=bool(data.get("is_deleted", False)),
             document_version=str(data.get("document_version", "v1")),
-            quality=str(data.get("quality", "full")),
+            quality=normalize_document_quality(_optional_str(data.get("quality"))),
             has_financials=bool(data.get("has_financials", False)),
             section_count=int(data.get("section_count", 0)),
             table_count=int(data.get("table_count", 0)),

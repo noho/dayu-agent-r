@@ -16,12 +16,12 @@ from dayu.fins.domain.document_models import (
     now_iso8601,
 )
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.domain.filing_semantics import normalize_sec_form_type_for_matching
 from dayu.fins.storage import SourceDocumentRepositoryProtocol
 
 from .sec_download_state import _normalize_rebuild_file_entries, _resolve_rebuild_source_fingerprint
 from .sec_fiscal_fields import (
     _coerce_optional_int,
-    _normalize_form_for_fiscal,
     _normalize_optional_period,
     _resolve_download_fiscal_fields,
 )
@@ -79,7 +79,7 @@ def _should_preserve_previous_rebuild_fiscal_fields(form_type: str) -> bool:
         无。
     """
 
-    normalized_form = _normalize_form_for_fiscal(form_type)
+    normalized_form = normalize_sec_form_type_for_matching(form_type)
     return normalized_form not in {"6-K", "6-K/A"}
 
 
@@ -95,10 +95,32 @@ def rebuild_download_artifacts(
     expand_form_aliases: Callable[[list[str]], list[str]],
     split_form_input: Callable[[str], list[str]],
     parse_date: Callable[[str, bool], dt.date],
-    normalize_form: Callable[[str], str],
+    parse_sec_form: Callable[[str], str],
     overwrite_rebuilt_meta: Callable[[SourceDocumentRepositoryProtocol, str, str, str, list[dict[str, JsonValue]], dict[str, JsonValue]], None],
 ) -> dict[str, JsonValue]:
-    """基于本地已下载 filings 重建 meta/manifest。"""
+    """基于本地已下载 filings 重建 meta/manifest。
+
+    Args:
+        host: 重建工作流宿主边界。
+        ticker: 股票代码。
+        form_type: 可选 SEC form 过滤条件。
+        start_date: 可选起始 filing date。
+        end_date: 可选结束 filing date。
+        overwrite: 是否覆盖既有 meta。
+        pipeline_download_version: 当前 SEC 下载版本。
+        expand_form_aliases: SEC form 筛选别名展开函数。
+        split_form_input: form 输入拆分函数。
+        parse_date: 日期解析函数。
+        parse_sec_form: SEC form 解析函数。
+        overwrite_rebuilt_meta: 重建 meta 写入函数。
+
+    Returns:
+        下载重建结果 payload。
+
+    Raises:
+        ValueError: 输入过滤条件非法时抛出。
+        RuntimeError: 仓储或写入函数异常时原样抛出。
+    """
 
     target_forms, start_bound, end_bound = build_rebuild_filter_spec(
         form_type=form_type,
@@ -131,7 +153,7 @@ def rebuild_download_artifacts(
             target_forms=target_forms,
             start_bound=start_bound,
             end_bound=end_bound,
-            normalize_form=normalize_form,
+            parse_sec_form=parse_sec_form,
             parse_date=parse_date,
         ):
             continue
@@ -203,17 +225,32 @@ def passes_rebuild_filters(
     target_forms: Optional[set[str]],
     start_bound: Optional[dt.date],
     end_bound: Optional[dt.date],
-    normalize_form: Callable[[str], str],
+    parse_sec_form: Callable[[str], str],
     parse_date: Callable[[str, bool], dt.date],
 ) -> bool:
-    """判断本地 meta 是否满足重建过滤条件。"""
+    """判断本地 meta 是否满足重建过滤条件。
+
+    Args:
+        meta: 本地 source meta。
+        target_forms: 目标 SEC form 集合；为空表示不过滤 form。
+        start_bound: filing date 起始边界。
+        end_bound: filing date 结束边界。
+        parse_sec_form: SEC form 解析函数。
+        parse_date: 日期解析函数。
+
+    Returns:
+        满足过滤条件返回 `True`，否则返回 `False`。
+
+    Raises:
+        无；解析失败按不匹配处理。
+    """
 
     if target_forms is not None:
         raw_form_type = str(meta.get("form_type", "")).strip()
         if not raw_form_type:
             return False
         try:
-            normalized_form = normalize_form(raw_form_type)
+            normalized_form = parse_sec_form(raw_form_type)
         except ValueError:
             return False
         if normalized_form not in target_forms:

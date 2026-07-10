@@ -22,7 +22,8 @@ from dayu.fins.pipelines.sec_6k_rules import (
     _extract_head_text,
     _score_6k_filename,
 )
-from dayu.fins.pipelines.sec_form_utils import normalize_form, parse_date
+from dayu.fins.domain.filing_semantics import normalize_sec_form_type_for_matching
+from dayu.fins.pipelines.sec_form_utils import parse_date
 from dayu.fins._log import Log
 
 
@@ -105,7 +106,9 @@ def collect_filings_from_table(
     file_numbers = _json_list(table.get("fileNumber"))
     row_count = min(len(forms), len(filing_dates), len(accessions), len(primary_documents))
     for index in range(row_count):
-        normalized_form = normalize_form(str(forms[index]))
+        normalized_form = normalize_sec_form_type_for_matching(str(forms[index]))
+        if normalized_form is None:
+            continue
         if normalized_form not in form_windows:
             continue
         filing_date_value = parse_date(str(filing_dates[index]), is_end=False)

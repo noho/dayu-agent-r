@@ -10,6 +10,12 @@ from typing import Optional, Protocol, TypeAlias, TypeGuard, runtime_checkable
 
 from dayu.fins.domain.document_models import SourceHandle, now_iso8601
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.domain.filing_semantics import (
+    DocumentQuality,
+    normalize_fiscal_period,
+    normalize_sec_form_type_for_matching,
+    sanitize_fiscal_period_by_sec_form,
+)
 from dayu.fins.storage import SourceDocumentRepositoryProtocol
 
 from .sec_6k_rules import _infer_filename_from_uri
@@ -139,10 +145,22 @@ def _resolve_processed_quality(
     has_xbrl: bool,
     financial_capable: bool,
     form_type: Optional[str] = None,
-) -> str:
-    """根据处理结果计算质量等级。"""
+) -> DocumentQuality:
+    """根据处理结果计算 processed 文档质量等级。
 
-    normalized_form_type = _normalize_form_for_fiscal(form_type)
+    Args:
+        has_xbrl: 当前处理结果是否包含 XBRL 能力。
+        financial_capable: 当前处理结果是否至少具备财务表格能力。
+        form_type: 原始或 canonical SEC form。
+
+    Returns:
+        domain 认可的文档质量值。
+
+    Raises:
+        无。
+    """
+
+    normalized_form_type = normalize_sec_form_type_for_matching(form_type)
     if normalized_form_type == "DEF 14A":
         return "partial"
     if has_xbrl:
@@ -162,7 +180,7 @@ def _resolve_processed_fiscal_fields(
 
     source_fiscal_year = _coerce_optional_int(source_meta.get("fiscal_year"))
     source_fiscal_period = _normalize_optional_period(source_meta.get("fiscal_period"))
-    normalized_form_type = _normalize_form_for_fiscal(source_meta.get("form_type"))
+    normalized_form_type = normalize_sec_form_type_for_matching(_normalize_optional_string(source_meta.get("form_type")))
     if source_fiscal_period is not None:
         source_fiscal_period = _sanitize_fiscal_period_by_form(
             form_type=normalized_form_type,
@@ -226,7 +244,7 @@ def _resolve_download_fiscal_fields(
         return fallback_year, fallback_period
 
     resolved_year = dei_year if dei_year is not None else fallback_year
-    normalized_form_type = _normalize_form_for_fiscal(form_type)
+    normalized_form_type = normalize_sec_form_type_for_matching(form_type)
     if dei_period is not None:
         return resolved_year, dei_period
     if dei_year is None:
@@ -297,7 +315,7 @@ def _extract_download_fiscal_from_xbrl(
     fiscal_period = _normalize_optional_period(raw_period)
     if fiscal_period is not None:
         fiscal_period = _sanitize_fiscal_period_by_form(
-            form_type=_normalize_form_for_fiscal(form_type),
+            form_type=normalize_sec_form_type_for_matching(form_type),
             fiscal_period=fiscal_period,
         )
     return fiscal_year, fiscal_period
@@ -396,7 +414,7 @@ def _pick_first_non_empty(candidates: tuple[JsonValue, ...]) -> JsonValue:
 def _infer_download_fiscal_fields(form_type: Optional[str], report_date: Optional[str]) -> tuple[Optional[int], Optional[str]]:
     """在 download 阶段为 source meta 推断 fiscal 字段。"""
 
-    normalized_form_type = _normalize_form_for_fiscal(form_type)
+    normalized_form_type = normalize_sec_form_type_for_matching(form_type)
     fiscal_year = _coerce_year_from_date(report_date)
     if _is_6k_family_form(normalized_form_type):
         fiscal_year = None
@@ -524,12 +542,25 @@ def _normalize_optional_string(value: JsonValue) -> Optional[str]:
 
 
 def _normalize_optional_period(value: JsonValue) -> Optional[str]:
-    """标准化 fiscal_period 字段。"""
+    """标准化可选 fiscal_period 字段。
+
+    Args:
+        value: 原始 JSON 字段值。
+
+    Returns:
+        canonical 财期；字段为空或无法解析时返回 `None`。
+
+    Raises:
+        无。
+    """
 
     normalized = _normalize_optional_string(value)
     if normalized is None:
         return None
-    return normalized.upper()
+    try:
+        return normalize_fiscal_period(normalized)
+    except ValueError:
+        return None
 
 
 def _coerce_year_from_date(value: JsonValue) -> Optional[int]:
@@ -541,28 +572,6 @@ def _coerce_year_from_date(value: JsonValue) -> Optional[int]:
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
         return int(text[:4])
     return None
-
-
-def _normalize_form_for_fiscal(value: JsonValue) -> Optional[str]:
-    """标准化用于 fiscal 推断的 SEC form。"""
-
-    form = _normalize_optional_string(value)
-    if form is None:
-        return None
-    normalized = form.upper().replace(" ", "")
-    mapping = {
-        "10K": "10-K",
-        "10K/A": "10-K/A",
-        "10Q": "10-Q",
-        "10Q/A": "10-Q/A",
-        "20F": "20-F",
-        "20F/A": "20-F/A",
-        "6K": "6-K",
-        "6K/A": "6-K/A",
-        "8K": "8-K",
-        "8K/A": "8-K/A",
-    }
-    return mapping.get(normalized, form.upper())
 
 
 def _is_6k_family_form(form_type: Optional[str]) -> bool:
@@ -587,7 +596,7 @@ def _should_skip_financial_extraction(form_type: Optional[str]) -> bool:
     normalized = _normalize_optional_string(form_type)
     if normalized is None:
         return False
-    normalized_form = _normalize_form_for_fiscal(normalized)
+    normalized_form = normalize_sec_form_type_for_matching(normalized)
     if normalized_form in FINANCIAL_EXTRACTION_SKIP_FORMS:
         return True
     normalized_no_space = normalized.upper().replace(" ", "")
@@ -595,13 +604,17 @@ def _should_skip_financial_extraction(form_type: Optional[str]) -> bool:
 
 
 def _sanitize_fiscal_period_by_form(form_type: Optional[str], fiscal_period: str) -> Optional[str]:
-    """按 form 约束 fiscal_period 合法值。"""
+    """按 SEC form 约束 fiscal_period 合法值。
 
-    normalized_period = fiscal_period.strip().upper()
-    if not normalized_period:
-        return None
-    if form_type in {"10-K", "20-F"}:
-        return "FY" if normalized_period == "FY" else None
-    if form_type == "10-Q":
-        return normalized_period if normalized_period in {"Q1", "Q2", "Q3", "Q4"} else None
-    return normalized_period
+    Args:
+        form_type: 原始或 canonical SEC form。
+        fiscal_period: 原始或 canonical 财期。
+
+    Returns:
+        通过 form 约束的 canonical 财期；为空或不匹配时返回 `None`。
+
+    Raises:
+        ValueError: 非空财期不是 Fins 支持的财期枚举时抛出。
+    """
+
+    return sanitize_fiscal_period_by_sec_form(form_type, fiscal_period)

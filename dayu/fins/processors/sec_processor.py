@@ -44,7 +44,7 @@ from dayu.documents.processors.source import Source
 from dayu.documents.processors.perf_utils import ProcessorStageProfiler, is_processor_profile_enabled
 from dayu.fins.xbrl_file_discovery import discover_xbrl_files
 from dayu.fins._log import Log
-from dayu.fins.processors.form_type_utils import normalize_form_type as _normalize_form_type
+from dayu.fins.domain.filing_semantics import normalize_sec_form_type_for_matching as _parse_processor_sec_form
 
 # --- 子模块导入 ---
 from dayu.fins.processors.sec_xbrl_query import (
@@ -138,7 +138,7 @@ class SecProcessor:
         """
 
         self._source = source
-        self._form_type = _normalize_form_type(form_type)
+        self._form_type = _parse_processor_sec_form(form_type)
         self._media_type = media_type or source.media_type
         self._profiler = ProcessorStageProfiler(
             component=self.__class__.__name__,
@@ -266,7 +266,7 @@ class SecProcessor:
             OSError: 文件访问失败时可能抛出。
         """
 
-        normalized_form = _normalize_form_type(form_type)
+        normalized_form = _parse_processor_sec_form(form_type)
         if normalized_form is None:
             return False
         # 设计约束：6-K 统一路由到 BSProcessor，避免 edgartools 分段结果

@@ -324,7 +324,7 @@ Fins 公共契约分为 Fins 专属契约、Dayu Agent 公共契约和文档处�
 
 ### Fins 专属契约
 
-- `dayu.fins.domain`：财报领域模型与枚举，包括 `Market`、`SourceKind`、公司元数据、源文档、processed 文档、文件对象、批处理 token、rejected filing artifact 等数据对象。
+- `dayu.fins.domain`：财报领域模型、枚举与共享业务值 parser，包括 `Market`、`SourceKind`、公司元数据、源文档、processed 文档、文件对象、批处理 token、rejected filing artifact、SEC form parser / alias expansion、财期、文档质量与财务数据质量等数据对象和封闭值。
 - `dayu.fins.ticker_normalization`：ticker 标准化结果与 market / exchange 推导。
 - `dayu.fins.storage.repository_protocols`：公司、源文档、processed、blob、filing maintenance 与批处理事务仓储协议。
 - `FinsDownloadRequest` / `FinsPreprocessRequest` / `FinsUploadFilingRequest` / `FinsUploadMaterialRequest`：下载、预处理与上传请求。
@@ -409,7 +409,7 @@ flowchart LR
 
 ```text
 dayu.fins
-├── domain                    # 财报领域模型与枚举
+├── domain                    # 财报领域模型、枚举、SEC form / 财期 / 质量封闭值 parser
 ├── downloaders               # source-specific 低层下载器；当前包含 SEC / 巨潮 / 披露易 downloader
 ├── storage                   # 仓储协议、文件系统仓储、文件对象存储
 ├── pipelines                 # source-specific ingestion pipeline；当前包含 SEC 与 CN/HK download / upload pipeline

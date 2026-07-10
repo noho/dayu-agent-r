@@ -18,6 +18,7 @@ from dayu.fins.downloaders.sec_downloader import (
     accession_to_no_dash,
     build_source_fingerprint,
 )
+from dayu.fins.domain.filing_semantics import normalize_sec_form_type_for_matching
 from dayu.fins._log import Log
 
 from .sec_download_state import (
@@ -564,7 +565,9 @@ async def extend_with_browse_edgar_sc13(
                 _browse_edgar_filings_to_dicts(entries),
             )
         for entry in entries:
-            normalized_form = _normalize_form(entry.form_type)
+            normalized_form = normalize_sec_form_type_for_matching(entry.form_type)
+            if normalized_form is None:
+                continue
             if normalized_form not in form_windows:
                 continue
             try:
@@ -694,27 +697,6 @@ async def retry_sc13_if_empty(
         )
 
     return list(filings)
-
-
-def _normalize_form(value: str) -> str:
-    """将 SC13 相关表单文本标准化。"""
-
-    normalized = str(value).strip().upper().replace("-", " ")
-    alias_map = {
-        "SCHEDULE 13D": "SC 13D",
-        "SCHEDULE 13D/A": "SC 13D/A",
-        "SCHEDULE 13G": "SC 13G",
-        "SCHEDULE 13G/A": "SC 13G/A",
-        "SC 13D": "SC 13D",
-        "SC 13D/A": "SC 13D/A",
-        "SC 13G": "SC 13G",
-        "SC 13G/A": "SC 13G/A",
-        "SC13D": "SC 13D",
-        "SC13D/A": "SC 13D/A",
-        "SC13G": "SC 13G",
-        "SC13G/A": "SC 13G/A",
-    }
-    return alias_map.get(normalized.replace("  ", " "), normalized)
 
 
 __all__ = [

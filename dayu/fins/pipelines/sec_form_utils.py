@@ -6,6 +6,11 @@
 from __future__ import annotations
 
 from dayu.contracts.json_value import JsonValue
+from dayu.fins.domain.filing_semantics import (
+    SEC_FORM_GROUP_SC13D_G,
+    expand_sec_form_aliases,
+    parse_sec_form_filter_value,
+)
 
 import datetime as dt
 import re
@@ -14,7 +19,7 @@ from typing import Optional
 # ---------- 常量 ----------
 
 # 美股默认下载表单集合（年报、季报、公告、持股），覆盖国内/外籍发行人两种表单。
-DEFAULT_FORMS_US: list[str] = ["10-K", "20-F", "10-Q", "6-K", "8-K", "DEF 14A", "SC 13D/G"]
+DEFAULT_FORMS_US: list[str] = ["10-K", "20-F", "10-Q", "6-K", "8-K", "DEF 14A", SEC_FORM_GROUP_SC13D_G]
 
 LOOKBACK_YEARS_BY_FORM: dict[str, int] = {
     "10-K": 5,
@@ -40,47 +45,20 @@ SUPPORTED_FORMS = frozenset(LOOKBACK_YEARS_BY_FORM.keys())
 # ---------- 函数 ----------
 
 
-def normalize_form(form_type: str) -> str:
-    """标准化 SEC form 类型。
+def parse_sec_pipeline_form(form_type: str) -> str:
+    """解析 SEC pipeline 接收的 form 筛选值。
 
     Args:
         form_type: 原始 form 字符串。
 
     Returns:
-        标准化后的 form。
+        canonical 单一 SEC form 或 `SC 13D/G` 组合别名。
 
     Raises:
-        ValueError: form 为空时抛出。
+        ValueError: form 为空或不受支持时抛出。
     """
 
-    normalized = form_type.strip().upper().replace(" ", "")
-    if not normalized:
-        raise ValueError("form_type 不能为空")
-    replacements = {
-        "10K": "10-K",
-        "10Q": "10-Q",
-        "8K": "8-K",
-        "8KA": "8-K/A",
-        "8K/A": "8-K/A",
-        "20F": "20-F",
-        "6K": "6-K",
-        "DEF14A": "DEF 14A",
-        "SCHEDULE13D": "SC 13D",
-        "SCHEDULE13DA": "SC 13D/A",
-        "SCHEDULE13D/A": "SC 13D/A",
-        "SCHEDULE13G": "SC 13G",
-        "SCHEDULE13GA": "SC 13G/A",
-        "SCHEDULE13G/A": "SC 13G/A",
-        "SC13D/G": "SC 13D/G",
-        "SC13DG": "SC 13D/G",
-        "SC13D": "SC 13D",
-        "SC13DA": "SC 13D/A",
-        "SC13D/A": "SC 13D/A",
-        "SC13G": "SC 13G",
-        "SC13GA": "SC 13G/A",
-        "SC13G/A": "SC 13G/A",
-    }
-    return replacements.get(normalized, form_type.strip().upper())
+    return parse_sec_form_filter_value(form_type)
 
 
 def expand_form_aliases(form_types: list[str]) -> list[str]:
@@ -98,9 +76,9 @@ def expand_form_aliases(form_types: list[str]) -> list[str]:
 
     expanded: list[str] = []
     for form_type in form_types:
-        normalized = normalize_form(form_type)
-        if normalized == "SC 13D/G":
-            expanded.extend(["SC 13D", "SC 13D/A", "SC 13G", "SC 13G/A"])
+        normalized = parse_sec_pipeline_form(form_type)
+        if normalized == SEC_FORM_GROUP_SC13D_G:
+            expanded.extend(expand_sec_form_aliases([normalized]))
             continue
         expanded.append(normalized)
     deduplicated = sorted(set(expanded))
