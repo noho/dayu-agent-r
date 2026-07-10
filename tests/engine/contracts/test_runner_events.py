@@ -13,7 +13,17 @@ from __future__ import annotations
 
 import dataclasses
 from datetime import datetime, timezone
+from typing import cast
 
+import pytest
+
+from dayu.engine.contracts.error_codes import (
+    EngineRunErrorCode,
+    RunnerSpecificErrorCode,
+    RunnerSpecificErrorSource,
+    runner_protocol_error_code,
+    serialize_engine_error_code,
+)
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.runner_events import (
     ContextOverflowDetection,
@@ -238,3 +248,64 @@ def test_runner_done_finish_reason_error_is_legal() -> None:
     )
     assert done.finish_reason is FinishReason.ERROR
     assert done.provider_request_id == "req-final"
+
+
+def test_runner_specific_error_code_trims_and_serializes() -> None:
+    """provider / runner 专有错误码必须 trim 后经统一 helper 序列化。"""
+
+    code = RunnerSpecificErrorCode(
+        "  sse_invalid_json  ",
+        RunnerSpecificErrorSource.RUNNER_PROTOCOL,
+    )
+
+    assert code.value == "sse_invalid_json"
+    assert code.source is RunnerSpecificErrorSource.RUNNER_PROTOCOL
+    assert serialize_engine_error_code(code) == "sse_invalid_json"
+
+
+def test_runner_specific_error_code_rejects_empty_and_too_long() -> None:
+    """专有错误码必须拒绝空白和超长文本。"""
+
+    with pytest.raises(ValueError):
+        RunnerSpecificErrorCode(
+            "   ",
+            RunnerSpecificErrorSource.RUNNER_PROTOCOL,
+        )
+    with pytest.raises(ValueError):
+        RunnerSpecificErrorCode(
+            "x" * 129,
+            RunnerSpecificErrorSource.RUNNER_PROTOCOL,
+        )
+
+
+def test_runner_protocol_error_data_rejects_bare_string_error_code() -> None:
+    """RunnerProtocolErrorData 不再接受裸字符串错误码。"""
+
+    with pytest.raises(TypeError):
+        RunnerProtocolErrorData(
+            error_code=cast(RunnerSpecificErrorCode, "bad_protocol"),
+            message="bad",
+            provider_request_id=None,
+            raw_payload=None,
+        )
+
+
+def test_missing_provider_detail_uses_engine_fallback_enum() -> None:
+    """缺失 provider 明细时使用 Engine-owned fallback enum。"""
+
+    assert serialize_engine_error_code(
+        EngineRunErrorCode.RUNNER_ERROR_DONE_WITHOUT_DETAIL
+    ) == "runner_error_done_without_detail"
+
+
+def test_runner_protocol_error_data_accepts_wrapper() -> None:
+    """RunnerProtocolErrorData 使用 wrapper 承载专有协议码。"""
+
+    data = RunnerProtocolErrorData(
+        error_code=runner_protocol_error_code("bad_protocol"),
+        message="bad",
+        provider_request_id=None,
+        raw_payload=None,
+    )
+
+    assert serialize_engine_error_code(data.error_code) == "bad_protocol"

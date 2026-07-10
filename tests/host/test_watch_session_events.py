@@ -14,6 +14,7 @@ import pytest
 
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
+from dayu.engine.contracts.error_codes import adapter_error_code
 from dayu.engine.contracts.engine_events import (
     EngineEvent,
     EngineEventType,
@@ -195,7 +196,7 @@ class _FailedHandle:
             run_id=self._snapshot.run_id,
             type=EngineEventType.RUN_FAILED,
             data=RunFailedData(
-                error_code="provider_failed",
+                error_code=adapter_error_code("provider_failed"),
                 message="provider failed safely",
                 provider_request_id=None,
                 recoverable=False,

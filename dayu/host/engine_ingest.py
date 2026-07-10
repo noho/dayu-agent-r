@@ -26,6 +26,7 @@ from dayu.contracts.tool_outcome import (
     ToolFailedOutcome,
 )
 from dayu.contracts.tool_await import ToolAwaitSnapshot
+from dayu.engine.contracts.error_codes import serialize_engine_error_code
 from dayu.engine.contracts.engine_events import (
     ContentCompleteData,
     ContentDeltaData,
@@ -1026,6 +1027,7 @@ class EngineEventIngestor:
         if event.type == EngineEventType.RUN_FAILED and isinstance(
             event.data, RunFailedData
         ):
+            error_code = serialize_engine_error_code(event.data.error_code)
             if event.data.recoverable:
                 diagnostic = self._append_diagnostic_event(
                     transaction,
@@ -1035,7 +1037,7 @@ class EngineEventIngestor:
                     payload={
                         "attempt_id": context.attempt.attempt_id,
                         "execution_id": context.attempt.execution_id,
-                        "error_code": event.data.error_code,
+                        "error_code": error_code,
                         "message": event.data.message,
                         "provider_request_id": event.data.provider_request_id,
                         "client_correlation_id": event.data.client_correlation_id,
@@ -3275,7 +3277,7 @@ class EngineEventIngestor:
             "attempt_id": context.attempt.attempt_id,
             "execution_id": context.attempt.execution_id,
             "iteration_id": data.iteration_id,
-            "error_code": data.error_code,
+            "error_code": serialize_engine_error_code(data.error_code),
             "message": data.message,
             "provider_request_id": data.provider_request_id,
             "client_correlation_id": data.client_correlation_id,
@@ -3304,7 +3306,7 @@ class EngineEventIngestor:
                 event_class=EventClass.DIAGNOSTIC,
                 event_type=_EVENT_TYPE_PROVIDER_PROTOCOL_ERROR,
                 payload=payload,
-                reason={"reason": data.error_code},
+                reason={"reason": serialize_engine_error_code(data.error_code)},
             ),
         ).row
 
@@ -5010,13 +5012,14 @@ def _run_failed_plan(data: RunFailedData) -> _EngineTerminalPlan:
     :raises: 无主动抛出。
     """
 
+    error_code = serialize_engine_error_code(data.error_code)
     unsupported_owner = _OWNER_PHASE10 if data.recoverable else None
     reason = (
-        _REASON_UNSUPPORTED_RECOVERY_POLICY if data.recoverable else data.error_code
+        _REASON_UNSUPPORTED_RECOVERY_POLICY if data.recoverable else error_code
     )
     terminal = _failed_terminal_fact_plan(
         reason=reason,
-        error_code=data.error_code,
+        error_code=error_code,
         message=data.message,
         provider_request_id=data.provider_request_id,
         client_correlation_id=data.client_correlation_id,
@@ -5027,7 +5030,7 @@ def _run_failed_plan(data: RunFailedData) -> _EngineTerminalPlan:
         finish_reason=None,
         filtered=None,
         degraded=None,
-        error_code=data.error_code,
+        error_code=error_code,
         message=data.message,
         provider_request_id=data.provider_request_id,
         client_correlation_id=data.client_correlation_id,
@@ -6929,7 +6932,7 @@ def _provider_protocol_failure_metadata(
         "schema_version": _FAILURE_METADATA_SCHEMA_VERSION,
         "signal_source": _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR,
         "failure_kind": _FAILURE_KIND_PROVIDER_PROTOCOL_ERROR,
-        "provider_error_code": data.error_code,
+        "provider_error_code": serialize_engine_error_code(data.error_code),
         "diagnostic_refs": list(diagnostic_refs),
     }
 

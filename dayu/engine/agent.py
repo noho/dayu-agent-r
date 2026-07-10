@@ -50,6 +50,12 @@ from dayu.engine.contracts.agent_run import (
     EngineRunOutcomeFinalAnswer,
     EngineRunOutcomeSuspended,
 )
+from dayu.engine.contracts.error_codes import (
+    EngineErrorCode,
+    EngineRunErrorCode,
+    adapter_error_code,
+    serialize_engine_error_code,
+)
 from dayu.engine.contracts.tool_records import (
     AcceptedToolExecutionRecord,
     AssistantToolCallBatchSnapshot,
@@ -137,30 +143,50 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 _FIRST_ITERATION_INDEX: int = 0
 _FIRST_ITERATION_ORDINAL: int = 1
 _DEFAULT_CANCEL_REASON: str = "cancelled"
-_ERROR_MAX_ITERATIONS_EXCEEDED: str = "max_iterations_exceeded"
-_ERROR_RUNNER_EXCEPTION: str = "runner_exception"
-_ERROR_RUNNER_ABNORMAL_STOP: str = "runner_abnormal_stop"
-_ERROR_RUNNER_ERROR_DONE_WITHOUT_DETAIL: str = (
-    "runner_error_done_without_detail"
+_ERROR_MAX_ITERATIONS_EXCEEDED: EngineRunErrorCode = (
+    EngineRunErrorCode.MAX_ITERATIONS_EXCEEDED
 )
-_ERROR_CONTEXT_COMPACTION_REQUIRED: str = "context_compaction_required"
-_ERROR_TOOL_CALL_NOT_ENABLED: str = "tool_call_not_enabled"
-_ERROR_MISSING_TERMINAL: str = "missing_terminal"
-_ERROR_RUNNER_TOOL_CALLS_MISSING: str = "runner_tool_calls_missing"
-_ERROR_RUNNER_TOOL_CALLS_FINISH_REASON_MISMATCH: str = (
-    "runner_tool_calls_finish_reason_mismatch"
+_ERROR_RUNNER_EXCEPTION: EngineRunErrorCode = EngineRunErrorCode.RUNNER_EXCEPTION
+_ERROR_RUNNER_ABNORMAL_STOP: EngineRunErrorCode = (
+    EngineRunErrorCode.RUNNER_ABNORMAL_STOP
 )
-_ERROR_RUNNER_EMPTY_FINAL_CONTENT: str = "runner_empty_final_content"
-_ERROR_DUPLICATE_TOOL_CALL_ID: str = "duplicate_tool_call_id"
-_ERROR_TOOL_EXECUTOR_EXCEPTION: str = "tool_executor_exception"
-_ERROR_TOOL_EXECUTION_TIMEOUT: str = "tool_execution_timeout"
-_ERROR_TOOL_BATCH_OUTCOME_MISMATCH: str = "tool_batch_outcome_mismatch"
-_ERROR_FORCE_ANSWER_EMPTY: str = "force_answer_empty"
-_ERROR_CONSECUTIVE_FAILED_TOOL_BATCHES: str = (
-    "consecutive_failed_tool_batches"
+_ERROR_RUNNER_ERROR_DONE_WITHOUT_DETAIL: EngineRunErrorCode = (
+    EngineRunErrorCode.RUNNER_ERROR_DONE_WITHOUT_DETAIL
 )
-_ERROR_CONTINUATION_TOOL_CALL_NOT_ALLOWED: str = (
-    "continuation_tool_call_not_allowed"
+_ERROR_CONTEXT_COMPACTION_REQUIRED: EngineRunErrorCode = (
+    EngineRunErrorCode.CONTEXT_COMPACTION_REQUIRED
+)
+_ERROR_TOOL_CALL_NOT_ENABLED: EngineRunErrorCode = (
+    EngineRunErrorCode.TOOL_CALL_NOT_ENABLED
+)
+_ERROR_MISSING_TERMINAL: EngineRunErrorCode = EngineRunErrorCode.MISSING_TERMINAL
+_ERROR_RUNNER_TOOL_CALLS_MISSING: EngineRunErrorCode = (
+    EngineRunErrorCode.RUNNER_TOOL_CALLS_MISSING
+)
+_ERROR_RUNNER_TOOL_CALLS_FINISH_REASON_MISMATCH: EngineRunErrorCode = (
+    EngineRunErrorCode.RUNNER_TOOL_CALLS_FINISH_REASON_MISMATCH
+)
+_ERROR_RUNNER_EMPTY_FINAL_CONTENT: EngineRunErrorCode = (
+    EngineRunErrorCode.RUNNER_EMPTY_FINAL_CONTENT
+)
+_ERROR_DUPLICATE_TOOL_CALL_ID: EngineRunErrorCode = (
+    EngineRunErrorCode.DUPLICATE_TOOL_CALL_ID
+)
+_ERROR_TOOL_EXECUTOR_EXCEPTION: EngineRunErrorCode = (
+    EngineRunErrorCode.TOOL_EXECUTOR_EXCEPTION
+)
+_ERROR_TOOL_EXECUTION_TIMEOUT: EngineRunErrorCode = (
+    EngineRunErrorCode.TOOL_EXECUTION_TIMEOUT
+)
+_ERROR_TOOL_BATCH_OUTCOME_MISMATCH: EngineRunErrorCode = (
+    EngineRunErrorCode.TOOL_BATCH_OUTCOME_MISMATCH
+)
+_ERROR_FORCE_ANSWER_EMPTY: EngineRunErrorCode = EngineRunErrorCode.FORCE_ANSWER_EMPTY
+_ERROR_CONSECUTIVE_FAILED_TOOL_BATCHES: EngineRunErrorCode = (
+    EngineRunErrorCode.CONSECUTIVE_FAILED_TOOL_BATCHES
+)
+_ERROR_CONTINUATION_TOOL_CALL_NOT_ALLOWED: EngineRunErrorCode = (
+    EngineRunErrorCode.CONTINUATION_TOOL_CALL_NOT_ALLOWED
 )
 _RUNNER_ERROR_WITHOUT_DETAIL_MESSAGE: str = (
     "runner finished with error without detail"
@@ -337,7 +363,7 @@ def _runner_input_message_projection(
     assert_never(message)
 
 
-def _fallback_error_message(error_code: str) -> str:
+def _fallback_error_message(error_code: EngineErrorCode) -> str:
     """返回 fallback RAISE_ERROR 模式下的人类可读失败消息。
 
     :param error_code: fallback 触发原因错误码。
@@ -349,7 +375,7 @@ def _fallback_error_message(error_code: str) -> str:
         return _MAX_ITERATIONS_EXHAUSTED_MESSAGE
     if error_code == _ERROR_CONSECUTIVE_FAILED_TOOL_BATCHES:
         return _CONSECUTIVE_FAILED_TOOL_BATCHES_MESSAGE
-    return f"agent fallback raised error: {error_code}"
+    return f"agent fallback raised error: {serialize_engine_error_code(error_code)}"
 
 
 def _build_runner(request: AgentRunRequest) -> AsyncRunner:
@@ -1471,7 +1497,7 @@ class _AsyncAgent:
                     state=state,
                 )
             state.failure_candidate = RunFailedData(
-                error_code=data.error_code.value,
+                error_code=adapter_error_code(data.error_code.value),
                 message=data.message,
                 provider_request_id=data.provider_request_id,
                 client_correlation_id=_client_correlation_id_from_state(state),
@@ -2170,13 +2196,13 @@ class _AsyncAgent:
         *,
         messages: list[AgentMessage],
         next_iteration_index: int,
-        error_code: str,
+        error_code: EngineRunErrorCode,
     ) -> AsyncIterator[EngineEvent]:
         """工具批次后按策略执行 force-answer 或 raise-error。
 
         :param messages: 可追加的 run-local 消息列表。
         :param next_iteration_index: fallback Runner 使用的迭代序号。
-        :param error_code: ``RAISE_ERROR`` 模式下使用的错误码。
+        :param error_code: ``RAISE_ERROR`` 模式下使用的 Engine-owned 错误码。
         :returns: EngineEvent 异步流。
         :raises asyncio.CancelledError: 外层 task 被取消时透传。
         """

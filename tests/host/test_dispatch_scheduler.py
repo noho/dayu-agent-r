@@ -18,6 +18,7 @@ import dayu.host.engine_ingest as host_engine_ingest
 from dayu.contracts.cancellation import CancellationToken
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
+from dayu.engine.contracts.error_codes import adapter_error_code
 from dayu.engine.contracts.engine_events import (
     ContextCompactionRequestedData,
     EngineEvent,
@@ -4095,7 +4096,7 @@ async def test_scheduler_closes_default_local_proxy_after_terminal_before_late_e
                 run_id=request.run_id,
                 type=EngineEventType.RUN_FAILED,
                 data=RunFailedData(
-                    error_code="late",
+                    error_code=adapter_error_code("late"),
                     message="late event must not be consumed",
                     provider_request_id=None,
                     recoverable=False,

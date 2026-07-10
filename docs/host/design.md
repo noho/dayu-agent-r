@@ -1534,6 +1534,13 @@ PROVIDER_DIAGNOSTIC
 
 `PROVIDER_DIAGNOSTIC` 是非致命 provider / adapter diagnostic，EventClass 固定为 `DIAGNOSTIC`。它持久化 bounded `diagnostic_code`、`severity`、`message`、`provider_request_id`、`diagnostic_source`、`payload_ref` 与 `payload_digest`，不得更新 Run / Attempt terminal state，不得写入 failure metadata，不得进入 outbox terminal item、Conversation Memory、final answer、accepted evidence material、compact material 或 LLM-facing prompt messages。Read API 以 `provider_diagnostic` / `info` activity 展示非致命诊断，以独立 `provider_protocol_error` activity 展示 fatal provider protocol error；Tool Trace 可以把 provider diagnostic 作为诊断展示材料。
 
+Engine typed failure code 的唯一 Host 边界是 EngineEvent ingest。Host ingest
+必须调用 Engine serializer，把 `EngineRunErrorCode` 或
+`RunnerSpecificErrorCode` 写成 durable JSON 文本；`RUN_FAILED`、
+`PROVIDER_PROTOCOL_ERROR`、failure metadata、public HostEvent、Tool Trace 和
+Outbox 之后都只读取 durable 文本，不检查 provider / runner-specific wrapper
+内部字段，也不按 provider-specific code 分支。
+
 ### 13.3 Canonical Event Contract Matrix
 
 canonical event contract 必须转成 typed dataclass / enum / validation tests。架构级最小矩阵如下：
@@ -1559,7 +1566,7 @@ canonical event contract 必须转成 typed dataclass / enum / validation tests�
 | `CONTEXT_COMPACTION_REQUESTED` | `session_id`、`run_id`；`trigger_source=reactive` 时必须有 `attempt_id`、`execution_id`；`trigger_source=proactive` 时可以没有 | trigger source / budget reason / provider error refs / snapshot refs | 触发 context governance；proactive path 是 pre-dispatch input governance；reactive path 可关闭当前 Attempt 并让 Run -> `RECOVERING` | resume 是；memory projection 按需消费 | audit yes / trace 是 |
 | `CONTEXT_COMPACTED` / `CONTEXT_COMPACTION_FAILED` | `session_id`、`run_id` | compact artifact ref / accepted candidate digest / prompt-local label mapping refs / source boundary refs / quality check / failure reason / fallback decision | compacted 后允许创建新 Attempt；failed 后按 policy 失败或保持 recoverable | resume 是；memory projection 按 policy 消费 accepted compact output | audit yes / trace 是 |
 | `PROVIDER_DIAGNOSTIC` | `session_id`、`run_id`、`attempt_id`、`execution_id` | diagnostic code / severity / message / provider request id / diagnostic source / payload ref + digest | 无 Run / Attempt 状态副作用；非 terminal；不写 failure metadata | resume 不消费；memory 不消费；LLM-facing material 不消费 | audit optional / Host activity optional / tool trace diagnostic |
-| `PROVIDER_PROTOCOL_ERROR` | `session_id`、`run_id`、`attempt_id`、`execution_id` | provider / error code / request ref | Attempt failure or retry input | retry 需要时 resume 消费 | audit yes / Host event stream emit |
+| `PROVIDER_PROTOCOL_ERROR` | `session_id`、`run_id`、`attempt_id`、`execution_id` | serializer 输出的 provider / runner error code 文本 / request ref | Attempt failure or retry input | retry 需要时 resume 消费 | audit yes / Host event stream emit |
 | `ENGINE_EVENT_REJECTED` | `session_id`、`host_run_id`、`attempt_id`、`execution_id`、worker_event_index、engine_event_type | reason / stop_worker_stream / optional diagnostic_refs / optional runner-call link or manifest refs | 无 Run / Attempt 状态副作用；只表达 Host ingest fail-closed 或 unsupported event diagnostic；`stop_worker_stream` 是 worker stream 控制信号，不是 lifecycle transition | resume 不消费；memory 不消费 | audit yes / tool trace optional |
 
 canonical event 的 required fields 不能被塞进无结构 `metadata`；`metadata` 只能承载不参与状态机、幂等、恢复和审计主链的附加说明。

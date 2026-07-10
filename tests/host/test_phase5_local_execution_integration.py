@@ -17,6 +17,7 @@ import pytest
 from dayu.contracts.json_value import JsonValue
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
+from dayu.engine.contracts.error_codes import adapter_error_code
 from dayu.engine.contracts.engine_events import (
     EngineEvent,
     EngineEventType,
@@ -248,7 +249,7 @@ class _ScriptedLocalWorkerHandle:
                 run_id=self._bound_run_id(),
                 type=EngineEventType.RUN_FAILED,
                 data=RunFailedData(
-                    error_code="fake_worker_failed",
+                    error_code=adapter_error_code("fake_worker_failed"),
                     message="fake worker failed",
                     provider_request_id=None,
                     recoverable=False,

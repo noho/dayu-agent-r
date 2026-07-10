@@ -30,6 +30,10 @@ from collections.abc import AsyncIterable, AsyncIterator
 from datetime import datetime, timezone
 
 from dayu.contracts.json_value import JsonValue
+from dayu.engine.contracts.error_codes import (
+    http_provider_error_code,
+    runner_protocol_error_code,
+)
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.runner_events import (
     RunnerContentCompletedData,
@@ -277,7 +281,7 @@ class SSEParser:
         )
         yield _make_event(
             RunnerProtocolErrorData(
-                error_code=error_code,
+                error_code=runner_protocol_error_code(error_code),
                 message=message,
                 provider_request_id=self._provider_request_id,
                 raw_payload=invalid_utf8_diagnostic_payload(
@@ -308,7 +312,7 @@ class SSEParser:
         _LOGGER.warning("sse.protocol_error code=%s", error_code)
         yield _make_event(
             RunnerProtocolErrorData(
-                error_code=error_code,
+                error_code=runner_protocol_error_code(error_code),
                 message=message,
                 provider_request_id=self._provider_request_id,
                 raw_payload=None,
@@ -369,7 +373,7 @@ class SSEParser:
             )
             yield _make_event(
                 RunnerProtocolErrorData(
-                    error_code=_INVALID_JSON_CODE,
+                    error_code=runner_protocol_error_code(_INVALID_JSON_CODE),
                     message=f"SSE data line is not valid JSON: {exc}",
                     provider_request_id=self._provider_request_id,
                     raw_payload=None,
@@ -387,7 +391,9 @@ class SSEParser:
         if not isinstance(parsed, dict):
             yield _make_event(
                 RunnerProtocolErrorData(
-                    error_code=_PAYLOAD_NOT_OBJECT_CODE,
+                    error_code=runner_protocol_error_code(
+                        _PAYLOAD_NOT_OBJECT_CODE
+                    ),
                     message="SSE data line is not a JSON object",
                     provider_request_id=self._provider_request_id,
                     raw_payload=None,
@@ -418,7 +424,7 @@ class SSEParser:
             self._terminated = True
             yield _make_event(
                 RunnerProtocolErrorData(
-                    error_code=_PROVIDER_ERROR_CODE,
+                    error_code=http_provider_error_code(_PROVIDER_ERROR_CODE),
                     message=_provider_error_message(parsed[_ERROR_FIELD]),
                     provider_request_id=self._provider_request_id,
                     raw_payload=provider_error_diagnostic_payload(
@@ -478,7 +484,7 @@ class SSEParser:
         self._terminated = True
         yield _make_event(
             RunnerProtocolErrorData(
-                error_code=error.error_code,
+                error_code=runner_protocol_error_code(error.error_code),
                 message=error.message,
                 provider_request_id=self._provider_request_id,
                 raw_payload=protocol_object_diagnostic_payload(
@@ -712,7 +718,9 @@ class SSEParser:
             if self._finish_reason is None:
                 yield _make_event(
                     RunnerProtocolErrorData(
-                        error_code=_MISSING_TERMINAL_FINISH_REASON_CODE,
+                        error_code=runner_protocol_error_code(
+                            _MISSING_TERMINAL_FINISH_REASON_CODE
+                        ),
                         message="SSE content response missing terminal finish_reason",
                         provider_request_id=self._provider_request_id,
                         raw_payload=protocol_object_diagnostic_payload(

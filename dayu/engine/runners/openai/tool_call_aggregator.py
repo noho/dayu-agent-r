@@ -32,6 +32,7 @@ from dayu.engine.contracts.partial_tool_call import (
     PARTIAL_TOOL_CALL_ID_MAX_CHARS,
     PartialToolCallSummary,
 )
+from dayu.engine.contracts.error_codes import runner_protocol_error_code
 from dayu.engine.contracts.runner_events import (
     RunnerDiagnosticSeverity,
     RunnerDiagnosticSource,
@@ -366,7 +367,9 @@ class ToolCallAggregator:
             if partial.tool_call_id is None:
                 self._fatal_errors.append(
                     RunnerProtocolErrorData(
-                        error_code="tool_call_missing_id",
+                        error_code=runner_protocol_error_code(
+                            "tool_call_missing_id"
+                        ),
                         message="tool call missing id at finalize",
                         provider_request_id=self._provider_request_id,
                         raw_payload=None,
@@ -377,7 +380,9 @@ class ToolCallAggregator:
             if not partial.name:
                 self._fatal_errors.append(
                     RunnerProtocolErrorData(
-                        error_code="tool_call_missing_name",
+                        error_code=runner_protocol_error_code(
+                            "tool_call_missing_name"
+                        ),
                         message=(f"tool call {partial.tool_call_id} missing name"),
                         provider_request_id=self._provider_request_id,
                         raw_payload=None,
@@ -443,7 +448,9 @@ class ToolCallAggregator:
         except json.JSONDecodeError as exc:
             self._fatal_errors.append(
                 RunnerProtocolErrorData(
-                    error_code="tool_call_arguments_invalid_json",
+                    error_code=runner_protocol_error_code(
+                        "tool_call_arguments_invalid_json"
+                    ),
                     message=(f"tool call {tool_call_id} arguments invalid: {exc}"),
                     provider_request_id=self._provider_request_id,
                     raw_payload=None,
@@ -454,7 +461,9 @@ class ToolCallAggregator:
         if not isinstance(parsed, dict):
             self._fatal_errors.append(
                 RunnerProtocolErrorData(
-                    error_code="tool_call_arguments_not_object",
+                    error_code=runner_protocol_error_code(
+                        "tool_call_arguments_not_object"
+                    ),
                     message=(f"tool call {tool_call_id} arguments is not an object"),
                     provider_request_id=self._provider_request_id,
                     raw_payload=None,

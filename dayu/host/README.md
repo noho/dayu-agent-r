@@ -619,7 +619,7 @@ positive orphan proof 需要 durable owner liveness 与本机进程证据支持�
 
 ### EngineEvent ingest
 
-Host ingest 对 Engine-origin final answer、run failed、cancelled、usage、iteration_started、provider diagnostic、tool awaiting confirmation 与 context compaction request 分别建模；worker lost 属于独立 Host lifecycle path。EngineEvent 进入 Host 前只是 worker 输入，必须匹配 run / attempt / execution identity 与当前 durable state；迟到、错 execution、错状态或无法链接 runner-call manifest 的事件会 fail closed 为 diagnostic / rejected path。Host lifecycle path 同样校验 durable identity，但使用自己的 event namespace、source 与 late-event routing。
+Host ingest 对 Engine-origin final answer、run failed、cancelled、usage、iteration_started、provider diagnostic、tool awaiting confirmation 与 context compaction request 分别建模；worker lost 属于独立 Host lifecycle path。EngineEvent 进入 Host 前只是 worker 输入，必须匹配 run / attempt / execution identity 与当前 durable state；迟到、错 execution、错状态或无法链接 runner-call manifest 的事件会 fail closed 为 diagnostic / rejected path。Host lifecycle path 同样校验 durable identity，但使用自己的 event namespace、source 与 late-event routing。Engine typed failure code 只在 ingest 边界通过 Engine serializer 写成 durable 文本；Read API、Tool Trace、Outbox 与 public HostEvent 只读取 durable payload，不检查 provider / runner-specific wrapper internals。
 
 同步 ingest 不处理需要异步 compact 的 reactive path；异步 ingest 在必要时执行 reactive compact / recovery。`iteration_started` 会显式链接 Host 先前写入的 `RUNNER_CALL_INPUT_ASSEMBLED` manifest；missing、ambiguous、mismatch 或 link conflict 都以 `ENGINE_EVENT_REJECTED` 收口，避免 provider observation 与 Host input manifest 脱节。已有 prior iteration 后的 Engine-only continuation 使用 `iteration_started.input_projection` 保存真实 runner input projection；projection 缺失时保留 limited diagnostic。
 

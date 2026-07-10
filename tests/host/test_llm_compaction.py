@@ -19,6 +19,7 @@ from dayu.engine.contracts.agent_run import (
     EngineRunOutcomeFailed,
     EngineRunOutcomeFinalAnswer,
 )
+from dayu.engine.contracts.error_codes import adapter_error_code
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.runner_spec import (
     ClientCorrelationPolicy,
@@ -814,7 +815,7 @@ async def test_llm_context_compactor_rejects_non_final_outcome(
         return EngineRunOutcomeFailed(
             session_id="session-1",
             run_id="run-1",
-            error_code="provider_error",
+            error_code=adapter_error_code("provider_error"),
             message="provider failed api_key=secret",
             provider_request_id=None,
             client_correlation_id=None,

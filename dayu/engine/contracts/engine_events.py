@@ -18,6 +18,10 @@ from enum import StrEnum
 from typing import TypeAlias
 
 from dayu.engine.contracts.agent_run import ContextBudgetSnapshot, RunResumeHint
+from dayu.engine.contracts.error_codes import (
+    EngineErrorCode,
+    validate_engine_error_code,
+)
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
 from dayu.engine.contracts.runner_events import (
@@ -358,12 +362,24 @@ class ProviderProtocolErrorData:
     """
 
     iteration_id: str
-    error_code: str
+    error_code: EngineErrorCode
     message: str
     provider_request_id: str | None
     raw_payload: JsonValue | None
     partial_tool_calls: tuple[PartialToolCallSummary, ...] = ()
     client_correlation_id: str | None = None
+
+    def __post_init__(self) -> None:
+        """校验 provider protocol error 的错误码类型。
+
+        :returns: ``None``。
+        :raises TypeError: ``error_code`` 不是 Engine 错误码联合成员时抛出。
+        """
+
+        validate_engine_error_code(
+            self.error_code,
+            field_name="ProviderProtocolErrorData.error_code",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -491,11 +507,23 @@ class RunFailedData:
     :param recoverable: 是否可恢复。
     """
 
-    error_code: str
+    error_code: EngineErrorCode
     message: str
     provider_request_id: str | None
     recoverable: bool
     client_correlation_id: str | None = None
+
+    def __post_init__(self) -> None:
+        """校验 run_failed 的错误码类型。
+
+        :returns: ``None``。
+        :raises TypeError: ``error_code`` 不是 Engine 错误码联合成员时抛出。
+        """
+
+        validate_engine_error_code(
+            self.error_code,
+            field_name="RunFailedData.error_code",
+        )
 
 
 EngineEventData: TypeAlias = (

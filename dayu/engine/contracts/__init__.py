@@ -23,6 +23,16 @@ from dayu.engine.contracts.agent_run import (
     EngineRunOutcomeSuspended,
     RunResumeHint,
 )
+from dayu.engine.contracts.error_codes import (
+    EngineErrorCode,
+    EngineRunErrorCode,
+    RunnerSpecificErrorCode,
+    RunnerSpecificErrorSource,
+    adapter_error_code,
+    http_provider_error_code,
+    runner_protocol_error_code,
+    serialize_engine_error_code,
+)
 from dayu.engine.contracts.engine_events import (
     RUN_SUSPENDED_REASON_TOOL_AWAITING,
     TERMINAL_ENGINE_EVENT_TYPES,
@@ -130,9 +140,11 @@ __all__ = [
     "ContextCompactionRequestedData",
     "DeepSeekReasoningEffort",
     "DeepSeekThinkingExtension",
+    "EngineErrorCode",
     "EngineEvent",
     "EngineEventData",
     "EngineEventType",
+    "EngineRunErrorCode",
     "EngineRunOutcomeCancelled",
     "EngineRunOutcomeFailed",
     "EngineRunOutcomeFinalAnswer",
@@ -176,6 +188,8 @@ __all__ = [
     "RunnerProviderDiagnosticData",
     "RunnerRequestIdentity",
     "RunnerReasoningDeltaData",
+    "RunnerSpecificErrorCode",
+    "RunnerSpecificErrorSource",
     "RunnerSpec",
     "RunnerToolCallDeltaData",
     "RunnerToolCallsCompletedData",
@@ -192,5 +206,9 @@ __all__ = [
     "ToolResultAcceptedData",
     "UsageReportedData",
     "UserMessage",
+    "adapter_error_code",
     "build_runner_request_identity",
+    "http_provider_error_code",
+    "runner_protocol_error_code",
+    "serialize_engine_error_code",
 ]

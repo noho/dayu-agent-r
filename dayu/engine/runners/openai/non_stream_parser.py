@@ -29,6 +29,10 @@ from typing import TypeAlias, assert_never
 
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import ToolCallRequest
+from dayu.engine.contracts.error_codes import (
+    http_provider_error_code,
+    runner_protocol_error_code,
+)
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.runner_events import (
     RunnerContentCompletedData,
@@ -139,7 +143,7 @@ def parse_non_stream_response(
         )
         yield _make_event(
             RunnerProtocolErrorData(
-                error_code=_INVALID_UTF8_CODE,
+                error_code=runner_protocol_error_code(_INVALID_UTF8_CODE),
                 message=f"non-stream response not utf-8: {exc}",
                 provider_request_id=provider_request_id,
                 raw_payload=None,
@@ -162,7 +166,7 @@ def parse_non_stream_response(
         )
         yield _make_event(
             RunnerProtocolErrorData(
-                error_code=_INVALID_JSON_CODE,
+                error_code=runner_protocol_error_code(_INVALID_JSON_CODE),
                 message=f"non-stream response is not valid JSON: {exc}",
                 provider_request_id=provider_request_id,
                 raw_payload=None,
@@ -182,7 +186,7 @@ def parse_non_stream_response(
         )
         yield _make_event(
             RunnerProtocolErrorData(
-                error_code=_PAYLOAD_NOT_OBJECT_CODE,
+                error_code=runner_protocol_error_code(_PAYLOAD_NOT_OBJECT_CODE),
                 message="non-stream response top-level is not a JSON object",
                 provider_request_id=provider_request_id,
                 raw_payload=None,
@@ -239,7 +243,7 @@ def _emit_from_dict(
         )
         yield _make_event(
             RunnerProtocolErrorData(
-                error_code=_PROVIDER_ERROR_CODE,
+                error_code=http_provider_error_code(_PROVIDER_ERROR_CODE),
                 message=_provider_error_message(parsed[_ERROR_FIELD]),
                 provider_request_id=provider_request_id,
                 raw_payload=provider_error_diagnostic_payload(
@@ -400,7 +404,7 @@ def _emit_choice_policy_error(
     _LOGGER.warning("non_stream.protocol_error code=%s", error.error_code)
     yield _make_event(
         RunnerProtocolErrorData(
-            error_code=error.error_code,
+            error_code=runner_protocol_error_code(error.error_code),
             message=error.message,
             provider_request_id=provider_request_id,
             raw_payload=protocol_object_diagnostic_payload(
@@ -507,7 +511,9 @@ def _build_tool_calls(
     if valid_raw_count == 0:
         combined_fatals = combined_fatals + (
             RunnerProtocolErrorData(
-                error_code=_TOOL_CALLS_EMPTY_AFTER_FILTER_CODE,
+                error_code=runner_protocol_error_code(
+                    _TOOL_CALLS_EMPTY_AFTER_FILTER_CODE
+                ),
                 message="non-stream tool_calls contained no JSON object entries",
                 provider_request_id=provider_request_id,
                 raw_payload=None,
@@ -571,7 +577,9 @@ def _coerce_final_tool_call(
                 delta_id if isinstance(delta_id, str) else f"#{index}"
             )
             pre_error = RunnerProtocolErrorData(
-                error_code=_TOOL_CALL_ARGUMENTS_NOT_OBJECT_CODE,
+                error_code=runner_protocol_error_code(
+                    _TOOL_CALL_ARGUMENTS_NOT_OBJECT_CODE
+                ),
                 message=(
                     f"tool call {tool_id_for_msg} arguments is neither a "
                     "JSON string nor a JSON object"

@@ -13,6 +13,10 @@ from datetime import datetime
 from enum import StrEnum
 from typing import TypeAlias
 
+from dayu.engine.contracts.error_codes import (
+    RunnerSpecificErrorCode,
+    validate_runner_specific_error_code,
+)
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
 from dayu.contracts.json_value import JsonValue
@@ -201,11 +205,23 @@ class RunnerProtocolErrorData:
         摘要；不包含 raw argument payload。
     """
 
-    error_code: str
+    error_code: RunnerSpecificErrorCode
     message: str
     provider_request_id: str | None
     raw_payload: JsonValue | None
     partial_tool_calls: tuple[PartialToolCallSummary, ...] = ()
+
+    def __post_init__(self) -> None:
+        """校验 provider 协议错误码类型。
+
+        :returns: ``None``。
+        :raises TypeError: ``error_code`` 不是专有错误码 wrapper 时抛出。
+        """
+
+        validate_runner_specific_error_code(
+            self.error_code,
+            field_name="RunnerProtocolErrorData.error_code",
+        )
 
 
 @dataclass(frozen=True, slots=True)

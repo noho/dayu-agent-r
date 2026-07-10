@@ -90,7 +90,8 @@ Engine 位于链路最下游。Host 可以调用 Engine public entry；Engine �
 - `EngineRunOutcomeCancelled`
 - `EngineRunOutcomeSuspended`
 
-若 `EngineEvent stream` 未产出终态就结束，聚合入口返回 `EngineRunOutcomeFailed(error_code="missing_terminal")`。
+若 `EngineEvent stream` 未产出终态就结束，聚合入口返回
+`EngineRunOutcomeFailed(error_code=EngineRunErrorCode.MISSING_TERMINAL)`。
 
 ### `AgentRunRequest`
 
@@ -172,6 +173,10 @@ Engine 公共契约分为 Engine 专属契约与 Dayu Agent 公共契约。
 - `AgentRunRequest`：单次 run 的完整输入快照。
 - `AgentPolicy`：Agent loop 策略，包含 iteration 预算、continuation 预算、工具开关、工具握手 timeout、fallback 模式、fallback prompt、continuation prompt 与连续失败工具批次阈值。`fallback_prompt` 与 `continuation_prompt` 是调用方已经解析好的必填文本；Engine 不提供 LLM-facing prompt 默认值。
 - `AgentRunResult`：`run_agent_and_wait` 的终态返回封闭联合。
+- `EngineRunErrorCode` / `RunnerSpecificErrorCode`：Agent / Engine
+  已知失败使用 Engine-owned 枚举；provider / runner adapter 专有协议码使用
+  带来源的 wrapper。Host / public 边界必须通过
+  `serialize_engine_error_code(...)` 序列化为 durable 文本。
 - `AgentMessage`：Runner 输入消息封闭联合，成员包括 `SystemMessage`、`UserMessage`、`AssistantMessage`、`ToolMessage`。
 - `AssistantToolCall`：assistant 消息中的工具调用记录，保留 `provider_state` 以支持 provider roundtrip。
 - `EngineEvent`：Engine 对调用方暴露的公共事件，字段包括 `occurred_at`、`session_id`、`run_id`、`type`、`data`、`metadata`。
@@ -266,6 +271,11 @@ Stream 术语固定如下：
 - SSE 与非流式响应都在 OpenAI-compatible Runner adapter 边界校验 `choices` 与 `finish_reason`：多 assistant choice、显式非零 choice index、非法 choice shape、未知或非法 `finish_reason` 都按 provider protocol error fail closed；`finish_reason` 缺失或 `null` 只表示 absent，不会默认成 `stop`。
 - 按 `RunnerSpec.max_retries`、HTTP 分类、网络异常、timeout 和 `Retry-After` 执行重试；若一次 attempt 已经产出事件，后续 retriable failure 不再重试，而是以 error 收口。
 - 取消 token 命中时 Runner 生成器自然结束，不补 `RunnerDoneData`。
+- fatal provider protocol error 的 `RunnerProtocolErrorData.error_code` 是
+  `RunnerSpecificErrorCode`；Agent 提升为 `ProviderProtocolErrorData` 时保留
+  typed code。缺失 provider 明细时不得构造空专有码，必须使用
+  Engine-owned fallback，例如
+  `EngineRunErrorCode.RUNNER_ERROR_DONE_WITHOUT_DETAIL`。
 
 ### Provider 请求扩展
 

@@ -24,6 +24,11 @@ from dayu.contracts.tool_outcome import ToolCompletedOutcome
 from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
+from dayu.engine.contracts.error_codes import (
+    EngineRunErrorCode,
+    adapter_error_code,
+    runner_protocol_error_code,
+)
 from dayu.engine.contracts.engine_events import (
     ContextCompactionRequestedData,
     ContentCompleteData,
@@ -520,7 +525,7 @@ def test_terminal_plans_use_lifecycle_event_owner_helpers() -> None:
     )
     failed = engine_ingest_module._run_failed_plan(
         RunFailedData(
-            error_code="provider_error",
+            error_code=adapter_error_code("provider_error"),
             message="provider failed",
             provider_request_id=None,
             client_correlation_id=None,
@@ -634,7 +639,7 @@ def test_run_failed_recoverable_false_closes_failed(tmp_path: Path) -> None:
             seeded,
             worker_event_index=2,
             data=RunFailedData(
-                error_code="provider_error",
+                error_code=adapter_error_code("provider_error"),
                 message="provider failed",
                 provider_request_id="req-1",
                 client_correlation_id="client-req-1",
@@ -670,7 +675,7 @@ def test_run_failed_recoverable_true_is_diagnostic_then_failed(tmp_path: Path) -
             seeded,
             worker_event_index=3,
             data=RunFailedData(
-                error_code="context_recovery_needed",
+                error_code=adapter_error_code("context_recovery_needed"),
                 message="recoverable",
                 provider_request_id="req-2",
                 client_correlation_id="client-req-2",
@@ -1301,7 +1306,7 @@ async def test_old_attempt_run_failed_after_recovery_is_stale_diagnostic(
                 seeded,
                 worker_event_index=44,
                 data=RunFailedData(
-                    error_code="context_compaction_required",
+                    error_code=EngineRunErrorCode.CONTEXT_COMPACTION_REQUIRED,
                     message="provider closed old attempt",
                     provider_request_id="req-overflow",
                     recoverable=True,
@@ -2197,7 +2202,7 @@ def test_provider_protocol_error_is_diagnostic_without_state_change(
             worker_event_index=10,
             data=ProviderProtocolErrorData(
                 iteration_id="iter-protocol",
-                error_code="invalid_stream",
+                error_code=runner_protocol_error_code("invalid_stream"),
                 message="bad stream",
                 provider_request_id="req-protocol",
                 client_correlation_id="client-protocol",
@@ -2245,6 +2250,7 @@ def test_provider_protocol_error_is_diagnostic_without_state_change(
             "provider_error_code": "invalid_stream",
             "diagnostic_refs": [payload["raw_payload_ref"], "req-protocol"],
         }
+        assert "RunnerSpecificErrorCode" not in json.dumps(payload)
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.RUNNING
         assert attempt_status == AttemptStatus.RUNNING
@@ -2311,7 +2317,7 @@ def test_provider_protocol_error_serializes_partial_tool_call_signal(
             worker_event_index=11,
             data=ProviderProtocolErrorData(
                 iteration_id="iter-protocol-partial",
-                error_code="invalid_stream",
+                error_code=runner_protocol_error_code("invalid_stream"),
                 message="bad stream",
                 provider_request_id="req-protocol-partial",
                 client_correlation_id="client-protocol-partial",
@@ -2566,8 +2572,8 @@ def test_late_terminal_event_is_rejected_after_closeout(tmp_path: Path) -> None:
         late = _candidate(
             seeded,
             worker_event_index=14,
-            data=RunFailedData(
-                error_code="late",
+                data=RunFailedData(
+                    error_code=adapter_error_code("late"),
                 message="late",
                 provider_request_id=None,
                 recoverable=False,
@@ -2697,8 +2703,8 @@ def test_late_worker_terminal_after_timeout_is_rejected_as_terminal_closed(
         candidate = _candidate(
             seeded,
             worker_event_index=17,
-            data=RunFailedData(
-                error_code="late_after_timeout",
+                data=RunFailedData(
+                    error_code=adapter_error_code("late_after_timeout"),
                 message="late after timeout",
                 provider_request_id=None,
                 recoverable=False,
@@ -2766,8 +2772,8 @@ def test_late_run_failed_after_run_cancelling_is_rejected_with_diagnostic(
         candidate = _candidate(
             seeded,
             worker_event_index=19,
-            data=RunFailedData(
-                error_code="late_failure",
+                data=RunFailedData(
+                    error_code=adapter_error_code("late_failure"),
                 message="late failure",
                 provider_request_id=None,
                 recoverable=False,
@@ -3362,7 +3368,7 @@ def test_engine_run_failed_with_worker_lifecycle_reason_remains_engine_failed(
             seeded,
             worker_event_index=1,
             data=RunFailedData(
-                error_code="worker_lost_before_terminal",
+                error_code=adapter_error_code("worker_lost_before_terminal"),
                 message="Engine reported its own failure",
                 provider_request_id=None,
                 recoverable=False,

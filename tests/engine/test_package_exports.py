@@ -30,9 +30,11 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "ContextCompactionRequestedData",
         "DeepSeekReasoningEffort",
         "DeepSeekThinkingExtension",
+        "EngineErrorCode",
         "EngineEvent",
         "EngineEventData",
         "EngineEventType",
+        "EngineRunErrorCode",
         "EngineRunOutcomeCancelled",
         "EngineRunOutcomeFailed",
         "EngineRunOutcomeFinalAnswer",
@@ -79,6 +81,8 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "RunnerProtocolErrorData",
         "RunnerRequestIdentity",
         "RunnerReasoningDeltaData",
+        "RunnerSpecificErrorCode",
+        "RunnerSpecificErrorSource",
         "RunnerSpec",
         "RunnerToolCallDeltaData",
         "RunnerToolCallsCompletedData",
@@ -120,8 +124,12 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "ToolResultSuccess",
         "ToolSchema",
         "UserMessage",
+        "adapter_error_code",
         "build_runner_request_identity",
+        "http_provider_error_code",
+        "runner_protocol_error_code",
         "runner_role_sequence_digest",
+        "serialize_engine_error_code",
     }
 )
 

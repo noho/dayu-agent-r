@@ -53,9 +53,17 @@ Engine 公共入口由 `dayu.engine.agent` 提供，并通过 `dayu.engine.__ini
 - `EngineRunOutcomeCancelled`
 - `EngineRunOutcomeSuspended`
 
-若 `EngineEvent stream` 结束但没有产出 terminal event，聚合入口返回 `EngineRunOutcomeFailed(error_code="missing_terminal")`。
+若 `EngineEvent stream` 结束但没有产出 terminal event，聚合入口返回
+`EngineRunOutcomeFailed(error_code=EngineRunErrorCode.MISSING_TERMINAL)`。
 
 包根 `dayu.engine` 同时导出 Engine 专属契约和调用 Engine 必需的 Dayu Agent 公共契约，例如工具 schema、工具执行协议、工具 outcome、JSON 值与取消 token。当前包根也导出 Runner 请求身份与输入观测相关公共契约，包括 `ClientCorrelationPolicy`、`RunnerRequestIdentity`、`build_runner_request_identity`、`RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION`、`RunnerInputMessageProjection`、`RunnerInputToolCallProjection` 与 `runner_role_sequence_digest`。`_AsyncAgent` 与 `AsyncOpenAIRunner` 是当前实现类，不属于包根稳定导出；调用方依赖函数式入口与 contracts。
+
+Engine 失败码契约分为两类：Agent / Engine 已知失败使用
+`EngineRunErrorCode` 枚举；provider / runner adapter 专有协议码使用
+`RunnerSpecificErrorCode(value, source)`，来源是闭集枚举。`RunFailedData`、
+`EngineRunOutcomeFailed`、`ProviderProtocolErrorData` 与
+`RunnerProtocolErrorData` 不接受裸字符串失败码。Host / public 边界只能通过
+`serialize_engine_error_code(...)` 把 typed code 写成 durable 文本。
 
 ## 3. Run-Scoped 生命周期
 
@@ -262,7 +270,7 @@ OpenAI-compatible Runner 只有在 policy 为 `OPENAI_X_CLIENT_REQUEST_ID` 且�
 | `runner_content_completed` | `RunnerContentCompletedData` | 保存完整正文与 finish reason，产出 `content_completed` |
 | `runner_usage_recorded` | `RunnerUsageRecordedData` | 产出 `usage_reported` |
 | `provider_diagnostic` | `RunnerProviderDiagnosticData` | 产出非致命 `provider_diagnostic`，不设置失败候选 |
-| `provider_protocol_error` | `RunnerProtocolErrorData` | 产出 `provider_protocol_error`，设置失败候选 |
+| `provider_protocol_error` | `RunnerProtocolErrorData` | 产出 `provider_protocol_error`，以 typed provider / runner 专有码设置失败候选 |
 | `runner_http_error` | `RunnerHTTPErrorData` | 上下文超限时产出 `context_compaction_requested`，其它 HTTP 错误设置失败候选 |
 | `runner_done` | `RunnerDoneData` | 标记 Runner 完成，产出 `iteration_completed` |
 
@@ -464,12 +472,12 @@ Terminal event 类型固定为：
 | `context_compaction_requested` | `ContextCompactionRequestedData` | provider 上下文超限，需要调用方重构上下文后新开 run |
 | `usage_reported` | `UsageReportedData` | provider usage 事实 |
 | `provider_diagnostic` | `ProviderDiagnosticData` | provider / adapter 非致命诊断；不代表 run failure |
-| `provider_protocol_error` | `ProviderProtocolErrorData` | provider 协议解析错误 |
+| `provider_protocol_error` | `ProviderProtocolErrorData` | provider 协议解析错误；`error_code` 为 typed Engine error-code union |
 | `iteration_completed` | `IterationCompletedData` | 本轮 Runner done |
 | `final_answer` | `FinalAnswerData` | 最终回答终态 |
 | `run_suspended` | `RunSuspendedData` | run 挂起终态 |
 | `run_cancelled` | `RunCancelledData` | run 取消终态 |
-| `run_failed` | `RunFailedData` | run 失败终态 |
+| `run_failed` | `RunFailedData` | run 失败终态；`error_code` 为 `EngineRunErrorCode` 或 `RunnerSpecificErrorCode` |
 
 `tool_call_requested` 是观测事件，不是外部二次执行命令。工具执行由 Agent 状态机在事件之后继续调用 `ToolExecutor.execute` 完成。
 

@@ -19,6 +19,10 @@ from typing import TypeAlias
 
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.contracts.cancellation import CancellationToken
+from dayu.engine.contracts.error_codes import (
+    EngineErrorCode,
+    validate_engine_error_code,
+)
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import AgentMessage
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
@@ -149,11 +153,23 @@ class EngineRunOutcomeFailed:
 
     session_id: str
     run_id: str
-    error_code: str
+    error_code: EngineErrorCode
     message: str
     provider_request_id: str | None
     recoverable: bool
     client_correlation_id: str | None = None
+
+    def __post_init__(self) -> None:
+        """校验失败 outcome 的错误码类型。
+
+        :returns: ``None``。
+        :raises TypeError: ``error_code`` 不是 Engine 错误码联合成员时抛出。
+        """
+
+        validate_engine_error_code(
+            self.error_code,
+            field_name="EngineRunOutcomeFailed.error_code",
+        )
 
 
 @dataclass(frozen=True, slots=True)

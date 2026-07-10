@@ -29,6 +29,15 @@ from dayu.engine.contracts.agent_run import (
     EngineRunOutcomeFinalAnswer,
     EngineRunOutcomeSuspended,
 )
+from dayu.engine.contracts.error_codes import (
+    EngineErrorCode,
+    EngineRunErrorCode,
+    RunnerSpecificErrorCode,
+    RunnerSpecificErrorSource,
+    adapter_error_code,
+    runner_protocol_error_code,
+    serialize_engine_error_code,
+)
 from dayu.engine.contracts.engine_events import (
     ContextCompactionRequestedData,
     EngineEvent,
@@ -91,6 +100,41 @@ from dayu.contracts.tool_schema import (
 
 _TOOL_EXECUTION_TIMEOUT_SECONDS: float = 5.0
 _CONTINUATION_MAX_ATTEMPTS: int = 3
+
+
+def _assert_engine_run_error_code(
+    actual: EngineErrorCode, expected: EngineRunErrorCode
+) -> None:
+    """断言 Engine-owned 失败码保持枚举身份并可序列化。
+
+    :param actual: 被测失败码。
+    :param expected: 期望的 Engine-owned 失败码枚举成员。
+    :returns: 无返回值。
+    :raises AssertionError: 失败码身份或序列化文本不符合预期时抛出。
+    """
+
+    assert actual is expected
+    assert serialize_engine_error_code(actual) == expected.value
+
+
+def _assert_runner_specific_error_code(
+    actual: EngineErrorCode,
+    *,
+    expected_value: str,
+    expected_source: RunnerSpecificErrorSource,
+) -> None:
+    """断言 provider / runner 专有失败码保持 wrapper 类型与来源。
+
+    :param actual: 被测失败码。
+    :param expected_value: 期望的序列化文本。
+    :param expected_source: 期望的失败码来源闭集成员。
+    :returns: 无返回值。
+    :raises AssertionError: 失败码类型、来源或序列化文本不符合预期时抛出。
+    """
+
+    assert isinstance(actual, RunnerSpecificErrorCode)
+    assert actual.source is expected_source
+    assert serialize_engine_error_code(actual) == expected_value
 
 
 def _utc_now() -> datetime:
@@ -697,7 +741,7 @@ async def test_protocol_error_and_error_done_maps_to_run_failed() -> None:
             _event(
                 RunnerEventType.PROVIDER_PROTOCOL_ERROR,
                 RunnerProtocolErrorData(
-                    error_code="bad_sse",
+                    error_code=runner_protocol_error_code("bad_sse"),
                     message="bad stream",
                     provider_request_id="req_1",
                     raw_payload={"type": "bad"},
@@ -718,7 +762,11 @@ async def test_protocol_error_and_error_done_maps_to_run_failed() -> None:
     terminal = _final_event(events)
     assert terminal.type is EngineEventType.RUN_FAILED
     assert isinstance(terminal.data, RunFailedData)
-    assert terminal.data.error_code == "bad_sse"
+    _assert_runner_specific_error_code(
+        terminal.data.error_code,
+        expected_value="bad_sse",
+        expected_source=RunnerSpecificErrorSource.RUNNER_PROTOCOL,
+    )
     assert isinstance(events[-2].data, IterationCompletedData)
     assert events[-2].data.provider_request_id == "req_1"
     assert terminal.data.provider_request_id == "req_1"
@@ -813,7 +861,11 @@ async def test_http_error_maps_to_run_failed_without_extra_engine_event() -> Non
         EngineEventType.RUN_FAILED,
     ]
     assert isinstance(events[-1].data, RunFailedData)
-    assert events[-1].data.error_code == "rate_limit_exceeded"
+    _assert_runner_specific_error_code(
+        events[-1].data.error_code,
+        expected_value="rate_limit_exceeded",
+        expected_source=RunnerSpecificErrorSource.ADAPTER,
+    )
     assert isinstance(events[-2].data, IterationCompletedData)
     assert events[-2].data.provider_request_id == "req_http"
     assert events[-1].data.provider_request_id == "req_http"
@@ -862,7 +914,10 @@ async def test_context_overflow_http_error_maps_to_compaction_required_fact() ->
     assert events[-2].data.provider_request_id == "req_context"
     terminal = events[-1]
     assert isinstance(terminal.data, RunFailedData)
-    assert terminal.data.error_code == "context_compaction_required"
+    _assert_engine_run_error_code(
+        terminal.data.error_code,
+        EngineRunErrorCode.CONTEXT_COMPACTION_REQUIRED,
+    )
     assert terminal.data.provider_request_id == "req_context"
     assert terminal.data.recoverable
 
@@ -972,7 +1027,10 @@ async def test_context_overflow_marker_fallback_emits_nonfatal_diagnostic() -> N
     assert compact.provider_request_id == "req_context_marker"
     terminal = events[-1].data
     assert isinstance(terminal, RunFailedData)
-    assert terminal.error_code == "context_compaction_required"
+    _assert_engine_run_error_code(
+        terminal.error_code,
+        EngineRunErrorCode.CONTEXT_COMPACTION_REQUIRED,
+    )
     assert terminal.recoverable
 
 
@@ -993,7 +1051,10 @@ async def test_bare_error_done_maps_to_specific_run_failed() -> None:
     terminal = _final_event(events)
     assert terminal.type is EngineEventType.RUN_FAILED
     assert isinstance(terminal.data, RunFailedData)
-    assert terminal.data.error_code == "runner_error_done_without_detail"
+    _assert_engine_run_error_code(
+        terminal.data.error_code,
+        EngineRunErrorCode.RUNNER_ERROR_DONE_WITHOUT_DETAIL,
+    )
     assert terminal.data.provider_request_id is None
 
 
@@ -1006,7 +1067,10 @@ async def test_runner_exception_maps_to_run_failed_and_closes() -> None:
 
     assert _final_event(events).type is EngineEventType.RUN_FAILED
     assert isinstance(events[-1].data, RunFailedData)
-    assert events[-1].data.error_code == "runner_exception"
+    _assert_engine_run_error_code(
+        events[-1].data.error_code,
+        EngineRunErrorCode.RUNNER_EXCEPTION,
+    )
     assert runner.close_count == 1
 
 
@@ -1293,7 +1357,7 @@ async def test_provider_error_and_cancel_same_run_cancel_wins() -> None:
             _event(
                 RunnerEventType.PROVIDER_PROTOCOL_ERROR,
                 RunnerProtocolErrorData(
-                    error_code="bad",
+                    error_code=runner_protocol_error_code("bad"),
                     message="bad",
                     provider_request_id=None,
                     raw_payload=None,
@@ -1457,7 +1521,10 @@ async def test_tool_call_delta_and_completed_fail_closed() -> None:
         events = await _collect(_AsyncAgent(request=_request(), runner=runner))
         assert _final_event(events).type is EngineEventType.RUN_FAILED
         assert isinstance(events[-1].data, RunFailedData)
-        assert events[-1].data.error_code == "runner_abnormal_stop"
+        _assert_engine_run_error_code(
+            events[-1].data.error_code,
+            EngineRunErrorCode.RUNNER_ABNORMAL_STOP,
+        )
         assert EngineEventType.TOOL_CALL_REQUESTED not in {
             event.type for event in events
         }
@@ -1585,7 +1652,10 @@ async def test_abnormal_stop_and_max_iterations_fail() -> None:
         )
     )
     assert isinstance(abnormal[-1].data, RunFailedData)
-    assert abnormal[-1].data.error_code == "runner_abnormal_stop"
+    _assert_engine_run_error_code(
+        abnormal[-1].data.error_code,
+        EngineRunErrorCode.RUNNER_ABNORMAL_STOP,
+    )
 
     exceeded = await _collect(
         _AsyncAgent(
@@ -1796,7 +1866,7 @@ async def test_run_agent_and_wait_preserves_provider_request_id(
             run_id=request.run_id,
             type=EngineEventType.RUN_FAILED,
             data=RunFailedData(
-                error_code="provider_http_error",
+                error_code=adapter_error_code("provider_http_error"),
                 message="provider failed",
                 provider_request_id=expected_provider_request_id,
                 client_correlation_id=expected_client_correlation_id,
@@ -1811,7 +1881,11 @@ async def test_run_agent_and_wait_preserves_provider_request_id(
     assert isinstance(result, EngineRunOutcomeFailed)
     assert result.provider_request_id == expected_provider_request_id
     assert result.client_correlation_id == expected_client_correlation_id
-    assert result.error_code == "provider_http_error"
+    _assert_runner_specific_error_code(
+        result.error_code,
+        expected_value="provider_http_error",
+        expected_source=RunnerSpecificErrorSource.ADAPTER,
+    )
 
 
 @pytest.mark.asyncio
@@ -1909,7 +1983,7 @@ async def test_run_agent_and_wait_logs_unknown_terminal_shape(
             run_id=request.run_id,
             type=EngineEventType.FINAL_ANSWER,
             data=RunFailedData(
-                error_code="bad_terminal_shape",
+                error_code=EngineRunErrorCode.MISSING_TERMINAL,
                 message="bad terminal shape",
                 provider_request_id=None,
                 recoverable=False,
