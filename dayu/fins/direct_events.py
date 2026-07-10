@@ -78,6 +78,61 @@ class FinsOperationKind(str, Enum):
     PROCESS_MATERIAL = "process_material"
 
 
+class FinsDirectStreamProtocolErrorKind(str, Enum):
+    """Fins direct stream 协议错误分类。"""
+
+    MISSING_RESULT = "missing_result"
+    DUPLICATE_RESULT = "duplicate_result"
+
+
+class FinsDirectStreamProtocolError(ValueError):
+    """Fins direct stream 协议错误。
+
+    Attributes:
+        reason: 协议错误分类。
+        operation_kind: 发生错误的 direct 操作类型。
+        message: 用户可读且非空的错误说明。
+    """
+
+    reason: FinsDirectStreamProtocolErrorKind
+    operation_kind: FinsOperationKind
+    message: str
+
+    def __init__(
+        self,
+        reason: FinsDirectStreamProtocolErrorKind,
+        operation_kind: FinsOperationKind,
+        message: str,
+    ) -> None:
+        """初始化 Fins direct stream 协议错误。
+
+        Args:
+            reason: 协议错误分类。
+            operation_kind: 发生错误的 direct 操作类型。
+            message: 用户可读且非空的错误说明。
+
+        Returns:
+            无。
+
+        Raises:
+            TypeError: reason 或 operation_kind 类型非法时抛出。
+            ValueError: message 为空时抛出。
+        """
+
+        if not isinstance(reason, FinsDirectStreamProtocolErrorKind):
+            raise TypeError(
+                "reason must be FinsDirectStreamProtocolErrorKind"
+            )
+        if not isinstance(operation_kind, FinsOperationKind):
+            raise TypeError("operation_kind must be FinsOperationKind")
+        if not message.strip():
+            raise ValueError("message must not be empty")
+        self.reason = reason
+        self.operation_kind = operation_kind
+        self.message = message
+        super().__init__(message)
+
+
 class FinsErrorKind(str, Enum):
     """Fins direct 失败分类。"""
 
@@ -427,6 +482,8 @@ __all__: tuple[str, ...] = (
     "FINS_RESULT_EXIT_CANCELLED",
     "FINS_RESULT_EXIT_FAILURE",
     "FINS_RESULT_EXIT_SUCCESS",
+    "FinsDirectStreamProtocolError",
+    "FinsDirectStreamProtocolErrorKind",
     "FinsErrorKind",
     "FinsEvent",
     "FinsEventDetail",

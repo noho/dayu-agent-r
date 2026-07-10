@@ -33,6 +33,8 @@ from dayu.fins.direct_events import (
     FINS_RESULT_EXIT_CANCELLED,
     FINS_RESULT_EXIT_FAILURE,
     FINS_RESULT_EXIT_SUCCESS,
+    FinsDirectStreamProtocolError,
+    FinsDirectStreamProtocolErrorKind,
     FinsErrorKind,
     FinsEvent,
     FinsEventDetail,
@@ -2666,7 +2668,8 @@ class FinsIngestionRuntime:
             Fins direct 事件异步迭代器。
 
         Raises:
-            无。producer 异常会转换成 ``RESULT(status=FAILURE)``。
+            FinsDirectStreamProtocolError: producer 未产出 RESULT 或产出重复 RESULT 时抛出。
+            Exception: producer 异常转换失败时由底层构造或 queue 操作抛出。
         """
 
         queue: Queue[_DirectStreamQueueItem] = Queue(maxsize=_DIRECT_EVENT_QUEUE_MAX_SIZE)
@@ -2695,7 +2698,7 @@ class FinsIngestionRuntime:
         )
         thread.start()
         try:
-            result_seen = False
+            result_event: FinsEvent | None = None
             while True:
                 item = await asyncio.to_thread(
                     _direct_queue_get,
@@ -2707,14 +2710,22 @@ class FinsIngestionRuntime:
                 if isinstance(item, _DirectStreamProducerDone):
                     break
                 if item.event_type is FinsEventType.RESULT:
-                    if result_seen:
-                        continue
-                    result_seen = True
+                    if result_event is not None:
+                        raise FinsDirectStreamProtocolError(
+                            FinsDirectStreamProtocolErrorKind.DUPLICATE_RESULT,
+                            direct_operation_kind,
+                            "Fins direct stream produced multiple RESULT events",
+                        )
+                    result_event = item
+                    continue
                 yield item
-                if result_seen:
-                    break
-            if not result_seen:
-                yield _direct_missing_result_event(context)
+            if result_event is None:
+                raise FinsDirectStreamProtocolError(
+                    FinsDirectStreamProtocolErrorKind.MISSING_RESULT,
+                    direct_operation_kind,
+                    "Fins direct stream ended without RESULT",
+                )
+            yield result_event
         finally:
             cancellation_state.request_cancel()
 
@@ -4562,39 +4573,6 @@ def _put_direct_queue(
             return True
         except Full:
             continue
-
-
-def _direct_missing_result_event(context: _FinsIngestionExecutionContext) -> FinsEvent:
-    """构造 producer 静默结束时的 direct failure RESULT。
-
-    Args:
-        context: direct stream 执行上下文。
-
-    Returns:
-        表示 runtime 未产出终态的失败 RESULT。
-
-    Raises:
-        无。
-    """
-
-    return FinsEvent(
-        event_type=FinsEventType.RESULT,
-        operation_kind=context.direct_operation_kind,
-        message=_DIRECT_FAILURE_TITLE,
-        emitted_at=datetime.now(timezone.utc),
-        ticker=context.normalized_ticker,
-        filing_kind=_direct_filing_kind(context.source_kind),
-        document_label=None,
-        progress=None,
-        result=FinsResultSummary(
-            status=FinsResultStatus.FAILURE,
-            exit_code=FINS_RESULT_EXIT_FAILURE,
-            title=_DIRECT_FAILURE_TITLE,
-            details=(),
-            error_kind=FinsErrorKind.EXECUTION,
-            error_message=_DIRECT_ERROR_TEXT_FALLBACK,
-        ),
-    )
 
 
 def _direct_progress_event(

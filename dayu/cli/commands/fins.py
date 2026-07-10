@@ -43,9 +43,12 @@ from dayu.cli.output import (
     render_fins_direct_local_exit_after_cancel,
 )
 from dayu.fins.direct_events import (
+    FinsDirectStreamProtocolError,
+    FinsDirectStreamProtocolErrorKind,
     FinsErrorKind,
     FinsEvent,
     FinsEventDetail,
+    FinsOperationKind,
     FinsResultStatus,
     FinsResultSummary,
 )
@@ -91,10 +94,6 @@ _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 class CliFinsUsageError(ValueError):
     """Fins direct CLI 用法错误。"""
-
-
-class FinsDirectStreamContractViolation(RuntimeError):
-    """CLI 观察到 Fins direct Service stream contract 被破坏。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,6 +283,9 @@ def run_fins_direct_command(args: ParsedCliArgs) -> int:
     except FinsDirectUsageError as exc:
         render_cli_error(f"dayu-cli {args.command_name}: {exc}")
         return EXIT_USAGE_ERROR
+    except FinsDirectStreamProtocolError as exc:
+        render_cli_error(f"dayu-cli {args.command_name}: {exc.message}")
+        return EXIT_FAILURE
     except KeyboardInterrupt:
         return EXIT_KEYBOARD_INTERRUPT
     except Exception as exc:
@@ -311,6 +313,7 @@ async def _run_fins_direct_command_async(args: ParsedCliArgs) -> int:
     workspace_root = _resolve_workspace_root(args.workspace_root)
     service = FINS_DIRECT_SERVICE_FACTORY(workspace_root)
     cancellation_token = _CliFinsCancellationToken()
+    operation_kind = _direct_operation_kind(args.command_name)
     stream = _open_direct_stream(
         args=args,
         service=service,
@@ -326,6 +329,7 @@ async def _run_fins_direct_command_async(args: ParsedCliArgs) -> int:
         cancellation_token=cancellation_token,
         sigint_monitor=_FinsSigintMonitor(),
         command_name=args.command_name,
+        operation_kind=operation_kind,
     )
     return terminal.exit_code
 
@@ -481,6 +485,29 @@ def _open_direct_stream(
             cancellation_token=cancellation_token,
         )
     raise CliFinsUsageError(f"unsupported fins direct command: {args.command_name}")
+
+
+def _direct_operation_kind(command_name: str) -> FinsOperationKind:
+    """把 CLI command name 映射为 Fins direct operation kind。
+
+    :param command_name: CLI command name。
+    :returns: 对应 direct operation kind。
+    :raises CliFinsUsageError: 命令不属于 Fins direct stream 时抛出。
+    """
+
+    if command_name == COMMAND_DOWNLOAD:
+        return FinsOperationKind.DOWNLOAD
+    if command_name == COMMAND_UPLOAD_FILING:
+        return FinsOperationKind.UPLOAD_FILING
+    if command_name == COMMAND_UPLOAD_MATERIAL:
+        return FinsOperationKind.UPLOAD_MATERIAL
+    if command_name == COMMAND_PROCESS:
+        return FinsOperationKind.PREPROCESS
+    if command_name == COMMAND_PROCESS_FILING:
+        return FinsOperationKind.PROCESS_FILING
+    if command_name == COMMAND_PROCESS_MATERIAL:
+        return FinsOperationKind.PROCESS_MATERIAL
+    raise CliFinsUsageError(f"unsupported fins direct command: {command_name}")
 
 
 def _download_stream(
@@ -660,6 +687,7 @@ async def _wait_for_terminal_handling_sigint(
     cancellation_token: _CliFinsCancellationToken,
     sigint_monitor: _FinsSigintMonitor,
     command_name: str,
+    operation_kind: FinsOperationKind,
 ) -> FinsResultSummary | _CliDirectLocalExit:
     """等待 direct stream 终态并处理运行中 SIGINT。
 
@@ -667,12 +695,15 @@ async def _wait_for_terminal_handling_sigint(
     :param cancellation_token: 当前 operation 的取消 token。
     :param sigint_monitor: SIGINT 观察器。
     :param command_name: 用户可见命令名，用于诊断。
+    :param operation_kind: 当前 direct 操作类型。
     :returns: direct stream 终态摘要，或 CLI 本地退出状态。
     :raises Exception: stream 消费失败时向上抛出。
     """
 
     sigint_monitor.install()
-    event_task = asyncio.create_task(_consume_fins_direct_events(events))
+    event_task = asyncio.create_task(
+        _consume_fins_direct_events(events, operation_kind=operation_kind)
+    )
     observed_count = sigint_monitor.count
     sigint_task = asyncio.create_task(sigint_monitor.wait_next(observed_count))
     try:
@@ -712,12 +743,15 @@ async def _wait_for_terminal_handling_sigint(
 
 async def _consume_fins_direct_events(
     events: AsyncIterator[FinsEvent],
+    *,
+    operation_kind: FinsOperationKind,
 ) -> FinsResultSummary:
     """消费 Service event stream 并输出 Fins direct 事件。
 
     :param events: Fins direct event stream。
+    :param operation_kind: 当前 direct 操作类型。
     :returns: event stream 产出的 terminal result summary。
-    :raises FinsDirectStreamContractViolation: Service stream 结束但没有 terminal result 时抛出。
+    :raises FinsDirectStreamProtocolError: Service stream 结束但没有 terminal result 时抛出。
     :raises Exception: Service stream 或输出失败时向上抛出。
     """
 
@@ -733,8 +767,12 @@ async def _consume_fins_direct_events(
                 event.result.exit_code,
             )
             return event.result
-    raise FinsDirectStreamContractViolation(
-        "Fins direct Service stream ended without RESULT"
+    # runtime / Service 通常已先抛同一 typed protocol error；这里仅兜底
+    # mocked 或截断的 CLI stream。
+    raise FinsDirectStreamProtocolError(
+        FinsDirectStreamProtocolErrorKind.MISSING_RESULT,
+        operation_kind,
+        "Fins direct Service stream ended without RESULT",
     )
 
 

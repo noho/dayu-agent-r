@@ -22,6 +22,8 @@ from dayu.cli.exit_codes import (
     EXIT_USAGE_ERROR,
 )
 from dayu.fins.direct_events import (
+    FinsDirectStreamProtocolError,
+    FinsDirectStreamProtocolErrorKind,
     FinsErrorKind,
     FinsEvent,
     FinsEventDetail,
@@ -876,11 +878,11 @@ def test_terminal_failed_and_cancelled_status_exit_mapping(
     assert "Fins cancelled" in cancelled_output.err
 
 
-def test_stream_without_result_returns_contract_violation(
+def test_stream_without_result_returns_protocol_error(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """direct stream 无 RESULT 时 CLI 必须报告 Service contract violation。"""
+    """direct stream 无 RESULT 时 CLI 必须报告 typed protocol error。"""
 
     service = _FakeFinsDirectService(events=(_progress_event(FinsOperationKind.DOWNLOAD),))
     monkeypatch.setattr(
@@ -898,6 +900,37 @@ def test_stream_without_result_returns_contract_violation(
     assert "Fins direct Service stream ended without RESULT" in captured.err
     assert "Fins failure" not in captured.err
     assert "ended without result" not in captured.err
+
+
+def test_direct_stream_protocol_error_surfaces_without_business_result(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Service typed protocol error 必须转为 CLI failure 且不伪造业务结果。"""
+
+    service = _FakeFinsDirectService(
+        events=(_progress_event(FinsOperationKind.DOWNLOAD),),
+        stream_error=FinsDirectStreamProtocolError(
+            FinsDirectStreamProtocolErrorKind.DUPLICATE_RESULT,
+            FinsOperationKind.DOWNLOAD,
+            "Fins direct stream produced multiple RESULT events",
+        ),
+    )
+    monkeypatch.setattr(
+        fins_command,
+        "FINS_DIRECT_SERVICE_FACTORY",
+        lambda _workspace_root: cast(
+            fins_command.FinsDirectCommandService,
+            service,
+        ),
+    )
+
+    assert cli_main.main(("download", "--ticker", "AAPL")) == EXIT_FAILURE
+
+    captured = capsys.readouterr()
+    assert "multiple RESULT" in captured.err
+    assert "Fins failure" not in captured.err
+    assert "failed" not in captured.err
 
 
 def test_stream_failure_propagates_to_cli_error(
@@ -945,6 +978,7 @@ async def test_sigint_cancels_stream_task_without_job_id(
             cancellation_token=token,
             sigint_monitor=monitor,
             command_name="download",
+            operation_kind=FinsOperationKind.DOWNLOAD,
         )
     )
     await service.first_event_yielded.wait()
@@ -990,6 +1024,7 @@ async def test_cancel_race_does_not_override_terminal_result() -> None:
             cancellation_token=token,
             sigint_monitor=monitor,
             command_name="download",
+            operation_kind=FinsOperationKind.DOWNLOAD,
         )
     )
     await asyncio.sleep(0)

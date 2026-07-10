@@ -31,7 +31,7 @@ Service 从模型配置构造 `RunnerSpec` 时默认启用 OpenAI-compatible cli
 
 `wait_callback_endpoint` 只做 Service/Web transport 映射：method、content-type 与 path/body wait id 错误在 Service 层拒绝；JSON body 与 outcome shape 错误在 Service 层返回 malformed payload；认证结果、wait 状态、replay、digest 与 late callback 语义来自注入的 Host callback adapter。响应体只包含 typed status、diagnostic、retryable 与可选 Run 摘要，不回显 outcome payload。
 
-`fins_direct` 的 upload helper 只通过 `FinsIngestionRuntime.upload(...)` 提交 `FinsUploadFilingRequest` 或 `FinsUploadMaterialRequest` 并消费 direct event stream，不要求 runtime 存在 `upload_filing(...)` / `upload_material(...)` 方法。调用方通过 `async for` 消费 `PROGRESS` 与唯一 terminal `RESULT`；若 runtime stream 正常结束但未产出 `RESULT`，Service 会合成清晰 failure result，避免 UI 悬挂。调用方收到用户中断时关闭当前 stream / 取消当前 task，并通过 operation-scoped cancellation 传播；Service direct API 不暴露 job id、event sidecar、cursor 或 `request_cancel(job_id)`。
+`fins_direct` 的 upload helper 只通过 `FinsIngestionRuntime.upload(...)` 提交 `FinsUploadFilingRequest` 或 `FinsUploadMaterialRequest` 并消费 direct event stream，不要求 runtime 存在 `upload_filing(...)` / `upload_material(...)` 方法。调用方通过 `async for` 消费 `PROGRESS` 与唯一 terminal `RESULT`；若 runtime stream 正常结束但未产出 `RESULT`，或产出重复 `RESULT`，Service 会抛出 `FinsDirectStreamProtocolError`，避免把 direct stream 协议错误伪造成业务失败。调用方收到用户中断时关闭当前 stream / 取消当前 task，并通过 operation-scoped cancellation 传播；Service direct API 不暴露 job id、event sidecar、cursor 或 `request_cancel(job_id)`。
 
 边界约束：
 

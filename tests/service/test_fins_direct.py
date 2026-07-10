@@ -13,6 +13,8 @@ import dayu.service.fins_direct as fins_direct_module
 from dayu.contracts.cancellation import CancellationToken
 from dayu.fins.direct_events import (
     FinsErrorKind,
+    FinsDirectStreamProtocolError,
+    FinsDirectStreamProtocolErrorKind,
     FinsEvent,
     FinsEventDetail,
     FinsEventType,
@@ -496,33 +498,31 @@ async def test_stream_exception_is_propagated_without_synthetic_result() -> None
 
 
 @pytest.mark.asyncio
-async def test_stream_without_result_closes_as_failure_result() -> None:
-    """stream 正常结束但没有 RESULT 时 Service 必须产出清晰 failure。"""
+async def test_stream_without_result_raises_protocol_error() -> None:
+    """stream 正常结束但没有 RESULT 时 Service 必须抛 typed protocol error。"""
 
     runtime = _FakeIngestionRuntime((_progress_event(),))
     service = FinsDirectCommandService(runtime)
 
-    events = await _collect_events(service.download(ticker="AAPL"))
+    with pytest.raises(FinsDirectStreamProtocolError) as raised:
+        await _collect_events(service.download(ticker="AAPL"))
 
-    assert [event.event_type for event in events] == [
-        FinsEventType.PROGRESS,
-        FinsEventType.RESULT,
-    ]
-    assert events[-1].result is not None
-    assert events[-1].result.status is FinsResultStatus.FAILURE
-    assert events[-1].result.error_kind is FinsErrorKind.EXECUTION
-    assert events[-1].result.exit_code == FINS_DIRECT_EXIT_FAILURE
+    assert raised.value.reason is FinsDirectStreamProtocolErrorKind.MISSING_RESULT
+    assert raised.value.operation_kind is FinsOperationKind.DOWNLOAD
 
 
 @pytest.mark.asyncio
 async def test_duplicate_result_fails_fast() -> None:
-    """runtime 重复产出 RESULT 时 Service 必须 fail fast。"""
+    """runtime 重复产出 RESULT 时 Service 必须抛 typed protocol error。"""
 
     runtime = _FakeIngestionRuntime((_result_event(), _result_event()))
     service = FinsDirectCommandService(runtime)
 
-    with pytest.raises(FinsDirectUsageError, match="multiple RESULT"):
+    with pytest.raises(FinsDirectStreamProtocolError) as raised:
         await _collect_events(service.download(ticker="AAPL"))
+
+    assert raised.value.reason is FinsDirectStreamProtocolErrorKind.DUPLICATE_RESULT
+    assert raised.value.operation_kind is FinsOperationKind.DOWNLOAD
 
 
 @pytest.mark.asyncio

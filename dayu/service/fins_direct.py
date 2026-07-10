@@ -12,7 +12,6 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Final, Protocol
 
@@ -22,12 +21,11 @@ from dayu.fins.direct_events import (
     FINS_RESULT_EXIT_CANCELLED,
     FINS_RESULT_EXIT_FAILURE,
     FINS_RESULT_EXIT_SUCCESS,
-    FinsErrorKind,
+    FinsDirectStreamProtocolError,
+    FinsDirectStreamProtocolErrorKind,
     FinsEvent,
     FinsEventType,
     FinsOperationKind,
-    FinsResultStatus,
-    FinsResultSummary,
 )
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ingestion_runtime import (
@@ -490,61 +488,29 @@ async def _ensure_result_event(
     :param filing_kind: 可选财报类型短标签。
     :param document_label: 可选文档短标签。
     :returns: Fins direct 事件异步迭代器。
-    :raises FinsDirectUsageError: runtime 产出重复 RESULT 时抛出。
+    :raises FinsDirectStreamProtocolError: runtime 未产出 RESULT 或产出重复 RESULT 时抛出。
     :raises Exception: runtime stream 迭代失败时原样透传。
     """
 
-    result_seen = False
+    result_event: FinsEvent | None = None
     async for event in events:
         if event.event_type is FinsEventType.RESULT:
-            if result_seen:
-                raise FinsDirectUsageError("Fins direct stream produced multiple RESULT events")
-            result_seen = True
+            if result_event is not None:
+                raise FinsDirectStreamProtocolError(
+                    FinsDirectStreamProtocolErrorKind.DUPLICATE_RESULT,
+                    operation_kind,
+                    "Fins direct stream produced multiple RESULT events",
+                )
+            result_event = event
+            continue
         yield event
-    if not result_seen:
-        yield _missing_result_event(
-            operation_kind=operation_kind,
-            ticker=ticker,
-            filing_kind=filing_kind,
-            document_label=document_label,
+    if result_event is None:
+        raise FinsDirectStreamProtocolError(
+            FinsDirectStreamProtocolErrorKind.MISSING_RESULT,
+            operation_kind,
+            "Fins direct stream ended without RESULT",
         )
-
-
-def _missing_result_event(
-    *,
-    operation_kind: FinsOperationKind,
-    ticker: str | None,
-    filing_kind: str | None,
-    document_label: str | None,
-) -> FinsEvent:
-    """构造 producer 未产出 RESULT 时的明确失败事件。
-
-    :param operation_kind: 当前 Service direct 操作类型。
-    :param ticker: 当前 ticker 文本。
-    :param filing_kind: 可选财报类型短标签。
-    :param document_label: 可选文档短标签。
-    :returns: failure RESULT 事件。
-    :raises ValueError: 构造出的事件违反 direct contract 时抛出。
-    """
-
-    return FinsEvent(
-        event_type=FinsEventType.RESULT,
-        operation_kind=operation_kind,
-        message="Fins direct stream ended without result",
-        emitted_at=datetime.now(timezone.utc),
-        ticker=ticker,
-        filing_kind=filing_kind,
-        document_label=document_label,
-        progress=None,
-        result=FinsResultSummary(
-            status=FinsResultStatus.FAILURE,
-            exit_code=FINS_DIRECT_EXIT_FAILURE,
-            title="Fins direct operation failed",
-            details=(),
-            error_kind=FinsErrorKind.EXECUTION,
-            error_message="Fins direct stream ended without result",
-        ),
-    )
+    yield result_event
 
 
 __all__: tuple[str, ...] = (

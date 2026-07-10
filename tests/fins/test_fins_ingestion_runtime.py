@@ -26,6 +26,8 @@ from dayu.fins.domain.enums import SourceKind
 from dayu.fins import ingestion_runtime
 from dayu.fins.direct_events import (
     FinsErrorKind,
+    FinsDirectStreamProtocolError,
+    FinsDirectStreamProtocolErrorKind,
     FinsEvent,
     FinsEventType,
     FinsOperationKind,
@@ -1342,8 +1344,8 @@ async def test_direct_download_unsupported_source_returns_failure_result(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_direct_stream_missing_result_returns_failure_result(tmp_path: Path) -> None:
-    """direct producer 静默结束时 runtime 自身应补齐失败 RESULT。"""
+async def test_direct_stream_missing_result_raises_protocol_error(tmp_path: Path) -> None:
+    """direct producer 静默结束时 runtime 应抛 typed protocol error。"""
 
     workspace_root = tmp_path / "fins-workspace"
     ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
@@ -1364,6 +1366,117 @@ async def test_direct_stream_missing_result_returns_failure_result(tmp_path: Pat
 
         del context
 
+    with pytest.raises(FinsDirectStreamProtocolError) as raised:
+        await _collect_direct_events(
+            ingestion._run_direct_stream(
+                operation_kind=FinsIngestionOperationKind.DOWNLOAD,
+                direct_operation_kind=FinsOperationKind.DOWNLOAD,
+                normalized=normalized,
+                source="fake",
+                source_kind=SourceKind.FILING,
+                cancellation_token=None,
+                producer=quiet_producer,
+            )
+        )
+
+    assert raised.value.reason is FinsDirectStreamProtocolErrorKind.MISSING_RESULT
+    assert raised.value.operation_kind is FinsOperationKind.DOWNLOAD
+
+
+@pytest.mark.asyncio
+async def test_direct_stream_duplicate_result_raises_protocol_error(tmp_path: Path) -> None:
+    """direct producer 重复投递 RESULT 时 runtime 应抛 typed protocol error。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    normalized = ticker_normalization.normalize_ticker("AAPL")
+
+    def duplicate_result_producer(
+        context: ingestion_runtime._FinsIngestionExecutionContext,
+    ) -> None:
+        """模拟重复产出 RESULT 的 producer。
+
+        Args:
+            context: direct stream 执行上下文。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        ingestion._emit_direct_result(
+            context,
+            status=FinsResultStatus.SUCCESS,
+            title="第一次完成",
+            details=(),
+            error_kind=None,
+            error_message=None,
+        )
+        ingestion._emit_direct_result(
+            context,
+            status=FinsResultStatus.SUCCESS,
+            title="第二次完成",
+            details=(),
+            error_kind=None,
+            error_message=None,
+        )
+
+    with pytest.raises(FinsDirectStreamProtocolError) as raised:
+        await _collect_direct_events(
+            ingestion._run_direct_stream(
+                operation_kind=FinsIngestionOperationKind.DOWNLOAD,
+                direct_operation_kind=FinsOperationKind.DOWNLOAD,
+                normalized=normalized,
+                source="fake",
+                source_kind=SourceKind.FILING,
+                cancellation_token=None,
+                producer=duplicate_result_producer,
+            )
+        )
+
+    assert raised.value.reason is FinsDirectStreamProtocolErrorKind.DUPLICATE_RESULT
+    assert raised.value.operation_kind is FinsOperationKind.DOWNLOAD
+
+
+@pytest.mark.asyncio
+async def test_direct_stream_drains_to_done_before_yielding_result(tmp_path: Path) -> None:
+    """正常 direct stream 通过 drain-until-sentinel 路径完成且不挂起。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    normalized = ticker_normalization.normalize_ticker("AAPL")
+
+    def normal_producer(context: ingestion_runtime._FinsIngestionExecutionContext) -> None:
+        """模拟正常产出 progress 和 RESULT 的 producer。
+
+        Args:
+            context: direct stream 执行上下文。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        ingestion._emit_context_progress(
+            context,
+            source_event_type="download_started",
+            message="下载已开始",
+            document_id=None,
+            payload={"ticker": "AAPL"},
+        )
+        ingestion._emit_direct_result(
+            context,
+            status=FinsResultStatus.SUCCESS,
+            title="完成",
+            details=(),
+            error_kind=None,
+            error_message=None,
+        )
+
     events = await _collect_direct_events(
         ingestion._run_direct_stream(
             operation_kind=FinsIngestionOperationKind.DOWNLOAD,
@@ -1372,14 +1485,16 @@ async def test_direct_stream_missing_result_returns_failure_result(tmp_path: Pat
             source="fake",
             source_kind=SourceKind.FILING,
             cancellation_token=None,
-            producer=quiet_producer,
+            producer=normal_producer,
         )
     )
 
-    assert [event.event_type for event in events] == [FinsEventType.RESULT]
+    assert [event.event_type for event in events] == [
+        FinsEventType.PROGRESS,
+        FinsEventType.RESULT,
+    ]
     assert events[-1].result is not None
-    assert events[-1].result.status is FinsResultStatus.FAILURE
-    assert events[-1].result.exit_code == 1
+    assert events[-1].result.status is FinsResultStatus.SUCCESS
 
 
 @pytest.mark.asyncio
