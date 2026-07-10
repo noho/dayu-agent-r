@@ -22,6 +22,7 @@ from dayu.fins.domain.document_models import (
     DocumentHandle,
     DocumentMeta,
     DocumentQuery,
+    DownloadRejectionRegistry,
     DocumentSummary,
     FileObjectMeta,
     ProcessedCreateRequest,
@@ -280,14 +281,14 @@ class FilingMaintenanceRepositoryProtocol(Protocol):
         """清空某个 ticker 下的全部 filing 文档。"""
         ...
 
-    def load_download_rejection_registry(self, ticker: str) -> dict[str, dict[str, str]]:
+    def load_download_rejection_registry(self, ticker: str) -> DownloadRejectionRegistry:
         """读取下载拒绝注册表。"""
         ...
 
     def save_download_rejection_registry(
         self,
         ticker: str,
-        registry: dict[str, dict[str, str]],
+        registry: DownloadRejectionRegistry,
     ) -> None:
         """保存下载拒绝注册表。"""
         ...

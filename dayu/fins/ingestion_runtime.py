@@ -46,6 +46,7 @@ from dayu.fins.direct_events import (
 )
 from dayu.fins.domain.document_models import (
     DocumentMeta,
+    DownloadRejectionEntry,
     FinsIngestMethod,
     FileObjectMeta,
     ProcessedCreateRequest,
@@ -3904,10 +3905,14 @@ class FinsIngestionRuntime:
             )
         )
         registry = self.filing_maintenance_repository.load_download_rejection_registry(ticker)
-        registry[document_id] = {
-            "reason": artifact.rejection_reason,
-            "category": artifact.rejection_category,
-        }
+        registry[document_id] = DownloadRejectionEntry(
+            document_id=document_id,
+            reason=artifact.rejection_reason,
+            category=artifact.rejection_category,
+            form_type=artifact.form_type,
+            filing_date=artifact.filing_date,
+            download_version=_DOWNLOAD_REJECTION_CLASSIFICATION_VERSION,
+        )
         self.filing_maintenance_repository.save_download_rejection_registry(ticker, registry)
 
     def _store_rejected_file_entry(

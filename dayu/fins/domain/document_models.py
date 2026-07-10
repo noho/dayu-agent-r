@@ -19,7 +19,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, TypeAlias
 
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.enums import SourceKind
@@ -181,6 +181,109 @@ class SourceDocumentProvenance:
             source_provider=FinsSourceProvider.from_storage_value(raw_provider),
             ingest_complete=raw_ingest_complete,
         )
+
+
+@dataclass(frozen=True)
+class DownloadRejectionEntry:
+    """SEC 下载拒绝注册表条目。
+
+    该模型是下载拒绝事实的 typed contract，避免仓储与 pipeline 之间通过
+    松散嵌套字典重复解释同一业务语义。
+    """
+
+    document_id: str
+    reason: str
+    category: str
+    form_type: str
+    filing_date: str
+    download_version: str
+
+    def __post_init__(self) -> None:
+        """校验直接构造的下载拒绝条目字段。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: 必填字段为空或 form 类型非法时抛出。
+        """
+
+        for field_name, value in (
+            ("document_id", self.document_id),
+            ("reason", self.reason),
+            ("category", self.category),
+            ("form_type", self.form_type),
+            ("filing_date", self.filing_date),
+            ("download_version", self.download_version),
+        ):
+            if not value.strip():
+                raise ValueError(f"{field_name} 不能为空")
+        canonical_form_type = parse_sec_form_type(self.form_type, field_name="form_type")
+        if canonical_form_type != self.form_type:
+            raise ValueError("form_type 必须使用 canonical SEC form")
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: Mapping[str, JsonValue],
+        *,
+        expected_document_id: Optional[str] = None,
+    ) -> "DownloadRejectionEntry":
+        """从 JSON 对象解析下载拒绝条目。
+
+        Args:
+            data: registry JSON 中的单条拒绝记录。
+            expected_document_id: registry key 表达的预期 document id；提供时必须与条目字段一致。
+
+        Returns:
+            已校验的下载拒绝条目。
+
+        Raises:
+            KeyError: 缺少必需字段时抛出。
+            ValueError: 字段类型、空值、form 类型或 document id 不匹配时抛出。
+        """
+
+        document_id = _required_json_string(data, "document_id")
+        if expected_document_id is not None and document_id != expected_document_id:
+            raise ValueError("download rejection document_id 与 registry key 不一致")
+        form_type = parse_sec_form_type(_required_json_string(data, "form_type"), field_name="form_type")
+        return cls(
+            document_id=document_id,
+            reason=_required_json_string(data, "reason"),
+            category=_required_json_string(data, "category"),
+            form_type=form_type,
+            filing_date=_required_json_string(data, "filing_date"),
+            download_version=_required_json_string(data, "download_version"),
+        )
+
+    def to_dict(self) -> dict[str, str]:
+        """转换为 registry JSON 持久化字典。
+
+        Args:
+            无。
+
+        Returns:
+            JSON 可序列化的字符串字典。
+
+        Raises:
+            无。
+        """
+
+        return {
+            "document_id": self.document_id,
+            "reason": self.reason,
+            "category": self.category,
+            "form_type": self.form_type,
+            "filing_date": self.filing_date,
+            "download_version": self.download_version,
+        }
+
+
+DownloadRejectionRegistry: TypeAlias = dict[str, DownloadRejectionEntry]
+"""SEC 下载拒绝注册表 typed 映射。"""
 
 
 @dataclass(frozen=True)
@@ -895,6 +998,30 @@ def now_iso8601() -> str:
     """
 
     return datetime.now(UTC).replace(microsecond=0).isoformat()
+
+
+def _required_json_string(data: Mapping[str, JsonValue], field_name: str) -> str:
+    """从 JSON 对象读取必填非空字符串。
+
+    Args:
+        data: JSON 对象。
+        field_name: 字段名。
+
+    Returns:
+        去除首尾空白后的字符串。
+
+    Raises:
+        KeyError: 字段缺失时抛出。
+        ValueError: 字段不是字符串或字符串为空时抛出。
+    """
+
+    value = data[field_name]
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} 必须为字符串")
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{field_name} 不能为空")
+    return normalized
 
 
 def _optional_str(value: Any) -> Optional[str]:

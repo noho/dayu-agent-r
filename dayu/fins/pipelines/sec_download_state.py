@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Final, Optional
 
-from dayu.fins.domain.document_models import now_iso8601
+from dayu.fins.domain.document_models import DownloadRejectionEntry, DownloadRejectionRegistry, now_iso8601
 from dayu.fins.downloaders.sec_downloader import (
     BrowseEdgarFiling,
     RemoteFileDescriptor,
@@ -47,7 +47,7 @@ def _build_sec_cache_dir(workspace_root: Path) -> Path:
 def _load_rejection_registry(
     repository: FilingMaintenanceRepositoryProtocol,
     ticker: str,
-) -> dict[str, dict[str, str]]:
+) -> DownloadRejectionRegistry:
     """加载拒绝注册表。
 
     Args:
@@ -55,10 +55,11 @@ def _load_rejection_registry(
         ticker: 股票代码。
 
     Returns:
-        document_id 到拒绝记录的映射；文件不存在或解析失败时返回空字典。
+        document_id 到 typed 拒绝记录的映射；文件不存在时返回空字典。
 
     Raises:
-        无。
+        OSError: 底层读取失败时抛出。
+        ValueError: registry JSON 或条目字段非法时抛出。
     """
 
     return repository.load_download_rejection_registry(ticker)
@@ -67,14 +68,14 @@ def _load_rejection_registry(
 def _save_rejection_registry(
     repository: FilingMaintenanceRepositoryProtocol,
     ticker: str,
-    registry: dict[str, dict[str, str]],
+    registry: DownloadRejectionRegistry,
 ) -> None:
     """持久化拒绝注册表。
 
     Args:
         repository: filing 维护治理仓储。
         ticker: 股票代码。
-        registry: document_id 到拒绝记录的映射。
+        registry: document_id 到 typed 拒绝记录的映射。
 
     Returns:
         无。
@@ -87,7 +88,7 @@ def _save_rejection_registry(
 
 
 def _is_rejected(
-    registry: dict[str, dict[str, str]],
+    registry: DownloadRejectionRegistry,
     document_id: str,
     overwrite: bool,
     download_version: str,
@@ -114,11 +115,11 @@ def _is_rejected(
     entry = registry.get(document_id)
     if entry is None:
         return False
-    return str(entry.get("download_version", "")) == download_version
+    return entry.download_version == download_version
 
 
 def _record_rejection(
-    registry: dict[str, dict[str, str]],
+    registry: DownloadRejectionRegistry,
     document_id: str,
     reason: str,
     category: str,
@@ -144,13 +145,14 @@ def _record_rejection(
         无。
     """
 
-    registry[document_id] = {
-        "reason": reason,
-        "category": category,
-        "form_type": form_type,
-        "filing_date": filing_date,
-        "download_version": download_version,
-    }
+    registry[document_id] = DownloadRejectionEntry(
+        document_id=document_id,
+        reason=reason,
+        category=category,
+        form_type=form_type,
+        filing_date=filing_date,
+        download_version=download_version,
+    )
 
 
 def _sec_cache_path(workspace_root: Path, category: str, key: str) -> Path:

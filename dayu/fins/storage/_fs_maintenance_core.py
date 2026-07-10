@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import shutil
-from typing import BinaryIO, Optional
+from collections.abc import Mapping
+from typing import BinaryIO, Optional, cast
 
+from dayu.contracts.json_value import JsonValue
 from dayu.fins._log import Log
 
 from dayu.fins.domain.document_models import (
+    DownloadRejectionEntry,
+    DownloadRejectionRegistry,
     FileObjectMeta,
     RejectedFilingArtifact,
     RejectedFilingArtifactUpsertRequest,
@@ -30,48 +34,45 @@ class _FsMaintenanceMixin(_FsStorageInfra):
 
     # ========== 下载拒绝注册表 ==========
 
-    def load_download_rejection_registry(self, ticker: str) -> dict[str, dict[str, str]]:
+    def load_download_rejection_registry(self, ticker: str) -> DownloadRejectionRegistry:
         """读取下载拒绝注册表。
 
         Args:
             ticker: 股票代码。
 
         Returns:
-            `document_id -> rejection payload` 映射；不存在或内容非法时返回空字典。
+            `document_id -> DownloadRejectionEntry` 映射；不存在时返回空字典。
 
         Raises:
             OSError: 底层读取失败时抛出。
+            ValueError: registry JSON 或条目字段非法时抛出。
         """
 
         path = self._download_rejections_path_for_read(_normalize_ticker(ticker))
         if not path.exists():
             return {}
-        try:
-            data = _read_json_object(path)
-        except (ValueError, OSError):
-            return {}
-        result: dict[str, dict[str, str]] = {}
+        data = _read_json_object(path)
+        result: DownloadRejectionRegistry = {}
         for document_id, payload in data.items():
             if not isinstance(document_id, str) or not isinstance(payload, dict):
-                continue
-            normalized_payload: dict[str, str] = {}
-            for key, value in payload.items():
-                if not isinstance(key, str):
-                    continue
-                normalized_payload[key] = str(value)
-            result[document_id] = normalized_payload
+                raise ValueError("download rejection registry 条目必须是 document_id 到对象的映射")
+            entry = DownloadRejectionEntry.from_dict(
+                cast(Mapping[str, JsonValue], payload),
+                expected_document_id=document_id,
+            )
+            result[document_id] = entry
         return result
 
     def save_download_rejection_registry(
         self,
         ticker: str,
-        registry: dict[str, dict[str, str]],
+        registry: DownloadRejectionRegistry,
     ) -> None:
         """保存下载拒绝注册表。
 
         Args:
             ticker: 股票代码。
-            registry: `document_id -> rejection payload` 映射。
+            registry: `document_id -> DownloadRejectionEntry` 映射。
 
         Returns:
             无。
@@ -90,13 +91,13 @@ class _FsMaintenanceMixin(_FsStorageInfra):
     def _save_download_rejection_registry_impl(
         self,
         ticker: str,
-        registry: dict[str, dict[str, str]],
+        registry: DownloadRejectionRegistry,
     ) -> None:
         """执行下载拒绝注册表持久化（内部实现）。
 
         Args:
             ticker: 股票代码。
-            registry: `document_id -> rejection payload` 映射。
+            registry: `document_id -> DownloadRejectionEntry` 映射。
 
         Returns:
             无。
@@ -107,7 +108,12 @@ class _FsMaintenanceMixin(_FsStorageInfra):
 
         normalized_ticker = _normalize_ticker(ticker)
         path = self._download_rejections_path(normalized_ticker)
-        _write_json(path, registry)
+        payload: dict[str, dict[str, str]] = {}
+        for document_id, entry in registry.items():
+            if document_id != entry.document_id:
+                raise ValueError("download rejection registry key 与条目 document_id 不一致")
+            payload[document_id] = entry.to_dict()
+        _write_json(path, payload)
 
     # ========== rejected filing artifact ==========
 

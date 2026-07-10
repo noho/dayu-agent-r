@@ -11,6 +11,7 @@ from dayu.contracts.json_value import JsonValue
 import datetime as dt
 
 
+from dayu.fins.domain.document_models import DownloadRejectionRegistry
 from dayu.fins.pipelines.sec_filing_collection import FilingRecord
 
 # ---------- 数量诊断常量 ----------
@@ -41,7 +42,7 @@ _XBRL_20F_CUTOFF_DATE: str = "2012-01-01"
 def warn_insufficient_filings(
     form_windows: dict[str, dt.date],
     filing_results: list[dict[str, JsonValue]],
-    rejection_registry: dict[str, dict[str, str]],
+    rejection_registry: DownloadRejectionRegistry,
 ) -> list[str]:
     """检查年报/季报组及 DEF 14A 的落盘数量，不足最低期望时返回 warning 文本列表。
 
@@ -103,7 +104,7 @@ def warn_insufficient_filings(
                 rejected_count = sum(
                     1
                     for entry in rejection_registry.values()
-                    if entry.get("form_type") == "6-K"
+                    if entry.form_type == "6-K"
                 )
                 if rejected_count > 0:
                     warnings.append(

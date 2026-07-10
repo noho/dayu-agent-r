@@ -18,7 +18,7 @@ from typing import AsyncIterator, BinaryIO, Callable, Coroutine, Final, Optional
 
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins._log import Log
-from dayu.fins.domain.document_models import CompanyMeta, FileObjectMeta, SourceHandle
+from dayu.fins.domain.document_models import CompanyMeta, DownloadRejectionRegistry, FileObjectMeta, SourceHandle
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.downloaders.sec_downloader import (
     DEFAULT_MAX_RETRIES,
@@ -273,7 +273,7 @@ def _json_int(value: JsonValue | None, field_name: str) -> int:
 
 
 def _is_rejected(
-    registry: dict[str, dict[str, str]],
+    registry: DownloadRejectionRegistry,
     document_id: str,
     overwrite: bool,
 ) -> bool:
@@ -300,7 +300,7 @@ def _is_rejected(
 
 
 def _record_rejection(
-    registry: dict[str, dict[str, str]],
+    registry: DownloadRejectionRegistry,
     document_id: str,
     reason: str,
     category: str,
@@ -1026,7 +1026,7 @@ class SecPipeline:
         cik: str,
         filing: FilingRecord,
         overwrite: bool,
-        rejection_registry: Optional[dict[str, dict[str, str]]] = None,
+        rejection_registry: Optional[DownloadRejectionRegistry] = None,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> AsyncIterator[DownloadEvent]:
         """下载单个 SEC filing 并产出事件。
@@ -1113,7 +1113,7 @@ class SecPipeline:
         end_date: dt.date,
         target_cik: str,
         sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
-        rejection_registry: Optional[dict[str, dict[str, str]]] = None,
+        rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> tuple[list[FilingRecord], set[str]]:
@@ -1218,7 +1218,7 @@ class SecPipeline:
         end_date: dt.date,
         target_cik: str,
         sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
-        rejection_registry: Optional[dict[str, dict[str, str]]] = None,
+        rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> list[FilingRecord]:
@@ -1279,7 +1279,7 @@ class SecPipeline:
         end_date: dt.date,
         target_cik: str,
         sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
-        rejection_registry: Optional[dict[str, dict[str, str]]] = None,
+        rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> list[FilingRecord]:
@@ -1330,7 +1330,7 @@ class SecPipeline:
         archive_cik: str,
         target_cik: str,
         sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
-        rejection_registry: Optional[dict[str, dict[str, str]]] = None,
+        rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> bool:

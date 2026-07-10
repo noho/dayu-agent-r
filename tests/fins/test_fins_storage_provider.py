@@ -53,6 +53,7 @@ from dayu.fins.domain.document_models import (
     CompanyMeta,
     DocumentMeta,
     DocumentSummary,
+    DownloadRejectionEntry,
     FinsSourceProvider,
     SourceDocumentUpsertRequest,
     SourceHandle,
@@ -64,6 +65,7 @@ from dayu.fins.storage import (
     FsBatchingRepository,
     FsCompanyMetaRepository,
     FsDocumentBlobRepository,
+    FsFilingMaintenanceRepository,
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
 )
@@ -1029,6 +1031,75 @@ def test_stage_source_document_lifecycle_and_blob_acknowledgement(tmp_path: Path
     assert completed_meta["files"][0]["name"] == "filing.htm"
     with pytest.raises(FileExistsError, match="完成态"):
         source_repository.stage_source_document(request, SourceKind.FILING)
+
+
+def test_download_rejection_registry_roundtrips_typed_entries(tmp_path: Path) -> None:
+    """下载拒绝注册表应通过 typed entry 读写并持久化 document_id。"""
+
+    workspace_root = tmp_path / "fins-download-rejection-workspace"
+    repository = FsFilingMaintenanceRepository(workspace_root)
+    entry = DownloadRejectionEntry(
+        document_id="fil_0000000000-25-000101",
+        reason="6k_filtered",
+        category="EXCLUDE_NON_QUARTERLY",
+        form_type="6-K",
+        filing_date="2025-01-02",
+        download_version="sec-download-v1",
+    )
+
+    repository.save_download_rejection_registry("aapl", {entry.document_id: entry})
+    loaded = repository.load_download_rejection_registry("AAPL")
+    raw_path = workspace_root / "portfolio" / "AAPL" / "filings" / "_download_rejections.json"
+    raw_payload = json.loads(raw_path.read_text(encoding="utf-8"))
+
+    assert loaded == {entry.document_id: entry}
+    assert raw_payload[entry.document_id] == entry.to_dict()
+
+
+def test_download_rejection_registry_fails_closed_on_malformed_entry(tmp_path: Path) -> None:
+    """下载拒绝注册表坏条目不得被静默跳过或字符串化。"""
+
+    workspace_root = tmp_path / "fins-download-rejection-invalid-workspace"
+    repository = FsFilingMaintenanceRepository(workspace_root)
+    raw_path = workspace_root / "portfolio" / "AAPL" / "filings" / "_download_rejections.json"
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_path.write_text(
+        json.dumps(
+            {
+                "fil_0000000000-25-000101": {
+                    "document_id": "fil_0000000000-25-000101",
+                    "reason": "6k_filtered",
+                    "category": "EXCLUDE_NON_QUARTERLY",
+                    "form_type": "6-K",
+                    "filing_date": 20250102,
+                    "download_version": "sec-download-v1",
+                }
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="filing_date 必须为字符串"):
+        repository.load_download_rejection_registry("AAPL")
+
+
+def test_download_rejection_registry_rejects_mismatched_storage_key(tmp_path: Path) -> None:
+    """下载拒绝注册表保存时必须拒绝 key 与 entry document_id 冲突。"""
+
+    repository = FsFilingMaintenanceRepository(tmp_path / "fins-download-rejection-key-workspace")
+    entry = DownloadRejectionEntry(
+        document_id="fil_0000000000-25-000101",
+        reason="6k_filtered",
+        category="EXCLUDE_NON_QUARTERLY",
+        form_type="6-K",
+        filing_date="2025-01-02",
+        download_version="sec-download-v1",
+    )
+
+    with pytest.raises(ValueError, match="document_id 不一致"):
+        repository.save_download_rejection_registry("AAPL", {"fil_other": entry})
 
 
 def test_read_runtime_citation_projects_provider_owned_source_types(tmp_path: Path) -> None:

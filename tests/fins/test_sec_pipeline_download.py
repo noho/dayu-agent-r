@@ -21,7 +21,7 @@ from dayu.fins.downloaders.sec_downloader import (
     SecDownloader,
     build_source_fingerprint,
 )
-from dayu.fins.domain.document_models import FileObjectMeta
+from dayu.fins.domain.document_models import DownloadRejectionEntry, FileObjectMeta
 from dayu.fins.ingestion_runtime import FinsSourceDownloadAdapterRequest
 from dayu.fins.pipelines import sec_download_filing_workflow as _sec_download_filing_workflow
 from dayu.fins.pipelines import sec_6k_primary_document_repair as _sec_6k_primary_repair
@@ -67,6 +67,42 @@ def _require_json_list(value: JsonValue) -> list[JsonValue]:
 
     assert isinstance(value, list)
     return value
+
+
+def test_sec_pipeline_rejection_helpers_consume_typed_registry() -> None:
+    """SEC pipeline 拒绝 helper 应写入并消费 typed registry 条目。"""
+
+    registry: dict[str, DownloadRejectionEntry] = {}
+    document_id = "fil_0000000000-25-000101"
+
+    sec_pipeline._record_rejection(
+        registry=registry,
+        document_id=document_id,
+        reason="6k_filtered",
+        category="EXCLUDE_NON_QUARTERLY",
+        form_type="6-K",
+        filing_date="2025-01-02",
+    )
+
+    assert registry[document_id] == DownloadRejectionEntry(
+        document_id=document_id,
+        reason="6k_filtered",
+        category="EXCLUDE_NON_QUARTERLY",
+        form_type="6-K",
+        filing_date="2025-01-02",
+        download_version=SEC_PIPELINE_DOWNLOAD_VERSION,
+    )
+    assert sec_pipeline._is_rejected(registry, document_id, overwrite=False) is True
+    assert sec_pipeline._is_rejected(registry, document_id, overwrite=True) is False
+    registry[document_id] = DownloadRejectionEntry(
+        document_id=document_id,
+        reason="6k_filtered",
+        category="EXCLUDE_NON_QUARTERLY",
+        form_type="6-K",
+        filing_date="2025-01-02",
+        download_version="legacy-download-version",
+    )
+    assert sec_pipeline._is_rejected(registry, document_id, overwrite=False) is False
 
 
 class StubDownloader:
@@ -1396,6 +1432,12 @@ def test_sec_pipeline_filters_6k_excluded(
     rejected_meta = json.loads(rejected_meta_path.read_text(encoding="utf-8"))
     assert rejected_meta["rejection_reason"] == "6k_filtered"
     assert rejected_meta["rejection_category"] == "EXCLUDE_NON_QUARTERLY"
+    registry_path = tmp_path / "portfolio" / "TCOM" / "filings" / "_download_rejections.json"
+    registry_payload = json.loads(registry_path.read_text(encoding="utf-8"))
+    rejected_registry_entry = registry_payload["fil_0000000000-25-000101"]
+    assert rejected_registry_entry["document_id"] == "fil_0000000000-25-000101"
+    assert rejected_registry_entry["reason"] == "6k_filtered"
+    assert rejected_registry_entry["download_version"] == SEC_PIPELINE_DOWNLOAD_VERSION
 
 
 def test_sec_download_adapter_counts_6k_filtered_as_rejected_in_persisted_summary(tmp_path: Path) -> None:

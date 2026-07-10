@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import BinaryIO, Optional
 
 from dayu.fins.domain.document_models import (
+    DownloadRejectionRegistry,
     RejectedFilingArtifact,
     RejectedFilingArtifactUpsertRequest,
 )
@@ -50,7 +51,7 @@ class FsFilingMaintenanceRepository(FilingMaintenanceRepositoryProtocol):
 
         self._repository_set.core.clear_filing_documents(ticker)
 
-    def load_download_rejection_registry(self, ticker: str) -> dict[str, dict[str, str]]:
+    def load_download_rejection_registry(self, ticker: str) -> DownloadRejectionRegistry:
         """读取下载拒绝注册表。"""
 
         return self._repository_set.core.load_download_rejection_registry(ticker)
@@ -58,7 +59,7 @@ class FsFilingMaintenanceRepository(FilingMaintenanceRepositoryProtocol):
     def save_download_rejection_registry(
         self,
         ticker: str,
-        registry: dict[str, dict[str, str]],
+        registry: DownloadRejectionRegistry,
     ) -> None:
         """保存下载拒绝注册表。"""
 

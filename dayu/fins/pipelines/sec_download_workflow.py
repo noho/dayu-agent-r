@@ -9,6 +9,7 @@ import inspect
 import time
 from typing import AsyncIterator, Awaitable, Callable, Final, Optional, Protocol, TypeVar, cast
 
+from dayu.fins.domain.document_models import DownloadRejectionRegistry
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.downloaders.sec_downloader import SecDownloadCancelledError
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
@@ -151,7 +152,7 @@ class SecDownloadWorkflowHost(Protocol):
         cik: str,
         filing: FilingRecord,
         overwrite: bool,
-        rejection_registry: dict[str, dict[str, str]],
+        rejection_registry: DownloadRejectionRegistry,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> AsyncIterator[DownloadEvent]:
         """执行单 filing 下载流。"""
@@ -167,7 +168,7 @@ class SecDownloadWorkflowHost(Protocol):
         end_date: dt.date,
         target_cik: str,
         sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
-        rejection_registry: Optional[dict[str, dict[str, str]]] = None,
+        rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> Awaitable[tuple[list[FilingRecord], set[str]]]:
@@ -185,7 +186,7 @@ class SecDownloadWorkflowHost(Protocol):
         end_date: dt.date,
         target_cik: str,
         sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
-        rejection_registry: Optional[dict[str, dict[str, str]]] = None,
+        rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> Awaitable[list[FilingRecord]]:
@@ -204,7 +205,7 @@ class SecDownloadWorkflowHost(Protocol):
         end_date: dt.date,
         target_cik: str,
         sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
-        rejection_registry: Optional[dict[str, dict[str, str]]] = None,
+        rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> Awaitable[list[FilingRecord]]:
@@ -241,15 +242,15 @@ async def run_download_stream_impl(
     clear_filings_dir: Callable[[FilingMaintenanceRepositoryProtocol, str], None],
     load_rejection_registry: Callable[
         [FilingMaintenanceRepositoryProtocol, str],
-        dict[str, dict[str, str]],
+        DownloadRejectionRegistry,
     ],
     save_rejection_registry: Callable[
-        [FilingMaintenanceRepositoryProtocol, str, dict[str, dict[str, str]]],
+        [FilingMaintenanceRepositoryProtocol, str, DownloadRejectionRegistry],
         None,
     ],
     should_warn_missing_sc13: Callable[[dict[str, dt.date], list[FilingRecord]], bool],
     warn_insufficient_filings: Callable[
-        [dict[str, dt.date], list[dict[str, JsonValue]], dict[str, dict[str, str]]],
+        [dict[str, dt.date], list[dict[str, JsonValue]], DownloadRejectionRegistry],
         list[str],
     ],
     warn_xbrl_missing_filings: Callable[[list[dict[str, JsonValue]]], list[str]],

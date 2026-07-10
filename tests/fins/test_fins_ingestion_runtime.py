@@ -1695,6 +1695,7 @@ def test_start_download_persists_rejected_filing_artifact(tmp_path: Path) -> Non
     record = ingestion.read_job(start.job_id)
     runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
     artifacts = runtime.filing_maintenance_repository.list_rejected_filing_artifacts("AAPL")
+    registry = runtime.filing_maintenance_repository.load_download_rejection_registry("AAPL")
     content = runtime.filing_maintenance_repository.read_rejected_filing_file_bytes(
         "AAPL",
         "aapl-fake-rejected",
@@ -1708,6 +1709,9 @@ def test_start_download_persists_rejected_filing_artifact(tmp_path: Path) -> Non
     assert len(artifacts) == 1
     assert artifacts[0].document_id == "aapl-fake-rejected"
     assert artifacts[0].rejection_category == "form_filter"
+    assert registry["aapl-fake-rejected"].document_id == "aapl-fake-rejected"
+    assert registry["aapl-fake-rejected"].reason == "表单类型不在请求范围内"
+    assert registry["aapl-fake-rejected"].category == "form_filter"
     assert content == b"<html>rejected</html>"
 
 

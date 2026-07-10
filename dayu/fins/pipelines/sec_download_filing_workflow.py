@@ -8,7 +8,7 @@ import inspect
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import BinaryIO, Optional, Protocol, TypeVar, cast
 
-from dayu.fins.domain.document_models import FileObjectMeta, SourceHandle
+from dayu.fins.domain.document_models import DownloadRejectionRegistry, FileObjectMeta, SourceHandle
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.downloaders.sec_downloader import (
     DownloaderEvent,
@@ -154,9 +154,9 @@ async def run_download_single_filing_stream(
     cik: str,
     filing: FilingRecord,
     overwrite: bool,
-    rejection_registry: Optional[dict[str, dict[str, str]]],
-    is_rejected: Callable[[dict[str, dict[str, str]], str, bool], bool],
-    record_rejection: Callable[[dict[str, dict[str, str]], str, str, str, str, str], None],
+    rejection_registry: Optional[DownloadRejectionRegistry],
+    is_rejected: Callable[[DownloadRejectionRegistry, str, bool], bool],
+    record_rejection: Callable[[DownloadRejectionRegistry, str, str, str, str, str], None],
     build_download_filing_event_payload: Callable[[dict[str, JsonValue]], dict[str, JsonValue]],
     build_file_result_from_downloader_event: Callable[[DownloaderEvent], DownloadFileResult],
     normalize_download_file_result: Callable[[DownloadFileResult], DownloadFileResult],
