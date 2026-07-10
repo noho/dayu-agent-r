@@ -55,7 +55,10 @@ from dayu.host.durable.options import (
     PayloadStoragePolicy,
 )
 from dayu.host.durable.state import (
+    DispatchRecordRow,
+    DispatchRecordStatus,
     WorkerKind,
+    is_dispatch_record_direct_cancelable,
     mark_dispatch_waiting_for_lane_row,
     mark_dispatching_after_lane_row,
 )
@@ -352,6 +355,63 @@ class _SequencedWorkerFactory:
         handle = self._handles[self.created]
         self.created += 1
         return _FakeWorker(handle)
+
+
+@pytest.mark.parametrize(
+    ("status", "worker_accepted", "expected"),
+    (
+        (DispatchRecordStatus.PENDING, False, True),
+        (DispatchRecordStatus.WAITING_FOR_LANE, False, True),
+        (DispatchRecordStatus.DISPATCHING, False, True),
+        (DispatchRecordStatus.DISPATCHING, True, False),
+        (DispatchRecordStatus.CANCELLED, False, False),
+    ),
+)
+def test_dispatch_record_direct_cancelable_predicate_owned_by_durable_state(
+    status: DispatchRecordStatus,
+    worker_accepted: bool,
+    expected: bool,
+) -> None:
+    """durable owner helper 完整覆盖 pre-worker direct-cancel 判定表。
+
+    :param status: dispatch record status。
+    :param worker_accepted: 是否写入完整 worker accepted facts。
+    :param expected: 预期 direct-cancel 判定。
+    :returns: ``None``。
+    :raises: 断言失败时由 pytest 报告。
+    """
+
+    accepted_at = _NOW.isoformat() if worker_accepted else None
+    accepted_event_id = "event-worker-accepted" if worker_accepted else None
+    accepted_event_sequence = 2 if worker_accepted else None
+    record = DispatchRecordRow(
+        dispatch_record_id="dispatch-direct-cancel-owner",
+        run_id="run-direct-cancel-owner",
+        attempt_id="attempt-direct-cancel-owner",
+        execution_id="execution-direct-cancel-owner",
+        status=status,
+        worker_kind=WorkerKind.LOCAL,
+        execution_target="local-default",
+        owner_host_instance_id="host-direct-cancel-owner",
+        created_event_id="event-attempt-started-owner",
+        created_event_sequence=1,
+        waiting_for_lane_at=None,
+        lane_name=None,
+        lane_claim_id=None,
+        lane_owner_id=None,
+        lane_acquired_at=None,
+        dispatching_at=None,
+        worker_accepted_at=accepted_at,
+        worker_accept_event_id=accepted_event_id,
+        worker_accept_event_sequence=accepted_event_sequence,
+        cancelled_event_id=None,
+        cancelled_event_sequence=None,
+        created_at=_NOW.isoformat(),
+        updated_at=_NOW.isoformat(),
+        cancelled_at=None,
+    )
+
+    assert is_dispatch_record_direct_cancelable(record) is expected
 
 
 def test_cancel_run_waiting_for_lane_skips_later_dispatch(tmp_path: Path) -> None:

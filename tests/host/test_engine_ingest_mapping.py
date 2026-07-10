@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import NoReturn, cast
@@ -127,6 +127,7 @@ from dayu.host.durable.run_transition import (
     CreateRunningRunInput,
     FailRecoveringRunInput,
     RunTransitionResult,
+    TerminalCloseoutInput,
     accept_worker_running_in_transaction,
     active_cancel_watchdog_closeout_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
@@ -137,12 +138,16 @@ from dayu.host.payload_resolution import sqlite_payload_object
 from dayu.host.durable.schema import (
     RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
     TABLE_EVENT_LOG,
+    TABLE_HOST_RUNS,
+    TABLE_PAYLOAD_DESCRIPTORS,
+    TABLE_SQLITE_PAYLOADS,
 )
 from dayu.host.durable.session_lifecycle import ensure_session
 from dayu.host.durable.state import (
     AttemptRow,
     DispatchRecordRow,
     DispatchRecordStatus,
+    RunRow,
     RunStartReason,
     StateMutationStatus,
     WaitResumePolicy,
@@ -195,6 +200,37 @@ class _SeededRun:
     attempt_id: str
     execution_id: str
     dispatch_record_id: str
+
+
+def _cas_lost_terminal_closeout(
+    transaction: HostTransaction,
+    event_log_store: EventLogStore,
+    request: TerminalCloseoutInput,
+) -> RunTransitionResult:
+    """模拟 terminal helper 在写 payload 后返回 CAS loser。
+
+    :param transaction: 当前真实 Host transaction。
+    :param event_log_store: 生产 EventLog store；本注入点不写事件。
+    :param request: terminal closeout 输入。
+    :returns: 携带真实 durable rows 的 ``CAS_LOST`` transition 结果。
+    :raises AssertionError: seeded durable rows 缺失时抛出。
+    """
+
+    del event_log_store
+    run = read_run_by_id(transaction, request.run_id)
+    attempt = read_attempt_by_id(transaction, request.attempt_id)
+    dispatch_record = read_dispatch_record_by_attempt_id(
+        transaction, request.attempt_id
+    )
+    assert run is not None
+    assert attempt is not None
+    assert dispatch_record is not None
+    return RunTransitionResult(
+        status=StateMutationStatus.CAS_LOST,
+        run=run,
+        attempt=attempt,
+        dispatch_record=dispatch_record,
+    )
 
 
 class _TransactionReadableCompactor(FakeContextCompactor):
@@ -463,7 +499,11 @@ def test_final_answer_closes_attempt_and_run_with_phase5_payload(
 
 
 def test_terminal_plans_use_lifecycle_event_owner_helpers() -> None:
-    """terminal closeout plan 的 event type 来自 lifecycle owner helper。"""
+    """两类 terminal plan 类型分离并复用 lifecycle event owner helper。
+
+    :returns: ``None``。
+    :raises AssertionError: 类型边界或 owner helper 映射漂移时抛出。
+    """
 
     succeeded = engine_ingest_module._final_answer_plan(
         FinalAnswerData(
@@ -489,22 +529,49 @@ def test_terminal_plans_use_lifecycle_event_owner_helpers() -> None:
         last_accepted_event_id=None,
     )
 
-    assert succeeded.attempt_event_type == (
+    assert isinstance(succeeded, engine_ingest_module._EngineTerminalPlan)
+    assert isinstance(failed, engine_ingest_module._EngineTerminalPlan)
+    assert isinstance(lost, engine_ingest_module._HostLifecycleTerminalPlan)
+    engine_plan_fields = {field.name for field in fields(succeeded)}
+    host_plan_fields = {field.name for field in fields(lost)}
+    assert engine_plan_fields == {
+        "terminal",
+        "finish_reason",
+        "filtered",
+        "degraded",
+        "error_code",
+        "message",
+        "provider_request_id",
+        "client_correlation_id",
+        "recoverable",
+        "unsupported_later_owner",
+    }
+    assert host_plan_fields == {
+        "terminal",
+        "error_code",
+        "message",
+        "recoverable",
+        "worker_lifecycle_signal",
+        "stream_error_code",
+        "last_observed_worker_event_index",
+        "last_accepted_event_id",
+    }
+    assert succeeded.terminal.attempt_event_type == (
         closeout_attempt_terminal_event_type_for_status(AttemptStatus.SUCCEEDED).value
     )
-    assert succeeded.run_event_type == (
+    assert succeeded.terminal.run_event_type == (
         run_terminal_event_type_for_status(RunStatus.SUCCEEDED).value
     )
-    assert failed.attempt_event_type == (
+    assert failed.terminal.attempt_event_type == (
         closeout_attempt_terminal_event_type_for_status(AttemptStatus.FAILED).value
     )
-    assert failed.run_event_type == (
+    assert failed.terminal.run_event_type == (
         run_terminal_event_type_for_status(RunStatus.FAILED).value
     )
-    assert lost.attempt_event_type == (
+    assert lost.terminal.attempt_event_type == (
         closeout_attempt_terminal_event_type_for_status(AttemptStatus.LOST).value
     )
-    assert lost.run_event_type == (
+    assert lost.terminal.run_event_type == (
         run_terminal_event_type_for_status(RunStatus.LOST).value
     )
 
@@ -843,6 +910,64 @@ async def test_reactive_compaction_calls_llm_outside_write_transaction(
         assert result.status is EngineIngestStatus.ACCEPTED
         assert compactor.calls == 1
         assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 1
+
+
+@pytest.mark.asyncio
+async def test_reactive_compaction_gate_consumes_terminal_attempt_status_truth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """reactive compact 返回后的 gate 直接消费 Attempt terminal status owner。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: reactive gate 未消费 terminal status owner 时抛出。
+    """
+
+    owner_predicate = engine_ingest_module.is_terminal_attempt_status
+    observed_statuses: list[AttemptStatus] = []
+
+    def status_gate(status: AttemptStatus) -> bool:
+        """记录 gate 输入并让 FAILED status 明确阻止 compact commit。
+
+        :param status: reactive gate 读取的 Attempt status。
+        :returns: 非 FAILED status 使用真实 owner predicate；FAILED 返回 ``False``。
+        :raises: 无主动抛出。
+        """
+
+        observed_statuses.append(status)
+        if status is AttemptStatus.FAILED:
+            return False
+        return owner_predicate(status)
+
+    monkeypatch.setattr(
+        engine_ingest_module,
+        "is_terminal_attempt_status",
+        status_gate,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        compactor = _TransactionReadableCompactor(store.transaction_runner)
+
+        result = await EngineEventIngestor(
+            transaction_runner=store.transaction_runner,
+            context_budget_policy=_reactive_policy(),
+            context_compactor=compactor,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        ).ingest_async(
+            _context_compaction_candidate(seeded, worker_event_index=141)
+        )
+
+        assert result.status is EngineIngestStatus.ACCEPTED
+        assert compactor.calls == 1
+        assert AttemptStatus.FAILED in observed_statuses
+        assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
+        assert _attempt_count(store.transaction_runner, seeded.run_id) == 1
+        assert _statuses(store.transaction_runner, seeded) == (
+            RunStatus.RECOVERING,
+            AttemptStatus.FAILED,
+        )
 
 
 @pytest.mark.asyncio
@@ -2612,6 +2737,64 @@ def test_late_run_failed_after_run_cancelling_is_rejected_with_diagnostic(
         assert attempt_status == AttemptStatus.RUNNING
 
 
+@pytest.mark.parametrize(
+    "lifecycle_source",
+    ("worker_clean_eof", "worker_lost"),
+)
+def test_host_lifecycle_after_run_cancelling_is_diagnostic_only(
+    tmp_path: Path,
+    lifecycle_source: str,
+) -> None:
+    """active cancel 后 Host lifecycle signal 不写失败或 lost terminal。
+
+    :param tmp_path: pytest 临时目录。
+    :param lifecycle_source: 待验证的 Host lifecycle 来源。
+    :returns: ``None``。
+    :raises AssertionError: lifecycle decision table 不满足时由 pytest 报告。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        store.transaction_runner.run_write(_RequestActiveCancelOperation(seeded))
+        ingestor = EngineEventIngestor(transaction_runner=store.transaction_runner)
+        if lifecycle_source == "worker_clean_eof":
+            result = ingestor.close_clean_eof(
+                _envelope(seeded),
+                observed_at=_NOW,
+                last_observed_worker_event_index=0,
+            )
+        else:
+            result = ingestor.close_worker_lost(
+                _envelope(seeded),
+                observed_at=_NOW,
+                worker_lifecycle_signal="worker_crash",
+                stream_error_code="RuntimeError",
+                last_observed_worker_event_index=0,
+            )
+
+        assert result.status == EngineIngestStatus.REJECTED
+        assert result.terminal_closeout is False
+        assert len(result.events) == 1
+        diagnostic = result.events[0]
+        assert diagnostic.event_type == "HOST_LIFECYCLE_DIAGNOSTIC"
+        assert diagnostic.event_id.startswith("event-host-lifecycle-")
+        assert diagnostic.source == "host.worker_lifecycle"
+        diagnostic_payload = _payload(diagnostic)
+        assert diagnostic_payload["reason"] == (
+            "host_lifecycle_after_active_cancel"
+        )
+        assert diagnostic_payload["lifecycle_source"] == lifecycle_source
+        assert "engine_event_type" not in diagnostic_payload
+        assert "engine_event_ref" not in diagnostic_payload
+        assert _event_count(store.transaction_runner, "RUN_FAILED") == 0
+        assert _event_count(store.transaction_runner, "ATTEMPT_FAILED") == 0
+        assert _event_count(store.transaction_runner, "RUN_LOST") == 0
+        assert _event_count(store.transaction_runner, "ATTEMPT_LOST") == 0
+        run_status, attempt_status = _statuses(store.transaction_runner, seeded)
+        assert run_status == RunStatus.CANCELLING
+        assert attempt_status == AttemptStatus.RUNNING
+
+
 def test_late_awaiting_after_cancel_does_not_move_to_waiting(
     tmp_path: Path,
 ) -> None:
@@ -2779,10 +2962,125 @@ class _CloseActiveCancelWatchdogOperation:
         assert result.status == StateMutationStatus.UPDATED
 
 
+def test_worker_clean_eof_closeout_uses_host_lifecycle_identity_and_source(
+    tmp_path: Path,
+) -> None:
+    """worker clean EOF 使用 Host lifecycle identity，不伪造 Engine fact。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: lifecycle identity、source 或 payload 不满足时报告。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).close_clean_eof(
+            _envelope(seeded),
+            observed_at=_NOW,
+            last_observed_worker_event_index=0,
+        )
+
+        assert result.status == EngineIngestStatus.ACCEPTED
+        assert [event.event_type for event in result.events] == [
+            "ATTEMPT_FAILED",
+            "RUN_FAILED",
+        ]
+        assert all(
+            event.event_id.startswith("event-host-lifecycle-")
+            for event in result.events
+        )
+        assert all(event.source == "host.worker_lifecycle" for event in result.events)
+        attempt_payload = _payload(result.events[0])
+        assert "engine_event_ref" not in attempt_payload
+        assert "engine_event_type" not in attempt_payload
+        terminal_payload = store.transaction_runner.run_read(
+            lambda transaction: sqlite_payload_object(
+                transaction,
+                payload_ref=cast(str, attempt_payload["terminal_summary_ref"]),
+                payload_digest=cast(
+                    str, attempt_payload["terminal_summary_digest"]
+                ),
+                payload_label="host lifecycle terminal payload",
+            )
+        )
+        assert terminal_payload["lifecycle_source"] == "worker_clean_eof"
+        assert terminal_payload["host_lifecycle_ref"] == (
+            f"host-lifecycle:{seeded.execution_id}:1:worker_clean_eof:"
+            "stream_ended_without_terminal"
+        )
+        assert "engine_event_type" not in terminal_payload
+
+
+def test_host_lifecycle_ingress_rejects_mismatched_run_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host lifecycle ingress 显式拒绝 repository 返回的错 run identity。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: ingress 接受错 Run identity 时抛出。
+    """
+
+    durable_read_run = engine_ingest_module.read_run_by_id
+
+    def mismatched_read_run(
+        transaction: HostTransaction, run_id: str
+    ) -> RunRow | None:
+        """返回 key 查询命中但 row identity 漂移的测试 double。
+
+        :param transaction: 当前 Host transaction。
+        :param run_id: envelope 请求的 Run id。
+        :returns: identity 被替换的 Run row；不存在时返回 ``None``。
+        :raises HostDurableError: durable Run row 读取失败时抛出。
+        """
+
+        run = durable_read_run(transaction, run_id)
+        if run is None:
+            return None
+        return replace(run, run_id=f"{run_id}-mismatched")
+
+    monkeypatch.setattr(
+        engine_ingest_module,
+        "read_run_by_id",
+        mismatched_read_run,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).close_clean_eof(
+            _envelope(seeded),
+            observed_at=_NOW,
+            last_observed_worker_event_index=0,
+        )
+
+        assert result.status is EngineIngestStatus.REJECTED
+        assert result.reason == "stale_execution_id"
+        assert result.terminal_closeout is False
+        assert [event.event_type for event in result.events] == [
+            "HOST_LIFECYCLE_DIAGNOSTIC"
+        ]
+        assert _event_count(store.transaction_runner, "RUN_FAILED") == 0
+        assert _statuses(store.transaction_runner, seeded) == (
+            RunStatus.RUNNING,
+            AttemptStatus.RUNNING,
+        )
+
+
 def test_worker_lost_closeout_uses_lost_event_ids_and_duplicate(
     tmp_path: Path,
 ) -> None:
-    """worker lost synthetic lifecycle 使用 LOST facts，重复 closeout 幂等。"""
+    """worker lost 使用 Host lifecycle LOST facts，重复 closeout 幂等。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: LOST closeout 或幂等 identity 不满足时报告。
+    """
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
@@ -2812,13 +3110,304 @@ def test_worker_lost_closeout_uses_lost_event_ids_and_duplicate(
             "ATTEMPT_LOST",
             "RUN_LOST",
         ]
-        payload = _payload(first.events[1])
-        assert payload["engine_event_ref"] == (
-            f"engine:{seeded.execution_id}:1:worker_lost_before_terminal"
+        assert all(
+            event.event_id.startswith("event-host-lifecycle-")
+            for event in first.events
         )
+        assert all(event.source == "host.worker_lifecycle" for event in first.events)
+        payload = _payload(first.events[1])
+        assert "engine_event_ref" not in payload
+        attempt_payload = _payload(first.events[0])
+        terminal_payload = store.transaction_runner.run_read(
+            lambda transaction: sqlite_payload_object(
+                transaction,
+                payload_ref=cast(str, attempt_payload["terminal_summary_ref"]),
+                payload_digest=cast(
+                    str, attempt_payload["terminal_summary_digest"]
+                ),
+                payload_label="host lifecycle terminal payload",
+            )
+        )
+        assert terminal_payload["lifecycle_source"] == "worker_lost"
+        assert terminal_payload["host_lifecycle_ref"] == (
+            f"host-lifecycle:{seeded.execution_id}:1:worker_lost:"
+            "worker_lost_before_terminal"
+        )
+        assert "engine_event_type" not in terminal_payload
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)
         assert run_status == RunStatus.LOST
         assert attempt_status == AttemptStatus.LOST
+
+
+def test_engine_terminal_invalid_state_rolls_back_payload_and_events(
+    tmp_path: Path,
+) -> None:
+    """Engine terminal 遇 WAITING/RUNNING invalid-state 时原子回滚。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: payload、EventLog 或状态未原子回滚时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        _force_run_status_for_invalid_terminal_precondition(
+            store.transaction_runner,
+            seeded,
+            status=RunStatus.WAITING,
+        )
+        before = _terminal_storage_snapshot(store.transaction_runner, seeded)
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(
+            _candidate(
+                seeded,
+                worker_event_index=61,
+                data=FinalAnswerData(
+                    content="late answer",
+                    filtered=False,
+                    degraded=False,
+                    finish_reason=FinishReason.STOP,
+                ),
+                event_type=EngineEventType.FINAL_ANSWER,
+            )
+        )
+
+        assert result.status is EngineIngestStatus.REJECTED
+        assert result.reason == "terminal_closeout_precondition_failed"
+        assert result.events == ()
+        assert _terminal_storage_snapshot(store.transaction_runner, seeded) == before
+
+
+def test_host_lifecycle_invalid_state_rolls_back_payload_and_events(
+    tmp_path: Path,
+) -> None:
+    """Host lifecycle terminal 遇 WAITING/RUNNING invalid-state 时原子回滚。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: payload、EventLog 或状态未原子回滚时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        _force_run_status_for_invalid_terminal_precondition(
+            store.transaction_runner,
+            seeded,
+            status=RunStatus.WAITING,
+        )
+        before = _terminal_storage_snapshot(store.transaction_runner, seeded)
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).close_worker_lost(
+            _envelope(seeded),
+            observed_at=_NOW,
+            worker_lifecycle_signal="worker_stream_error",
+            stream_error_code="RuntimeError",
+            last_observed_worker_event_index=0,
+        )
+
+        assert result.status is EngineIngestStatus.REJECTED
+        assert result.reason == "terminal_closeout_precondition_failed"
+        assert result.events == ()
+        assert _terminal_storage_snapshot(store.transaction_runner, seeded) == before
+
+
+def test_engine_terminal_cas_lost_rolls_back_real_payload_repository(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Engine terminal CAS loser 经真实 transaction 与 payload repository 回滚。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: CAS loser 未原子回滚时抛出。
+    """
+
+    monkeypatch.setattr(
+        engine_ingest_module,
+        "terminal_closeout_in_transaction",
+        _cas_lost_terminal_closeout,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        before = _terminal_storage_snapshot(store.transaction_runner, seeded)
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(
+            _candidate(
+                seeded,
+                worker_event_index=62,
+                data=FinalAnswerData(
+                    content="answer",
+                    filtered=False,
+                    degraded=False,
+                    finish_reason=FinishReason.STOP,
+                ),
+                event_type=EngineEventType.FINAL_ANSWER,
+            )
+        )
+
+        assert result.status is EngineIngestStatus.REJECTED
+        assert result.reason == "terminal_closeout_precondition_failed"
+        assert result.events == ()
+        assert _terminal_storage_snapshot(store.transaction_runner, seeded) == before
+
+
+def test_host_lifecycle_cas_lost_rolls_back_real_payload_repository(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host lifecycle CAS loser 经真实 transaction 与 payload repository 回滚。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: CAS loser 未原子回滚时抛出。
+    """
+
+    monkeypatch.setattr(
+        engine_ingest_module,
+        "terminal_closeout_in_transaction",
+        _cas_lost_terminal_closeout,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        before = _terminal_storage_snapshot(store.transaction_runner, seeded)
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).close_clean_eof(
+            _envelope(seeded),
+            observed_at=_NOW,
+            last_observed_worker_event_index=0,
+        )
+
+        assert result.status is EngineIngestStatus.REJECTED
+        assert result.reason == "terminal_closeout_precondition_failed"
+        assert result.events == ()
+        assert _terminal_storage_snapshot(store.transaction_runner, seeded) == before
+
+
+def test_engine_run_failed_with_worker_lifecycle_reason_remains_engine_failed(
+    tmp_path: Path,
+) -> None:
+    """真实 Engine run_failed 不因 Host lifecycle reason 文本被重解释为 LOST。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: Engine-origin closeout 被错误重解释时报告。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _candidate(
+            seeded,
+            worker_event_index=1,
+            data=RunFailedData(
+                error_code="worker_lost_before_terminal",
+                message="Engine reported its own failure",
+                provider_request_id=None,
+                recoverable=False,
+            ),
+            event_type=EngineEventType.RUN_FAILED,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert [event.event_type for event in result.events] == [
+            "ATTEMPT_FAILED",
+            "RUN_FAILED",
+        ]
+        assert all(event.event_id.startswith("event-engine-") for event in result.events)
+        payload = _payload(result.events[0])
+        assert payload["engine_event_ref"] == (
+            f"engine:{seeded.execution_id}:1:run_failed"
+        )
+        assert _statuses(store.transaction_runner, seeded) == (
+            RunStatus.FAILED,
+            AttemptStatus.FAILED,
+        )
+
+
+def test_late_rejection_uses_status_even_when_terminal_refs_are_missing(
+    tmp_path: Path,
+) -> None:
+    """late rejection 直接消费 Run / Attempt status，而不依赖 nullable refs。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: status truth 未优先于 nullable refs 时报告。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _candidate(
+            seeded,
+            worker_event_index=1,
+            data=ReasoningDeltaData(
+                iteration_id="iter-status-truth",
+                delta="late",
+            ),
+            event_type=EngineEventType.REASONING_DELTA,
+        )
+
+        def _context(
+            transaction: HostTransaction,
+        ) -> engine_ingest_module._ValidatedCandidate:
+            """构造只用于 predicate 单测的异常 nullable-ref 上下文。
+
+            :param transaction: Host read transaction。
+            :returns: status 已终态但 terminal refs 为空的校验上下文。
+            :raises AssertionError: seeded durable rows 缺失时抛出。
+            """
+
+            run = read_run_by_id(transaction, seeded.run_id)
+            attempt = read_attempt_by_id(transaction, seeded.attempt_id)
+            dispatch = read_dispatch_record_by_attempt_id(
+                transaction, seeded.attempt_id
+            )
+            assert run is not None
+            assert attempt is not None
+            assert dispatch is not None
+            return engine_ingest_module._ValidatedCandidate(
+                candidate=candidate,
+                run=replace(
+                    run,
+                    status=RunStatus.FAILED,
+                    terminal_event_id=None,
+                    terminal_event_sequence=None,
+                    terminal_at=None,
+                ),
+                attempt=attempt,
+                dispatch_record=dispatch,
+            )
+
+        run_terminal_context = store.transaction_runner.run_read(_context)
+        attempt_terminal_context = replace(
+            run_terminal_context,
+            run=replace(run_terminal_context.run, status=RunStatus.RUNNING),
+            attempt=replace(
+                run_terminal_context.attempt,
+                status=AttemptStatus.FAILED,
+                terminal_event_id=None,
+                terminal_event_sequence=None,
+                terminal_at=None,
+            ),
+        )
+
+        assert engine_ingest_module._late_engine_event_rejection_reason(
+            run_terminal_context
+        ) == "terminal_already_closed"
+        assert engine_ingest_module._late_engine_event_rejection_reason(
+            attempt_terminal_context
+        ) == "terminal_already_closed"
 
 
 def test_unsupported_engine_event_shape_is_rejected(tmp_path: Path) -> None:
@@ -4465,6 +5054,91 @@ def _statuses(
         return run.status, attempt.status
 
     return transaction_runner.run_read(_operation)
+
+
+def _terminal_storage_snapshot(
+    transaction_runner: HostTransactionRunner,
+    seeded: _SeededRun,
+) -> tuple[int, int, int, RunStatus, AttemptStatus]:
+    """读取 terminal 原子性断言所需的真实 durable snapshot。
+
+    :param transaction_runner: Host transaction runner。
+    :param seeded: seeded run。
+    :returns: payload row、descriptor、EventLog row 数与 Run/Attempt status。
+    :raises AssertionError: durable count 或 Run/Attempt row 缺失时抛出。
+    """
+
+    def _operation(
+        transaction: HostTransaction,
+    ) -> tuple[int, int, int, RunStatus, AttemptStatus]:
+        """在同一 read transaction 内读取原子性快照。
+
+        :param transaction: Host read transaction。
+        :returns: payload row、descriptor、EventLog row 数与 Run/Attempt status。
+        :raises AssertionError: durable count 或 Run/Attempt row 缺失时抛出。
+        """
+
+        run = read_run_by_id(transaction, seeded.run_id)
+        attempt = read_attempt_by_id(transaction, seeded.attempt_id)
+        assert run is not None
+        assert attempt is not None
+        return (
+            _table_row_count(transaction, TABLE_SQLITE_PAYLOADS),
+            _table_row_count(transaction, TABLE_PAYLOAD_DESCRIPTORS),
+            _table_row_count(transaction, TABLE_EVENT_LOG),
+            run.status,
+            attempt.status,
+        )
+
+    return transaction_runner.run_read(_operation)
+
+
+def _force_run_status_for_invalid_terminal_precondition(
+    transaction_runner: HostTransactionRunner,
+    seeded: _SeededRun,
+    *,
+    status: RunStatus,
+) -> None:
+    """构造 row 可解码但不满足 terminal closeout 的跨对象状态组合。
+
+    :param transaction_runner: Host transaction runner。
+    :param seeded: seeded run。
+    :param status: 写入 Run row 的非终态 status。
+    :returns: ``None``。
+    :raises AssertionError: 状态更新未命中唯一 Run row 时抛出。
+    """
+
+    def _operation(transaction: HostTransaction) -> None:
+        """更新测试 Run status，不改变 Attempt 与 terminal refs。
+
+        :param transaction: Host write transaction。
+        :returns: ``None``。
+        :raises AssertionError: 状态更新未命中唯一 Run row 时抛出。
+        """
+
+        changed = transaction.execute(
+            f"UPDATE {TABLE_HOST_RUNS} SET status = ? WHERE run_id = ?",
+            (status.value, seeded.run_id),
+        )
+        assert changed.rowcount == 1
+
+    transaction_runner.run_write(_operation)
+
+
+def _table_row_count(transaction: HostTransaction, table_name: str) -> int:
+    """读取测试白名单 durable table 的 row count。
+
+    :param transaction: Host transaction。
+    :param table_name: schema 常量提供的 durable table 名称。
+    :returns: row count。
+    :raises AssertionError: SQLite 未返回整数 count 时抛出。
+    """
+
+    row = transaction.fetchone(f"SELECT COUNT(*) AS total FROM {table_name}")
+    assert row is not None
+    total = row.get("total")
+    assert isinstance(total, int)
+    return total
 
 
 def _event_count(transaction_runner: HostTransactionRunner, event_type: str) -> int:

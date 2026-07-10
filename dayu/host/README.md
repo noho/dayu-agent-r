@@ -367,6 +367,8 @@ RunInputBuilder 只从 durable providers 读取当前 Run facts、Session contin
 
 EngineEvent ingest 校验 run / attempt / execution identity、当前 durable state 与 event type，再把 EngineEvent 转成 Host facts、preview 或 diagnostic。`EngineEvent` 本身不是 truth；final answer、failure、cancel、lost、usage、iteration_started、context compaction request 和 awaiting confirmation 都必须经 Host ingest 才能影响 Host 状态。
 
+worker clean EOF、stream error 与 worker crash 不是 EngineEvent。它们通过独立的 Host lifecycle closeout candidate、Host lifecycle event identity 与 source 进入同一个 durable terminal transaction；该路径不合成 `run_failed` EngineEvent，也不把 Host lifecycle source ref 写成 Engine event ref。
+
 ### ToolRuntime
 
 ToolRuntime 把 construction-time `HostToolingOptions` 中的业务工具 bundle 与 Host framework tools 组合成 effective tool bundle，并向 Engine 提供受治理的 `ToolExecutor`。工具结果只有通过 Host accept barrier 后才会返回给 Engine；side-effect / paid tool 必须携带工具幂等键；attempt-local duplicate governance、run-scoped truncation cursor 和 optional `fetch_more` 都在 ToolRuntime 内治理。
@@ -598,7 +600,7 @@ resume Attempt 的 runner input 会把当前用户请求、使用 LLM-safe repla
 
 Dispatch scheduler 不从内存队列恢复状态，只扫描 durable accepted / queued / pending dispatch facts。standard path 是 dispatch 前执行 context governance，写入 `RUN_STARTED` / `ATTEMPT_STARTED` / dispatch record，然后 acquire runtime lane、durable recheck、调用 `LocalEngineWorker.accept(...)`，最后写入 `ATTEMPT_RUNNING` 并消费 worker 的 EngineEvent stream。
 
-runtime lane 只表达资源容量，不能证明 worker ownership。lane acquire 成功后仍要重新读取 durable state；worker startup timeout、worker accept failure、worker stream crash、cancel 后 clean EOF、非 cancel clean EOF 都由 Host closeout 成结构化 terminal 或 diagnostic。active cancel watchdog 使用当前 `CANCELLING` Run / `RUNNING` Attempt / worker accepted dispatch record 与已接受 cancel fact 做 deterministic tick；cancel commit 会唤醒 watchdog，scheduler 也会做 periodic fallback scan。terminal closeout 后，scheduler 唤醒同 Session queued promotion。
+runtime lane 只表达资源容量，不能证明 worker ownership。lane acquire 成功后仍要重新读取 durable state；worker startup timeout、worker accept failure、worker stream crash、cancel 后 clean EOF、非 cancel clean EOF 都由 Host closeout 成结构化 terminal 或 diagnostic。worker EOF / crash closeout 使用 Host lifecycle identity，不借用 EngineEvent identity；`CANCELLING` 下该 signal 只产生 Host lifecycle diagnostic，terminal cancel 仍由 accepted-cancel watchdog 或既有 terminal first-committer 拥有。active cancel watchdog 使用当前 `CANCELLING` Run / `RUNNING` Attempt / worker accepted dispatch record 与已接受 cancel fact 做 deterministic tick；cancel commit 会唤醒 watchdog，scheduler 也会做 periodic fallback scan。terminal closeout 后，scheduler 唤醒同 Session queued promotion。
 
 ### Host 启动恢复
 
@@ -615,7 +617,7 @@ positive orphan proof 需要 durable owner liveness 与本机进程证据支持�
 
 ### EngineEvent ingest
 
-Host ingest 对 final answer、run failed、cancelled、lost、usage、iteration_started、tool awaiting confirmation 与 context compaction request 分别建模。EngineEvent 进入 Host 前只是 worker 输入，必须匹配 run / attempt / execution identity 与当前 durable state；迟到、错 execution、错状态或无法链接 runner-call manifest 的事件会 fail closed 为 diagnostic / rejected path。
+Host ingest 对 Engine-origin final answer、run failed、cancelled、usage、iteration_started、tool awaiting confirmation 与 context compaction request 分别建模；worker lost 属于独立 Host lifecycle path。EngineEvent 进入 Host 前只是 worker 输入，必须匹配 run / attempt / execution identity 与当前 durable state；迟到、错 execution、错状态或无法链接 runner-call manifest 的事件会 fail closed 为 diagnostic / rejected path。Host lifecycle path 同样校验 durable identity，但使用自己的 event namespace、source 与 late-event routing。
 
 同步 ingest 不处理需要异步 compact 的 reactive path；异步 ingest 在必要时执行 reactive compact / recovery。`iteration_started` 会显式链接 Host 先前写入的 `RUNNER_CALL_INPUT_ASSEMBLED` manifest；missing、ambiguous、mismatch 或 link conflict 都以 `ENGINE_EVENT_REJECTED` 收口，避免 provider observation 与 Host input manifest 脱节。已有 prior iteration 后的 Engine-only continuation 使用 `iteration_started.input_projection` 保存真实 runner input projection；projection 缺失时保留 limited diagnostic。
 

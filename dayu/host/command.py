@@ -105,10 +105,10 @@ from dayu.host.durable.session_lifecycle import (
 from dayu.host.durable.state import (
     AttemptRow,
     DispatchRecordRow,
-    DispatchRecordStatus,
     RunRow,
     WaitRecordRow,
     WaitRecordStatus,
+    is_dispatch_record_direct_cancelable,
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
     read_run_by_id,
@@ -1702,7 +1702,7 @@ def _is_predispatch_starting_run(transaction: HostTransaction, run: RunRow) -> b
         attempt is not None
         and attempt.status == AttemptStatus.STARTING
         and dispatch_record is not None
-        and _is_direct_cancelable_dispatch_record(dispatch_record)
+        and is_dispatch_record_direct_cancelable(dispatch_record)
     )
 
 
@@ -1716,28 +1716,6 @@ def _is_active_worker_cancelable_run(transaction: HostTransaction, run: RunRow) 
 
     attempt, _dispatch_record = _read_attempt_and_dispatch_for_run(transaction, run)
     return attempt is not None and attempt.status == AttemptStatus.RUNNING
-
-
-def _is_direct_cancelable_dispatch_record(
-    dispatch_record: DispatchRecordRow,
-) -> bool:
-    """判断 dispatch record 是否仍可 pre-worker direct cancel。
-
-    :param dispatch_record: dispatch record row。
-    :returns: 可 direct cancel 时返回 ``True``。
-    """
-
-    if dispatch_record.status in (
-        DispatchRecordStatus.PENDING,
-        DispatchRecordStatus.WAITING_FOR_LANE,
-    ):
-        return True
-    return (
-        dispatch_record.status == DispatchRecordStatus.DISPATCHING
-        and dispatch_record.worker_accepted_at is None
-        and dispatch_record.worker_accept_event_id is None
-        and dispatch_record.worker_accept_event_sequence is None
-    )
 
 
 def _pending_dispatch_from_row(

@@ -660,6 +660,32 @@ def deserialize_dispatch_record_status(value: str) -> DispatchRecordStatus:
     )
 
 
+def is_dispatch_record_direct_cancelable(record: DispatchRecordRow) -> bool:
+    """判断 dispatch record 是否仍可在 worker 接受前直接取消。
+
+    ``PENDING``、``WAITING_FOR_LANE`` 与尚无 worker accepted facts 的
+    ``DISPATCHING`` 都属于 pre-worker direct cancel 边界。其它状态或已经
+    写入 worker accepted facts 的 ``DISPATCHING`` 必须交给 active worker
+    cancel 路径处理。
+
+    :param record: durable dispatch record row。
+    :returns: 可直接取消时返回 ``True``，否则返回 ``False``。
+    :raises: 无主动抛出。
+    """
+
+    if record.status in (
+        DispatchRecordStatus.PENDING,
+        DispatchRecordStatus.WAITING_FOR_LANE,
+    ):
+        return True
+    return (
+        record.status is DispatchRecordStatus.DISPATCHING
+        and record.worker_accepted_at is None
+        and record.worker_accept_event_id is None
+        and record.worker_accept_event_sequence is None
+    )
+
+
 def serialize_worker_kind(worker_kind: WorkerKind) -> str:
     """序列化 worker kind。
 

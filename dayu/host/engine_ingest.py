@@ -179,6 +179,8 @@ from dayu.host.durable.state import (
     WaitRecordRow,
     WaitRecordStatus,
     WorkerKind,
+    is_terminal_attempt_status,
+    is_terminal_run_status,
     read_active_wait_records_for_run,
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
@@ -226,8 +228,14 @@ _EVENT_ACTOR = "host.engine_ingest"
 _EVENT_ID_PREFIX = "event-engine-"
 _PAYLOAD_REF_PREFIX = "payload-engine-terminal"
 _PAYLOAD_ID_PREFIX = "sqlite-payload-engine-terminal"
+_HOST_LIFECYCLE_EVENT_SOURCE = "host.worker_lifecycle"
+_HOST_LIFECYCLE_EVENT_ACTOR = "host.worker_lifecycle"
+_HOST_LIFECYCLE_EVENT_ID_PREFIX = "event-host-lifecycle-"
+_HOST_LIFECYCLE_PAYLOAD_REF_PREFIX = "payload-host-lifecycle-terminal"
+_HOST_LIFECYCLE_PAYLOAD_ID_PREFIX = "sqlite-payload-host-lifecycle-terminal"
 _EVENT_TYPE_ENGINE_EVENT_REJECTED = "ENGINE_EVENT_REJECTED"
 _EVENT_TYPE_ENGINE_EVENT_DIAGNOSTIC = "ENGINE_EVENT_DIAGNOSTIC"
+_EVENT_TYPE_HOST_LIFECYCLE_DIAGNOSTIC = "HOST_LIFECYCLE_DIAGNOSTIC"
 _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR = "PROVIDER_PROTOCOL_ERROR"
 _EVENT_TYPE_RUN_RECOVERING = "RUN_RECOVERING"
 _EVENT_TYPE_TOOL_AWAITING = "TOOL_AWAITING"
@@ -245,7 +253,13 @@ _REASON_WORKER_LOST_BEFORE_TERMINAL = "worker_lost_before_terminal"
 _REASON_EMPTY_FINAL_ANSWER = "empty_final_answer"
 _REASON_STALE_EXECUTION_ID = "stale_execution_id"
 _REASON_TERMINAL_ALREADY_CLOSED = "terminal_already_closed"
+_REASON_TERMINAL_CLOSEOUT_PRECONDITION_FAILED = (
+    "terminal_closeout_precondition_failed"
+)
 _REASON_LATE_TERMINAL_AFTER_ACTIVE_CANCEL = "late_terminal_after_active_cancel"
+_REASON_HOST_LIFECYCLE_AFTER_ACTIVE_CANCEL = (
+    "host_lifecycle_after_active_cancel"
+)
 _REASON_WAITING_EVENT_CONFIRMATION = "waiting_event_confirmation"
 _REASON_WAITING_EVENT_WITHOUT_HOST_ACCEPTED_REFS = (
     "waiting_event_without_host_accepted_refs"
@@ -310,6 +324,17 @@ class EngineIngestStatus(StrEnum):
     ACCEPTED = "accepted"
     DUPLICATE = "duplicate"
     REJECTED = "rejected"
+
+
+class _HostLifecycleSource(StrEnum):
+    """Host worker lifecycle closeout 的强类型来源。"""
+
+    WORKER_CLEAN_EOF = "worker_clean_eof"
+    WORKER_LOST = "worker_lost"
+
+
+class _TerminalCloseoutRollback(Exception):
+    """terminal closeout 未更新 durable state 时触发整笔事务回滚。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -415,8 +440,8 @@ class _RunnerCallIterationResolution:
 
 
 @dataclass(frozen=True, slots=True)
-class _TerminalPlan:
-    """terminal closeout 事件规划。"""
+class _TerminalFactPlan:
+    """两类 terminal 来源共享的 canonical fact 规划。"""
 
     attempt_event_type: str
     run_event_type: str
@@ -424,6 +449,13 @@ class _TerminalPlan:
     run_status: RunStatus
     reason: str
     terminal_payload: Mapping[str, JsonValue]
+
+
+@dataclass(frozen=True, slots=True)
+class _EngineTerminalPlan:
+    """Engine-origin terminal closeout 规划。"""
+
+    terminal: _TerminalFactPlan
     finish_reason: str | None
     filtered: bool | None
     degraded: bool | None
@@ -433,10 +465,54 @@ class _TerminalPlan:
     client_correlation_id: str | None
     recoverable: bool | None
     unsupported_later_owner: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _HostLifecycleTerminalPlan:
+    """Host worker lifecycle terminal closeout 规划。"""
+
+    terminal: _TerminalFactPlan
+    error_code: str | None
+    message: str | None
+    recoverable: bool | None
     worker_lifecycle_signal: str | None
     stream_error_code: str | None
     last_observed_worker_event_index: int | None
     last_accepted_event_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _HostLifecycleCloseoutCandidate:
+    """进入 Host lifecycle closeout 的强类型 candidate。
+
+    :param envelope: Host-owned worker identity envelope。
+    :param observed_at: Host 观察到 lifecycle signal 的 UTC aware 时间。
+    :param worker_event_index: 单个 execution 内 Host 分配的 lifecycle 序号。
+    :param plan: Host terminal closeout 规划。
+    :param lifecycle_source: worker lifecycle signal 的强类型来源。
+    """
+
+    envelope: LocalEngineEnvelope
+    observed_at: datetime
+    worker_event_index: int
+    plan: _HostLifecycleTerminalPlan
+    lifecycle_source: _HostLifecycleSource
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidatedHostLifecycleCloseoutCandidate:
+    """已通过 durable identity 校验的 Host lifecycle candidate 上下文。
+
+    :param candidate: Host lifecycle closeout candidate。
+    :param run: 当前 durable Run row。
+    :param attempt: 当前 durable Attempt row。
+    :param dispatch_record: 当前 durable dispatch record row。
+    """
+
+    candidate: _HostLifecycleCloseoutCandidate
+    run: RunRow
+    attempt: AttemptRow
+    dispatch_record: DispatchRecordRow
 
 
 @dataclass(frozen=True, slots=True)
@@ -729,10 +805,10 @@ class EngineEventIngestor:
                     candidate=candidate,
                     reason=_REASON_STALE_EXECUTION_ID,
                 )
-            duplicate = self._duplicate_terminal_result(transaction, context)
+            duplicate = self._duplicate_engine_terminal_result(transaction, context)
             if duplicate is not None:
                 return duplicate
-            late = _late_rejection_reason(context)
+            late = _late_engine_event_rejection_reason(context)
             if late is not None:
                 return self._append_rejected_diagnostic(
                     transaction,
@@ -741,7 +817,10 @@ class EngineEventIngestor:
                 )
             return self._ingest_validated(transaction, context)
 
-        return self._transaction_runner.run_write(_operation)
+        try:
+            return self._transaction_runner.run_write(_operation)
+        except _TerminalCloseoutRollback:
+            return _terminal_closeout_precondition_failed_result()
 
     def _finish_ingest(
         self,
@@ -784,14 +863,15 @@ class EngineEventIngestor:
         )
         return promoted
 
-    def _duplicate_terminal_result(
+    def _duplicate_engine_terminal_result(
         self, transaction: HostTransaction, context: _ValidatedCandidate
     ) -> EngineIngestResult | None:
-        """识别 terminal candidate 的完整重复写入。
+        """识别 Engine-origin terminal candidate 的完整重复写入。
 
         :param transaction: 当前 Host transaction。
         :param context: 已校验 candidate 上下文。
         :returns: duplicate 结果；不是完整重复时返回 ``None``。
+        :raises HostDurableError: EventLog 读取失败时抛出。
         """
 
         event_ids = _duplicate_terminal_event_ids(context.candidate)
@@ -812,6 +892,31 @@ class EngineEventIngestor:
                 reason="duplicate_candidate",
                 stop_worker_stream=True,
             )
+        return EngineIngestResult(
+            status=EngineIngestStatus.DUPLICATE,
+            events=existing,
+            terminal_closeout=True,
+            promotion_triggered=False,
+            reason="duplicate_candidate",
+        )
+
+    def _duplicate_host_lifecycle_terminal_result(
+        self,
+        transaction: HostTransaction,
+        context: _ValidatedHostLifecycleCloseoutCandidate,
+    ) -> EngineIngestResult | None:
+        """识别 Host lifecycle terminal candidate 的完整重复写入。
+
+        :param transaction: 当前 Host transaction。
+        :param context: 已校验的 Host lifecycle candidate 上下文。
+        :returns: duplicate 结果；不是完整重复时返回 ``None``。
+        :raises HostDurableError: EventLog 读取失败时抛出。
+        """
+
+        event_ids = _host_lifecycle_terminal_event_ids(context.candidate)
+        existing = _existing_rows(self._event_log_store, transaction, event_ids)
+        if len(existing) != len(event_ids):
+            return None
         return EngineIngestResult(
             status=EngineIngestStatus.DUPLICATE,
             events=existing,
@@ -843,6 +948,7 @@ class EngineEventIngestor:
             envelope,
             observed_at=observed_at,
             event_index=last_observed_worker_event_index + 1,
+            lifecycle_source=_HostLifecycleSource.WORKER_CLEAN_EOF,
             plan=_failed_lifecycle_plan(
                 reason=_REASON_STREAM_ENDED_WITHOUT_TERMINAL,
                 last_observed_worker_event_index=last_observed_worker_event_index,
@@ -880,6 +986,7 @@ class EngineEventIngestor:
             envelope,
             observed_at=observed_at,
             event_index=last_observed_worker_event_index + 1,
+            lifecycle_source=_HostLifecycleSource.WORKER_LOST,
             plan=_lost_lifecycle_plan(
                 worker_lifecycle_signal=worker_lifecycle_signal,
                 stream_error_code=stream_error_code,
@@ -1036,11 +1143,49 @@ class EngineEventIngestor:
             dispatch_record=dispatch_record,
         )
 
+    def _validate_host_lifecycle_context(
+        self,
+        transaction: HostTransaction,
+        candidate: _HostLifecycleCloseoutCandidate,
+    ) -> _ValidatedHostLifecycleCloseoutCandidate | None:
+        """校验 Host lifecycle candidate 与 durable identity 是否同源。
+
+        :param transaction: 当前 Host transaction。
+        :param candidate: 待校验的 Host lifecycle candidate。
+        :returns: 校验通过的强类型上下文；identity 不匹配时返回 ``None``。
+        :raises HostDurableError: durable row 解码失败时抛出。
+        """
+
+        envelope = candidate.envelope
+        run = read_run_by_id(transaction, envelope.run_id)
+        attempt = read_attempt_by_id(transaction, envelope.attempt_id)
+        dispatch_record = read_dispatch_record_by_attempt_id(
+            transaction, envelope.attempt_id
+        )
+        if run is None or attempt is None or dispatch_record is None:
+            return None
+        if (
+            run.session_id != envelope.session_id
+            or run.run_id != envelope.run_id
+            or run.current_attempt_id != envelope.attempt_id
+            or attempt.run_id != envelope.run_id
+            or attempt.execution_id != envelope.execution_id
+            or dispatch_record.dispatch_record_id != envelope.dispatch_record_id
+            or dispatch_record.execution_id != envelope.execution_id
+        ):
+            return None
+        return _ValidatedHostLifecycleCloseoutCandidate(
+            candidate=candidate,
+            run=run,
+            attempt=attempt,
+            dispatch_record=dispatch_record,
+        )
+
     def _close_terminal(
         self,
         transaction: HostTransaction,
         context: _ValidatedCandidate,
-        plan: _TerminalPlan,
+        plan: _EngineTerminalPlan,
         *,
         sub_index_offset: int = 0,
     ) -> EngineIngestResult:
@@ -1051,19 +1196,22 @@ class EngineEventIngestor:
         :param plan: terminal closeout 规划。
         :param sub_index_offset: 多事件映射时的 sub-index 偏移。
         :returns: ingest 结果。
+        :raises _TerminalCloseoutRollback: terminal mutation 未更新时抛出以回滚事务。
+        :raises HostDurableError: payload、EventLog 或状态写入失败时抛出。
         """
 
         candidate = context.candidate
+        terminal = plan.terminal
         attempt_event_id = _event_id(
             candidate,
             EventClass.CANONICAL_FACT,
-            plan.attempt_event_type,
+            terminal.attempt_event_type,
             sub_index_offset,
         )
         run_event_id = _event_id(
             candidate,
             EventClass.CANONICAL_FACT,
-            plan.run_event_type,
+            terminal.run_event_type,
             sub_index_offset + 1,
         )
         existing = _existing_rows(
@@ -1077,13 +1225,13 @@ class EngineEventIngestor:
                 events=existing,
                 terminal_closeout=True,
                 promotion_triggered=False,
-                reason=plan.reason,
+                reason=terminal.reason,
             )
         descriptor = self._write_terminal_payload(
             transaction,
             candidate=candidate,
             event_id=attempt_event_id,
-            payload=plan.terminal_payload,
+            payload=terminal.terminal_payload,
         )
         result = terminal_closeout_in_transaction(
             transaction,
@@ -1093,12 +1241,12 @@ class EngineEventIngestor:
                 attempt_id=context.attempt.attempt_id,
                 attempt_terminal_event_id=attempt_event_id,
                 run_terminal_event_id=run_event_id,
-                attempt_terminal_status=plan.attempt_status,
-                run_terminal_status=plan.run_status,
+                attempt_terminal_status=terminal.attempt_status,
+                run_terminal_status=terminal.run_status,
                 occurred_at=candidate.observed_at,
                 actor=_EVENT_ACTOR,
                 source=_EVENT_SOURCE,
-                reason=plan.reason,
+                reason=terminal.reason,
                 terminal_summary_ref=descriptor.payload_ref,
                 terminal_summary_digest=descriptor.payload_digest,
                 engine_event_ref=_engine_event_ref(candidate),
@@ -1111,21 +1259,15 @@ class EngineEventIngestor:
                 client_correlation_id=plan.client_correlation_id,
                 recoverable=plan.recoverable,
                 unsupported_later_owner=plan.unsupported_later_owner,
-                worker_lifecycle_signal=plan.worker_lifecycle_signal,
-                stream_error_code=plan.stream_error_code,
-                last_observed_worker_event_index=(
-                    plan.last_observed_worker_event_index
-                ),
-                last_accepted_event_id=plan.last_accepted_event_id,
+                worker_lifecycle_signal=None,
+                stream_error_code=None,
+                last_observed_worker_event_index=None,
+                last_accepted_event_id=None,
             ),
         )
         if result.status != StateMutationStatus.UPDATED:
-            return EngineIngestResult(
-                status=EngineIngestStatus.REJECTED,
-                events=(),
-                terminal_closeout=True,
-                promotion_triggered=False,
-                reason="terminal_closeout_precondition_failed",
+            raise _TerminalCloseoutRollback(
+                f"Engine terminal closeout returned {result.status.value}"
             )
         rows = _existing_rows(
             self._event_log_store,
@@ -1137,7 +1279,96 @@ class EngineEventIngestor:
             events=rows,
             terminal_closeout=True,
             promotion_triggered=False,
-            reason=plan.reason,
+            reason=terminal.reason,
+        )
+
+    def _close_host_lifecycle_terminal(
+        self,
+        transaction: HostTransaction,
+        context: _ValidatedHostLifecycleCloseoutCandidate,
+    ) -> EngineIngestResult:
+        """按 Host lifecycle plan 写入 Attempt / Run terminal facts。
+
+        :param transaction: 当前 Host transaction。
+        :param context: 已校验的 Host lifecycle candidate 上下文。
+        :returns: lifecycle closeout 结果。
+        :raises _TerminalCloseoutRollback: terminal mutation 未更新时抛出以回滚事务。
+        :raises HostDurableError: payload 或 terminal transaction 写入失败时抛出。
+        """
+
+        candidate = context.candidate
+        plan = candidate.plan
+        terminal = plan.terminal
+        attempt_event_id, run_event_id = _host_lifecycle_terminal_event_ids(
+            candidate
+        )
+        existing = _existing_rows(
+            self._event_log_store,
+            transaction,
+            (attempt_event_id, run_event_id),
+        )
+        if len(existing) == 2:
+            return EngineIngestResult(
+                status=EngineIngestStatus.DUPLICATE,
+                events=existing,
+                terminal_closeout=True,
+                promotion_triggered=False,
+                reason=terminal.reason,
+            )
+        descriptor = self._write_host_lifecycle_terminal_payload(
+            transaction,
+            candidate=candidate,
+            event_id=attempt_event_id,
+        )
+        result = terminal_closeout_in_transaction(
+            transaction,
+            self._event_log_store,
+            TerminalCloseoutInput(
+                run_id=context.run.run_id,
+                attempt_id=context.attempt.attempt_id,
+                attempt_terminal_event_id=attempt_event_id,
+                run_terminal_event_id=run_event_id,
+                attempt_terminal_status=terminal.attempt_status,
+                run_terminal_status=terminal.run_status,
+                occurred_at=candidate.observed_at,
+                actor=_HOST_LIFECYCLE_EVENT_ACTOR,
+                source=_HOST_LIFECYCLE_EVENT_SOURCE,
+                reason=terminal.reason,
+                terminal_summary_ref=descriptor.payload_ref,
+                terminal_summary_digest=descriptor.payload_digest,
+                engine_event_ref=None,
+                finish_reason=None,
+                filtered=None,
+                degraded=None,
+                error_code=plan.error_code,
+                message=plan.message,
+                provider_request_id=None,
+                client_correlation_id=None,
+                recoverable=plan.recoverable,
+                unsupported_later_owner=None,
+                worker_lifecycle_signal=plan.worker_lifecycle_signal,
+                stream_error_code=plan.stream_error_code,
+                last_observed_worker_event_index=(
+                    plan.last_observed_worker_event_index
+                ),
+                last_accepted_event_id=plan.last_accepted_event_id,
+            ),
+        )
+        if result.status != StateMutationStatus.UPDATED:
+            raise _TerminalCloseoutRollback(
+                f"Host lifecycle terminal closeout returned {result.status.value}"
+            )
+        rows = _existing_rows(
+            self._event_log_store,
+            transaction,
+            (attempt_event_id, run_event_id),
+        )
+        return EngineIngestResult(
+            status=EngineIngestStatus.ACCEPTED,
+            events=rows,
+            terminal_closeout=True,
+            promotion_triggered=False,
+            reason=terminal.reason,
         )
 
     def _close_active_cancel(
@@ -1701,7 +1932,7 @@ class EngineEventIngestor:
                 )
             if (
                 latest.run.status is not RunStatus.RECOVERING
-                or latest.attempt.terminal_event_id is None
+                or not is_terminal_attempt_status(latest.attempt.status)
             ):
                 return pending.result_prefix
             attempt_rows: list[EventLogRow] = []
@@ -2423,16 +2654,29 @@ class EngineEventIngestor:
         *,
         observed_at: datetime,
         event_index: int,
-        plan: _TerminalPlan,
+        lifecycle_source: _HostLifecycleSource,
+        plan: _HostLifecycleTerminalPlan,
     ) -> EngineIngestResult:
         """按 worker lifecycle signal 执行 terminal closeout。
 
         :param envelope: Host-owned identity envelope。
         :param observed_at: Host 观察时间。
-        :param event_index: 合成 worker event index。
+        :param event_index: Host worker lifecycle event index。
+        :param lifecycle_source: Host worker lifecycle 来源。
         :param plan: terminal closeout 规划。
         :returns: closeout 结果。
+        :raises ValueError: candidate identity、时间或 event index 非法时抛出。
+        :raises HostDurableError: durable identity、EventLog 或 closeout 写入失败时抛出。
         """
+
+        candidate = _HostLifecycleCloseoutCandidate(
+            envelope=envelope,
+            observed_at=observed_at,
+            worker_event_index=event_index,
+            plan=plan,
+            lifecycle_source=lifecycle_source,
+        )
+        _validate_host_lifecycle_candidate_shape(candidate)
 
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
@@ -2444,49 +2688,35 @@ class EngineEventIngestor:
             envelope.attempt_id,
             envelope.execution_id,
             event_index,
-            plan.reason,
-        )
-        event = EngineEvent(
-            occurred_at=observed_at,
-            session_id=envelope.session_id,
-            run_id=envelope.run_id,
-            type=EngineEventType.RUN_FAILED,
-            data=RunFailedData(
-                error_code=plan.reason,
-                message=plan.reason,
-                provider_request_id=None,
-                recoverable=False,
-            ),
-            metadata=None,
-        )
-        candidate = EngineEventCandidate(
-            envelope=envelope,
-            worker_event_index=event_index,
-            engine_event=event,
-            observed_at=observed_at,
+            plan.terminal.reason,
         )
 
         def _operation(transaction: HostTransaction) -> EngineIngestResult:
-            context = self._validate_durable_context(transaction, candidate)
+            context = self._validate_host_lifecycle_context(transaction, candidate)
             if context is None:
-                return self._append_rejected_diagnostic(
+                return self._append_stale_host_lifecycle_diagnostic(
                     transaction,
                     candidate=candidate,
                     reason=_REASON_STALE_EXECUTION_ID,
                 )
-            duplicate = self._duplicate_terminal_result(transaction, context)
+            duplicate = self._duplicate_host_lifecycle_terminal_result(
+                transaction, context
+            )
             if duplicate is not None:
                 return duplicate
-            late = _late_rejection_reason(context)
+            late = _late_host_lifecycle_rejection_reason(context)
             if late is not None:
-                return self._append_rejected_diagnostic(
+                return self._append_host_lifecycle_diagnostic(
                     transaction,
-                    candidate=candidate,
+                    context=context,
                     reason=late,
                 )
-            return self._close_terminal(transaction, context, plan)
+            return self._close_host_lifecycle_terminal(transaction, context)
 
-        result = self._transaction_runner.run_write(_operation)
+        try:
+            result = self._transaction_runner.run_write(_operation)
+        except _TerminalCloseoutRollback:
+            result = _terminal_closeout_precondition_failed_result()
         promoted = self._with_terminal_promotion_retry(
             result,
             session_id=envelope.session_id,
@@ -3179,6 +3409,127 @@ class EngineEventIngestor:
             stop_worker_stream=stop_worker_stream,
         )
 
+    def _append_stale_host_lifecycle_diagnostic(
+        self,
+        transaction: HostTransaction,
+        *,
+        candidate: _HostLifecycleCloseoutCandidate,
+        reason: str,
+    ) -> EngineIngestResult:
+        """为 durable identity 不匹配的 Host lifecycle signal 追加诊断。
+
+        :param transaction: 当前 Host transaction。
+        :param candidate: Host lifecycle closeout candidate。
+        :param reason: 拒绝原因。
+        :returns: rejected 或 duplicate lifecycle 诊断结果。
+        :raises HostDurableError: EventLog 读写失败时抛出。
+        """
+
+        payload: dict[str, JsonValue] = {
+            "attempt_id": candidate.envelope.attempt_id,
+            "execution_id": candidate.envelope.execution_id,
+            "dispatch_record_id": candidate.envelope.dispatch_record_id,
+            "worker_event_index": candidate.worker_event_index,
+            "lifecycle_source": candidate.lifecycle_source.value,
+            "lifecycle_reason": candidate.plan.terminal.reason,
+            "host_lifecycle_ref": _host_lifecycle_ref(candidate),
+            "reason": reason,
+        }
+        return self._append_host_lifecycle_diagnostic_candidate(
+            transaction,
+            candidate=candidate,
+            reason=reason,
+            payload=payload,
+        )
+
+    def _append_host_lifecycle_diagnostic(
+        self,
+        transaction: HostTransaction,
+        *,
+        context: _ValidatedHostLifecycleCloseoutCandidate,
+        reason: str,
+    ) -> EngineIngestResult:
+        """为已校验但不允许 closeout 的 Host lifecycle signal 追加诊断。
+
+        :param transaction: 当前 Host transaction。
+        :param context: 已校验的 Host lifecycle candidate 上下文。
+        :param reason: 拒绝原因。
+        :returns: rejected 或 duplicate lifecycle 诊断结果。
+        :raises HostDurableError: EventLog 读写失败时抛出。
+        """
+
+        candidate = context.candidate
+        payload: dict[str, JsonValue] = {
+            "attempt_id": context.attempt.attempt_id,
+            "execution_id": context.attempt.execution_id,
+            "dispatch_record_id": context.dispatch_record.dispatch_record_id,
+            "worker_event_index": candidate.worker_event_index,
+            "lifecycle_source": candidate.lifecycle_source.value,
+            "lifecycle_reason": candidate.plan.terminal.reason,
+            "host_lifecycle_ref": _host_lifecycle_ref(candidate),
+            "run_status": context.run.status.value,
+            "attempt_status": context.attempt.status.value,
+            "reason": reason,
+        }
+        return self._append_host_lifecycle_diagnostic_candidate(
+            transaction,
+            candidate=candidate,
+            reason=reason,
+            payload=payload,
+        )
+
+    def _append_host_lifecycle_diagnostic_candidate(
+        self,
+        transaction: HostTransaction,
+        *,
+        candidate: _HostLifecycleCloseoutCandidate,
+        reason: str,
+        payload: Mapping[str, JsonValue],
+    ) -> EngineIngestResult:
+        """按 Host lifecycle identity 幂等追加诊断事件。
+
+        :param transaction: 当前 Host transaction。
+        :param candidate: Host lifecycle closeout candidate。
+        :param reason: 诊断原因。
+        :param payload: Host lifecycle 诊断 payload。
+        :returns: rejected 或 duplicate lifecycle 诊断结果。
+        :raises HostDurableError: EventLog 读写失败时抛出。
+        """
+
+        event_id = _host_lifecycle_event_id(
+            candidate,
+            EventClass.DIAGNOSTIC,
+            _EVENT_TYPE_HOST_LIFECYCLE_DIAGNOSTIC,
+            0,
+        )
+        existing = _existing_rows(self._event_log_store, transaction, (event_id,))
+        if len(existing) == 1:
+            return EngineIngestResult(
+                status=EngineIngestStatus.DUPLICATE,
+                events=existing,
+                terminal_closeout=False,
+                promotion_triggered=False,
+                reason=reason,
+            )
+        row = self._event_log_store.append_event(
+            transaction,
+            _host_lifecycle_event_request(
+                candidate=candidate,
+                event_id=event_id,
+                event_class=EventClass.DIAGNOSTIC,
+                event_type=_EVENT_TYPE_HOST_LIFECYCLE_DIAGNOSTIC,
+                payload=payload,
+                reason={"reason": reason},
+            ),
+        ).row
+        return EngineIngestResult(
+            status=EngineIngestStatus.REJECTED,
+            events=(row,),
+            terminal_closeout=False,
+            promotion_triggered=False,
+            reason=reason,
+        )
+
     def _write_terminal_payload(
         self,
         transaction: HostTransaction,
@@ -3216,6 +3567,53 @@ class EngineEventIngestor:
                 metadata={
                     "kind": "engine_terminal_payload",
                     "engine_event_type": candidate.engine_event.type.value,
+                },
+                expected_digest=None,
+            ),
+        )
+
+    def _write_host_lifecycle_terminal_payload(
+        self,
+        transaction: HostTransaction,
+        *,
+        candidate: _HostLifecycleCloseoutCandidate,
+        event_id: str,
+    ) -> PayloadDescriptor:
+        """写入 Host lifecycle terminal payload descriptor。
+
+        :param transaction: 当前 Host transaction。
+        :param candidate: Host lifecycle closeout candidate。
+        :param event_id: Host lifecycle Attempt terminal event id。
+        :returns: payload descriptor。
+        :raises HostDurableError: durable payload 写入失败时抛出。
+        """
+
+        payload_json: dict[str, JsonValue] = dict(
+            candidate.plan.terminal.terminal_payload
+        )
+        payload_json.update(
+            {
+                "attempt_id": candidate.envelope.attempt_id,
+                "execution_id": candidate.envelope.execution_id,
+                "worker_event_index": candidate.worker_event_index,
+                "lifecycle_source": candidate.lifecycle_source.value,
+                "host_lifecycle_ref": _host_lifecycle_ref(candidate),
+            }
+        )
+        return self._payload_store.write_sqlite_payload(
+            transaction,
+            SQLitePayloadWriteRequest(
+                payload_ref=(
+                    f"{_HOST_LIFECYCLE_PAYLOAD_REF_PREFIX}-{event_id}"
+                ),
+                payload_id=f"{_HOST_LIFECYCLE_PAYLOAD_ID_PREFIX}-{event_id}",
+                payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+                payload_json=payload_json,
+                payload_bytes=None,
+                media_type="application/json",
+                metadata={
+                    "kind": "host_lifecycle_terminal_payload",
+                    "lifecycle_source": candidate.lifecycle_source.value,
                 },
                 expected_digest=None,
             ),
@@ -3280,6 +3678,31 @@ def _validate_candidate_shape(candidate: EngineEventCandidate) -> None:
         raise ValueError("EngineEvent.occurred_at must be timezone-aware")
 
 
+def _validate_host_lifecycle_candidate_shape(
+    candidate: _HostLifecycleCloseoutCandidate,
+) -> None:
+    """校验 Host lifecycle candidate 的必填事实。
+
+    :param candidate: 待校验的 Host lifecycle closeout candidate。
+    :returns: ``None``。
+    :raises ValueError: event index、时间或 identity 字段非法时抛出。
+    """
+
+    if candidate.worker_event_index <= 0:
+        raise ValueError("worker_event_index must be positive")
+    _validate_observed_at(candidate.observed_at)
+    envelope = candidate.envelope
+    required_identity = (
+        envelope.session_id,
+        envelope.run_id,
+        envelope.attempt_id,
+        envelope.execution_id,
+        envelope.dispatch_record_id,
+    )
+    if any(value.strip() == "" for value in required_identity):
+        raise ValueError("Host lifecycle envelope identity must be non-empty")
+
+
 def _engine_ingest_log_level(engine_event_type: EngineEventType) -> int:
     """根据 Engine event 类型选择 ingest 诊断日志级别。
 
@@ -3305,11 +3728,14 @@ def _validate_observed_at(observed_at: datetime) -> None:
         raise ValueError("observed_at must be timezone.utc aware")
 
 
-def _late_rejection_reason(context: _ValidatedCandidate) -> str | None:
-    """判断 candidate 是否为 terminal 后迟到事件。
+def _late_engine_event_rejection_reason(
+    context: _ValidatedCandidate,
+) -> str | None:
+    """判断 Engine-origin candidate 是否为迟到事件。
 
     :param context: 已校验上下文。
     :returns: 拒绝原因；可接受时为 ``None``。
+    :raises: 无主动抛出。
     """
 
     if (
@@ -3319,9 +3745,8 @@ def _late_rejection_reason(context: _ValidatedCandidate) -> str | None:
         and context.attempt.status is AttemptStatus.SUSPENDED
     ):
         return None
-    if (
-        context.run.terminal_event_id is not None
-        or context.attempt.terminal_event_id is not None
+    if is_terminal_run_status(context.run.status) or is_terminal_attempt_status(
+        context.attempt.status
     ):
         return _REASON_TERMINAL_ALREADY_CLOSED
     if (
@@ -3331,6 +3756,41 @@ def _late_rejection_reason(context: _ValidatedCandidate) -> str | None:
     ):
         return _REASON_LATE_TERMINAL_AFTER_ACTIVE_CANCEL
     return None
+
+
+def _late_host_lifecycle_rejection_reason(
+    context: _ValidatedHostLifecycleCloseoutCandidate,
+) -> str | None:
+    """判断 Host lifecycle candidate 是否已迟到或被 active cancel 抢先。
+
+    :param context: 已校验的 Host lifecycle candidate 上下文。
+    :returns: 拒绝原因；允许 closeout 时返回 ``None``。
+    :raises: 无主动抛出。
+    """
+
+    if is_terminal_run_status(context.run.status) or is_terminal_attempt_status(
+        context.attempt.status
+    ):
+        return _REASON_TERMINAL_ALREADY_CLOSED
+    if context.run.status is RunStatus.CANCELLING:
+        return _REASON_HOST_LIFECYCLE_AFTER_ACTIVE_CANCEL
+    return None
+
+
+def _terminal_closeout_precondition_failed_result() -> EngineIngestResult:
+    """构造 terminal transaction 回滚后的稳定 rejected 结果。
+
+    :returns: 不携带未提交事件、且不触发 promotion 的 rejected 结果。
+    :raises: 无主动抛出。
+    """
+
+    return EngineIngestResult(
+        status=EngineIngestStatus.REJECTED,
+        events=(),
+        terminal_closeout=True,
+        promotion_triggered=False,
+        reason=_REASON_TERMINAL_CLOSEOUT_PRECONDITION_FAILED,
+    )
 
 
 def _validate_waiting_confirmation(
@@ -3801,6 +4261,87 @@ def _event_id(
     return f"{_EVENT_ID_PREFIX}{digest}"
 
 
+def _host_lifecycle_event_id(
+    candidate: _HostLifecycleCloseoutCandidate,
+    event_class: EventClass,
+    event_type: str,
+    sub_index: int,
+) -> str:
+    """按 Host lifecycle identity material 派生稳定 event id。
+
+    :param candidate: Host lifecycle closeout candidate。
+    :param event_class: Host EventLog class。
+    :param event_type: Host lifecycle event type。
+    :param sub_index: 单个 lifecycle signal 映射多事件时的下标。
+    :returns: ``event-host-lifecycle-`` 命名空间下的稳定 event id。
+    :raises ValueError: identity material 含非法 JSON 数值时抛出。
+    :raises TypeError: identity material 含不可序列化值时抛出。
+    """
+
+    envelope = candidate.envelope
+    digest = sha256_digest_json(
+        {
+            "identity_kind": "host-lifecycle-terminal",
+            "session_id": envelope.session_id,
+            "run_id": envelope.run_id,
+            "attempt_id": envelope.attempt_id,
+            "execution_id": envelope.execution_id,
+            "worker_event_index": candidate.worker_event_index,
+            "event_class": event_class.value,
+            "event_type": event_type,
+            "sub_index": sub_index,
+            "lifecycle_source": candidate.lifecycle_source.value,
+            "reason": candidate.plan.terminal.reason,
+        }
+    ).removeprefix("sha256:")
+    return f"{_HOST_LIFECYCLE_EVENT_ID_PREFIX}{digest}"
+
+
+def _host_lifecycle_terminal_event_ids(
+    candidate: _HostLifecycleCloseoutCandidate,
+) -> tuple[str, str]:
+    """计算 Host lifecycle Attempt / Run terminal event ids。
+
+    :param candidate: Host lifecycle closeout candidate。
+    :returns: Attempt 与 Run terminal event id 二元组。
+    :raises ValueError: identity material 含非法 JSON 数值时抛出。
+    :raises TypeError: identity material 含不可序列化值时抛出。
+    """
+
+    return (
+        _host_lifecycle_event_id(
+            candidate,
+            EventClass.CANONICAL_FACT,
+            candidate.plan.terminal.attempt_event_type,
+            0,
+        ),
+        _host_lifecycle_event_id(
+            candidate,
+            EventClass.CANONICAL_FACT,
+            candidate.plan.terminal.run_event_type,
+            1,
+        ),
+    )
+
+
+def _host_lifecycle_ref(candidate: _HostLifecycleCloseoutCandidate) -> str:
+    """构造 Host lifecycle 治理来源标签。
+
+    该标签只表达 worker lifecycle 来源，不是 Engine event ref、业务事实或
+    EventLog identity。
+
+    :param candidate: Host lifecycle closeout candidate。
+    :returns: Host lifecycle 来源标签。
+    :raises: 无主动抛出。
+    """
+
+    return (
+        f"host-lifecycle:{candidate.envelope.execution_id}:"
+        f"{candidate.worker_event_index}:{candidate.lifecycle_source.value}:"
+        f"{candidate.plan.terminal.reason}"
+    )
+
+
 def _frozen_reactive_material_blocks(
     *,
     context: _ValidatedCandidate,
@@ -3944,6 +4485,48 @@ def _event_request(
         occurred_at=candidate.observed_at,
         actor=_EVENT_ACTOR,
         source=_EVENT_SOURCE,
+        client_request_id=None,
+        idempotency_key=None,
+        policy_decision=None,
+        reason=reason,
+        payload_json=payload,
+        payload_ref=None,
+        payload_digest=None,
+    )
+
+
+def _host_lifecycle_event_request(
+    *,
+    candidate: _HostLifecycleCloseoutCandidate,
+    event_id: str,
+    event_class: EventClass,
+    event_type: str,
+    payload: Mapping[str, JsonValue],
+    reason: JsonValue,
+) -> EventLogAppendRequest:
+    """构造 Host lifecycle EventLog append request。
+
+    :param candidate: Host lifecycle closeout candidate。
+    :param event_id: Host lifecycle event id。
+    :param event_class: Host EventLog class。
+    :param event_type: Host lifecycle event type。
+    :param payload: inline payload JSON。
+    :param reason: reason JSON。
+    :returns: EventLog append request。
+    :raises: 无主动抛出。
+    """
+
+    return EventLogAppendRequest(
+        event_id=event_id,
+        event_class=event_class,
+        session_id=candidate.envelope.session_id,
+        run_id=candidate.envelope.run_id,
+        attempt_id=candidate.envelope.attempt_id,
+        execution_id=candidate.envelope.execution_id,
+        event_type=event_type,
+        occurred_at=candidate.observed_at,
+        actor=_HOST_LIFECYCLE_EVENT_ACTOR,
+        source=_HOST_LIFECYCLE_EVENT_SOURCE,
         client_request_id=None,
         idempotency_key=None,
         policy_decision=None,
@@ -4186,21 +4769,6 @@ def _duplicate_terminal_event_ids(
     if event.type == EngineEventType.RUN_FAILED and isinstance(
         event.data, RunFailedData
     ):
-        if event.data.error_code == _REASON_WORKER_LOST_BEFORE_TERMINAL:
-            return (
-                _event_id(
-                    candidate,
-                    EventClass.CANONICAL_FACT,
-                    _closeout_attempt_event_type(AttemptStatus.LOST),
-                    0,
-                ),
-                _event_id(
-                    candidate,
-                    EventClass.CANONICAL_FACT,
-                    _run_terminal_event_type(RunStatus.LOST),
-                    1,
-                ),
-            )
         if event.data.recoverable:
             return (
                 _event_id(
@@ -4282,16 +4850,9 @@ def _engine_event_ref(candidate: EngineEventCandidate) -> str:
     :returns: EngineEvent 引用文本。
     """
 
-    event_type = candidate.engine_event.type.value
-    if (
-        candidate.engine_event.type == EngineEventType.RUN_FAILED
-        and isinstance(candidate.engine_event.data, RunFailedData)
-        and candidate.engine_event.data.error_code == _REASON_WORKER_LOST_BEFORE_TERMINAL
-    ):
-        event_type = _REASON_WORKER_LOST_BEFORE_TERMINAL
     return (
         f"engine:{candidate.envelope.execution_id}:"
-        f"{candidate.worker_event_index}:{event_type}"
+        f"{candidate.worker_event_index}:{candidate.engine_event.type.value}"
     )
 
 
@@ -4321,11 +4882,12 @@ def _host_event_type(event_type: EngineEventType) -> str:
     return event_type.value.upper()
 
 
-def _final_answer_plan(data: FinalAnswerData) -> _TerminalPlan:
+def _final_answer_plan(data: FinalAnswerData) -> _EngineTerminalPlan:
     """构造 final_answer terminal plan。
 
     :param data: final_answer data。
     :returns: terminal plan。
+    :raises: 无主动抛出。
     """
 
     if data.content.strip() == "":
@@ -4341,18 +4903,22 @@ def _final_answer_plan(data: FinalAnswerData) -> _TerminalPlan:
             recoverable=False,
             unsupported_later_owner=None,
         )
-    return _TerminalPlan(
-        attempt_event_type=_closeout_attempt_event_type(AttemptStatus.SUCCEEDED),
-        run_event_type=_run_terminal_event_type(RunStatus.SUCCEEDED),
-        attempt_status=AttemptStatus.SUCCEEDED,
-        run_status=RunStatus.SUCCEEDED,
-        reason=_REASON_FINAL_ANSWER,
-        terminal_payload={
-            "content": data.content,
-            "finish_reason": data.finish_reason.value,
-            "filtered": data.filtered,
-            "degraded": data.degraded,
-        },
+    return _EngineTerminalPlan(
+        terminal=_TerminalFactPlan(
+            attempt_event_type=_closeout_attempt_event_type(
+                AttemptStatus.SUCCEEDED
+            ),
+            run_event_type=_run_terminal_event_type(RunStatus.SUCCEEDED),
+            attempt_status=AttemptStatus.SUCCEEDED,
+            run_status=RunStatus.SUCCEEDED,
+            reason=_REASON_FINAL_ANSWER,
+            terminal_payload={
+                "content": data.content,
+                "finish_reason": data.finish_reason.value,
+                "filtered": data.filtered,
+                "degraded": data.degraded,
+            },
+        ),
         finish_reason=data.finish_reason.value,
         filtered=data.filtered,
         degraded=data.degraded,
@@ -4362,37 +4928,31 @@ def _final_answer_plan(data: FinalAnswerData) -> _TerminalPlan:
         client_correlation_id=None,
         recoverable=None,
         unsupported_later_owner=None,
-        worker_lifecycle_signal=None,
-        stream_error_code=None,
-        last_observed_worker_event_index=None,
-        last_accepted_event_id=None,
     )
 
 
-def _run_failed_plan(data: RunFailedData) -> _TerminalPlan:
+def _run_failed_plan(data: RunFailedData) -> _EngineTerminalPlan:
     """构造 run_failed terminal plan。
 
     :param data: run_failed data。
     :returns: terminal plan。
+    :raises: 无主动抛出。
     """
 
     unsupported_owner = _OWNER_PHASE10 if data.recoverable else None
     reason = (
         _REASON_UNSUPPORTED_RECOVERY_POLICY if data.recoverable else data.error_code
     )
-    return _TerminalPlan(
-        attempt_event_type=_closeout_attempt_event_type(AttemptStatus.FAILED),
-        run_event_type=_run_terminal_event_type(RunStatus.FAILED),
-        attempt_status=AttemptStatus.FAILED,
-        run_status=RunStatus.FAILED,
+    terminal = _failed_terminal_fact_plan(
         reason=reason,
-        terminal_payload={
-            "error_code": data.error_code,
-            "message": data.message,
-            "provider_request_id": data.provider_request_id,
-            "client_correlation_id": data.client_correlation_id,
-            "recoverable": data.recoverable,
-        },
+        error_code=data.error_code,
+        message=data.message,
+        provider_request_id=data.provider_request_id,
+        client_correlation_id=data.client_correlation_id,
+        recoverable=data.recoverable,
+    )
+    return _EngineTerminalPlan(
+        terminal=terminal,
         finish_reason=None,
         filtered=None,
         degraded=None,
@@ -4402,18 +4962,17 @@ def _run_failed_plan(data: RunFailedData) -> _TerminalPlan:
         client_correlation_id=data.client_correlation_id,
         recoverable=data.recoverable,
         unsupported_later_owner=unsupported_owner,
-        worker_lifecycle_signal=None,
-        stream_error_code=None,
-        last_observed_worker_event_index=None,
-        last_accepted_event_id=None,
     )
 
 
-def _unsupported_recovery_plan(provider_request_id: str | None) -> _TerminalPlan:
+def _unsupported_recovery_plan(
+    provider_request_id: str | None,
+) -> _EngineTerminalPlan:
     """构造 unsupported recovery terminal plan。
 
     :param provider_request_id: provider request id；无时为 ``None``。
     :returns: terminal plan。
+    :raises: 无主动抛出。
     """
 
     return _failed_plan(
@@ -4427,10 +4986,11 @@ def _unsupported_recovery_plan(provider_request_id: str | None) -> _TerminalPlan
     )
 
 
-def _unsupported_waiting_plan() -> _TerminalPlan:
+def _unsupported_waiting_plan() -> _EngineTerminalPlan:
     """构造 unsupported waiting terminal plan。
 
     :returns: terminal plan。
+    :raises: 无主动抛出。
     """
 
     return _failed_plan(
@@ -4446,24 +5006,33 @@ def _unsupported_waiting_plan() -> _TerminalPlan:
 
 def _failed_lifecycle_plan(
     *, reason: str, last_observed_worker_event_index: int
-) -> _TerminalPlan:
+) -> _HostLifecycleTerminalPlan:
     """构造 worker lifecycle failed closeout plan。
 
     :param reason: closeout reason。
     :param last_observed_worker_event_index: 最后观察到的 worker event index。
     :returns: terminal plan。
+    :raises: 无主动抛出。
     """
 
-    plan = _failed_plan(
+    terminal = _failed_terminal_fact_plan(
         reason=reason,
         error_code=reason,
         message=reason,
         provider_request_id=None,
         client_correlation_id=None,
         recoverable=False,
-        unsupported_later_owner=None,
     )
-    return _replace_lifecycle_index(plan, last_observed_worker_event_index)
+    return _HostLifecycleTerminalPlan(
+        terminal=terminal,
+        error_code=reason,
+        message=reason,
+        recoverable=False,
+        worker_lifecycle_signal=None,
+        stream_error_code=None,
+        last_observed_worker_event_index=last_observed_worker_event_index,
+        last_accepted_event_id=None,
+    )
 
 
 def _lost_lifecycle_plan(
@@ -4472,7 +5041,7 @@ def _lost_lifecycle_plan(
     stream_error_code: str | None,
     last_observed_worker_event_index: int,
     last_accepted_event_id: str | None,
-) -> _TerminalPlan:
+) -> _HostLifecycleTerminalPlan:
     """构造 worker lost closeout plan。
 
     :param worker_lifecycle_signal: worker lifecycle signal。
@@ -4480,28 +5049,25 @@ def _lost_lifecycle_plan(
     :param last_observed_worker_event_index: 最后观察到的 worker event index。
     :param last_accepted_event_id: 最后已接受 EventLog id；无时为 ``None``。
     :returns: terminal plan。
+    :raises: 无主动抛出。
     """
 
-    return _TerminalPlan(
-        attempt_event_type=_closeout_attempt_event_type(AttemptStatus.LOST),
-        run_event_type=_run_terminal_event_type(RunStatus.LOST),
-        attempt_status=AttemptStatus.LOST,
-        run_status=RunStatus.LOST,
-        reason=_REASON_WORKER_LOST_BEFORE_TERMINAL,
-        terminal_payload={
-            "reason": _REASON_WORKER_LOST_BEFORE_TERMINAL,
-            "worker_lifecycle_signal": worker_lifecycle_signal,
-            "stream_error_code": stream_error_code,
-        },
-        finish_reason=None,
-        filtered=None,
-        degraded=None,
+    return _HostLifecycleTerminalPlan(
+        terminal=_TerminalFactPlan(
+            attempt_event_type=_closeout_attempt_event_type(AttemptStatus.LOST),
+            run_event_type=_run_terminal_event_type(RunStatus.LOST),
+            attempt_status=AttemptStatus.LOST,
+            run_status=RunStatus.LOST,
+            reason=_REASON_WORKER_LOST_BEFORE_TERMINAL,
+            terminal_payload={
+                "reason": _REASON_WORKER_LOST_BEFORE_TERMINAL,
+                "worker_lifecycle_signal": worker_lifecycle_signal,
+                "stream_error_code": stream_error_code,
+            },
+        ),
         error_code=None,
         message=None,
-        provider_request_id=None,
-        client_correlation_id=None,
         recoverable=None,
-        unsupported_later_owner=None,
         worker_lifecycle_signal=worker_lifecycle_signal,
         stream_error_code=stream_error_code,
         last_observed_worker_event_index=last_observed_worker_event_index,
@@ -4518,7 +5084,7 @@ def _failed_plan(
     client_correlation_id: str | None,
     recoverable: bool,
     unsupported_later_owner: str | None,
-) -> _TerminalPlan:
+) -> _EngineTerminalPlan:
     """构造 failed terminal plan。
 
     :param reason: terminal reason。
@@ -4529,9 +5095,52 @@ def _failed_plan(
     :param recoverable: 是否可恢复。
     :param unsupported_later_owner: unsupported later owner。
     :returns: terminal plan。
+    :raises: 无主动抛出。
     """
 
-    return _TerminalPlan(
+    return _EngineTerminalPlan(
+        terminal=_failed_terminal_fact_plan(
+            reason=reason,
+            error_code=error_code,
+            message=message,
+            provider_request_id=provider_request_id,
+            client_correlation_id=client_correlation_id,
+            recoverable=recoverable,
+        ),
+        finish_reason=None,
+        filtered=None,
+        degraded=None,
+        error_code=error_code,
+        message=message,
+        provider_request_id=provider_request_id,
+        client_correlation_id=client_correlation_id,
+        recoverable=recoverable,
+        unsupported_later_owner=unsupported_later_owner,
+    )
+
+
+def _failed_terminal_fact_plan(
+    *,
+    reason: str,
+    error_code: str,
+    message: str,
+    provider_request_id: str | None,
+    client_correlation_id: str | None,
+    recoverable: bool,
+) -> _TerminalFactPlan:
+    """构造 Engine failure 与 clean EOF 共用的 FAILED canonical facts。
+
+    :param reason: terminal reason。
+    :param error_code: error code。
+    :param message: error message。
+    :param provider_request_id: provider request id；无时为 ``None``。
+    :param client_correlation_id: 客户端关联 id；无时为 ``None``。
+    :param recoverable: failure 是否可恢复。
+    :returns: 由 lifecycle owner helper 派生 event type 的 terminal fact plan。
+    :raises: 无主动抛出。
+    """
+
+    return _TerminalFactPlan(
         attempt_event_type=_closeout_attempt_event_type(AttemptStatus.FAILED),
         run_event_type=_run_terminal_event_type(RunStatus.FAILED),
         attempt_status=AttemptStatus.FAILED,
@@ -4544,52 +5153,6 @@ def _failed_plan(
             "client_correlation_id": client_correlation_id,
             "recoverable": recoverable,
         },
-        finish_reason=None,
-        filtered=None,
-        degraded=None,
-        error_code=error_code,
-        message=message,
-        provider_request_id=provider_request_id,
-        client_correlation_id=client_correlation_id,
-        recoverable=recoverable,
-        unsupported_later_owner=unsupported_later_owner,
-        worker_lifecycle_signal=None,
-        stream_error_code=None,
-        last_observed_worker_event_index=None,
-        last_accepted_event_id=None,
-    )
-
-
-def _replace_lifecycle_index(
-    plan: _TerminalPlan, last_observed_worker_event_index: int
-) -> _TerminalPlan:
-    """复制 failed plan 并写入 lifecycle index。
-
-    :param plan: 原 failed plan。
-    :param last_observed_worker_event_index: 最后观察到的 worker event index。
-    :returns: 新 terminal plan。
-    """
-
-    return _TerminalPlan(
-        attempt_event_type=plan.attempt_event_type,
-        run_event_type=plan.run_event_type,
-        attempt_status=plan.attempt_status,
-        run_status=plan.run_status,
-        reason=plan.reason,
-        terminal_payload=plan.terminal_payload,
-        finish_reason=plan.finish_reason,
-        filtered=plan.filtered,
-        degraded=plan.degraded,
-        error_code=plan.error_code,
-        message=plan.message,
-        provider_request_id=plan.provider_request_id,
-        client_correlation_id=plan.client_correlation_id,
-        recoverable=plan.recoverable,
-        unsupported_later_owner=plan.unsupported_later_owner,
-        worker_lifecycle_signal=None,
-        stream_error_code=None,
-        last_observed_worker_event_index=last_observed_worker_event_index,
-        last_accepted_event_id=None,
     )
 
 
