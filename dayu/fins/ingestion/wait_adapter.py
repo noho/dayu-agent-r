@@ -48,6 +48,7 @@ from dayu.host.api import (
     ResolveWaitLostOutcome,
     WaitAdapterKey,
 )
+from dayu.host.durable.codec import parse_utc_timestamp
 from dayu.host.durable.state import WaitRecordRow, WaitResumePolicy
 from dayu.host.wait_adapter import (
     WaitActivationAdapterRegistration,
@@ -102,7 +103,6 @@ _ABANDON_REASON_OBSERVATION_ERROR_PREFIX: Final[str] = "observation_error"
 _ABANDON_APPLIED_MESSAGE: Final[str] = (
     "Fins observation cancellation was requested and local observation tracking was released."
 )
-_TRANSIENT_PENDING_MAX_SECONDS: Final[float] = 300.0
 _ASYNC_RESULT_T = TypeVar("_ASYNC_RESULT_T")
 
 
@@ -397,7 +397,7 @@ def _poll_error_result(
     """
 
     if exc.error_kind is FinsObservationPollErrorKind.TRANSIENT_UNAVAILABLE:
-        if _transient_pending_expired(wait_record):
+        if _wait_boundary_lost(wait_record):
             return WaitPollLost(_lost_outcome())
         return WaitPollNotReady()
     return WaitPollLost(_lost_outcome())
@@ -606,17 +606,27 @@ def _timestamp_or_now(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def _transient_pending_expired(wait_record: WaitRecordRow) -> bool:
-    """判断 transient unavailable 是否已超过本 adapter 的有界等待窗口。
+def _wait_boundary_lost(wait_record: WaitRecordRow) -> bool:
+    """按 Host wait record 边界判断 transient unavailable 是否已 lost。
 
     :param wait_record: Host wait record 快照。
-    :returns: 超过窗口返回 ``True``。
+    :returns: Host deadline/expires 已过期或边界文本非法时返回 ``True``；
+        没有 Host 边界或边界仍在未来时返回 ``False``。
     :raises Exception: 不主动抛出异常。
     """
 
-    created_at = _timestamp_or_now(wait_record.created_at)
-    age_seconds = (datetime.now(timezone.utc) - created_at).total_seconds()
-    return age_seconds >= _TRANSIENT_PENDING_MAX_SECONDS
+    boundary_text = (
+        wait_record.deadline_at
+        if wait_record.deadline_at is not None
+        else wait_record.expires_at
+    )
+    if boundary_text is None:
+        return False
+    try:
+        boundary = parse_utc_timestamp(boundary_text)
+    except ValueError:
+        return True
+    return datetime.now(timezone.utc) > boundary
 
 
 def _run_async_observation(

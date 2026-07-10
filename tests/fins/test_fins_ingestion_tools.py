@@ -7,7 +7,7 @@ import asyncio
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Final, TypeGuard
 
@@ -82,6 +82,7 @@ from dayu.host.durable.state import (
     WaitRecordStatus,
     WaitResumePolicy,
 )
+from dayu.host.durable.codec import format_utc_timestamp
 from dayu.host.wait_adapter import (
     WaitExternalJobLifecycleAction,
     WaitExternalJobLifecycleApplied,
@@ -1629,8 +1630,8 @@ def test_fins_wait_poll_adapter_corrupt_and_missing_handles_are_lost() -> None:
     assert isinstance(missing_poll.outcome, ResolveWaitLostOutcome)
 
 
-def test_fins_wait_poll_adapter_transient_unavailable_is_bounded_not_ready() -> None:
-    """transient unavailable 初期保持 not-ready，超过窗口后收口 LOST。"""
+def test_fins_wait_poll_adapter_transient_unavailable_uses_host_wait_boundaries() -> None:
+    """transient unavailable 只消费 Host wait deadline/expires 边界。"""
 
     handle = _observation_handle_with_id("abababababababab")
     runtime = _FakeObservationRuntime(
@@ -1643,15 +1644,42 @@ def test_fins_wait_poll_adapter_transient_unavailable_is_bounded_not_ready() -> 
         },
     )
     adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
+    future_deadline = _boundary_from_now(seconds=60)
+    past_deadline = _boundary_from_now(seconds=-60)
+    future_expires = _boundary_from_now(seconds=120)
+    past_expires = _boundary_from_now(seconds=-120)
 
-    not_ready = adapter.poll_wait(
+    future_deadline_poll = adapter.poll_wait(
         _wait_record(
             handle.handle_id,
             DOWNLOAD_TOOL_NAME,
-            created_at=datetime.now(timezone.utc).isoformat(),
+            deadline_at=future_deadline,
+            expires_at=past_expires,
         )
     )
-    expired = adapter.poll_wait(
+    past_deadline_poll = adapter.poll_wait(
+        _wait_record(
+            handle.handle_id,
+            DOWNLOAD_TOOL_NAME,
+            deadline_at=past_deadline,
+            expires_at=future_expires,
+        )
+    )
+    past_expires_poll = adapter.poll_wait(
+        _wait_record(handle.handle_id, DOWNLOAD_TOOL_NAME, expires_at=past_expires)
+    )
+    invalid_deadline_poll = adapter.poll_wait(
+        _wait_record(
+            handle.handle_id,
+            DOWNLOAD_TOOL_NAME,
+            deadline_at="invalid-deadline",
+            expires_at=future_expires,
+        )
+    )
+    invalid_expires_poll = adapter.poll_wait(
+        _wait_record(handle.handle_id, DOWNLOAD_TOOL_NAME, expires_at="invalid-expires")
+    )
+    no_boundary_old_created_poll = adapter.poll_wait(
         _wait_record(
             handle.handle_id,
             DOWNLOAD_TOOL_NAME,
@@ -1659,8 +1687,12 @@ def test_fins_wait_poll_adapter_transient_unavailable_is_bounded_not_ready() -> 
         )
     )
 
-    assert isinstance(not_ready, WaitPollNotReady)
-    assert isinstance(expired, WaitPollLost)
+    assert isinstance(future_deadline_poll, WaitPollNotReady)
+    assert isinstance(past_deadline_poll, WaitPollLost)
+    assert isinstance(past_expires_poll, WaitPollLost)
+    assert isinstance(invalid_deadline_poll, WaitPollLost)
+    assert isinstance(invalid_expires_poll, WaitPollLost)
+    assert isinstance(no_boundary_old_created_poll, WaitPollNotReady)
 
 
 def test_fins_wait_poll_adapter_abandon_cancels_and_cleans_observation() -> None:
@@ -1817,6 +1849,8 @@ def _wait_record(
     *,
     include_external_job_ref: bool = True,
     created_at: str = _WAIT_RECORD_TIME,
+    deadline_at: str | None = None,
+    expires_at: str | None = None,
 ) -> WaitRecordRow:
     """构造测试用 Host wait record。
 
@@ -1825,6 +1859,8 @@ def _wait_record(
         tool_name: 原始 awaiting 工具名。
         include_external_job_ref: 是否带 external job ref。
         created_at: wait record 创建时间。
+        deadline_at: 可选 Host deadline 边界。
+        expires_at: 可选 Host expires 边界。
 
     Returns:
         Host wait record row。
@@ -1858,8 +1894,8 @@ def _wait_record(
         accept_idempotency_key=f"accept-{resume_token}",
         resolve_idempotency_key=None,
         resolve_semantic_digest=None,
-        deadline_at=None,
-        expires_at=None,
+        deadline_at=deadline_at,
+        expires_at=expires_at,
         status=WaitRecordStatus.WAITING,
         created_event_id=f"event-created-{resume_token}",
         created_event_sequence=1,
@@ -1869,6 +1905,22 @@ def _wait_record(
         updated_at=_WAIT_RECORD_TIME,
         terminal_at=None,
     )
+
+
+def _boundary_from_now(*, seconds: int) -> str:
+    """构造 Host durable UTC wait 边界文本。
+
+    Args:
+        seconds: 相对当前 UTC 时间偏移秒数。
+
+    Returns:
+        Host durable timestamp 文本。
+
+    Raises:
+        ValueError: 时间格式化失败时由 Host codec 抛出。
+    """
+
+    return format_utc_timestamp(datetime.now(timezone.utc) + timedelta(seconds=seconds))
 
 
 def _activation_request(tool_name: str, resume_token: str) -> WaitActivationRequest:

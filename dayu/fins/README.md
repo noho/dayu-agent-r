@@ -494,7 +494,7 @@ Legacy job helpers 仍保留 `start_*`、`read_job(...)`、`read_job_events(...)
 - `failed` -> failed outcome。
 - `cancelled` -> cancelled outcome。
 - `lost`、corrupt resume token 或当前进程找不到 handle -> lost outcome。
-- `TRANSIENT_UNAVAILABLE` 在有界窗口内保持 not ready，超过窗口后 lost，避免无限 pending。
+- `TRANSIENT_UNAVAILABLE` 消费 Host wait record 的 `deadline_at` / `expires_at` 边界；边界过期或非法时 lost，没有 Host 边界时保持 not ready。Fins wait adapter 不从 `created_at` 年龄自行制造终态 timeout。
 
 Host 取消 wait 时，adapter 通过 `cancel_observation(handle)` / `abandon_observation(handle)` 做 best-effort 取消和本地 observation record 清理，不删除 Fins source docs、processed docs、legacy job record 或 Host wait record。
 
@@ -730,7 +730,7 @@ CN/HK Docling convert 当前通过 `asyncio.to_thread(...)` 调用同步第三�
 
 ### Wait adapter 与 Host resume
 
-Fins awaiting tools 不直接恢复 Host Run。Service assembly 根据启用的 Fins awaiting provider 显式构造 wait adapter registry、wait activation registry 与 wait poll adapter registry，并确保 awaiting tool callable、activation adapter 与 poll adapter 使用同一个 workspace-scoped ingestion runtime。Host poller 通过 `FinsIngestionWaitPollAdapter` 读取 process-local observation snapshot，再由 Host 自己执行 resolve / resume / failed / lost 治理。Fins wait adapter 不改变 Host wait record，不写 Host EventLog，也不恢复旧 Engine 生成器。
+Fins awaiting tools 不直接恢复 Host Run。Service assembly 根据启用的 Fins awaiting provider 显式构造 wait adapter registry、wait activation registry 与 wait poll adapter registry，并确保 awaiting tool callable、activation adapter 与 poll adapter 使用同一个 workspace-scoped ingestion runtime。Host poller 通过 `FinsIngestionWaitPollAdapter` 读取 process-local observation snapshot，再由 Host 自己执行 resolve / resume / failed / lost 治理。Fins wait adapter 不改变 Host wait record，不写 Host EventLog，也不恢复旧 Engine 生成器；等待 deadline / expiry 的 durable truth 属于 Host wait record，adapter 只按 Host 边界消费。
 
 ### Ticker normalization
 
