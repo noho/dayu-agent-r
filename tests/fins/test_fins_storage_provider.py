@@ -532,6 +532,7 @@ class _XbrlFactsProcessor(_SearchCancellingProcessor):
         return {
             "query_params": {"concepts": concept_values},
             "facts": facts,
+            "total": len(facts),
         }
 
 

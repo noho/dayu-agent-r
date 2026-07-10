@@ -25,6 +25,7 @@ from dayu.documents.processors.base import (
     SectionSummary,
     TableContent,
 )
+from dayu.fins.domain.xbrl_result_contract import validate_xbrl_facts_result_payload
 from .result_types import NotSupportedResult
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.domain.filing_semantics import normalize_sec_form_type_for_matching
@@ -1373,7 +1374,7 @@ def _resolve_default_xbrl_concepts(*, form_type: Optional[str], taxonomy: Option
 
 def _normalize_xbrl_query_payload(
     *,
-    payload: Mapping[str, Any] | dict[str, Any],
+    payload: Mapping[str, JsonValue],
     default_concepts: list[str],
 ) -> dict[str, Any]:
     """标准化 `query_xbrl_facts` 的输出载荷。
@@ -1389,16 +1390,12 @@ def _normalize_xbrl_query_payload(
         RuntimeError: 标准化失败时抛出。
     """
 
-    query_params_raw = payload.get("query_params")
-    query_params = dict(query_params_raw) if isinstance(query_params_raw, Mapping) else {}
+    validated = validate_xbrl_facts_result_payload(payload)
+    query_params: dict[str, Any] = dict(validated.query_params)
     query_params["concepts"] = _normalize_concepts_for_query(query_params.get("concepts"), default_concepts)
 
-    facts_raw = payload.get("facts")
-    if not isinstance(facts_raw, list):
-        facts_raw = []
-
     normalized_pairs: list[tuple[dict[str, Any], dict[str, Any], int]] = []
-    for index, raw_fact in enumerate(facts_raw):
+    for index, raw_fact in enumerate(validated.facts):
         if not isinstance(raw_fact, Mapping):
             continue
         normalized_fact = _normalize_single_fact(raw_fact)
@@ -1407,10 +1404,14 @@ def _normalize_xbrl_query_payload(
         normalized_pairs.append((normalized_fact, dict(raw_fact), index))
 
     deduped_facts = _deduplicate_xbrl_facts(normalized_pairs)
-    normalized_payload = dict(payload)
+    normalized_payload: dict[str, Any] = dict(payload)
     normalized_payload["query_params"] = query_params
     normalized_payload["facts"] = deduped_facts
-    normalized_payload["total"] = len(deduped_facts)
+    normalized_payload["total"] = validated.total
+    if len(deduped_facts) != validated.total:
+        normalized_payload["deduped_fact_count"] = len(deduped_facts)
+    else:
+        normalized_payload.pop("deduped_fact_count", None)
     return normalized_payload
 
 

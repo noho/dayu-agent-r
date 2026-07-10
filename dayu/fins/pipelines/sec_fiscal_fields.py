@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from dayu.contracts.json_value import JsonValue
-
 import re
 from pathlib import Path
 from typing import Optional, Protocol, TypeAlias, TypeGuard, runtime_checkable
 
+from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.document_models import SourceHandle, now_iso8601
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.domain.filing_semantics import (
@@ -16,6 +15,7 @@ from dayu.fins.domain.filing_semantics import (
     normalize_sec_form_type_for_matching,
     sanitize_fiscal_period_by_sec_form,
 )
+from dayu.fins.domain.xbrl_result_contract import validate_xbrl_facts_result_payload
 from dayu.fins.storage import SourceDocumentRepositoryProtocol
 
 from .sec_6k_rules import _infer_filename_from_uri
@@ -491,9 +491,11 @@ def _extract_fiscal_from_xbrl_query(processor: _FiscalProcessor | None) -> tuple
         return None, None
     if not isinstance(query_result, dict):
         return None, None
-    facts = query_result.get("facts")
-    if not isinstance(facts, list):
+    try:
+        validated_query_result = validate_xbrl_facts_result_payload(query_result)
+    except ValueError:
         return None, None
+    facts = validated_query_result.facts
 
     first_year_only: Optional[int] = None
     for fact in facts:

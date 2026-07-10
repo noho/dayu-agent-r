@@ -299,3 +299,4 @@ class XbrlQueryResult(_XbrlQueryBase, total=False):
 
     # processor 可能附带的额外字段
     supported: bool
+    deduped_fact_count: int

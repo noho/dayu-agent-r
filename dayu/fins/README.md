@@ -100,6 +100,8 @@ source document acknowledgement 由 source repository 持有：完成态 source 
 
 `FilingMaintenanceRepositoryProtocol` 持有 SEC 下载拒绝注册表。注册表条目使用 `DownloadRejectionEntry` typed contract，包含 document id、拒绝原因、分类、SEC form、filing date 和下载版本；文件系统仓储读取非法 registry 时失败关闭，保存时只通过 typed entry 序列化，SEC 下载、SC13 过滤和下载诊断只消费该 typed registry。
 
+XBRL facts processor result contract 由 `dayu.fins.domain.xbrl_result_contract` 持有：`query_xbrl_facts` 的 raw payload 必须包含 `query_params`、raw `facts`、整数 `total`，且 `total` 必须等于 raw facts 数量。read runtime 与 fiscal inference 在任何去重、清洗或投影前先校验该契约；read runtime 不覆盖 processor-owned `total`，去重后的展示数量使用独立派生字段 `deduped_fact_count`。
+
 上传链路的 company meta freshness 由 `dayu.fins.pipelines.upload_company_meta` 持有：只有既有 meta 的 `resolver_version` 等于当前 upload resolver 版本时才可保留；版本不一致时必须用本次上传字段重新校验并写入。`updated_at` 仅是审计时间，不是 freshness TTL。SEC/CN/HK 下载链路仍由各自 producer 写入公司元数据，不经上传 freshness 逻辑；read runtime 只读取仓储中的 company meta，不刷新或推断 freshness。
 
 ### Resolver

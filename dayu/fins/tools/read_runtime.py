@@ -15,6 +15,7 @@ from threading import Lock, RLock
 from typing import Any, Final, Literal, Optional, cast
 
 from dayu.contracts.cancellation import CancellationToken
+from dayu.contracts.json_value import JsonValue
 from dayu.fins._log import Log
 from dayu.fins.domain.document_models import FinsSourceProvider
 from dayu.documents.processors.base import (
@@ -1332,7 +1333,7 @@ class FinsReadRuntime:
 
         _raise_if_fins_cancelled(cancellation_token)
         payload = cast(
-            dict[str, Any],
+            dict[str, JsonValue],
             query_method(
                 concepts=resolved_concepts,
                 statement_type=normalize_optional_text(statement_type),
