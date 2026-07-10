@@ -28,6 +28,11 @@ from dayu.fins.direct_events import (
     FinsResultStatus,
     FinsResultSummary,
 )
+from dayu.fins.direct_event_text import (
+    wait_cancelled_hint,
+    wait_cancelled_message,
+    wait_failed_hint,
+)
 from dayu.fins.ingestion.observation_handle import (
     FinsObservationHandle,
     FinsObservationPollError,
@@ -480,8 +485,8 @@ def _failed_outcome(
         result=ToolResultFailure(
             ok=False,
             error=_ERROR_FINS_OBSERVATION_FAILED,
-            message=_failure_message(snapshot, result),
-            hint="请检查 Fins ingestion 摘要，必要时重新发起对应操作。",
+            message=_failure_message(result),
+            hint=wait_failed_hint(),
             meta=_result_meta(tool_name, snapshot),
         ),
         payload_ref=None,
@@ -502,8 +507,8 @@ def _cancelled_outcome(
     return ResolveWaitCancelledOutcome(
         result=ToolCancelledOutcome(
             reason=TOOL_CANCELLED_REASON_HOST_CANCELLED,
-            message="Fins operation was cancelled before completion.",
-            hint="如仍需要该财报资料，请重新发起对应操作。",
+            message=wait_cancelled_message(),
+            hint=wait_cancelled_hint(),
             meta=_result_meta(tool_name, snapshot),
         ),
         payload_ref=None,
@@ -548,25 +553,17 @@ def _details_value(details: tuple[FinsEventDetail, ...]) -> list[JsonValue]:
     return [{"label": detail.label, "value": detail.value} for detail in details]
 
 
-def _failure_message(
-    snapshot: FinsObservationSnapshot,
-    result: FinsResultSummary,
-) -> str:
+def _failure_message(result: FinsResultSummary) -> str:
     """提取模型可读失败说明。
 
-    :param snapshot: failed observation snapshot。
     :param result: terminal result summary。
     :returns: 非空失败说明。
-    :raises Exception: 不主动抛出异常。
+    :raises ValueError: failed result 缺少业务可读失败说明时抛出。
     """
 
     if result.error_message is not None and result.error_message.strip() != "":
         return result.error_message.strip()
-    if snapshot.message.strip() != "":
-        return snapshot.message.strip()
-    if result.status is FinsResultStatus.FAILURE:
-        return "Fins operation failed."
-    return "Fins operation did not complete successfully."
+    raise ValueError("failed Fins observation result must contain error_message")
 
 
 def _result_meta(tool_name: str, snapshot: FinsObservationSnapshot) -> ToolResultMeta:

@@ -33,6 +33,18 @@ from dayu.fins.direct_events import (
     FinsOperationKind,
     FinsResultStatus,
 )
+from dayu.fins.direct_event_text import (
+    direct_download_no_source_documents_message,
+    direct_failure_message,
+    direct_preprocess_no_requested_documents_message,
+    direct_progress_message,
+    direct_result_title,
+    direct_upload_failed_status_message,
+    direct_upload_runtime_unavailable_message,
+    wait_cancelled_hint,
+    wait_cancelled_message,
+    wait_failed_hint,
+)
 from dayu.fins.ingestion_events import (
     FinsIngestionJobEventAppend,
     FinsIngestionJobEventRecord,
@@ -95,6 +107,75 @@ from dayu.fins.storage import (
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 from dayu.fins.ticker_normalization import NormalizedTicker
 from dayu.fins.tools.read_runtime import FinsReadRuntime
+
+
+def test_direct_event_text_helper_owns_result_titles_and_failure_messages() -> None:
+    """direct 文案 helper 应统一选择 result 标题与失败说明。"""
+
+    assert (
+        direct_result_title(
+            operation_kind=FinsOperationKind.DOWNLOAD,
+            status=FinsResultStatus.SUCCESS,
+        )
+        == "操作完成"
+    )
+    assert (
+        direct_result_title(
+            operation_kind=FinsOperationKind.DOWNLOAD,
+            status=FinsResultStatus.FAILURE,
+        )
+        == "下载失败"
+    )
+    assert (
+        direct_result_title(
+            operation_kind=FinsOperationKind.PROCESS_MATERIAL,
+            status=FinsResultStatus.FAILURE,
+        )
+        == "预处理失败"
+    )
+    assert (
+        direct_result_title(
+            operation_kind=FinsOperationKind.UPLOAD_FILING,
+            status=FinsResultStatus.CANCELLED,
+        )
+        == "操作已取消"
+    )
+    assert (
+        direct_failure_message(
+            error_kind=FinsErrorKind.STORAGE,
+            fallback_message=None,
+        )
+        == "财报资料读写失败"
+    )
+    assert (
+        direct_failure_message(
+            error_kind=FinsErrorKind.PROVIDER,
+            fallback_message="  provider failed safely  ",
+        )
+        == "provider failed safely"
+    )
+    assert direct_download_no_source_documents_message() == "下载请求未写入任何源文档"
+    assert direct_preprocess_no_requested_documents_message() == "没有任何请求文档完成预处理"
+    assert direct_upload_failed_status_message() == "上传运行时返回失败状态"
+    assert direct_upload_runtime_unavailable_message() == "当前环境未装配财报上传能力"
+
+
+def test_direct_event_text_helper_owns_progress_and_wait_copy() -> None:
+    """direct/wait 文案 helper 应输出业务可读文案且不暴露内部等待术语。"""
+
+    assert direct_progress_message(stage="download.preparing") == "下载准备中"
+    assert direct_progress_message(stage="download.completed_with_failures") == "下载已完成，存在失败候选"
+    assert direct_progress_message(stage="preprocess.document_not_supported") == "预处理源文档不支持"
+    assert direct_progress_message(stage="upload.completed_with_failures") == "上传已完成，存在失败"
+    assert direct_progress_message(stage="unknown.stage") == "财报处理进度已更新"
+    assert wait_failed_hint() == "请检查财报处理摘要，必要时重新发起对应操作。"
+    assert wait_cancelled_message() == "财报处理已取消。"
+    assert wait_cancelled_hint() == "如仍需要该财报资料，请重新发起对应操作。"
+    visible_wait_text = " ".join(
+        (wait_failed_hint(), wait_cancelled_message(), wait_cancelled_hint())
+    )
+    for forbidden in ("Host", "Engine", "wait", "poll", "runtime", "Fins ingestion"):
+        assert forbidden not in visible_wait_text
 
 
 class _HoldingExecutor(FinsIngestionExecutor):
@@ -1409,7 +1490,6 @@ async def test_direct_stream_duplicate_result_raises_protocol_error(tmp_path: Pa
         ingestion._emit_direct_result(
             context,
             status=FinsResultStatus.SUCCESS,
-            title="第一次完成",
             details=(),
             error_kind=None,
             error_message=None,
@@ -1417,7 +1497,6 @@ async def test_direct_stream_duplicate_result_raises_protocol_error(tmp_path: Pa
         ingestion._emit_direct_result(
             context,
             status=FinsResultStatus.SUCCESS,
-            title="第二次完成",
             details=(),
             error_kind=None,
             error_message=None,
@@ -1471,7 +1550,6 @@ async def test_direct_stream_drains_to_done_before_yielding_result(tmp_path: Pat
         ingestion._emit_direct_result(
             context,
             status=FinsResultStatus.SUCCESS,
-            title="完成",
             details=(),
             error_kind=None,
             error_message=None,
@@ -2384,7 +2462,13 @@ def test_cancel_prepared_observation_prevents_later_activation_submit(
     assert cancelled.result is not None
     assert cancelled.result.status is FinsResultStatus.CANCELLED
     assert cancelled.result.error_kind is FinsErrorKind.CANCELLED
-    assert cancelled.result.error_message == "Observation was cancelled before activation."
+    assert cancelled.result.error_message == direct_failure_message(
+        error_kind=FinsErrorKind.CANCELLED,
+        fallback_message=None,
+    )
+    cancelled_error_message = cancelled.result.error_message
+    assert cancelled_error_message is not None
+    assert "Observation" not in cancelled_error_message
     assert polled.status is FinsObservationStatus.CANCELLED
     assert executor.operations == []
 
@@ -2600,7 +2684,63 @@ def test_unexpected_activation_exception_terminalizes_prepared_observation(
 
     assert snapshot.status is FinsObservationStatus.FAILED
     assert snapshot.result is not None
-    assert snapshot.result.error_message == "Observation activation failed."
+    assert snapshot.result.error_message == direct_failure_message(
+        error_kind=FinsErrorKind.EXECUTION,
+        fallback_message=None,
+    )
+    activation_error_message = snapshot.result.error_message
+    assert activation_error_message is not None
+    assert "Observation" not in activation_error_message
+
+
+def test_observed_producer_without_result_uses_helper_failure_message(
+    tmp_path: Path,
+) -> None:
+    """observed producer 静默结束时终态错误说明不得泄漏 observation 诊断文本。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    runtime = _build_ingestion_runtime(workspace_root, executor=executor)
+    normalized = ticker_normalization.normalize_ticker("AAPL")
+
+    def quiet_producer(context: ingestion_runtime._FinsIngestionExecutionContext) -> None:
+        """模拟未投递 RESULT 的 observed producer。
+
+        Args:
+            context: direct stream 执行上下文。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        del context
+
+    handle = runtime._prepare_observed_stream(
+        direct_operation_kind=FinsOperationKind.DOWNLOAD,
+        operation_kind=FinsIngestionOperationKind.DOWNLOAD,
+        normalized=normalized,
+        source="fake",
+        source_kind=SourceKind.FILING,
+        cancellation_token=_NeverCancelledToken(),
+        producer=quiet_producer,
+    )
+
+    runtime.activate_observation(handle)
+    executor.run_all()
+    snapshot = asyncio.run(runtime.poll_observation(handle))
+
+    assert snapshot.status is FinsObservationStatus.FAILED
+    assert snapshot.result is not None
+    assert snapshot.result.error_message == direct_failure_message(
+        error_kind=FinsErrorKind.EXECUTION,
+        fallback_message=None,
+    )
+    missing_result_error_message = snapshot.result.error_message
+    assert missing_result_error_message is not None
+    assert "Observation" not in missing_result_error_message
 
 
 def test_job_serialization_validates_upload_operation_shape(tmp_path: Path) -> None:

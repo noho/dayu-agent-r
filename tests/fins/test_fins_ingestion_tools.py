@@ -63,6 +63,11 @@ from dayu.fins.direct_events import (
     FinsResultStatus,
     FinsResultSummary,
 )
+from dayu.fins.direct_event_text import (
+    wait_cancelled_hint,
+    wait_cancelled_message,
+    wait_failed_hint,
+)
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.tools import download_provider, preprocess_provider, provider as read_provider
@@ -1603,8 +1608,11 @@ def test_fins_wait_poll_adapter_maps_observation_statuses() -> None:
     assert isinstance(succeeded_poll.outcome, ResolveWaitCompletedOutcome)
     assert isinstance(failed_poll, WaitPollReady)
     assert isinstance(failed_poll.outcome, ResolveWaitFailedOutcome)
+    assert failed_poll.outcome.result.hint == wait_failed_hint()
     assert isinstance(cancelled_poll, WaitPollReady)
     assert isinstance(cancelled_poll.outcome, ResolveWaitCancelledOutcome)
+    assert cancelled_poll.outcome.result.message == wait_cancelled_message()
+    assert cancelled_poll.outcome.result.hint == wait_cancelled_hint()
     assert isinstance(pending_poll, WaitPollNotReady)
     assert isinstance(running_poll, WaitPollNotReady)
     assert isinstance(lost_poll, WaitPollLost)
@@ -1613,6 +1621,35 @@ def test_fins_wait_poll_adapter_maps_observation_statuses() -> None:
     assert isinstance(value, Mapping)
     assert value["operation"] == "download"
     assert "job_id" not in value
+
+
+def test_fins_wait_poll_adapter_rejects_failed_result_without_message() -> None:
+    """failed observation 缺少业务错误说明时不得回退内部 observation message。"""
+
+    failed = _observation_handle_with_id("1212121212121212")
+    runtime = _FakeObservationRuntime(
+        snapshots={
+            failed.handle_id: FinsObservationSnapshot(
+                handle=failed,
+                status=FinsObservationStatus.FAILED,
+                message="Observation activation failed.",
+                result=FinsResultSummary(
+                    status=FinsResultStatus.FAILURE,
+                    exit_code=FINS_RESULT_EXIT_FAILURE,
+                    title="Observation result",
+                    details=(FinsEventDetail(label="ticker", value="AAPL"),),
+                    error_kind=FinsErrorKind.EXECUTION,
+                    error_message=None,
+                ),
+                error_kind=FinsErrorKind.EXECUTION,
+                retry_after_seconds=None,
+            )
+        }
+    )
+    adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
+
+    with pytest.raises(ValueError, match="must contain error_message"):
+        adapter.poll_wait(_wait_record(failed.handle_id, DOWNLOAD_TOOL_NAME))
 
 
 def test_fins_wait_poll_adapter_corrupt_and_missing_handles_are_lost() -> None:

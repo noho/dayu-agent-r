@@ -44,6 +44,15 @@ from dayu.fins.direct_events import (
     FinsResultStatus,
     FinsResultSummary,
 )
+from dayu.fins.direct_event_text import (
+    direct_download_no_source_documents_message,
+    direct_failure_message,
+    direct_preprocess_no_requested_documents_message,
+    direct_progress_message,
+    direct_result_title,
+    direct_upload_failed_status_message,
+    direct_upload_runtime_unavailable_message,
+)
 from dayu.fins.domain.document_models import (
     DocumentMeta,
     DownloadRejectionEntry,
@@ -178,11 +187,6 @@ _PAYLOAD_FILE_NAME: Final[str] = "file_name"
 _DIRECT_EVENT_QUEUE_MAX_SIZE: Final[int] = 32
 _DIRECT_QUEUE_GET_TIMEOUT_SECONDS: Final[float] = 0.05
 _DIRECT_QUEUE_PUT_TIMEOUT_SECONDS: Final[float] = 0.05
-_DIRECT_CANCELLED_MESSAGE: Final[str] = "操作已取消"
-_DIRECT_FAILURE_TITLE: Final[str] = "操作失败"
-_DIRECT_SUCCESS_TITLE: Final[str] = "操作完成"
-_DIRECT_ERROR_TEXT_FALLBACK: Final[str] = "执行失败"
-
 
 class FinsIngestionOperationKind(str, Enum):
     """Fins ingestion job 操作类型。"""
@@ -2431,7 +2435,9 @@ class FinsIngestionRuntime:
                 else:
                     record.status = FinsObservationStatus.CANCELLED
                     record.message = "Observation was cancelled before activation."
-                    record.result = _observation_cancelled_result(record.message)
+                    record.result = _observation_cancelled_result(
+                        operation_kind=record.handle.operation_kind,
+                    )
             return self._observation_snapshot_locked(record)
 
     async def abandon_observation(self, handle: FinsObservationHandle) -> None:
@@ -2631,7 +2637,9 @@ class FinsIngestionRuntime:
                 if record.result is None and record.status not in _TERMINAL_OBSERVATION_STATUSES:
                     record.status = FinsObservationStatus.FAILED
                     record.message = "Observation finished without a result."
-                    record.result = _observation_failure_result(record.message)
+                    record.result = _observation_failure_result(
+                        operation_kind=record.handle.operation_kind,
+                    )
                 continue
             if item.event_type is FinsEventType.PROGRESS:
                 if record.result is None:
@@ -2751,13 +2759,13 @@ class FinsIngestionRuntime:
         try:
             producer(context)
         except Exception as exc:
+            error_kind = _classify_direct_error(exc)
             self._emit_direct_result(
                 context,
                 status=FinsResultStatus.FAILURE,
-                title=_DIRECT_FAILURE_TITLE,
                 details=(),
-                error_kind=_classify_direct_error(exc),
-                error_message=_safe_direct_error_message(exc),
+                error_kind=error_kind,
+                error_message=_safe_direct_error_message(exc, error_kind=error_kind),
             )
         finally:
             _put_direct_queue(context, _DirectStreamProducerDone())
@@ -2788,7 +2796,7 @@ class FinsIngestionRuntime:
         self._emit_context_progress(
             context,
             source_event_type=_PROGRESS_DOWNLOAD_PREPARING,
-            message="下载准备中",
+            message=direct_progress_message(stage=_PROGRESS_DOWNLOAD_PREPARING),
             document_id=None,
             payload={
                 _PAYLOAD_TICKER: context.normalized_ticker,
@@ -2807,16 +2815,14 @@ class FinsIngestionRuntime:
             self._emit_direct_result(
                 context,
                 status=FinsResultStatus.FAILURE,
-                title="下载失败",
                 details=_download_result_details(summary),
                 error_kind=FinsErrorKind.PROVIDER,
-                error_message="下载请求未写入任何源文档",
+                error_message=direct_download_no_source_documents_message(),
             )
             return
         self._emit_direct_result(
             context,
             status=FinsResultStatus.SUCCESS,
-            title=_DIRECT_SUCCESS_TITLE,
             details=_download_result_details(summary),
             error_kind=None,
             error_message=None,
@@ -2846,7 +2852,7 @@ class FinsIngestionRuntime:
         self._emit_context_progress(
             context,
             source_event_type=_PROGRESS_PREPROCESS_PREPARING,
-            message="预处理准备中",
+            message=direct_progress_message(stage=_PROGRESS_PREPROCESS_PREPARING),
             document_id=None,
             payload={
                 _PAYLOAD_TICKER: context.normalized_ticker,
@@ -2865,16 +2871,14 @@ class FinsIngestionRuntime:
             self._emit_direct_result(
                 context,
                 status=FinsResultStatus.FAILURE,
-                title="预处理失败",
                 details=_preprocess_result_details(summary),
                 error_kind=FinsErrorKind.EXECUTION,
-                error_message="没有任何请求文档完成预处理",
+                error_message=direct_preprocess_no_requested_documents_message(),
             )
             return
         self._emit_direct_result(
             context,
             status=FinsResultStatus.SUCCESS,
-            title=_DIRECT_SUCCESS_TITLE,
             details=_preprocess_result_details(summary),
             error_kind=None,
             error_message=None,
@@ -2904,7 +2908,7 @@ class FinsIngestionRuntime:
         self._emit_context_progress(
             context,
             source_event_type=_PROGRESS_UPLOAD_PREPARING,
-            message="上传准备中",
+            message=direct_progress_message(stage=_PROGRESS_UPLOAD_PREPARING),
             document_id=_upload_request_document_id(request),
             payload=_upload_context_request_progress_payload(context, request),
         )
@@ -2915,7 +2919,6 @@ class FinsIngestionRuntime:
             self._emit_direct_result(
                 context,
                 status=FinsResultStatus.FAILURE,
-                title="上传失败",
                 details=_upload_result_details(
                     FinsUploadResultSummary(
                         source_kind=request.source_kind,
@@ -2923,13 +2926,13 @@ class FinsIngestionRuntime:
                     )
                 ),
                 error_kind=FinsErrorKind.EXECUTION,
-                error_message=_UNSUPPORTED_UPLOAD_RUNTIME_MESSAGE,
+                error_message=direct_upload_runtime_unavailable_message(),
             )
             return
         self._emit_context_progress(
             context,
             source_event_type=_PROGRESS_UPLOAD_STARTED,
-            message="上传已开始",
+            message=direct_progress_message(stage=_PROGRESS_UPLOAD_STARTED),
             document_id=_upload_request_document_id(request),
             payload=_upload_context_request_progress_payload(context, request),
         )
@@ -2940,7 +2943,7 @@ class FinsIngestionRuntime:
         self._emit_context_progress(
             context,
             source_event_type=_upload_completed_progress_type(summary),
-            message=_upload_completed_progress_message(summary),
+            message=direct_progress_message(stage=_upload_completed_progress_type(summary)),
             document_id=summary.document_id or _upload_request_document_id(request),
             payload=_upload_context_summary_progress_payload(context, request, summary),
         )
@@ -2951,16 +2954,14 @@ class FinsIngestionRuntime:
             self._emit_direct_result(
                 context,
                 status=FinsResultStatus.FAILURE,
-                title="上传失败",
                 details=_upload_result_details(summary),
                 error_kind=FinsErrorKind.EXECUTION,
-                error_message="上传运行时返回失败状态",
+                error_message=direct_upload_failed_status_message(),
             )
             return
         self._emit_direct_result(
             context,
             status=FinsResultStatus.SUCCESS,
-            title=_DIRECT_SUCCESS_TITLE,
             details=_upload_result_details(summary),
             error_kind=None,
             error_message=None,
@@ -3286,7 +3287,7 @@ class FinsIngestionRuntime:
             if summary.result_status() is FinsPreprocessResultStatus.FAILED:
                 self._save_failed(
                     latest,
-                    message="没有任何请求文档完成预处理",
+                    message=direct_preprocess_no_requested_documents_message(),
                     result_summary=summary.to_json_summary(),
                 )
                 return
@@ -3331,7 +3332,7 @@ class FinsIngestionRuntime:
             if summary.failed_count > 0 and summary.downloaded_count == 0 and summary.rejected_count == 0:
                 self._save_failed(
                     latest,
-                    message="下载请求未写入任何源文档",
+                    message=direct_download_no_source_documents_message(),
                     result_summary=summary.to_json_summary(),
                 )
                 return
@@ -3381,7 +3382,7 @@ class FinsIngestionRuntime:
             self._emit_context_progress(
                 context,
                 source_event_type=_PROGRESS_UPLOAD_STARTED,
-                message="上传已开始",
+                message=direct_progress_message(stage=_PROGRESS_UPLOAD_STARTED),
                 document_id=_upload_request_document_id(request),
                 payload=_upload_context_request_progress_payload(context, request),
             )
@@ -3392,7 +3393,7 @@ class FinsIngestionRuntime:
             self._emit_context_progress(
                 context,
                 source_event_type=_upload_completed_progress_type(summary),
-                message=_upload_completed_progress_message(summary),
+                message=direct_progress_message(stage=_upload_completed_progress_type(summary)),
                 document_id=summary.document_id or _upload_request_document_id(request),
                 payload=_upload_context_summary_progress_payload(context, request, summary),
             )
@@ -3507,7 +3508,7 @@ class FinsIngestionRuntime:
         self._emit_context_progress(
             context,
             source_event_type=_PROGRESS_PREPROCESS_SELECTED,
-            message="预处理已选择源文档",
+            message=direct_progress_message(stage=_PROGRESS_PREPROCESS_SELECTED),
             document_id=None,
             payload=_preprocess_selected_progress_payload(
                 context,
@@ -3526,7 +3527,7 @@ class FinsIngestionRuntime:
             self._emit_context_progress(
                 context,
                 source_event_type=_PROGRESS_PREPROCESS_DOCUMENT_STARTED,
-                message="预处理源文档已开始",
+                message=direct_progress_message(stage=_PROGRESS_PREPROCESS_DOCUMENT_STARTED),
                 document_id=document_id,
                 payload=_preprocess_document_progress_payload(
                     context,
@@ -3547,7 +3548,7 @@ class FinsIngestionRuntime:
                 self._emit_context_progress(
                     context,
                     source_event_type=_PROGRESS_PREPROCESS_DOCUMENT_NOT_SUPPORTED,
-                    message="预处理源文档不支持",
+                    message=direct_progress_message(stage=_PROGRESS_PREPROCESS_DOCUMENT_NOT_SUPPORTED),
                     document_id=document_id,
                     payload=_preprocess_document_progress_payload(
                         context,
@@ -3562,7 +3563,7 @@ class FinsIngestionRuntime:
                 self._emit_context_progress(
                     context,
                     source_event_type=_PROGRESS_PREPROCESS_DOCUMENT_FAILED,
-                    message="预处理源文档失败",
+                    message=direct_progress_message(stage=_PROGRESS_PREPROCESS_DOCUMENT_FAILED),
                     document_id=document_id,
                     payload=_preprocess_document_progress_payload(
                         context,
@@ -3577,7 +3578,7 @@ class FinsIngestionRuntime:
                 self._emit_context_progress(
                     context,
                     source_event_type=_PROGRESS_PREPROCESS_DOCUMENT_PROCESSED,
-                    message="预处理源文档已完成",
+                    message=direct_progress_message(stage=_PROGRESS_PREPROCESS_DOCUMENT_PROCESSED),
                     document_id=document_id,
                     payload=_preprocess_document_progress_payload(
                         context,
@@ -3591,7 +3592,7 @@ class FinsIngestionRuntime:
                 self._emit_context_progress(
                     context,
                     source_event_type=_PROGRESS_PREPROCESS_DOCUMENT_SKIPPED,
-                    message="预处理源文档已跳过",
+                    message=direct_progress_message(stage=_PROGRESS_PREPROCESS_DOCUMENT_SKIPPED),
                     document_id=document_id,
                     payload=_preprocess_document_progress_payload(
                         context,
@@ -3615,7 +3616,7 @@ class FinsIngestionRuntime:
         self._emit_context_progress(
             context,
             source_event_type=_PROGRESS_PREPROCESS_COMPLETED,
-            message="预处理请求已完成",
+            message=direct_progress_message(stage=_PROGRESS_PREPROCESS_COMPLETED),
             document_id=None,
             payload=_preprocess_summary_progress_payload(context, request, summary),
         )
@@ -3658,7 +3659,7 @@ class FinsIngestionRuntime:
         self._emit_context_progress(
             context,
             source_event_type=_PROGRESS_DOWNLOAD_STARTED,
-            message="下载已开始",
+            message=direct_progress_message(stage=_PROGRESS_DOWNLOAD_STARTED),
             document_id=None,
             payload=_download_context_request_progress_payload(context, adapter_request),
         )
@@ -3670,7 +3671,7 @@ class FinsIngestionRuntime:
             self._emit_context_progress(
                 context,
                 source_event_type=_download_completed_progress_type(summary),
-                message=_download_completed_progress_message(summary),
+                message=direct_progress_message(stage=_download_completed_progress_type(summary)),
                 document_id=None,
                 payload=_download_context_summary_progress_payload(context, adapter_request, summary),
             )
@@ -3712,7 +3713,7 @@ class FinsIngestionRuntime:
         self._emit_context_progress(
             context,
             source_event_type=_download_completed_progress_type(summary),
-            message=_download_completed_progress_message(summary),
+            message=direct_progress_message(stage=_download_completed_progress_type(summary)),
             document_id=None,
             payload=_download_context_summary_progress_payload(context, adapter_request, summary),
         )
@@ -4401,7 +4402,6 @@ class FinsIngestionRuntime:
         context: _FinsIngestionExecutionContext,
         *,
         status: FinsResultStatus,
-        title: str,
         details: tuple[FinsEventDetail, ...],
         error_kind: FinsErrorKind | None,
         error_message: str | None,
@@ -4411,7 +4411,6 @@ class FinsIngestionRuntime:
         Args:
             context: direct stream 执行上下文。
             status: 终态状态。
-            title: 结果标题。
             details: 有界业务摘要详情。
             error_kind: 可选失败分类。
             error_message: 可选失败说明。
@@ -4426,6 +4425,10 @@ class FinsIngestionRuntime:
         if context.direct_queue is None:
             return
         exit_code = _direct_exit_code(status)
+        title = direct_result_title(
+            operation_kind=context.direct_operation_kind,
+            status=status,
+        )
         event = FinsEvent(
             event_type=FinsEventType.RESULT,
             operation_kind=context.direct_operation_kind,
@@ -4462,10 +4465,12 @@ class FinsIngestionRuntime:
         self._emit_direct_result(
             context,
             status=FinsResultStatus.CANCELLED,
-            title=_DIRECT_CANCELLED_MESSAGE,
             details=(),
             error_kind=FinsErrorKind.CANCELLED,
-            error_message=_DIRECT_CANCELLED_MESSAGE,
+            error_message=direct_failure_message(
+                error_kind=FinsErrorKind.CANCELLED,
+                fallback_message=None,
+            ),
         )
 
     def _append_job_event_warn(
@@ -4929,11 +4934,12 @@ def _classify_direct_error(exc: Exception) -> FinsErrorKind:
     return FinsErrorKind.UNKNOWN
 
 
-def _safe_direct_error_message(exc: Exception) -> str:
+def _safe_direct_error_message(exc: Exception, *, error_kind: FinsErrorKind) -> str:
     """构造不会泄漏路径、job id 或 raw payload 的 direct 错误说明。
 
     Args:
         exc: runtime 异常。
+        error_kind: runtime 异常分类。
 
     Returns:
         有界错误说明。
@@ -4954,10 +4960,10 @@ def _safe_direct_error_message(exc: Exception) -> str:
         or "raw payload" in lowered
         or "provider payload" in lowered
     ):
-        return f"{_DIRECT_ERROR_TEXT_FALLBACK}: {type(exc).__name__}"
+        return direct_failure_message(error_kind=error_kind, fallback_message=None)
     if len(message) > _MAX_TEXT_CHARS:
-        return message[:_MAX_TEXT_CHARS]
-    return message
+        message = message[:_MAX_TEXT_CHARS]
+    return direct_failure_message(error_kind=error_kind, fallback_message=message)
 
 
 def _new_job_id() -> str:
@@ -5085,11 +5091,11 @@ def _observation_error_kind(
     return None
 
 
-def _observation_failure_result(message: str) -> FinsResultSummary:
+def _observation_failure_result(*, operation_kind: FinsOperationKind) -> FinsResultSummary:
     """构造 observation producer 异常收口失败摘要。
 
     Args:
-        message: 有界失败说明。
+        operation_kind: observation 对应的 direct 业务操作类型。
 
     Returns:
         Fins result summary。
@@ -5101,18 +5107,27 @@ def _observation_failure_result(message: str) -> FinsResultSummary:
     return FinsResultSummary(
         status=FinsResultStatus.FAILURE,
         exit_code=FINS_RESULT_EXIT_FAILURE,
-        title=_DIRECT_FAILURE_TITLE,
+        title=direct_result_title(
+            operation_kind=operation_kind,
+            status=FinsResultStatus.FAILURE,
+        ),
         details=(),
         error_kind=FinsErrorKind.EXECUTION,
-        error_message=message,
+        error_message=direct_failure_message(
+            error_kind=FinsErrorKind.EXECUTION,
+            fallback_message=None,
+        ),
     )
 
 
-def _observation_cancelled_result(message: str) -> FinsResultSummary:
+def _observation_cancelled_result(
+    *,
+    operation_kind: FinsOperationKind,
+) -> FinsResultSummary:
     """构造 observation prepare 阶段取消摘要。
 
     Args:
-        message: 原始或有界取消说明。
+        operation_kind: observation 对应的 direct 业务操作类型。
 
     Returns:
         Fins result summary。
@@ -5121,14 +5136,19 @@ def _observation_cancelled_result(message: str) -> FinsResultSummary:
         ValueError: result 字段非法时由契约构造抛出。
     """
 
-    safe_message = _safe_observation_message(message)
     return FinsResultSummary(
         status=FinsResultStatus.CANCELLED,
         exit_code=FINS_RESULT_EXIT_CANCELLED,
-        title=_DIRECT_CANCELLED_MESSAGE,
+        title=direct_result_title(
+            operation_kind=operation_kind,
+            status=FinsResultStatus.CANCELLED,
+        ),
         details=(),
         error_kind=FinsErrorKind.CANCELLED,
-        error_message=safe_message,
+        error_message=direct_failure_message(
+            error_kind=FinsErrorKind.CANCELLED,
+            fallback_message=None,
+        ),
     )
 
 
@@ -5157,10 +5177,16 @@ def _mark_observation_failed(
     record.result = FinsResultSummary(
         status=FinsResultStatus.FAILURE,
         exit_code=FINS_RESULT_EXIT_FAILURE,
-        title=_DIRECT_FAILURE_TITLE,
+        title=direct_result_title(
+            operation_kind=record.handle.operation_kind,
+            status=FinsResultStatus.FAILURE,
+        ),
         details=(),
         error_kind=error_kind,
-        error_message=safe_message,
+        error_message=direct_failure_message(
+            error_kind=error_kind,
+            fallback_message=None,
+        ),
     )
 
 
@@ -5877,24 +5903,6 @@ def _download_completed_progress_type(summary: FinsDownloadResultSummary) -> str
     return _PROGRESS_DOWNLOAD_COMPLETED
 
 
-def _download_completed_progress_message(summary: FinsDownloadResultSummary) -> str:
-    """根据下载摘要选择用户可读 progress 说明。
-
-    Args:
-        summary: 下载结果摘要。
-
-    Returns:
-        下载完成或带失败完成的简短说明。
-
-    Raises:
-        无。
-    """
-
-    if summary.failed_count > 0:
-        return "下载已完成，存在失败候选"
-    return "下载已完成"
-
-
 def _upload_request_document_id(request: FinsUploadRequest) -> str | None:
     """从上传请求提取可用于 progress 的业务文档 ID。
 
@@ -5996,24 +6004,6 @@ def _upload_completed_progress_type(summary: FinsUploadResultSummary) -> str:
     if summary.status.strip().lower() == _UPLOAD_RESULT_STATUS_FAILED:
         return _PROGRESS_UPLOAD_COMPLETED_WITH_FAILURES
     return _PROGRESS_UPLOAD_COMPLETED
-
-
-def _upload_completed_progress_message(summary: FinsUploadResultSummary) -> str:
-    """根据上传摘要选择用户可读 progress 说明。
-
-    Args:
-        summary: 上传结果摘要。
-
-    Returns:
-        上传完成或带失败完成的简短说明。
-
-    Raises:
-        无。
-    """
-
-    if summary.status.strip().lower() == _UPLOAD_RESULT_STATUS_FAILED:
-        return "上传已完成，存在失败"
-    return "上传已完成"
 
 
 def _preprocess_selected_progress_payload(
