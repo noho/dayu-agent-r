@@ -51,9 +51,9 @@ _FIELD_NORMALIZED_ARGUMENTS_DIGEST = "normalized_arguments_digest"
 _FIELD_RESOLUTION_KIND = "resolution_kind"
 _FIELD_TOOL_FACT_KIND = "tool_fact_kind"
 _FIELD_RAW_TOOL_OUTCOME = "raw_tool_outcome"
-_FIELD_RESULT = "result"
-_FIELD_KIND = "kind"
-_FIELD_OK = "ok"
+_DIAGNOSTIC_ACCEPTED_STATUS_UNAVAILABLE = "accepted_status_unavailable"
+_DIAGNOSTIC_RESULT_PAYLOAD_UNAVAILABLE = "result_payload_unavailable"
+_DIAGNOSTIC_EVENT_PAYLOAD_UNAVAILABLE = "event_payload_unavailable"
 _READABLE_SOURCE_SEPARATOR = ", "
 _ARGUMENTS_SUMMARY_MAX_CHARS = 1200
 _RESULT_DETAILS_MAX_CHARS = 1200
@@ -203,7 +203,8 @@ def project_accepted_tool_result(
     raw_outcome = result_payload.get(_FIELD_RAW_TOOL_OUTCOME) if result_payload is not None else None
     result_text = _raw_outcome_text(result_payload)
     result_details_text = _result_details_text(raw_outcome)
-    status = _accepted_status(payload, raw_outcome, tuple(diagnostics))
+    status, status_diagnostics = _accepted_status(payload, tuple(diagnostics))
+    diagnostics.extend(status_diagnostics)
     request_atoms = _request_atoms_projection(
         transaction,
         result_row,
@@ -277,7 +278,7 @@ def _result_event_payload(
             (),
         )
     except HostDurableError:
-        return ({}, ("event_payload_unavailable",))
+        return ({}, (_DIAGNOSTIC_EVENT_PAYLOAD_UNAVAILABLE,))
 
 
 def _accepted_envelope(
@@ -338,7 +339,7 @@ def _result_payload(
             (),
         )
     except HostDurableError:
-        return (None, ("result_payload_unavailable",))
+        return (None, (_DIAGNOSTIC_RESULT_PAYLOAD_UNAVAILABLE,))
 
 
 def _projection_tool_name(
@@ -389,31 +390,32 @@ def _raw_outcome_text(payload: Mapping[str, JsonValue] | None) -> str | None:
 
 def _accepted_status(
     payload: Mapping[str, JsonValue],
-    raw_outcome: JsonValue | None,
     diagnostics: tuple[str, ...],
-) -> AcceptedToolResultStatus:
+) -> tuple[AcceptedToolResultStatus, tuple[str, ...]]:
     """归一 accepted tool result status。
 
     :param payload: accepted result payload。
-    :param raw_outcome: raw outcome JSON。
     :param diagnostics: projection 读取诊断。
-    :returns: 封闭状态枚举。
+    :returns: 封闭状态枚举与状态诊断。
     """
 
-    if "result_payload_unavailable" in diagnostics or "event_payload_unavailable" in diagnostics:
-        return AcceptedToolResultStatus.LOST
-    resolution_kind = _optional_payload_text(payload, _FIELD_RESOLUTION_KIND)
+    if (
+        _DIAGNOSTIC_RESULT_PAYLOAD_UNAVAILABLE in diagnostics
+        or _DIAGNOSTIC_EVENT_PAYLOAD_UNAVAILABLE in diagnostics
+    ):
+        return (AcceptedToolResultStatus.LOST, ())
+    resolution_kind = _payload_status_text(payload, _FIELD_RESOLUTION_KIND)
     if resolution_kind is not None:
-        return _status_from_text(resolution_kind)
-    tool_fact_kind = _optional_payload_text(payload, _FIELD_TOOL_FACT_KIND)
+        status = _status_from_text(resolution_kind)
+        return _status_with_unknown_diagnostic(status)
+    tool_fact_kind = _payload_status_text(payload, _FIELD_TOOL_FACT_KIND)
     if tool_fact_kind is not None:
-        return _status_from_text(tool_fact_kind)
-    if raw_outcome is None:
-        return AcceptedToolResultStatus.LOST
-    raw_status = _status_from_raw_outcome(raw_outcome)
-    if raw_status is not None:
-        return raw_status
-    return AcceptedToolResultStatus.UNKNOWN
+        status = _status_from_text(tool_fact_kind)
+        return _status_with_unknown_diagnostic(status)
+    return (
+        AcceptedToolResultStatus.UNKNOWN,
+        (_DIAGNOSTIC_ACCEPTED_STATUS_UNAVAILABLE,),
+    )
 
 
 def _status_from_text(value: str) -> AcceptedToolResultStatus:
@@ -436,28 +438,41 @@ def _status_from_text(value: str) -> AcceptedToolResultStatus:
     return AcceptedToolResultStatus.UNKNOWN
 
 
-def _status_from_raw_outcome(raw_outcome: JsonValue) -> AcceptedToolResultStatus | None:
-    """从 raw outcome 的通用字段降级推断状态。
+def _payload_status_text(
+    payload: Mapping[str, JsonValue],
+    field_name: str,
+) -> str | None:
+    """读取 accepted-result payload 中的 typed status 文本。
 
-    :param raw_outcome: raw outcome JSON。
-    :returns: 状态；无法判断时为 ``None``。
+    状态 owner 是 accept barrier 写入的 typed payload 字段。字段缺失、空白或
+    非字符串均视为 status unavailable，不从 raw outcome 重建状态。
+
+    :param payload: accepted result payload。
+    :param field_name: typed status 字段名。
+    :returns: 去除首尾空白后的状态文本；不可用时为 ``None``。
     """
 
-    if not isinstance(raw_outcome, Mapping):
+    value = payload.get(field_name)
+    if not isinstance(value, str):
         return None
-    kind = raw_outcome.get(_FIELD_KIND)
-    if isinstance(kind, str) and kind.strip() != "":
-        return _status_from_text(kind)
-    result = raw_outcome.get(_FIELD_RESULT)
-    if isinstance(result, Mapping):
-        ok = result.get(_FIELD_OK)
-        if isinstance(ok, bool):
-            return (
-                AcceptedToolResultStatus.COMPLETED
-                if ok
-                else AcceptedToolResultStatus.FAILED
-            )
-    return None
+    text = value.strip()
+    if text == "":
+        return None
+    return text
+
+
+def _status_with_unknown_diagnostic(
+    status: AcceptedToolResultStatus,
+) -> tuple[AcceptedToolResultStatus, tuple[str, ...]]:
+    """给 unknown typed status 附加投影诊断。
+
+    :param status: typed status 字段映射出的封闭状态。
+    :returns: 状态与可选诊断。
+    """
+
+    if status is AcceptedToolResultStatus.UNKNOWN:
+        return (status, (_DIAGNOSTIC_ACCEPTED_STATUS_UNAVAILABLE,))
+    return (status, ())
 
 
 def _request_atoms_projection(

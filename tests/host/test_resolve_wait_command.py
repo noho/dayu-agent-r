@@ -248,7 +248,7 @@ def test_resolve_wait_committed_tool_result_direct_catchup_without_fact(
         recent_evidence = memory_snapshot.snapshot.evidence_fact_memory.recent_evidence_items
         assert len(recent_evidence) == 1
         evidence_text = recent_evidence[0].text
-        assert "工具：long_tool" in evidence_text
+        assert "工具名称：long_tool" in evidence_text
         assert '工具 long_tool 请求参数：{"name":"long_tool"}' in evidence_text
         assert '"answer":42' in evidence_text
         assert "原始工具响应不可用" not in evidence_text

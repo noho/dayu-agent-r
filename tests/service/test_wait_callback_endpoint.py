@@ -301,6 +301,22 @@ def test_malformed_outcome_shape_returns_malformed_payload_without_adapter_call(
     assert adapter.envelopes == []
 
 
+def test_string_provider_status_ref_returns_malformed_payload_without_adapter_call() -> None:
+    """裸字符串 provider_status_ref 会返回 malformed_payload 且不调用 adapter。"""
+
+    body = _lost_body()
+    outcome = body["outcome"]
+    assert isinstance(outcome, dict)
+    outcome["provider_status_ref"] = "jobs/provider-1/status"
+    adapter = _adapter(_adapter_result(WaitCallbackAdapterStatus.ACCEPTED))
+
+    response = handle_wait_callback_completion(_request(body), adapter)
+
+    assert response.status_code == 400
+    assert _body_string(response, "status") == "malformed_payload"
+    assert adapter.envelopes == []
+
+
 def test_unknown_outcome_kind_returns_malformed_payload_without_adapter_call() -> None:
     """未知 outcome kind 会返回 malformed_payload 且不调用 adapter。"""
 
@@ -613,7 +629,11 @@ def _lost_body() -> JsonObject:
             "kind": "lost",
             "reason_code": "provider_lost",
             "message": "provider lost job",
-            "provider_status_ref": "jobs/provider-1/status",
+            "provider_status_ref": {
+                "adapter_key": "callback",
+                "status_ref": "jobs/provider-1/status",
+                "status_digest": None,
+            },
         }
     )
 

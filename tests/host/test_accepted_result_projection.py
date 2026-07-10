@@ -279,13 +279,14 @@ def test_projection_missing_material_uses_owner_fallback() -> None:
     )
 
 
-def test_projection_malformed_optional_payload_text_fails_closed(
+def test_projection_malformed_optional_payload_text_and_status_handling(
     tmp_path: Path,
 ) -> None:
-    """optional payload text 存在但类型或空白非法时 fail closed。"""
+    """非状态 optional text fail closed；状态字段不可用时投影 unknown。"""
 
     event_log = EventLogStore()
     projection: AcceptedToolResultProjection | None = None
+    blank_status_projection: AcceptedToolResultProjection | None = None
     with open_host_durable_store(_durable_options(tmp_path)) as store:
         wrong_type_row = store.transaction_runner.run_write(
             lambda transaction: _append_event(
@@ -334,13 +335,12 @@ def test_projection_malformed_optional_payload_text_fails_closed(
                     wrong_type_row,
                 )
             )
-        with pytest.raises(HostDurableError):
-            store.transaction_runner.run_read(
-                lambda transaction: project_accepted_tool_result(
-                    transaction,
-                    blank_status_row,
-                )
+        blank_status_projection = store.transaction_runner.run_read(
+            lambda transaction: project_accepted_tool_result(
+                transaction,
+                blank_status_row,
             )
+        )
         projection = store.transaction_runner.run_read(
             lambda transaction: project_accepted_tool_result(
                 transaction,
@@ -349,8 +349,15 @@ def test_projection_malformed_optional_payload_text_fails_closed(
         )
 
     assert projection is not None
+    assert blank_status_projection is not None
     assert projection.tool_name is None
     assert projection.llm_material is None
+    assert blank_status_projection.status is AcceptedToolResultStatus.UNKNOWN
+    assert (
+        "accepted_status_unavailable"
+        in blank_status_projection.diagnostic_reasons
+    )
+    assert "accepted_status_unavailable" in projection.diagnostic_reasons
 
 
 def test_accepted_evidence_producer_mismatch_is_typed_exception(
@@ -445,6 +452,7 @@ def test_projection_maps_governed_error_and_unknown_status(tmp_path: Path) -> No
     assert unknown_projection is not None
     assert governed_projection.status is AcceptedToolResultStatus.GOVERNED_ERROR
     assert unknown_projection.status is AcceptedToolResultStatus.UNKNOWN
+    assert "accepted_status_unavailable" in unknown_projection.diagnostic_reasons
 
 
 def test_projection_identity_mismatch_returns_limited_signal(tmp_path: Path) -> None:
@@ -689,6 +697,56 @@ def test_projection_reads_descriptor_payload_and_reports_missing_descriptor(
     assert "result_payload_unavailable" in missing_projection.diagnostic_reasons
 
 
+def test_projection_missing_event_payload_maps_lost_with_diagnostic(
+    tmp_path: Path,
+) -> None:
+    """EventLog payload 不可读时映射 lost 并保留 event payload 诊断。"""
+
+    event_log = EventLogStore()
+    projection: AcceptedToolResultProjection | None = None
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        def seed(transaction: HostTransaction) -> EventLogRow:
+            """写入 payload JSON 非 object 的 accepted result event。
+
+            :param transaction: Host transaction。
+            :returns: accepted result row。
+            """
+
+            payload_ref = "payload-invalid-event-payload"
+            payload_json: JsonValue = ["not-object"]
+            payload_digest = sha256_digest_json(payload_json)
+            PayloadStore().write_sqlite_payload(
+                transaction,
+                SQLitePayloadWriteRequest(
+                    payload_ref=payload_ref,
+                    payload_id="sqlite-invalid-event-payload",
+                    payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+                    payload_json=payload_json,
+                    media_type="application/json",
+                    metadata={"kind": "accepted_result_test"},
+                    expected_digest=payload_digest,
+                ),
+            )
+            return _append_event(
+                transaction,
+                event_log,
+                event_id="event-result-missing-event-payload",
+                event_type="TOOL_RESULT_ACCEPTED",
+                payload={},
+                payload_ref=payload_ref,
+                payload_digest=payload_digest,
+            )
+
+        row = store.transaction_runner.run_write(seed)
+        projection = store.transaction_runner.run_read(
+            lambda transaction: project_accepted_tool_result(transaction, row)
+        )
+
+    assert projection is not None
+    assert projection.status is AcceptedToolResultStatus.LOST
+    assert "event_payload_unavailable" in projection.diagnostic_reasons
+
+
 def test_projection_unsafe_argument_keys_return_limited_signal(tmp_path: Path) -> None:
     """敏感或本地路径参数 key 不进入 LLM-facing query 摘要。"""
 
@@ -740,7 +798,7 @@ def test_projection_unsafe_argument_keys_return_limited_signal(tmp_path: Path) -
 def test_projection_maps_raw_result_ok_false_and_extracts_details(
     tmp_path: Path,
 ) -> None:
-    """raw outcome result.ok=false 映射 failed，并抽取结构化 details。"""
+    """raw outcome result.ok=false 不重建状态，但仍抽取结构化 details。"""
 
     event_log = EventLogStore()
     projection: AcceptedToolResultProjection | None = None
@@ -766,7 +824,8 @@ def test_projection_maps_raw_result_ok_false_and_extracts_details(
         )
 
     assert projection is not None
-    assert projection.status is AcceptedToolResultStatus.FAILED
+    assert projection.status is AcceptedToolResultStatus.UNKNOWN
+    assert "accepted_status_unavailable" in projection.diagnostic_reasons
     assert projection.result_details_text == "reason=not found"
 
 
