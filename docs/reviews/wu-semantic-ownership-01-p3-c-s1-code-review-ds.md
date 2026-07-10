@@ -99,7 +99,7 @@
 - **实际分支**: `_parse_fact` 调用 `_required_text_list(fact, _FIELD_EVIDENCE_LABELS)` 返回保留重复的 tuple → 传给 `EvidenceBackedFactCandidateVNext(...)` → `__post_init__` 调用 `_require_non_empty_unique_string_tuple(self.evidence_labels, ...)` → `ValueError("EvidenceBackedFactCandidateVNext.evidence_labels must be unique")`。
 - **预期行为**: parser 应在构造 typed object 之前校验唯一性，并在错误消息中包含 `evidence_backed_facts[{index}]` 路径前缀（与其他 parser 校验的错误消息风格一致，参见 `_require_exact_fields` 的 `path` 参数用法）。
 - **实际行为**: `ValueError` 从 typed constructor 抛出，消息不含 fact index 或 JSON path。操作员排查时只知道 "某个 fact 的 evidence_labels 有重复"，不知道是第几个 fact。
-- **直接证据**: 
+- **直接证据**:
   - `compact_payload.py:272`: `_required_text_list(fact, _FIELD_EVIDENCE_LABELS)` — 不检查唯一性（行 778-797，只检查 `isinstance(item, str) or item.strip() == ""`）。
   - `compaction.py:1203-1206`: `_require_non_empty_unique_string_tuple(self.evidence_labels, ...)` — 唯一性检查在此处，消息固定不含路径。
   - 对比同文件 `_parse_answer_anchor_child`（行 340-342）在调用 typed constructor 前已用 `_require_exact_fields(child, _ANCHOR_CHILD_FIELDS, path=path)` 带上完整路径。`_parse_fact` 只构造了 `path`（行 268）但未在证据标签校验中使用。
