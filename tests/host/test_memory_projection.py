@@ -12,10 +12,27 @@ from typing import cast
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.host.compact_payload import parse_context_compacted_semantic_payload
+from dayu.host.compaction import (
+    CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
+    AnswerAnchorCandidateVNext,
+    AnswerAnchorChildVNext,
+    CompactQualityCheckResultVNext,
+    ConversationCompactOutputVNext,
+    EvidenceBackedFactCandidateVNext,
+    FactEvidenceKindVNext,
+    ForwardIntentCandidateVNext,
+    ForwardIntentStatusVNext,
+    ForwardIntentTypeVNext,
+    ReferenceContinuityCandidateVNext,
+    ReferenceContinuityReasonVNext,
+    SessionSummaryCandidateVNext,
+)
 from dayu.host.context_events import (
     CONTEXT_COMPACTED,
     CONTEXT_COMPACTION_ATTEMPT_REJECTED,
     CONTEXT_COMPACTION_FAILED,
+    build_context_compacted_payload,
 )
 from dayu.host.durable import memory as durable_memory_module
 from dayu.host.durable.connection import open_host_durable_store
@@ -95,6 +112,9 @@ _REQUEST_PAYLOAD_KIND_VALID = "valid"
 _REQUEST_PAYLOAD_KIND_INVALID = "invalid"
 _FAIL_SAFE_QUERY_TEXT = "这个 request query 不应进入 memory"
 _FAIL_SAFE_LIMITED_QUERY_TEXT = ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT
+_COMPACT_ARTIFACT_DIGEST = (
+    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+)
 
 _POLICY_FIELDS = (
     "context_window_size",
@@ -250,6 +270,11 @@ def _event(
         payload_ref=None,
         payload_digest=None,
         payload=payload,
+        compacted_semantics=(
+            parse_context_compacted_semantic_payload(payload)
+            if event_type == CONTEXT_COMPACTED
+            else None
+        ),
         assistant_final_answer_text=assistant_final_answer_text,
         evidence_query_text=evidence_query_text,
         evidence_tool_name=evidence_tool_name,
@@ -283,52 +308,74 @@ def _llm_facing_memory_text_view(
 
 def _accepted_compact_payload(
     *,
-    facts: list[dict[str, JsonValue]] | None = None,
+    facts: list[EvidenceBackedFactCandidateVNext] | None = None,
+    summary_text: str = "用户关注收入增速和毛利率变化。",
 ) -> dict[str, JsonValue]:
     """构造 accepted vNext compact payload。
 
     :param facts: 可选 evidence-backed fact candidates。
+    :param summary_text: session summary 文本。
     :returns: CONTEXT_COMPACTED payload。
     """
 
-    accepted_candidate = cast(dict[str, JsonValue], {
-        "schema_version": "conversation_compact_output_v1",
-        "session_summary": {
-            "summary_text": "用户关注收入增速和毛利率变化。",
-            "source_labels": ["u1"],
-        },
-        "evidence_backed_facts": [] if facts is None else facts,
-        "answer_anchors": [
-            {
-                "anchor_title": "收入口径",
-                "anchor_items": [
-                    {"display_text": "同比收入增速来自已接受证据。", "ordinal": 1}
-                ],
-                "answer_source_labels": ["e1"],
-            }
-        ],
-        "forward_intents": [
-            {
-                "intent_type": "follow_up",
-                "text": "下一轮继续核对费用率。",
-                "status": "open",
-                "source_labels": ["u1"],
-            }
-        ],
-        "reference_continuity_items": [
-            {
-                "text": "“该公司”继续指向当前分析主体。",
-                "reason": "pronoun_resolution",
-                "source_labels": ["u1"],
-            }
-        ],
-        "diagnostics": [],
-    })
-    return {
-        "accepted_candidate": accepted_candidate,
-        "accepted_evidence_mapping_refs": ["event:tool-1"],
-        "compact_artifact_ref": "artifact:compact-1",
-    }
+    candidate = ConversationCompactOutputVNext(
+        schema_version=CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
+        session_summary=SessionSummaryCandidateVNext(
+            summary_text=summary_text,
+            source_labels=("u1",),
+        ),
+        evidence_backed_facts=() if facts is None else tuple(facts),
+        answer_anchors=(
+            AnswerAnchorCandidateVNext(
+                anchor_title="收入口径",
+                anchor_items=(
+                    AnswerAnchorChildVNext(
+                        display_text="同比收入增速来自已接受证据。",
+                        ordinal=1,
+                    ),
+                    AnswerAnchorChildVNext(
+                        display_text="毛利率口径保持一致。",
+                        ordinal=2,
+                    ),
+                ),
+                answer_source_labels=("e1",),
+            ),
+        ),
+        forward_intents=(
+            ForwardIntentCandidateVNext(
+                intent_type=ForwardIntentTypeVNext.NEXT_STEP_NOTE,
+                text="下一轮继续核对费用率。",
+                status=ForwardIntentStatusVNext.OPEN,
+                source_labels=("u1",),
+            ),
+        ),
+        reference_continuity_items=(
+            ReferenceContinuityCandidateVNext(
+                text="“该公司”继续指向当前分析主体。",
+                reason=ReferenceContinuityReasonVNext.LOCAL_REFERENCE,
+                source_labels=("u1",),
+            ),
+        ),
+        diagnostics=(),
+    )
+    return dict(
+        build_context_compacted_payload(
+            operation_id="event-context-compaction-requested-1",
+            accepted_attempt_number=1,
+            compact_artifact_ref="artifact:compact-1",
+            compact_artifact_digest=_COMPACT_ARTIFACT_DIGEST,
+            accepted_candidate=candidate,
+            quality_check_result=CompactQualityCheckResultVNext(
+                accepted=True,
+                rejection_reasons=(),
+            ),
+            budget_after_compact=512,
+            prompt_local_label_mapping_refs=("prompt-label:u1", "prompt-label:e1"),
+            source_boundary_refs=("event:user-1",),
+            accepted_evidence_mapping_refs=("event:tool-1",),
+            projection_signal="conversation_memory_projection_catchup",
+        )
+    )
 
 
 def _tool_call_requested_payload(
@@ -617,17 +664,19 @@ def _project_tool_query_fail_safe_case(
     raise AssertionError("tool query fail-safe projection did not return memory text")
 
 
-def _fact(claim_text: str) -> dict[str, JsonValue]:
+def _fact(claim_text: str) -> EvidenceBackedFactCandidateVNext:
     """构造 fact candidate。
 
     :param claim_text: fact claim 文本。
-    :returns: fact candidate JSON object。
+    :returns: typed fact candidate。
     """
 
-    return {
-        "claim_text": claim_text,
-        "evidence_labels": ["e1"],
-    }
+    return EvidenceBackedFactCandidateVNext(
+        claim_text=claim_text,
+        evidence_labels=("e1",),
+        evidence_kind=FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL,
+        source_labels=("e1",),
+    )
 
 
 def _memory_item_count(transaction: HostTransaction) -> int:
@@ -979,9 +1028,24 @@ def test_accepted_compact_materializes_vnext_memory_sections() -> None:
         "收入同比增长 12%。"
     )
     assert snapshot.answer_anchor_memory.anchors[0].anchor_title == "收入口径"
+    assert tuple(
+        (child.display_text, child.ordinal)
+        for child in snapshot.answer_anchor_memory.anchors[0].anchor_items
+    ) == (
+        ("同比收入增速来自已接受证据。", 1),
+        ("毛利率口径保持一致。", 2),
+    )
+    assert (
+        snapshot.forward_intent_memory.intents[0].intent_type
+        is ForwardIntentTypeVNext.NEXT_STEP_NOTE
+    )
+    assert (
+        snapshot.forward_intent_memory.intents[0].status
+        is ForwardIntentStatusVNext.OPEN
+    )
     assert snapshot.forward_intent_memory.intents[0].text == "下一轮继续核对费用率。"
-    assert snapshot.trace_memory.reference_continuity_items[0].reason == (
-        "pronoun_resolution"
+    assert snapshot.trace_memory.reference_continuity_items[0].reason is (
+        ReferenceContinuityReasonVNext.LOCAL_REFERENCE
     )
 
 
@@ -1559,84 +1623,12 @@ def test_accepted_compact_drops_oversized_fact_without_prefix_text() -> None:
     )
 
 
-def test_accepted_compact_preserves_budget_diagnostic_before_invalid_fact() -> None:
-    """oversized fact 后续遇到 invalid fact 时保留已记录 budget diagnostic。"""
-
-    policy = replace(_policy(), evidence_fact_char_cap=8, evidence_fact_floor=0)
-    invalid_fact = _fact("无标签")
-    invalid_fact["evidence_labels"] = []
-    snapshot = build_conversation_memory_snapshot_from_events(
-        events=(
-            _event(
-                1,
-                "compact-oversized-then-invalid-fact",
-                CONTEXT_COMPACTED,
-                _accepted_compact_payload(
-                    facts=[
-                        _fact("这是一条超过上限的完整事实。"),
-                        invalid_fact,
-                    ]
-                ),
-            ),
-        ),
-        session_id=_SESSION_ID,
-        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
-        policy=policy,
-        built_at=_NOW,
-    )
-
-    assert snapshot.evidence_fact_memory.evidence_backed_facts == ()
-    assert tuple(diagnostic.reason for diagnostic in snapshot.diagnostics) == (
-        MemoryDiagnosticReason.BUDGET_LIMIT_REACHED,
-        MemoryDiagnosticReason.EVIDENCE_BACKED_FACT_CANDIDATE_INVALID,
-    )
-
-
-def test_accepted_compact_keeps_valid_fact_before_empty_evidence_labels() -> None:
-    """后续空 evidence labels candidate 不得清空此前 valid facts。"""
-
-    invalid_fact = _fact("无标签")
-    invalid_fact["evidence_labels"] = []
-    snapshot = build_conversation_memory_snapshot_from_events(
-        events=(
-            _event(
-                1,
-                "compact-valid-then-empty-labels",
-                CONTEXT_COMPACTED,
-                _accepted_compact_payload(
-                    facts=[
-                        _fact("有效事实应保留。"),
-                        invalid_fact,
-                    ]
-                ),
-            ),
-        ),
-        session_id=_SESSION_ID,
-        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
-        policy=_policy(),
-        built_at=_NOW,
-    )
-
-    assert tuple(
-        fact.claim_text
-        for fact in snapshot.evidence_fact_memory.evidence_backed_facts
-    ) == ("有效事实应保留。",)
-    assert MemoryDiagnosticReason.EVIDENCE_BACKED_FACT_CANDIDATE_INVALID in tuple(
-        diagnostic.reason for diagnostic in snapshot.diagnostics
-    )
-
-
 def test_accepted_compact_drops_oversized_summary_without_prefix_text() -> None:
     """超出 summary char cap 的 compact summary 整体丢弃，不返回前缀文本。"""
 
     policy = replace(_policy(), session_summary_char_cap=8)
     long_summary = "用户需要完整保留的长 summary，不能静默截断。"
-    payload = _accepted_compact_payload()
-    candidate = cast(dict[str, JsonValue], payload["accepted_candidate"])
-    candidate["session_summary"] = {
-        "summary_text": long_summary,
-        "source_labels": ["u1"],
-    }
+    payload = _accepted_compact_payload(summary_text=long_summary)
     snapshot = build_conversation_memory_snapshot_from_events(
         events=(
             _event(
@@ -1718,6 +1710,64 @@ def test_snapshot_json_roundtrip_preserves_vnext_sections() -> None:
 
     assert restored == snapshot
     assert restored.snapshot_digest == calculate_memory_snapshot_digest(restored)
+    mapping = cast(dict[str, JsonValue], value)
+    forward_memory = cast(dict[str, JsonValue], mapping["forward_intent_memory"])
+    intents = cast(list[JsonValue], forward_memory["intents"])
+    intent = cast(dict[str, JsonValue], intents[0])
+    trace_memory = cast(dict[str, JsonValue], mapping["trace_memory"])
+    references = cast(list[JsonValue], trace_memory["reference_continuity_items"])
+    reference = cast(dict[str, JsonValue], references[0])
+    assert intent["intent_type"] == ForwardIntentTypeVNext.NEXT_STEP_NOTE.value
+    assert intent["status"] == ForwardIntentStatusVNext.OPEN.value
+    assert reference["reason"] == ReferenceContinuityReasonVNext.LOCAL_REFERENCE.value
+
+
+@pytest.mark.parametrize(
+    ("section", "field_name", "invalid_value"),
+    (
+        ("forward_intent_memory", "intent_type", "unknown_intent"),
+        ("forward_intent_memory", "status", "unknown_status"),
+        ("trace_memory", "reason", "unknown_reason"),
+    ),
+)
+def test_snapshot_json_rejects_invalid_compact_enum(
+    section: str,
+    field_name: str,
+    invalid_value: str,
+) -> None:
+    """snapshot codec 严格恢复 compact enum，不写 unknown fallback。
+
+    :param section: 被破坏的 snapshot section。
+    :param field_name: 被破坏的 enum 字段。
+    :param invalid_value: 非法 enum value。
+    """
+
+    snapshot = project_conversation_memory_event(
+        previous_snapshot=None,
+        event=_event(
+            1,
+            "compact-invalid-snapshot-enum",
+            CONTEXT_COMPACTED,
+            _accepted_compact_payload(),
+        ),
+        policy=_policy(),
+        built_at=_NOW,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+    )
+    mapping = cast(
+        dict[str, JsonValue],
+        conversation_memory_snapshot_to_json_value(snapshot),
+    )
+    section_mapping = cast(dict[str, JsonValue], mapping[section])
+    items_field = (
+        "reference_continuity_items" if section == "trace_memory" else "intents"
+    )
+    items = cast(list[JsonValue], section_mapping[items_field])
+    item = cast(dict[str, JsonValue], items[0])
+    item[field_name] = invalid_value
+
+    with pytest.raises(ValueError):
+        conversation_memory_snapshot_from_json_value(mapping)
 
 
 def test_snapshot_json_rejects_bool_for_integer_fields() -> None:
@@ -1913,6 +1963,74 @@ def test_projection_consumer_applies_event_and_writes_durable_vnext_snapshot(
             "reference_continuity",
             "session_summary",
         }
+
+
+def test_projection_consumer_invalid_persisted_enum_does_not_advance_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """非法 persisted enum 记录 failure，不写 snapshot 或推进 checkpoint。
+
+    :param tmp_path: pytest 临时目录。
+    """
+
+    policy = _policy()
+    payload = _accepted_compact_payload(facts=[_fact("收入增长。")])
+    candidate = cast(dict[str, JsonValue], payload["accepted_candidate"])
+    intents = cast(list[JsonValue], candidate["forward_intents"])
+    intent = cast(dict[str, JsonValue], intents[0])
+    intent["intent_type"] = "unknown_intent"
+    payload["accepted_candidate_digest"] = sha256_digest_json(candidate)
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id="compact-invalid-enum",
+                    event_class=EventClass.CANONICAL_FACT,
+                    session_id=_SESSION_ID,
+                    run_id=_RUN_ID,
+                    attempt_id=_ATTEMPT_ID,
+                    execution_id=_EXECUTION_ID,
+                    event_type=CONTEXT_COMPACTED,
+                    occurred_at=_OCCURRED_AT,
+                    actor="pytest",
+                    source="pytest",
+                    client_request_id=None,
+                    idempotency_key=None,
+                    policy_decision=None,
+                    reason=None,
+                    payload_json=payload,
+                    payload_ref=None,
+                    payload_digest=None,
+                ),
+            ).row
+        )
+        consumer = ConversationMemoryProjectionConsumer(policy)
+        result = ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
+            consumer.consumer_id,
+            limit=10,
+        )
+        latest = store.transaction_runner.run_read(
+            lambda transaction: read_latest_memory_snapshot(
+                transaction,
+                session_id=_SESSION_ID,
+                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                policy_digest=digest_memory_projection_policy(policy),
+            )
+        )
+        checkpoint = store.transaction_runner.run_read(
+            lambda transaction: read_projection_checkpoint(
+                transaction,
+                CONVERSATION_MEMORY_CONSUMER_ID,
+            )
+        )
+
+        assert result.failures == 1
+        assert result.events_applied == 0
+        assert latest is None
+        assert checkpoint is not None
+        assert checkpoint.checkpoint_event_sequence == 0
+        assert checkpoint.checkpoint_event_id is None
 
 
 def test_projection_consumer_pairs_tool_result_with_requested_query(
@@ -2818,6 +2936,7 @@ def _write_integrity_compact_snapshot(
         payload_ref=None,
         payload_digest=None,
         payload=payload,
+        compacted_semantics=parse_context_compacted_semantic_payload(payload),
     )
     snapshot = project_conversation_memory_event(
         previous_snapshot=None,

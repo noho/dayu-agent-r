@@ -928,9 +928,9 @@ def test_conversation_compact_input_vnext_preserves_previous_multi_record_blocks
                 intents=(
                     ForwardIntent(
                         item_id="memory-item:forward-intent-1",
-                        intent_type="next_step_note",
+                        intent_type=ForwardIntentTypeVNext.NEXT_STEP_NOTE,
                         text="follow up one",
-                        status="open",
+                        status=ForwardIntentStatusVNext.OPEN,
                         source_refs=("event:intent:1",),
                         event_id="event-intent-1",
                         event_sequence=2,
@@ -938,9 +938,11 @@ def test_conversation_compact_input_vnext_preserves_previous_multi_record_blocks
                     ),
                     ForwardIntent(
                         item_id="memory-item:forward-intent-2",
-                        intent_type="pending_user_visible_task",
+                        intent_type=(
+                            ForwardIntentTypeVNext.PENDING_USER_VISIBLE_TASK
+                        ),
                         text="follow up two\nwith wrapped source text",
-                        status="superseded",
+                        status=ForwardIntentStatusVNext.SUPERSEDED,
                         source_refs=("event:intent:2",),
                         event_id="event-intent-2",
                         event_sequence=2,
@@ -954,7 +956,7 @@ def test_conversation_compact_input_vnext_preserves_previous_multi_record_blocks
                     ReferenceContinuityItem(
                         item_id="memory-item:reference-continuity-1",
                         text="first reference",
-                        reason="local_reference",
+                        reason=ReferenceContinuityReasonVNext.LOCAL_REFERENCE,
                         source_refs=("event:reference:1",),
                         event_id="event-reference-1",
                         event_sequence=2,
@@ -963,7 +965,7 @@ def test_conversation_compact_input_vnext_preserves_previous_multi_record_blocks
                     ReferenceContinuityItem(
                         item_id="memory-item:reference-continuity-2",
                         text="second reference\nwith wrapped source text",
-                        reason="recent_state",
+                        reason=ReferenceContinuityReasonVNext.RECENT_STATE,
                         source_refs=("event:reference:2",),
                         event_id="event-reference-2",
                         event_sequence=2,
@@ -3106,9 +3108,9 @@ def _snapshot_with_stable_blocks(
                 intents=(
                     ForwardIntent(
                         item_id="memory-item:forward-intent",
-                        intent_type="next_step_note",
+                        intent_type=ForwardIntentTypeVNext.NEXT_STEP_NOTE,
                         text="follow up",
-                        status="open",
+                        status=ForwardIntentStatusVNext.OPEN,
                         source_refs=("event:intent",),
                         event_id="event-intent",
                         event_sequence=checkpoint_event_sequence,
@@ -3122,7 +3124,7 @@ def _snapshot_with_stable_blocks(
                     ReferenceContinuityItem(
                         item_id="memory-item:reference-continuity",
                         text="second factor",
-                        reason="local_reference",
+                        reason=ReferenceContinuityReasonVNext.LOCAL_REFERENCE,
                         source_refs=("event:reference",),
                         event_id="event-reference",
                         event_sequence=checkpoint_event_sequence,

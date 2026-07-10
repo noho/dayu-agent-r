@@ -8,6 +8,11 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from dayu.host.compaction import (
+    ForwardIntentStatusVNext,
+    ForwardIntentTypeVNext,
+    ReferenceContinuityReasonVNext,
+)
 from dayu.host.memory import (
     AnswerAnchor,
     AnswerAnchorChild,
@@ -194,7 +199,7 @@ def rich_memory_snapshot(
                 ReferenceContinuityItem(
                     item_id="memory-item:reference-continuity:test",
                     text="second factor: margin mix",
-                    reason="needed_for_ordered_item_reference",
+                    reason=ReferenceContinuityReasonVNext.ORDINAL_REFERENCE,
                     source_refs=("event-memory-raw-user",),
                     event_id="event-memory-episode",
                     event_sequence=5,
@@ -235,9 +240,9 @@ def rich_memory_snapshot(
             intents=(
                 ForwardIntent(
                     item_id="memory-item:forward-intent:test",
-                    intent_type="follow_up",
+                    intent_type=ForwardIntentTypeVNext.NEXT_STEP_NOTE,
                     text="what changed in margin?",
-                    status="open",
+                    status=ForwardIntentStatusVNext.OPEN,
                     source_refs=("event-memory-episode",),
                     event_id="event-memory-episode",
                     event_sequence=5,
@@ -348,7 +353,7 @@ def reference_continuity_only_snapshot(
                     ReferenceContinuityItem(
                         item_id="memory-item:reference-continuity:second-factor",
                         text=preserve_text,
-                        reason="needed_for_ordered_item_reference",
+                        reason=ReferenceContinuityReasonVNext.ORDINAL_REFERENCE,
                         source_refs=(source_event_id,),
                         event_id=producer_event_id,
                         event_sequence=producer_event_sequence,

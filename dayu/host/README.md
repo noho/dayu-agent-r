@@ -33,7 +33,7 @@ Dayu 是生产级通用 Agent，具备买方财报分析能力，核心范式是
 - 工具调用只通过 Host-owned ToolRuntime 进入业务工具；工具结果、等待、截断、`fetch_more` 与重复调用治理必须经过 Host accept barrier。
 - accepted 工具结果投影给 Tool Trace、Read API、Conversation Memory、RunInputBuilder 与 compact material 时，LLM-facing 的查询语义、状态语义、结果摘要和业务 source 由 Host 统一投影；下游消费者只消费该投影，不重新回读或猜测 request atom。
 - 上下文预算和 compact 治理由 Host 负责；Engine 只在 provider 明确报告上下文溢出时发出 `context_compaction_requested`。
-- Conversation Memory 只消费 committed canonical facts 与 accepted compact 结果；assistant final answer 和普通工具证据不会自动成为 evidence-backed fact。descriptor-backed terminal answer continuity 由 Host terminal resolver 解析成 typed LLM-facing material，Memory projection 与 RunInputBuilder 不通过改写 EventLog payload 来投影回答文本。
+- Conversation Memory 只消费 committed canonical facts 与 accepted compact 结果；persisted accepted compact candidate 在唯一严格 typed read boundary 恢复，非法 shape、digest 或 enum fail closed，Memory projection 不再自行解释 nested candidate JSON。assistant final answer 和普通工具证据不会自动成为 evidence-backed fact。descriptor-backed terminal answer continuity 由 Host terminal resolver 解析成 typed LLM-facing material，Memory projection 与 RunInputBuilder 不通过改写 EventLog payload 来投影回答文本。
 - 财报业务语义、财报文档下载、预处理、处理与存取不属于 Host；财报文档存取必须通过 `dayu.fins.storage` 下的仓储协议与仓储实现完成。
 
 ## 架构边界

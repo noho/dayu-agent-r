@@ -981,7 +981,6 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_MEMORY_DIAGNOSTICS} (
   snapshot_id TEXT NULL,
   reason TEXT NOT NULL CHECK (
     reason IN (
-      'evidence_backed_fact_candidate_invalid',
       'accepted_evidence_without_fact_candidate',
       'inline_delta_repair_included',
       'snapshot_missing',

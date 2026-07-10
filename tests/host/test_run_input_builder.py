@@ -109,8 +109,21 @@ from dayu.host.durable.state import (
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
 from dayu.host.compaction import (
+    CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
+    AnswerAnchorCandidateVNext,
+    AnswerAnchorChildVNext,
     CompactMaterialBlockKind,
     CompactMaterialSection,
+    CompactQualityCheckResultVNext,
+    ConversationCompactOutputVNext,
+    EvidenceBackedFactCandidateVNext,
+    FactEvidenceKindVNext,
+    ForwardIntentCandidateVNext,
+    ForwardIntentStatusVNext,
+    ForwardIntentTypeVNext,
+    ReferenceContinuityCandidateVNext,
+    ReferenceContinuityReasonVNext,
+    SessionSummaryCandidateVNext,
 )
 from dayu.host.compact_material import (
     RunInputMaterialBlock,
@@ -128,6 +141,7 @@ from dayu.host.context_policy import (
     ContextCompactionTriggerSource,
     context_budget_policy_from_threshold_tokens,
 )
+from dayu.host.context_events import build_context_compacted_payload
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.payload_resolution import event_payload_object
 from dayu.host.run_input import (
@@ -3495,7 +3509,7 @@ def test_reference_continuity_resolves_second_factor_without_full_long_input(
 
         assert "## Reference Continuity" in system_content
         assert f"text={preserve_text}" in system_content
-        assert "reason=needed_for_ordered_item_reference" in system_content
+        assert "reason=ordinal_reference" in system_content
         assert all(long_input not in content for content in contents)
         assert contents[-1] == "第二个因素具体影响是什么？"
 
@@ -6260,47 +6274,53 @@ def _compact_payload(
     :returns: compacted payload。
     """
 
-    resolved_fact_candidates: list[JsonValue]
+    resolved_fact_candidates: list[EvidenceBackedFactCandidateVNext]
     if fact_candidates is None:
         resolved_fact_candidates = [
-            {
-                "claim_text": "Revenue increased year over year",
-                "evidence_labels": ["evidence:memory-tool"],
-            }
+            EvidenceBackedFactCandidateVNext(
+                claim_text="Revenue increased year over year",
+                evidence_labels=("evidence:memory-tool",),
+                evidence_kind=FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL,
+                source_labels=("evidence:memory-tool",),
+            )
         ]
     else:
         resolved_fact_candidates = [
-            {
-                "claim_text": str(candidate["claim_text"]),
-                "evidence_labels": ["evidence:memory-tool"],
-            }
+            EvidenceBackedFactCandidateVNext(
+                claim_text=str(candidate["claim_text"]),
+                evidence_labels=("evidence:memory-tool",),
+                evidence_kind=FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL,
+                source_labels=("evidence:memory-tool",),
+            )
             for candidate in fact_candidates
             if isinstance(candidate, dict) and "claim_text" in candidate
         ]
-    resolved_reference_continuity_items: list[JsonValue]
+    resolved_reference_continuity_items: list[ReferenceContinuityCandidateVNext]
     if reference_continuity_items is None:
         resolved_reference_continuity_items = [
-            {
-                "text": "second factor: margin mix",
-                "reason": "needed_for_ordered_item_reference",
-                "source_labels": ["event-memory-raw-user"],
-            }
+            ReferenceContinuityCandidateVNext(
+                text="second factor: margin mix",
+                reason=ReferenceContinuityReasonVNext.RECENT_STATE,
+                source_labels=("event-memory-raw-user",),
+            )
         ]
     else:
         resolved_reference_continuity_items = [
-            {
-                "text": str(candidate["text"]),
-                "reason": "needed_for_ordered_item_reference",
-                "source_labels": ["event-long-input"],
-            }
+            ReferenceContinuityCandidateVNext(
+                text=str(candidate["text"]),
+                reason=ReferenceContinuityReasonVNext.ORDINAL_REFERENCE,
+                source_labels=("event-long-input",),
+            )
             for candidate in reference_continuity_items
             if isinstance(candidate, dict) and "text" in candidate
         ]
     anchor_text = "compact pinned goal"
     if isinstance(pinned_patch.get("current_goal"), dict):
         current_goal = pinned_patch["current_goal"]
-        if isinstance(current_goal, dict) and isinstance(current_goal.get("value"), str):
-            anchor_text = current_goal["value"]
+        if isinstance(current_goal, dict):
+            current_goal_value = current_goal.get("value")
+            if isinstance(current_goal_value, str):
+                anchor_text = current_goal_value
     forward_text = "compact open question"
     if isinstance(pinned_patch.get("open_questions"), dict):
         open_questions = pinned_patch["open_questions"]
@@ -6308,38 +6328,55 @@ def _compact_payload(
             values = open_questions.get("value")
             if isinstance(values, list) and values and isinstance(values[0], str):
                 forward_text = values[0]
-    payload: dict[str, JsonValue] = {
-        "operation_id": operation_id,
-        "accepted_candidate": {
-            "schema_version": "conversation_compact_output_v1",
-            "session_summary": {
-                "summary_text": summary_text,
-                "source_labels": ["event-memory-raw-user"],
-            },
-            "evidence_backed_facts": resolved_fact_candidates,
-            "answer_anchors": [
-                {
-                    "anchor_title": "Compacted answer anchor",
-                    "anchor_items": [{"display_text": anchor_text, "ordinal": 1}],
-                    "answer_source_labels": ["event-memory-episode"],
-                }
-            ],
-            "forward_intents": [
-                {
-                    "intent_type": "open_question",
-                    "text": forward_text,
-                    "status": "open",
-                    "source_labels": ["event-memory-episode"],
-                }
-            ],
-            "reference_continuity_items": resolved_reference_continuity_items,
-            "diagnostics": [],
-        },
-        "accepted_evidence_mapping_refs": ["evidence:memory-tool"],
-        "compact_artifact_ref": "compact-artifact:test",
-        "compact_artifact_digest": _DIGEST_A,
-    }
-    return payload
+    candidate = ConversationCompactOutputVNext(
+        schema_version=CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
+        session_summary=SessionSummaryCandidateVNext(
+            summary_text=summary_text,
+            source_labels=("event-memory-raw-user",),
+        ),
+        evidence_backed_facts=tuple(resolved_fact_candidates),
+        answer_anchors=(
+            AnswerAnchorCandidateVNext(
+                anchor_title="Compacted answer anchor",
+                anchor_items=(
+                    AnswerAnchorChildVNext(display_text=anchor_text, ordinal=1),
+                ),
+                answer_source_labels=("event-memory-episode",),
+            ),
+        ),
+        forward_intents=(
+            ForwardIntentCandidateVNext(
+                intent_type=ForwardIntentTypeVNext.OPEN_QUESTION,
+                text=forward_text,
+                status=ForwardIntentStatusVNext.OPEN,
+                source_labels=("event-memory-episode",),
+            ),
+        ),
+        reference_continuity_items=tuple(resolved_reference_continuity_items),
+        diagnostics=(),
+    )
+    return dict(
+        build_context_compacted_payload(
+            operation_id=operation_id,
+            accepted_attempt_number=1,
+            compact_artifact_ref="compact-artifact:test",
+            compact_artifact_digest=_DIGEST_A,
+            accepted_candidate=candidate,
+            quality_check_result=CompactQualityCheckResultVNext(
+                accepted=True,
+                rejection_reasons=(),
+            ),
+            budget_after_compact=512,
+            prompt_local_label_mapping_refs=(
+                "prompt-label:event-memory-raw-user",
+                "prompt-label:event-memory-episode",
+                "prompt-label:evidence:memory-tool",
+            ),
+            source_boundary_refs=("event-memory-raw-user",),
+            accepted_evidence_mapping_refs=("evidence:memory-tool",),
+            projection_signal="conversation_memory_projection_catchup",
+        )
+    )
 
 
 def _message_content(message: AgentMessage) -> str:

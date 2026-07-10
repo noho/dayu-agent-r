@@ -50,6 +50,7 @@ from dayu.host._event_payload import (
 from dayu.host._terminal_answer import assistant_final_answer_continuity_text
 from dayu.host.api import AttemptDispatchSnapshot
 from dayu.host.api import AttemptStatus, RunStatus
+from dayu.host.compact_payload import parse_context_compacted_semantic_payload
 from dayu.host.context_events import CONTEXT_COMPACTED, CONTEXT_COMPACTION_REQUESTED
 from dayu.host.context_fallback import (
     ActiveRecentWindowFallback,
@@ -2386,7 +2387,11 @@ def _memory_forward_intent_message(
         return None
     lines = [_MEMORY_FORWARD_INTENT_HEADER]
     for intent in intents:
-        lines.append("forward_intent=" f"type={intent.intent_type}; status={intent.status}; text={intent.text}")
+        lines.append(
+            "forward_intent="
+            f"type={intent.intent_type.value}; "
+            f"status={intent.status.value}; text={intent.text}"
+        )
     return SystemMessage(role=AgentMessageRole.SYSTEM, content="\n".join(lines))
 
 
@@ -2403,7 +2408,9 @@ def _memory_reference_continuity_message(
         return None
     lines = [_MEMORY_REFERENCE_CONTINUITY_HEADER]
     for item in items:
-        lines.append(f"reference_continuity=reason={item.reason}; text={item.text}")
+        lines.append(
+            f"reference_continuity=reason={item.reason.value}; text={item.text}"
+        )
     return SystemMessage(role=AgentMessageRole.SYSTEM, content="\n".join(lines))
 
 
@@ -3175,6 +3182,7 @@ def _memory_projection_event_from_row(transaction: HostTransaction, row: EventLo
     :param row: EventLog row。
     :returns: memory projection event。
     :raises HostDurableError: payload 不是 JSON object 时抛出。
+    :raises ValueError: persisted compact semantic payload 非法时抛出。
     """
 
     payload = _memory_projection_payload(transaction, row)
@@ -3191,6 +3199,11 @@ def _memory_projection_event_from_row(transaction: HostTransaction, row: EventLo
         payload_ref=row.payload_ref,
         payload_digest=row.payload_digest,
         payload=payload,
+        compacted_semantics=(
+            parse_context_compacted_semantic_payload(payload)
+            if row.event_type == CONTEXT_COMPACTED
+            else None
+        ),
         assistant_final_answer_text=_assistant_final_answer_text(
             transaction,
             row,

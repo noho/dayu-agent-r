@@ -38,6 +38,10 @@ from dayu.host.durable.schema import (
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction
 from dayu.host.context_events import CONTEXT_COMPACTED
+from dayu.host.compact_payload import (
+    ContextCompactedSemanticPayload,
+    parse_context_compacted_semantic_payload,
+)
 from dayu.host.accepted_result_projection import project_accepted_tool_result
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
@@ -112,6 +116,7 @@ class _MemoryProjectionPayloadView:
     :param evidence_result_text: 可选 LLM-safe 工具结果文本。
     :param evidence_source_text: 可选业务可读 source 文本；accepted result 正常路径由
         统一 projection owner 提供非空 source 文本。
+    :param compacted_semantics: compact event 的严格 typed semantic view。
     """
 
     payload: Mapping[str, JsonValue]
@@ -120,6 +125,7 @@ class _MemoryProjectionPayloadView:
     evidence_tool_name: str | None
     evidence_result_text: str | None
     evidence_source_text: str | None
+    compacted_semantics: ContextCompactedSemanticPayload | None
 
 
 class MemorySnapshotIntegrityFailureKind(StrEnum):
@@ -360,6 +366,7 @@ def _memory_projection_event_from_view(
         payload_ref=event.payload_ref,
         payload_digest=event.payload_digest,
         payload=payload_view.payload,
+        compacted_semantics=payload_view.compacted_semantics,
         assistant_final_answer_text=payload_view.assistant_final_answer_text,
         evidence_query_text=payload_view.evidence_query_text,
         evidence_tool_name=payload_view.evidence_tool_name,
@@ -377,10 +384,23 @@ def _memory_projection_payload_view(
     :param event: projection runner event view。
     :returns: memory projection 消费的 payload view。
     :raises HostDurableError: terminal artifact descriptor 或工具 payload 损坏时抛出。
+    :raises ValueError: persisted compact semantic payload 非法时抛出。
     """
 
     if event.event_type == _EVENT_TYPE_TOOL_RESULT_ACCEPTED:
         return _tool_result_memory_payload_view(transaction, event)
+    if event.event_type == CONTEXT_COMPACTED:
+        return _MemoryProjectionPayloadView(
+            payload=event.payload,
+            assistant_final_answer_text=None,
+            evidence_query_text=None,
+            evidence_tool_name=None,
+            evidence_result_text=None,
+            evidence_source_text=None,
+            compacted_semantics=parse_context_compacted_semantic_payload(
+                event.payload
+            ),
+        )
     if event.event_type != _EVENT_TYPE_RUN_SUCCEEDED:
         return _MemoryProjectionPayloadView(
             payload=event.payload,
@@ -389,6 +409,7 @@ def _memory_projection_payload_view(
             evidence_tool_name=None,
             evidence_result_text=None,
             evidence_source_text=None,
+            compacted_semantics=None,
         )
     final_answer = assistant_final_answer_continuity_text(
         transaction,
@@ -402,6 +423,7 @@ def _memory_projection_payload_view(
         evidence_tool_name=None,
         evidence_result_text=None,
         evidence_source_text=None,
+        compacted_semantics=None,
     )
 
 
@@ -431,6 +453,7 @@ def _tool_result_memory_payload_view(
             evidence_tool_name=projection.tool_name,
             evidence_result_text=projection.result_text,
             evidence_source_text=projection.source.text,
+            compacted_semantics=None,
         )
     envelope = accepted_evidence_envelope_from_payload(
         event.payload,
@@ -452,6 +475,7 @@ def _tool_result_memory_payload_view(
         evidence_tool_name=projection.tool_name,
         evidence_result_text=projection.result_text,
         evidence_source_text=projection.source.text,
+        compacted_semantics=None,
     )
 
 
@@ -1699,11 +1723,11 @@ def _forward_intent_item_json_value(item: ForwardIntent) -> JsonValue:
     """
 
     return {
-        "intent_type": item.intent_type,
+        "intent_type": item.intent_type.value,
         "item_id": item.item_id,
         "size_units": item.size_units.units,
         "source_refs": list(item.source_refs),
-        "status": item.status,
+        "status": item.status.value,
         "text": item.text,
     }
 
@@ -1719,7 +1743,7 @@ def _reference_continuity_item_json_value(
 
     return {
         "item_id": item.item_id,
-        "reason": item.reason,
+        "reason": item.reason.value,
         "size_units": item.size_units.units,
         "source_refs": list(item.source_refs),
         "text": item.text,
