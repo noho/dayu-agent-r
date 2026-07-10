@@ -89,12 +89,6 @@ _UNTRUSTED_COMPACTION_MATERIAL_BEGIN = "UNTRUSTED_COMPACTION_MATERIAL_JSON_BEGIN
 _UNTRUSTED_COMPACTION_MATERIAL_END = "UNTRUSTED_COMPACTION_MATERIAL_JSON_END"
 _COMPACTOR_PROPOSAL_TIMEOUT_MESSAGE = "compactor proposal timed out"
 _COMPACTOR_PROPOSAL_TIMEOUT_CANCEL_REASON = "compactor_proposal_timeout"
-_POST_COMPACT_SYSTEM_PROMPT_ESTIMATE = (
-    "Host post-compact run context includes session summary, current input, "
-    "evidence-backed facts, answer anchors, forward intents, and continuity items."
-)
-_POST_COMPACT_BASE_MESSAGE_COUNT = 2
-_POST_COMPACT_TOOL_SCHEMA_OVERHEAD_COUNT = 1
 _COMPACTOR_PROJECTION_SCHEMA_VERSION = "compactor_input_projection.v1"
 _SCHEMA_VERSION_FIELD = "schema_version"
 _SESSION_SUMMARY_FIELD = "session_summary"

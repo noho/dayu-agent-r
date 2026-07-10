@@ -83,6 +83,20 @@ def test_llm_context_compactor_does_not_use_thread_bridge() -> None:
     assert "asyncio.run" not in source
 
 
+def test_llm_compaction_dead_post_compact_budget_constants_removed() -> None:
+    """post-compact budget 常量归 context_budget owner，llm_compaction 不再定义副本。"""
+
+    source = inspect.getsource(llm_compaction_module)
+    removed_constants = (
+        "_POST_COMPACT_" + "SYSTEM_PROMPT_ESTIMATE",
+        "_POST_COMPACT_" + "BASE_MESSAGE_COUNT",
+        "_POST_COMPACT_" + "TOOL_SCHEMA_OVERHEAD_COUNT",
+    )
+
+    for constant_name in removed_constants:
+        assert constant_name not in source
+
+
 @pytest.mark.parametrize(
     ("raw_message", "secret_value"),
     (

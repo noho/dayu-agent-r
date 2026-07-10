@@ -183,25 +183,6 @@ _PAYLOAD_FIELD_COMPACT_ARTIFACT_REF = "compact_artifact_ref"
 _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST = "compact_artifact_digest"
 _PAYLOAD_FIELD_OPERATION_ID = "operation_id"
 _PAYLOAD_FIELD_TRIGGER_SOURCE = "trigger_source"
-_PAYLOAD_FIELD_ACCEPTED_CANDIDATE = "accepted_candidate"
-_PAYLOAD_FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS = "accepted_evidence_mapping_refs"
-_PAYLOAD_FIELD_SCHEMA_VERSION = "schema_version"
-_PAYLOAD_FIELD_SESSION_SUMMARY = "session_summary"
-_PAYLOAD_FIELD_SUMMARY_TEXT = "summary_text"
-_PAYLOAD_FIELD_TEXT = "text"
-_PAYLOAD_FIELD_CLAIM_TEXT = "claim_text"
-_PAYLOAD_FIELD_EVIDENCE_LABELS = "evidence_labels"
-_PAYLOAD_FIELD_SOURCE_LABELS = "source_labels"
-_PAYLOAD_FIELD_ANCHOR_TITLE = "anchor_title"
-_PAYLOAD_FIELD_ANCHOR_ITEMS = "anchor_items"
-_PAYLOAD_FIELD_ORDINAL = "ordinal"
-_PAYLOAD_FIELD_INTENT_TYPE = "intent_type"
-_PAYLOAD_FIELD_STATUS = "status"
-_PAYLOAD_FIELD_REASON = "reason"
-_PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS = "evidence_backed_facts"
-_PAYLOAD_FIELD_ANSWER_ANCHORS = "answer_anchors"
-_PAYLOAD_FIELD_FORWARD_INTENTS = "forward_intents"
-_PAYLOAD_FIELD_REFERENCE_CONTINUITY_ITEMS = "reference_continuity_items"
 _NO_TOOL_CANCEL_MESSAGE = "tools are disabled for this attempt"
 _SYSTEM_ENVELOPE_SEPARATOR = "\n\n"
 _SYSTEM_ENVELOPE_HEADER_PREFIX = "## "
@@ -226,7 +207,6 @@ _SYSTEM_ENVELOPE_SECTION_ORDER = (
     _SYSTEM_SECTION_RESUME_GUIDANCE,
 )
 _EXECUTION_GUIDANCE_PREFIX = "Execution guidance:"
-_ACCEPTED_COMPACTED_VIEW_PREFIX = "Accepted compacted conversation view:"
 _RECENT_EVIDENCE_PREFIX = "Recent evidence:"
 _ACCEPTED_TOOL_EVIDENCE_PREFIX = "Accepted tool evidence:"
 _RESUME_GUIDANCE_PREFIX = "恢复上下文："
@@ -344,6 +324,7 @@ class MemorySnapshotView:
     :param diagnostics: memory provider 产生或透传的 diagnostics。
     :param represented_evidence_refs: 已被 stable evidence-backed fact 表示的
         accepted evidence refs。
+    :param latest_compaction_event_ref: memory snapshot 已覆盖的最新 compact event id。
     :param selected_recent_source_refs: 已渲染 selected recent window 的内部来源
         refs，仅用于 provider 内部去重，不进入 LLM-facing messages。
     :param selected_recent_content_digests: 已渲染 selected recent window 的文本
@@ -355,6 +336,7 @@ class MemorySnapshotView:
     policy_digest: str | None
     diagnostics: tuple[MemoryDiagnostic, ...]
     represented_evidence_refs: tuple[str, ...] = ()
+    latest_compaction_event_ref: str | None = None
     selected_recent_source_refs: tuple[str, ...] = ()
     selected_recent_content_digests: tuple[str, ...] = ()
 
@@ -425,14 +407,14 @@ class _RenderedMemoryMessages:
 class CompactArtifactView:
     """Compact artifact provider 输出。
 
-    :param messages: compact artifact messages；Phase 5 noop 为空。
+    :param compaction_event_ref: latest accepted compact event id。
     :param compact_artifact_ref: compact artifact ref；Phase 5 noop 为 ``None``。
     :param compact_artifact_digest: compact artifact digest；Phase 5 noop 为 ``None``。
     :param represented_evidence_refs: 已被 accepted compact artifact 表示的
         canonical evidence refs。
     """
 
-    messages: tuple[AgentMessage, ...]
+    compaction_event_ref: str | None
     compact_artifact_ref: str | None
     compact_artifact_digest: str | None
     represented_evidence_refs: tuple[str, ...] = ()
@@ -1305,7 +1287,7 @@ class NoopCompactArtifactProvider:
 
         del snapshot, current_facts
         return CompactArtifactView(
-            messages=(),
+            compaction_event_ref=None,
             compact_artifact_ref=None,
             compact_artifact_digest=None,
         )
@@ -1605,32 +1587,23 @@ class DurableCompactArtifactProvider:
         row = _latest_compacted_event_before_attempt(transaction, current_facts)
         if row is None:
             return CompactArtifactView(
-                messages=(),
+                compaction_event_ref=None,
                 compact_artifact_ref=None,
                 compact_artifact_digest=None,
             )
         payload = _payload_object(row)
-        artifact_ref = _required_text_field(payload, _PAYLOAD_FIELD_COMPACT_ARTIFACT_REF)
-        artifact_digest = _required_text_field(payload, _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST)
-        message_content = _compact_artifact_message_content(
-            compacted_event=row,
-            payload=payload,
-        )
-        messages: tuple[SystemMessage, ...] = (
-            ()
-            if message_content is None
-            else (
-                SystemMessage(
-                    role=AgentMessageRole.SYSTEM,
-                    content=message_content,
-                ),
-            )
-        )
+        try:
+            semantic_payload = parse_context_compacted_semantic_payload(payload)
+        except (TypeError, ValueError) as exc:
+            raise HostDurableError("compact semantic payload is invalid") from exc
         return CompactArtifactView(
-            messages=messages,
-            compact_artifact_ref=artifact_ref,
-            compact_artifact_digest=artifact_digest,
-            represented_evidence_refs=_accepted_evidence_mapping_refs(payload),
+            compaction_event_ref=row.event_id,
+            compact_artifact_ref=semantic_payload.compact_artifact_ref,
+            compact_artifact_digest=_required_text_field(
+                payload,
+                _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST,
+            ),
+            represented_evidence_refs=semantic_payload.accepted_evidence_mapping_refs,
         )
 
 
@@ -1911,6 +1884,11 @@ class RunInputBuilder:
         continuity = self._session_continuity_provider.load_session_continuity(attempt_snapshot, current_facts)
         memory = self._memory_snapshot_provider.load_memory_snapshot(attempt_snapshot, current_facts)
         compact = self._compact_artifact_provider.load_compact_artifact(attempt_snapshot, current_facts)
+        _require_compact_memory_event_ref_consistency(
+            memory=memory,
+            compact=compact,
+            current_facts=current_facts,
+        )
         fallback = self._context_fallback_provider.load_context_fallback(
             run_id=current_facts.run.run_id,
             run_started_event_sequence=(current_facts.run_started_event.event_sequence),
@@ -1935,7 +1913,6 @@ class RunInputBuilder:
             )
             bounded_context_messages = (
                 *memory.messages,
-                *compact.messages,
                 *protected_recent_raw_tail.messages,
                 *continuity.messages,
             )
@@ -1952,7 +1929,6 @@ class RunInputBuilder:
                 else build_run_input_material_blocks(
                     current_facts=current_facts,
                     memory=memory,
-                    compact=compact,
                     continuity=continuity,
                     accepted_tool_evidence=evidence,
                 )
@@ -2031,7 +2007,6 @@ class RunInputBuilder:
         return build_run_input_material_blocks(
             current_facts=current_facts,
             memory=memory,
-            compact=compact,
             continuity=continuity,
             accepted_tool_evidence=evidence,
         )
@@ -2262,6 +2237,7 @@ def _memory_snapshot_view(
         policy_digest=snapshot.policy_digest,
         diagnostics=snapshot.diagnostics + rendered.diagnostics,
         represented_evidence_refs=_memory_represented_evidence_refs(snapshot),
+        latest_compaction_event_ref=snapshot.latest_compaction_event_ref,
         selected_recent_source_refs=_memory_selected_recent_source_refs(
             snapshot.trace_memory.selected_recent_window,
             render_scope,
@@ -2493,7 +2469,6 @@ def build_run_input_material_blocks(
     *,
     current_facts: CurrentRunFacts,
     memory: MemorySnapshotView,
-    compact: CompactArtifactView,
     continuity: SessionContinuityView,
     accepted_tool_evidence: tuple[RunInputMaterialBlock, ...] = (),
 ) -> tuple[RunInputMaterialBlock, ...]:
@@ -2501,7 +2476,6 @@ def build_run_input_material_blocks(
 
     :param current_facts: 当前 Run durable facts。
     :param memory: memory snapshot provider view。
-    :param compact: compact artifact provider view。
     :param continuity: session continuity provider view。
     :param accepted_tool_evidence: 当前 Attempt 前可用于 compact 的 accepted
         tool evidence material blocks。
@@ -2520,20 +2494,6 @@ def build_run_input_material_blocks(
                 canonical_source_refs=(_memory_material_source_ref(memory),),
                 event_sequence=None,
                 event_sub_index=index,
-            )
-        )
-    compact_source_ref = _compact_material_source_ref(compact)
-    for index, message in enumerate(compact.messages):
-        blocks.append(
-            run_input_material_block(
-                block_id=f"compact:{index}",
-                section=CompactMaterialSection.TRACE_MATERIAL,
-                kind=CompactMaterialBlockKind.SESSION_SUMMARY,
-                text=_run_input_message_content(message),
-                canonical_source_refs=(compact_source_ref,),
-                event_sequence=None,
-                event_sub_index=index,
-                already_represented=True,
             )
         )
     for index, message in enumerate(continuity.messages):
@@ -2626,12 +2586,6 @@ def _system_envelope_section_and_body(content: str) -> tuple[str, str]:
         return _stripped_prefixed_system_body(
             content,
             prefix=_MEMORY_SESSION_SUMMARY_HEADER,
-            section=_SYSTEM_SECTION_CONVERSATION_SUMMARY,
-        )
-    if content.startswith(_ACCEPTED_COMPACTED_VIEW_PREFIX):
-        return _stripped_prefixed_system_body(
-            content,
-            prefix=_ACCEPTED_COMPACTED_VIEW_PREFIX,
             section=_SYSTEM_SECTION_CONVERSATION_SUMMARY,
         )
     if content.startswith(_MEMORY_EVIDENCE_FACT_HEADER):
@@ -3127,18 +3081,39 @@ def _memory_represented_evidence_refs(
     return tuple(dict.fromkeys(refs))
 
 
-def _compact_material_source_ref(compact: CompactArtifactView) -> str:
-    """返回 compact artifact material canonical source ref。
+def _require_compact_memory_event_ref_consistency(
+    *,
+    memory: MemorySnapshotView,
+    compact: CompactArtifactView,
+    current_facts: CurrentRunFacts,
+) -> None:
+    """校验 compact artifact 与 memory snapshot 的 latest compact event id 一致。
 
-    :param compact: compact artifact view。
-    :returns: source ref。
+    :param memory: memory provider view。
+    :param compact: compact artifact provider view。
+    :param current_facts: 当前 Run facts。
+    :returns: ``None``。
+    :raises MemoryProjectionRepairRequired: memory 需要 catch-up / rebuild 时抛出。
+    :raises HostDurableError: repair request 所需 metadata 缺失时抛出。
     """
 
-    if compact.compact_artifact_ref is not None:
-        return f"compact:{compact.compact_artifact_ref}"
-    if compact.compact_artifact_digest is not None:
-        return f"compact:{compact.compact_artifact_digest}"
-    return "compact:no-artifact"
+    compact_ref = compact.compaction_event_ref
+    memory_ref = memory.latest_compaction_event_ref
+    if compact_ref is None and memory_ref is None:
+        return
+    if compact_ref is not None and memory_ref == compact_ref:
+        return
+    if memory.policy_digest is None:
+        raise HostDurableError("memory policy digest is required for compaction repair")
+    raise MemoryProjectionRepairRequired(
+        MemoryRepairRequest(
+            session_id=current_facts.run.session_id,
+            reason=MemoryRepairReason.SNAPSHOT_DAMAGED,
+            required_event_sequence=_required_memory_event_sequence(current_facts),
+            observed_cursor=None,
+            policy_digest=memory.policy_digest,
+        )
+    )
 
 
 def _represented_evidence_refs(memory: MemorySnapshotView, compact: CompactArtifactView) -> tuple[str, ...]:
@@ -3290,7 +3265,7 @@ def _tool_result_memory_payload(
 def _latest_compacted_event_before_attempt(
     transaction: HostTransaction, current_facts: CompactPipelineCurrentRunFacts
 ) -> EventLogRow | None:
-    """读取当前 Attempt start cursor 前最新 ``CONTEXT_COMPACTED``。
+    """读取当前 Session 在 Attempt start cursor 前最新 ``CONTEXT_COMPACTED``。
 
     :param transaction: Host durable transaction。
     :param current_facts: 当前 Run facts。
@@ -3302,7 +3277,6 @@ def _latest_compacted_event_before_attempt(
         SELECT event_id
         FROM {TABLE_EVENT_LOG}
         WHERE session_id = ?
-          AND run_id = ?
           AND event_type = ?
           AND event_class = ?
           AND event_sequence < ?
@@ -3311,7 +3285,6 @@ def _latest_compacted_event_before_attempt(
         """,
         (
             current_facts.run.session_id,
-            current_facts.run.run_id,
             CONTEXT_COMPACTED,
             EventClass.CANONICAL_FACT.value,
             current_facts.attempt.started_event_sequence,
@@ -3329,7 +3302,7 @@ def _latest_compacted_event_before_attempt(
 def _validate_loaded_compact_view_matches_event(
     *, compact: CompactPipelineCompactArtifactView, compacted_event: EventLogRow
 ) -> None:
-    """校验 compact provider view 来自同一个 current-run compact event。
+    """校验 compact provider view 来自同一个 session latest compact event。
 
     :param compact: compact provider view。
     :param compacted_event: current Run / current Attempt 前的 compacted event。
@@ -3388,288 +3361,6 @@ def _text_content_digest(text: str) -> str:
     return sha256_digest_json({"text": text})
 
 
-def _compact_artifact_message_content(
-    *,
-    compacted_event: EventLogRow,
-    payload: Mapping[str, JsonValue],
-) -> str | None:
-    """构造 compact artifact SystemMessage 内容。
-
-    :param compacted_event: ``CONTEXT_COMPACTED`` event row。
-    :param payload: compacted payload。
-    :returns: message 内容；没有可渲染语义项时返回 ``None``。
-    """
-
-    del compacted_event
-    semantic_lines = _vnext_compact_candidate_semantic_lines(payload)
-    if len(semantic_lines) == 0:
-        return None
-    lines = [
-        _ACCEPTED_COMPACTED_VIEW_PREFIX,
-        *semantic_lines,
-    ]
-    return "\n".join(lines)
-
-
-def _accepted_evidence_mapping_refs(
-    payload: Mapping[str, JsonValue],
-) -> tuple[str, ...]:
-    """读取 vNext compact payload 中已接受 evidence mapping refs。
-
-    :param payload: ``CONTEXT_COMPACTED`` vNext payload。
-    :returns: accepted evidence mapping refs。
-    :raises HostDurableError: 字段缺失或包含非文本元素时抛出。
-    """
-
-    return _required_text_list_field(payload, _PAYLOAD_FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS)
-
-
-def _vnext_compact_candidate_semantic_lines(
-    payload: Mapping[str, JsonValue],
-) -> tuple[str, ...]:
-    """从 vNext accepted candidate 渲染完整语义条目。
-
-    :param payload: ``CONTEXT_COMPACTED`` vNext payload。
-    :returns: LLM-facing semantic lines。
-    :raises HostDurableError: accepted candidate 结构损坏时抛出。
-    """
-
-    candidate = _required_mapping_field(payload, _PAYLOAD_FIELD_ACCEPTED_CANDIDATE)
-    _required_text_field(candidate, _PAYLOAD_FIELD_SCHEMA_VERSION)
-    facts = _required_mapping_list_field(candidate, _PAYLOAD_FIELD_EVIDENCE_BACKED_FACTS)
-    anchors = _required_mapping_list_field(candidate, _PAYLOAD_FIELD_ANSWER_ANCHORS)
-    intents = _required_mapping_list_field(candidate, _PAYLOAD_FIELD_FORWARD_INTENTS)
-    references = _required_mapping_list_field(candidate, _PAYLOAD_FIELD_REFERENCE_CONTINUITY_ITEMS)
-    lines: list[str] = []
-    session_summary = _optional_session_summary_text(candidate)
-    if session_summary is not None:
-        lines.append(f"session_summary={session_summary}")
-    lines.extend(_accepted_compact_fact_lines(facts))
-    lines.extend(_accepted_compact_answer_anchor_lines(anchors))
-    lines.extend(_accepted_compact_forward_intent_lines(intents))
-    lines.extend(_accepted_compact_reference_lines(references))
-    return tuple(lines)
-
-
-def _accepted_compact_fact_lines(
-    facts: tuple[Mapping[str, JsonValue], ...],
-) -> tuple[str, ...]:
-    """渲染 accepted compact fact 语义条目。
-
-    :param facts: fact JSON objects。
-    :returns: LLM-facing fact lines。
-    :raises HostDurableError: fact 结构损坏时抛出。
-    """
-
-    lines: list[str] = []
-    for index, fact in enumerate(facts, start=1):
-        parts = [f"fact {index}: claim_text={_required_text_field(fact, _PAYLOAD_FIELD_CLAIM_TEXT)}"]
-        evidence_labels = _optional_text_list_field(
-            fact,
-            _PAYLOAD_FIELD_EVIDENCE_LABELS,
-        )
-        if len(evidence_labels) > 0:
-            parts.append(f"evidence_labels={', '.join(evidence_labels)}")
-        source_labels = _optional_text_list_field(fact, _PAYLOAD_FIELD_SOURCE_LABELS)
-        if len(source_labels) > 0:
-            parts.append(f"source_labels={', '.join(source_labels)}")
-        lines.append("; ".join(parts))
-    return tuple(lines)
-
-
-def _accepted_compact_answer_anchor_lines(
-    anchors: tuple[Mapping[str, JsonValue], ...],
-) -> tuple[str, ...]:
-    """渲染 accepted compact answer anchor 语义条目。
-
-    :param anchors: answer anchor JSON objects。
-    :returns: LLM-facing answer anchor lines。
-    :raises HostDurableError: anchor 结构损坏时抛出。
-    """
-
-    lines: list[str] = []
-    for index, anchor in enumerate(anchors, start=1):
-        title = _required_text_field(anchor, _PAYLOAD_FIELD_ANCHOR_TITLE)
-        item_text = _accepted_compact_anchor_item_text(anchor)
-        line = f"answer_anchor {index}: title={title}"
-        if item_text != "":
-            line = f"{line}; items={item_text}"
-        lines.append(line)
-    return tuple(lines)
-
-
-def _accepted_compact_anchor_item_text(anchor: Mapping[str, JsonValue]) -> str:
-    """渲染 answer anchor 子项文本。
-
-    :param anchor: answer anchor JSON object。
-    :returns: 子项文本；没有子项时返回空字符串。
-    :raises HostDurableError: 子项结构损坏时抛出。
-    """
-
-    value = anchor.get(_PAYLOAD_FIELD_ANCHOR_ITEMS)
-    if value is None:
-        return ""
-    if not isinstance(value, list):
-        raise HostDurableError("answer_anchor.anchor_items must be list")
-    items: list[str] = []
-    for item in value:
-        if not isinstance(item, Mapping):
-            raise HostDurableError("answer_anchor.anchor_items item must be object")
-        display_text = _required_text_field(item, _PAYLOAD_FIELD_DISPLAY_TEXT)
-        ordinal = item.get(_PAYLOAD_FIELD_ORDINAL)
-        if ordinal is None:
-            items.append(display_text)
-        elif isinstance(ordinal, int):
-            items.append(f"{ordinal}. {display_text}")
-        else:
-            raise HostDurableError("answer_anchor.anchor_items ordinal must be int")
-    return "; ".join(items)
-
-
-def _accepted_compact_forward_intent_lines(
-    intents: tuple[Mapping[str, JsonValue], ...],
-) -> tuple[str, ...]:
-    """渲染 accepted compact forward intent 语义条目。
-
-    :param intents: forward intent JSON objects。
-    :returns: LLM-facing forward intent lines。
-    :raises HostDurableError: intent 结构损坏时抛出。
-    """
-
-    lines: list[str] = []
-    for index, intent in enumerate(intents, start=1):
-        lines.append(
-            "forward_intent "
-            f"{index}: type={_required_text_field(intent, _PAYLOAD_FIELD_INTENT_TYPE)}; "
-            f"status={_required_text_field(intent, _PAYLOAD_FIELD_STATUS)}; "
-            f"text={_required_text_field(intent, _PAYLOAD_FIELD_TEXT)}"
-        )
-    return tuple(lines)
-
-
-def _accepted_compact_reference_lines(
-    references: tuple[Mapping[str, JsonValue], ...],
-) -> tuple[str, ...]:
-    """渲染 accepted compact reference continuity 语义条目。
-
-    :param references: reference continuity JSON objects。
-    :returns: LLM-facing reference continuity lines。
-    :raises HostDurableError: reference 结构损坏时抛出。
-    """
-
-    lines: list[str] = []
-    for index, reference in enumerate(references, start=1):
-        parts = [f"reference_continuity {index}: text={_required_text_field(reference, _PAYLOAD_FIELD_TEXT)}"]
-        reason = _optional_semantic_text_field(reference, _PAYLOAD_FIELD_REASON)
-        if reason is not None:
-            parts.append(f"reason={reason}")
-        source_labels = _optional_text_list_field(
-            reference,
-            _PAYLOAD_FIELD_SOURCE_LABELS,
-        )
-        if len(source_labels) > 0:
-            parts.append(f"source_labels={', '.join(source_labels)}")
-        lines.append("; ".join(parts))
-    return tuple(lines)
-
-
-def _optional_session_summary_text(
-    candidate: Mapping[str, JsonValue],
-) -> str | None:
-    """读取 vNext accepted candidate 的可选 session summary 文本。
-
-    :param candidate: ``accepted_candidate`` JSON object。
-    :returns: summary text；无 summary 时返回 ``None``。
-    :raises HostDurableError: summary 字段存在但结构损坏时抛出。
-    """
-
-    value = candidate.get(_PAYLOAD_FIELD_SESSION_SUMMARY)
-    if value is None:
-        return None
-    if not isinstance(value, Mapping):
-        raise HostDurableError("accepted_candidate.session_summary must be object")
-    return _required_text_field(value, _PAYLOAD_FIELD_SUMMARY_TEXT)
-
-
-def _required_mapping_field(payload: Mapping[str, JsonValue], field_name: str) -> Mapping[str, JsonValue]:
-    """读取必填 JSON object 字段。
-
-    :param payload: JSON payload。
-    :param field_name: 字段名。
-    :returns: JSON object。
-    :raises HostDurableError: 字段缺失或非 object 时抛出。
-    """
-
-    value = payload.get(field_name)
-    if not isinstance(value, Mapping):
-        raise HostDurableError(f"payload field {field_name} must be object")
-    return value
-
-
-def _required_mapping_list_field(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> tuple[Mapping[str, JsonValue], ...]:
-    """读取必填 JSON object list 字段。
-
-    :param payload: JSON payload。
-    :param field_name: 字段名。
-    :returns: JSON object tuple。
-    :raises HostDurableError: 字段缺失、非 list 或元素非 object 时抛出。
-    """
-
-    value = payload.get(field_name)
-    if not isinstance(value, list):
-        raise HostDurableError(f"payload field {field_name} must be list")
-    items: list[Mapping[str, JsonValue]] = []
-    for item in value:
-        if not isinstance(item, Mapping):
-            raise HostDurableError(f"payload field {field_name} item must be object")
-        items.append(item)
-    return tuple(items)
-
-
-def _required_text_list_field(payload: Mapping[str, JsonValue], field_name: str) -> tuple[str, ...]:
-    """读取必填文本 list 字段。
-
-    :param payload: JSON payload。
-    :param field_name: 字段名。
-    :returns: 文本 tuple。
-    :raises HostDurableError: 字段缺失、非 list 或元素非文本时抛出。
-    """
-
-    value = payload.get(field_name)
-    if not isinstance(value, list):
-        raise HostDurableError(f"payload field {field_name} must be list")
-    result: list[str] = []
-    for item in value:
-        if not isinstance(item, str) or item.strip() == "":
-            raise HostDurableError(f"payload field {field_name} item must be text")
-        result.append(item)
-    return tuple(result)
-
-
-def _optional_text_list_field(payload: Mapping[str, JsonValue], field_name: str) -> tuple[str, ...]:
-    """读取可选文本 list 字段。
-
-    :param payload: JSON payload。
-    :param field_name: 字段名。
-    :returns: 文本 tuple；字段不存在时返回空 tuple。
-    :raises HostDurableError: 字段存在但非 list 或元素非文本时抛出。
-    """
-
-    value = payload.get(field_name)
-    if value is None:
-        return ()
-    if not isinstance(value, list):
-        raise HostDurableError(f"payload field {field_name} must be list")
-    result: list[str] = []
-    for item in value:
-        if not isinstance(item, str) or item.strip() == "":
-            raise HostDurableError(f"payload field {field_name} item must be text")
-        result.append(item)
-    return tuple(result)
-
-
 def _required_text_field(payload: Mapping[str, JsonValue], field_name: str) -> str:
     """读取必填文本字段。
 
@@ -3683,23 +3374,6 @@ def _required_text_field(payload: Mapping[str, JsonValue], field_name: str) -> s
     if not isinstance(value, str) or value.strip() == "":
         raise HostDurableError(f"payload field {field_name} must be text")
     return value
-
-
-def _optional_semantic_text_field(payload: Mapping[str, JsonValue], field_name: str) -> str | None:
-    """读取 accepted compact semantic renderer 的可选文本字段。
-
-    字段不存在时表示该 semantic item 不提供该属性；字段一旦存在，必须是
-    非空文本，避免把损坏 compact payload 静默渲染为缺省语义。
-
-    :param payload: payload 映射。
-    :param field_name: 字段名。
-    :returns: 文本或 ``None``。
-    :raises HostDurableError: 字段存在但不是非空文本时抛出。
-    """
-
-    if field_name not in payload:
-        return None
-    return _required_text_field(payload, field_name)
 
 
 def _optional_mapping_text(payload: Mapping[str, JsonValue], field_name: str) -> str | None:

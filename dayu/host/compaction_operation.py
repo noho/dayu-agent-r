@@ -24,17 +24,16 @@ from dayu.contracts.json_value import JsonValue
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
 from dayu.host.compact_material import conversation_compact_input_vnext_from_material_pack
+from dayu.host.compact_payload import accepted_compact_business_texts
 from dayu.host.compaction import (
     CompactMaterialBlock,
-    CompactMaterialBlockKind,
     CompactQualityCheckResultVNext,
     CompactionRequest,
     ContextCompactor,
     ConversationCompactInputVNext,
     ConversationCompactOutputVNext,
-    ReferenceContinuityReasonVNext,
 )
-from dayu.host.context_budget import DEFAULT_ESTIMATOR_MESSAGE_OVERHEAD_TOKENS, estimate_budget_text_tokens
+from dayu.host.context_budget import estimate_post_compact_budget
 from dayu.host.context_governance import check_conversation_compact_output_vnext
 from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.durable.artifact import LocalArtifactStore
@@ -66,7 +65,6 @@ _TRUNCATED_SUFFIX = "..."
 _REDACTED_SECRET = "<redacted>"
 _ERROR_CODE_PATTERN = re.compile(r"\berror_code=([A-Za-z0-9_-]+)")
 _LOGGER = logging.getLogger(__name__)
-_POST_COMPACT_BASE_MESSAGE_COUNT = 2
 _EVENT_ID_RUNNER_CALL_INPUT_ASSEMBLED_PREFIX = "event-runner-call-input-assembled"
 _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED = "RUNNER_CALL_INPUT_ASSEMBLED"
 _RUNNER_CALL_KIND_COMPACTOR_PROPOSAL = "compactor_proposal"
@@ -103,22 +101,11 @@ _DIAGNOSTIC_DESCRIPTOR_KIND_COMPACTION_REJECTED_ATTEMPT = (
 _DIAGNOSTIC_STAGE_MATERIAL_PACK_TO_COMPACT_INPUT = (
     "material_pack_to_compact_input"
 )
-_DIAGNOSTIC_STAGE_PREVIOUS_COMPACTED_VIEW_PARSE = (
-    "previous_compacted_view_parse"
-)
 _DIAGNOSTIC_STAGE_PROPOSAL_EXECUTION = "proposal_execution"
-_DIAGNOSTIC_PARSER_PREVIOUS_REFERENCE_CONTINUITY = (
-    "previous_reference_continuity"
-)
 _DIAGNOSTIC_PARSER_COMPACT_INPUT_PROJECTOR = (
     "conversation_compact_input_vnext_from_material_pack"
 )
 _DIAGNOSTIC_PARSER_PROPOSAL_EXECUTION = "compactor_proposal_execution"
-_PREVIOUS_REFERENCE_CONTINUITY_TEXT_INVALID = (
-    "previous reference continuity text is invalid"
-)
-_PREVIOUS_REFERENCE_PREFIX = "reference_continuity="
-_PREVIOUS_REFERENCE_TEXT_PREFIX = "text="
 
 
 @dataclass(frozen=True, slots=True)
@@ -749,7 +736,10 @@ async def run_compaction_operation(
                 attempt_number += 1
                 continue
             quality = check_conversation_compact_output_vnext(compact_input, candidate)
-            last_budget = _budget_after_compact_candidate(pass_request, compact_input, candidate)
+            last_budget = estimate_post_compact_budget(
+                compacted_business_texts=accepted_compact_business_texts(candidate),
+                current_input_text=compact_input.current_input_anchor.text,
+            )
             if not quality.accepted:
                 rejected_attempt = _attempt_rejected(
                     request=pass_request,
@@ -1468,57 +1458,6 @@ def _required_manifest_int(
     return value
 
 
-def _budget_after_compact_candidate(
-    request: CompactionRequest,
-    compact_input: ConversationCompactInputVNext,
-    candidate: ConversationCompactOutputVNext,
-) -> int:
-    """估算 vNext compact 后预算。
-
-    预算是 Host governance 诊断，不由 LLM candidate 输出。本估算只读取
-    accepted candidate 的业务可读文本、当前输入和必须保留的边界 refs。
-
-    :param request: operation root request。
-    :param compact_input: 本次发送给 compactor 的 vNext input。
-    :param candidate: vNext compact output。
-    :returns: 非负 token 估算。
-    """
-
-    fragments = (
-        *_candidate_text_fragments(candidate),
-        compact_input.current_input_anchor.text,
-    )
-    token_count = sum(max(1, estimate_budget_text_tokens(fragment)) for fragment in fragments)
-    return token_count + (
-        DEFAULT_ESTIMATOR_MESSAGE_OVERHEAD_TOKENS * _POST_COMPACT_BASE_MESSAGE_COUNT
-    )
-
-
-def _candidate_text_fragments(candidate: ConversationCompactOutputVNext) -> tuple[str, ...]:
-    """收集 vNext candidate 中会被后续 projection 消费的文本片段。
-
-    :param candidate: vNext compact output。
-    :returns: 文本片段 tuple。
-    """
-
-    fragments: list[str] = []
-    if candidate.session_summary is not None:
-        fragments.append(candidate.session_summary.summary_text)
-    for fact in candidate.evidence_backed_facts:
-        fragments.append(fact.claim_text)
-    for anchor in candidate.answer_anchors:
-        fragments.append(anchor.anchor_title)
-        fragments.extend(item.display_text for item in anchor.anchor_items)
-    for intent in candidate.forward_intents:
-        fragments.append(intent.text)
-    for item in candidate.reference_continuity_items:
-        fragments.append(item.text)
-    for diagnostic in candidate.diagnostics:
-        fragments.append(diagnostic.code)
-        fragments.append(diagnostic.text)
-    return tuple(fragments)
-
-
 def _proposal_failure_diagnostic(
     *,
     request: CompactionRequest,
@@ -1596,13 +1535,9 @@ def _proposal_failure_diagnostic_unchecked(
 
     exception_message = _safe_exception_message(exception)
     previous_blocks = request.material_pack.previous_compacted_view
-    offending = _proposal_failure_offending_block(
-        previous_blocks=previous_blocks,
-        exception_message=exception_message,
-    )
+    offending: CompactionRejectedAttemptOffendingBlock | None = None
     failure_stage, parser_or_validator = _proposal_failure_stage(
         exception_message=exception_message,
-        has_reference_blocks=_has_reference_continuity_blocks(previous_blocks),
         proposal_manifest_reference=proposal_manifest_reference,
     )
     material_pack_digest = sha256_digest_json(
@@ -1641,25 +1576,16 @@ def _proposal_failure_diagnostic_unchecked(
 def _proposal_failure_stage(
     *,
     exception_message: str,
-    has_reference_blocks: bool,
     proposal_manifest_reference: CompactorProposalManifestReference | None,
 ) -> tuple[str, str]:
     """返回 proposal failure 的稳定 stage 与 parser/validator 名称。
 
     :param exception_message: 已脱敏异常消息。
-    :param has_reference_blocks: previous view 是否存在 reference continuity block。
     :param proposal_manifest_reference: proposal manifest ref。
     :returns: ``(failure_stage, parser_or_validator)``。
     """
 
-    if (
-        exception_message == _PREVIOUS_REFERENCE_CONTINUITY_TEXT_INVALID
-        and has_reference_blocks
-    ):
-        return (
-            _DIAGNOSTIC_STAGE_PREVIOUS_COMPACTED_VIEW_PARSE,
-            _DIAGNOSTIC_PARSER_PREVIOUS_REFERENCE_CONTINUITY,
-        )
+    del exception_message
     if proposal_manifest_reference is None:
         return (
             _DIAGNOSTIC_STAGE_MATERIAL_PACK_TO_COMPACT_INPUT,
@@ -1668,74 +1594,6 @@ def _proposal_failure_stage(
     return (
         _DIAGNOSTIC_STAGE_PROPOSAL_EXECUTION,
         _DIAGNOSTIC_PARSER_PROPOSAL_EXECUTION,
-    )
-
-
-def _proposal_failure_offending_block(
-    *,
-    previous_blocks: tuple[CompactMaterialBlock, ...],
-    exception_message: str,
-) -> CompactionRejectedAttemptOffendingBlock | None:
-    """定位 previous compacted view 中的 offending block。
-
-    该诊断逻辑镜像 ``compact_material._parse_previous_reference_continuity_text``
-    当前文本协议，只用于定位 artifact 中的 raw block，不改变 parser 行为。
-
-    :param previous_blocks: previous compacted view blocks。
-    :param exception_message: 已脱敏异常消息。
-    :returns: offending block locator；无法定位时返回 ``None``。
-    """
-
-    if exception_message != _PREVIOUS_REFERENCE_CONTINUITY_TEXT_INVALID:
-        return None
-    for ordinal, block in enumerate(previous_blocks):
-        if block.kind is not CompactMaterialBlockKind.REFERENCE_CONTINUITY:
-            continue
-        if any(_previous_reference_continuity_line_invalid(line) for line in block.text.splitlines()):
-            return _offending_block_locator(block=block, ordinal=ordinal)
-    return None
-
-
-def _previous_reference_continuity_line_invalid(line: str) -> bool:
-    """判断 previous reference continuity 单行是否违反当前 parser 协议。
-
-    :param line: previous reference continuity raw line。
-    :returns: 违反协议时返回 ``True``。
-    """
-
-    parts = line.split("; ")
-    if len(parts) != 2:
-        return True
-    reason_text = parts[0].removeprefix(_PREVIOUS_REFERENCE_PREFIX)
-    readable_text = parts[1].removeprefix(_PREVIOUS_REFERENCE_TEXT_PREFIX)
-    if reason_text == parts[0] or readable_text == parts[1]:
-        return True
-    try:
-        ReferenceContinuityReasonVNext(reason_text)
-    except ValueError:
-        return True
-    return False
-
-
-def _offending_block_locator(
-    *, block: CompactMaterialBlock, ordinal: int
-) -> CompactionRejectedAttemptOffendingBlock:
-    """构造 offending block locator。
-
-    :param block: offending material block。
-    :param ordinal: block 在 previous view 中的序号。
-    :returns: locator。
-    """
-
-    return CompactionRejectedAttemptOffendingBlock(
-        section=block.section.value,
-        kind=block.kind.value,
-        block_label=block.block_label,
-        block_ordinal=ordinal,
-        block_path=f"previous_compacted_view[{ordinal}]",
-        content_digest=block.content_digest,
-        text_digest=_diagnostic_text_digest(block.text),
-        text_length=len(block.text),
     )
 
 
@@ -1894,21 +1752,6 @@ def _previous_block_locator_json(
         "source_labels": list(block.source_labels),
         "canonical_source_refs": list(block.canonical_source_refs),
     }
-
-
-def _has_reference_continuity_blocks(
-    previous_blocks: tuple[CompactMaterialBlock, ...]
-) -> bool:
-    """判断 previous view 是否包含 reference continuity block。
-
-    :param previous_blocks: previous compacted view blocks。
-    :returns: 存在 reference continuity block 时返回 ``True``。
-    """
-
-    return any(
-        block.kind is CompactMaterialBlockKind.REFERENCE_CONTINUITY
-        for block in previous_blocks
-    )
 
 
 def _diagnostic_text_digest(text: str) -> str:

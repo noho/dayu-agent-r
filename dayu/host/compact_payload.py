@@ -158,6 +158,30 @@ def parse_context_compacted_semantic_payload(
     )
 
 
+def accepted_compact_business_texts(
+    candidate: ConversationCompactOutputVNext,
+) -> tuple[str, ...]:
+    """返回 accepted compact 后普通 dispatch 会消费的业务文本。
+
+    :param candidate: typed accepted compact candidate。
+    :returns: 按 memory / ordinary RunInput 业务投影顺序排列的文本 tuple。
+    :raises TypeError: candidate 类型非法时抛出。
+    """
+
+    if not isinstance(candidate, ConversationCompactOutputVNext):
+        raise TypeError("candidate must be ConversationCompactOutputVNext")
+    texts: list[str] = []
+    if candidate.session_summary is not None:
+        texts.append(candidate.session_summary.summary_text)
+    texts.extend(fact.claim_text for fact in candidate.evidence_backed_facts)
+    for anchor in candidate.answer_anchors:
+        texts.append(anchor.anchor_title)
+        texts.extend(item.display_text for item in anchor.anchor_items)
+    texts.extend(intent.text for intent in candidate.forward_intents)
+    texts.extend(item.text for item in candidate.reference_continuity_items)
+    return tuple(texts)
+
+
 def _parse_persisted_candidate(
     candidate: Mapping[str, JsonValue],
 ) -> ConversationCompactOutputVNext:

@@ -157,13 +157,10 @@ from dayu.host.run_input import (
     ToolExecutionMode,
     MemorySnapshotView,
     _SYSTEM_ENVELOPE_FORBIDDEN_FRAGMENTS,
-    _accepted_evidence_mapping_refs,
     _accepted_tool_evidence_content,
-    _compact_artifact_message_content,
     _fallback_context_messages,
     _normalize_ordinary_run_messages,
     _resume_wait_messages_from_current_start,
-    _vnext_compact_candidate_semantic_lines,
     create_no_tool_run_input_builder,
     create_tool_enabled_run_input_builder,
 )
@@ -333,6 +330,56 @@ class _StaticCompactArtifactProvider:
 
         del snapshot, current_facts
         return self.view
+
+
+def _build_with_compact_memory_refs(
+    tmp_path: Path,
+    *,
+    compact_event_ref: str | None,
+    memory_event_ref: str | None,
+    memory_messages: tuple[AgentMessage, ...],
+) -> AgentRunRequest:
+    """用静态 compact/memory refs 构造普通 RunInput。
+
+    :param tmp_path: pytest 临时目录。
+    :param compact_event_ref: compact provider 暴露的 latest compact event id。
+    :param memory_event_ref: memory snapshot 暴露的 latest compact event id。
+    :param memory_messages: memory provider 暴露的 messages。
+    :returns: 构造出的 AgentRunRequest。
+    :raises MemoryProjectionRepairRequired: refs 不一致时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt after compact"),
+        )
+        memory_view = MemorySnapshotView(
+            messages=memory_messages,
+            memory_snapshot_cursor=None,
+            policy_digest="memory-policy:test",
+            diagnostics=(),
+            latest_compaction_event_ref=memory_event_ref,
+        )
+        compact_view = CompactArtifactView(
+            compaction_event_ref=compact_event_ref,
+            compact_artifact_ref=(
+                None if compact_event_ref is None else "compact-artifact:test"
+            ),
+            compact_artifact_digest=(
+                None if compact_event_ref is None else "sha256:" + "1" * 64
+            ),
+        )
+        builder = create_no_tool_run_input_builder(
+            transaction_runner=store.transaction_runner,
+            policy_snapshot=_policy_snapshot(),
+            memory_snapshot_provider=_StaticMemorySnapshotProvider(memory_view),
+            compact_artifact_provider=_StaticCompactArtifactProvider(compact_view),
+        )
+        return builder.build(_attempt_snapshot(seeded))
+    raise AssertionError("durable store context did not build run input")
 
 
 def test_current_user_message_comes_from_durable_user_input(
@@ -1350,7 +1397,7 @@ def test_run_input_builder_represented_refs_exclude_whole_accepted_evidence_bloc
             represented_evidence_refs=(seeded_evidence[0].accepted_evidence_id,),
         )
         compact_view = CompactArtifactView(
-            messages=(),
+            compaction_event_ref=None,
             compact_artifact_ref="compact-artifact:test",
             compact_artifact_digest=None,
             represented_evidence_refs=(seeded_evidence[1].accepted_evidence_id,),
@@ -3220,8 +3267,9 @@ def test_post_compaction_raw_tail_dedupes_memory_selected_recent_window(
             ),
         ),
         memory_snapshot_cursor=None,
-        policy_digest=None,
+        policy_digest="memory-policy:test",
         diagnostics=(),
+        latest_compaction_event_ref="event-run-current-compacted",
         selected_recent_source_refs=(
             "event-run-ordinal-answer-input",
             "event-run-ordinal-answer-success",
@@ -3286,13 +3334,16 @@ def test_post_compaction_raw_tail_skips_without_compact_or_in_fallback(
             session_id=session_id,
             payload=_user_input_payload(current_prompt),
         )
-        no_compact = _build_post_compaction_request(
+        without_compacted_event = _build_post_compaction_request(
             store,
             seeded_without_compact,
             policy,
         )
 
-        assert all(answer_text not in _message_content(message) for message in no_compact.messages)
+        assert all(
+            answer_text not in _message_content(message)
+            for message in without_compacted_event.messages
+        )
 
     with open_host_durable_store(_options(tmp_path / "fallback")) as store:
         session_id = _ensure_session_id(store.transaction_runner)
@@ -3328,6 +3379,15 @@ def test_post_compaction_raw_tail_skips_without_compact_or_in_fallback(
             transaction_runner=store.transaction_runner,
             policy_snapshot=_policy_snapshot(),
             memory_projection_policy=policy,
+            memory_snapshot_provider=_StaticMemorySnapshotProvider(
+                MemorySnapshotView(
+                    messages=(),
+                    memory_snapshot_cursor=None,
+                    policy_digest="memory-policy:test",
+                    diagnostics=(),
+                    latest_compaction_event_ref="event-run-current-compacted",
+                )
+            ),
             compact_artifact_provider=DurableCompactArtifactProvider(store.transaction_runner),
             context_fallback_provider=_StaticContextFallbackProvider(fallback),
         )
@@ -3367,103 +3427,85 @@ def test_accepted_tool_evidence_content_consumes_projection_source_text() -> Non
     assert "event-result" not in content
 
 
-def test_compact_artifact_reader_uses_vnext_evidence_mapping_refs() -> None:
-    """compact artifact reader 只读取 vNext accepted evidence mapping refs。"""
-
-    payload: dict[str, JsonValue] = {
-        "accepted_candidate": {
-            "schema_version": "conversation_compact_output_v1",
-            "session_summary": {
-                "summary_text": "用户关注收入与毛利率。",
-                "source_labels": ["T1"],
-            },
-            "evidence_backed_facts": [{"claim_text": "收入增长", "evidence_labels": ["E1"]}],
-            "answer_anchors": [
-                {
-                    "anchor_title": "收入质量",
-                    "anchor_items": [{"display_text": "关注经常性收入", "ordinal": 1}],
-                }
-            ],
-            "forward_intents": [
-                {
-                    "intent_type": "follow_up",
-                    "status": "open",
-                    "text": "继续核对毛利率。",
-                }
-            ],
-            "reference_continuity_items": [
-                {
-                    "reason": "followup_reference",
-                    "text": "这个因素指收入增长。",
-                    "source_labels": ["T1"],
-                }
-            ],
-            "diagnostics": [],
-        },
-        "accepted_evidence_mapping_refs": ["evidence:memory-tool"],
-    }
-
-    lines = _vnext_compact_candidate_semantic_lines(payload)
-    content = _compact_artifact_message_content(
-        compacted_event=_event_log_row("event-compact"),
-        payload=payload,
-    )
-
-    assert _accepted_evidence_mapping_refs(payload) == ("evidence:memory-tool",)
-    assert lines == (
-        "session_summary=用户关注收入与毛利率。",
-        "fact 1: claim_text=收入增长; evidence_labels=E1",
-        "answer_anchor 1: title=收入质量; items=1. 关注经常性收入",
-        "forward_intent 1: type=follow_up; status=open; text=继续核对毛利率。",
-        "reference_continuity 1: text=这个因素指收入增长。; " "reason=followup_reference; source_labels=T1",
-    )
-    assert all("evidence_backed_facts=" not in line for line in lines)
-    assert all("answer_anchors=" not in line for line in lines)
-    assert content is not None
-    assert "Accepted compacted conversation view:" in content
-    assert "fact 1: claim_text=收入增长" in content
-    assert "evidence_backed_facts=1" not in content
-    assert "answer_anchors=1" not in content
-
-
-@pytest.mark.parametrize(
-    ("field_path", "bad_value"),
-    (
-        ("reference.text", 123),
-        ("reference.reason", ""),
-    ),
-)
-def test_compact_artifact_semantic_renderer_rejects_invalid_optional_text(
-    field_path: str,
-    bad_value: JsonValue,
+def test_no_compact_event_and_no_memory_compaction_ref_builds_without_repair(
+    tmp_path: Path,
 ) -> None:
-    """accepted compact 新 semantic renderer 对坏可选文本字段 fail closed。"""
+    """无 compact event 且 memory 无 latest ref 时正常构造。"""
 
-    payload: dict[str, JsonValue] = {
-        "accepted_candidate": {
-            "schema_version": "conversation_compact_output_v1",
-            "session_summary": None,
-            "evidence_backed_facts": [{"claim_text": "收入增长", "evidence_labels": ["E1"]}],
-            "answer_anchors": [],
-            "forward_intents": [],
-            "reference_continuity_items": [{"reason": "followup_reference", "text": "这个因素指收入增长。"}],
-            "diagnostics": [],
-        },
-        "accepted_evidence_mapping_refs": ["evidence:memory-tool"],
-    }
-    candidate = payload["accepted_candidate"]
-    assert isinstance(candidate, dict)
-    references = candidate["reference_continuity_items"]
-    assert isinstance(references, list)
-    reference = references[0]
-    assert isinstance(reference, dict)
-    if field_path == "reference.text":
-        reference["text"] = bad_value
-    else:
-        reference["reason"] = bad_value
+    request = _build_with_compact_memory_refs(
+        tmp_path,
+        compact_event_ref=None,
+        memory_event_ref=None,
+        memory_messages=(),
+    )
 
-    with pytest.raises(HostDurableError, match="must be text"):
-        _vnext_compact_candidate_semantic_lines(payload)
+    assert request.messages[-1].role is AgentMessageRole.USER
+
+
+def test_matching_compact_and_memory_compaction_event_refs_build_once(
+    tmp_path: Path,
+) -> None:
+    """compact 与 memory latest ref 相等时只渲染 memory 中的 compact 语义一次。"""
+
+    summary_text = "Session Summary Memory:\n用户关注收入与毛利率。"
+    request = _build_with_compact_memory_refs(
+        tmp_path,
+        compact_event_ref="event-compact",
+        memory_event_ref="event-compact",
+        memory_messages=(SystemMessage(role=AgentMessageRole.SYSTEM, content=summary_text),),
+    )
+    contents = "\n".join(_message_content(message) for message in request.messages)
+
+    assert contents.count("用户关注收入与毛利率。") == 1
+    assert "Accepted compacted conversation view:" not in contents
+
+
+def test_compact_event_without_memory_compaction_ref_requires_repair(
+    tmp_path: Path,
+) -> None:
+    """compact event 存在但 memory 未覆盖 latest ref 时要求 repair。"""
+
+    with pytest.raises(MemoryProjectionRepairRequired) as exc_info:
+        _build_with_compact_memory_refs(
+            tmp_path,
+            compact_event_ref="event-compact",
+            memory_event_ref=None,
+            memory_messages=(),
+        )
+
+    assert exc_info.value.repair_request.reason is MemoryRepairReason.SNAPSHOT_DAMAGED
+
+
+def test_memory_compaction_ref_without_compact_event_requires_repair(
+    tmp_path: Path,
+) -> None:
+    """memory latest ref 存在但 compact provider 无 event 时要求 repair。"""
+
+    with pytest.raises(MemoryProjectionRepairRequired) as exc_info:
+        _build_with_compact_memory_refs(
+            tmp_path,
+            compact_event_ref=None,
+            memory_event_ref="event-compact",
+            memory_messages=(),
+        )
+
+    assert exc_info.value.repair_request.reason is MemoryRepairReason.SNAPSHOT_DAMAGED
+
+
+def test_mismatched_compact_and_memory_compaction_event_refs_require_repair(
+    tmp_path: Path,
+) -> None:
+    """compact provider 与 memory latest ref 不同源时要求 repair。"""
+
+    with pytest.raises(MemoryProjectionRepairRequired) as exc_info:
+        _build_with_compact_memory_refs(
+            tmp_path,
+            compact_event_ref="event-compact-new",
+            memory_event_ref="event-compact-old",
+            memory_messages=(),
+        )
+
+    assert exc_info.value.repair_request.reason is MemoryRepairReason.SNAPSHOT_DAMAGED
 
 
 def test_reference_continuity_resolves_second_factor_without_full_long_input(
@@ -3720,6 +3762,7 @@ def _build_request_with_memory(
         policy_snapshot=_policy_snapshot(),
         memory_projection_policy=policy,
         memory_snapshot_provider=provider,
+        compact_artifact_provider=DurableCompactArtifactProvider(store.transaction_runner),
     )
     return builder.build(_attempt_snapshot(seeded))
 
@@ -3737,13 +3780,45 @@ def _build_post_compaction_request(
     :returns: AgentRunRequest。
     """
 
+    latest_compact_event_ref = _latest_current_run_compact_event_ref(
+        store,
+        seeded,
+    )
     builder = create_no_tool_run_input_builder(
         transaction_runner=store.transaction_runner,
         policy_snapshot=_policy_snapshot(),
         memory_projection_policy=policy,
+        memory_snapshot_provider=_StaticMemorySnapshotProvider(
+            MemorySnapshotView(
+                messages=(),
+                memory_snapshot_cursor=None,
+                policy_digest="memory-policy:test",
+                diagnostics=(),
+                latest_compaction_event_ref=latest_compact_event_ref,
+            )
+        ),
         compact_artifact_provider=DurableCompactArtifactProvider(store.transaction_runner),
     )
     return builder.build(_attempt_snapshot(seeded))
+
+
+def _latest_current_run_compact_event_ref(
+    store: HostDurableStore,
+    seeded: _SeededRun,
+) -> str | None:
+    """读取测试 current run compact event id。
+
+    :param store: Host durable store。
+    :param seeded: seeded Run 引用。
+    :returns: 当前 run compact event id；不存在时为 ``None``。
+    """
+
+    event_id = f"event-{seeded.run_id}-compacted"
+    return store.transaction_runner.run_read(
+        lambda transaction: (
+            event_id if EventLogStore().read_event_by_id(transaction, event_id) is not None else None
+        )
+    )
 
 
 def _four_item_answer() -> str:
@@ -4464,6 +4539,28 @@ def _append_rich_memory_source_events(transaction_runner: HostTransactionRunner,
         EventLogStore().append_event(
             transaction,
             _event_request(
+                event_id="event-compact-requested",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id="run-memory",
+                event_type="CONTEXT_COMPACTION_REQUESTED",
+                payload={
+                    "trigger_source": ContextCompactionTriggerSource.PROACTIVE.value,
+                    "budget_reason": "test_rich_memory_source_events",
+                    "budget_snapshot_ref": _DIGEST_A,
+                    "input_snapshot_cursor": 1,
+                    "estimator_digest": _DIGEST_A,
+                    "policy_ref": "test-policy",
+                    "provider_request_id": None,
+                    "provider_error_ref": None,
+                    "attempt_id": None,
+                    "execution_id": None,
+                },
+            ),
+        )
+        EventLogStore().append_event(
+            transaction,
+            _event_request(
                 event_id="event-memory-episode",
                 event_class=EventClass.CANONICAL_FACT,
                 session_id=session_id,
@@ -4531,6 +4628,28 @@ def _append_compacted_gross_margin_facts(transaction_runner: HostTransactionRunn
         EventLogStore().append_event(
             transaction,
             _event_request(
+                event_id="event-compact-requested",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id="run-memory-gross",
+                event_type="CONTEXT_COMPACTION_REQUESTED",
+                payload={
+                    "trigger_source": ContextCompactionTriggerSource.PROACTIVE.value,
+                    "budget_reason": "test_gross_margin_compact",
+                    "budget_snapshot_ref": _DIGEST_A,
+                    "input_snapshot_cursor": 1,
+                    "estimator_digest": _DIGEST_A,
+                    "policy_ref": "test-policy",
+                    "provider_request_id": None,
+                    "provider_error_ref": None,
+                    "attempt_id": None,
+                    "execution_id": None,
+                },
+            ),
+        )
+        EventLogStore().append_event(
+            transaction,
+            _event_request(
                 event_id="event-memory-gross-compact",
                 event_class=EventClass.CANONICAL_FACT,
                 session_id=session_id,
@@ -4579,6 +4698,28 @@ def _append_reference_continuity_compact_marker(
         :returns: compact producer EventLog row。
         """
 
+        EventLogStore().append_event(
+            transaction,
+            _event_request(
+                event_id="event-compact-requested",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id="run-long-input",
+                event_type="CONTEXT_COMPACTION_REQUESTED",
+                payload={
+                    "trigger_source": ContextCompactionTriggerSource.PROACTIVE.value,
+                    "budget_reason": "test_reference_continuity",
+                    "budget_snapshot_ref": _DIGEST_A,
+                    "input_snapshot_cursor": 1,
+                    "estimator_digest": _DIGEST_A,
+                    "policy_ref": "test-policy",
+                    "provider_request_id": None,
+                    "provider_error_ref": None,
+                    "attempt_id": None,
+                    "execution_id": None,
+                },
+            ),
+        )
         return (
             EventLogStore()
             .append_event(

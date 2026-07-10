@@ -17,8 +17,10 @@ from dayu.host.context_budget import (
     ContextBudgetOverageReason,
     DEFAULT_ESTIMATOR_CJK_CHARS_PER_TOKEN,
     DEFAULT_ESTIMATOR_CHARS_PER_TOKEN,
+    DEFAULT_ESTIMATOR_MESSAGE_OVERHEAD_TOKENS,
     DEFAULT_ESTIMATOR_TOOL_SCHEMA_OVERHEAD_TOKENS,
     DEFAULT_INPUT_SOFT_THRESHOLD_RATIO,
+    POST_COMPACT_BASE_MESSAGE_COUNT,
     UsageObservation,
     USAGE_OBSERVATION_STATUS_ESTIMATE_UNAVAILABLE,
     USAGE_OBSERVATION_STATUS_OBSERVED,
@@ -26,6 +28,7 @@ from dayu.host.context_budget import (
     decide_context_budget,
     estimate_budget_text_tokens,
     estimate_context_budget,
+    estimate_post_compact_budget,
 )
 from dayu.host.context_policy import (
     ContextBudgetPolicy,
@@ -110,6 +113,53 @@ def test_text_token_estimator_counts_cjk_more_conservatively() -> None:
     assert DEFAULT_ESTIMATOR_CJK_CHARS_PER_TOKEN == 1
     assert estimate_budget_text_tokens("收入增长明显") == 6
     assert estimate_budget_text_tokens("收入abc增长") == 5
+
+
+def test_post_compact_budget_estimator_counts_empty_current_and_overhead() -> None:
+    """post-compact 预算估算空当前输入时仍保留 user message 与固定 envelope overhead。"""
+
+    estimate = estimate_post_compact_budget(
+        compacted_business_texts=(),
+        current_input_text="",
+    )
+
+    assert estimate == (
+        1
+        + DEFAULT_ESTIMATOR_MESSAGE_OVERHEAD_TOKENS
+        * POST_COMPACT_BASE_MESSAGE_COUNT
+    )
+
+
+def test_post_compact_budget_estimator_counts_all_business_and_current_text() -> None:
+    """post-compact 预算估算统计 compact 业务文本与当前输入文本。"""
+
+    estimate = estimate_post_compact_budget(
+        compacted_business_texts=("abcdef", "收入增长"),
+        current_input_text="current",
+    )
+
+    assert estimate == (
+        estimate_budget_text_tokens("abcdef")
+        + estimate_budget_text_tokens("收入增长")
+        + estimate_budget_text_tokens("current")
+        + DEFAULT_ESTIMATOR_MESSAGE_OVERHEAD_TOKENS
+        * POST_COMPACT_BASE_MESSAGE_COUNT
+    )
+
+
+def test_post_compact_budget_estimator_excludes_diagnostics_by_contract() -> None:
+    """post-compact 预算 owner 只接收业务文本，diagnostic 文本不在输入 contract 内。"""
+
+    business_only = estimate_post_compact_budget(
+        compacted_business_texts=("short fact",),
+        current_input_text="current",
+    )
+    with_diagnostic_text_not_passed = estimate_post_compact_budget(
+        compacted_business_texts=("short fact",),
+        current_input_text="current",
+    )
+
+    assert business_only == with_diagnostic_text_not_passed
 
 
 @pytest.mark.parametrize(

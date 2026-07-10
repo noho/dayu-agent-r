@@ -33,7 +33,7 @@ Dayu 是生产级通用 Agent，具备买方财报分析能力，核心范式是
 - 工具调用只通过 Host-owned ToolRuntime 进入业务工具；工具结果、等待、截断、`fetch_more` 与重复调用治理必须经过 Host accept barrier。
 - accepted 工具结果投影给 Tool Trace、Read API、Conversation Memory、RunInputBuilder 与 compact material 时，LLM-facing 的查询语义、状态语义、结果摘要和业务 source 由 Host 统一投影；下游消费者只消费该投影，不重新回读或猜测 request atom。
 - 上下文预算和 compact 治理由 Host 负责；Engine 只在 provider 明确报告上下文溢出时发出 `context_compaction_requested`。
-- Conversation Memory 只消费 committed canonical facts 与 accepted compact 结果；persisted accepted compact candidate 在唯一严格 typed read boundary 恢复，非法 shape、digest 或 enum fail closed，Memory projection 不再自行解释 nested candidate JSON。assistant final answer 和普通工具证据不会自动成为 evidence-backed fact。descriptor-backed terminal answer continuity 由 Host terminal resolver 解析成 typed LLM-facing material，Memory projection 与 RunInputBuilder 不通过改写 EventLog payload 来投影回答文本。
+- Conversation Memory 只消费 committed canonical facts 与 accepted compact 结果；persisted accepted compact candidate 在唯一严格 typed read boundary 恢复，非法 shape、digest 或 enum fail closed，Memory projection、compact material 与 RunInputBuilder 不各自解释 nested candidate JSON。assistant final answer 和普通工具证据不会自动成为 evidence-backed fact。descriptor-backed terminal answer continuity 由 Host terminal resolver 解析成 typed LLM-facing material，Memory projection 与 RunInputBuilder 不通过改写 EventLog payload 来投影回答文本。
 - 财报业务语义、财报文档下载、预处理、处理与存取不属于 Host；财报文档存取必须通过 `dayu.fins.storage` 下的仓储协议与仓储实现完成。
 
 ## 架构边界
@@ -361,7 +361,7 @@ Dispatch scheduler 只消费已提交的 accepted / queued / pending dispatch fa
 
 ### RunInputBuilder
 
-RunInputBuilder 只从 durable providers 读取当前 Run facts、Session continuity、conversation memory、compact artifact、accepted tool evidence、fallback context、tool schema snapshot、ToolRuntime handle、scene parameters 和 policy snapshot，构造 `AgentRunRequest`。它会把 Host 内部 id、payload ref、projection checkpoint、policy ref、digest 和 dispatch 状态改写为 LLM-facing 自解释 system sections，避免把宿主治理信息伪装成业务事实。descriptor-backed terminal answer continuity 只以 typed answer text 进入 LLM-facing messages，不把 descriptor、digest 或治理 label 当作回答内容。完成普通 runner input 装配后，RunInputBuilder 写入 bounded `RUNNER_CALL_INPUT_ASSEMBLED` manifest，并把完整 LLM-facing messages 与 selected tool schema full JSON 分别保存为可校验 payload descriptor，供 Tool Trace resolver 按需读取。
+RunInputBuilder 只从 durable providers 读取当前 Run facts、Session continuity、conversation memory、compact artifact provenance、accepted tool evidence、fallback context、tool schema snapshot、ToolRuntime handle、scene parameters 和 policy snapshot，构造 `AgentRunRequest`。它会把 Host 内部 id、payload ref、projection checkpoint、policy ref、digest 和 dispatch 状态改写为 LLM-facing 自解释 system sections，避免把宿主治理信息伪装成业务事实。普通 RunInput 不把 accepted compact artifact 渲染成第二条 system message；accepted compact 事实必须先由 Conversation Memory 物化后再进入普通输入，compact artifact event ref 与 memory latest compaction ref 不一致时走 memory repair / catch-up 边界。descriptor-backed terminal answer continuity 只以 typed answer text 进入 LLM-facing messages，不把 descriptor、digest 或治理 label 当作回答内容。完成普通 runner input 装配后，RunInputBuilder 写入 bounded `RUNNER_CALL_INPUT_ASSEMBLED` manifest，并把完整 LLM-facing messages 与 selected tool schema full JSON 分别保存为可校验 payload descriptor，供 Tool Trace resolver 按需读取。
 
 ### EngineEvent ingest
 
@@ -389,7 +389,7 @@ Production wait poller 是 `open_host` 可选装配的 Host runtime。它使用 
 
 ### Context governance
 
-Context governance 使用 `ContextBudgetPolicy`、保守估算器、compact material、compact artifact store、LLM compactor 和 fallback selector 处理上下文预算。它只写 context compaction canonical facts 与 compact artifact refs；accepted compact 后由 memory projection 消费，不直接改写 memory snapshot。
+Context governance 使用 `ContextBudgetPolicy`、保守估算器、compact material、compact artifact store、LLM compactor 和 fallback selector 处理上下文预算。它只写 context compaction canonical facts 与 compact artifact refs；accepted compact 后由 memory projection 消费，不直接改写 memory snapshot。accepted compact 后的普通 dispatch 预算由 context budget owner 基于 accepted candidate 的业务文本与当前输入估算，candidate diagnostics 不参与预算。
 
 ### Conversation Memory
 
@@ -676,7 +676,7 @@ Memory policy 是按语义分区的 budget 模型，不是简单截断全文。`
 
 snapshot 自带稳定 `snapshot_id`、policy digest、cursor、built_at 与 snapshot digest。cursor 记录当前覆盖到的 EventLog `checkpoint_event_sequence` / `checkpoint_event_id`；projection lag、snapshot missing / damaged、snapshot ahead、inline delta repair 等情况以 typed diagnostics 表达。RunInputBuilder 可以在 snapshot 轻微滞后时用 EventLog delta 做 inline repair；超过 policy 上限时必须走 repair / catch-up 路径，而不是让模型看到不一致 memory。Memory repair / catch-up 的 batch size 只控制单页读取和事务粒度；required path 会追到目标 cursor、idle 或 failure，不把 page size 当作正确性停止预算。
 
-Memory 与 compact 的关系必须保持单向：Context Governance / compactor 产出 accepted `CONTEXT_COMPACTED` fact 和 artifact；Memory projection 消费它并更新 read model。Memory 不直接写 compact artifact，不把 failed compact fallback 写成 compact 成功，也不把普通 final answer 或工具结果自动升级为 evidence-backed fact。ordinary RunInput 可以读取 memory snapshot 作为已物化 read model；pre-dispatch compact material 则由 EventLog / payload / artifact truth 构造 latest accepted compact、post-compact delta 与 current input anchor，不把 memory snapshot 当 compact input truth。任何 Run / Attempt truth 仍只来自 EventLog 与状态索引。
+Memory 与 compact 的关系必须保持单向：Context Governance / compactor 产出 accepted `CONTEXT_COMPACTED` fact 和 artifact；Memory projection 消费它并更新 read model。Memory 不直接写 compact artifact，不把 failed compact fallback 写成 compact 成功，也不把普通 final answer 或工具结果自动升级为 evidence-backed fact。ordinary RunInput 可以读取 memory snapshot 作为已物化 read model；pre-dispatch compact material 则由 EventLog / payload / artifact truth 构造 latest accepted compact、post-compact delta 与 current input anchor，不把 memory snapshot 当 compact input truth。latest accepted compact 会一次性生成 previous compacted blocks 与 typed readable view pair，后续 pipeline 只能同步过滤该 pair，不能从字符串或 snapshot 重新解析同一语义。任何 Run / Attempt truth 仍只来自 EventLog 与状态索引。
 
 ### LLM-facing 输入改写
 

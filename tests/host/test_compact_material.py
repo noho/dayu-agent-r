@@ -29,11 +29,12 @@ from dayu.host.compact_material import (
     build_pre_dispatch_compact_material_view,
     check_compact_memory_snapshot_cursor,
     conversation_compact_input_vnext_from_material_pack,
-    degrade_previous_compacted_view_for_recovery,
     normalized_material_text,
     prompt_local_evidence_map,
+    retained_previous_compacted_view_labels_for_recovery,
     run_input_material_block,
     select_compact_segment,
+    transform_previous_compacted_view_pair_for_recovery,
 )
 from dayu.host.compaction import (
     AnswerAnchorCandidateVNext,
@@ -41,6 +42,7 @@ from dayu.host.compaction import (
     CompactMaterialBlock,
     CompactQualityCheckResultVNext,
     CompactMaterialBlockKind,
+    CompactReadableViewVNext,
     CompactMaterialSection,
     CompactSegmentTrigger,
     ConversationCompactInputVNext,
@@ -52,6 +54,11 @@ from dayu.host.compaction import (
     ForwardIntentTypeVNext,
     ReferenceContinuityCandidateVNext,
     ReferenceContinuityReasonVNext,
+    ReadableAnswerAnchorItemVNext,
+    ReadableAnswerAnchorVNext,
+    ReadableFactItemVNext,
+    ReadableForwardIntentVNext,
+    ReadableReferenceContinuityItemVNext,
     SessionSummaryCandidateVNext,
 )
 from dayu.host.context_events import build_context_compacted_payload
@@ -435,6 +442,16 @@ def test_recovery_segment_selection_does_not_use_later_block_to_evade_char_cap()
 def test_degrade_previous_compacted_view_keeps_highest_priority_section_exact() -> None:
     """Tier 2 只保留最高优先级 section，文本 byte-exact 不改写。"""
 
+    answer_anchor = ReadableAnswerAnchorVNext(
+        source_label="P3",
+        anchor_title="answer must drop whole",
+        anchor_items=(
+            ReadableAnswerAnchorItemVNext(
+                display_text="answer child must drop whole",
+                ordinal=None,
+            ),
+        ),
+    )
     previous = (
         _previous_compact_block(
             label="P5",
@@ -444,7 +461,7 @@ def test_degrade_previous_compacted_view_keeps_highest_priority_section_exact() 
         _previous_compact_block(
             label="P3",
             kind=CompactMaterialBlockKind.ANSWER_ANCHOR,
-            text="answer must drop whole",
+            text="answer must drop whole\n- answer child must drop whole",
         ),
         _previous_compact_block(
             label="P1",
@@ -463,17 +480,39 @@ def test_degrade_previous_compacted_view_keeps_highest_priority_section_exact() 
         ),
     )
 
-    degraded = degrade_previous_compacted_view_for_recovery(previous)
+    retained = retained_previous_compacted_view_labels_for_recovery(previous)
+    degraded, degraded_view = transform_previous_compacted_view_pair_for_recovery(
+        blocks=previous,
+        readable_view=CompactReadableViewVNext(
+            session_summary="summary must drop whole",
+            evidence_backed_facts=(
+                ReadableFactItemVNext(source_label="P1", claim_text="fact must stay byte exact"),
+                ReadableFactItemVNext(source_label="P4", claim_text="second fact must stay byte exact"),
+            ),
+            answer_anchors=(answer_anchor,),
+            forward_intents=(),
+            reference_continuity_items=(
+                ReadableReferenceContinuityItemVNext(
+                    source_label="P2",
+                    text="reference must drop whole",
+                    reason=ReferenceContinuityReasonVNext.LOCAL_REFERENCE,
+                ),
+            ),
+        ),
+        retained_block_labels=retained,
+    )
 
     assert tuple(block.block_label for block in degraded) == ("P1", "P4")
     assert tuple(block.text for block in degraded) == (
         "fact must stay byte exact",
         "second fact must stay byte exact",
     )
+    assert degraded_view is not None
+    assert tuple(item.source_label for item in degraded_view.evidence_backed_facts) == ("P1", "P4")
 
 
-def test_degrade_previous_compacted_view_sorts_source_sequences_descending() -> None:
-    """Tier 2 同 section 全有 source sequence 时按最大 sequence 降序。"""
+def test_degrade_previous_compacted_view_preserves_verified_pair_order() -> None:
+    """Tier 2 通过 retained labels 同步过滤 pair，不重排已验证 block 顺序。"""
 
     previous = (
         _previous_compact_block(
@@ -502,14 +541,77 @@ def test_degrade_previous_compacted_view_sorts_source_sequences_descending() -> 
         ),
     )
 
-    degraded = degrade_previous_compacted_view_for_recovery(previous)
+    retained = retained_previous_compacted_view_labels_for_recovery(previous)
+    degraded, degraded_view = transform_previous_compacted_view_pair_for_recovery(
+        blocks=previous,
+        readable_view=CompactReadableViewVNext(
+            session_summary="lower priority summary drops whole",
+            evidence_backed_facts=(
+                ReadableFactItemVNext(source_label="P1", claim_text="older fact remains exact"),
+                ReadableFactItemVNext(source_label="P2", claim_text="newer fact remains exact"),
+                ReadableFactItemVNext(source_label="P3", claim_text="middle fact remains exact"),
+            ),
+            answer_anchors=(),
+            forward_intents=(),
+            reference_continuity_items=(),
+        ),
+        retained_block_labels=retained,
+    )
 
-    assert tuple(block.block_label for block in degraded) == ("P2", "P3", "P1")
+    assert tuple(block.block_label for block in degraded) == ("P1", "P2", "P3")
     assert tuple(block.text for block in degraded) == (
+        "older fact remains exact",
         "newer fact remains exact",
         "middle fact remains exact",
-        "older fact remains exact",
     )
+    assert degraded_view is not None
+    assert tuple(item.source_label for item in degraded_view.evidence_backed_facts) == ("P1", "P2", "P3")
+
+
+def test_compact_material_pack_rejects_previous_typed_pair_text_mismatch() -> None:
+    """CompactMaterialPack 边界拒绝 previous blocks 与 typed view 文本不一致。"""
+
+    previous = (
+        _previous_compact_block(
+            label="P1",
+            kind=CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
+            text="durable fact text",
+        ),
+    )
+    selected = _history_block("new-delta", event_sequence=2, text="new delta")
+    selection = select_compact_segment(
+        trigger_source=CompactSegmentTrigger.PROACTIVE,
+        input_cursor=3,
+        memory_snapshot_cursor=None,
+        policy_digest=_POLICY_DIGEST,
+        material_blocks=(selected,),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="previous evidence_backed_facts block text mismatch",
+    ):
+        build_compact_material_pack(
+            selected_segment=selection,
+            material_blocks=(selected,),
+            memory_snapshot=None,
+            inline_delta_repair_view=None,
+            current_input_ref="event-current",
+            current_input_text="current",
+            previous_compacted_view=previous,
+            previous_compacted_readable_view=CompactReadableViewVNext(
+                session_summary=None,
+                evidence_backed_facts=(
+                    ReadableFactItemVNext(
+                        source_label="P1",
+                        claim_text="different typed text",
+                    ),
+                ),
+                answer_anchors=(),
+                forward_intents=(),
+                reference_continuity_items=(),
+            ),
+        )
 
 
 def test_reactive_segment_uses_frozen_overflow_material_list() -> None:
@@ -600,20 +702,13 @@ def test_vnext_snapshot_does_not_bridge_old_goal_into_previous_view() -> None:
 def test_duplicate_section_owner_raises_for_vnext_previous_and_trace_material() -> None:
     """同一 canonical content 进入两个 LLM-facing section 时必须抛错。"""
 
-    snapshot = recalculate_memory_snapshot_digest(
-        replace(
-            _empty_snapshot(
-                "snapshot-duplicate-owner",
-                checkpoint_event_sequence=2,
-            ),
-            session_summary_memory=SessionSummaryMemoryView(
-                summary_text="duplicate readable content",
-                source_refs=("event:summary",),
-                event_id="event-summary",
-                event_sequence=2,
-                size_units=MemorySizeUnits(26),
-            ),
-        )
+    previous = (
+        _previous_compact_block(
+            label="P1",
+            kind=CompactMaterialBlockKind.SESSION_SUMMARY,
+            text="duplicate readable content",
+            canonical_source_refs=("snapshot-duplicate-owner",),
+        ),
     )
     duplicate_trace_block = run_input_material_block(
         block_id="history-duplicate-owner",
@@ -636,10 +731,18 @@ def test_duplicate_section_owner_raises_for_vnext_previous_and_trace_material() 
         build_compact_material_pack(
             selected_segment=selection,
             material_blocks=(duplicate_trace_block,),
-            memory_snapshot=snapshot,
+            memory_snapshot=None,
             inline_delta_repair_view=None,
             current_input_ref="event-current",
             current_input_text="current input",
+            previous_compacted_view=previous,
+            previous_compacted_readable_view=CompactReadableViewVNext(
+                session_summary="duplicate readable content",
+                evidence_backed_facts=(),
+                answer_anchors=(),
+                forward_intents=(),
+                reference_continuity_items=(),
+            ),
         )
 
 
@@ -874,12 +977,67 @@ def test_conversation_compact_input_vnext_maps_evidence_to_evidence_material() -
     assert "E1.2" not in vnext_input.citable_source_labels
 
 
-def test_conversation_compact_input_vnext_previous_view_maps_stable_blocks() -> None:
-    """vNext previous view 必须映射五类 stable memory blocks。"""
+def test_conversation_compact_input_vnext_uses_typed_previous_pair() -> None:
+    """vNext previous view 必须直接使用已验证 typed previous pair。"""
 
-    snapshot = _snapshot_with_stable_blocks(
-        snapshot_id="snapshot-stable-blocks",
-        checkpoint_event_sequence=2,
+    answer_anchor = ReadableAnswerAnchorVNext(
+        source_label="P3",
+        anchor_title="answer title",
+        anchor_items=(
+            ReadableAnswerAnchorItemVNext(display_text="answer child", ordinal=None),
+        ),
+    )
+    previous = (
+        _previous_compact_block(
+            label="P1",
+            kind=CompactMaterialBlockKind.SESSION_SUMMARY,
+            text="summary text",
+        ),
+        _previous_compact_block(
+            label="P2",
+            kind=CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
+            text="Revenue increased year over year",
+        ),
+        _previous_compact_block(
+            label="P3",
+            kind=CompactMaterialBlockKind.ANSWER_ANCHOR,
+            text="answer title\n- answer child",
+        ),
+        _previous_compact_block(
+            label="P4",
+            kind=CompactMaterialBlockKind.FORWARD_INTENT,
+            text="follow up",
+        ),
+        _previous_compact_block(
+            label="P5",
+            kind=CompactMaterialBlockKind.REFERENCE_CONTINUITY,
+            text="second factor",
+        ),
+    )
+    readable_view = CompactReadableViewVNext(
+        session_summary="summary text",
+        evidence_backed_facts=(
+            ReadableFactItemVNext(
+                source_label="P2",
+                claim_text="Revenue increased year over year",
+            ),
+        ),
+        answer_anchors=(answer_anchor,),
+        forward_intents=(
+            ReadableForwardIntentVNext(
+                source_label="P4",
+                intent_type=ForwardIntentTypeVNext.NEXT_STEP_NOTE,
+                text="follow up",
+                status=ForwardIntentStatusVNext.OPEN,
+            ),
+        ),
+        reference_continuity_items=(
+            ReadableReferenceContinuityItemVNext(
+                source_label="P5",
+                text="second factor",
+                reason=ReferenceContinuityReasonVNext.LOCAL_REFERENCE,
+            ),
+        ),
     )
     selection = select_compact_segment(
         trigger_source=CompactSegmentTrigger.PROACTIVE,
@@ -891,10 +1049,12 @@ def test_conversation_compact_input_vnext_previous_view_maps_stable_blocks() -> 
     pack = build_compact_material_pack(
         selected_segment=selection,
         material_blocks=(),
-        memory_snapshot=snapshot,
+        memory_snapshot=None,
         inline_delta_repair_view=None,
         current_input_ref="event-current",
         current_input_text="current input",
+        previous_compacted_view=previous,
+        previous_compacted_readable_view=readable_view,
     )
 
     vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
@@ -903,10 +1063,10 @@ def test_conversation_compact_input_vnext_previous_view_maps_stable_blocks() -> 
     assert previous_view is not None
     assert previous_view.session_summary == "summary text"
     assert tuple(item.claim_text for item in previous_view.evidence_backed_facts) == (
-        "fact=claim_text=Revenue increased year over year; evidence_refs=evidence:accepted",
+        "Revenue increased year over year",
     )
     assert tuple(item.anchor_title for item in previous_view.answer_anchors) == ("answer title",)
-    assert tuple(item.anchor_items[0].display_text for item in previous_view.answer_anchors) == ("answer title",)
+    assert tuple(item.anchor_items[0].display_text for item in previous_view.answer_anchors) == ("answer child",)
     assert tuple(item.text for item in previous_view.forward_intents) == ("follow up",)
     assert tuple(item.intent_type.value for item in previous_view.forward_intents) == ("next_step_note",)
     assert tuple(item.status.value for item in previous_view.forward_intents) == ("open",)
@@ -914,66 +1074,61 @@ def test_conversation_compact_input_vnext_previous_view_maps_stable_blocks() -> 
     assert tuple(item.reason.value for item in previous_view.reference_continuity_items) == ("local_reference",)
 
 
-def test_conversation_compact_input_vnext_preserves_previous_multi_record_blocks() -> None:
-    """previous compacted view 多记录 block 往返时必须保留记录边界。"""
+def test_conversation_compact_input_vnext_preserves_typed_previous_multi_items() -> None:
+    """previous compacted view 多 item 由 typed pair 保留边界与文本。"""
 
-    base = _snapshot_with_stable_blocks(
-        snapshot_id="snapshot-stable-multi-record-blocks",
-        checkpoint_event_sequence=2,
+    previous = (
+        _previous_compact_block(
+            label="P1",
+            kind=CompactMaterialBlockKind.FORWARD_INTENT,
+            text="follow up one",
+        ),
+        _previous_compact_block(
+            label="P2",
+            kind=CompactMaterialBlockKind.FORWARD_INTENT,
+            text="follow up two\nwith wrapped source text",
+        ),
+        _previous_compact_block(
+            label="P3",
+            kind=CompactMaterialBlockKind.REFERENCE_CONTINUITY,
+            text="first reference",
+        ),
+        _previous_compact_block(
+            label="P4",
+            kind=CompactMaterialBlockKind.REFERENCE_CONTINUITY,
+            text="second reference\nwith wrapped source text",
+        ),
     )
-    snapshot = recalculate_memory_snapshot_digest(
-        replace(
-            base,
-            forward_intent_memory=ForwardIntentMemoryView(
-                intents=(
-                    ForwardIntent(
-                        item_id="memory-item:forward-intent-1",
-                        intent_type=ForwardIntentTypeVNext.NEXT_STEP_NOTE,
-                        text="follow up one",
-                        status=ForwardIntentStatusVNext.OPEN,
-                        source_refs=("event:intent:1",),
-                        event_id="event-intent-1",
-                        event_sequence=2,
-                        size_units=MemorySizeUnits(13),
-                    ),
-                    ForwardIntent(
-                        item_id="memory-item:forward-intent-2",
-                        intent_type=(
-                            ForwardIntentTypeVNext.PENDING_USER_VISIBLE_TASK
-                        ),
-                        text="follow up two\nwith wrapped source text",
-                        status=ForwardIntentStatusVNext.SUPERSEDED,
-                        source_refs=("event:intent:2",),
-                        event_id="event-intent-2",
-                        event_sequence=2,
-                        size_units=MemorySizeUnits(38),
-                    ),
-                )
+    readable_view = CompactReadableViewVNext(
+        session_summary=None,
+        evidence_backed_facts=(),
+        answer_anchors=(),
+        forward_intents=(
+            ReadableForwardIntentVNext(
+                source_label="P1",
+                intent_type=ForwardIntentTypeVNext.NEXT_STEP_NOTE,
+                text="follow up one",
+                status=ForwardIntentStatusVNext.OPEN,
             ),
-            trace_memory=TraceMemoryView(
-                selected_recent_window=(),
-                reference_continuity_items=(
-                    ReferenceContinuityItem(
-                        item_id="memory-item:reference-continuity-1",
-                        text="first reference",
-                        reason=ReferenceContinuityReasonVNext.LOCAL_REFERENCE,
-                        source_refs=("event:reference:1",),
-                        event_id="event-reference-1",
-                        event_sequence=2,
-                        size_units=MemorySizeUnits(15),
-                    ),
-                    ReferenceContinuityItem(
-                        item_id="memory-item:reference-continuity-2",
-                        text="second reference\nwith wrapped source text",
-                        reason=ReferenceContinuityReasonVNext.RECENT_STATE,
-                        source_refs=("event:reference:2",),
-                        event_id="event-reference-2",
-                        event_sequence=2,
-                        size_units=MemorySizeUnits(41),
-                    ),
-                ),
+            ReadableForwardIntentVNext(
+                source_label="P2",
+                intent_type=ForwardIntentTypeVNext.PENDING_USER_VISIBLE_TASK,
+                text="follow up two\nwith wrapped source text",
+                status=ForwardIntentStatusVNext.SUPERSEDED,
             ),
-        )
+        ),
+        reference_continuity_items=(
+            ReadableReferenceContinuityItemVNext(
+                source_label="P3",
+                text="first reference",
+                reason=ReferenceContinuityReasonVNext.LOCAL_REFERENCE,
+            ),
+            ReadableReferenceContinuityItemVNext(
+                source_label="P4",
+                text="second reference\nwith wrapped source text",
+                reason=ReferenceContinuityReasonVNext.RECENT_STATE,
+            ),
+        ),
     )
     selection = select_compact_segment(
         trigger_source=CompactSegmentTrigger.PROACTIVE,
@@ -985,10 +1140,12 @@ def test_conversation_compact_input_vnext_preserves_previous_multi_record_blocks
     pack = build_compact_material_pack(
         selected_segment=selection,
         material_blocks=(),
-        memory_snapshot=snapshot,
+        memory_snapshot=None,
         inline_delta_repair_view=None,
         current_input_ref="event-current",
         current_input_text="current input",
+        previous_compacted_view=previous,
+        previous_compacted_readable_view=readable_view,
     )
 
     vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
@@ -997,7 +1154,7 @@ def test_conversation_compact_input_vnext_preserves_previous_multi_record_blocks
     assert previous_view is not None
     assert tuple(item.text for item in previous_view.forward_intents) == (
         "follow up one",
-        "follow up two with wrapped source text",
+        "follow up two\nwith wrapped source text",
     )
     assert tuple(item.intent_type.value for item in previous_view.forward_intents) == (
         "next_step_note",
@@ -1009,7 +1166,7 @@ def test_conversation_compact_input_vnext_preserves_previous_multi_record_blocks
     )
     assert tuple(item.text for item in previous_view.reference_continuity_items) == (
         "first reference",
-        "second reference with wrapped source text",
+        "second reference\nwith wrapped source text",
     )
     assert tuple(item.reason.value for item in previous_view.reference_continuity_items) == (
         "local_reference",
@@ -1959,6 +2116,7 @@ def test_pre_dispatch_material_view_rejects_boundary_field_mismatches() -> None:
     view = PreDispatchCompactMaterialView(
         material_blocks=(),
         previous_compacted_view=(),
+        previous_compacted_readable_view=None,
         current_input_text="current input",
         source_boundary=boundary,
         latest_compacted_event_id="event-compact",
@@ -2083,11 +2241,19 @@ def test_pre_dispatch_second_compact_rolls_from_latest_accepted_candidate(tmp_pa
 
         assert tuple(block.text for block in view.previous_compacted_view) == (
             "accepted session summary",
-            "fact=claim_text=accepted fact; evidence_refs=E1",
-            "answer_anchor=accepted anchor",
-            "forward_intent=next_step_note; status=open; text=accepted next step",
-            "reference_continuity=local_reference; text=accepted reference",
+            "accepted fact",
+            "accepted anchor\n- 1. accepted anchor item",
+            "accepted next step",
+            "accepted reference",
         )
+        assert view.previous_compacted_readable_view is not None
+        assert view.previous_compacted_readable_view.session_summary == (
+            "accepted session summary"
+        )
+        assert tuple(
+            item.claim_text
+            for item in view.previous_compacted_readable_view.evidence_backed_facts
+        ) == ("accepted fact",)
         assert tuple(block.text for block in view.material_blocks) == (
             "new user after compact",
             '{"kind":"completed","result":{"content":"raw content event-tool-result-after-compact"}}',
@@ -2157,13 +2323,18 @@ def test_pre_dispatch_previous_view_splits_each_accepted_candidate_item(
         )
         assert tuple(block.text for block in view.previous_compacted_view) == (
             "accepted session summary",
-            "fact=claim_text=accepted fact one; evidence_refs=E1",
-            "fact=claim_text=accepted fact two; evidence_refs=E2",
-            "answer_anchor=accepted anchor one",
-            "answer_anchor=accepted anchor two",
-            "forward_intent=next_step_note; status=open; text=accepted next step",
-            "reference_continuity=local_reference; text=accepted reference",
+            "accepted fact one",
+            "accepted fact two",
+            "accepted anchor one\n- 1. accepted anchor item one",
+            "accepted anchor two\n- 1. accepted anchor item two",
+            "accepted next step",
+            "accepted reference",
         )
+        assert view.previous_compacted_readable_view is not None
+        assert tuple(
+            item.source_label
+            for item in view.previous_compacted_readable_view.evidence_backed_facts
+        ) == ("P2", "P3")
 
 
 def test_pre_dispatch_builder_ignores_memory_snapshot_lag_or_missing(tmp_path: Path) -> None:
@@ -2356,6 +2527,13 @@ def test_build_compact_material_pack_uses_explicit_previous_view_without_snapsho
         current_input_ref="event-current",
         current_input_text="current",
         previous_compacted_view=explicit_previous,
+        previous_compacted_readable_view=CompactReadableViewVNext(
+            session_summary="explicit summary",
+            evidence_backed_facts=(),
+            answer_anchors=(),
+            forward_intents=(),
+            reference_continuity_items=(),
+        ),
     )
     first_pack = build_compact_material_pack(
         selected_segment=selection,

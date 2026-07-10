@@ -30,11 +30,13 @@ from dayu.host.compaction import (
     CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
     CompactMaterialBlock,
     CompactMaterialBlockKind,
+    CompactReadableViewVNext,
     CompactMaterialSection,
     ConversationCompactOutputVNext,
     EvidenceBackedFactCandidateVNext,
     FactEvidenceKindVNext,
     CompactQualityCheckResultVNext,
+    ReadableFactItemVNext,
 )
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_fallback import (
@@ -420,6 +422,18 @@ def _material_view(*, current_input_sequence: int) -> PreDispatchCompactMaterial
                 kind=CompactMaterialBlockKind.EVIDENCE_BACKED_FACT,
                 text="previous evidence fact",
             ),
+        ),
+        previous_compacted_readable_view=CompactReadableViewVNext(
+            session_summary="previous summary",
+            evidence_backed_facts=(
+                ReadableFactItemVNext(
+                    source_label="P2",
+                    claim_text="previous evidence fact",
+                ),
+            ),
+            answer_anchors=(),
+            forward_intents=(),
+            reference_continuity_items=(),
         ),
         current_input_text="current user input",
         source_boundary=boundary,
