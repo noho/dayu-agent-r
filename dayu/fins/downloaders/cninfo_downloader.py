@@ -6,9 +6,10 @@
 
 设计要点：
 
-- 仅依赖 ``httpx`` 与 typed model；不依赖 ``CnPipeline``、不写 workspace、
-  不调用 docling，也不生成 ``document_id``（``document_id`` 由 pipeline 层
-  通过 ``build_cn_filing_ids`` 统一生成）。
+- 仅依赖 ``httpx``、typed model 与 pipeline-owned report selection helper；
+  不依赖 ``CnPipeline``、不写 workspace、不调用 docling，也不生成
+  ``document_id``（``document_id`` 由 pipeline 层通过
+  ``build_cn_filing_ids`` 统一生成）。
 - 主源接口：
 
   - ``GET http://www.cninfo.com.cn/new/data/szse_stock.json``：
@@ -17,11 +18,10 @@
     ``stock={code},{orgId}`` + ``category_*_szsh;`` 分类拉公告列表。
   - ``GET http://static.cninfo.com.cn/{adjunctUrl}``：PDF 实体下载。
 
-- 候选筛选：白名单按 category（与请求参数一致），黑名单按标题
-  关键词（摘要 / 英文版 / ``（英文）`` / 英文简版 / 已取消 / 募集说明书 /
-  ESG / 可持续 / 审计 等），并额外排除关于财报正本的公告类文件。
-- 同 ``fiscal_period`` 多版本：``amended=True`` 优先，再按
-  ``announcementTime`` 取最新；无 amended 时取最新一条全文。
+- 产品级候选筛选、标题黑名单、fiscal year 推断、同 period/year 去重、
+  amended 优先与 ``CnReportCandidate`` 构造由
+  ``dayu.fins.pipelines.cn_report_selection`` 持有；本 downloader 只拉取
+  provider raw announcement 并提供 HEAD / GET HTTP 边界。
 - HEAD 失败、PDF magic bytes 校验失败仅影响该 candidate，不让整个
   ticker 流程崩。公告分类查询失败属于 discovery 阶段远端错误，必须抛
   ``RuntimeError``，避免被 workflow 误报成缺报告 skipped。
@@ -46,10 +46,13 @@ import httpx
 from dayu.fins.pipelines.cn_download_models import (
     CnCompanyProfile,
     CnFiscalPeriod,
+    CnReportHeadMeta,
     CnReportCandidate,
     CnReportQuery,
+    CninfoRawAnnouncement,
     DownloadedReportAsset,
 )
+from dayu.fins.pipelines.cn_report_selection import select_cninfo_report_candidates
 from dayu.fins._log import Log
 
 _MODULE: Final[str] = "FINS.CNINFO_DOWNLOADER"
@@ -80,52 +83,6 @@ _PERIOD_TO_CATEGORY: Final[dict[CnFiscalPeriod, str]] = {
 _CNINFO_UNSUPPORTED_INDEPENDENT_PERIODS: Final[frozenset[CnFiscalPeriod]] = frozenset(
     {"Q2", "Q4"}
 )
-
-# 标题黑名单关键词：命中即排除（大小写不敏感）。
-_TITLE_BLOCKLIST: Final[tuple[str, ...]] = (
-    "摘要",
-    "已取消",
-    "已撤销",
-    "撤回",
-    "取消",
-    "更正前",
-    "募集说明书",
-    "ESG",
-    "可持续发展",
-    "审计报告",
-    "财务报表",
-    "意见",
-    "（英文）",
-    "(英文)",
-    "英文)",
-    "英文）",
-    "英文版",
-    "英文简版",
-    "英文简本",
-    "english",
-    "港股公告",
-    "h股公告",
-    "h股",
-)
-
-# 标题含财报关键词但语义是公告时，不应作为财报正本候选。
-_REPORT_NOTICE_TITLE_TOKENS: Final[tuple[str, ...]] = (
-    "公告",
-    "提示性公告",
-    "自愿性披露公告",
-)
-_REPORT_TITLE_TOKENS: Final[tuple[str, ...]] = (
-    "年度报告",
-    "年报",
-    "半年度报告",
-    "一季度报告",
-    "第一季度报告",
-    "三季度报告",
-    "第三季度报告",
-)
-
-# 标题中 "amended" 标记关键词。
-_TITLE_AMENDED_TOKENS: Final[tuple[str, ...]] = ("更正", "更正后", "修订", "补充", "修正")
 
 _PDF_MAGIC_BYTES: Final[bytes] = b"%PDF-"
 _PDF_MIN_BYTES: Final[int] = 1024  # 1 KiB；正常财报 PDF 至少几百 KB。
@@ -309,7 +266,7 @@ class CninfoDiscoveryClient:
         ticker = query.normalized_ticker.strip()
         context = self._resolve_exchange_context(ticker)
 
-        per_period_year: dict[tuple[CnFiscalPeriod, int], list[_RawAnnouncement]] = {}
+        raw_by_period: dict[CnFiscalPeriod, tuple[CninfoRawAnnouncement, ...]] = {}
         for period in query.target_periods:
             category = _PERIOD_TO_CATEGORY.get(period)
             if category is None:
@@ -335,28 +292,12 @@ class CninfoDiscoveryClient:
                 raise RuntimeError(
                     f"巨潮公告分类查询失败: ticker={ticker} period={period} category={category} error={exc}"
                 ) from exc
-            for item in announcements:
-                if _is_title_blocked(item.title):
-                    continue
-                fiscal_year = _infer_fiscal_year(item.title, item.announcement_date)
-                if fiscal_year is None:
-                    continue
-                per_period_year.setdefault((period, fiscal_year), []).append(item)
-
-        candidates: list[CnReportCandidate] = []
-        for (period, fiscal_year), items in per_period_year.items():
-            best = _pick_best_announcement(items)
-            if best is None:
-                continue
-            candidate = self._build_candidate_from_announcement(
-                announcement=best,
-                period=period,
-                fiscal_year=fiscal_year,
-            )
-            if candidate is not None:
-                candidates.append(candidate)
-        candidates.sort(key=lambda c: (-c.fiscal_year, _PERIOD_SORT_KEY[c.fiscal_period]))
-        return tuple(candidates)
+            raw_by_period[period] = tuple(announcements)
+        return select_cninfo_report_candidates(
+            query=query,
+            announcements_by_period=raw_by_period,
+            read_head_meta=self._http_head_meta,
+        )
 
     def download_report_pdf(self, candidate: CnReportCandidate) -> DownloadedReportAsset:
         """下载单份候选 PDF 并返回强类型资产对象。
@@ -508,7 +449,7 @@ class CninfoDiscoveryClient:
         category: str,
         start_date: str,
         end_date: str,
-    ) -> list[_RawAnnouncement]:
+    ) -> list[CninfoRawAnnouncement]:
         """调 ``hisAnnouncement/query`` 拉取一类公告（自动翻页）。
 
         Args:
@@ -527,7 +468,7 @@ class CninfoDiscoveryClient:
             RuntimeError: 主源响应不可解析时抛出。
         """
 
-        announcements: list[_RawAnnouncement] = []
+        announcements: list[CninfoRawAnnouncement] = []
         page_num = 1
         while True:
             payload = self._query_announcement_page(
@@ -611,49 +552,6 @@ class CninfoDiscoveryClient:
         }
         return self._http_post_form(CNINFO_QUERY_URL, data=data)
 
-    def _build_candidate_from_announcement(
-        self,
-        *,
-        announcement: _RawAnnouncement,
-        period: CnFiscalPeriod,
-        fiscal_year: int,
-    ) -> Optional[CnReportCandidate]:
-        """把 ``_RawAnnouncement`` 转为 :class:`CnReportCandidate`。
-
-        Args:
-            announcement: 已筛选公告。
-            period: 当前 fiscal period（来自请求分类）。
-            fiscal_year: 已由调用方解析的财年；为避免重复推断而由调用方注入。
-
-        Returns:
-            候选；HEAD 失败但其他字段齐全时仍返回 candidate（content_length /
-            etag / last_modified 字段为 ``None``）。返回 ``None`` 表示
-            adjunctUrl 缺失等致命缺陷。
-
-        Raises:
-            无（HEAD 失败软降级，不抛）。
-        """
-
-        if not announcement.adjunct_url:
-            return None
-        source_url = CNINFO_STATIC_BASE_URL + announcement.adjunct_url.lstrip("/")
-        head_meta = self._http_head_meta(source_url)
-        title_amended = any(token in announcement.title for token in _TITLE_AMENDED_TOKENS)
-        return CnReportCandidate(
-            provider="cninfo",
-            source_id=announcement.announcement_id,
-            source_url=source_url,
-            title=announcement.title,
-            language="zh",
-            filing_date=announcement.announcement_date,
-            fiscal_year=fiscal_year,
-            fiscal_period=period,
-            amended=title_amended,
-            content_length=head_meta.content_length,
-            etag=head_meta.etag,
-            last_modified=head_meta.last_modified,
-        )
-
     # ---------- HTTP 辅助 ----------
 
     def _http_get_json(self, url: str) -> JsonValue:
@@ -721,7 +619,7 @@ class CninfoDiscoveryClient:
                 self._retry_backoff(attempt)
         raise RuntimeError(f"POST form 失败: url={url} error={last_exc}")
 
-    def _http_head_meta(self, url: str) -> "_HeadMeta":
+    def _http_head_meta(self, url: str) -> CnReportHeadMeta:
         """HEAD 拉取 ``content-length`` / ``etag`` / ``last-modified``。
 
         Args:
@@ -743,7 +641,7 @@ class CninfoDiscoveryClient:
                 self._mark_request_finished()
         except httpx.HTTPError as exc:
             Log.warn(f"HEAD 失败: url={url} error={exc}", module=_MODULE)
-            return _HeadMeta(content_length=None, etag=None, last_modified=None)
+            return CnReportHeadMeta(content_length=None, etag=None, last_modified=None)
         content_length_header = response.headers.get("Content-Length")
         try:
             content_length = (
@@ -751,7 +649,7 @@ class CninfoDiscoveryClient:
             )
         except (TypeError, ValueError):
             content_length = None
-        return _HeadMeta(
+        return CnReportHeadMeta(
             content_length=content_length,
             etag=response.headers.get("ETag"),
             last_modified=response.headers.get("Last-Modified"),
@@ -836,110 +734,11 @@ class CninfoDiscoveryClient:
 # ---------- 模块级私有辅助 ----------
 
 
-@dataclass(frozen=True)
-class _HeadMeta:
-    """HEAD 响应中的 fingerprint 输入字段。"""
-
-    content_length: Optional[int]
-    etag: Optional[str]
-    last_modified: Optional[str]
-
-
-@dataclass(frozen=True)
-class _RawAnnouncement:
-    """巨潮 ``hisAnnouncement/query`` 单条公告的强类型抽象。"""
-
-    sec_code: str
-    announcement_id: str
-    title: str
-    announcement_date: str
-    adjunct_url: str
-
-
-_PERIOD_SORT_KEY: Final[dict[CnFiscalPeriod, int]] = {
-    "FY": 0,
-    "H1": 1,
-    "Q1": 2,
-    "Q2": 3,
-    "Q3": 4,
-    "Q4": 5,
-}
-
-_TITLE_FY_PATTERN: Final[re.Pattern[str]] = re.compile(r"(\d{4})\s*年[年度]?\s*(年度报告|年报)")
-_TITLE_FISCAL_YEAR_FALLBACK: Final[re.Pattern[str]] = re.compile(r"(\d{4})\s*年")
 _CNINFO_HTML_TAG_PATTERN: Final[re.Pattern[str]] = re.compile(r"<[^>]+>")
 
 
-def _is_title_blocked(title: str) -> bool:
-    """判断标题是否命中黑名单。
-
-    Args:
-        title: 公告标题。
-
-    Returns:
-        命中黑名单返回 ``True``；否则 ``False``。
-
-    Raises:
-        无。
-    """
-
-    lowered = title.lower()
-    if any(token.lower() in lowered for token in _TITLE_BLOCKLIST):
-        return True
-    if _has_report_language_marker(title):
-        return True
-    has_report_title = any(token in title for token in _REPORT_TITLE_TOKENS)
-    has_notice_title = any(token in title for token in _REPORT_NOTICE_TITLE_TOKENS)
-    return has_report_title and has_notice_title
-
-
-def _has_report_language_marker(title: str) -> bool:
-    """判断财报标题是否带英文语言标记。
-
-    Args:
-        title: 公告标题。
-
-    Returns:
-        财报标题带 ``英文`` 语言标记时返回 ``True``。
-
-    Raises:
-        无。
-    """
-
-    if "英文" not in title:
-        return False
-    return any(token in title for token in _REPORT_TITLE_TOKENS)
-
-
-def _pick_best_announcement(items: list[_RawAnnouncement]) -> Optional[_RawAnnouncement]:
-    """从同一 fiscal period 的多条公告中挑最新有效全文。
-
-    挑选规则：
-    - 标题命中 :data:`_TITLE_AMENDED_TOKENS`（更正 / 修订 等）优先级最高；
-    - 同优先级下取 ``announcement_date`` 字典序最大（即最新披露日期）。
-
-    Args:
-        items: 同 fiscal period 的候选列表。
-
-    Returns:
-        最佳候选；输入空列表返回 ``None``。
-
-    Raises:
-        无。
-    """
-
-    if not items:
-        return None
-
-    def sort_key(announcement: _RawAnnouncement) -> tuple[int, str]:
-        is_amended = any(token in announcement.title for token in _TITLE_AMENDED_TOKENS)
-        return (1 if is_amended else 0, announcement.announcement_date)
-
-    return max(items, key=sort_key)
-
-
-def _parse_raw_announcement(raw: JsonValue) -> Optional[_RawAnnouncement]:
-    """把巨潮原始公告 dict 转为 :class:`_RawAnnouncement`。
+def _parse_raw_announcement(raw: JsonValue) -> Optional[CninfoRawAnnouncement]:
+    """把巨潮原始公告 dict 转为 :class:`CninfoRawAnnouncement`。
 
     Args:
         raw: ``announcements`` 列表中的单条 dict。
@@ -964,12 +763,13 @@ def _parse_raw_announcement(raw: JsonValue) -> Optional[_RawAnnouncement]:
         return None
     if not sec_code or not announcement_id or not title or not adjunct_url or not announcement_date:
         return None
-    return _RawAnnouncement(
+    return CninfoRawAnnouncement(
         sec_code=sec_code,
         announcement_id=announcement_id,
         title=title,
         announcement_date=announcement_date,
         adjunct_url=adjunct_url,
+        source_url=CNINFO_STATIC_BASE_URL + adjunct_url.lstrip("/"),
     )
 
 
@@ -1024,34 +824,6 @@ def _format_announcement_date(raw_time: JsonValue) -> Optional[str]:
                 return time.strftime("%Y-%m-%d", local)
             except (OverflowError, OSError, ValueError):
                 return None
-    return None
-
-
-def _infer_fiscal_year(title: str, announcement_date: str) -> Optional[int]:
-    """从标题与披露日期推断 fiscal year。
-
-    优先匹配标题 ``YYYY 年年度报告`` 形态；失败则按 ``YYYY 年``；再失败按
-    ``announcement_date`` 推断（H1 / 三季度 等中报通常披露当年；FY 通常披露次年）。
-
-    Args:
-        title: 公告标题。
-        announcement_date: 披露日期 ``YYYY-MM-DD``。
-
-    Returns:
-        推断 fiscal year；解析失败返回 ``None``。
-
-    Raises:
-        无。
-    """
-
-    matched = _TITLE_FY_PATTERN.search(title)
-    if matched is not None:
-        return int(matched.group(1))
-    fallback = _TITLE_FISCAL_YEAR_FALLBACK.search(title)
-    if fallback is not None:
-        return int(fallback.group(1))
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", announcement_date):
-        return int(announcement_date[:4])
     return None
 
 

@@ -449,6 +449,10 @@ Storage 是财报文件系统的唯一访问边界。仓储协议按职责拆分
 
 source repository 拥有 source document acknowledgement 与 provenance；blob repository 拥有最终文件写入边界，并在 `SourceHandle` 写入时拒绝未被 source repository 承认的 source。pipeline 可以请求 staging，但不能绕过 `stage_source_document(...)` 自行发明第二份 staging 真源。
 
+### Downloaders 与 CN/HK report selection
+
+CNInfo / HKEXNews downloader 只负责 HTTP 请求响应、provider JSON 解析、provider raw 字段归一、股票代码匹配、PDF URL 归一、HEAD / GET 与 PDF 字节校验。产品级财报候选语义由 `dayu.fins.pipelines.cn_report_selection` 持有：title blocklist、语言过滤、report kind / fiscal period / fiscal year 推断、同 period/year 去重、amended 优先和 `CnReportCandidate` 构造都在 pipeline helper 内完成。
+
 ### Processors
 
 Processors 在 `dayu.documents.processors` 通用能力上增加财报语义：

@@ -7,7 +7,8 @@
 设计要点：
 
 - 所有 dataclass 均 ``frozen=True``，避免下载链路把可变状态散落到不同阶段。
-- 字面量类型集中在本模块，禁止跨模块再定义同义字面量。
+- CN/HK 专属字面量集中在本模块；共享财报语义值必须消费
+  ``dayu.fins.domain`` 真源，禁止再定义同义字面量。
 - ``CN_PIPELINE_DOWNLOAD_VERSION`` 为常量字符串：commit 时写入 source meta
   的 ``download_version`` 字段；skip 路径必须做版本相等性校验。版本不一致
   视同新候选，必须重新走完整下载流程。该常量随 CN 下载链路语义版本一起
@@ -18,20 +19,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, Literal, Optional
+from typing import Final, Literal, Optional, TypeAlias
+
+from dayu.fins.domain.filing_semantics import FiscalPeriod
 
 CnMarketKind = Literal["CN", "HK"]
 """CN 下载链路覆盖的市场标识。``ticker_normalization.NormalizedTicker.market``
 取值 ``"CN"`` / ``"HK"`` / ``"US"``，本字面量是 CN 链路允许的子集。"""
 
-CnFiscalPeriod = Literal["FY", "H1", "Q1", "Q2", "Q3", "Q4"]
-"""CN/HK 财期字面量集合。
+CnFiscalPeriod: TypeAlias = FiscalPeriod
+"""CN/HK 财期类型别名，消费共享 domain 财期真源。
 
 - ``FY``：年报。
 - ``H1``：半年报。
 - ``Q1`` / ``Q2`` / ``Q3`` / ``Q4``：独立季度报告或季度业绩。
 
-这些字面量表示互不折叠的业务期间：``Q2`` 不归一为 ``H1``，``Q4`` 不归一
+这些值表示互不折叠的业务期间：``Q2`` 不归一为 ``H1``，``Q4`` 不归一
 为 ``FY``。主源缺少某个独立期间报告时由 workflow 统一标记为 skipped，而
 不是用相邻累计期间冒充。
 """
@@ -162,6 +165,71 @@ class CnReportCandidate:
 
 
 @dataclass(frozen=True)
+class CnReportHeadMeta:
+    """候选 PDF HEAD 响应元数据。
+
+    Attributes:
+        content_length: HEAD 返回的 ``Content-Length``；不可用时为 ``None``。
+        etag: HEAD 返回的 ``ETag``。
+        last_modified: HEAD 返回的 ``Last-Modified``。
+    """
+
+    content_length: Optional[int]
+    etag: Optional[str]
+    last_modified: Optional[str]
+
+
+@dataclass(frozen=True)
+class CninfoRawAnnouncement:
+    """巨潮 raw announcement DTO。
+
+    downloader 只负责 provider JSON 字段解析和 URL 归一，不在此对象上执行
+    财报业务筛选、财期推断或 candidate 去重。
+
+    Attributes:
+        sec_code: 巨潮证券代码。
+        announcement_id: 巨潮公告 ID。
+        title: 清洗后的公告标题。
+        announcement_date: 公告披露日期，``YYYY-MM-DD``。
+        adjunct_url: 巨潮 PDF 相对路径。
+        source_url: PDF 绝对 URL。
+    """
+
+    sec_code: str
+    announcement_id: str
+    title: str
+    announcement_date: str
+    adjunct_url: str
+    source_url: str
+
+
+@dataclass(frozen=True)
+class HkexnewsRawAnnouncement:
+    """披露易 raw announcement DTO。
+
+    downloader 只负责 provider 字段解析、股票代码匹配前的 raw 字段清洗和
+    PDF URL 归一，不在此对象上执行语言过滤、财期推断或 candidate 去重。
+
+    Attributes:
+        document_id: 披露易文档 ID。
+        title: 清洗后的公告标题。
+        source_url: PDF 绝对 URL。
+        stock_code_payload: 披露易 ``STOCK_CODE`` 原始多代码字段。
+        category_text: 披露易分类文本。
+        filing_date: 披露日期，``YYYY-MM-DD``。
+        language: 查询语言。
+    """
+
+    document_id: str
+    title: str
+    source_url: str
+    stock_code_payload: str
+    category_text: str
+    filing_date: str
+    language: CnLanguage
+
+
+@dataclass(frozen=True)
 class DownloadedReportAsset:
     """downloader 完成 PDF 下载后返回的强类型资产对象。
 
@@ -193,7 +261,10 @@ __all__ = [
     "CnLanguage",
     "CnMarketKind",
     "CnReportCandidate",
+    "CnReportHeadMeta",
     "CnReportQuery",
     "CnSourceProvider",
+    "CninfoRawAnnouncement",
     "DownloadedReportAsset",
+    "HkexnewsRawAnnouncement",
 ]

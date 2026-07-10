@@ -2,8 +2,10 @@
 
 本模块实现 ``CnReportDiscoveryClientProtocol``：从披露易 stock list 解析
 ``stockId``，通过 ``titleSearchServlet.do`` 发现年报、半年报与季度公告，并
-下载 PDF。模块只依赖 HTTP 客户端和 CN/HK typed model，不依赖 pipeline、
-docling 或 storage，也不生成 ``document_id``。
+下载 PDF。模块只依赖 HTTP 客户端、CN/HK typed model 和 pipeline-owned
+report selection helper；不依赖 storage/docling，也不生成 ``document_id``。
+语言过滤、财期/财年推断、同 period/year 去重、amended 优先与
+``CnReportCandidate`` 构造由 ``dayu.fins.pipelines.cn_report_selection`` 持有。
 """
 
 from __future__ import annotations
@@ -26,9 +28,12 @@ from dayu.fins.pipelines.cn_download_models import (
     CnFiscalPeriod,
     CnLanguage,
     CnReportCandidate,
+    CnReportHeadMeta,
     CnReportQuery,
     DownloadedReportAsset,
+    HkexnewsRawAnnouncement,
 )
+from dayu.fins.pipelines.cn_report_selection import select_hkexnews_report_candidates
 from dayu.fins._log import Log
 
 _MODULE: Final[str] = "FINS.HKEXNEWS_DOWNLOADER"
@@ -57,36 +62,8 @@ DEFAULT_MAX_RETRIES: Final[int] = 3
 RETRY_BACKOFF_BASE_SECONDS: Final[float] = 0.8
 DEFAULT_LANGUAGES: Final[tuple[CnLanguage, ...]] = ("zh",)
 
-_PERIOD_SORT_KEY: Final[dict[CnFiscalPeriod, int]] = {
-    "FY": 0,
-    "H1": 1,
-    "Q1": 2,
-    "Q2": 3,
-    "Q3": 4,
-    "Q4": 5,
-}
-
 _PDF_MAGIC_BYTES: Final[bytes] = b"%PDF-"
 _PDF_MIN_BYTES: Final[int] = 1024
-_TITLE_AMENDED_TOKENS: Final[tuple[str, ...]] = (
-    "更正",
-    "修訂",
-    "修订",
-    "補充",
-    "补充",
-    "REVISED",
-    "SUPPLEMENTAL",
-)
-_ENGLISH_REPORT_TITLE_TOKENS: Final[tuple[str, ...]] = (
-    "ANNUAL REPORT",
-    "INTERIM REPORT",
-    "QUARTERLY REPORT",
-    "QUARTERLY RESULTS",
-    "FIRST QUARTER",
-    "SECOND QUARTER",
-    "THIRD QUARTER",
-    "FOURTH QUARTER",
-)
 _HKEXNEWS_CATEGORY_MARKET: Final[str] = "SEHK"
 _HKEXNEWS_CATEGORY_ZERO: Final[str] = "0"
 _HKEXNEWS_SEARCH_TYPE_BY_STOCK: Final[str] = "1"
@@ -103,29 +80,6 @@ _HKEXNEWS_MB_DATE_RANGE: Final[str] = "0"
 _HKEXNEWS_SORT_BY_DATETIME: Final[str] = "DateTime"
 _HKEXNEWS_SORT_DIR_DESC: Final[str] = "0"
 _HKEXNEWS_FILE_TYPE_PDF: Final[str] = "PDF"
-_PERIOD_INFERENCE_TOKENS: Final[dict[CnFiscalPeriod, tuple[str, ...]]] = {
-    "FY": ("ANNUAL REPORT", "年報", "年报", "年度報告", "年度报告"),
-    "H1": ("INTERIM REPORT", "HALF-YEAR", "HALF YEAR", "中期報告", "中期报告", "半年報", "半年度報告"),
-    "Q1": ("FIRST QUARTER", "FIRST QUARTERLY", "THREE MONTHS", "3 MONTHS", "第一季度", "第一季", "一季度", "一季", "三個月", "三个月"),
-    "Q2": ("SECOND QUARTER", "SECOND QUARTERLY", "SIX MONTHS", "6 MONTHS", "HALF YEAR", "Q2", "第二季度", "第二季", "二季度", "二季", "六個月", "六个月", "半年"),
-    "Q3": ("THIRD QUARTER", "THIRD QUARTERLY", "NINE MONTHS", "9 MONTHS", "第三季度", "第三季", "三季度", "三季", "九個月", "九个月"),
-    "Q4": ("FOURTH QUARTER", "FOURTH QUARTERLY", "TWELVE MONTHS", "12 MONTHS", "FULL YEAR", "Q4", "第四季度", "第四季", "四季度", "四季", "十二個月", "十二个月", "全年"),
-}
-_TITLE_YEAR_PATTERN: Final[re.Pattern[str]] = re.compile(r"(20\d{2}|19\d{2})")
-_TITLE_CHINESE_YEAR_PATTERN: Final[re.Pattern[str]] = re.compile(r"([零〇一二三四五六七八九]{4})年")
-_CHINESE_DIGIT_TO_INT: Final[dict[str, int]] = {
-    "零": 0,
-    "〇": 0,
-    "一": 1,
-    "二": 2,
-    "三": 3,
-    "四": 4,
-    "五": 5,
-    "六": 6,
-    "七": 7,
-    "八": 8,
-    "九": 9,
-}
 _DATE_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"(?P<year>\d{4})[-/](?P<month>\d{1,2})[-/](?P<day>\d{1,2})"
 )
@@ -149,28 +103,6 @@ class _HkStockMappingEntry:
     stock_code: str
     stock_id: str
     company_name: str
-
-
-@dataclass(frozen=True)
-class _RawHkAnnouncement:
-    """披露易 title search 单条公告强类型抽象。"""
-
-    document_id: str
-    title: str
-    file_link: str
-    stock_code_payload: str
-    category_text: str
-    filing_date: str
-    language: CnLanguage
-
-
-@dataclass(frozen=True)
-class _HeadMeta:
-    """HEAD 响应中的候选 fingerprint 字段。"""
-
-    content_length: Optional[int]
-    etag: Optional[str]
-    last_modified: Optional[str]
 
 
 _PERIOD_TO_CATEGORY_SPEC: Final[dict[CnFiscalPeriod, _HkCategorySpec]] = {
@@ -328,7 +260,7 @@ class HkexnewsDiscoveryClient:
             raise ValueError(f"profile.company_id 缺少 HKEX: 前缀: {profile.company_id!r}")
         stock_code = _to_hkex_stock_code(query.normalized_ticker)
 
-        grouped: dict[tuple[CnFiscalPeriod, int], list[_RawHkAnnouncement]] = {}
+        raw_announcements: list[HkexnewsRawAnnouncement] = []
         periods_by_category: dict[_HkCategorySpec, list[CnFiscalPeriod]] = {}
         for period in query.target_periods:
             category_spec = _PERIOD_TO_CATEGORY_SPEC.get(period)
@@ -352,35 +284,12 @@ class HkexnewsDiscoveryClient:
                 raise RuntimeError(
                     f"披露易公告分类查询失败: stock_code={stock_code} periods={','.join(requested_periods)} error={exc}"
                 ) from exc
-            for item in announcements:
-                inferred_period = _infer_fiscal_period_from_text(
-                    title=item.title,
-                    category_text=item.category_text,
-                )
-                if inferred_period not in requested_periods:
-                    continue
-                fiscal_year = _infer_fiscal_year(
-                    title=item.title,
-                    filing_date=item.filing_date,
-                )
-                if fiscal_year is None:
-                    continue
-                grouped.setdefault((inferred_period, fiscal_year), []).append(item)
-
-        candidates: list[CnReportCandidate] = []
-        for (period, fiscal_year), items in grouped.items():
-            best = _pick_best_announcement(items)
-            if best is None:
-                continue
-            candidates.append(
-                self._build_candidate(
-                    announcement=best,
-                    period=period,
-                    fiscal_year=fiscal_year,
-                )
-            )
-        candidates.sort(key=lambda c: (-c.fiscal_year, _PERIOD_SORT_KEY[c.fiscal_period]))
-        return tuple(candidates)
+            raw_announcements.extend(announcements)
+        return select_hkexnews_report_candidates(
+            query=query,
+            announcements=tuple(raw_announcements),
+            read_head_meta=self._http_head_meta,
+        )
 
     def download_report_pdf(self, candidate: CnReportCandidate) -> DownloadedReportAsset:
         """下载单份 HK PDF 并返回资产对象。
@@ -458,7 +367,7 @@ class HkexnewsDiscoveryClient:
         category_spec: _HkCategorySpec,
         start_date: str,
         end_date: str,
-    ) -> list[_RawHkAnnouncement]:
+    ) -> list[HkexnewsRawAnnouncement]:
         """查询单个披露易二级分类的公告列表。
 
         Args:
@@ -475,7 +384,7 @@ class HkexnewsDiscoveryClient:
             RuntimeError: HTTP 或 JSON 解析失败时抛出。
         """
 
-        primary: list[_RawHkAnnouncement] = []
+        primary: list[HkexnewsRawAnnouncement] = []
         for language in self._languages:
             payload = self._http_get_json(
                 HKEXNEWS_TITLE_SEARCH_URL,
@@ -503,48 +412,9 @@ class HkexnewsDiscoveryClient:
                 for item in (_parse_announcement(row, language=language) for row in rows)
                 if item is not None
                 and _announcement_matches_stock(item.stock_code_payload, stock_code)
-                and not _is_english_announcement(item)
             ]
             primary.extend(parsed_rows)
         return primary
-
-    def _build_candidate(
-        self,
-        *,
-        announcement: _RawHkAnnouncement,
-        period: CnFiscalPeriod,
-        fiscal_year: int,
-    ) -> CnReportCandidate:
-        """把披露易公告转换为 ``CnReportCandidate``。
-
-        Args:
-            announcement: 原始公告。
-            period: 财期。
-            fiscal_year: 财年。
-
-        Returns:
-            下载候选。
-
-        Raises:
-            无。HEAD 失败会软降级为空 fingerprint 字段。
-        """
-
-        source_url = _build_absolute_file_url(announcement.file_link)
-        head_meta = self._http_head_meta(source_url)
-        return CnReportCandidate(
-            provider="hkexnews",
-            source_id=announcement.document_id,
-            source_url=source_url,
-            title=announcement.title,
-            language=announcement.language,
-            filing_date=announcement.filing_date,
-            fiscal_year=fiscal_year,
-            fiscal_period=period,
-            amended=_is_amended_title(announcement.title),
-            content_length=head_meta.content_length,
-            etag=head_meta.etag,
-            last_modified=head_meta.last_modified,
-        )
 
     def _http_get_json(
         self,
@@ -580,7 +450,7 @@ class HkexnewsDiscoveryClient:
                 self._retry_backoff(attempt)
         raise RuntimeError(f"GET JSON 失败: url={url} error={last_exc}")
 
-    def _http_head_meta(self, url: str) -> _HeadMeta:
+    def _http_head_meta(self, url: str) -> CnReportHeadMeta:
         """HEAD 拉取 content-length / etag / last-modified。
 
         Args:
@@ -602,13 +472,13 @@ class HkexnewsDiscoveryClient:
                 self._mark_request_finished()
         except httpx.HTTPError as exc:
             Log.warn(f"HEAD 失败: url={url} error={exc}", module=_MODULE)
-            return _HeadMeta(content_length=None, etag=None, last_modified=None)
+            return CnReportHeadMeta(content_length=None, etag=None, last_modified=None)
         raw_length = response.headers.get("Content-Length")
         try:
             content_length = int(raw_length) if raw_length is not None else None
         except ValueError:
             content_length = None
-        return _HeadMeta(
+        return CnReportHeadMeta(
             content_length=content_length,
             etag=response.headers.get("ETag"),
             last_modified=response.headers.get("Last-Modified"),
@@ -789,7 +659,7 @@ def _parse_announcement(
     raw: JsonValue,
     *,
     language: CnLanguage,
-) -> _RawHkAnnouncement | None:
+) -> HkexnewsRawAnnouncement | None:
     """解析 title search 单行公告。
 
     Args:
@@ -828,10 +698,10 @@ def _parse_announcement(
         or filing_date is None
     ):
         return None
-    return _RawHkAnnouncement(
+    return HkexnewsRawAnnouncement(
         document_id=document_id,
         title=_strip_html(title),
-        file_link=file_link,
+        source_url=_build_absolute_file_url(file_link),
         stock_code_payload=stock_code_payload,
         category_text=_strip_html(category_text or ""),
         filing_date=filing_date,
@@ -991,189 +861,6 @@ def _parse_filing_date(raw_date: str | None) -> str | None:
             if year >= 1900:
                 return f"{year:04d}-{month:02d}-{day:02d}"
     return None
-
-
-def _infer_fiscal_year(title: str, filing_date: str) -> int | None:
-    """从标题和披露日期推断财年。
-
-    Args:
-        title: 公告标题。
-        filing_date: 披露日期 ``YYYY-MM-DD``。
-
-    Returns:
-        推断财年；解析失败返回 ``None``。
-
-    Raises:
-        无。
-    """
-
-    matched = _TITLE_YEAR_PATTERN.search(title)
-    if matched is not None:
-        return int(matched.group(1))
-    chinese_matched = _TITLE_CHINESE_YEAR_PATTERN.search(title)
-    if chinese_matched is not None:
-        chinese_year = _parse_chinese_digit_year(chinese_matched.group(1))
-        if chinese_year is not None:
-            return chinese_year
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", filing_date):
-        return int(filing_date[:4])
-    return None
-
-
-def _parse_chinese_digit_year(value: str) -> int | None:
-    """解析 ``二零二五`` 这类逐位中文数字年份。
-
-    Args:
-        value: 四位中文数字年份。
-
-    Returns:
-        解析出的公历年份；格式或范围异常返回 ``None``。
-
-    Raises:
-        无。
-    """
-
-    if len(value) != 4:
-        return None
-    digits: list[str] = []
-    for char in value:
-        digit = _CHINESE_DIGIT_TO_INT.get(char)
-        if digit is None:
-            return None
-        digits.append(str(digit))
-    year = int("".join(digits))
-    if 1900 <= year <= 2099:
-        return year
-    return None
-
-
-def _infer_fiscal_period_from_text(
-    *,
-    title: str,
-    category_text: str,
-) -> CnFiscalPeriod | None:
-    """从标题和分类文本推断 HK 财期。
-
-    Args:
-        title: 公告标题。
-        category_text: 披露易分类文本。
-
-    Returns:
-        推断财期；无法判定返回 ``None``。
-
-    Raises:
-        无。
-    """
-
-    combined = f"{title} {category_text}".upper()
-    normalized_category = category_text.upper()
-    if "季度" in category_text or "QUARTER" in normalized_category:
-        order: tuple[CnFiscalPeriod, ...] = ("Q4", "Q3", "Q2", "Q1", "H1", "FY")
-    else:
-        order = ("H1", "FY", "Q4", "Q3", "Q2", "Q1")
-    for period in order:
-        tokens = _PERIOD_INFERENCE_TOKENS[period]
-        if any(token.upper() in combined for token in tokens):
-            return period
-    return None
-
-
-def _pick_best_announcement(items: list[_RawHkAnnouncement]) -> _RawHkAnnouncement | None:
-    """从同一 fiscal year + period 的公告中挑最佳版本。
-
-    Args:
-        items: 同组公告。
-
-    Returns:
-        最佳公告；空列表返回 ``None``。
-
-    Raises:
-        无。
-    """
-
-    if not items:
-        return None
-
-    def sort_key(item: _RawHkAnnouncement) -> tuple[int, str]:
-        return (1 if _is_amended_title(item.title) else 0, item.filing_date)
-
-    return max(items, key=sort_key)
-
-
-def _is_amended_title(title: str) -> bool:
-    """判断标题是否为更正/修订版本。
-
-    Args:
-        title: 公告标题。
-
-    Returns:
-        是更正版本返回 ``True``。
-
-    Raises:
-        无。
-    """
-
-    upper = title.upper()
-    return any(token.upper() in upper for token in _TITLE_AMENDED_TOKENS)
-
-
-def _is_english_announcement(announcement: _RawHkAnnouncement) -> bool:
-    """判断披露易公告是否属于英文候选。
-
-    Args:
-        announcement: 披露易原始公告对象。
-
-    Returns:
-        英文语言入口或标题/分类明显为英文时返回 ``True``。
-
-    Raises:
-        无。
-    """
-
-    if announcement.language == "en":
-        return True
-    if _looks_like_english_report_text(announcement.title):
-        return True
-    if not _contains_cjk(announcement.title) and _looks_like_english_report_text(
-        announcement.category_text
-    ):
-        return True
-    return False
-
-
-def _looks_like_english_report_text(text: str) -> bool:
-    """判断文本是否明显是英文财报标题或分类。
-
-    Args:
-        text: 标题或分类文本。
-
-    Returns:
-        命中英文财报关键词且缺少中文/繁中文字符时返回 ``True``。
-
-    Raises:
-        无。
-    """
-
-    if _contains_cjk(text):
-        return False
-    upper = text.upper()
-    return any(token in upper for token in _ENGLISH_REPORT_TITLE_TOKENS)
-
-
-def _contains_cjk(text: str) -> bool:
-    """判断文本是否包含中日韩统一表意文字。
-
-    Args:
-        text: 待检测文本。
-
-    Returns:
-        包含中文/繁中文字符返回 ``True``。
-
-    Raises:
-        无。
-    """
-
-    return any("\u4e00" <= char <= "\u9fff" for char in text)
 
 
 def _language_param(language: CnLanguage) -> str:
