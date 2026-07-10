@@ -934,7 +934,7 @@ def test_fins_read_process_backed_cancel_drops_late_result(tmp_path: Path) -> No
 
     assert accepting_port.candidates
     assert isinstance(outcome, ToolFailedOutcome)
-    assert outcome.result.hint == "tool_runtime_cancelled"
+    assert outcome.result.hint is None
 
 
 def test_fins_read_provider_requires_workspace_root_when_enabled(tmp_path: Path) -> None:

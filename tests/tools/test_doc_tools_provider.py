@@ -1207,7 +1207,7 @@ def test_doc_toolruntime_cancel_returns_governed_failure_without_late_accept(
     time.sleep(0.3)
 
     assert elapsed < 2.0
-    assert governed_outcome.result.hint == "tool_runtime_cancelled"
+    assert governed_outcome.result.hint is None
     assert len(accept_port.candidates) == 1
     assert accept_port.candidates[0].governance.policy_decision.reason_code == (
         "tool_runtime_cancelled"
@@ -1260,7 +1260,7 @@ def test_doc_toolruntime_cancel_terminates_real_doc_target_blocked_on_fifo(
     time.sleep(0.3)
 
     assert elapsed < 2.0
-    assert governed_outcome.result.hint == "tool_runtime_cancelled"
+    assert governed_outcome.result.hint is None
     assert len(accept_port.candidates) == 1
     assert accept_port.candidates[0].governance.policy_decision.reason_code == (
         "tool_runtime_cancelled"

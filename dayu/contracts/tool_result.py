@@ -73,6 +73,16 @@ class ToolResultSuccess:
     value: JsonValue
     meta: ToolResultMeta | None
 
+    def __post_init__(self) -> None:
+        """校验成功结果判别字段。
+
+        :returns: ``None``。
+        :raises ValueError: ``ok`` 不是运行时 ``True`` 时抛出。
+        """
+
+        if self.ok is not True:
+            raise ValueError("ToolResultSuccess.ok must be True")
+
 
 @dataclass(frozen=True, slots=True)
 class ToolResultFailure:
@@ -95,10 +105,12 @@ class ToolResultFailure:
         """校验失败结果的最小完整性。
 
         :returns: ``None``。
-        :raises ValueError: ``error``、``message`` 或已提供的 ``hint`` 为空 /
-            纯空白时抛出。
+        :raises ValueError: ``ok`` 不是运行时 ``False``，或 ``error``、
+            ``message``、已提供的 ``hint`` 为空 / 纯空白时抛出。
         """
 
+        if self.ok is not False:
+            raise ValueError("ToolResultFailure.ok must be False")
         if self.error.strip() == "":
             raise ValueError("ToolResultFailure.error must be non-empty")
         if self.message.strip() == "":

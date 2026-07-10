@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 from datetime import UTC, datetime, timedelta
+from typing import Literal, cast
 
 import pytest
 
@@ -28,6 +29,17 @@ def test_success_envelope_has_ok_true_and_value() -> None:
     assert not isinstance(s, ToolResultFailure)
 
 
+def test_success_envelope_rejects_runtime_false_ok() -> None:
+    """成功结果运行时必须拒绝被伪装成 ``Literal[True]`` 的 ``False``。"""
+
+    with pytest.raises(ValueError, match="ToolResultSuccess.ok must be True"):
+        ToolResultSuccess(
+            ok=cast(Literal[True], False),
+            value={"a": 1},
+            meta=None,
+        )
+
+
 def test_failure_envelope_has_ok_false_and_error() -> None:
     """:class:`ToolResultFailure` 应固定 ``ok=False`` 并承载错误字段。"""
 
@@ -37,6 +49,19 @@ def test_failure_envelope_has_ok_false_and_error() -> None:
     assert f.ok is False
     assert isinstance(f, ToolResultFailure)
     assert not isinstance(f, ToolResultSuccess)
+
+
+def test_failure_envelope_rejects_runtime_true_ok() -> None:
+    """失败结果运行时必须拒绝被伪装成 ``Literal[False]`` 的 ``True``。"""
+
+    with pytest.raises(ValueError, match="ToolResultFailure.ok must be False"):
+        ToolResultFailure(
+            ok=cast(Literal[False], True),
+            error="E_X",
+            message="x",
+            hint=None,
+            meta=None,
+        )
 
 
 def test_failure_envelope_rejects_empty_error_or_message() -> None:

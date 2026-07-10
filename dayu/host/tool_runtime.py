@@ -271,9 +271,6 @@ _TOOL_RUNTIME_DUPLICATE_AWAITING_MARKER_FAILURE_REASON = (
     "duplicate_awaiting_marker_failed"
 )
 _TOOL_RUNTIME_WAIT_ACTIVATION_FAILURE_REASON = "wait_activation_failed"
-_TOOL_RUNTIME_DIAGNOSTIC_REFS_HINT_KEY = "diagnostic_refs"
-_TOOL_RUNTIME_HINT_SECTION_SEPARATOR = ";"
-_TOOL_RUNTIME_DIAGNOSTIC_REF_SEPARATOR = ","
 _TOOL_RUNTIME_DUPLICATE_REUSE_REASON = "duplicate_reuse"
 _TOOL_RUNTIME_DUPLICATE_HINT_REASON = "duplicate_hint"
 _TOOL_RUNTIME_DUPLICATE_REQUIRE_JUSTIFICATION_REASON = (
@@ -295,14 +292,6 @@ _TRUNCATED_VALUE_FIELD = "value"
 _TRUNCATED_META_FIELD = "fetch_more"
 _TRUNCATED_APPLIED_FIELD = "truncated"
 _TRUNCATION_ERROR_CODE = "truncation_error"
-_TRUNCATION_UNSUPPORTED_REASON = "unsupported_truncation_target"
-_TRUNCATION_CURSOR_MISSING_REASON = "missing_cursor"
-_TRUNCATION_SCOPE_MISMATCH_REASON = "scope_mismatch"
-_TRUNCATION_TOKEN_MISMATCH_REASON = "scope_token_mismatch"
-_TRUNCATION_CURSOR_EXPIRED_REASON = "cursor_expired"
-_TRUNCATION_CURSOR_USED_REASON = "cursor_already_used"
-_TRUNCATION_REMAINDER_DIGEST_REASON = "remainder_digest_mismatch"
-_TRUNCATION_INVALID_REQUEST_REASON = "invalid_fetch_more_request"
 _DEFAULT_TRUNCATION_TTL_SECONDS = 600
 _DEFAULT_TEXT_CHARS_TRUNCATION_LIMIT = 4096
 _DEFAULT_TEXT_LINES_TRUNCATION_LIMIT = 200
@@ -2047,7 +2036,6 @@ class TruncationManager:
             self._cursors.pop(cursor.cursor_id, None)
             return TruncationAppliedOutcome(
                 outcome=_truncation_failure(
-                    _TRUNCATION_UNSUPPORTED_REASON,
                     "tool result target cannot be replaced safely",
                 ),
                 cursor_hint=None,
@@ -2089,7 +2077,6 @@ class TruncationManager:
         if cursor is None:
             self._cleanup_expired_cursors(datetime.now(UTC))
             return _truncation_failure(
-                _TRUNCATION_CURSOR_MISSING_REASON,
                 "truncation cursor is missing or no longer available",
             )
         validation_failure = self._validate_cursor(cursor, request, context)
@@ -2102,7 +2089,6 @@ class TruncationManager:
         if fetched is None:
             self._cleanup_expired_cursors(datetime.now(UTC))
             return _truncation_failure(
-                _TRUNCATION_REMAINDER_DIGEST_REASON,
                 "truncation remainder digest mismatch",
             )
         fetched_outcome = ToolCompletedOutcome(
@@ -2198,27 +2184,22 @@ class TruncationManager:
             or context.run_id != self._run_id
         ):
             return _truncation_failure(
-                _TRUNCATION_SCOPE_MISMATCH_REASON,
                 "truncation cursor does not belong to this run scope",
             )
         if cursor.scope_token_digest != _scope_token_digest(request.scope_token):
             return _truncation_failure(
-                _TRUNCATION_TOKEN_MISMATCH_REASON,
                 "truncation scope token does not match cursor",
             )
         if datetime.now(UTC) > cursor.expires_at:
             return _truncation_failure(
-                _TRUNCATION_CURSOR_EXPIRED_REASON,
                 "truncation cursor expired",
             )
         if cursor.single_use and cursor.used_at is not None:
             return _truncation_failure(
-                _TRUNCATION_CURSOR_USED_REASON,
                 "truncation cursor has already been used",
             )
         if not _remainder_digest_matches(cursor.remaining_ref):
             return _truncation_failure(
-                _TRUNCATION_REMAINDER_DIGEST_REASON,
                 "truncation remainder digest mismatch",
             )
         return None
@@ -2258,7 +2239,6 @@ class FetchMoreToolCallable:
 
         if self._manager is None:
             return _truncation_failure(
-                _TRUNCATION_CURSOR_MISSING_REASON,
                 "truncation manager is not enabled for this run",
             )
         request = _fetch_more_request_from_call(call)
@@ -6013,14 +5993,12 @@ def _fetch_more_request_from_call(
     limit_value = call.arguments.get(_FETCH_MORE_LIMIT_FIELD)
     if not isinstance(cursor, str) or not isinstance(scope_token, str):
         return _truncation_failure(
-            _TRUNCATION_INVALID_REQUEST_REASON,
             "fetch_more requires cursor and scope_token string arguments",
         )
     limit: int | None = None
     if limit_value is not None:
         if isinstance(limit_value, bool) or not isinstance(limit_value, int):
             return _truncation_failure(
-                _TRUNCATION_INVALID_REQUEST_REASON,
                 "fetch_more limit must be a positive integer",
             )
         limit = limit_value
@@ -6031,7 +6009,7 @@ def _fetch_more_request_from_call(
             limit=limit,
         )
     except ValueError as exc:
-        return _truncation_failure(_TRUNCATION_INVALID_REQUEST_REASON, str(exc))
+        return _truncation_failure(str(exc))
 
 
 def _tool_truncation_strategy(
@@ -7462,10 +7440,9 @@ def _tool_interrupt_result_from_process(
     )
 
 
-def _truncation_failure(reason_code: str, message: str) -> ToolFailedOutcome:
+def _truncation_failure(message: str) -> ToolFailedOutcome:
     """构造截断 / 补读失败工具 outcome。
 
-    :param reason_code: 截断错误原因码。
     :param message: 人类可读错误。
     :returns: 普通 ``ToolFailedOutcome``。
     """
@@ -7473,7 +7450,7 @@ def _truncation_failure(reason_code: str, message: str) -> ToolFailedOutcome:
     return _tool_failed_outcome(
         error=_TRUNCATION_ERROR_CODE,
         message=message,
-        hint=reason_code,
+        hint=None,
     )
 
 
@@ -7489,26 +7466,7 @@ def _governed_failure_outcome(
     return _tool_failed_outcome(
         error=_TOOL_RUNTIME_POLICY_BLOCKED_ERROR,
         message=policy_decision.message or _TOOL_RUNTIME_GOVERNED_ERROR,
-        hint=policy_decision.reason_code,
-    )
-
-
-def _hint_with_diagnostic_refs(
-    *, base_hint: str, diagnostic_refs: tuple[str, ...]
-) -> str:
-    """把诊断引用合并进失败结果的稳定提示字段。
-
-    :param base_hint: 原始失败提示。
-    :param diagnostic_refs: 需要暴露给最终 outcome 的诊断引用。
-    :returns: 合并诊断引用后的提示；无诊断引用时返回原始提示。
-    """
-
-    if len(diagnostic_refs) == 0:
-        return base_hint
-    refs_value = _TOOL_RUNTIME_DIAGNOSTIC_REF_SEPARATOR.join(diagnostic_refs)
-    return (
-        f"{base_hint}{_TOOL_RUNTIME_HINT_SECTION_SEPARATOR}"
-        f"{_TOOL_RUNTIME_DIAGNOSTIC_REFS_HINT_KEY}={refs_value}"
+        hint=None,
     )
 
 
@@ -7525,12 +7483,15 @@ def _accept_failure_outcome(
         return _tool_failed_outcome(
             error=_TOOL_RUNTIME_ACCEPT_REJECTED_ERROR,
             message=result.message,
-            hint=f"{_TOOL_RUNTIME_ACCEPT_REJECTED_REASON}:{result.reason_code.value}",
+            hint=None,
         )
     return _tool_failed_outcome(
         error=_TOOL_RUNTIME_ACCEPT_TIMEOUT_ERROR,
-        message="tool fact accept ack timed out",
-        hint=result.last_error_code or _TOOL_RUNTIME_ACCEPT_TIMEOUT_REASON,
+        message=_accept_timeout_message(
+            "tool fact accept ack timed out",
+            result.last_error_code,
+        ),
+        hint=None,
     )
 
 
@@ -7547,19 +7508,29 @@ def _awaiting_accept_failure_outcome(
         return _tool_failed_outcome(
             error=_TOOL_RUNTIME_AWAITING_ACCEPT_REJECTED_ERROR,
             message=result.message,
-            hint=(
-                f"{_TOOL_RUNTIME_ACCEPT_REJECTED_REASON}:"
-                f"{result.reason_code.value}"
-            ),
+            hint=None,
         )
     return _tool_failed_outcome(
         error=_TOOL_RUNTIME_AWAITING_ACCEPT_TIMEOUT_ERROR,
-        message="tool awaiting accept ack timed out",
-        hint=_hint_with_diagnostic_refs(
-            base_hint=result.last_error_code or _TOOL_RUNTIME_ACCEPT_TIMEOUT_REASON,
-            diagnostic_refs=result.diagnostic_refs,
+        message=_accept_timeout_message(
+            "tool awaiting accept ack timed out",
+            result.last_error_code,
         ),
+        hint=None,
     )
+
+
+def _accept_timeout_message(message: str, last_error_code: str | None) -> str:
+    """构造保留最后 accept 错误码的失败说明。
+
+    :param message: 基础失败说明。
+    :param last_error_code: accept owner 记录的最后错误码；无则为 ``None``。
+    :returns: 保留必要错误码后的说明。
+    """
+
+    if last_error_code is None:
+        return message
+    return f"{message} (last_error_code={last_error_code})"
 
 
 __all__ = [

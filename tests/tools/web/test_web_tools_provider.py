@@ -711,7 +711,7 @@ def test_web_toolruntime_cancel_real_process_target_has_no_late_accept() -> None
         server.close()
 
     assert elapsed < 2.0
-    assert governed_outcome.result.hint == "tool_runtime_cancelled"
+    assert governed_outcome.result.hint is None
     assert len(accept_port.candidates) == 1
     assert accept_port.candidates[0].governance.policy_decision.reason_code == (
         "tool_runtime_cancelled"

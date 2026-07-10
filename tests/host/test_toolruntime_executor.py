@@ -1410,7 +1410,7 @@ async def test_accept_rejected_does_not_expose_raw_fake_result() -> None:
         (
             ToolFactRejectedAck(
                 reason_code=ToolAcceptRejectReason.IDEMPOTENCY_CONFLICT,
-                message="reject fake result",
+                message="idempotency_conflict: reject fake result",
                 diagnostic_refs=(),
                 retryable=False,
             ),
@@ -1424,6 +1424,8 @@ async def test_accept_rejected_does_not_expose_raw_fake_result() -> None:
     assert callable_.call_count == 1
     assert isinstance(record.outcome, ToolFailedOutcome)
     assert record.outcome.result.error == "tool_accept_rejected"
+    assert record.outcome.result.hint is None
+    assert "idempotency_conflict" in record.outcome.result.message
     assert "must-not-leak" not in record.outcome.result.message
 
 
@@ -1432,6 +1434,7 @@ async def test_accept_timeout_bounded_retry_returns_governed_error() -> None:
     """accept timeout 只有限重试，耗尽后返回 governed error。"""
 
     callable_ = _CountingCallable({"secret": "timeout-raw"})
+    diagnostics = InMemoryToolTraceDiagnosticEmitter()
     accept_port = _SequencedAcceptPort(
         (
             ToolFactAcceptTimedOut(
@@ -1450,6 +1453,7 @@ async def test_accept_timeout_bounded_retry_returns_governed_error() -> None:
         callable_,
         accept_port,
         retry_policy=ToolAcceptRetryPolicy(max_attempts=2, backoff_seconds=0.0),
+        diagnostic_emitter=diagnostics,
     )
 
     outcome = await executor.execute(_request(_call("tool-call-1")))
@@ -1459,7 +1463,10 @@ async def test_accept_timeout_bounded_retry_returns_governed_error() -> None:
     assert len(accept_port.candidates) == 2
     assert isinstance(record.outcome, ToolFailedOutcome)
     assert record.outcome.result.error == "tool_accept_timeout"
+    assert record.outcome.result.hint is None
+    assert "last_error_code=ack_lost" in record.outcome.result.message
     assert "timeout-raw" not in record.outcome.result.message
+    assert diagnostics.records[-1].reason_code == "accept_timeout"
 
 
 @pytest.mark.asyncio
@@ -1538,7 +1545,7 @@ async def test_duplicate_cleanup_failure_does_not_replace_tool_timeout_return(
     record = outcome.records[0]
     assert isinstance(record.outcome, ToolFailedOutcome)
     assert record.outcome.result.error == "tool_call_governed"
-    assert record.outcome.result.hint == "tool_runtime_timeout"
+    assert record.outcome.result.hint is None
     assert diagnostics.records[-1].reason_code == "duplicate_cleanup_failed"
 
 
@@ -1625,7 +1632,7 @@ async def test_tool_runtime_timeout_returns_governed_failure() -> None:
     )
     assert isinstance(record.outcome, ToolFailedOutcome)
     assert record.outcome.result.error == "tool_call_governed"
-    assert record.outcome.result.hint == "tool_runtime_timeout"
+    assert record.outcome.result.hint is None
 
 
 @pytest.mark.asyncio
@@ -1660,7 +1667,7 @@ async def test_tool_runtime_process_backed_cancel_does_not_wait_for_natural_comp
         "tool_runtime_cancelled"
     )
     assert isinstance(record.outcome, ToolFailedOutcome)
-    assert record.outcome.result.hint == "tool_runtime_cancelled"
+    assert record.outcome.result.hint is None
 
 
 @pytest.mark.asyncio
@@ -2019,7 +2026,7 @@ async def test_tool_runtime_process_backed_cancel_kills_when_terminate_is_ignore
     assert capsule.kill_result.supported
     assert capsule.kill_result.completed
     assert isinstance(record.outcome, ToolFailedOutcome)
-    assert record.outcome.result.hint == "tool_runtime_cancelled"
+    assert record.outcome.result.hint is None
 
 
 @pytest.mark.asyncio
@@ -2052,7 +2059,7 @@ async def test_tool_runtime_interrupt_close_failure_keeps_governed_cancel_outcom
     assert callable_.call_count == 0
     assert capsule.close_calls == 1
     assert isinstance(record.outcome, ToolFailedOutcome)
-    assert record.outcome.result.hint == "tool_runtime_cancelled"
+    assert record.outcome.result.hint is None
     assert "host.tool_runtime.capsule_close_failed" in caplog.text
     assert "error_type=RuntimeError" in caplog.text
 
@@ -2108,7 +2115,7 @@ async def test_tool_runtime_pre_cancelled_context_returns_governed_failure() -> 
     )
     assert isinstance(record.outcome, ToolFailedOutcome)
     assert record.outcome.result.error == "tool_call_governed"
-    assert record.outcome.result.hint == "tool_runtime_cancelled"
+    assert record.outcome.result.hint is None
     assert "must-not-run" not in record.outcome.result.message
     assert activation_adapter.requests == []
 
@@ -2409,7 +2416,7 @@ async def test_awaiting_outcome_without_adapter_binding_is_governed_error() -> N
     assert callable_.call_count == 1
     assert accept_port.candidates == []
     assert isinstance(record.outcome, ToolFailedOutcome)
-    assert record.outcome.result.hint == "awaiting_adapter_not_configured"
+    assert record.outcome.result.hint is None
     assert activation_adapter.requests == []
 
 
@@ -2467,7 +2474,7 @@ async def test_awaiting_accept_rejected_returns_governed_error(
     record = outcome.records[0]
     assert isinstance(record.outcome, ToolFailedOutcome)
     assert record.outcome.result.error == "tool_awaiting_accept_rejected"
-    assert record.outcome.result.hint == "accept_rejected:idempotency_conflict"
+    assert record.outcome.result.hint is None
     assert recorded_reasons == [DuplicateDurableMissingReason.HOST_ACCEPT_REJECTED]
     assert activation_adapter.requests == []
 
@@ -2526,7 +2533,7 @@ async def test_stale_execution_awaiting_rejection_does_not_activate_wait(
     record = outcome.records[0]
     assert isinstance(record.outcome, ToolFailedOutcome)
     assert record.outcome.result.error == "tool_awaiting_accept_rejected"
-    assert record.outcome.result.hint == "accept_rejected:stale_execution"
+    assert record.outcome.result.hint is None
     assert recorded_reasons == [DuplicateDurableMissingReason.HOST_ACCEPT_REJECTED]
     assert activation_adapter.requests == []
 
@@ -2584,16 +2591,15 @@ async def test_awaiting_accept_timeout_returns_governed_error(
     record = outcome.records[0]
     assert isinstance(record.outcome, ToolFailedOutcome)
     assert record.outcome.result.error == "tool_awaiting_accept_timeout"
-    assert record.outcome.result.hint is not None
-    assert record.outcome.result.hint.startswith("accept_ack_lost;diagnostic_refs=")
-    assert "tool-diagnostic-" in record.outcome.result.hint
+    assert record.outcome.result.hint is None
+    assert "last_error_code=accept_ack_lost" in record.outcome.result.message
     assert recorded_reasons == [DuplicateDurableMissingReason.HOST_ACCEPT_TIMEOUT]
     assert activation_adapter.requests == []
 
 
 @pytest.mark.asyncio
 async def test_awaiting_accept_retry_exhaustion_emits_diagnostic_ref() -> None:
-    """awaiting accept retry 耗尽时最终失败 outcome 携带诊断引用。"""
+    """awaiting accept retry 耗尽时保留 Tool Trace 诊断且不写入 hint。"""
 
     callable_ = _AwaitingCallable()
     accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
@@ -2614,10 +2620,8 @@ async def test_awaiting_accept_retry_exhaustion_emits_diagnostic_ref() -> None:
     record = outcome.records[0]
     assert isinstance(record.outcome, ToolFailedOutcome)
     assert record.outcome.result.error == "tool_awaiting_accept_timeout"
-    assert (
-        record.outcome.result.hint
-        == "accept_ack_lost;diagnostic_refs=tool-diagnostic-memory-1"
-    )
+    assert record.outcome.result.hint is None
+    assert "last_error_code=accept_ack_lost" in record.outcome.result.message
     assert len(diagnostics.records) == 1
     assert diagnostics.records[0].reason_code == "accept_timeout"
     assert activation_adapter.requests == []
@@ -2661,7 +2665,7 @@ async def test_poll_awaiting_without_external_job_ref_is_governed_error() -> Non
     record = outcome.records[0]
     assert awaiting_accept_port.candidates == []
     assert isinstance(record.outcome, ToolFailedOutcome)
-    assert record.outcome.result.hint == "awaiting_external_job_missing"
+    assert record.outcome.result.hint is None
     assert activation_adapter.requests == []
 
 
@@ -2727,7 +2731,7 @@ async def test_awaiting_outcome_stops_remaining_batch_calls() -> None:
     assert len(awaiting_accept_port.candidates) == 1
     assert isinstance(first, ToolAwaitingOutcome)
     assert isinstance(second, ToolFailedOutcome)
-    assert second.result.hint == "run_suspended_by_tool_awaiting"
+    assert second.result.hint is None
 
 
 @pytest.mark.asyncio

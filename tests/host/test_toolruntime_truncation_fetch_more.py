@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Iterator, Mapping
 from dataclasses import replace
 from datetime import datetime
+from typing import cast
 
 import pytest
 
@@ -63,6 +65,54 @@ _ITERATION_ID = "iteration-truncation"
 _POLICY_DIGEST = "sha256:4444444444444444444444444444444444444444444444444444444444444444"
 _DEFAULT_TEXT_CHARS_LIMIT = 8
 _DEFAULT_TTL_SECONDS = 30
+
+
+class _VanishingPathMapping(Mapping[str, JsonValue]):
+    """第一次读取字段成功、后续读取失败的测试 mapping。
+
+    用于覆盖 ToolRuntime 截断 target 已选择但替换失败的防御分支。
+    """
+
+    def __init__(self, field_name: str, field_value: JsonValue) -> None:
+        """初始化测试 mapping。
+
+        :param field_name: 第一次可读取的字段名。
+        :param field_value: 第一次读取返回的字段值。
+        :returns: ``None``。
+        """
+
+        self._field_name = field_name
+        self._field_value = field_value
+        self._read_count = 0
+
+    def __getitem__(self, key: str) -> JsonValue:
+        """按读取次数返回字段值或模拟字段消失。
+
+        :param key: 字段名。
+        :returns: 第一次读取目标字段时返回字段值。
+        :raises KeyError: 非目标字段或第二次以后读取目标字段时抛出。
+        """
+
+        if key == self._field_name and self._read_count == 0:
+            self._read_count += 1
+            return self._field_value
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        """返回字段名迭代器。
+
+        :returns: 只包含目标字段名的迭代器。
+        """
+
+        return iter((self._field_name,))
+
+    def __len__(self) -> int:
+        """返回字段数量。
+
+        :returns: 固定返回 ``1``。
+        """
+
+        return 1
 
 
 class _OpenCancellationToken:
@@ -234,7 +284,10 @@ async def test_fetch_more_dispatches_as_normal_tool_and_is_single_use() -> None:
     assert first_outcome.result.value == "EFGHIJ"
     assert cursor not in _manager_from_handle(handle)._cursors
     assert isinstance(second_outcome, ToolFailedOutcome)
-    assert second_outcome.result.hint == "missing_cursor"
+    _assert_truncation_failure(
+        second_outcome,
+        "truncation cursor is missing or no longer available",
+    )
     assert [candidate.call.tool_name for candidate in accept_port.candidates] == [
         "fake_tool",
         "fetch_more",
@@ -380,7 +433,10 @@ async def test_fetch_more_missing_cursor_returns_ordinary_tool_error() -> None:
 
     record = outcome.records[0]
     assert isinstance(record.outcome, ToolFailedOutcome)
-    assert record.outcome.result.hint == "missing_cursor"
+    _assert_truncation_failure(
+        record.outcome,
+        "truncation cursor is missing or no longer available",
+    )
 
 
 @pytest.mark.asyncio
@@ -396,7 +452,10 @@ async def test_fetch_more_rejects_token_mismatch() -> None:
 
     record = outcome.records[0]
     assert isinstance(record.outcome, ToolFailedOutcome)
-    assert record.outcome.result.hint == "scope_token_mismatch"
+    _assert_truncation_failure(
+        record.outcome,
+        "truncation scope token does not match cursor",
+    )
 
 
 @pytest.mark.asyncio
@@ -415,7 +474,10 @@ async def test_fetch_more_rejects_used_cursor() -> None:
 
     record = outcome.records[0]
     assert isinstance(record.outcome, ToolFailedOutcome)
-    assert record.outcome.result.hint == "cursor_already_used"
+    _assert_truncation_failure(
+        record.outcome,
+        "truncation cursor has already been used",
+    )
 
 
 @pytest.mark.asyncio
@@ -431,7 +493,10 @@ async def test_fetch_more_rejects_invalid_limit() -> None:
 
     record = outcome.records[0]
     assert isinstance(record.outcome, ToolFailedOutcome)
-    assert record.outcome.result.hint == "invalid_fetch_more_request"
+    _assert_truncation_failure(
+        record.outcome,
+        "limit must be positive when provided",
+    )
 
 
 @pytest.mark.asyncio
@@ -447,7 +512,7 @@ async def test_fetch_more_rejects_ttl_expiry() -> None:
 
     record = outcome.records[0]
     assert isinstance(record.outcome, ToolFailedOutcome)
-    assert record.outcome.result.hint == "cursor_expired"
+    _assert_truncation_failure(record.outcome, "truncation cursor expired")
     assert cursor not in _manager_from_handle(handle)._cursors
 
 
@@ -489,7 +554,10 @@ async def test_fetch_more_rejects_scope_mismatch() -> None:
 
     record = outcome.records[0]
     assert isinstance(record.outcome, ToolFailedOutcome)
-    assert record.outcome.result.hint == "scope_mismatch"
+    _assert_truncation_failure(
+        record.outcome,
+        "truncation cursor does not belong to this run scope",
+    )
 
 
 @pytest.mark.asyncio
@@ -515,7 +583,50 @@ async def test_fetch_more_rejects_remainder_digest_mismatch() -> None:
 
     record = outcome.records[0]
     assert isinstance(record.outcome, ToolFailedOutcome)
-    assert record.outcome.result.hint == "remainder_digest_mismatch"
+    _assert_truncation_failure(
+        record.outcome,
+        "truncation remainder digest mismatch",
+    )
+
+
+def test_truncation_rejects_unreplaceable_target() -> None:
+    """截断目标读取后无法安全替换时返回保留场景说明的失败。"""
+
+    spec = replace(
+        _truncate_strategy_spec(
+            strategy=ToolTruncationStrategy.TEXT_CHARS,
+            limits={"max_chars": 4},
+        ),
+        field_path=("payload",),
+    )
+    manager = TruncationManager(
+        session_id=_SESSION_ID,
+        run_id=_RUN_ID,
+        attempt_id=_ATTEMPT_ID,
+        truncate_specs_by_name={"fake_tool": spec},
+    )
+
+    applied = manager.apply_truncation(
+        "fake_tool",
+        "tool-call-1",
+        ToolCompletedOutcome(
+            result=ToolResultSuccess(
+                ok=True,
+                value=cast(
+                    JsonValue,
+                    _VanishingPathMapping("payload", "ABCDEFGHIJ"),
+                ),
+                meta=None,
+            )
+        ),
+        spec,
+    )
+
+    assert isinstance(applied.outcome, ToolFailedOutcome)
+    _assert_truncation_failure(
+        applied.outcome,
+        "tool result target cannot be replaced safely",
+    )
 
 
 def _handle(
@@ -558,6 +669,21 @@ def _handle(
         )
     )
     return handle, accept_port
+
+
+def _assert_truncation_failure(
+    outcome: ToolFailedOutcome, expected_message: str
+) -> None:
+    """断言截断失败只通过 error/message 保留语义，不写 LLM-facing hint。
+
+    :param outcome: 待检查的工具失败 outcome。
+    :param expected_message: 预期人类可读失败说明。
+    :returns: ``None``。
+    """
+
+    assert outcome.result.error == "truncation_error"
+    assert outcome.result.message == expected_message
+    assert outcome.result.hint is None
 
 
 async def _create_cursor(
