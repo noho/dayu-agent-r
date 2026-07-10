@@ -854,6 +854,10 @@ def _final_answer_from_outbox_json(value: str | None) -> HostFinalAnswerView | N
         raise HostDurableError("outbox final answer degraded is invalid")
     if finish_reason is not None and not isinstance(finish_reason, str):
         raise HostDurableError("outbox final answer finish_reason is invalid")
+    if finish_reason is not None and finish_reason.strip() == "":
+        raise HostDurableError(
+            "Outbox final answer field finish_reason must be non-empty text"
+        )
     if terminal_status != HostTerminalStatus.SUCCEEDED.value:
         raise HostDurableError("outbox final answer terminal_status is invalid")
     return HostFinalAnswerView(

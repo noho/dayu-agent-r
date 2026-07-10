@@ -187,6 +187,93 @@ async def test_public_outbox_read_rejects_raw_blank_final_answer_content(
     assert "content" in diagnostic
 
 
+@pytest.mark.parametrize("finish_reason", ("", " \t\n"))
+@pytest.mark.asyncio
+async def test_public_outbox_read_rejects_raw_blank_finish_reason(
+    tmp_path: pathlib.Path,
+    finish_reason: str,
+) -> None:
+    """public read 对 raw Outbox row 的空白 finish_reason fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :param finish_reason: 直接写入 durable row 的空白结束原因。
+    :returns: ``None``。
+    :raises AssertionError: public read 未保留 Outbox field 诊断时抛出。
+    """
+
+    factory = smoke.FinalAnswerWorkerFactory()
+    options = smoke.open_host_options(
+        tmp_path,
+        runner_spec=smoke.deterministic_runner_spec(),
+        worker_factory=factory,
+        allow_tool_calls=False,
+    )
+
+    async with open_host(options) as host:
+        session = await host.ensure_session(
+            smoke.ensure_request("outbox-raw-blank-finish-reason")
+        )
+        followup = await host.submit_followup(
+            session.session_id,
+            smoke.followup_request(
+                session.session_id,
+                "outbox-raw-blank-finish-reason-run",
+                "请给出最终答案",
+            ),
+        )
+        await smoke.wait_for_status(
+            host,
+            followup.accepted_run_id,
+            HostTerminalStatus.SUCCEEDED,
+        )
+        materialized = await host.read_outbox_terminal_items(
+            session.session_id,
+            ReadOutboxTerminalItemsRequest(
+                after=OutboxTerminalCursor(event_sequence=0),
+                seen_terminal_event_ids=(),
+                limit=10,
+            ),
+        )
+        assert len(materialized.items) == 1
+        terminal_event_id = materialized.items[0].terminal_event_id
+        corrupted_json = canonical_json_dumps(
+            {
+                "content": "final answer",
+                "filtered": False,
+                "degraded": False,
+                "finish_reason": finish_reason,
+                "terminal_status": "succeeded",
+            }
+        )
+        with sqlite3.connect(options.db_path) as connection:
+            connection.execute(
+                f"""
+                UPDATE {TABLE_HOST_OUTBOX_TERMINAL_ITEMS}
+                SET final_answer_json = ?
+                WHERE terminal_event_id = ?
+                """,
+                (corrupted_json, terminal_event_id),
+            )
+
+        with pytest.raises(HostApiError) as public_error:
+            await host.read_outbox_terminal_items(
+                session.session_id,
+                ReadOutboxTerminalItemsRequest(
+                    after=OutboxTerminalCursor(event_sequence=0),
+                    seen_terminal_event_ids=(),
+                    limit=10,
+                ),
+            )
+
+    durable_error = public_error.value.__cause__
+    assert public_error.value.code is HostApiErrorCode.INTERNAL_ERROR
+    assert isinstance(durable_error, HostDurableError)
+    diagnostic = str(durable_error)
+    assert "Outbox" in diagnostic
+    assert "finish_reason" in diagnostic
+    assert "non-empty" in diagnostic
+
+
 @pytest.mark.asyncio
 async def test_public_outbox_validation_and_closed_handle(
     tmp_path: pathlib.Path,
