@@ -46,16 +46,18 @@ from dayu.host.compaction import (
 from dayu.host.context_budget import BudgetTextFragment
 from dayu.host.context_events import CONTEXT_COMPACTED, validate_context_compacted_payload
 from dayu.host.compact_payload import parse_context_compacted_semantic_payload
-from dayu.host.accepted_result_projection import project_accepted_tool_result
+from dayu.host.accepted_result_projection import (
+    project_accepted_tool_result,
+)
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import EventClass, EventLogRow, EventLogStore
 from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.state import RunRow
 from dayu.host.durable.transaction import HostRow, HostTransaction
-from dayu.host.evidence import ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH
 from dayu.host.evidence import OpaqueEvidenceRef
-from dayu.host.evidence import accepted_evidence_envelope_from_payload
+from dayu.host.evidence import AcceptedToolEvidenceLLMMaterial
+from dayu.host.evidence import render_accepted_tool_evidence_for_llm
 from dayu.host.memory import (
     ConversationMemorySnapshotVNext,
     MemoryDiagnostic,
@@ -193,9 +195,7 @@ class RunInputMaterialBlock:
     :param payload_refs: evidence payload / artifact refs。
     :param artifact_refs: evidence artifact refs。
     :param source_locator_refs: evidence source locator refs。
-    :param readable_tool_name: evidence block 的可读工具名。
-    :param readable_query_text: evidence block 的可读查询文本。
-    :param readable_source_text: evidence block 的可读来源文本。
+    :param accepted_tool_evidence: accepted tool evidence 的 LLM-facing typed material。
     """
 
     block_id: str
@@ -217,9 +217,7 @@ class RunInputMaterialBlock:
     payload_refs: tuple[str, ...] = ()
     artifact_refs: tuple[str, ...] = ()
     source_locator_refs: tuple[OpaqueEvidenceRef, ...] = ()
-    readable_tool_name: str | None = None
-    readable_query_text: str | None = None
-    readable_source_text: str | None = None
+    accepted_tool_evidence: AcceptedToolEvidenceLLMMaterial | None = None
 
     def __post_init__(self) -> None:
         """校验 ordinary input material block。
@@ -266,19 +264,25 @@ class RunInputMaterialBlock:
             self.source_locator_refs,
             "RunInputMaterialBlock.source_locator_refs",
         )
-        _require_optional_text(
-            self.readable_tool_name,
-            "RunInputMaterialBlock.readable_tool_name",
+        if (
+            self.accepted_tool_evidence is not None
+            and not isinstance(
+                self.accepted_tool_evidence,
+                AcceptedToolEvidenceLLMMaterial,
+            )
+        ):
+            raise TypeError(
+                "RunInputMaterialBlock.accepted_tool_evidence is invalid"
+            )
+        is_evidence = (
+            self.section is CompactMaterialSection.EVIDENCE_MATERIAL
+            or self.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE
         )
-        _require_optional_text(
-            self.readable_query_text,
-            "RunInputMaterialBlock.readable_query_text",
-        )
-        _require_optional_text(
-            self.readable_source_text,
-            "RunInputMaterialBlock.readable_source_text",
-        )
-        if self.section is CompactMaterialSection.EVIDENCE_MATERIAL:
+        if is_evidence:
+            if self.section is not CompactMaterialSection.EVIDENCE_MATERIAL:
+                raise ValueError("accepted evidence block section is invalid")
+            if self.kind is not CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE:
+                raise ValueError("accepted evidence block kind is invalid")
             _require_non_empty_text(
                 self.accepted_evidence_id,
                 "RunInputMaterialBlock.accepted_evidence_id",
@@ -291,18 +295,25 @@ class RunInputMaterialBlock:
                 self.tool_call_event_ref,
                 "RunInputMaterialBlock.tool_call_event_ref",
             )
-            _require_non_empty_text(
-                self.readable_tool_name,
-                "RunInputMaterialBlock.readable_tool_name",
-            )
-            _require_non_empty_text(
-                self.readable_query_text,
-                "RunInputMaterialBlock.readable_query_text",
-            )
-            _require_non_empty_text(
-                self.readable_source_text,
-                "RunInputMaterialBlock.readable_source_text",
-            )
+            if len(self.payload_refs) == 0 and len(self.artifact_refs) == 0:
+                raise ValueError("accepted evidence block requires payload or artifact refs")
+            if self.accepted_tool_evidence is None:
+                raise ValueError("accepted evidence block requires typed LLM material")
+            if self.text != render_accepted_tool_evidence_for_llm(
+                self.accepted_tool_evidence
+            ):
+                raise ValueError("accepted evidence block text must use shared renderer")
+        else:
+            if (
+                self.accepted_evidence_id is not None
+                or self.tool_result_event_ref is not None
+                or self.tool_call_event_ref is not None
+                or len(self.payload_refs) > 0
+                or len(self.artifact_refs) > 0
+                or len(self.source_locator_refs) > 0
+                or self.accepted_tool_evidence is not None
+            ):
+                raise ValueError("non-evidence block must not carry evidence provenance")
 
 
 @dataclass(frozen=True, slots=True)
@@ -778,9 +789,7 @@ def run_input_material_block(
     payload_refs: tuple[str, ...] = (),
     artifact_refs: tuple[str, ...] = (),
     source_locator_refs: tuple[OpaqueEvidenceRef, ...] = (),
-    readable_tool_name: str | None = None,
-    readable_query_text: str | None = None,
-    readable_source_text: str | None = None,
+    accepted_tool_evidence: AcceptedToolEvidenceLLMMaterial | None = None,
 ) -> RunInputMaterialBlock:
     """构造共享 ordinary input material block。
 
@@ -801,9 +810,7 @@ def run_input_material_block(
     :param payload_refs: payload / artifact refs。
     :param artifact_refs: artifact refs。
     :param source_locator_refs: source locator refs。
-    :param readable_tool_name: evidence block 可读工具名。
-    :param readable_query_text: evidence block 可读查询文本。
-    :param readable_source_text: evidence block 可读来源文本。
+    :param accepted_tool_evidence: accepted tool evidence 的 LLM-facing typed material。
     :returns: RunInputMaterialBlock。
     :raises TypeError: 参数类型非法时抛出。
     :raises ValueError: 参数值非法时抛出。
@@ -830,9 +837,7 @@ def run_input_material_block(
         payload_refs=payload_refs,
         artifact_refs=artifact_refs,
         source_locator_refs=source_locator_refs,
-        readable_tool_name=readable_tool_name,
-        readable_query_text=readable_query_text,
-        readable_source_text=readable_source_text,
+        accepted_tool_evidence=accepted_tool_evidence,
     )
 
 
@@ -2549,48 +2554,35 @@ def _accepted_tool_evidence_delta_blocks(
     :raises HostDurableError: evidence envelope 或 raw tool payload 损坏时抛出。
     """
 
-    payload = event_payload_object(
-        transaction,
-        row,
-        payload_label=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
-    )
-    try:
-        envelope = accepted_evidence_envelope_from_payload(
-            payload,
-            producer_event_ref=row.event_id,
-        )
-    except ValueError as exc:
-        if str(exc) == ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH:
-            raise HostDurableError(str(exc)) from exc
-        raise HostDurableError("canonical evidence envelope is invalid") from exc
-    if envelope is None:
-        return ()
-    if envelope.evidence_id in represented_evidence_refs:
-        return ()
     projection = project_accepted_tool_result(transaction, row)
-    if projection.result_text is None:
+    if not projection.envelope_available:
+        return ()
+    if projection.evidence_id in represented_evidence_refs:
+        return ()
+    if projection.llm_material is None:
         raise HostDurableError("TOOL_RESULT_ACCEPTED raw_tool_outcome is missing")
-    tool_call_event_ref = envelope.tool_query.tool_call_requested_event_ref
+    tool_call_event_ref = projection.tool_call_requested_event_ref
     if tool_call_event_ref is None:
         # 缺少 request atom 时只保留本地 provenance 线索，不伪造 request event。
         tool_call_event_ref = row.event_id
+    payload_refs = tuple(
+        dict.fromkeys((*projection.payload_refs, *_payload_refs_for_event(row)))
+    )
     return (
         run_input_material_block(
-            block_id=f"eventlog:evidence:{row.event_id}:{envelope.evidence_id}",
+            block_id=f"eventlog:evidence:{row.event_id}:{projection.evidence_id}",
             section=CompactMaterialSection.EVIDENCE_MATERIAL,
             kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
-            text=projection.result_text,
-            canonical_source_refs=(envelope.evidence_id,),
+            text=render_accepted_tool_evidence_for_llm(projection.llm_material),
+            canonical_source_refs=(projection.evidence_id,),
             event_sequence=row.event_sequence,
             turn_group_id=row.run_id,
-            accepted_evidence_id=envelope.evidence_id,
+            accepted_evidence_id=projection.evidence_id,
             tool_result_event_ref=row.event_id,
             tool_call_event_ref=tool_call_event_ref,
-            payload_refs=_payload_refs_for_event(row),
-            source_locator_refs=envelope.locator_refs,
-            readable_tool_name=envelope.tool_name,
-            readable_query_text=projection.query.text,
-            readable_source_text=projection.source.text,
+            payload_refs=payload_refs,
+            source_locator_refs=projection.source_locator_refs,
+            accepted_tool_evidence=projection.llm_material,
         ),
     )
 
@@ -2753,23 +2745,20 @@ def _pack_evidence_blocks(blocks: tuple[RunInputMaterialBlock, ...]) -> tuple[Co
     result: list[CompactEvidenceBlock] = []
     evidence_blocks = tuple(block for block in blocks if block.section is CompactMaterialSection.EVIDENCE_MATERIAL)
     for index, block in enumerate(evidence_blocks, start=_FIRST_ORDINAL):
-        if block.readable_tool_name is None:
-            raise ValueError("RunInputMaterialBlock.readable_tool_name is required")
-        if block.readable_query_text is None:
-            raise ValueError("RunInputMaterialBlock.readable_query_text is required")
-        if block.readable_source_text is None:
-            raise ValueError("RunInputMaterialBlock.readable_source_text is required")
+        if block.accepted_tool_evidence is None:
+            raise ValueError("RunInputMaterialBlock.accepted_tool_evidence is required")
         _require_non_empty_text(block.text, "evidence_text")
+        material = block.accepted_tool_evidence
         result.append(
             CompactEvidenceBlock(
                 evidence_label=material_label(CompactMaterialSection.EVIDENCE_MATERIAL, index),
-                readable_tool_name=block.readable_tool_name,
-                readable_query_text=block.readable_query_text,
-                raw_result_text=block.text,
-                readable_source_text=block.readable_source_text,
-                size_units=len(block.text),
+                readable_tool_name=material.tool_name,
+                readable_query_text=material.query_text,
+                raw_result_text=material.result_text,
+                readable_source_text=material.source_text,
+                size_units=len(material.result_text),
                 canonical_source_refs=block.canonical_source_refs,
-                content_digest=block.content_digest,
+                content_digest=_text_digest(material.result_text),
             )
         )
     return tuple(result)

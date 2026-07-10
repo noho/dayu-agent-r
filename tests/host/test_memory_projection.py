@@ -78,9 +78,11 @@ from dayu.host.evidence import (
     AcceptedEvidenceToolQuery,
     accepted_evidence_envelope_to_json_value,
 )
-from dayu.host.accepted_result_projection import (
+from dayu.host.evidence import (
     ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT,
     ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
+    AcceptedToolEvidenceLLMMaterial,
+    render_accepted_tool_evidence_for_llm,
 )
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
@@ -237,10 +239,7 @@ def _event(
     *,
     run_id: str | None = _RUN_ID,
     assistant_final_answer_text: str | None = None,
-    evidence_query_text: str | None = None,
-    evidence_tool_name: str | None = None,
-    evidence_result_text: str | None = None,
-    evidence_source_text: str | None = None,
+    accepted_tool_evidence: AcceptedToolEvidenceLLMMaterial | None = None,
 ) -> MemoryProjectionEvent:
     """构造 memory projection event。
 
@@ -250,10 +249,7 @@ def _event(
     :param payload: canonical payload。
     :param run_id: Host Run id。
     :param assistant_final_answer_text: 可选 typed assistant answer material。
-    :param evidence_query_text: 可选 LLM-safe 工具 request / query 文本。
-    :param evidence_tool_name: 可选 projection 工具名。
-    :param evidence_result_text: 可选 projection 结果文本。
-    :param evidence_source_text: 可选 projection source 文本。
+    :param accepted_tool_evidence: accepted tool evidence typed material。
     :returns: memory projection event。
     """
 
@@ -276,10 +272,7 @@ def _event(
             else None
         ),
         assistant_final_answer_text=assistant_final_answer_text,
-        evidence_query_text=evidence_query_text,
-        evidence_tool_name=evidence_tool_name,
-        evidence_result_text=evidence_result_text,
-        evidence_source_text=evidence_source_text,
+        accepted_tool_evidence=accepted_tool_evidence,
     )
 
 
@@ -955,13 +948,14 @@ def test_selected_recent_window_floor_protects_recent_run_groups() -> None:
         "run-new",
         "run-new",
     )
+    fallback_text = render_accepted_tool_evidence_for_llm(None)
     assert tuple(item.text for item in selected) == (
         "mid user",
         "mid answer",
-        "工具结果已接受；可读投影字段缺失，未展开原始工具响应。",
+        fallback_text,
         "new user",
         "new answer",
-        "工具结果已接受；可读投影字段缺失，未展开原始工具响应。",
+        fallback_text,
     )
 
 
@@ -1339,12 +1333,14 @@ def test_accepted_tool_evidence_includes_query_and_raw_outcome_without_refs() ->
                         "text": "tool fact accepted",
                     },
                 },
-                evidence_query_text="查询 DAYU 的业务事实",
-                evidence_tool_name="lookup_mock_fact",
-                evidence_result_text=canonical_json_dumps(
-                    {"status": "ok", "text": "tool fact accepted"}
+                accepted_tool_evidence=AcceptedToolEvidenceLLMMaterial(
+                    tool_name="lookup_mock_fact",
+                    query_text="查询 DAYU 的业务事实",
+                    source_text=ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
+                    result_text=canonical_json_dumps(
+                        {"status": "ok", "text": "tool fact accepted"}
+                    ),
                 ),
-                evidence_source_text=ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
             ),
         ),
         session_id=_SESSION_ID,
@@ -1405,10 +1401,13 @@ def test_accepted_tool_evidence_disambiguates_raw_result_with_request_query() ->
                     ),
                     "raw_tool_outcome": {"total": 0, "documents": []},
                 },
-                evidence_query_text="读取 ticker=COIN 的财报列表",
-                evidence_tool_name="list_documents",
-                evidence_result_text=canonical_json_dumps(
-                    {"total": 0, "documents": []}
+                accepted_tool_evidence=AcceptedToolEvidenceLLMMaterial(
+                    tool_name="list_documents",
+                    query_text="读取 ticker=COIN 的财报列表",
+                    source_text=ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
+                    result_text=canonical_json_dumps(
+                        {"total": 0, "documents": []}
+                    ),
                 ),
             ),
         ),
@@ -1487,7 +1486,7 @@ def test_accepted_tool_evidence_missing_projection_fields_fail_closed() -> None:
                     },
                     "result_preview": "preview must not be read by memory",
                 },
-                evidence_query_text="查询 DAYU 的业务事实",
+                accepted_tool_evidence=None,
             ),
         ),
         session_id=_SESSION_ID,
@@ -1497,7 +1496,7 @@ def test_accepted_tool_evidence_missing_projection_fields_fail_closed() -> None:
     )
 
     text = snapshot.trace_memory.selected_recent_window[0].text
-    assert text == "工具结果已接受；可读投影字段缺失，未展开原始工具响应。"
+    assert text == render_accepted_tool_evidence_for_llm(None)
     assert "lookup_mock_fact" not in text
     assert "tool fact accepted" not in text
     assert "preview must not be read" not in text
@@ -1518,10 +1517,12 @@ def test_accepted_tool_evidence_uses_projection_fields_without_payload_rebuild()
                 "event-tool-result-projected-memory",
                 "TOOL_RESULT_ACCEPTED",
                 payload,
-                evidence_query_text="projection query",
-                evidence_tool_name="projection_tool",
-                evidence_result_text=canonical_json_dumps({"text": "projection result"}),
-                evidence_source_text="filing:projection",
+                accepted_tool_evidence=AcceptedToolEvidenceLLMMaterial(
+                    tool_name="projection_tool",
+                    query_text="projection query",
+                    source_text="filing:projection",
+                    result_text=canonical_json_dumps({"text": "projection result"}),
+                ),
             ),
         ),
         session_id=_SESSION_ID,
@@ -1536,7 +1537,7 @@ def test_accepted_tool_evidence_uses_projection_fields_without_payload_rebuild()
                 "event-tool-result-missing-projection-memory",
                 "TOOL_RESULT_ACCEPTED",
                 payload,
-                evidence_query_text="projection query",
+                accepted_tool_evidence=None,
             ),
         ),
         session_id=_SESSION_ID,
@@ -1553,9 +1554,7 @@ def test_accepted_tool_evidence_uses_projection_fields_without_payload_rebuild()
     assert "projection query" in projected_text
     assert "projection result" in projected_text
     assert "filing:projection" in projected_text
-    assert missing_fields_text == (
-        "工具结果已接受；可读投影字段缺失，未展开原始工具响应。"
-    )
+    assert missing_fields_text == render_accepted_tool_evidence_for_llm(None)
     for forbidden in ("payload_tool_must_not_leak", "payload result must not leak"):
         assert forbidden not in projected_text
         assert forbidden not in missing_fields_text

@@ -38,9 +38,6 @@ from dayu.engine.contracts.messages import (
 )
 from dayu.engine.contracts.engine_events import runner_role_sequence_digest
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
-from dayu.host.accepted_result_projection import (
-    ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
-)
 from dayu.host._event_payload import (
     payload_object as _payload_object,
     required_payload_text as _required_payload_text,
@@ -157,7 +154,6 @@ from dayu.host.run_input import (
     ToolExecutionMode,
     MemorySnapshotView,
     _SYSTEM_ENVELOPE_FORBIDDEN_FRAGMENTS,
-    _accepted_tool_evidence_content,
     _fallback_context_messages,
     _normalize_ordinary_run_messages,
     _resume_wait_messages_from_current_start,
@@ -165,11 +161,14 @@ from dayu.host.run_input import (
     create_tool_enabled_run_input_builder,
 )
 from dayu.host.evidence import (
+    ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
     AcceptedEvidenceEnvelope,
     AcceptedEvidenceResultRef,
     AcceptedEvidenceToolQuery,
+    AcceptedToolEvidenceLLMMaterial,
     OpaqueEvidenceRef,
     accepted_evidence_envelope_to_json_value,
+    render_accepted_tool_evidence_for_llm,
 )
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
@@ -1369,7 +1368,13 @@ def test_run_input_builder_accepted_tool_evidence_material_has_no_private_row_ca
         assert tuple(block.accepted_evidence_id for block in evidence_blocks) == tuple(
             evidence.accepted_evidence_id for evidence in seeded_evidence
         )
-        assert evidence_blocks[-1].text == canonical_json_dumps(seeded_evidence[-1].raw_outcome)
+        assert evidence_blocks[-1].accepted_tool_evidence is not None
+        assert evidence_blocks[-1].accepted_tool_evidence.result_text == (
+            canonical_json_dumps(seeded_evidence[-1].raw_outcome)
+        )
+        assert evidence_blocks[-1].text == render_accepted_tool_evidence_for_llm(
+            evidence_blocks[-1].accepted_tool_evidence
+        )
 
 
 def test_run_input_builder_represented_refs_exclude_whole_accepted_evidence_blocks(
@@ -1415,7 +1420,13 @@ def test_run_input_builder_represented_refs_exclude_whole_accepted_evidence_bloc
         assert tuple(block.accepted_evidence_id for block in evidence_blocks) == (
             seeded_evidence[2].accepted_evidence_id,
         )
-        assert evidence_blocks[0].text == canonical_json_dumps(seeded_evidence[2].raw_outcome)
+        assert evidence_blocks[0].accepted_tool_evidence is not None
+        assert evidence_blocks[0].accepted_tool_evidence.result_text == (
+            canonical_json_dumps(seeded_evidence[2].raw_outcome)
+        )
+        assert evidence_blocks[0].text == render_accepted_tool_evidence_for_llm(
+            evidence_blocks[0].accepted_tool_evidence
+        )
 
 
 def test_run_input_builder_accepted_tool_evidence_uses_raw_outcome_text(
@@ -1452,12 +1463,20 @@ def test_run_input_builder_accepted_tool_evidence_uses_raw_outcome_text(
         blocks = builder.build_material_blocks(_attempt_snapshot(seeded))
         evidence_block = _accepted_tool_evidence_blocks(blocks)[0]
 
-        assert evidence_block.text == canonical_json_dumps(raw_outcome)
+        assert evidence_block.accepted_tool_evidence is not None
+        assert evidence_block.accepted_tool_evidence.result_text == (
+            canonical_json_dumps(raw_outcome)
+        )
+        assert evidence_block.text == render_accepted_tool_evidence_for_llm(
+            evidence_block.accepted_tool_evidence
+        )
         assert "full raw outcome for LLM material" in evidence_block.text
         assert _DIGEST_A not in evidence_block.text
         assert seeded_evidence.tool_result_event_id not in evidence_block.text
-        assert evidence_block.readable_tool_name == "fins.search"
-        assert evidence_block.readable_query_text == ("Read MSFT FY2025 revenue from filing")
+        assert evidence_block.accepted_tool_evidence.tool_name == "fins.search"
+        assert evidence_block.accepted_tool_evidence.query_text == (
+            "Read MSFT FY2025 revenue from filing"
+        )
         assert evidence_block.accepted_evidence_id == (seeded_evidence.accepted_evidence_id)
         assert evidence_block.canonical_source_refs == (seeded_evidence.accepted_evidence_id,)
         assert evidence_block.payload_refs == (f"payload:{seeded_evidence.tool_result_event_id}",)
@@ -3403,24 +3422,44 @@ def test_post_compaction_raw_tail_skips_without_compact_or_in_fallback(
 def test_accepted_tool_evidence_content_consumes_projection_source_text() -> None:
     """RunInputBuilder 只消费 projection owner 给出的 accepted evidence source。"""
 
+    material = AcceptedToolEvidenceLLMMaterial(
+        tool_name="fins.search",
+        query_text="查询收入",
+        source_text=ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
+        result_text='{"result":"ok"}',
+    )
     block = run_input_material_block(
         block_id="accepted-evidence",
         section=CompactMaterialSection.EVIDENCE_MATERIAL,
         kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
-        text='{"result":"ok"}',
+        text=render_accepted_tool_evidence_for_llm(material),
         canonical_source_refs=("evidence:accepted-evidence",),
         event_sequence=1,
-        readable_tool_name="fins.search",
-        readable_query_text="查询收入",
-        readable_source_text=ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
         accepted_evidence_id="evidence:accepted-evidence",
         tool_result_event_ref="event-result",
         tool_call_event_ref="event-request",
+        payload_refs=("payload:event-result",),
+        accepted_tool_evidence=material,
     )
 
-    content = _accepted_tool_evidence_content(block)
+    current = _material_block(
+        "current",
+        CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+        CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+        "current",
+        event_sequence=2,
+    )
+    content = _fallback_context_messages(
+        fallback=_active_fallback(
+            selected_blocks=(block, current),
+            current_input_ref="current",
+        ),
+        material_blocks=(block, current),
+    )[0].content
 
-    assert f"source={ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT}" in content
+    assert content is not None
+    assert render_accepted_tool_evidence_for_llm(material) in content
+    assert ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT in content
     assert "tool_call_event:" not in content
     assert "payload:" not in content
     assert "event-request" not in content
@@ -3918,20 +3957,25 @@ def _material_block(
     """
 
     if kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE:
+        material = AcceptedToolEvidenceLLMMaterial(
+            tool_name="read_tool",
+            query_text="query",
+            source_text="source",
+            result_text=text,
+        )
         return run_input_material_block(
             block_id=block_id,
             section=section,
             kind=kind,
-            text=text,
+            text=render_accepted_tool_evidence_for_llm(material),
             canonical_source_refs=(block_id if source_ref is None else source_ref,),
             event_sequence=event_sequence,
             turn_group_id=turn_group_id,
             accepted_evidence_id=f"evidence:{block_id}",
             tool_result_event_ref=f"tool-result:{block_id}",
             tool_call_event_ref=f"tool-call:{block_id}",
-            readable_tool_name="read_tool",
-            readable_query_text="query",
-            readable_source_text="source",
+            payload_refs=(f"payload:{block_id}",),
+            accepted_tool_evidence=material,
         )
     return run_input_material_block(
         block_id=block_id,

@@ -5,11 +5,11 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from dayu.contracts.json_value import JsonValue
 from dayu.host.api import RunStatus
 from dayu.host.accepted_result_projection import (
-    ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT,
-    ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
     AcceptedToolResultProjection,
     AcceptedToolResultQueryState,
     AcceptedToolResultSourceState,
@@ -23,11 +23,17 @@ from dayu.host.compact_material import (
 from dayu.host.compaction import CompactMaterialBlockKind
 from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
+from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
     EventLogRow,
     EventLogStore,
+)
+from dayu.host.evidence import (
+    ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT,
+    ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
+    render_accepted_tool_evidence_for_llm,
 )
 from dayu.host.durable.memory import _memory_projection_event_from_view
 from dayu.host.durable.options import (
@@ -50,9 +56,11 @@ from dayu.host.durable.tool_trace import ToolTraceHotRow, read_tool_trace_hot_ro
 from dayu.host.durable.transaction import HostTransaction
 from dayu.host.evidence import (
     AcceptedEvidenceEnvelope,
+    AcceptedEvidenceProducerEventRefMismatchError,
     AcceptedEvidenceResultRef,
     AcceptedEvidenceToolQuery,
     OpaqueEvidenceRef,
+    accepted_evidence_envelope_from_payload,
     accepted_evidence_envelope_to_json_value,
 )
 from dayu.host.memory import (
@@ -62,7 +70,6 @@ from dayu.host.memory import (
     default_memory_projection_policy,
 )
 from dayu.host.projection import projection_event_view_from_row
-from dayu.host.run_input import _accepted_tool_evidence_content
 from dayu.host.tool_trace import (
     ToolTraceProjectionConsumer,
     ToolTraceSinkOptions,
@@ -255,6 +262,143 @@ def test_projection_missing_envelope_returns_shared_unavailable_source_text(
     assert projection.source.state is AcceptedToolResultSourceState.UNAVAILABLE
     assert projection.source.diagnostic_reason == "accepted_evidence_envelope_missing"
     assert projection.source.text == ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT
+    assert projection.llm_material is not None
+    assert render_accepted_tool_evidence_for_llm(projection.llm_material) == (
+        "工具名称：fins.search\n"
+        f"查询语义：{ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT}\n"
+        f"业务来源：{ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT}\n"
+        '工具结果：{"kind":"completed","result":{"ok":true}}'
+    )
+
+
+def test_projection_missing_material_uses_owner_fallback() -> None:
+    """material 缺失时唯一 renderer 返回 projection-owned 整体 fallback。"""
+
+    assert render_accepted_tool_evidence_for_llm(None) == (
+        "工具证据不可用；缺少可安全展示的工具名称或工具结果。"
+    )
+
+
+def test_projection_malformed_optional_payload_text_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """optional payload text 存在但类型或空白非法时 fail closed。"""
+
+    event_log = EventLogStore()
+    projection: AcceptedToolResultProjection | None = None
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        wrong_type_row = store.transaction_runner.run_write(
+            lambda transaction: _append_event(
+                transaction,
+                event_log,
+                event_id="event-result-wrong-tool-name",
+                event_type="TOOL_RESULT_ACCEPTED",
+                payload={
+                    "tool_name": 123,
+                    "raw_tool_outcome": {"kind": "completed"},
+                },
+            )
+        )
+        blank_status_row = store.transaction_runner.run_write(
+            lambda transaction: _append_event(
+                transaction,
+                event_log,
+                event_id="event-result-blank-status",
+                event_type="TOOL_RESULT_ACCEPTED",
+                payload={
+                    "tool_name": _TOOL_NAME,
+                    "tool_call_id": "tool-call-blank-status",
+                    "resolution_kind": " ",
+                    "raw_tool_outcome": {"kind": "completed"},
+                },
+            )
+        )
+        null_tool_name_row = store.transaction_runner.run_write(
+            lambda transaction: _append_event(
+                transaction,
+                event_log,
+                event_id="event-result-null-tool-name",
+                event_type="TOOL_RESULT_ACCEPTED",
+                payload={
+                    "tool_name": None,
+                    "tool_call_id": "tool-call-null-tool-name",
+                    "raw_tool_outcome": {"kind": "completed"},
+                },
+            )
+        )
+
+        with pytest.raises(HostDurableError):
+            store.transaction_runner.run_read(
+                lambda transaction: project_accepted_tool_result(
+                    transaction,
+                    wrong_type_row,
+                )
+            )
+        with pytest.raises(HostDurableError):
+            store.transaction_runner.run_read(
+                lambda transaction: project_accepted_tool_result(
+                    transaction,
+                    blank_status_row,
+                )
+            )
+        projection = store.transaction_runner.run_read(
+            lambda transaction: project_accepted_tool_result(
+                transaction,
+                null_tool_name_row,
+            )
+        )
+
+    assert projection is not None
+    assert projection.tool_name is None
+    assert projection.llm_material is None
+
+
+def test_accepted_evidence_producer_mismatch_is_typed_exception(
+    tmp_path: Path,
+) -> None:
+    """producer event ref mismatch 使用专用异常并由 projection 包装 cause。"""
+
+    event_log = EventLogStore()
+    envelope = _accepted_envelope(
+        event_id="event-result-observed",
+        tool_call_id="tool-call-mismatch",
+        request_event_ref=None,
+        normalized_arguments_digest=_DIGEST,
+        raw_tool_outcome={"kind": "completed"},
+        source_refs=(),
+    )
+    payload: dict[str, JsonValue] = {
+        "accepted_evidence_envelope": accepted_evidence_envelope_to_json_value(
+            envelope
+        ),
+        "raw_tool_outcome": {"kind": "completed"},
+    }
+    wrapped_cause: BaseException | None = None
+    with pytest.raises(AcceptedEvidenceProducerEventRefMismatchError) as direct:
+        accepted_evidence_envelope_from_payload(
+            payload,
+            producer_event_ref="event-result-expected",
+        )
+    assert direct.value.expected_event_ref == "event-result-expected"
+    assert direct.value.observed_event_ref == "event-result-observed"
+
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        row = store.transaction_runner.run_write(
+            lambda transaction: _append_event(
+                transaction,
+                event_log,
+                event_id="event-result-expected",
+                event_type="TOOL_RESULT_ACCEPTED",
+                payload=payload,
+            )
+        )
+        with pytest.raises(HostDurableError) as wrapped:
+            store.transaction_runner.run_read(
+                lambda transaction: project_accepted_tool_result(transaction, row)
+            )
+        wrapped_cause = wrapped.value.__cause__
+
+    assert isinstance(wrapped_cause, AcceptedEvidenceProducerEventRefMismatchError)
 
 
 def test_projection_maps_governed_error_and_unknown_status(tmp_path: Path) -> None:
@@ -734,7 +878,9 @@ def test_same_accepted_result_has_equivalent_consumer_projection(
     )
     assert len(evidence_blocks) == 1
     evidence_block = evidence_blocks[0]
-    run_input_text = _accepted_tool_evidence_content(evidence_block)
+    assert projection.llm_material is not None
+    material = projection.llm_material
+    run_input_text = render_accepted_tool_evidence_for_llm(material)
     memory_text = memory_snapshot.trace_memory.selected_recent_window[0].text
     trace_request = tool_trace_row.trace_summary["tool_request"]
     trace_result = tool_trace_row.trace_summary["tool_result"]
@@ -744,12 +890,18 @@ def test_same_accepted_result_has_equivalent_consumer_projection(
     assert trace_request["query_state"] == projection.query.state.value
     assert trace_result["result_status"] == projection.status.value
     assert trace_result["result_text"] == projection.result_text
-    assert evidence_block.readable_query_text == projection.query.text
-    assert evidence_block.readable_source_text == projection.source.text
-    assert evidence_block.text == projection.result_text
-    assert f"query={projection.query.text}" in run_input_text
-    assert f"source={projection.source.text}" in run_input_text
-    assert f"result={projection.result_text}" in run_input_text
+    block_material = evidence_block.accepted_tool_evidence
+    assert block_material is not None
+    assert block_material == material
+    assert block_material.query_text == projection.query.text
+    assert block_material.source_text == projection.source.text
+    assert block_material.result_text == projection.result_text
+    assert evidence_block.text == render_accepted_tool_evidence_for_llm(
+        material
+    )
+    assert f"查询语义：{projection.query.text}" in run_input_text
+    assert f"业务来源：{projection.source.text}" in run_input_text
+    assert f"工具结果：{projection.result_text}" in run_input_text
     assert projection.query.text in memory_text
     assert projection.result_text is not None
     assert projection.result_text in memory_text

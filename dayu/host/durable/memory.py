@@ -43,6 +43,7 @@ from dayu.host.compact_payload import (
     parse_context_compacted_semantic_payload,
 )
 from dayu.host.accepted_result_projection import project_accepted_tool_result
+from dayu.host.evidence import AcceptedToolEvidenceLLMMaterial
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
     AnswerAnchor,
@@ -68,10 +69,6 @@ from dayu.host.memory import (
 )
 from dayu.host._terminal_answer import assistant_final_answer_continuity_text
 from dayu.host.terminal_payload import PayloadTextReadPolicy
-from dayu.host.evidence import accepted_evidence_envelope_from_payload
-from dayu.host.payload_resolution import (
-    event_payload_object_for_result_ref,
-)
 from dayu.host.projection import (
     ProjectionApplyResult,
     ProjectionApplyStatus,
@@ -111,20 +108,13 @@ class _MemoryProjectionPayloadView:
     :param payload: memory projection 消费的 payload。
     :param assistant_final_answer_text: 可选 LLM-facing assistant answer
         continuity 文本，不回写 EventLog payload。
-    :param evidence_query_text: 可选 LLM-safe request / query 文本。
-    :param evidence_tool_name: 可选工具名。
-    :param evidence_result_text: 可选 LLM-safe 工具结果文本。
-    :param evidence_source_text: 可选业务可读 source 文本；accepted result 正常路径由
-        统一 projection owner 提供非空 source 文本。
+    :param accepted_tool_evidence: accepted result projection 产生的 LLM-facing typed material。
     :param compacted_semantics: compact event 的严格 typed semantic view。
     """
 
     payload: Mapping[str, JsonValue]
     assistant_final_answer_text: str | None
-    evidence_query_text: str | None
-    evidence_tool_name: str | None
-    evidence_result_text: str | None
-    evidence_source_text: str | None
+    accepted_tool_evidence: AcceptedToolEvidenceLLMMaterial | None
     compacted_semantics: ContextCompactedSemanticPayload | None
 
 
@@ -368,10 +358,7 @@ def _memory_projection_event_from_view(
         payload=payload_view.payload,
         compacted_semantics=payload_view.compacted_semantics,
         assistant_final_answer_text=payload_view.assistant_final_answer_text,
-        evidence_query_text=payload_view.evidence_query_text,
-        evidence_tool_name=payload_view.evidence_tool_name,
-        evidence_result_text=payload_view.evidence_result_text,
-        evidence_source_text=payload_view.evidence_source_text,
+        accepted_tool_evidence=payload_view.accepted_tool_evidence,
     )
 
 
@@ -393,10 +380,7 @@ def _memory_projection_payload_view(
         return _MemoryProjectionPayloadView(
             payload=event.payload,
             assistant_final_answer_text=None,
-            evidence_query_text=None,
-            evidence_tool_name=None,
-            evidence_result_text=None,
-            evidence_source_text=None,
+            accepted_tool_evidence=None,
             compacted_semantics=parse_context_compacted_semantic_payload(
                 event.payload
             ),
@@ -405,10 +389,7 @@ def _memory_projection_payload_view(
         return _MemoryProjectionPayloadView(
             payload=event.payload,
             assistant_final_answer_text=None,
-            evidence_query_text=None,
-            evidence_tool_name=None,
-            evidence_result_text=None,
-            evidence_source_text=None,
+            accepted_tool_evidence=None,
             compacted_semantics=None,
         )
     final_answer = assistant_final_answer_continuity_text(
@@ -419,10 +400,7 @@ def _memory_projection_payload_view(
     return _MemoryProjectionPayloadView(
         payload=event.payload,
         assistant_final_answer_text=final_answer,
-        evidence_query_text=None,
-        evidence_tool_name=None,
-        evidence_result_text=None,
-        evidence_source_text=None,
+        accepted_tool_evidence=None,
         compacted_semantics=None,
     )
 
@@ -445,36 +423,10 @@ def _tool_result_memory_payload_view(
         result_row,
         resolved_payload=event.payload,
     )
-    if not projection.envelope_available:
-        return _MemoryProjectionPayloadView(
-            payload=event.payload,
-            assistant_final_answer_text=None,
-            evidence_query_text=projection.query.text,
-            evidence_tool_name=projection.tool_name,
-            evidence_result_text=projection.result_text,
-            evidence_source_text=projection.source.text,
-            compacted_semantics=None,
-        )
-    envelope = accepted_evidence_envelope_from_payload(
-        event.payload,
-        producer_event_ref=event.event_id,
-    )
-    if envelope is None:
-        raise HostDurableError("canonical evidence envelope is missing")
-    payload = event_payload_object_for_result_ref(
-        transaction,
-        result_row,
-        expected_payload_ref=envelope.result_ref.payload_ref,
-        expected_payload_digest=envelope.result_ref.payload_digest,
-        payload_label=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
-    )
     return _MemoryProjectionPayloadView(
-        payload=payload,
+        payload=event.payload,
         assistant_final_answer_text=None,
-        evidence_query_text=projection.query.text,
-        evidence_tool_name=projection.tool_name,
-        evidence_result_text=projection.result_text,
-        evidence_source_text=projection.source.text,
+        accepted_tool_evidence=projection.llm_material,
         compacted_semantics=None,
     )
 

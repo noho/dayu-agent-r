@@ -126,11 +126,9 @@ from dayu.host.accepted_result_projection import (
     AcceptedToolResultProjection,
     project_accepted_tool_result,
 )
-from dayu.host.evidence import ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH
-from dayu.host.evidence import accepted_evidence_envelope_from_payload
+from dayu.host.evidence import render_accepted_tool_evidence_for_llm
 from dayu.host.payload_resolution import (
     event_payload_object,
-    event_payload_object_for_result_ref,
 )
 from dayu.host.projection import event_log_read_filter_from_projection_filter
 from dayu.host.terminal_payload import (
@@ -2934,7 +2932,10 @@ def _fallback_message_from_material_block(block: RunInputMaterialBlock) -> Agent
     if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE:
         return SystemMessage(
             role=AgentMessageRole.SYSTEM,
-            content=_accepted_tool_evidence_content(block),
+            content=(
+                f"{_ACCEPTED_TOOL_EVIDENCE_PREFIX}\n"
+                f"{render_accepted_tool_evidence_for_llm(block.accepted_tool_evidence)}"
+            ),
         )
     if block.kind is CompactMaterialBlockKind.EVIDENCE_BACKED_FACT:
         return SystemMessage(role=AgentMessageRole.SYSTEM, content=block.text)
@@ -2954,32 +2955,6 @@ def _recent_evidence_content(text: str) -> str:
     """
 
     return f"{_RECENT_EVIDENCE_PREFIX}\n{text}"
-
-
-def _accepted_tool_evidence_content(block: RunInputMaterialBlock) -> str:
-    """把 accepted tool evidence block 改写为业务可读 material。
-
-    :param block: accepted tool evidence material block。
-    :returns: 不含内部 ref / digest 的 evidence 文本。
-    :raises HostDurableError: 可读工具名缺失时抛出。
-    """
-
-    if block.readable_tool_name is None:
-        raise HostDurableError("accepted tool evidence requires readable tool name")
-    query_text = (
-        "The original tool query is not available in readable form."
-        if block.readable_query_text is None
-        else block.readable_query_text
-    )
-    lines = [
-        _ACCEPTED_TOOL_EVIDENCE_PREFIX,
-        f"tool_name={block.readable_tool_name}",
-        f"query={query_text}",
-    ]
-    if block.readable_source_text is not None:
-        lines.append(f"source={block.readable_source_text}")
-    lines.append(f"result={block.text}")
-    return "\n".join(lines)
 
 
 def _run_input_message_content(message: AgentMessage) -> str:
@@ -3161,6 +3136,15 @@ def _memory_projection_event_from_row(transaction: HostTransaction, row: EventLo
     """
 
     payload = _memory_projection_payload(transaction, row)
+    accepted_tool_projection = (
+        project_accepted_tool_result(
+            transaction,
+            row,
+            resolved_payload=payload,
+        )
+        if row.event_type == _EVENT_TYPE_TOOL_RESULT_ACCEPTED
+        else None
+    )
     return MemoryProjectionEvent(
         event_sequence=row.event_sequence,
         event_id=row.event_id,
@@ -3184,6 +3168,11 @@ def _memory_projection_event_from_row(transaction: HostTransaction, row: EventLo
             row,
             payload,
         ),
+        accepted_tool_evidence=(
+            None
+            if accepted_tool_projection is None
+            else accepted_tool_projection.llm_material
+        ),
     )
 
 
@@ -3200,8 +3189,7 @@ def _memory_projection_payload(
     """
 
     payload = _payload_object(row)
-    if row.event_type == _EVENT_TYPE_TOOL_RESULT_ACCEPTED:
-        return _tool_result_memory_payload(transaction, row, payload)
+    del transaction
     return payload
 
 
@@ -3225,40 +3213,6 @@ def _assistant_final_answer_text(
         transaction,
         payload,
         text_policy=PayloadTextReadPolicy.STRICT_NON_EMPTY,
-    )
-
-
-def _tool_result_memory_payload(
-    transaction: HostTransaction,
-    row: EventLogRow,
-    payload: Mapping[str, JsonValue],
-) -> Mapping[str, JsonValue]:
-    """读取 memory inline repair 使用的完整 accepted tool result payload。
-
-    :param transaction: Host transaction。
-    :param row: ``TOOL_RESULT_ACCEPTED`` EventLog row。
-    :param payload: inline hot payload。
-    :returns: digest-checked 工具结果 payload。
-    :raises HostDurableError: envelope 或 payload descriptor 损坏时抛出。
-    """
-
-    try:
-        envelope = accepted_evidence_envelope_from_payload(
-            payload,
-            producer_event_ref=row.event_id,
-        )
-    except ValueError as exc:
-        if str(exc) == ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH:
-            raise HostDurableError(str(exc)) from exc
-        raise HostDurableError("canonical evidence envelope is invalid") from exc
-    if envelope is None:
-        return payload
-    return event_payload_object_for_result_ref(
-        transaction,
-        row,
-        expected_payload_ref=envelope.result_ref.payload_ref,
-        expected_payload_digest=envelope.result_ref.payload_digest,
-        payload_label=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
     )
 
 

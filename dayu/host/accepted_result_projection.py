@@ -18,12 +18,23 @@ from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import EventClass, EventLogRow, read_event_by_id
 from dayu.host.durable.transaction import HostTransaction
 from dayu.host.evidence import (
-    ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH,
     AcceptedEvidenceEnvelope,
     OpaqueEvidenceRef,
     accepted_evidence_envelope_from_payload,
     accepted_tool_raw_outcome_text_from_payload,
     derive_accepted_evidence_id,
+)
+from dayu.host.evidence import (
+    ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT as _ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT,
+)
+from dayu.host.evidence import (
+    ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT as _ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
+)
+from dayu.host.evidence import (
+    AcceptedEvidenceProducerEventRefMismatchError as _AcceptedEvidenceProducerEventRefMismatchError,
+)
+from dayu.host.evidence import (
+    AcceptedToolEvidenceLLMMaterial as _AcceptedToolEvidenceLLMMaterial,
 )
 from dayu.host.payload_resolution import (
     ToolCallRequestAtoms,
@@ -31,14 +42,6 @@ from dayu.host.payload_resolution import (
     event_payload_object_for_result_ref,
     tool_call_request_atoms,
 )
-
-ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT = "查询语义不可用；参数未安全展开。"
-"""Accepted tool result query 不可安全投影时的唯一 LLM-facing 文案。"""
-
-ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT = (
-    "业务来源不可用；工具结果未提供可安全展示的来源。"
-)
-"""Accepted tool result source 不可安全投影时的唯一 LLM-facing 文案。"""
 
 _EVENT_TYPE_TOOL_CALL_REQUESTED = "TOOL_CALL_REQUESTED"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
@@ -131,6 +134,7 @@ class AcceptedToolResultProjection:
     :param envelope_available: durable payload 是否携带 accepted evidence envelope。
     :param tool_name: 工具名。
     :param tool_call_id: 工具调用 id。
+    :param tool_call_requested_event_ref: 可选 ``TOOL_CALL_REQUESTED`` event ref。
     :param query: query 可读投影。
     :param request_arguments_json: 已校验的 LLM-safe request 参数 JSON。
     :param status: 统一工具结果状态。
@@ -138,7 +142,9 @@ class AcceptedToolResultProjection:
     :param result_text: canonical raw outcome 文本；不可用时为 ``None``。
     :param result_details_text: 从 raw outcome 抽取的短业务摘要。
     :param source: source 可读投影。
+    :param llm_material: 可直接渲染给 LLM 的 typed evidence material。
     :param payload_refs: 可诊断 payload refs，不进入 LLM-facing source。
+    :param source_locator_refs: accepted evidence source locator refs。
     :param diagnostic_reasons: projection 降级或损坏原因。
     """
 
@@ -147,6 +153,7 @@ class AcceptedToolResultProjection:
     envelope_available: bool
     tool_name: str | None
     tool_call_id: str | None
+    tool_call_requested_event_ref: str | None
     query: AcceptedToolResultQueryProjection
     request_arguments_json: Mapping[str, JsonValue] | None
     status: AcceptedToolResultStatus
@@ -154,7 +161,9 @@ class AcceptedToolResultProjection:
     result_text: str | None
     result_details_text: str | None
     source: AcceptedToolResultSourceProjection
+    llm_material: _AcceptedToolEvidenceLLMMaterial | None
     payload_refs: tuple[str, ...]
+    source_locator_refs: tuple[OpaqueEvidenceRef, ...]
     diagnostic_reasons: tuple[str, ...]
 
 
@@ -203,6 +212,12 @@ def project_accepted_tool_result(
     )
     query = _query_projection(request_atoms, payload, diagnostics)
     source = _source_projection(envelope, diagnostics)
+    llm_material = _llm_material(
+        tool_name=tool_name,
+        query=query,
+        source=source,
+        result_text=result_text,
+    )
     return AcceptedToolResultProjection(
         event_id=result_row.event_id,
         evidence_id=(
@@ -213,6 +228,11 @@ def project_accepted_tool_result(
         envelope_available=envelope is not None,
         tool_name=tool_name,
         tool_call_id=tool_call_id,
+        tool_call_requested_event_ref=(
+            None
+            if envelope is None
+            else envelope.tool_query.tool_call_requested_event_ref
+        ),
         query=query,
         request_arguments_json=(
             request_atoms.arguments_json if request_atoms is not None else None
@@ -222,7 +242,11 @@ def project_accepted_tool_result(
         result_text=result_text,
         result_details_text=result_details_text,
         source=source,
+        llm_material=llm_material,
         payload_refs=_payload_refs(result_row, envelope),
+        source_locator_refs=(
+            () if envelope is None else envelope.locator_refs
+        ),
         diagnostic_reasons=tuple(diagnostics),
     )
 
@@ -272,9 +296,9 @@ def _accepted_envelope(
             payload,
             producer_event_ref=event_id,
         )
+    except _AcceptedEvidenceProducerEventRefMismatchError as exc:
+        raise HostDurableError("accepted evidence producer_event_ref mismatch") from exc
     except ValueError as exc:
-        if str(exc) == ACCEPTED_EVIDENCE_PRODUCER_EVENT_REF_MISMATCH:
-            raise HostDurableError(str(exc)) from exc
         raise HostDurableError("accepted result envelope is invalid") from exc
 
 
@@ -329,7 +353,7 @@ def _projection_tool_name(
 
     if envelope is not None:
         return envelope.tool_name
-    return _optional_text(payload, _FIELD_TOOL_NAME)
+    return _optional_payload_text(payload, _FIELD_TOOL_NAME)
 
 
 def _projection_tool_call_id(
@@ -344,7 +368,7 @@ def _projection_tool_call_id(
 
     if envelope is not None:
         return envelope.tool_call_id
-    return _optional_text(payload, _FIELD_TOOL_CALL_ID)
+    return _optional_payload_text(payload, _FIELD_TOOL_CALL_ID)
 
 
 def _raw_outcome_text(payload: Mapping[str, JsonValue] | None) -> str | None:
@@ -378,10 +402,10 @@ def _accepted_status(
 
     if "result_payload_unavailable" in diagnostics or "event_payload_unavailable" in diagnostics:
         return AcceptedToolResultStatus.LOST
-    resolution_kind = _optional_text(payload, _FIELD_RESOLUTION_KIND)
+    resolution_kind = _optional_payload_text(payload, _FIELD_RESOLUTION_KIND)
     if resolution_kind is not None:
         return _status_from_text(resolution_kind)
-    tool_fact_kind = _optional_text(payload, _FIELD_TOOL_FACT_KIND)
+    tool_fact_kind = _optional_payload_text(payload, _FIELD_TOOL_FACT_KIND)
     if tool_fact_kind is not None:
         return _status_from_text(tool_fact_kind)
     if raw_outcome is None:
@@ -545,7 +569,7 @@ def _limited_query(reason: str) -> AcceptedToolResultQueryProjection:
     """
 
     return AcceptedToolResultQueryProjection(
-        text=ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT,
+        text=_ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT,
         state=AcceptedToolResultQueryState.LIMITED_SIGNAL,
         diagnostic_reason=reason,
     )
@@ -615,7 +639,7 @@ def _source_projection(
 
     if envelope is None:
         return AcceptedToolResultSourceProjection(
-            text=ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
+            text=_ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
             state=AcceptedToolResultSourceState.UNAVAILABLE,
             diagnostic_reason="accepted_evidence_envelope_missing",
         )
@@ -628,7 +652,7 @@ def _source_projection(
     if len(visible_refs) == 0:
         diagnostics.append("business_source_unavailable")
         return AcceptedToolResultSourceProjection(
-            text=ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
+            text=_ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
             state=AcceptedToolResultSourceState.UNAVAILABLE,
             diagnostic_reason="business_source_unavailable",
         )
@@ -668,6 +692,32 @@ def _payload_refs(
     if envelope is not None and envelope.result_ref.payload_ref is not None:
         refs.append(envelope.result_ref.payload_ref)
     return tuple(dict.fromkeys(refs))
+
+
+def _llm_material(
+    *,
+    tool_name: str | None,
+    query: AcceptedToolResultQueryProjection,
+    source: AcceptedToolResultSourceProjection,
+    result_text: str | None,
+) -> _AcceptedToolEvidenceLLMMaterial | None:
+    """从已校验 projection 字段构造 LLM material。
+
+    :param tool_name: 工具名。
+    :param query: query projection。
+    :param source: source projection。
+    :param result_text: canonical 工具结果文本。
+    :returns: 字段完整时返回 material，否则返回 ``None``。
+    """
+
+    if tool_name is None or result_text is None:
+        return None
+    return _AcceptedToolEvidenceLLMMaterial(
+        tool_name=tool_name,
+        query_text=query.text,
+        source_text=source.text,
+        result_text=result_text,
+    )
 
 
 def _result_details_text(value: JsonValue | None) -> str | None:
@@ -756,18 +806,27 @@ def _bounded_text(text: str, *, max_chars: int) -> str:
     return text[: max_chars - len(_TRUNCATED_SUFFIX)] + _TRUNCATED_SUFFIX
 
 
-def _optional_text(mapping: Mapping[str, JsonValue], field_name: str) -> str | None:
-    """读取可选非空文本字段。
+def _optional_payload_text(
+    payload: Mapping[str, JsonValue],
+    field_name: str,
+) -> str | None:
+    """读取 accepted-result payload 中的可选非空文本字段。
 
-    :param mapping: JSON object。
+    字段缺失或显式为 ``null`` 时返回 ``None``；字段存在但不是非空文本时
+    fail closed，避免把 malformed optional 字段误当缺失字段继续投影。
+
+    :param payload: accepted result payload。
     :param field_name: 字段名。
-    :returns: 非空字符串；否则为 ``None``。
+    :returns: 文本值或 ``None``。
+    :raises HostDurableError: 字段存在但类型错误或空白时抛出。
     """
 
-    value = mapping.get(field_name)
+    value = payload.get(field_name)
+    if value is None:
+        return None
     if isinstance(value, str) and value.strip() != "":
         return value
-    return None
+    raise HostDurableError(f"payload field {field_name} must be non-empty text")
 
 
 def projection_result_digest(projection: AcceptedToolResultProjection) -> str | None:
@@ -783,8 +842,6 @@ def projection_result_digest(projection: AcceptedToolResultProjection) -> str | 
 
 
 __all__ = [
-    "ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT",
-    "ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT",
     "AcceptedToolResultProjection",
     "AcceptedToolResultQueryProjection",
     "AcceptedToolResultQueryState",

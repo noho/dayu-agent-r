@@ -11,8 +11,10 @@ import pytest
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host.api import RunStatus
-from dayu.host.accepted_result_projection import (
+from dayu.host.evidence import (
     ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
+    AcceptedToolEvidenceLLMMaterial,
+    render_accepted_tool_evidence_for_llm,
 )
 from dayu.host.compact_material import (
     CompactMaterialSourceBoundary,
@@ -1406,7 +1408,7 @@ def test_single_large_evidence_block_stays_whole_with_same_provenance() -> None:
     assert evidence_map["E1"].tool_result_event_ref == "tool-result:evidence-large"
     assert evidence_map["E1"].tool_call_event_ref == "tool-call:evidence-large"
     assert evidence_map["E1"].canonical_source_refs == ("event:evidence-large",)
-    assert evidence_map["E1"].content_digest == sha256_digest_json({"text": large_text})
+    assert evidence_map["E1"].content_digest == evidence.content_digest
     assert evidence_map["E1"].payload_refs == ("payload:evidence-large",)
     assert evidence_map["E1"].artifact_refs == ("artifact:evidence-large",)
     assert evidence_map["E1"].source_locator_refs == (locator_ref,)
@@ -1672,7 +1674,10 @@ def test_pre_dispatch_evidence_uses_full_tool_call_query_atom(tmp_path: Path) ->
             block for block in view.material_blocks if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE
         )
         assert len(evidence_blocks) == 1
-        assert evidence_blocks[0].readable_query_text == ("Search FY2025 revenue for MSFT")
+        assert evidence_blocks[0].accepted_tool_evidence is not None
+        assert evidence_blocks[0].accepted_tool_evidence.query_text == (
+            "Search FY2025 revenue for MSFT"
+        )
 
 
 def test_pre_dispatch_evidence_query_text_is_not_truncated(tmp_path: Path) -> None:
@@ -1727,8 +1732,8 @@ def test_pre_dispatch_evidence_query_text_is_not_truncated(tmp_path: Path) -> No
             block for block in view.material_blocks if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE
         )
         assert len(evidence_blocks) == 1
-        query_text = evidence_blocks[0].readable_query_text
-        assert query_text is not None
+        assert evidence_blocks[0].accepted_tool_evidence is not None
+        query_text = evidence_blocks[0].accepted_tool_evidence.query_text
         assert query_text == long_query
         assert len(query_text) > 1200
 
@@ -1807,8 +1812,14 @@ def test_pre_dispatch_evidence_reads_descriptor_raw_payload(tmp_path: Path) -> N
             )
         )
 
-        assert tuple(block.text for block in view.material_blocks) == (
-            '{"kind":"completed","result":{"content":"descriptor raw content"}}',
+        assert len(view.material_blocks) == 1
+        block = view.material_blocks[0]
+        assert block.accepted_tool_evidence is not None
+        assert block.accepted_tool_evidence.result_text == (
+            '{"kind":"completed","result":{"content":"descriptor raw content"}}'
+        )
+        assert block.text == render_accepted_tool_evidence_for_llm(
+            block.accepted_tool_evidence
         )
         assert view.material_blocks[0].payload_refs == ("payload-descriptor-evidence",)
 
@@ -1886,14 +1897,15 @@ def test_pre_dispatch_evidence_uses_projection_unavailable_source(
     )
     assert len(evidence_blocks) == 1
     evidence_block = evidence_blocks[0]
-    assert evidence_block.readable_source_text == (
+    assert evidence_block.accepted_tool_evidence is not None
+    assert evidence_block.accepted_tool_evidence.source_text == (
         ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT
     )
     visible_text = "\n".join(
         (
             evidence_block.text,
-            evidence_block.readable_query_text or "",
-            evidence_block.readable_source_text or "",
+            evidence_block.accepted_tool_evidence.query_text,
+            evidence_block.accepted_tool_evidence.source_text,
         )
     )
     assert ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT in visible_text
@@ -1984,8 +1996,8 @@ def test_pre_dispatch_evidence_missing_request_atom_emits_limited_signal(
             )
         )
 
-        query_text = view.material_blocks[0].readable_query_text
-        assert query_text is not None
+        assert view.material_blocks[0].accepted_tool_evidence is not None
+        query_text = view.material_blocks[0].accepted_tool_evidence.query_text
         assert query_text == "查询语义不可用；参数未安全展开。"
         assert "event-tool-result-missing-request" not in query_text
         assert "tool-call-event-tool-result-missing-request" not in query_text
@@ -2254,9 +2266,13 @@ def test_pre_dispatch_second_compact_rolls_from_latest_accepted_candidate(tmp_pa
             item.claim_text
             for item in view.previous_compacted_readable_view.evidence_backed_facts
         ) == ("accepted fact",)
-        assert tuple(block.text for block in view.material_blocks) == (
-            "new user after compact",
-            '{"kind":"completed","result":{"content":"raw content event-tool-result-after-compact"}}',
+        assert view.material_blocks[0].text == "new user after compact"
+        assert view.material_blocks[1].accepted_tool_evidence is not None
+        assert view.material_blocks[1].accepted_tool_evidence.result_text == (
+            '{"kind":"completed","result":{"content":"raw content event-tool-result-after-compact"}}'
+        )
+        assert view.material_blocks[1].text == render_accepted_tool_evidence_for_llm(
+            view.material_blocks[1].accepted_tool_evidence
         )
         assert all("before compact" not in block.text for block in view.material_blocks)
         assert view.represented_evidence_refs == ("evidence:event-tool-result-before-compact",)
@@ -2636,11 +2652,17 @@ def _evidence_block(
     :returns: RunInputMaterialBlock。
     """
 
+    material = AcceptedToolEvidenceLLMMaterial(
+        tool_name="read_tool",
+        query_text="query",
+        source_text="source",
+        result_text=text,
+    )
     return run_input_material_block(
         block_id=block_id,
         section=CompactMaterialSection.EVIDENCE_MATERIAL,
         kind=CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
-        text=text,
+        text=render_accepted_tool_evidence_for_llm(material),
         canonical_source_refs=(f"event:{block_id}",),
         event_sequence=event_sequence,
         turn_group_id=turn_group_id,
@@ -2650,9 +2672,7 @@ def _evidence_block(
         payload_refs=payload_refs,
         artifact_refs=artifact_refs,
         source_locator_refs=source_locator_refs,
-        readable_tool_name="read_tool",
-        readable_query_text="query",
-        readable_source_text="source",
+        accepted_tool_evidence=material,
     )
 
 

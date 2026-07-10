@@ -33,9 +33,7 @@ from dayu.host.compact_material import (
     selected_material_view_digest,
     transform_previous_compacted_view_pair_for_recovery,
 )
-from dayu.host.accepted_result_projection import (
-    ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT,
-)
+from dayu.host.evidence import render_accepted_tool_evidence_for_llm
 from dayu.host.compact_payload import (
     accepted_evidence_mapping_refs_for_candidate,
     prompt_local_label_mapping_refs,
@@ -1109,7 +1107,10 @@ def _message_from_material_block(block: RunInputMaterialBlock) -> AgentMessage:
     if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE:
         return SystemMessage(
             role=AgentMessageRole.SYSTEM,
-            content=_accepted_tool_evidence_content(block),
+            content=(
+                f"{_ACCEPTED_TOOL_EVIDENCE_PREFIX}\n"
+                f"{render_accepted_tool_evidence_for_llm(block.accepted_tool_evidence)}"
+            ),
         )
     if block.section is CompactMaterialSection.EVIDENCE_MATERIAL:
         return SystemMessage(
@@ -1117,32 +1118,6 @@ def _message_from_material_block(block: RunInputMaterialBlock) -> AgentMessage:
             content=f"{_RECENT_EVIDENCE_PREFIX}\n{block.text}",
         )
     return SystemMessage(role=AgentMessageRole.SYSTEM, content=block.text)
-
-
-def _accepted_tool_evidence_content(block: RunInputMaterialBlock) -> str:
-    """构造 accepted tool evidence 的 LLM-facing 文本。
-
-    :param block: accepted evidence material block。
-    :returns: 业务可读 evidence 文本。
-    :raises HostDurableError: readable tool name 缺失时抛出。
-    """
-
-    if block.readable_tool_name is None:
-        raise HostDurableError("accepted tool evidence requires readable tool name")
-    query_text = (
-        ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT
-        if block.readable_query_text is None
-        else block.readable_query_text
-    )
-    lines = [
-        _ACCEPTED_TOOL_EVIDENCE_PREFIX,
-        f"tool_name={block.readable_tool_name}",
-        f"query={query_text}",
-    ]
-    if block.readable_source_text is not None:
-        lines.append(f"source={block.readable_source_text}")
-    lines.append(f"result={block.text}")
-    return "\n".join(lines)
 
 
 __all__ = [
