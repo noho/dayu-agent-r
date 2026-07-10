@@ -120,6 +120,7 @@ def test_execute_upload_create_material_success(tmp_path: Path) -> None:
     assert result.file_events[0].event_type == "conversion_started"
     meta = context.source_repository.get_source_meta("AAPL", "mat_demo", SourceKind.MATERIAL)
     assert str(meta["primary_document"]).endswith("_docling.json")
+    assert meta["source_provider"] == "user_upload"
     assert len(meta["files"]) == 2
 
 

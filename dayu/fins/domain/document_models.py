@@ -14,11 +14,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, Optional
+
+from dayu.contracts.json_value import JsonValue
+from dayu.fins.domain.enums import SourceKind
 
 
 DocumentMeta = dict[str, Any]
@@ -68,6 +72,110 @@ class FinsIngestMethod(str, Enum):
         """
 
         return self.value
+
+
+class FinsSourceProvider(str, Enum):
+    """财报源文档提供方的仓储值。
+
+    该枚举表达 source meta 中持久化的 provider 真源，不直接作为
+    LLM-facing 展示值使用。
+    """
+
+    SEC_EDGAR = "sec_edgar"
+    CNINFO = "cninfo"
+    HKEXNEWS = "hkexnews"
+    USER_UPLOAD = "user_upload"
+
+    @classmethod
+    def from_storage_value(cls, value: str, *, field_name: str = "source_provider") -> "FinsSourceProvider":
+        """从 storage meta 字符串解析 source provider。
+
+        Args:
+            value: storage meta 中的 provider 字符串。
+            field_name: 报错使用的字段名。
+
+        Returns:
+            已校验的 provider 枚举值。
+
+        Raises:
+            ValueError: 字符串为空或不是合法 provider 时抛出。
+        """
+
+        normalized = value.strip().lower()
+        if not normalized:
+            raise ValueError(f"{field_name} 不能为空")
+        try:
+            return cls(normalized)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} 非法: {value}") from exc
+
+    def to_storage_value(self) -> str:
+        """转换为 source meta 使用的仓储字符串。
+
+        Args:
+            无。
+
+        Returns:
+            storage meta 中持久化的字符串值。
+
+        Raises:
+            无。
+        """
+
+        return self.value
+
+
+@dataclass(frozen=True)
+class SourceDocumentProvenance:
+    """源文档溯源事实投影。
+
+    Attributes:
+        source_kind: 源文档类型。
+        ingest_method: 文档进入仓储的业务方式。
+        source_provider: 文档来源提供方。
+        ingest_complete: source meta 是否为完成态。
+    """
+
+    source_kind: SourceKind
+    ingest_method: FinsIngestMethod
+    source_provider: FinsSourceProvider
+    ingest_complete: bool
+
+    @classmethod
+    def from_meta(
+        cls,
+        meta: Mapping[str, JsonValue],
+        source_kind: SourceKind,
+    ) -> "SourceDocumentProvenance":
+        """从 source meta 解析溯源事实。
+
+        Args:
+            meta: source repository 读取到的 meta 内容。
+            source_kind: 仓储路由已经确认的源文档类型。
+
+        Returns:
+            已校验的源文档溯源事实。
+
+        Raises:
+            KeyError: meta 缺少必需溯源字段时抛出。
+            ValueError: 字段类型或枚举值非法时抛出。
+        """
+
+        raw_ingest_method = meta["ingest_method"]
+        if not isinstance(raw_ingest_method, str):
+            raise ValueError("ingest_method 必须为字符串")
+        raw_provider = meta["source_provider"]
+        if not isinstance(raw_provider, str):
+            raise ValueError("source_provider 必须为字符串")
+        raw_ingest_complete = meta["ingest_complete"]
+        if not isinstance(raw_ingest_complete, bool):
+            raise ValueError("ingest_complete 必须为布尔值")
+        return cls(
+            source_kind=source_kind,
+            ingest_method=FinsIngestMethod.from_storage_value(raw_ingest_method),
+            source_provider=FinsSourceProvider.from_storage_value(raw_provider),
+            ingest_complete=raw_ingest_complete,
+        )
 
 
 @dataclass(frozen=True)

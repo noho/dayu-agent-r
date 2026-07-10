@@ -12,11 +12,11 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from threading import Lock, RLock
-from typing import Any, Literal, Optional, cast
+from typing import Any, Final, Literal, Optional, cast
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.fins._log import Log
-from dayu.fins.domain.document_models import FinsIngestMethod
+from dayu.fins.domain.document_models import FinsSourceProvider
 from dayu.documents.processors.base import (
     DocumentProcessor,
     SectionContent,
@@ -119,6 +119,23 @@ _MISSING_TICKER_HINT = (
     "目标：先确认这家公司是否已被当前财报工具收录。允许动作：切到公司或网页来源确认公司标识。"
     "不允许：继续穷举 ticker 变体。下一步：先确认公司标识，再回到财报工具。"
 )
+_CITATION_PROVIDER_LABELS: Final[dict[FinsSourceProvider, str]] = {
+    FinsSourceProvider.SEC_EDGAR: "SEC_EDGAR",
+    FinsSourceProvider.CNINFO: "CNINFO",
+    FinsSourceProvider.HKEXNEWS: "HKEXNEWS",
+    FinsSourceProvider.USER_UPLOAD: "USER_UPLOAD",
+}
+"""source provider 到 LLM-facing provider 文本的唯一映射。"""
+
+_FILING_SOURCE_TYPES_BY_PROVIDER: Final[dict[FinsSourceProvider, SourceType]] = {
+    FinsSourceProvider.SEC_EDGAR: SourceType.SEC_EDGAR,
+    FinsSourceProvider.CNINFO: SourceType.CNINFO,
+    FinsSourceProvider.HKEXNEWS: SourceType.HKEXNEWS,
+    FinsSourceProvider.USER_UPLOAD: SourceType.UPLOADED,
+}
+"""filing citation source_type 的 provider 派生规则。"""
+
+
 def _raise_if_fins_cancelled(cancellation_token: CancellationToken | None) -> None:
     """在财报读取慢边界执行协作式取消检查。
 
@@ -1687,25 +1704,21 @@ class FinsReadRuntime:
         Returns:
             citation 字典（值为 None 的键已移除）。
         """
-        meta = self._get_document_meta_cached(ticker, document_id)
-        source_kind = normalize_optional_text(meta.get("source_kind")) if meta else None
-        # 推断来源类型
-        if source_kind == SourceKind.MATERIAL.value:
+        source_kind = self._resolve_source_kind(ticker=ticker, document_id=document_id)
+        meta = self._get_source_meta_cached_by_kind(ticker, document_id, source_kind)
+        provenance = self._source_repository.get_source_document_provenance(
+            ticker,
+            document_id,
+            source_kind,
+            meta=meta,
+        )
+        if not provenance.ingest_complete:
+            raise FileNotFoundError(f"source document 尚未完成入库: ticker={ticker}, document_id={document_id}")
+        if source_kind is SourceKind.MATERIAL:
             source_type = SourceType.SUPPLEMENTARY.value
-        elif document_id.startswith("fil_"):
-            # 美股 filing: document_id = fil_{accession_number}
-            ingest_method = (
-                FinsIngestMethod.from_storage_value(str(meta["ingest_method"]))
-                if meta
-                else FinsIngestMethod.UPLOAD
-            )
-            source_type = (
-                SourceType.SEC_EDGAR.value
-                if ingest_method is FinsIngestMethod.DOWNLOAD
-                else SourceType.UPLOADED.value
-            )
         else:
-            source_type = SourceType.UPLOADED.value
+            source_type = _FILING_SOURCE_TYPES_BY_PROVIDER[provenance.source_provider].value
+        source_provider = _CITATION_PROVIDER_LABELS[provenance.source_provider]
 
         form_type = _normalize_form_type_for_matching(meta.get("form_type")) if meta else None
         # 美股 filing 的 accession_number 存储在 meta.json 中
@@ -1718,12 +1731,41 @@ class FinsReadRuntime:
             form_type=form_type,
             filing_date=normalize_optional_text(meta.get("filing_date")) if meta else None,
             accession_no=accession_no,
+            source_provider=source_provider,
             fiscal_year=meta.get("fiscal_year") if meta else None,
             fiscal_period=normalize_optional_text(meta.get("fiscal_period")) if meta else None,
             item=item,
             heading=heading,
         )
         return citation.to_dict()
+
+    def _get_source_meta_cached_by_kind(
+        self,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+    ) -> dict[str, Any]:
+        """按已知 source kind 读取并缓存 source meta。
+
+        Args:
+            ticker: 标准化股票代码。
+            document_id: 标准化文档 ID。
+            source_kind: 已解析的 source kind 路由键。
+
+        Returns:
+            source meta 字典。
+
+        Raises:
+            FileNotFoundError: source meta 不存在时抛出。
+        """
+
+        cache_key = (ticker, document_id)
+        cached_meta = self._meta_cache.get(cache_key)
+        if cached_meta is not None:
+            return cached_meta
+        meta = self._source_repository.get_source_meta(ticker, document_id, source_kind)
+        self._meta_cache[cache_key] = meta
+        return meta
 
     def _get_document_meta_cached(self, ticker: str, document_id: str) -> Optional[dict[str, Any]]:
         """读取文档元数据（带实例级缓存）。

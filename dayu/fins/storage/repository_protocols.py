@@ -30,6 +30,7 @@ from dayu.fins.domain.document_models import (
     RejectedFilingArtifact,
     RejectedFilingArtifactUpsertRequest,
     ProcessedUpdateRequest,
+    SourceDocumentProvenance,
     SourceDocumentStateChangeRequest,
     SourceDocumentUpsertRequest,
     SourceHandle,
@@ -116,6 +117,14 @@ class SourceDocumentRepositoryProtocol(Protocol):
         """更新源文档。"""
         ...
 
+    def stage_source_document(
+        self,
+        req: SourceDocumentUpsertRequest,
+        source_kind: SourceKind,
+    ) -> SourceHandle:
+        """创建或复用未完成 source meta，作为后续 blob 写入的前置承认。"""
+        ...
+
     def delete_source_document(self, req: SourceDocumentStateChangeRequest) -> None:
         """逻辑删除源文档。"""
         ...
@@ -152,6 +161,17 @@ class SourceDocumentRepositoryProtocol(Protocol):
         source_kind: SourceKind,
     ) -> DocumentMeta:
         """读取源文档 meta。"""
+        ...
+
+    def get_source_document_provenance(
+        self,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+        *,
+        meta: DocumentMeta | None = None,
+    ) -> SourceDocumentProvenance:
+        """读取并校验源文档溯源事实。"""
         ...
 
     def replace_source_meta(

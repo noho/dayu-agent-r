@@ -51,17 +51,21 @@ from dayu.documents.processors.base import (
 from dayu.documents.processors.source import Source
 from dayu.fins.domain.document_models import (
     CompanyMeta,
+    DocumentMeta,
+    FinsSourceProvider,
     SourceDocumentUpsertRequest,
     now_iso8601,
 )
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.domain.tool_models import Citation
 from dayu.fins.storage import (
     FsBatchingRepository,
     FsCompanyMetaRepository,
     FsDocumentBlobRepository,
+    FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
 )
-from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
+from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.tools.fins_limits import FinsToolLimits
 from dayu.fins.tools.fins_tools import build_fins_read_tool_definitions
@@ -527,6 +531,51 @@ class _XbrlFactsProcessor(_SearchCancellingProcessor):
         }
 
 
+class _CountingSourceRepository(FsSourceDocumentRepository):
+    """统计 source meta 读取次数的测试仓储。"""
+
+    def __init__(self, workspace_root: Path, *, repository_set: _FsRepositorySet) -> None:
+        """初始化计数仓储。
+
+        Args:
+            workspace_root: Fins workspace 根目录。
+            repository_set: 文件系统仓储 core 集合。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: 底层仓储初始化失败时抛出。
+        """
+
+        super().__init__(workspace_root, repository_set=repository_set)
+        self.get_source_meta_calls = 0
+
+    def get_source_meta(
+        self,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+    ) -> DocumentMeta:
+        """统计并读取源文档 meta。
+
+        Args:
+            ticker: 股票代码。
+            document_id: 文档 ID。
+            source_kind: 来源类型。
+
+        Returns:
+            源文档 meta。
+
+        Raises:
+            FileNotFoundError: source meta 不存在时抛出。
+            ValueError: source meta 非法时抛出。
+        """
+
+        self.get_source_meta_calls += 1
+        return super().get_source_meta(ticker, document_id, source_kind)
+
+
 class _ConcurrentReadRuntimeProbe:
     """记录同一 provider read runtime 业务体并发进入情况。"""
 
@@ -679,6 +728,253 @@ def test_storage_repositories_list_and_read_fixture_documents(tmp_path: Path) ->
     assert document_ids == ["aapl-2024-10k"]
     assert "Annual recurring revenue increased" in content
     assert source.media_type == "text/markdown"
+
+
+def test_source_repository_projects_source_document_provenance(tmp_path: Path) -> None:
+    """source repository 应从 meta 投影 provider 与 ingest method 真源。"""
+
+    workspace_root = tmp_path / "fins-provenance-workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+
+    _create_source_document_for_provenance(
+        source_repository=source_repository,
+        ticker="AAPL",
+        document_id="fil_sec",
+        source_kind=SourceKind.FILING,
+        ingest_method="download",
+        source_provider=FinsSourceProvider.SEC_EDGAR.to_storage_value(),
+    )
+    _create_source_document_for_provenance(
+        source_repository=source_repository,
+        ticker="600519",
+        document_id="fil_cninfo",
+        source_kind=SourceKind.FILING,
+        ingest_method="download",
+        source_provider=FinsSourceProvider.CNINFO.to_storage_value(),
+    )
+    _create_source_document_for_provenance(
+        source_repository=source_repository,
+        ticker="0700",
+        document_id="fil_hkexnews",
+        source_kind=SourceKind.FILING,
+        ingest_method="download",
+        source_provider=FinsSourceProvider.HKEXNEWS.to_storage_value(),
+    )
+    _create_source_document_for_provenance(
+        source_repository=source_repository,
+        ticker="AAPL",
+        document_id="upload_10k",
+        source_kind=SourceKind.FILING,
+        ingest_method="upload",
+        source_provider=FinsSourceProvider.USER_UPLOAD.to_storage_value(),
+    )
+
+    assert source_repository.get_source_document_provenance(
+        "AAPL",
+        "fil_sec",
+        SourceKind.FILING,
+    ).source_provider is FinsSourceProvider.SEC_EDGAR
+    assert source_repository.get_source_document_provenance(
+        "600519",
+        "fil_cninfo",
+        SourceKind.FILING,
+    ).source_provider is FinsSourceProvider.CNINFO
+    assert source_repository.get_source_document_provenance(
+        "0700",
+        "fil_hkexnews",
+        SourceKind.FILING,
+    ).source_provider is FinsSourceProvider.HKEXNEWS
+    assert source_repository.get_source_document_provenance(
+        "AAPL",
+        "upload_10k",
+        SourceKind.FILING,
+    ).source_provider is FinsSourceProvider.USER_UPLOAD
+
+
+def test_source_repository_fails_closed_for_missing_or_invalid_completed_provider(tmp_path: Path) -> None:
+    """完成态 source document 缺失或非法 provenance 字段时应失败关闭。"""
+
+    workspace_root = tmp_path / "fins-invalid-provenance-workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+
+    _create_source_document_for_provenance(
+        source_repository=source_repository,
+        ticker="AAPL",
+        document_id="missing_provider",
+        source_kind=SourceKind.FILING,
+        ingest_method="download",
+        source_provider=None,
+    )
+    _create_source_document_for_provenance(
+        source_repository=source_repository,
+        ticker="AAPL",
+        document_id="invalid_provider",
+        source_kind=SourceKind.FILING,
+        ingest_method="download",
+        source_provider="unknown_provider",
+    )
+    _create_source_document_for_provenance(
+        source_repository=source_repository,
+        ticker="AAPL",
+        document_id="missing_ingest_complete",
+        source_kind=SourceKind.FILING,
+        ingest_method="download",
+        source_provider=FinsSourceProvider.SEC_EDGAR.to_storage_value(),
+    )
+    missing_ingest_meta = source_repository.get_source_meta(
+        "AAPL",
+        "missing_ingest_complete",
+        SourceKind.FILING,
+    )
+    missing_ingest_meta.pop("ingest_complete")
+    source_repository.replace_source_meta(
+        "AAPL",
+        "missing_ingest_complete",
+        SourceKind.FILING,
+        missing_ingest_meta,
+    )
+
+    with pytest.raises(KeyError):
+        source_repository.get_source_document_provenance("AAPL", "missing_provider", SourceKind.FILING)
+    with pytest.raises(ValueError, match="source_provider 非法"):
+        source_repository.get_source_document_provenance("AAPL", "invalid_provider", SourceKind.FILING)
+    with pytest.raises(KeyError):
+        source_repository.get_source_document_provenance("AAPL", "missing_ingest_complete", SourceKind.FILING)
+
+
+def test_stage_source_document_requires_existing_stable_fields_on_retry(tmp_path: Path) -> None:
+    """重复 staging 不能通过省略既有 stable 字段掩盖冲突。"""
+
+    workspace_root = tmp_path / "fins-staging-conflict-workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    first_request = SourceDocumentUpsertRequest(
+        ticker="AAPL",
+        document_id="fil_staging",
+        internal_document_id="fil_staging",
+        form_type="10-K",
+        meta={
+            "ingest_method": "download",
+            "source_provider": "sec_edgar",
+            "source_fingerprint": "fingerprint-v1",
+            "company_id": "0000320193",
+            "ingest_complete": False,
+        },
+    )
+    matching_request = SourceDocumentUpsertRequest(
+        ticker="AAPL",
+        document_id="fil_staging",
+        internal_document_id="fil_staging",
+        form_type="10-K",
+        meta={
+            "ingest_method": "download",
+            "source_provider": "sec_edgar",
+            "source_fingerprint": "fingerprint-v1",
+            "company_id": "0000320193",
+            "ingest_complete": False,
+        },
+    )
+    omitted_fingerprint_request = SourceDocumentUpsertRequest(
+        ticker="AAPL",
+        document_id="fil_staging",
+        internal_document_id="fil_staging",
+        form_type="10-K",
+        meta={
+            "ingest_method": "download",
+            "source_provider": "sec_edgar",
+            "company_id": "0000320193",
+            "ingest_complete": False,
+        },
+    )
+
+    first_handle = source_repository.stage_source_document(first_request, SourceKind.FILING)
+    matching_handle = source_repository.stage_source_document(matching_request, SourceKind.FILING)
+
+    assert matching_handle == first_handle
+    with pytest.raises(FileExistsError, match="稳定字段冲突"):
+        source_repository.stage_source_document(omitted_fingerprint_request, SourceKind.FILING)
+
+
+def test_read_runtime_citation_projects_provider_owned_source_types(tmp_path: Path) -> None:
+    """read runtime citation 应只从 repository provenance 投影来源分类。"""
+
+    runtime = _build_read_runtime_with_provenance_documents(tmp_path)
+
+    assert runtime._build_citation(ticker="AAPL", document_id="fil_sec")["source_type"] == "SEC_EDGAR"
+    assert runtime._build_citation(ticker="AAPL", document_id="fil_sec")["source_provider"] == "SEC_EDGAR"
+    assert runtime._build_citation(ticker="600519", document_id="fil_cninfo")["source_type"] == "CNINFO"
+    assert runtime._build_citation(ticker="600519", document_id="fil_cninfo")["source_provider"] == "CNINFO"
+    assert runtime._build_citation(ticker="0700", document_id="fil_hkexnews")["source_type"] == "HKEXNEWS"
+    assert runtime._build_citation(ticker="0700", document_id="fil_hkexnews")["source_provider"] == "HKEXNEWS"
+    assert runtime._build_citation(ticker="AAPL", document_id="fil_user_upload")["source_type"] == "UPLOADED"
+    assert runtime._build_citation(ticker="AAPL", document_id="fil_user_upload")["source_provider"] == "USER_UPLOAD"
+    assert runtime._build_citation(ticker="AAPL", document_id="mat_user_upload")["source_type"] == "SUPPLEMENTARY"
+    assert runtime._build_citation(ticker="AAPL", document_id="mat_user_upload")["source_provider"] == "USER_UPLOAD"
+
+
+def test_read_runtime_citation_reuses_single_cached_source_meta_read(tmp_path: Path) -> None:
+    """citation 构建不应为 provenance 对同一 source meta 做重复读取。"""
+
+    workspace_root = tmp_path / "fins-citation-cache-workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    company_repository = FsCompanyMetaRepository(workspace_root, repository_set=repository_set)
+    source_repository = _CountingSourceRepository(workspace_root, repository_set=repository_set)
+    processed_repository = FsProcessedDocumentRepository(workspace_root, repository_set=repository_set)
+    company_repository.upsert_company_meta(
+        CompanyMeta(
+            company_id="0000320193",
+            company_name="Apple Inc.",
+            ticker="AAPL",
+            market="US",
+            resolver_version="test",
+            updated_at=now_iso8601(),
+            ticker_aliases=[],
+        )
+    )
+    _create_source_document_for_provenance(
+        source_repository=source_repository,
+        ticker="AAPL",
+        document_id="fil_sec",
+        source_kind=SourceKind.FILING,
+        ingest_method="download",
+        source_provider=FinsSourceProvider.SEC_EDGAR.to_storage_value(),
+    )
+    runtime = FinsReadRuntime(
+        company_repository=company_repository,
+        source_repository=source_repository,
+        processed_repository=processed_repository,
+        processor_registry=DefaultFinsRuntime.create(workspace_root=workspace_root).get_processor_registry(),
+    )
+
+    assert runtime._build_citation(ticker="AAPL", document_id="fil_sec")["source_provider"] == "SEC_EDGAR"
+    assert runtime._build_citation(ticker="AAPL", document_id="fil_sec")["source_provider"] == "SEC_EDGAR"
+    assert source_repository.get_source_meta_calls == 1
+
+
+def test_read_runtime_citation_rejects_incomplete_source_meta(tmp_path: Path) -> None:
+    """read runtime citation 不得投影未完成 staging source meta。"""
+
+    runtime = _build_read_runtime_with_provenance_documents(tmp_path)
+
+    with pytest.raises(FileNotFoundError, match="尚未完成入库"):
+        runtime._build_citation(ticker="AAPL", document_id="fil_incomplete")
+
+
+def test_citation_to_dict_omits_none_source_provider() -> None:
+    """Citation.to_dict 只在 source_provider 非空时输出该字段。"""
+
+    providerless = Citation(source_type="UPLOADED", document_id="doc", ticker="AAPL")
+    with_provider = Citation(
+        source_type="UPLOADED",
+        source_provider="USER_UPLOAD",
+        document_id="doc",
+        ticker="AAPL",
+    )
+
+    assert "source_provider" not in providerless.to_dict()
+    assert with_provider.to_dict()["source_provider"] == "USER_UPLOAD"
 
 
 def test_fins_provider_discovers_read_tools_with_fins_read_tag(tmp_path: Path) -> None:
@@ -1500,6 +1796,7 @@ def _build_fins_workspace(tmp_path: Path) -> Path:
                     "report_date": "2024-09-28",
                     "amended": False,
                     "ingest_method": "upload",
+                    "source_provider": "user_upload",
                 },
             ),
             SourceKind.FILING,
@@ -1525,6 +1822,7 @@ def _build_fins_workspace(tmp_path: Path) -> Path:
                     "report_date": "2024-09-28",
                     "amended": False,
                     "ingest_method": "upload",
+                    "source_provider": "user_upload",
                 },
                 files=[file_meta],
             ),
@@ -1535,6 +1833,150 @@ def _build_fins_workspace(tmp_path: Path) -> Path:
         batching_repository.rollback_batch(token)
         raise
     return workspace_root
+
+
+def _create_source_document_for_provenance(
+    *,
+    source_repository: FsSourceDocumentRepository,
+    ticker: str,
+    document_id: str,
+    source_kind: SourceKind,
+    ingest_method: str,
+    source_provider: str | None,
+    ingest_complete: bool | None = True,
+) -> None:
+    """创建用于 provenance 测试的 source document。
+
+    Args:
+        source_repository: source 文档仓储。
+        ticker: 股票代码。
+        document_id: 文档 ID。
+        source_kind: 来源类型。
+        ingest_method: ingest method 仓储值。
+        source_provider: provider 仓储值；为 None 时故意不写入。
+        ingest_complete: 是否写入完成态标记；为 None 时故意不写入。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: 仓储写入失败时抛出。
+    """
+
+    meta: dict[str, JsonValue] = {
+        "ingest_method": ingest_method,
+        "fiscal_year": 2024,
+        "fiscal_period": "FY",
+        "filing_date": "2024-11-01",
+        "report_date": "2024-09-28",
+        "amended": False,
+    }
+    if ingest_complete is not None:
+        meta["ingest_complete"] = ingest_complete
+    if source_provider is not None:
+        meta["source_provider"] = source_provider
+    source_repository.create_source_document(
+        SourceDocumentUpsertRequest(
+            ticker=ticker,
+            document_id=document_id,
+            internal_document_id=document_id,
+            form_type="10-K",
+            meta=meta,
+        ),
+        source_kind,
+    )
+
+
+def _build_read_runtime_with_provenance_documents(tmp_path: Path) -> FinsReadRuntime:
+    """构造包含多 provider source 文档的 read runtime。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        已装配仓储的 read runtime。
+
+    Raises:
+        OSError: 仓储写入失败时抛出。
+    """
+
+    workspace_root = tmp_path / "fins-citation-provenance-workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    company_repository = FsCompanyMetaRepository(workspace_root, repository_set=repository_set)
+    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    processed_repository = FsProcessedDocumentRepository(workspace_root, repository_set=repository_set)
+    for ticker, company_id, market in (
+        ("AAPL", "0000320193", "US"),
+        ("600519", "600519_CNINFO", "CN"),
+        ("0700", "0700_HKEX", "HK"),
+    ):
+        company_repository.upsert_company_meta(
+            CompanyMeta(
+                company_id=company_id,
+                company_name=f"{ticker} Test Company",
+                ticker=ticker,
+                market=market,
+                resolver_version="test",
+                updated_at=now_iso8601(),
+                ticker_aliases=[],
+            )
+        )
+
+    _create_source_document_for_provenance(
+        source_repository=source_repository,
+        ticker="AAPL",
+        document_id="fil_sec",
+        source_kind=SourceKind.FILING,
+        ingest_method="download",
+        source_provider=FinsSourceProvider.SEC_EDGAR.to_storage_value(),
+    )
+    _create_source_document_for_provenance(
+        source_repository=source_repository,
+        ticker="600519",
+        document_id="fil_cninfo",
+        source_kind=SourceKind.FILING,
+        ingest_method="download",
+        source_provider=FinsSourceProvider.CNINFO.to_storage_value(),
+    )
+    _create_source_document_for_provenance(
+        source_repository=source_repository,
+        ticker="0700",
+        document_id="fil_hkexnews",
+        source_kind=SourceKind.FILING,
+        ingest_method="download",
+        source_provider=FinsSourceProvider.HKEXNEWS.to_storage_value(),
+    )
+    _create_source_document_for_provenance(
+        source_repository=source_repository,
+        ticker="AAPL",
+        document_id="fil_user_upload",
+        source_kind=SourceKind.FILING,
+        ingest_method="upload",
+        source_provider=FinsSourceProvider.USER_UPLOAD.to_storage_value(),
+    )
+    _create_source_document_for_provenance(
+        source_repository=source_repository,
+        ticker="AAPL",
+        document_id="mat_user_upload",
+        source_kind=SourceKind.MATERIAL,
+        ingest_method="upload",
+        source_provider=FinsSourceProvider.USER_UPLOAD.to_storage_value(),
+    )
+    _create_source_document_for_provenance(
+        source_repository=source_repository,
+        ticker="AAPL",
+        document_id="fil_incomplete",
+        source_kind=SourceKind.FILING,
+        ingest_method="download",
+        source_provider=FinsSourceProvider.SEC_EDGAR.to_storage_value(),
+        ingest_complete=False,
+    )
+    return FinsReadRuntime(
+        company_repository=company_repository,
+        source_repository=source_repository,
+        processed_repository=processed_repository,
+        processor_registry=DefaultFinsRuntime.create(workspace_root=workspace_root).get_processor_registry(),
+    )
 
 
 def _build_fins_financial_html_workspace(tmp_path: Path) -> Path:
@@ -1583,6 +2025,7 @@ def _build_fins_financial_html_workspace(tmp_path: Path) -> Path:
                     "report_date": "2024-09-28",
                     "amended": False,
                     "ingest_method": "upload",
+                    "source_provider": "user_upload",
                 },
             ),
             SourceKind.FILING,
@@ -1608,6 +2051,7 @@ def _build_fins_financial_html_workspace(tmp_path: Path) -> Path:
                     "report_date": "2024-09-28",
                     "amended": False,
                     "ingest_method": "upload",
+                    "source_provider": "user_upload",
                 },
                 files=[file_meta],
             ),

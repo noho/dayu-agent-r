@@ -23,6 +23,7 @@ from dayu.documents.docling_runtime import (
 )
 from dayu.fins._log import Log
 from dayu.fins.domain.document_models import (
+    FinsSourceProvider,
     FileObjectMeta,
     SourceDocumentStateChangeRequest,
     SourceDocumentUpsertRequest,
@@ -536,6 +537,7 @@ class DoclingUploadService:
         merged["document_version"] = document_version
         merged["source_fingerprint"] = source_fingerprint
         merged["ingest_complete"] = True
+        merged["source_provider"] = FinsSourceProvider.USER_UPLOAD.to_storage_value()
         merged["is_deleted"] = False
         merged["deleted_at"] = None
         return merged

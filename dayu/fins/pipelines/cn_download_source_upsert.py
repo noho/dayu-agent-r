@@ -14,6 +14,7 @@ from typing import TypeAlias
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.document_models import (
     FinsIngestMethod,
+    FinsSourceProvider,
     FileObjectMeta,
     FilingCreateRequest,
     FilingUpdateRequest,
@@ -312,7 +313,7 @@ def _build_base_meta(
         "ingest_complete": ingest_complete,
         "is_deleted": False,
         "deleted_at": None,
-        "source_provider": candidate.provider,
+        "source_provider": FinsSourceProvider.from_storage_value(candidate.provider).to_storage_value(),
         "source_id": candidate.source_id,
         "source_url": candidate.source_url,
         "source_language": candidate.language,

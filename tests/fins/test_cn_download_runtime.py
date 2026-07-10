@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from dayu.documents.processors.processor_registry import ProcessorRegistry
+from dayu.fins.domain.document_models import FinsSourceProvider
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ingestion_runtime import (
     FinsDownloadRequest,
@@ -372,6 +373,11 @@ def test_start_download_cninfo_persists_summary_and_source_document(tmp_path: Pa
     source_meta = runtime.source_repository.get_source_meta("600519", document_id, SourceKind.FILING)
     assert source_meta["source_provider"] == "cninfo"
     assert source_meta["ingest_complete"] is True
+    assert runtime.source_repository.get_source_document_provenance(
+        "600519",
+        document_id,
+        SourceKind.FILING,
+    ).source_provider is FinsSourceProvider.CNINFO
 
 
 def test_start_download_auto_hk_uses_hkexnews_adapter(tmp_path: Path) -> None:
@@ -411,6 +417,11 @@ def test_start_download_auto_hk_uses_hkexnews_adapter(tmp_path: Path) -> None:
     source_meta = runtime.source_repository.get_source_meta("0700", document_id, SourceKind.FILING)
     assert source_meta["source_provider"] == "hkexnews"
     assert source_meta["company_id"] == "0700_HKEX"
+    assert runtime.source_repository.get_source_document_provenance(
+        "0700",
+        document_id,
+        SourceKind.FILING,
+    ).source_provider is FinsSourceProvider.HKEXNEWS
 
 
 def test_default_runtime_registers_cn_hk_download_adapters(tmp_path: Path) -> None:

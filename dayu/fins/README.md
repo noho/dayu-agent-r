@@ -94,6 +94,8 @@ Fins 与其它层的稳定边界如下：
 - 对应 `Fs*Repository` 文件系统实现
 - `FileStore` / `LocalFileStore`
 
+source document meta 中的 `source_provider` 是来源提供方真源，当前支持 SEC EDGAR、巨潮资讯、港交所披露易与用户上传。`SourceDocumentRepositoryProtocol` 负责把 source meta 投影为 typed provenance；read runtime 的 citation 只消费该 provenance 来生成 LLM-facing `source_type` 与 `source_provider`。
+
 ### Resolver
 
 `dayu.fins.resolver` 是公司信息等财报业务标识解析能力的 public subpackage。`dayu.fins` 包根不 re-export resolver 符号，调用方应显式导入子包。

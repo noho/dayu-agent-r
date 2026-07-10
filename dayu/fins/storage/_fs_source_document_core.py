@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import shutil
-from typing import Any, Optional
+from typing import Any, Final, Optional
 
 from dayu.documents.processors.source import Source
 from dayu.fins.domain.document_models import (
@@ -23,6 +23,7 @@ from dayu.fins.domain.document_models import (
     MaterialManifestItem,
     MaterialRestoreRequest,
     MaterialUpdateRequest,
+    SourceDocumentProvenance,
     SourceDocumentUpsertRequest,
     SourceHandle,
     now_iso8601,
@@ -49,6 +50,17 @@ from ._fs_storage_utils import (
     _resolve_primary_uri,
     _write_json,
 )
+
+
+_STAGING_STABLE_META_FIELDS: Final[tuple[str, ...]] = (
+    "ingest_method",
+    "source_provider",
+    "source_fingerprint",
+    "remote_fingerprint",
+    "company_id",
+    "provider_company_id",
+)
+"""staging source document 重入时必须保持不变的 meta 字段。"""
 
 
 class _FsSourceDocumentMixin(_FsStorageInfra):
@@ -320,6 +332,63 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
                 f"document_id={document_id} 的 {normalized_source_kind.value} meta.json 不存在"
             )
         return _read_json_object(meta_path)
+
+    def get_source_document_provenance(
+        self,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+        *,
+        meta: DocumentMeta | None = None,
+    ) -> SourceDocumentProvenance:
+        """读取并校验源文档溯源事实。
+
+        Args:
+            ticker: 股票代码。
+            document_id: 文档 ID。
+            source_kind: 来源类型。
+            meta: 可选的已读取 source meta；提供时避免重复读取。
+
+        Returns:
+            已校验的源文档溯源事实。
+
+        Raises:
+            FileNotFoundError: 对应来源目录下的 meta.json 不存在时抛出。
+            KeyError: meta 缺少必需溯源字段时抛出。
+            ValueError: meta 溯源字段非法时抛出。
+        """
+
+        normalized_source_kind = _normalize_source_kind(source_kind)
+        source_meta = meta if meta is not None else self.get_source_meta(ticker, document_id, normalized_source_kind)
+        return SourceDocumentProvenance.from_meta(source_meta, normalized_source_kind)
+
+    def stage_source_document(
+        self,
+        req: SourceDocumentUpsertRequest,
+        source_kind: SourceKind,
+    ) -> SourceHandle:
+        """创建或复用未完成 source meta。
+
+        Args:
+            req: 源文档写入请求。
+            source_kind: 来源类型。
+
+        Returns:
+            可用于后续 blob 写入的 source handle。
+
+        Raises:
+            FileExistsError: 已存在完成态 source meta，或 staging 稳定字段冲突时抛出。
+            KeyError: 请求 meta 缺少必需溯源字段时抛出。
+            ValueError: 请求或既有 meta 的溯源字段非法时抛出。
+            OSError: 写入失败时抛出。
+        """
+
+        return self._execute_with_auto_batch(
+            req.ticker,
+            self._stage_source_document_impl,
+            req,
+            source_kind,
+        )
 
     def replace_source_meta(
         self,
@@ -789,6 +858,67 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             file_uris=[str(item.get("uri")) for item in file_payloads if isinstance(item, dict)],
         )
 
+    def _stage_source_document_impl(
+        self,
+        req: SourceDocumentUpsertRequest,
+        source_kind: SourceKind,
+    ) -> SourceHandle:
+        """执行 staging source meta 写入或复用。
+
+        Args:
+            req: 源文档写入请求。
+            source_kind: 来源类型。
+
+        Returns:
+            staging source handle。
+
+        Raises:
+            FileExistsError: 已存在完成态 source meta，或 staging 稳定字段冲突时抛出。
+            KeyError: 请求 meta 缺少必需溯源字段时抛出。
+            ValueError: 请求或既有 meta 的溯源字段非法时抛出。
+            OSError: 写入失败时抛出。
+        """
+
+        ticker = _normalize_ticker(req.ticker)
+        normalized_source_kind = _normalize_source_kind(source_kind)
+        SourceDocumentProvenance.from_meta(req.meta, normalized_source_kind)
+        meta_path = self._source_meta_path(ticker, req.document_id, normalized_source_kind)
+        if meta_path.exists():
+            existing_meta = _read_json_object(meta_path)
+            existing_provenance = SourceDocumentProvenance.from_meta(existing_meta, normalized_source_kind)
+            if existing_provenance.ingest_complete:
+                raise FileExistsError(f"完成态 source meta 已存在: {meta_path}")
+            if not _staging_stable_fields_match(
+                existing_meta=existing_meta,
+                req=req,
+                ticker=ticker,
+            ):
+                raise FileExistsError(f"staging source meta 稳定字段冲突: {meta_path}")
+            return SourceHandle(
+                ticker=ticker,
+                document_id=req.document_id,
+                source_kind=normalized_source_kind.value,
+            )
+
+        staging_meta = dict(req.meta)
+        staging_meta["ingest_complete"] = False
+        staging_req = SourceDocumentUpsertRequest(
+            ticker=ticker,
+            document_id=req.document_id,
+            internal_document_id=req.internal_document_id,
+            form_type=req.form_type,
+            primary_document=None,
+            meta=staging_meta,
+            files=[],
+            file_entries=[],
+        )
+        self._upsert_source_document(staging_req, normalized_source_kind, True)
+        return SourceHandle(
+            ticker=ticker,
+            document_id=req.document_id,
+            source_kind=normalized_source_kind.value,
+        )
+
     def _toggle_source_deleted(
         self,
         ticker: str,
@@ -894,3 +1024,43 @@ def _ingest_method_from_meta(meta: DocumentMeta) -> FinsIngestMethod:
     """
 
     return FinsIngestMethod.from_storage_value(str(meta["ingest_method"]))
+
+
+def _staging_stable_fields_match(
+    *,
+    existing_meta: DocumentMeta,
+    req: SourceDocumentUpsertRequest,
+    ticker: str,
+) -> bool:
+    """判断重复 staging 请求是否与既有未完成 meta 表达同一 source。
+
+    Args:
+        existing_meta: 已落盘的 staging source meta。
+        req: 本次 staging 请求。
+        ticker: 已规范化的 ticker。
+
+    Returns:
+        稳定字段一致时返回 ``True``，否则返回 ``False``。
+
+    Raises:
+        无。
+    """
+
+    if str(existing_meta.get("ticker", "")).strip() != ticker:
+        return False
+    if str(existing_meta.get("document_id", "")).strip() != req.document_id:
+        return False
+    if str(existing_meta.get("internal_document_id", "")).strip() != req.internal_document_id:
+        return False
+    for field_name in _STAGING_STABLE_META_FIELDS:
+        existing_value = existing_meta.get(field_name)
+        requested_value = req.meta.get(field_name)
+        existing_has_value = existing_value is not None and existing_value != ""
+        requested_has_value = requested_value is not None and requested_value != ""
+        if not existing_has_value and not requested_has_value:
+            continue
+        if existing_has_value != requested_has_value:
+            return False
+        if existing_value != requested_value:
+            return False
+    return True

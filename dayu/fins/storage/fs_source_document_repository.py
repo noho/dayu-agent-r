@@ -18,6 +18,7 @@ from dayu.fins.domain.document_models import (
     MaterialDeleteRequest,
     MaterialRestoreRequest,
     MaterialUpdateRequest,
+    SourceDocumentProvenance,
     SourceDocumentStateChangeRequest,
     SourceDocumentUpsertRequest,
     SourceHandle,
@@ -327,6 +328,15 @@ class FsSourceDocumentRepository(SourceDocumentRepositoryProtocol):
             return self._repository_set.core.update_filing(_build_filing_update_request(req))
         return self._repository_set.core.update_material(_build_material_update_request(req))
 
+    def stage_source_document(
+        self,
+        req: SourceDocumentUpsertRequest,
+        source_kind: SourceKind,
+    ) -> SourceHandle:
+        """创建或复用未完成 source meta。"""
+
+        return self._repository_set.core.stage_source_document(req, source_kind)
+
     def delete_source_document(self, req: SourceDocumentStateChangeRequest) -> None:
         """逻辑删除源文档。"""
 
@@ -375,6 +385,23 @@ class FsSourceDocumentRepository(SourceDocumentRepositoryProtocol):
         """读取源文档 meta。"""
 
         return self._repository_set.core.get_source_meta(ticker, document_id, source_kind)
+
+    def get_source_document_provenance(
+        self,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+        *,
+        meta: DocumentMeta | None = None,
+    ) -> SourceDocumentProvenance:
+        """读取并校验源文档溯源事实。"""
+
+        return self._repository_set.core.get_source_document_provenance(
+            ticker,
+            document_id,
+            source_kind,
+            meta=meta,
+        )
 
     def replace_source_meta(
         self,

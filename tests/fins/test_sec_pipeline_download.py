@@ -681,6 +681,7 @@ def test_sec_pipeline_download_writes_meta_and_manifest(tmp_path: Path) -> None:
     assert meta["files"][0]["uri"].endswith("sample-10k.htm")
     assert meta["fiscal_year"] == 2024
     assert meta["fiscal_period"] == "FY"
+    assert meta["source_provider"] == "sec_edgar"
     manifest_path = tmp_path / "portfolio" / "AAPL" / "filings" / "filing_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["documents"][0]["document_id"] == "fil_0000000000-25-000001"

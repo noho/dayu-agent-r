@@ -9,6 +9,7 @@ from typing import Optional, Protocol
 
 from dayu.fins.domain.document_models import (
     FinsIngestMethod,
+    FinsSourceProvider,
     FilingCreateRequest,
     FilingUpdateRequest,
     now_iso8601,
@@ -204,6 +205,7 @@ def _build_downloaded_filing_meta_payload(
         "internal_document_id": internal_document_id,
         "accession_number": filing.accession_number,
         "ingest_method": FinsIngestMethod.DOWNLOAD.to_storage_value(),
+        "source_provider": FinsSourceProvider.SEC_EDGAR.to_storage_value(),
         "ticker": ticker,
         "company_id": cik,
         "form_type": filing.form_type,
