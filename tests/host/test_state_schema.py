@@ -44,7 +44,10 @@ from dayu.host.durable.state import (
     dispatch_record_row_from_host_row,
     is_terminal_attempt_status,
     is_terminal_run_status,
+    read_active_run_for_session,
     read_cancelling_runs,
+    read_non_terminal_runs,
+    read_non_terminal_runs_for_session,
     run_status_in_clause,
     run_row_from_host_row,
     serialize_attempt_status,
@@ -253,6 +256,166 @@ def test_run_status_sequence_index_supports_status_ordered_scan(tmp_path: Path) 
             )
         finally:
             connection.close()
+
+
+def test_run_status_in_clause_matches_durable_read_queries(tmp_path: Path) -> None:
+    """SQL status helper 生成的 IN clause 与 durable read helper 查询等价。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def seed(transaction: HostTransaction) -> None:
+            """写入覆盖 start-blocking、queued 与 terminal 的 Run rows。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            _insert_session_tx(transaction, session_id="session-sql-1")
+            _insert_session_tx(transaction, session_id="session-sql-2")
+            _insert_run_tx(
+                transaction,
+                run_id="run-sql-accepted",
+                session_id="session-sql-1",
+                status=RunStatus.ACCEPTED,
+                client_request_id="request-sql-accepted",
+            )
+            _insert_run_tx(
+                transaction,
+                run_id="run-sql-queued",
+                session_id="session-sql-1",
+                status=RunStatus.QUEUED,
+                client_request_id="request-sql-queued",
+            )
+            _insert_run_tx(
+                transaction,
+                run_id="run-sql-succeeded",
+                session_id="session-sql-1",
+                status=RunStatus.SUCCEEDED,
+                client_request_id="request-sql-succeeded",
+            )
+            _insert_run_tx(
+                transaction,
+                run_id="run-sql-running",
+                session_id="session-sql-2",
+                status=RunStatus.RUNNING,
+                client_request_id="request-sql-running",
+            )
+
+        def verify(
+            transaction: HostTransaction,
+        ) -> tuple[str | None, tuple[str, ...], tuple[str, ...], bool, bool, bool]:
+            """比较 durable read helper 与 helper SQL 的结果。
+
+            :param transaction: Host transaction。
+            :returns: active id、session/all 非终态 id 与三条 planner 输出是否存在。
+            """
+
+            active_clause, active_params = run_status_in_clause(
+                START_BLOCKING_RUN_STATUSES
+            )
+            non_terminal_clause, non_terminal_params = run_status_in_clause(
+                NON_TERMINAL_RUN_STATUSES
+            )
+            active_plan = transaction.fetchall(
+                f"""
+                EXPLAIN QUERY PLAN
+                SELECT run_id
+                FROM {TABLE_HOST_RUNS}
+                WHERE session_id = ?
+                  AND status {active_clause}
+                ORDER BY accepted_event_sequence ASC, run_id ASC
+                LIMIT 1
+                """,
+                ("session-sql-1", *active_params),
+            )
+            session_plan = transaction.fetchall(
+                f"""
+                EXPLAIN QUERY PLAN
+                SELECT run_id
+                FROM {TABLE_HOST_RUNS}
+                WHERE session_id = ?
+                  AND status {non_terminal_clause}
+                ORDER BY accepted_event_sequence ASC, run_id ASC
+                """,
+                ("session-sql-1", *non_terminal_params),
+            )
+            all_plan = transaction.fetchall(
+                f"""
+                EXPLAIN QUERY PLAN
+                SELECT run_id
+                FROM {TABLE_HOST_RUNS}
+                WHERE status {non_terminal_clause}
+                ORDER BY accepted_event_sequence ASC, run_id ASC
+                """,
+                non_terminal_params,
+            )
+            active_equivalent = transaction.fetchone(
+                f"""
+                SELECT run_id
+                FROM {TABLE_HOST_RUNS}
+                WHERE session_id = ?
+                  AND status {active_clause}
+                ORDER BY accepted_event_sequence ASC, run_id ASC
+                LIMIT 1
+                """,
+                ("session-sql-1", *active_params),
+            )
+            session_equivalent = transaction.fetchall(
+                f"""
+                SELECT run_id
+                FROM {TABLE_HOST_RUNS}
+                WHERE session_id = ?
+                  AND status {non_terminal_clause}
+                ORDER BY accepted_event_sequence ASC, run_id ASC
+                """,
+                ("session-sql-1", *non_terminal_params),
+            )
+            all_equivalent = transaction.fetchall(
+                f"""
+                SELECT run_id
+                FROM {TABLE_HOST_RUNS}
+                WHERE status {non_terminal_clause}
+                ORDER BY accepted_event_sequence ASC, run_id ASC
+                """,
+                non_terminal_params,
+            )
+            active = read_active_run_for_session(transaction, "session-sql-1")
+            session_runs = read_non_terminal_runs_for_session(
+                transaction, "session-sql-1"
+            )
+            all_runs = read_non_terminal_runs(transaction)
+            active_id = active.run_id if active is not None else None
+            equivalent_active_id = (
+                _required_row_text(active_equivalent, column="run_id")
+                if active_equivalent is not None
+                else None
+            )
+            assert active_id == equivalent_active_id
+            assert tuple(row.run_id for row in session_runs) == tuple(
+                _required_row_text(row, column="run_id") for row in session_equivalent
+            )
+            assert tuple(row.run_id for row in all_runs) == tuple(
+                _required_row_text(row, column="run_id") for row in all_equivalent
+            )
+            return (
+                active_id,
+                tuple(row.run_id for row in session_runs),
+                tuple(row.run_id for row in all_runs),
+                len(active_plan) > 0,
+                len(session_plan) > 0,
+                len(all_plan) > 0,
+            )
+
+        store.transaction_runner.run_write(seed)
+        assert store.transaction_runner.run_read(verify) == (
+            "run-sql-accepted",
+            ("run-sql-accepted", "run-sql-queued"),
+            ("run-sql-accepted", "run-sql-queued", "run-sql-running"),
+            True,
+            True,
+            True,
+        )
 
 
 def test_run_start_reason_resume_codec_round_trips() -> None:

@@ -25,6 +25,7 @@ from dayu.host.durable.schema import (
     TABLE_HOST_RUN_RESULTS,
     TABLE_HOST_SESSION_TIMELINE_ITEMS,
 )
+from dayu.host.durable.state import is_terminal_run_status
 from dayu.host.durable.transaction import HostRow, HostTransaction
 
 
@@ -35,9 +36,6 @@ class ReadModelWriteStatus(StrEnum):
     DUPLICATE = "duplicate"
 
 
-_TERMINAL_RUN_STATUSES = frozenset(
-    (RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.LOST)
-)
 _TIMELINE_ITEM_KINDS = frozenset(("user_input", "run_lifecycle", "run_terminal"))
 
 
@@ -466,7 +464,7 @@ def _terminal_status_from_text(value: str) -> RunStatus:
         status = RunStatus(value)
     except ValueError as exc:
         raise HostDurableError("RunResult terminal_status is invalid") from exc
-    if status not in _TERMINAL_RUN_STATUSES:
+    if not is_terminal_run_status(status):
         raise HostDurableError("RunResult terminal_status is not terminal")
     return status
 

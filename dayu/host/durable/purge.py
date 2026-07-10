@@ -56,7 +56,11 @@ from dayu.host.durable.schema import (
     TABLE_PAYLOAD_DESCRIPTORS,
     TABLE_SQLITE_PAYLOADS,
 )
-from dayu.host.durable.state import NON_TERMINAL_RUN_STATUSES, TERMINAL_RUN_STATUSES
+from dayu.host.durable.state import (
+    NON_TERMINAL_RUN_STATUSES,
+    TERMINAL_RUN_STATUSES,
+    serialized_run_status_values,
+)
 from dayu.host.durable.transaction import HostRow, HostTransaction, SQLiteScalar
 
 PURGE_IDEMPOTENCY_SCOPE_KIND = "purge_session"
@@ -119,8 +123,12 @@ _PAYLOAD_KIND_SQLITE = "sqlite_payload"
 _TOMBSTONE_ID_PREFIX = "purge-tombstone-"
 _PURGE_ATTEMPT_REF_PREFIX = "purge-attempt:"
 
-_NON_TERMINAL_RUN_STATUS_VALUES = frozenset(status.value for status in NON_TERMINAL_RUN_STATUSES)
-_TERMINAL_RUN_STATUS_VALUES = frozenset(status.value for status in TERMINAL_RUN_STATUSES)
+_NON_TERMINAL_RUN_STATUS_VALUES = frozenset(
+    serialized_run_status_values(NON_TERMINAL_RUN_STATUSES)
+)
+_TERMINAL_RUN_STATUS_VALUES = frozenset(
+    serialized_run_status_values(TERMINAL_RUN_STATUSES)
+)
 _PURGE_REBUILDABLE_PROJECTION_CONSUMER_IDS = (
     "host.minimal-read-model",
     "host.memory.session.v1",

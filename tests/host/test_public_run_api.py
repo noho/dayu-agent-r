@@ -41,15 +41,11 @@ from dayu.host.command import HostCommandHandle, create_host_command_handle, sta
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.state import (
     RunRow,
+    TERMINAL_RUN_STATUSES,
     deserialize_attempt_status,
     run_snapshot_from_row,
 )
 from dayu.host.durable.transaction import HostTransaction
-
-_TERMINAL_RUN_STATUSES = frozenset(
-    (RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.LOST)
-)
-
 
 def _options(tmp_path: Path) -> HostCommandHandleOptions:
     """构造测试用 Host command handle options。
@@ -140,7 +136,7 @@ def test_run_snapshot_mapping_covers_current_run_statuses() -> None:
     for status in RunStatus:
         snapshot = run_snapshot_from_row(_durable_run_row(status))
         assert snapshot.status is status
-        if status in _TERMINAL_RUN_STATUSES:
+        if status in TERMINAL_RUN_STATUSES:
             assert snapshot.terminal_result_summary is not None
             assert snapshot.terminal_result_summary.status is status
         else:

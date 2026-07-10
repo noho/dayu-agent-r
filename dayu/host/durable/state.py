@@ -1634,6 +1634,7 @@ def read_active_run_for_session(transaction: HostTransaction, session_id: str) -
     """
 
     _require_non_empty_text(session_id, field_name="session_id")
+    status_clause, status_params = run_status_in_clause(START_BLOCKING_RUN_STATUSES)
     row = transaction.fetchone(
         f"""
         SELECT
@@ -1662,18 +1663,11 @@ def read_active_run_for_session(transaction: HostTransaction, session_id: str) -
           terminal_at
         FROM {TABLE_HOST_RUNS}
         WHERE session_id = ?
-          AND status IN (?, ?, ?, ?, ?)
+          AND status {status_clause}
         ORDER BY accepted_event_sequence ASC, run_id ASC
         LIMIT 1
         """,
-        (
-            session_id,
-            serialize_run_status(RunStatus.ACCEPTED),
-            serialize_run_status(RunStatus.RUNNING),
-            serialize_run_status(RunStatus.WAITING),
-            serialize_run_status(RunStatus.CANCELLING),
-            serialize_run_status(RunStatus.RECOVERING),
-        ),
+        (session_id, *status_params),
     )
     if row is None:
         return None
@@ -1788,6 +1782,7 @@ def read_non_terminal_runs_for_session(transaction: HostTransaction, session_id:
     """
 
     _require_non_empty_text(session_id, field_name="session_id")
+    status_clause, status_params = run_status_in_clause(NON_TERMINAL_RUN_STATUSES)
     rows = transaction.fetchall(
         f"""
         SELECT
@@ -1816,18 +1811,10 @@ def read_non_terminal_runs_for_session(transaction: HostTransaction, session_id:
           terminal_at
         FROM {TABLE_HOST_RUNS}
         WHERE session_id = ?
-          AND status IN (?, ?, ?, ?, ?, ?)
+          AND status {status_clause}
         ORDER BY accepted_event_sequence ASC, run_id ASC
         """,
-        (
-            session_id,
-            serialize_run_status(RunStatus.ACCEPTED),
-            serialize_run_status(RunStatus.QUEUED),
-            serialize_run_status(RunStatus.RUNNING),
-            serialize_run_status(RunStatus.WAITING),
-            serialize_run_status(RunStatus.CANCELLING),
-            serialize_run_status(RunStatus.RECOVERING),
-        ),
+        (session_id, *status_params),
     )
     return tuple(run_row_from_host_row(row) for row in rows)
 
@@ -1841,6 +1828,7 @@ def read_non_terminal_runs(transaction: HostTransaction) -> tuple[RunRow, ...]:
     :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
     """
 
+    status_clause, status_params = run_status_in_clause(NON_TERMINAL_RUN_STATUSES)
     rows = transaction.fetchall(
         f"""
         SELECT
@@ -1868,17 +1856,10 @@ def read_non_terminal_runs(transaction: HostTransaction) -> tuple[RunRow, ...]:
           updated_at,
           terminal_at
         FROM {TABLE_HOST_RUNS}
-        WHERE status IN (?, ?, ?, ?, ?, ?)
+        WHERE status {status_clause}
         ORDER BY accepted_event_sequence ASC, run_id ASC
         """,
-        (
-            serialize_run_status(RunStatus.ACCEPTED),
-            serialize_run_status(RunStatus.QUEUED),
-            serialize_run_status(RunStatus.RUNNING),
-            serialize_run_status(RunStatus.WAITING),
-            serialize_run_status(RunStatus.CANCELLING),
-            serialize_run_status(RunStatus.RECOVERING),
-        ),
+        status_params,
     )
     return tuple(run_row_from_host_row(row) for row in rows)
 

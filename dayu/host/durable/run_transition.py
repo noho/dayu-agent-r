@@ -41,6 +41,8 @@ from dayu.host.durable.state import (
     RunMutationResult,
     RunStartReason,
     StateMutationStatus,
+    TERMINAL_ATTEMPT_STATUSES,
+    TERMINAL_RUN_STATUSES,
     WaitRecordMutationResult,
     WaitRecordRow,
     WaitRecordStatus,
@@ -84,6 +86,10 @@ from dayu.host.durable.state import (
     terminal_run_row,
 )
 from dayu.host.durable.transaction import HostTransaction
+from dayu.host.lifecycle_events import (
+    closeout_attempt_terminal_event_type_for_status,
+    run_terminal_event_type_for_status,
+)
 
 _EVENT_TYPE_RUN_ACCEPTED = "RUN_ACCEPTED"
 _EVENT_TYPE_RUN_QUEUED = "RUN_QUEUED"
@@ -93,23 +99,9 @@ _EVENT_TYPE_RUN_RECOVERING = "RUN_RECOVERING"
 _EVENT_TYPE_ATTEMPT_RUNNING = "ATTEMPT_RUNNING"
 _EVENT_TYPE_CANCEL_REQUESTED = "CANCEL_REQUESTED"
 _EVENT_TYPE_RUN_CANCELLING = "RUN_CANCELLING"
-_EVENT_TYPE_ATTEMPT_CANCELLED = "ATTEMPT_CANCELLED"
-_EVENT_TYPE_RUN_CANCELLED = "RUN_CANCELLED"
-_EVENT_TYPE_ATTEMPT_SUCCEEDED = "ATTEMPT_SUCCEEDED"
-_EVENT_TYPE_ATTEMPT_FAILED = "ATTEMPT_FAILED"
-_EVENT_TYPE_ATTEMPT_LOST = "ATTEMPT_LOST"
-_EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
-_EVENT_TYPE_RUN_FAILED = "RUN_FAILED"
-_EVENT_TYPE_RUN_LOST = "RUN_LOST"
 _EVENT_TYPE_RESUME_REQUESTED = "RESUME_REQUESTED"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
 _ACTIVE_CANCEL_WATCHDOG_CLOSEOUT_REASON = "active_cancel_watchdog_closeout"
-_TERMINAL_STATUS_PAIRS: tuple[tuple[AttemptStatus, RunStatus], ...] = (
-    (AttemptStatus.SUCCEEDED, RunStatus.SUCCEEDED),
-    (AttemptStatus.FAILED, RunStatus.FAILED),
-    (AttemptStatus.CANCELLED, RunStatus.CANCELLED),
-    (AttemptStatus.LOST, RunStatus.LOST),
-)
 
 
 class PromotionSkipReason(StrEnum):
@@ -3308,7 +3300,7 @@ def _context_recovery_attempt_failed_event_request(
         run_id=run.run_id,
         attempt_id=attempt.attempt_id,
         execution_id=attempt.execution_id,
-        event_type=_EVENT_TYPE_ATTEMPT_FAILED,
+        event_type=_attempt_terminal_event_type(AttemptStatus.FAILED),
         occurred_at=request.occurred_at,
         actor=request.actor,
         source=request.source,
@@ -3454,7 +3446,7 @@ def _startup_orphan_attempt_lost_event_request(
         run_id=run.run_id,
         attempt_id=attempt.attempt_id,
         execution_id=attempt.execution_id,
-        event_type=_EVENT_TYPE_ATTEMPT_LOST,
+        event_type=_attempt_terminal_event_type(AttemptStatus.LOST),
         occurred_at=request.occurred_at,
         actor=request.actor,
         source=request.source,
@@ -3496,7 +3488,9 @@ def _startup_orphan_run_close_event_request(
     """
 
     event_type = (
-        _EVENT_TYPE_RUN_RECOVERING if request.recoverable else _EVENT_TYPE_RUN_LOST
+        _EVENT_TYPE_RUN_RECOVERING
+        if request.recoverable
+        else _run_terminal_event_type(RunStatus.LOST)
     )
     return EventLogAppendRequest(
         event_id=request.run_close_event_id,
@@ -3543,7 +3537,7 @@ def _startup_recovering_run_lost_event_request(
         run_id=run.run_id,
         attempt_id=None,
         execution_id=None,
-        event_type=_EVENT_TYPE_RUN_LOST,
+        event_type=_run_terminal_event_type(RunStatus.LOST),
         occurred_at=request.occurred_at,
         actor=request.actor,
         source=request.source,
@@ -3619,7 +3613,7 @@ def _recovering_run_failed_event_request(
         run_id=run.run_id,
         attempt_id=request.source_attempt_id,
         execution_id=None,
-        event_type=_EVENT_TYPE_RUN_FAILED,
+        event_type=_run_terminal_event_type(RunStatus.FAILED),
         occurred_at=request.occurred_at,
         actor=request.actor,
         source=request.source,
@@ -3659,7 +3653,7 @@ def _unstarted_run_failed_event_request(
         run_id=run.run_id,
         attempt_id=None,
         execution_id=None,
-        event_type=_EVENT_TYPE_RUN_FAILED,
+        event_type=_run_terminal_event_type(RunStatus.FAILED),
         occurred_at=request.occurred_at,
         actor=request.actor,
         source=request.source,
@@ -4040,7 +4034,7 @@ def _attempt_cancelled_event_request(
         run_id=run.run_id,
         attempt_id=attempt.attempt_id,
         execution_id=attempt.execution_id,
-        event_type=_EVENT_TYPE_ATTEMPT_CANCELLED,
+        event_type=_attempt_terminal_event_type(AttemptStatus.CANCELLED),
         occurred_at=request.occurred_at,
         actor=request.actor,
         source=request.source,
@@ -4089,7 +4083,7 @@ def _run_cancelled_event_request(
         run_id=run.run_id,
         attempt_id=terminal_attempt_id,
         execution_id=None,
-        event_type=_EVENT_TYPE_RUN_CANCELLED,
+        event_type=_run_terminal_event_type(RunStatus.CANCELLED),
         occurred_at=request.occurred_at,
         actor=request.actor,
         source=request.source,
@@ -4233,7 +4227,7 @@ def _waiting_run_cancelled_event_request(
         run_id=run.run_id,
         attempt_id=attempt.attempt_id,
         execution_id=None,
-        event_type=_EVENT_TYPE_RUN_CANCELLED,
+        event_type=_run_terminal_event_type(RunStatus.CANCELLED),
         occurred_at=request.occurred_at,
         actor=request.actor,
         source=request.source,
@@ -4280,7 +4274,7 @@ def _active_attempt_cancelled_event_request(
         run_id=run.run_id,
         attempt_id=attempt.attempt_id,
         execution_id=attempt.execution_id,
-        event_type=_EVENT_TYPE_ATTEMPT_CANCELLED,
+        event_type=_attempt_terminal_event_type(AttemptStatus.CANCELLED),
         occurred_at=request.occurred_at,
         actor=request.actor,
         source=request.source,
@@ -4329,7 +4323,7 @@ def _active_run_cancelled_event_request(
         run_id=run.run_id,
         attempt_id=attempt.attempt_id,
         execution_id=None,
-        event_type=_EVENT_TYPE_RUN_CANCELLED,
+        event_type=_run_terminal_event_type(RunStatus.CANCELLED),
         occurred_at=request.occurred_at,
         actor=request.actor,
         source=request.source,
@@ -4383,7 +4377,7 @@ def _active_watchdog_attempt_cancelled_event_request(
         run_id=run.run_id,
         attempt_id=attempt.attempt_id,
         execution_id=attempt.execution_id,
-        event_type=_EVENT_TYPE_ATTEMPT_CANCELLED,
+        event_type=_attempt_terminal_event_type(AttemptStatus.CANCELLED),
         occurred_at=request.occurred_at,
         actor=request.actor,
         source=request.source,
@@ -4436,7 +4430,7 @@ def _active_watchdog_run_cancelled_event_request(
         run_id=run.run_id,
         attempt_id=attempt.attempt_id,
         execution_id=None,
-        event_type=_EVENT_TYPE_RUN_CANCELLED,
+        event_type=_run_terminal_event_type(RunStatus.CANCELLED),
         occurred_at=request.occurred_at,
         actor=request.actor,
         source=request.source,
@@ -5534,41 +5528,67 @@ def _read_current_dispatch_record_if_present(
 
 
 def _attempt_terminal_event_type(status: AttemptStatus) -> str:
-    """把 Attempt 终态映射到具体 canonical event type。
+    """把 closeout-supported Attempt terminal status 投影为事件类型。
 
     :param status: Attempt 终态。
-    :returns: event type。
-    :raises ValueError: 状态不是 terminal closeout 支持的终态时抛出。
+    :returns: 具体 Attempt terminal EventLog type 字符串。
+    :raises ValueError: 状态不是 Run / Attempt 联合 closeout 支持的 Attempt
+        terminal 子集时抛出。
     """
 
-    if status == AttemptStatus.SUCCEEDED:
-        return _EVENT_TYPE_ATTEMPT_SUCCEEDED
-    if status == AttemptStatus.FAILED:
-        return _EVENT_TYPE_ATTEMPT_FAILED
-    if status == AttemptStatus.CANCELLED:
-        return _EVENT_TYPE_ATTEMPT_CANCELLED
-    if status == AttemptStatus.LOST:
-        return _EVENT_TYPE_ATTEMPT_LOST
-    raise ValueError("unsupported Attempt terminal status")
+    return closeout_attempt_terminal_event_type_for_status(status).value
 
 
 def _run_terminal_event_type(status: RunStatus) -> str:
-    """把 Run 终态映射到具体 canonical event type。
+    """把 Run terminal status 投影为事件类型。
 
     :param status: Run 终态。
-    :returns: event type。
+    :returns: 具体 Run terminal EventLog type 字符串。
     :raises ValueError: 状态不是 terminal closeout 支持的终态时抛出。
     """
 
-    if status == RunStatus.SUCCEEDED:
-        return _EVENT_TYPE_RUN_SUCCEEDED
-    if status == RunStatus.FAILED:
-        return _EVENT_TYPE_RUN_FAILED
-    if status == RunStatus.CANCELLED:
-        return _EVENT_TYPE_RUN_CANCELLED
-    if status == RunStatus.LOST:
-        return _EVENT_TYPE_RUN_LOST
-    raise ValueError("unsupported Run terminal status")
+    return run_terminal_event_type_for_status(status).value
+
+
+def _derive_terminal_status_pairs() -> tuple[tuple[AttemptStatus, RunStatus], ...]:
+    """从 durable status owner 与 lifecycle closeout helper 派生合法 closeout 配对。
+
+    :returns: Run / Attempt 同名 terminal status 配对。
+    :raises RuntimeError: lifecycle helper 支持的 Attempt 终态缺少同名 Run 终态时抛出。
+    """
+
+    pairs: list[tuple[AttemptStatus, RunStatus]] = []
+    for attempt_status in AttemptStatus:
+        if attempt_status not in TERMINAL_ATTEMPT_STATUSES:
+            continue
+        try:
+            _attempt_terminal_event_type(attempt_status)
+        except ValueError:
+            continue
+        try:
+            run_status = RunStatus(attempt_status.value)
+        except ValueError as exc:
+            raise RuntimeError(
+                "closeout-supported Attempt terminal status has no matching "
+                f"Run terminal status: {attempt_status.value}"
+            ) from exc
+        if run_status not in TERMINAL_RUN_STATUSES:
+            raise RuntimeError(
+                "closeout-supported Attempt terminal status maps to "
+                f"non-terminal Run status: {attempt_status.value}"
+            )
+        _run_terminal_event_type(run_status)
+        pairs.append((attempt_status, run_status))
+    return tuple(pairs)
+
+
+_TERMINAL_STATUS_PAIRS = _derive_terminal_status_pairs()
+"""Run / Attempt 联合 terminal closeout 的派生兼容配对。
+
+该 invariant 来自 durable terminal status owner 与 lifecycle closeout-supported
+Attempt helper；``SUSPENDED`` / ``STEERED`` 是 durable Attempt 终态，但不进入
+Run / Attempt 联合 terminal closeout。
+"""
 
 
 def _terminal_status_pair_is_compatible(

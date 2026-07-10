@@ -192,6 +192,10 @@ from dayu.host._event_payload import (
     required_payload_text as _required_payload_text,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.lifecycle_events import (
+    closeout_attempt_terminal_event_type_for_status,
+    run_terminal_event_type_for_status,
+)
 from dayu.host.memory import (
     MemoryProjectionPolicy,
     default_memory_projection_policy,
@@ -225,14 +229,6 @@ _PAYLOAD_ID_PREFIX = "sqlite-payload-engine-terminal"
 _EVENT_TYPE_ENGINE_EVENT_REJECTED = "ENGINE_EVENT_REJECTED"
 _EVENT_TYPE_ENGINE_EVENT_DIAGNOSTIC = "ENGINE_EVENT_DIAGNOSTIC"
 _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR = "PROVIDER_PROTOCOL_ERROR"
-_EVENT_TYPE_ATTEMPT_SUCCEEDED = "ATTEMPT_SUCCEEDED"
-_EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
-_EVENT_TYPE_ATTEMPT_FAILED = "ATTEMPT_FAILED"
-_EVENT_TYPE_RUN_FAILED = "RUN_FAILED"
-_EVENT_TYPE_ATTEMPT_CANCELLED = "ATTEMPT_CANCELLED"
-_EVENT_TYPE_RUN_CANCELLED = "RUN_CANCELLED"
-_EVENT_TYPE_ATTEMPT_LOST = "ATTEMPT_LOST"
-_EVENT_TYPE_RUN_LOST = "RUN_LOST"
 _EVENT_TYPE_RUN_RECOVERING = "RUN_RECOVERING"
 _EVENT_TYPE_TOOL_AWAITING = "TOOL_AWAITING"
 _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED = "RUNNER_CALL_INPUT_ASSEMBLED"
@@ -1162,13 +1158,13 @@ class EngineEventIngestor:
         attempt_event_id = _event_id(
             candidate,
             EventClass.CANONICAL_FACT,
-            _EVENT_TYPE_ATTEMPT_CANCELLED,
+            _closeout_attempt_event_type(AttemptStatus.CANCELLED),
             0,
         )
         run_event_id = _event_id(
             candidate,
             EventClass.CANONICAL_FACT,
-            _EVENT_TYPE_RUN_CANCELLED,
+            _run_terminal_event_type(RunStatus.CANCELLED),
             1,
         )
         existing = _existing_rows(
@@ -1457,7 +1453,7 @@ class EngineEventIngestor:
         attempt_event_id = _event_id(
             candidate,
             EventClass.CANONICAL_FACT,
-            _EVENT_TYPE_ATTEMPT_FAILED,
+            _closeout_attempt_event_type(AttemptStatus.FAILED),
             sub_index_offset,
         )
         recovering_event_id = _event_id(
@@ -2270,7 +2266,7 @@ class EngineEventIngestor:
         run_failed_event_id = _event_id(
             context.candidate,
             EventClass.CANONICAL_FACT,
-            _EVENT_TYPE_RUN_FAILED,
+            _run_terminal_event_type(RunStatus.FAILED),
             4,
         )
         result = fail_recovering_run_in_transaction(
@@ -4140,6 +4136,28 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid4().hex}"
 
 
+def _closeout_attempt_event_type(status: AttemptStatus) -> str:
+    """把 closeout-supported Attempt terminal status 投影为 EventLog type。
+
+    :param status: Attempt terminal status。
+    :returns: 对应 EventLog event_type 文本。
+    :raises ValueError: 状态不属于 Run / Attempt 联合 closeout 支持子集时抛出。
+    """
+
+    return closeout_attempt_terminal_event_type_for_status(status).value
+
+
+def _run_terminal_event_type(status: RunStatus) -> str:
+    """把 Run terminal status 投影为 EventLog type。
+
+    :param status: Run terminal status。
+    :returns: 对应 EventLog event_type 文本。
+    :raises ValueError: 状态不是 Run terminal status 时抛出。
+    """
+
+    return run_terminal_event_type_for_status(status).value
+
+
 def _duplicate_terminal_event_ids(
     candidate: EngineEventCandidate,
 ) -> tuple[str, ...]:
@@ -4155,13 +4173,13 @@ def _duplicate_terminal_event_ids(
             _event_id(
                 candidate,
                 EventClass.CANONICAL_FACT,
-                _EVENT_TYPE_ATTEMPT_SUCCEEDED,
+                _closeout_attempt_event_type(AttemptStatus.SUCCEEDED),
                 0,
             ),
             _event_id(
                 candidate,
                 EventClass.CANONICAL_FACT,
-                _EVENT_TYPE_RUN_SUCCEEDED,
+                _run_terminal_event_type(RunStatus.SUCCEEDED),
                 1,
             ),
         )
@@ -4173,13 +4191,13 @@ def _duplicate_terminal_event_ids(
                 _event_id(
                     candidate,
                     EventClass.CANONICAL_FACT,
-                    _EVENT_TYPE_ATTEMPT_LOST,
+                    _closeout_attempt_event_type(AttemptStatus.LOST),
                     0,
                 ),
                 _event_id(
                     candidate,
                     EventClass.CANONICAL_FACT,
-                    _EVENT_TYPE_RUN_LOST,
+                    _run_terminal_event_type(RunStatus.LOST),
                     1,
                 ),
             )
@@ -4194,13 +4212,13 @@ def _duplicate_terminal_event_ids(
                 _event_id(
                     candidate,
                     EventClass.CANONICAL_FACT,
-                    _EVENT_TYPE_ATTEMPT_FAILED,
+                    _closeout_attempt_event_type(AttemptStatus.FAILED),
                     1,
                 ),
                 _event_id(
                     candidate,
                     EventClass.CANONICAL_FACT,
-                    _EVENT_TYPE_RUN_FAILED,
+                    _run_terminal_event_type(RunStatus.FAILED),
                     2,
                 ),
             )
@@ -4208,13 +4226,13 @@ def _duplicate_terminal_event_ids(
             _event_id(
                 candidate,
                 EventClass.CANONICAL_FACT,
-                _EVENT_TYPE_ATTEMPT_FAILED,
+                _closeout_attempt_event_type(AttemptStatus.FAILED),
                 0,
             ),
             _event_id(
                 candidate,
                 EventClass.CANONICAL_FACT,
-                _EVENT_TYPE_RUN_FAILED,
+                _run_terminal_event_type(RunStatus.FAILED),
                 1,
             ),
         )
@@ -4223,13 +4241,13 @@ def _duplicate_terminal_event_ids(
             _event_id(
                 candidate,
                 EventClass.CANONICAL_FACT,
-                _EVENT_TYPE_ATTEMPT_CANCELLED,
+                _closeout_attempt_event_type(AttemptStatus.CANCELLED),
                 0,
             ),
             _event_id(
                 candidate,
                 EventClass.CANONICAL_FACT,
-                _EVENT_TYPE_RUN_CANCELLED,
+                _run_terminal_event_type(RunStatus.CANCELLED),
                 1,
             ),
         )
@@ -4244,7 +4262,7 @@ def _duplicate_terminal_event_ids(
             _event_id(
                 candidate,
                 EventClass.CANONICAL_FACT,
-                _EVENT_TYPE_ATTEMPT_FAILED,
+                _closeout_attempt_event_type(AttemptStatus.FAILED),
                 1,
             ),
             _event_id(
@@ -4324,8 +4342,8 @@ def _final_answer_plan(data: FinalAnswerData) -> _TerminalPlan:
             unsupported_later_owner=None,
         )
     return _TerminalPlan(
-        attempt_event_type=_EVENT_TYPE_ATTEMPT_SUCCEEDED,
-        run_event_type=_EVENT_TYPE_RUN_SUCCEEDED,
+        attempt_event_type=_closeout_attempt_event_type(AttemptStatus.SUCCEEDED),
+        run_event_type=_run_terminal_event_type(RunStatus.SUCCEEDED),
         attempt_status=AttemptStatus.SUCCEEDED,
         run_status=RunStatus.SUCCEEDED,
         reason=_REASON_FINAL_ANSWER,
@@ -4363,8 +4381,8 @@ def _run_failed_plan(data: RunFailedData) -> _TerminalPlan:
         _REASON_UNSUPPORTED_RECOVERY_POLICY if data.recoverable else data.error_code
     )
     return _TerminalPlan(
-        attempt_event_type=_EVENT_TYPE_ATTEMPT_FAILED,
-        run_event_type=_EVENT_TYPE_RUN_FAILED,
+        attempt_event_type=_closeout_attempt_event_type(AttemptStatus.FAILED),
+        run_event_type=_run_terminal_event_type(RunStatus.FAILED),
         attempt_status=AttemptStatus.FAILED,
         run_status=RunStatus.FAILED,
         reason=reason,
@@ -4465,8 +4483,8 @@ def _lost_lifecycle_plan(
     """
 
     return _TerminalPlan(
-        attempt_event_type=_EVENT_TYPE_ATTEMPT_LOST,
-        run_event_type=_EVENT_TYPE_RUN_LOST,
+        attempt_event_type=_closeout_attempt_event_type(AttemptStatus.LOST),
+        run_event_type=_run_terminal_event_type(RunStatus.LOST),
         attempt_status=AttemptStatus.LOST,
         run_status=RunStatus.LOST,
         reason=_REASON_WORKER_LOST_BEFORE_TERMINAL,
@@ -4514,8 +4532,8 @@ def _failed_plan(
     """
 
     return _TerminalPlan(
-        attempt_event_type=_EVENT_TYPE_ATTEMPT_FAILED,
-        run_event_type=_EVENT_TYPE_RUN_FAILED,
+        attempt_event_type=_closeout_attempt_event_type(AttemptStatus.FAILED),
+        run_event_type=_run_terminal_event_type(RunStatus.FAILED),
         attempt_status=AttemptStatus.FAILED,
         run_status=RunStatus.FAILED,
         reason=reason,

@@ -85,6 +85,10 @@ from dayu.host.durable.state import (
     terminal_run_row,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
+from dayu.host.lifecycle_events import (
+    closeout_attempt_terminal_event_type_for_status,
+    run_terminal_event_type_for_status,
+)
 
 _NOW = datetime(2026, 5, 14, 1, 2, 3, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "run-transition-test"})
@@ -411,6 +415,39 @@ def test_terminal_closeout_appends_concrete_terminal_events(
         assert _EVENT_TYPE_ATTEMPT_SUCCEEDED in event_types
         assert _EVENT_TYPE_RUN_SUCCEEDED in event_types
         assert "RUN_TERMINAL" not in event_types
+
+
+def test_terminal_closeout_status_pair_invariant_uses_lifecycle_owner() -> None:
+    """terminal closeout status pair invariant 由 lifecycle owner helper 派生。"""
+
+    expected = tuple(
+        (attempt_status, RunStatus(attempt_status.value))
+        for attempt_status in AttemptStatus
+        if attempt_status
+        in (
+            AttemptStatus.SUCCEEDED,
+            AttemptStatus.FAILED,
+            AttemptStatus.CANCELLED,
+            AttemptStatus.LOST,
+        )
+    )
+    assert run_transition_module._TERMINAL_STATUS_PAIRS == expected
+    for attempt_status, run_status in expected:
+        assert run_transition_module._terminal_status_pair_is_compatible(
+            attempt_status=attempt_status,
+            run_status=run_status,
+        )
+        assert run_transition_module._attempt_terminal_event_type(
+            attempt_status
+        ) == closeout_attempt_terminal_event_type_for_status(attempt_status).value
+        assert run_transition_module._run_terminal_event_type(
+            run_status
+        ) == run_terminal_event_type_for_status(run_status).value
+    for durable_only_status in (AttemptStatus.SUSPENDED, AttemptStatus.STEERED):
+        assert not run_transition_module._terminal_status_pair_is_compatible(
+            attempt_status=durable_only_status,
+            run_status=RunStatus.SUCCEEDED,
+        )
 
 
 def test_failed_terminal_closeout_payload_includes_client_correlation_id(
@@ -779,7 +816,7 @@ def test_terminal_closeout_accepts_attempt_running_in_phase5(
         (
             AttemptStatus.SUSPENDED,
             RunStatus.SUCCEEDED,
-            "unsupported Attempt terminal status",
+            "unsupported closeout Attempt terminal status",
         ),
     ),
 )

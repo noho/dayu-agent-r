@@ -158,6 +158,10 @@ from dayu.host.durable.state import (
     steer_running_attempt_row,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.lifecycle_events import (
+    closeout_attempt_terminal_event_type_for_status,
+    run_terminal_event_type_for_status,
+)
 from dayu.host.memory import MemoryProjectionPolicy
 from dayu.host.payload_resolution import event_payload_object
 from tests.host._context_compaction_assertions import assert_failed_payload_no_fallback
@@ -456,6 +460,53 @@ def test_final_answer_closes_attempt_and_run_with_phase5_payload(
         assert terminal_payload["execution_id"] == seeded.execution_id
         assert "summary" not in terminal_payload
         assert "summary_text" not in terminal_payload
+
+
+def test_terminal_plans_use_lifecycle_event_owner_helpers() -> None:
+    """terminal closeout plan 的 event type 来自 lifecycle owner helper。"""
+
+    succeeded = engine_ingest_module._final_answer_plan(
+        FinalAnswerData(
+            content="完成答案",
+            filtered=False,
+            degraded=False,
+            finish_reason=FinishReason.STOP,
+        )
+    )
+    failed = engine_ingest_module._run_failed_plan(
+        RunFailedData(
+            error_code="provider_error",
+            message="provider failed",
+            provider_request_id=None,
+            client_correlation_id=None,
+            recoverable=False,
+        )
+    )
+    lost = engine_ingest_module._lost_lifecycle_plan(
+        worker_lifecycle_signal="worker_crashed",
+        stream_error_code=None,
+        last_observed_worker_event_index=3,
+        last_accepted_event_id=None,
+    )
+
+    assert succeeded.attempt_event_type == (
+        closeout_attempt_terminal_event_type_for_status(AttemptStatus.SUCCEEDED).value
+    )
+    assert succeeded.run_event_type == (
+        run_terminal_event_type_for_status(RunStatus.SUCCEEDED).value
+    )
+    assert failed.attempt_event_type == (
+        closeout_attempt_terminal_event_type_for_status(AttemptStatus.FAILED).value
+    )
+    assert failed.run_event_type == (
+        run_terminal_event_type_for_status(RunStatus.FAILED).value
+    )
+    assert lost.attempt_event_type == (
+        closeout_attempt_terminal_event_type_for_status(AttemptStatus.LOST).value
+    )
+    assert lost.run_event_type == (
+        run_terminal_event_type_for_status(RunStatus.LOST).value
+    )
 
 
 def test_empty_final_answer_closes_failed_without_run_succeeded(

@@ -108,6 +108,7 @@ from dayu.host.durable.state import (
     count_runs_by_source_relation,
     insert_attempt,
     insert_dispatch_record,
+    is_terminal_run_status,
     read_active_run_for_session,
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
@@ -1570,7 +1571,7 @@ class _CancelRunOperation:
                 semantic_digest=semantic_digest,
                 scope=scope,
             )
-        if _is_terminal_run_status(run.status):
+        if is_terminal_run_status(run.status):
             return self._record_terminal_cancel_ack(
                 transaction=transaction,
                 run=run,
@@ -4552,21 +4553,6 @@ def _require_event_sequence_if_present(
             retryable=False,
         )
     return value
-
-
-def _is_terminal_run_status(status: RunStatus) -> bool:
-    """判断 Run 状态是否为终态。
-
-    :param status: Run 状态。
-    :returns: 是终态时返回 ``True``。
-    """
-
-    return status in (
-        RunStatus.SUCCEEDED,
-        RunStatus.FAILED,
-        RunStatus.CANCELLED,
-        RunStatus.LOST,
-    )
 
 
 def _raise_for_cancel_transition_status(
