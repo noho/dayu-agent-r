@@ -1,16 +1,17 @@
-"""Host Run lifecycle event type 与 terminal status 契约。
+"""Host Run lifecycle event type、Attempt terminal event type 与状态契约。
 
-本模块是 Host Run lifecycle event type、terminal event set 与 public outbox
-terminal item set 的代码真源。调用方可以传入 EventLog 中的原始 ``event_type``
-字符串，由本模块统一完成解析与分类，避免 projection、read API、dispatch 或
-durable helper 各自复制 terminal 集合。
+本模块是 Host Run lifecycle event type、Host Attempt terminal event type、
+terminal event set、closeout-supported Attempt terminal subset 与 public
+outbox terminal item set 的代码真源。调用方可以传入 EventLog 中的原始
+``event_type`` 字符串，由本模块统一完成解析与分类，避免 projection、read
+API、dispatch 或 durable helper 各自复制 terminal 集合。
 """
 
 from __future__ import annotations
 
 from enum import StrEnum
 
-from dayu.host.api import HostTerminalStatus, RunStatus
+from dayu.host.api import AttemptStatus, HostTerminalStatus, RunStatus
 
 
 class HostRunEventType(StrEnum):
@@ -28,6 +29,21 @@ class HostRunEventType(StrEnum):
     RUN_LOST = "RUN_LOST"
 
 
+class HostAttemptEventType(StrEnum):
+    """Host Attempt terminal EventLog 事件类型。
+
+    当前 P3-A 只定义 terminal 成员；非终态 Attempt event type 不属于本轮
+    terminal closeout owner 收敛范围。
+    """
+
+    ATTEMPT_SUCCEEDED = "ATTEMPT_SUCCEEDED"
+    ATTEMPT_FAILED = "ATTEMPT_FAILED"
+    ATTEMPT_CANCELLED = "ATTEMPT_CANCELLED"
+    ATTEMPT_SUSPENDED = "ATTEMPT_SUSPENDED"
+    ATTEMPT_STEERED = "ATTEMPT_STEERED"
+    ATTEMPT_LOST = "ATTEMPT_LOST"
+
+
 HOST_RUN_TERMINAL_EVENT_TYPES: tuple[HostRunEventType, ...] = (
     HostRunEventType.RUN_SUCCEEDED,
     HostRunEventType.RUN_FAILED,
@@ -35,6 +51,28 @@ HOST_RUN_TERMINAL_EVENT_TYPES: tuple[HostRunEventType, ...] = (
     HostRunEventType.RUN_LOST,
 )
 """Host Run terminal canonical fact 事件集合，包含 ``RUN_LOST``。"""
+
+HOST_ATTEMPT_TERMINAL_EVENT_TYPES: tuple[HostAttemptEventType, ...] = (
+    HostAttemptEventType.ATTEMPT_SUCCEEDED,
+    HostAttemptEventType.ATTEMPT_FAILED,
+    HostAttemptEventType.ATTEMPT_CANCELLED,
+    HostAttemptEventType.ATTEMPT_SUSPENDED,
+    HostAttemptEventType.ATTEMPT_STEERED,
+    HostAttemptEventType.ATTEMPT_LOST,
+)
+"""Host Attempt durable terminal canonical fact 事件集合。
+
+``ATTEMPT_SUSPENDED`` 与 ``ATTEMPT_STEERED`` 是 durable Attempt 终态事件，
+但不属于 Run / Attempt 联合 terminal closeout 支持的子集。
+"""
+
+CLOSEOUT_SUPPORTED_ATTEMPT_TERMINAL_EVENT_TYPES: tuple[HostAttemptEventType, ...] = (
+    HostAttemptEventType.ATTEMPT_SUCCEEDED,
+    HostAttemptEventType.ATTEMPT_FAILED,
+    HostAttemptEventType.ATTEMPT_CANCELLED,
+    HostAttemptEventType.ATTEMPT_LOST,
+)
+"""Run / Attempt 联合 terminal closeout 支持的 Attempt terminal 事件子集。"""
 
 PUBLIC_OUTBOX_TERMINAL_EVENT_TYPES: tuple[HostRunEventType, ...] = (
     HostRunEventType.RUN_SUCCEEDED,
@@ -59,6 +97,33 @@ _RUN_STATUS_BY_TERMINAL_EVENT_TYPE: dict[HostRunEventType, RunStatus] = {
     HostRunEventType.RUN_FAILED: RunStatus.FAILED,
     HostRunEventType.RUN_CANCELLED: RunStatus.CANCELLED,
     HostRunEventType.RUN_LOST: RunStatus.LOST,
+}
+
+_TERMINAL_EVENT_TYPE_BY_RUN_STATUS: dict[RunStatus, HostRunEventType] = {
+    RunStatus.SUCCEEDED: HostRunEventType.RUN_SUCCEEDED,
+    RunStatus.FAILED: HostRunEventType.RUN_FAILED,
+    RunStatus.CANCELLED: HostRunEventType.RUN_CANCELLED,
+    RunStatus.LOST: HostRunEventType.RUN_LOST,
+}
+
+_TERMINAL_EVENT_TYPE_BY_ATTEMPT_STATUS: dict[
+    AttemptStatus, HostAttemptEventType
+] = {
+    AttemptStatus.SUCCEEDED: HostAttemptEventType.ATTEMPT_SUCCEEDED,
+    AttemptStatus.FAILED: HostAttemptEventType.ATTEMPT_FAILED,
+    AttemptStatus.CANCELLED: HostAttemptEventType.ATTEMPT_CANCELLED,
+    AttemptStatus.SUSPENDED: HostAttemptEventType.ATTEMPT_SUSPENDED,
+    AttemptStatus.STEERED: HostAttemptEventType.ATTEMPT_STEERED,
+    AttemptStatus.LOST: HostAttemptEventType.ATTEMPT_LOST,
+}
+
+_CLOSEOUT_TERMINAL_EVENT_TYPE_BY_ATTEMPT_STATUS: dict[
+    AttemptStatus, HostAttemptEventType
+] = {
+    AttemptStatus.SUCCEEDED: HostAttemptEventType.ATTEMPT_SUCCEEDED,
+    AttemptStatus.FAILED: HostAttemptEventType.ATTEMPT_FAILED,
+    AttemptStatus.CANCELLED: HostAttemptEventType.ATTEMPT_CANCELLED,
+    AttemptStatus.LOST: HostAttemptEventType.ATTEMPT_LOST,
 }
 
 _HOST_TERMINAL_STATUS_BY_EVENT_TYPE: dict[HostRunEventType, HostTerminalStatus] = {
@@ -113,6 +178,60 @@ def host_terminal_status_for_terminal_event(
     return _HOST_TERMINAL_STATUS_BY_EVENT_TYPE.get(parsed)
 
 
+def run_terminal_event_type_for_status(status: RunStatus) -> HostRunEventType:
+    """把 Run terminal status 映射为 Host Run terminal event type。
+
+    :param status: Run 状态。
+    :returns: 对应的 Host Run terminal event type。
+    :raises ValueError: ``status`` 不是当前支持的 Run terminal status 时抛出。
+    """
+
+    event_type = _TERMINAL_EVENT_TYPE_BY_RUN_STATUS.get(status)
+    if event_type is None:
+        raise ValueError(f"unsupported Run terminal status: {status.value}")
+    return event_type
+
+
+def attempt_terminal_event_type_for_status(
+    status: AttemptStatus,
+) -> HostAttemptEventType:
+    """把 durable Attempt terminal status 映射为 Host Attempt terminal event type。
+
+    ``SUSPENDED`` 与 ``STEERED`` 是 durable Attempt 终态，本 helper 会返回对应
+    event type；它们不属于 Run / Attempt 联合 terminal closeout 支持的子集。
+    closeout path 必须使用 ``closeout_attempt_terminal_event_type_for_status``。
+
+    :param status: Attempt 状态。
+    :returns: 对应的 Host Attempt terminal event type。
+    :raises ValueError: ``status`` 不是当前支持的 Attempt terminal status 时抛出。
+    """
+
+    event_type = _TERMINAL_EVENT_TYPE_BY_ATTEMPT_STATUS.get(status)
+    if event_type is None:
+        raise ValueError(f"unsupported Attempt terminal status: {status.value}")
+    return event_type
+
+
+def closeout_attempt_terminal_event_type_for_status(
+    status: AttemptStatus,
+) -> HostAttemptEventType:
+    """把 closeout-supported Attempt terminal status 映射为 event type。
+
+    :param status: Attempt 状态。
+    :returns: 可进入 Run / Attempt 联合 terminal closeout 的 Attempt event type。
+    :raises ValueError: ``status`` 不是 closeout-supported Attempt terminal status
+        时抛出；其中 ``SUSPENDED`` 与 ``STEERED`` 是 durable terminal，但不属于
+        closeout-supported subset。
+    """
+
+    event_type = _CLOSEOUT_TERMINAL_EVENT_TYPE_BY_ATTEMPT_STATUS.get(status)
+    if event_type is None:
+        raise ValueError(
+            f"unsupported closeout Attempt terminal status: {status.value}"
+        )
+    return event_type
+
+
 def is_host_run_terminal_event(event_type: str) -> bool:
     """判断事件是否为 Host Run terminal canonical fact。
 
@@ -140,6 +259,19 @@ def event_type_values(event_types: tuple[HostRunEventType, ...]) -> tuple[str, .
     """把 typed Host Run event type 集合转换为 EventLog 字符串集合。
 
     :param event_types: typed Host Run event type tuple。
+    :returns: 可供 SQL ``IN`` 参数或 projection filter 使用的字符串 tuple。
+    :raises: 无主动抛出。
+    """
+
+    return tuple(event_type.value for event_type in event_types)
+
+
+def attempt_event_type_values(
+    event_types: tuple[HostAttemptEventType, ...],
+) -> tuple[str, ...]:
+    """把 typed Host Attempt event type 集合转换为 EventLog 字符串集合。
+
+    :param event_types: typed Host Attempt event type tuple。
     :returns: 可供 SQL ``IN`` 参数或 projection filter 使用的字符串 tuple。
     :raises: 无主动抛出。
     """

@@ -74,7 +74,18 @@ TERMINAL_RUN_STATUSES = frozenset(RunStatus(value) for value in TERMINAL_RUN_STA
 NON_TERMINAL_RUN_STATUSES = frozenset(status for status in RunStatus if status not in TERMINAL_RUN_STATUSES)
 """Run 非终态集合，由 :class:`RunStatus` 与终态集合派生。"""
 
-_TERMINAL_ATTEMPT_STATUSES = frozenset(AttemptStatus(value) for value in TERMINAL_ATTEMPT_STATUS_VALUES)
+START_BLOCKING_RUN_STATUSES = frozenset(
+    status for status in NON_TERMINAL_RUN_STATUSES if status is not RunStatus.QUEUED
+)
+"""阻塞启动新 Run 的 Run 状态集合。
+
+当前假设是所有非终态 Run 状态都会阻塞同一 Session 启动新 Run，唯一例外是
+``QUEUED``。该集合用于 accepted / start-blocking admission 查询，不等同于
+active slot。未来新增不应阻塞启动的非终态 ``RunStatus`` 时，必须显式审查
+admission 语义并更新本集合与 owner test。
+"""
+
+TERMINAL_ATTEMPT_STATUSES = frozenset(AttemptStatus(value) for value in TERMINAL_ATTEMPT_STATUS_VALUES)
 """Attempt 终态集合，作为 durable state terminal shape 的状态真源。"""
 
 _TERMINAL_REFS_UNSET_WHERE_SQL = terminal_event_refs_unset_where_sql(indent="          ")
@@ -543,6 +554,53 @@ def deserialize_run_status(value: str) -> RunStatus:
     return _deserialize_str_enum(value, enum_type=RunStatus, enum_name="RunStatus")
 
 
+def is_terminal_run_status(status: RunStatus) -> bool:
+    """判断 Run 状态是否为 durable 终态。
+
+    :param status: Run 状态。
+    :returns: 属于 durable Run 终态集合时返回 ``True``。
+    :raises: 无主动抛出。
+    """
+
+    return status in TERMINAL_RUN_STATUSES
+
+
+def serialized_run_status_values(
+    statuses: frozenset[RunStatus] | tuple[RunStatus, ...],
+) -> tuple[str, ...]:
+    """把 Run 状态集合转换为 durable schema 文本值。
+
+    :param statuses: Run 状态集合。传入 tuple 时保留调用方顺序；传入
+        frozenset 时按 ``RunStatus`` 定义顺序输出，保证 SQL 参数稳定。
+    :returns: schema 中存储的 Run status 文本 tuple。
+    :raises HostDurableError: 任一状态不是合法 ``RunStatus`` 时抛出。
+    """
+
+    if isinstance(statuses, frozenset):
+        ordered_statuses = tuple(status for status in RunStatus if status in statuses)
+    else:
+        ordered_statuses = statuses
+    return tuple(serialize_run_status(status) for status in ordered_statuses)
+
+
+def run_status_in_clause(
+    statuses: frozenset[RunStatus] | tuple[RunStatus, ...],
+) -> tuple[str, tuple[str, ...]]:
+    """生成 Run status ``IN`` 谓词片段与参数。
+
+    :param statuses: Run 状态集合。传入 tuple 时保留调用方顺序；传入
+        frozenset 时按 ``RunStatus`` 定义顺序输出。
+    :returns: SQL ``IN`` 片段与对应参数，例如 ``("IN (?, ?)", (...))``。
+    :raises HostDurableError: 状态集合为空或任一状态非法时抛出。
+    """
+
+    params = serialized_run_status_values(statuses)
+    if not params:
+        raise HostDurableError("Run status IN clause statuses must not be empty")
+    placeholders = ", ".join("?" for _status in params)
+    return f"IN ({placeholders})", params
+
+
 def serialize_attempt_status(status: AttemptStatus) -> str:
     """序列化公共 Attempt 状态。
 
@@ -552,6 +610,17 @@ def serialize_attempt_status(status: AttemptStatus) -> str:
     """
 
     return _serialize_str_enum(status, enum_name="AttemptStatus")
+
+
+def is_terminal_attempt_status(status: AttemptStatus) -> bool:
+    """判断 Attempt 状态是否为 durable 终态。
+
+    :param status: Attempt 状态。
+    :returns: 属于 durable Attempt 终态集合时返回 ``True``。
+    :raises: 无主动抛出。
+    """
+
+    return status in TERMINAL_ATTEMPT_STATUSES
 
 
 def deserialize_attempt_status(value: str) -> AttemptStatus:
@@ -1142,7 +1211,7 @@ def run_row_from_host_row(row: HostRow) -> RunRow:
             terminal_event_id=run_row.terminal_event_id,
             terminal_event_sequence=run_row.terminal_event_sequence,
             terminal_at=run_row.terminal_at,
-            is_terminal=_is_terminal_run_status(run_row.status),
+            is_terminal=is_terminal_run_status(run_row.status),
             owner_label="Run",
         )
     except HostDurableError as exc:
@@ -1181,7 +1250,7 @@ def attempt_row_from_host_row(row: HostRow) -> AttemptRow:
             terminal_event_id=attempt_row.terminal_event_id,
             terminal_event_sequence=attempt_row.terminal_event_sequence,
             terminal_at=attempt_row.terminal_at,
-            is_terminal=attempt_row.status in _TERMINAL_ATTEMPT_STATUSES,
+            is_terminal=is_terminal_attempt_status(attempt_row.status),
             owner_label="Attempt",
         )
     except HostDurableError as exc:
@@ -5191,7 +5260,7 @@ def _validate_run_for_insert(run: RunRow) -> None:
         terminal_event_id=run.terminal_event_id,
         terminal_event_sequence=run.terminal_event_sequence,
         terminal_at=run.terminal_at,
-        is_terminal=_is_terminal_run_status(run.status),
+        is_terminal=is_terminal_run_status(run.status),
         owner_label="Run",
     )
     if (run.source_run_id is None) != (run.source_run_relation is None):
@@ -5244,7 +5313,7 @@ def _validate_attempt_for_insert(attempt: AttemptRow) -> None:
         terminal_event_id=attempt.terminal_event_id,
         terminal_event_sequence=attempt.terminal_event_sequence,
         terminal_at=attempt.terminal_at,
-        is_terminal=attempt.status in _TERMINAL_ATTEMPT_STATUSES,
+        is_terminal=is_terminal_attempt_status(attempt.status),
         owner_label="Attempt",
     )
 
@@ -5620,7 +5689,7 @@ def _run_mutation_result_for_active(
         RunStatus.WAITING,
         RunStatus.CANCELLING,
         RunStatus.RECOVERING,
-    ) or _is_terminal_run_status(latest.status):
+    ) or is_terminal_run_status(latest.status):
         return RunMutationResult(status=StateMutationStatus.CAS_LOST, row=latest)
     return RunMutationResult(status=StateMutationStatus.INVALID_STATE, row=latest)
 
@@ -6350,16 +6419,6 @@ def _require_optional_text_max_length(value: str | None, *, field_name: str, max
 
     if value is not None:
         _require_text_max_length(value, field_name=field_name, max_length=max_length)
-
-
-def _is_terminal_run_status(status: RunStatus) -> bool:
-    """判断 Run 状态是否为终态。
-
-    :param status: Run 状态。
-    :returns: 是终态时返回 ``True``。
-    """
-
-    return status in TERMINAL_RUN_STATUSES
 
 
 def _slot_ref_from_row(slot: SessionSlotRow | None) -> SessionSlotRef | None:

@@ -9,6 +9,10 @@ import pytest
 
 from dayu.host.api import AttemptStatus, RunStatus, SessionStatus
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
+from dayu.host.durable._row_rules import (
+    TERMINAL_ATTEMPT_STATUS_VALUES,
+    TERMINAL_RUN_STATUS_VALUES,
+)
 from dayu.host.durable.errors import HostDurableError, HostRowDecodeError, HostUniqueConstraintError
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
@@ -26,7 +30,11 @@ from dayu.host.durable.schema import (
 )
 from dayu.host.durable.state import (
     DispatchRecordStatus,
+    NON_TERMINAL_RUN_STATUSES,
     RunStartReason,
+    START_BLOCKING_RUN_STATUSES,
+    TERMINAL_ATTEMPT_STATUSES,
+    TERMINAL_RUN_STATUSES,
     WorkerKind,
     attempt_row_from_host_row,
     deserialize_dispatch_record_status,
@@ -34,13 +42,17 @@ from dayu.host.durable.state import (
     deserialize_run_start_reason,
     deserialize_worker_kind,
     dispatch_record_row_from_host_row,
+    is_terminal_attempt_status,
+    is_terminal_run_status,
     read_cancelling_runs,
+    run_status_in_clause,
     run_row_from_host_row,
     serialize_attempt_status,
     serialize_dispatch_record_status,
     serialize_run_status,
     serialize_run_start_reason,
     serialize_session_status,
+    serialized_run_status_values,
     serialize_worker_kind,
     session_row_from_host_row,
 )
@@ -79,6 +91,117 @@ def _options(
         payload_policy=PayloadStoragePolicy(artifact_root=tmp_path / "artifacts"),
         sqlite_policy=HostSQLiteStoragePolicy(busy_timeout_seconds=busy_timeout_seconds),
     )
+
+
+def test_terminal_run_statuses_derive_from_row_rules() -> None:
+    """Run 终态集合与 durable row rules 使用同一个文本真源。"""
+
+    expected = frozenset(RunStatus(value) for value in TERMINAL_RUN_STATUS_VALUES)
+
+    assert TERMINAL_RUN_STATUSES == expected
+
+
+def test_terminal_attempt_statuses_derive_from_row_rules() -> None:
+    """Attempt 终态集合与 durable row rules 使用同一个文本真源。"""
+
+    expected = frozenset(AttemptStatus(value) for value in TERMINAL_ATTEMPT_STATUS_VALUES)
+
+    assert TERMINAL_ATTEMPT_STATUSES == expected
+
+
+def test_is_terminal_run_status_covers_all_members() -> None:
+    """is_terminal_run_status predicate 显式覆盖所有 RunStatus 成员。"""
+
+    expected = frozenset(RunStatus(value) for value in TERMINAL_RUN_STATUS_VALUES)
+
+    for status in RunStatus:
+        assert is_terminal_run_status(status) is (status in expected)
+
+
+def test_is_terminal_attempt_status_covers_all_members() -> None:
+    """is_terminal_attempt_status predicate 显式覆盖所有 AttemptStatus 成员。"""
+
+    expected = frozenset(AttemptStatus(value) for value in TERMINAL_ATTEMPT_STATUS_VALUES)
+
+    for status in AttemptStatus:
+        assert is_terminal_attempt_status(status) is (status in expected)
+
+
+def test_non_terminal_run_statuses_derive_from_terminal_owner_set() -> None:
+    """Run 非终态集合由 RunStatus 全集减终态集合派生。"""
+
+    assert NON_TERMINAL_RUN_STATUSES == frozenset(
+        status for status in RunStatus if status not in TERMINAL_RUN_STATUSES
+    )
+
+
+def test_start_blocking_run_statuses_are_explicit_current_assumption() -> None:
+    """start-blocking 当前假设为除 QUEUED 外所有非终态 Run status。
+
+    新增非终态 ``RunStatus`` 时，本测试必须失败，迫使开发者显式审查该状态是否
+    应阻塞同一 Session 启动新 Run。
+    """
+
+    assert START_BLOCKING_RUN_STATUSES == frozenset(
+        (
+            RunStatus.ACCEPTED,
+            RunStatus.RUNNING,
+            RunStatus.WAITING,
+            RunStatus.CANCELLING,
+            RunStatus.RECOVERING,
+        )
+    )
+    assert START_BLOCKING_RUN_STATUSES == (
+        NON_TERMINAL_RUN_STATUSES - frozenset((RunStatus.QUEUED,))
+    )
+
+
+def test_serialized_run_status_values_use_owner_serialization() -> None:
+    """Run status value projection 统一走 durable state serialization helper。"""
+
+    assert serialized_run_status_values(
+        (
+            RunStatus.LOST,
+            RunStatus.SUCCEEDED,
+        )
+    ) == (
+        serialize_run_status(RunStatus.LOST),
+        serialize_run_status(RunStatus.SUCCEEDED),
+    )
+    assert serialized_run_status_values(TERMINAL_RUN_STATUSES) == (
+        serialize_run_status(RunStatus.SUCCEEDED),
+        serialize_run_status(RunStatus.FAILED),
+        serialize_run_status(RunStatus.CANCELLED),
+        serialize_run_status(RunStatus.LOST),
+    )
+    assert serialized_run_status_values(
+        frozenset(
+            (
+                RunStatus.LOST,
+                RunStatus.SUCCEEDED,
+            )
+        )
+    ) == (
+        serialize_run_status(RunStatus.SUCCEEDED),
+        serialize_run_status(RunStatus.LOST),
+    )
+
+
+def test_run_status_in_clause_rejects_empty_statuses() -> None:
+    """Run status SQL helper 对空集合 fail-fast，避免生成不明确谓词。"""
+
+    with pytest.raises(HostDurableError, match="must not be empty"):
+        run_status_in_clause(())
+
+
+def test_run_status_in_clause_placeholder_count_matches_params() -> None:
+    """Run status SQL helper 生成的占位符数量与参数数量一致。"""
+
+    clause, params = run_status_in_clause(START_BLOCKING_RUN_STATUSES)
+
+    assert clause == "IN (?, ?, ?, ?, ?)"
+    assert clause.count("?") == len(params)
+    assert params == serialized_run_status_values(START_BLOCKING_RUN_STATUSES)
 
 
 def test_active_run_partial_unique_index_shape(tmp_path: Path) -> None:
