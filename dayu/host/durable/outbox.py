@@ -100,7 +100,8 @@ class OutboxTerminalItemRow:
     :param run_id: source Run id。
     :param terminal_status: public terminal 状态文本。
     :param dedupe_key: 与 live HostEvent 对齐的去重键。
-    :param final_answer_json: 可选 final answer JSON 文本；缺失时由 refs 承载。
+    :param final_answer_json: succeeded 必需的 final answer JSON 文本；其它终态为
+        ``None``。
     :param error_message: 可选失败展示消息。
     :param cancel_reason: 可选取消原因。
     :param result_ref: 可选结果 payload 引用。
@@ -839,6 +840,15 @@ def _validate_item_row(row: OutboxTerminalItemRow) -> None:
     if row.dedupe_key != row.terminal_event_id:
         raise HostDurableError("outbox dedupe_key must equal terminal_event_id")
     _require_optional_non_empty_text(row.final_answer_json, field_name="final_answer_json")
+    if row.terminal_status == _TERMINAL_STATUS_SUCCEEDED:
+        if row.final_answer_json is None:
+            raise HostDurableError(
+                "succeeded outbox item requires final_answer_json"
+            )
+    elif row.final_answer_json is not None:
+        raise HostDurableError(
+            "non-success outbox item must not carry final_answer_json"
+        )
     _require_optional_non_empty_text(row.error_message, field_name="error_message")
     _require_optional_non_empty_text(row.cancel_reason, field_name="cancel_reason")
     _require_optional_non_empty_text(row.result_ref, field_name="result_ref")
@@ -911,7 +921,7 @@ def _item_row_from_host_row(row: HostRow) -> OutboxTerminalItemRow:
     :raises HostDurableError: durable row 类型不符合预期时抛出。
     """
 
-    return OutboxTerminalItemRow(
+    item_row = OutboxTerminalItemRow(
         item_id=_require_text(row.get("item_id"), field_name="item_id"),
         idempotency_key=_require_text(
             row.get("idempotency_key"),
@@ -966,6 +976,8 @@ def _item_row_from_host_row(row: HostRow) -> OutboxTerminalItemRow:
             field_name="last_drain_request_id",
         ),
     )
+    _validate_item_row(item_row)
+    return item_row
 
 
 def _batch_item_ids_from_json(value: str) -> tuple[str, ...]:

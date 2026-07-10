@@ -2736,6 +2736,10 @@ class HostFinalAnswerView:
 
         if not isinstance(self.content, str):
             raise TypeError("HostFinalAnswerView.content must be str")
+        _require_non_empty(
+            self.content,
+            field_name="HostFinalAnswerView.content",
+        )
         _require_bool(self.filtered, field_name="HostFinalAnswerView.filtered")
         _require_bool(self.degraded, field_name="HostFinalAnswerView.degraded")
         _require_optional_non_empty(
@@ -3155,6 +3159,10 @@ def _validate_outbox_terminal_payload(item: OutboxTerminalItem) -> None:
     """
 
     if item.terminal_status is HostTerminalStatus.SUCCEEDED:
+        if item.final_answer is None:
+            raise ValueError(
+                "OutboxTerminalItem succeeded item requires final_answer"
+            )
         if item.error_message is not None or item.cancel_reason is not None:
             raise ValueError(
                 "OutboxTerminalItem succeeded item cannot carry error or cancel"
@@ -3162,7 +3170,7 @@ def _validate_outbox_terminal_payload(item: OutboxTerminalItem) -> None:
         return
     if item.final_answer is not None:
         raise ValueError(
-            "OutboxTerminalItem failed or cancelled item must not carry final_answer"
+            "OutboxTerminalItem failed, cancelled or lost item must not carry final_answer"
         )
 
 

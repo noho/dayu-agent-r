@@ -14,6 +14,9 @@ from datetime import UTC, datetime
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host._terminal_diagnostics import _append_terminal_diagnostic_suffix
+from dayu.host._terminal_answer import (
+    required_assistant_final_answer_continuity_text,
+)
 from dayu.host._event_payload import optional_payload_text
 from dayu.host.api import HostTerminalStatus
 from dayu.host.lifecycle_events import (
@@ -58,7 +61,6 @@ _PAYLOAD_FIELD_RESULT_REF = "result_ref"
 _PAYLOAD_FIELD_RESULT_DIGEST = "result_digest"
 _PAYLOAD_FIELD_TERMINAL_SUMMARY_REF = "terminal_summary_ref"
 _PAYLOAD_FIELD_TERMINAL_SUMMARY_DIGEST = "terminal_summary_digest"
-_PAYLOAD_FIELD_FINAL_ANSWER = "final_answer"
 _PAYLOAD_FIELD_CONTENT = "content"
 _PAYLOAD_FIELD_FILTERED = "filtered"
 _PAYLOAD_FIELD_DEGRADED = "degraded"
@@ -163,7 +165,7 @@ class OutboxTerminalProjectionConsumer:
                 idempotency_key=event.event_id,
                 detail_code=_DETAIL_CODE_RUN_LOST_SKIPPED,
             )
-        row = build_outbox_terminal_item_row(event)
+        row = build_outbox_terminal_item_row(transaction, event)
         result = insert_outbox_terminal_item_if_absent(transaction, row)
         if result.status is OutboxTerminalItemWriteStatus.DUPLICATE:
             return ProjectionApplyResult(
@@ -226,10 +228,12 @@ def build_outbox_terminal_item_identity(
 
 
 def build_outbox_terminal_item_row(
+    transaction: HostTransaction,
     event: ProjectionEventView,
 ) -> OutboxTerminalItemRow:
     """从 terminal projection event 构造 Outbox terminal item row。
 
+    :param transaction: 当前 projection write transaction。
     :param event: terminal projection event。
     :returns: 可写入 durable outbox table 的 item row。
     :raises HostDurableError: event 缺少 Run id、event type 不支持或 payload 字段非法时抛出。
@@ -272,7 +276,11 @@ def build_outbox_terminal_item_row(
         run_id=event.run_id,
         terminal_status=terminal_status.value,
         dedupe_key=event.event_id,
-        final_answer_json=_final_answer_json(event.payload, terminal_status),
+        final_answer_json=_final_answer_json(
+            transaction,
+            event.payload,
+            terminal_status,
+        ),
         error_message=_error_message(event),
         cancel_reason=_cancel_reason(event),
         result_ref=result_ref,
@@ -344,22 +352,22 @@ def catch_up_outbox_terminal_projection(
 
 
 def _final_answer_json(
+    transaction: HostTransaction,
     payload: Mapping[str, JsonValue],
     terminal_status: HostTerminalStatus,
 ) -> str | None:
-    """从 succeeded payload 构造可选 final answer JSON。
+    """从 terminal-answer owner 构造 succeeded final answer JSON。
 
+    :param transaction: 当前 projection write transaction。
     :param payload: terminal EventLog payload。
     :param terminal_status: terminal 状态。
-    :returns: canonical final answer JSON 文本；缺失时为 ``None``。
-    :raises HostDurableError: final answer 相关字段类型非法时抛出。
+    :returns: succeeded 的 canonical final answer JSON；非 succeeded 为 ``None``。
+    :raises HostDurableError: succeeded answer source 或 metadata 非法时抛出。
     """
 
     if terminal_status is not HostTerminalStatus.SUCCEEDED:
         return None
-    content = optional_payload_text(payload, field_name=_PAYLOAD_FIELD_FINAL_ANSWER)
-    if content is None:
-        return None
+    content = required_assistant_final_answer_continuity_text(transaction, payload)
     final_answer_json: JsonValue = {
         _PAYLOAD_FIELD_CONTENT: content,
         _PAYLOAD_FIELD_FILTERED: _required_payload_bool(

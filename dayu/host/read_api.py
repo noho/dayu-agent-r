@@ -46,6 +46,9 @@ from dayu.host.api import (
     SessionSnapshot,
 )
 from dayu.host._terminal_diagnostics import _append_terminal_diagnostic_suffix
+from dayu.host._terminal_answer import (
+    required_assistant_final_answer_continuity_text,
+)
 from dayu.host.accepted_result_projection import (
     AcceptedToolResultStatus,
     project_accepted_tool_result,
@@ -69,11 +72,7 @@ from dayu.host.durable.outbox import (
     read_outbox_terminal_items_after as _read_outbox_terminal_items_after,
     read_outbox_terminal_projection_state as _read_outbox_terminal_projection_state,
 )
-from dayu.host.durable.payload import PayloadKind, read_payload_descriptor
-from dayu.host.durable.schema import (
-    TABLE_EVENT_LOG,
-    TABLE_SQLITE_PAYLOADS,
-)
+from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.state import (
     SessionWithSlotRows,
     read_all_sessions_with_slots,
@@ -111,8 +110,6 @@ _EVENT_TYPE_CONTEXT_COMPACTION_FAILED = "CONTEXT_COMPACTION_FAILED"
 _EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED = "CONTEXT_COMPACTION_ATTEMPT_REJECTED"
 _EVENT_TYPE_PROVIDER_PROTOCOL_ERROR = "PROVIDER_PROTOCOL_ERROR"
 _EVENT_TYPE_REASONING_DELTA = "REASONING_DELTA"
-_PAYLOAD_FIELD_TERMINAL_SUMMARY_REF = "terminal_summary_ref"
-_PAYLOAD_FIELD_TERMINAL_SUMMARY_DIGEST = "terminal_summary_digest"
 _PAYLOAD_FIELD_CONTENT = "content"
 _PAYLOAD_FIELD_FINISH_REASON = "finish_reason"
 _PAYLOAD_FIELD_FILTERED = "filtered"
@@ -829,7 +826,7 @@ def _final_answer_from_outbox_json(value: str | None) -> HostFinalAnswerView | N
     :param value: durable outbox final answer JSON 文本；无 final answer 时为
         ``None``。
     :returns: public final answer view 或 ``None``。
-    :raises HostDurableError: JSON 非法或字段类型非法时抛出。
+    :raises HostDurableError: JSON 非法或字段类型/语义非法时抛出。
     """
 
     if value is None:
@@ -847,6 +844,10 @@ def _final_answer_from_outbox_json(value: str | None) -> HostFinalAnswerView | N
     terminal_status = parsed.get(_PAYLOAD_FIELD_TERMINAL_STATUS)
     if not isinstance(content, str):
         raise HostDurableError("outbox final answer content is invalid")
+    if content.strip() == "":
+        raise HostDurableError(
+            "Outbox final answer field content must be non-empty text"
+        )
     if not isinstance(filtered, bool):
         raise HostDurableError("outbox final answer filtered is invalid")
     if not isinstance(degraded, bool):
@@ -910,40 +911,23 @@ def _succeeded_host_event(transaction: HostTransaction, row: EventLogRow) -> Hos
     """
 
     payload = _payload_object(row)
-    summary_ref = _required_payload_text(
-        payload,
-        field_name=_PAYLOAD_FIELD_TERMINAL_SUMMARY_REF,
-        row=row,
-    )
-    summary_digest = _required_payload_text(
-        payload,
-        field_name=_PAYLOAD_FIELD_TERMINAL_SUMMARY_DIGEST,
-        row=row,
-    )
-    terminal_payload = _terminal_payload_object(
-        transaction,
-        payload_ref=summary_ref,
-        payload_digest=summary_digest,
-        row=row,
-    )
     final_answer = HostFinalAnswerView(
-        content=_required_payload_text(
-            terminal_payload,
-            field_name=_PAYLOAD_FIELD_CONTENT,
-            row=row,
+        content=required_assistant_final_answer_continuity_text(
+            transaction,
+            payload,
         ),
         filtered=_required_payload_bool(
-            terminal_payload,
+            payload,
             field_name=_PAYLOAD_FIELD_FILTERED,
             row=row,
         ),
         degraded=_required_payload_bool(
-            terminal_payload,
+            payload,
             field_name=_PAYLOAD_FIELD_DEGRADED,
             row=row,
         ),
         finish_reason=_optional_payload_text(
-            terminal_payload,
+            payload,
             field_name=_PAYLOAD_FIELD_FINISH_REASON,
             row=row,
         ),
@@ -1604,73 +1588,6 @@ def _join_summary_parts(first: str | None, second: str | None) -> str | None:
     if len(parts) == 0:
         return None
     return _bounded_summary("；".join(parts))
-
-
-def _terminal_payload_object(
-    transaction: HostTransaction,
-    *,
-    payload_ref: str,
-    payload_digest: str,
-    row: EventLogRow,
-) -> Mapping[str, JsonValue]:
-    """读取 terminal artifact descriptor 并返回顶层 payload object。
-
-    :param transaction: 当前 Host transaction。
-    :param payload_ref: terminal payload ref。
-    :param payload_digest: terminal payload digest。
-    :param row: 关联 terminal EventLog row，用于错误上下文。
-    :returns: terminal payload JSON object。
-    :raises HostDurableError: descriptor、digest 或 payload 字段非法时抛出。
-    """
-
-    return _sqlite_payload_object(
-        transaction,
-        payload_ref=payload_ref,
-        payload_digest=payload_digest,
-        row=row,
-    )
-
-
-def _sqlite_payload_object(
-    transaction: HostTransaction,
-    *,
-    payload_ref: str,
-    payload_digest: str,
-    row: EventLogRow,
-) -> Mapping[str, JsonValue]:
-    """读取 SQLite payload descriptor 对应的 JSON object。
-
-    :param transaction: 当前 Host transaction。
-    :param payload_ref: payload descriptor 引用。
-    :param payload_digest: 期望 payload digest。
-    :param row: 关联 EventLog row，用于错误上下文。
-    :returns: payload JSON object。
-    :raises HostDurableError: descriptor 缺失、类型非法或 JSON 不是 object 时抛出。
-    """
-
-    descriptor = read_payload_descriptor(transaction, payload_ref)
-    if descriptor is None:
-        raise HostDurableError("terminal payload descriptor is missing")
-    if descriptor.payload_kind is not PayloadKind.SQLITE_PAYLOAD:
-        raise HostDurableError("terminal payload must be sqlite payload")
-    if descriptor.payload_digest != payload_digest:
-        raise HostDurableError("terminal payload digest mismatch")
-    if descriptor.sqlite_payload_id is None:
-        raise HostDurableError("terminal summary sqlite payload id is missing")
-    payload_row = transaction.fetchone(
-        f"""
-        SELECT payload_json
-        FROM {TABLE_SQLITE_PAYLOADS}
-        WHERE payload_id = ?
-        """,
-        (descriptor.sqlite_payload_id,),
-    )
-    if payload_row is None:
-        raise HostDurableError("terminal summary sqlite payload row is missing")
-    payload_json = payload_row.get("payload_json")
-    if not isinstance(payload_json, str):
-        raise HostDurableError("terminal summary sqlite payload JSON is invalid")
-    return _json_object(payload_json, row=row)
 
 
 def _payload_object(row: EventLogRow) -> Mapping[str, JsonValue]:

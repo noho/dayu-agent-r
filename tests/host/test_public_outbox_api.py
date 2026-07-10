@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import pathlib
+import sqlite3
+from datetime import UTC, datetime
 
 import pytest
 
@@ -12,14 +14,177 @@ from dayu.host import (
     HostApiError,
     HostApiErrorCode,
     HostClosedError,
+    HostFinalAnswerView,
     HostTerminalStatus,
     OutboxProjectionStatus,
     OutboxTerminalCursor,
+    OutboxTerminalItem,
+    OutboxTerminalItemState,
     ReadOutboxTerminalItemsRequest,
     open_host,
 )
+from dayu.host.durable.codec import canonical_json_dumps
+from dayu.host.durable.errors import HostDurableError
+from dayu.host.durable.schema import TABLE_HOST_OUTBOX_TERMINAL_ITEMS
 from dayu.host.durable.transaction import HostTransactionRunner
 from tests.host import public_smoke_support as smoke
+
+
+def _public_outbox_item(
+    *,
+    terminal_status: HostTerminalStatus,
+    final_answer: HostFinalAnswerView | None,
+) -> OutboxTerminalItem:
+    """构造 public Outbox 条件不变量测试 item。
+
+    :param terminal_status: terminal 状态。
+    :param final_answer: 可选 final answer view。
+    :returns: 构造完成的 public item。
+    :raises ValueError: terminal status 与 final answer 组合非法时抛出。
+    """
+
+    return OutboxTerminalItem(
+        item_id="outbox-item",
+        idempotency_key="sha256:item",
+        terminal_event_id="terminal-event",
+        event_sequence=1,
+        session_id="session-1",
+        run_id="run-1",
+        terminal_status=terminal_status,
+        dedupe_key="terminal-event",
+        final_answer=final_answer,
+        error_message=None,
+        cancel_reason=None,
+        result_ref=None,
+        result_digest=None,
+        terminal_summary_ref=None,
+        terminal_summary_digest=None,
+        projected_at=datetime(2026, 7, 10, tzinfo=UTC),
+        item_state=OutboxTerminalItemState.PENDING,
+    )
+
+
+def test_public_outbox_terminal_final_answer_invariants() -> None:
+    """public Outbox succeeded 必填，非成功三类禁止 final answer。
+
+    :returns: ``None``。
+    :raises AssertionError: conditional invariant 未生效时抛出。
+    """
+
+    final_answer = HostFinalAnswerView(
+        content="answer",
+        filtered=False,
+        degraded=False,
+        finish_reason="stop",
+        terminal_status=HostTerminalStatus.SUCCEEDED,
+    )
+    assert (
+        _public_outbox_item(
+            terminal_status=HostTerminalStatus.SUCCEEDED,
+            final_answer=final_answer,
+        ).final_answer
+        is final_answer
+    )
+    with pytest.raises(ValueError, match="succeeded item requires final_answer"):
+        _public_outbox_item(
+            terminal_status=HostTerminalStatus.SUCCEEDED,
+            final_answer=None,
+        )
+    for terminal_status in (
+        HostTerminalStatus.FAILED,
+        HostTerminalStatus.CANCELLED,
+        HostTerminalStatus.LOST,
+    ):
+        with pytest.raises(ValueError, match="failed, cancelled or lost"):
+            _public_outbox_item(
+                terminal_status=terminal_status,
+                final_answer=final_answer,
+            )
+
+
+@pytest.mark.parametrize("content", ("", " \t\n"))
+@pytest.mark.asyncio
+async def test_public_outbox_read_rejects_raw_blank_final_answer_content(
+    tmp_path: pathlib.Path,
+    content: str,
+) -> None:
+    """public read 对 raw Outbox row 的空白 content fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :param content: 直接写入 durable row 的空白回答文本。
+    :returns: ``None``。
+    :raises AssertionError: public read 未保留 Outbox field 诊断时抛出。
+    """
+
+    factory = smoke.FinalAnswerWorkerFactory()
+    options = smoke.open_host_options(
+        tmp_path,
+        runner_spec=smoke.deterministic_runner_spec(),
+        worker_factory=factory,
+        allow_tool_calls=False,
+    )
+
+    async with open_host(options) as host:
+        session = await host.ensure_session(smoke.ensure_request("outbox-raw-blank"))
+        followup = await host.submit_followup(
+            session.session_id,
+            smoke.followup_request(
+                session.session_id,
+                "outbox-raw-blank-run",
+                "请给出最终答案",
+            ),
+        )
+        await smoke.wait_for_status(
+            host,
+            followup.accepted_run_id,
+            HostTerminalStatus.SUCCEEDED,
+        )
+        materialized = await host.read_outbox_terminal_items(
+            session.session_id,
+            ReadOutboxTerminalItemsRequest(
+                after=OutboxTerminalCursor(event_sequence=0),
+                seen_terminal_event_ids=(),
+                limit=10,
+            ),
+        )
+        assert len(materialized.items) == 1
+        terminal_event_id = materialized.items[0].terminal_event_id
+        corrupted_json = canonical_json_dumps(
+            {
+                "content": content,
+                "filtered": False,
+                "degraded": False,
+                "finish_reason": "stop",
+                "terminal_status": "succeeded",
+            }
+        )
+        with sqlite3.connect(options.db_path) as connection:
+            connection.execute(
+                f"""
+                UPDATE {TABLE_HOST_OUTBOX_TERMINAL_ITEMS}
+                SET final_answer_json = ?
+                WHERE terminal_event_id = ?
+                """,
+                (corrupted_json, terminal_event_id),
+            )
+
+        with pytest.raises(HostApiError) as public_error:
+            await host.read_outbox_terminal_items(
+                session.session_id,
+                ReadOutboxTerminalItemsRequest(
+                    after=OutboxTerminalCursor(event_sequence=0),
+                    seen_terminal_event_ids=(),
+                    limit=10,
+                ),
+            )
+
+    durable_error = public_error.value.__cause__
+    assert public_error.value.code is HostApiErrorCode.INTERNAL_ERROR
+    assert isinstance(durable_error, HostDurableError)
+    diagnostic = str(durable_error)
+    assert "Outbox" in diagnostic
+    assert "field" in diagnostic
+    assert "content" in diagnostic
 
 
 @pytest.mark.asyncio

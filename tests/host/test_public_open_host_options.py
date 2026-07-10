@@ -353,6 +353,15 @@ def test_host_event_terminal_final_answer_contract() -> None:
     )
     assert event.final_answer is final_answer
 
+    with pytest.raises(ValueError, match="HostFinalAnswerView.content"):
+        HostFinalAnswerView(
+            content=" \n\t",
+            filtered=False,
+            degraded=False,
+            finish_reason="stop",
+            terminal_status=HostTerminalStatus.SUCCEEDED,
+        )
+
     with pytest.raises(ValueError, match="requires final_answer"):
         HostEvent(
             event_id="event-2",

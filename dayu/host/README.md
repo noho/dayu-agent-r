@@ -688,6 +688,8 @@ LLM-facing 文本不得要求模型理解 event id、payload ref、dispatch id�
 
 Outbox 是 terminal fact 的派生通知队列。`read_outbox_terminal_items` 不改变 drain state；`drain_outbox_terminal_items` 只幂等更新 Host outbox projection queue state。Outbox projection lag 或 failure 不改写 Run terminal truth。
 
+成功终态的 live `HostEvent` 与 Outbox item 必须携带非空 final answer。两者共用 Host terminal-answer continuity resolver：优先读取 canonical `RUN_SUCCEEDED` 的 inline `final_answer`，否则校验 terminal descriptor / digest 后读取顶层 `content`；`filtered`、`degraded` 与 `finish_reason` 始终来自 canonical `RUN_SUCCEEDED`。failed、cancelled、lost 不得携带 final answer，其中 lost 不生成 public Outbox item。Outbox 在同一 projection transaction 内解析回答、写 item 并推进 checkpoint；resolver 失败会整体回滚并留下 projection failure，descriptor 原样恢复后可重试，同一 terminal identity 只生成一个 item。
+
 Outbox terminal item 的 failed `error_message` 与 live `HostEvent` 使用同一个 Host projection helper 追加 provider / client correlation 诊断后缀；该后缀属于 public projection 文本，不改变 terminal fact payload。
 
 ### Purge tombstone
