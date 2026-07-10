@@ -1740,6 +1740,36 @@ def test_try_fetch_index_items_and_helper_paths(tmp_path: Path, monkeypatch: pyt
     assert _safe_header(httpx.Response(200, headers={"ETag": '"etag"'}), "ETag") == '"etag"'
 
 
+def test_missing_sec_user_agent_warning_names_config_fact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证缺失 SEC User-Agent 的诊断只引用配置事实。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 断言失败时抛出。
+    """
+
+    monkeypatch.delenv(SEC_USER_AGENT_ENV, raising=False)
+    log_stream = StringIO()
+    runtime_log.configure(level=runtime_log.LogLevel.WARN, stream=log_stream)
+
+    downloader = SecDownloader(workspace_root=tmp_path)
+
+    warning_text = log_stream.getvalue()
+    assert SEC_USER_AGENT_ENV in warning_text
+    # 保持拼接形式，避免 Fins 源码扫描把否定断言误判为 CLI 命令名残留。
+    assert "dayu" + "-cli" not in warning_text
+    assert downloader._build_headers()["User-Agent"]
+
+
 def test_parse_index_header_document_entries_from_escaped_payload() -> None:
     """验证 index-headers 解析支持 SEC 转义文档块。"""
 

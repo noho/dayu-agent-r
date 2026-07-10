@@ -2034,7 +2034,7 @@ class SecDownloader:
             return value
         Log.warning(
             f"SEC User-Agent 未配置。SEC 要求提供真实联系信息，否则可能限流或封禁。"
-            f"请通过环境变量 {SEC_USER_AGENT_ENV} 或 dayu-cli init 配置。",
+            f"请通过环境变量 {SEC_USER_AGENT_ENV} 或调用方/部署配置提供。",
             module=self.MODULE,
         )
         return _UNCONFIGURED_USER_AGENT
