@@ -1503,7 +1503,10 @@ def _active_wait_id(options: OpenHostOptions, run_id: str) -> str | None:
 
 
 def _diagnostic_event_type_count(db_path: pathlib.Path, event_type: str) -> int:
-    """统计测试同步所需的 diagnostic event type 数量。
+    """diagnostic-only：统计测试同步所需的跨 Run event type 数量。
+
+    本 helper 只提供 public smoke 等待调度事件时的 point-in-time diagnostic，
+    不表达 EventLog truth，也不替代 run-scoped EventLog owner helper。
 
     :param db_path: Host SQLite 路径。
     :param event_type: 目标事件类型。

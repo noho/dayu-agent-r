@@ -718,7 +718,7 @@ async def close_host_event_iterator(iterator: AsyncIterator[HostEvent]) -> None:
 
 
 def read_latest_event_sequence(root_path: pathlib.Path) -> int:
-    """读取 EventLog 当前最新全局序号。
+    """diagnostic-only：读取 EventLog 当前最新全局序号。
 
     每次调用都会打开新的短连接并执行 fresh short read transaction，得到
     point-in-time diagnostic。该读取只用于测试诊断和 watch lag 估算，
@@ -741,7 +741,7 @@ def read_latest_event_sequence(root_path: pathlib.Path) -> int:
 
 
 def read_event_log_count(root_path: pathlib.Path) -> int:
-    """读取 EventLog row 数量。
+    """diagnostic-only：读取 EventLog row 数量。
 
     每次调用都会打开新的短连接并执行 fresh short read transaction，得到
     point-in-time diagnostic。该读取只用于 consumer cancel 测试断言和
@@ -982,7 +982,7 @@ async def wait_all_runs_terminal(
 
 
 def read_host_instances(root_path: pathlib.Path) -> tuple[StressHostInstanceDiagnostic, ...]:
-    """读取 Host instance liveness 诊断视图。
+    """diagnostic-only：读取全部 Host instance liveness 诊断视图。
 
     每次调用都会打开新的 SQLite 短连接读取 ``host_instances``，只用于
     WU-STRESS-01 判断 running / stopping / stopped 与 stale heartbeat

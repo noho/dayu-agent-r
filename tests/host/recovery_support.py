@@ -38,6 +38,16 @@ from dayu.host import (
     RunStatus,
     open_host,
 )
+from dayu.host.durable.connection import open_host_durable_store
+from dayu.host.durable.options import (
+    HostDurableStoreOptions,
+    HostSQLiteStoragePolicy,
+    PayloadStoragePolicy,
+)
+from dayu.host.durable.projection import (
+    ProjectionCheckpointRow,
+    read_projection_checkpoint,
+)
 from tests.host.public_smoke_support import (
     deterministic_runner_spec,
     ensure_request,
@@ -54,6 +64,8 @@ _LANE_DEFAULT_TIMEOUT_SECONDS = 1.0
 _LANE_CLAIM_TTL_SECONDS = 0.4
 _LANE_HEARTBEAT_INTERVAL_SECONDS = 0.05
 _MISSING_OWNER_PID = 999_999
+_HOST_DB_FILENAME = "host.sqlite3"
+_ARTIFACT_ROOT_NAME = "artifacts"
 _STALE_HEARTBEAT_AT = "2000-01-01T00:00:00.000000Z"
 _RUNNING_INSTANCE_STATUS = "running"
 _MEMORY_CONSUMER_ID = "host.memory.session.v1"
@@ -648,7 +660,10 @@ def force_owner_pid_missing_and_heartbeat_stale(
     root_path: pathlib.Path,
     run_id: str,
 ) -> None:
-    """把当前 dispatch owner 改写为 pid missing + stale heartbeat。
+    """fault-injection-only：改写当前 dispatch owner 为 pid missing + stale heartbeat。
+
+    本 helper 是 tests/host recovery 故障注入 owner，不是 liveness 语义真源。
+    生产 liveness API 不应制造 pid missing / stale heartbeat 状态。
 
     :param root_path: 测试根目录。
     :param run_id: 目标 Run id。
@@ -656,7 +671,7 @@ def force_owner_pid_missing_and_heartbeat_stale(
     :raises AssertionError: 未找到当前 owner row 时抛出。
     """
 
-    with sqlite3.connect(root_path / "host.sqlite3") as connection:
+    with sqlite3.connect(root_path / _HOST_DB_FILENAME) as connection:
         cursor = connection.execute(
             """
             UPDATE host_instances
@@ -682,13 +697,17 @@ def force_owner_pid_missing_and_heartbeat_stale(
 
 
 def force_memory_projection_lag(root_path: pathlib.Path) -> None:
-    """制造 memory projection checkpoint lag。
+    """fault-injection-only：制造 memory projection checkpoint lag。
+
+    本 helper 是 tests/host recovery 故障注入 owner，不是 checkpoint 语义真源。
+    生产 checkpoint helper 只初始化或单调推进 checkpoint，不提供把既有
+    checkpoint 倒退并清空 ``checkpoint_event_id`` 的接口。
 
     :param root_path: 测试根目录。
     :returns: ``None``。
     """
 
-    with sqlite3.connect(root_path / "host.sqlite3") as connection:
+    with sqlite3.connect(root_path / _HOST_DB_FILENAME) as connection:
         connection.execute(
             """
             INSERT INTO host_projection_checkpoints (
@@ -710,14 +729,19 @@ def force_memory_projection_lag(root_path: pathlib.Path) -> None:
 
 
 def event_type_count(root_path: pathlib.Path, event_type: str) -> int:
-    """统计 EventLog 中指定事件类型数量。
+    """diagnostic-only：统计 EventLog 中指定事件类型的跨 Run 数量。
+
+    本 helper 只服务 recovery 测试同步与失败定位，是 point-in-time diagnostic，
+    不是 EventLog truth。生产 run-scoped event count helper 不是该跨 Run
+    聚合读取的精确等价物。
 
     :param root_path: 测试根目录。
     :param event_type: event_type。
     :returns: 事件数量。
+    :raises TypeError: SQLite COUNT 结果类型不符合预期时抛出。
     """
 
-    with sqlite3.connect(root_path / "host.sqlite3") as connection:
+    with sqlite3.connect(root_path / _HOST_DB_FILENAME) as connection:
         row = connection.execute(
             "SELECT COUNT(*) FROM event_log WHERE event_type = ?",
             (event_type,),
@@ -738,7 +762,7 @@ def attempt_count_for_run(root_path: pathlib.Path, run_id: str) -> int:
     :returns: Attempt 数。
     """
 
-    with sqlite3.connect(root_path / "host.sqlite3") as connection:
+    with sqlite3.connect(root_path / _HOST_DB_FILENAME) as connection:
         row = connection.execute(
             "SELECT COUNT(*) FROM host_attempts WHERE run_id = ?",
             (run_id,),
@@ -760,7 +784,7 @@ def current_attempt_id_for_run(root_path: pathlib.Path, run_id: str) -> str:
     :raises AssertionError: Run 不存在或 current_attempt_id 为空时抛出。
     """
 
-    with sqlite3.connect(root_path / "host.sqlite3") as connection:
+    with sqlite3.connect(root_path / _HOST_DB_FILENAME) as connection:
         row = connection.execute(
             "SELECT current_attempt_id FROM host_runs WHERE run_id = ?",
             (run_id,),
@@ -771,27 +795,26 @@ def current_attempt_id_for_run(root_path: pathlib.Path, run_id: str) -> str:
 
 
 def projection_checkpoint_sequence(root_path: pathlib.Path) -> int | None:
-    """读取 memory projection checkpoint sequence。
+    """通过 production owner helper 读取 memory projection checkpoint sequence。
 
     :param root_path: 测试根目录。
     :returns: checkpoint sequence；row 不存在时返回 ``None``。
+    :raises Exception: durable store 打开或 read transaction 失败时透传。
     """
 
-    with sqlite3.connect(root_path / "host.sqlite3") as connection:
-        row = connection.execute(
-            """
-            SELECT checkpoint_event_sequence
-            FROM host_projection_checkpoints
-            WHERE consumer_id = ?
-            """,
-            (_MEMORY_CONSUMER_ID,),
-        ).fetchone()
+    durable_options = HostDurableStoreOptions(
+        db_path=root_path / _HOST_DB_FILENAME,
+        payload_policy=PayloadStoragePolicy(artifact_root=root_path / _ARTIFACT_ROOT_NAME),
+        sqlite_policy=HostSQLiteStoragePolicy(),
+    )
+    row: ProjectionCheckpointRow | None = None
+    with open_host_durable_store(durable_options) as store:
+        row = store.transaction_runner.run_read(
+            lambda transaction: read_projection_checkpoint(transaction, _MEMORY_CONSUMER_ID)
+        )
     if row is None:
         return None
-    value = row[0]
-    if not isinstance(value, int):
-        raise TypeError("projection checkpoint sequence must be int")
-    return value
+    return row.checkpoint_event_sequence
 
 
 def assert_process_exited_successfully(process: Process) -> None:
