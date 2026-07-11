@@ -112,7 +112,7 @@ XBRL facts processor result contract 由 `dayu.fins.domain.xbrl_result_contract`
 
 - `FmpCompanyInfo(canonical_ticker, company_name, ticker_aliases)`：不可变解析结果，`ticker_aliases` 是 tuple，首项恒为 canonical ticker。
 - `FmpCompanyInfoResolver(api_key=..., http_client=..., timeout_seconds=...)`：显式接收 FMP API key 和 timeout，不读取环境变量。
-- `resolve_company_info(canonical_ticker)`：先用 `search-symbol` 定位公司名，再用 `search-name` 搜索严格同名证券，alias 去重后返回；HTTP、JSON、空结果、非法 payload 或第二跳失败都会收口为 `FmpCompanyInfoResolutionError`。
+- `resolve_company_info(canonical_ticker)`：先用 `search-symbol` 精确匹配 canonical ticker 后定位公司名，再用 `search-name` 搜索严格同名证券，alias 去重后返回；HTTP、JSON、空结果、无精确 ticker 命中、非法 payload 或第二跳失败都会收口为 `FmpCompanyInfoResolutionError`。
 
 resolver 只提供业务解析能力；调用方负责读取环境变量、配置超时、处理失败回退和决定是否把公司名投影给 LLM。
 

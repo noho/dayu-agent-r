@@ -15,10 +15,11 @@ import os
 import pickle
 import time
 from collections.abc import Callable, Mapping
+from functools import partial
 from multiprocessing.process import BaseProcess
 from queue import Empty, Queue
 from threading import Lock, Thread
-from typing import Protocol, TypeAlias, TypedDict, cast
+from typing import NotRequired, Protocol, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse
 
 import requests
@@ -30,6 +31,8 @@ from dayu.runtime.interruptible_process import (
     enter_new_process_session_if_supported,
     interrupt_multiprocessing_process,
 )
+
+from .web_fetch_orchestrator import _FetchUrlSafetyError
 
 MODULE = "ENGINE.WEB_PLAYWRIGHT"
 _LOGGER = logging.getLogger(__name__)
@@ -77,6 +80,7 @@ class _RouteRequestProtocol(Protocol):
     """Playwright Route.request 的最小协议。"""
 
     resource_type: str
+    url: str
 
 
 class _RouteProtocol(Protocol):
@@ -180,6 +184,7 @@ class _WorkerKwargs(TypedDict):
     headers: Mapping[str, str] | None
     playwright_channel: str | None
     playwright_storage_state_path: str
+    is_url_allowed: NotRequired[Callable[[str], bool] | None]
 
 
 class _PlaywrightWorkerProtocol(Protocol):
@@ -193,6 +198,7 @@ class _PlaywrightWorkerProtocol(Protocol):
         headers: Mapping[str, str] | None = None,
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
+        is_url_allowed: Callable[[str], bool] | None = None,
     ) -> WebPayload:
         """执行一次 Playwright 抓取。"""
         ...
@@ -411,6 +417,17 @@ def _playwright_process_entry(
             "kind": "result",
             "payload": worker_callable(**worker_kwargs),
         })
+    except _FetchUrlSafetyError as exc:
+        result_queue.put(
+            {
+                "kind": "error",
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+                "blocked_by_safety_policy": True,
+                "blocked_url": exc.url,
+                "blocked_stage": exc.reason,
+            }
+        )
     except BaseException as exc:
         result_queue.put(
             {
@@ -696,6 +713,11 @@ def _run_playwright_worker_process(
                 continue
 
         if payload.get("kind") == "error":
+            if payload.get("blocked_by_safety_policy") is True:
+                blocked_url = payload.get("blocked_url")
+                blocked_stage = payload.get("blocked_stage")
+                if isinstance(blocked_url, str) and isinstance(blocked_stage, str):
+                    raise _FetchUrlSafetyError(url=blocked_url, reason=blocked_stage)
             raise RuntimeError(
                 f"{payload.get('error_type')}: {payload.get('message')}"
             )
@@ -862,11 +884,39 @@ def _get_playwright_browser(
     return _PW_BROWSER
 
 
-def _route_handler_abort_resources(route: _RouteProtocol) -> None:
-    """中止图片、字体、媒体请求，放行其余资源。
+def _raise_if_playwright_url_blocked(
+    *, url: str, is_url_allowed: Callable[[str], bool] | None, reason: str
+) -> None:
+    """在 Playwright 导航/request 边界复用 Web URL 安全谓词。
+
+    Args:
+        url: 待校验 URL。
+        is_url_allowed: Web fetch owner 提供的安全谓词。
+        reason: 诊断用阶段标识。
+
+    Returns:
+        无。
+
+    Raises:
+        _FetchUrlSafetyError: URL 被安全策略拒绝时抛出。
+    """
+
+    if is_url_allowed is None:
+        return
+    if not is_url_allowed(url):
+        raise _FetchUrlSafetyError(url=url, reason=reason)
+
+
+def _route_handler_abort_resources(
+    route: _RouteProtocol,
+    *,
+    is_url_allowed: Callable[[str], bool] | None = None,
+) -> None:
+    """中止图片、字体、媒体请求，并拒绝不安全的浏览器 request。
 
     Args:
         route: Playwright Route 对象。
+        is_url_allowed: URL 安全谓词。
 
     Returns:
         无。
@@ -877,6 +927,8 @@ def _route_handler_abort_resources(route: _RouteProtocol) -> None:
 
     abort_resource_types = {"image", "font", "media"}
     if route.request.resource_type in abort_resource_types:
+        route.abort()
+    elif is_url_allowed is not None and not is_url_allowed(route.request.url):
         route.abort()
     else:
         route.continue_()
@@ -938,6 +990,7 @@ def _maybe_warmup_playwright_page(
     deadline_monotonic: float,
     build_domain_home_url: Callable[[str], str],
     normalize_url_for_http: Callable[[str], str],
+    is_url_allowed: Callable[[str], bool] | None = None,
     time_monotonic: Callable[[], float] = time.monotonic,
 ) -> None:
     """在浏览器回退前先做一次同域首页预热。
@@ -948,6 +1001,7 @@ def _maybe_warmup_playwright_page(
         deadline_monotonic: 本次浏览器抓取总预算 deadline。
         build_domain_home_url: 同域首页构造函数。
         normalize_url_for_http: URL 规范化函数。
+        is_url_allowed: URL 安全谓词。
         time_monotonic: 可注入的单调时钟函数。
 
     Returns:
@@ -965,6 +1019,14 @@ def _maybe_warmup_playwright_page(
 
     if home_url == normalized_url:
         return
+    try:
+        _raise_if_playwright_url_blocked(
+            url=home_url,
+            is_url_allowed=is_url_allowed,
+            reason="playwright_warmup",
+        )
+    except RuntimeError:
+        return
 
     remaining_timeout_ms = _get_remaining_playwright_timeout_ms(
         deadline_monotonic,
@@ -976,6 +1038,11 @@ def _maybe_warmup_playwright_page(
 
     try:
         page.goto(home_url, wait_until="domcontentloaded", timeout=warmup_timeout_ms)
+        _raise_if_playwright_url_blocked(
+            url=page.url,
+            is_url_allowed=is_url_allowed,
+            reason="playwright_warmup_response",
+        )
     except Exception:
         return
 
@@ -1039,6 +1106,7 @@ def _playwright_sync_worker(
     sanitize_response_headers: Callable[[Mapping[str, str]], dict[str, str]],
     build_text_excerpt: Callable[[str], str],
     convert_html_to_markdown: _HtmlConverterProtocol,
+    is_url_allowed: Callable[[str], bool] | None = None,
     time_monotonic: Callable[[], float] = time.monotonic,
 ) -> WebPayload:
     """在独立线程中执行完整的 Playwright 同步抓取流程。
@@ -1055,6 +1123,7 @@ def _playwright_sync_worker(
         sanitize_response_headers: 响应头裁剪函数。
         build_text_excerpt: 文本摘录构造函数。
         convert_html_to_markdown: HTML 四段式转换函数。
+        is_url_allowed: URL 安全谓词。
         time_monotonic: 可注入的单调时钟函数。
 
     Returns:
@@ -1107,15 +1176,24 @@ def _playwright_sync_worker(
         page = context.new_page()
         if has_stealth and stealth_class is not None:
             stealth_class().apply_stealth_sync(page)
-        page.route("**/*", _route_handler_abort_resources)
+        page.route(
+            "**/*",
+            partial(_route_handler_abort_resources, is_url_allowed=is_url_allowed),
+        )
 
         deadline_monotonic = time_monotonic() + max(float(timeout_seconds), 0.0)
+        _raise_if_playwright_url_blocked(
+            url=url,
+            is_url_allowed=is_url_allowed,
+            reason="playwright_goto",
+        )
         _maybe_warmup_playwright_page(
             page=page,
             url=url,
             deadline_monotonic=deadline_monotonic,
             build_domain_home_url=build_domain_home_url,
             normalize_url_for_http=normalize_url_for_http,
+            is_url_allowed=is_url_allowed,
             time_monotonic=time_monotonic,
         )
         try:
@@ -1132,6 +1210,11 @@ def _playwright_sync_worker(
 
         if response is None:
             raise RuntimeError("Playwright page.goto 未返回 response 对象。")
+        _raise_if_playwright_url_blocked(
+            url=page.url,
+            is_url_allowed=is_url_allowed,
+            reason="playwright_response",
+        )
 
         content_type_value = (response.headers.get("content-type") or "").lower()
         if "text/html" not in content_type_value and content_type_value:
@@ -1149,6 +1232,11 @@ def _playwright_sync_worker(
             page=page,
             deadline_monotonic=deadline_monotonic,
             time_monotonic=time_monotonic,
+        )
+        _raise_if_playwright_url_blocked(
+            url=page.url,
+            is_url_allowed=is_url_allowed,
+            reason="playwright_settled_page",
         )
         html = page.content()
         final_url = page.url
@@ -1188,6 +1276,7 @@ def _fetch_and_convert_with_playwright(
     deadline_monotonic: float | None = None,
     playwright_channel: str | None = None,
     playwright_storage_state_path: str = "",
+    is_url_allowed: Callable[[str], bool] | None = None,
     cancellation_token: CancellationToken | None = None,
     resolve_timeout_budget: _ResolveTimeoutBudgetProtocol,
     playwright_sync_worker: _PlaywrightWorkerProtocol,
@@ -1203,6 +1292,7 @@ def _fetch_and_convert_with_playwright(
         deadline_monotonic: 当前工具调用的单调时钟 deadline。
         playwright_channel: 浏览器回退使用的 Chromium channel。
         playwright_storage_state_path: 浏览器回退可选 storage state 文件路径。
+        is_url_allowed: URL 安全谓词。
         resolve_timeout_budget: timeout 预算解析函数。
         playwright_sync_worker: 同步 worker 函数。
         detect_bot_challenge: challenge 检测函数。
@@ -1211,7 +1301,7 @@ def _fetch_and_convert_with_playwright(
         成功时返回 `ok=True` 结果；失败时返回标准化失败字典。
 
     Raises:
-        无。
+        _FetchUrlSafetyError: Playwright 导航或最终页面 URL 被安全策略拒绝时抛出。
     """
 
     try:
@@ -1251,6 +1341,7 @@ def _fetch_and_convert_with_playwright(
                     "headers": headers,
                     "playwright_channel": playwright_channel,
                     "playwright_storage_state_path": playwright_storage_state_path,
+                    "is_url_allowed": is_url_allowed,
                 },
                 total_timeout=total_timeout,
                 cancellation_token=cancellation_token,
@@ -1272,6 +1363,8 @@ def _fetch_and_convert_with_playwright(
             "reason": "playwright_timeout",
         }
     except CancelledError:
+        raise
+    except _FetchUrlSafetyError:
         raise
     except Exception as exc:
         Log.debug(f"Playwright 浏览器回退失败: {exc}", module=MODULE)

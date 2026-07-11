@@ -700,6 +700,40 @@ def test_list_and_search_return_paths_can_chain_to_read_tools(
     assert isinstance(read_section_from_search_outcome, ToolCompletedOutcome)
 
 
+def test_search_files_does_not_read_symlink_escape(
+    tmp_path: Path,
+) -> None:
+    """allowed root 内 symlink 指向 root 外时 search_files 不得读取目标内容。"""
+
+    allowed_root = tmp_path / "allowed"
+    outside_root = tmp_path / "outside"
+    allowed_root.mkdir()
+    outside_root.mkdir()
+    outside_file = outside_root / "secret.txt"
+    outside_file.write_text("revenue outside root", encoding="utf-8")
+    symlink_path = allowed_root / "linked-secret.txt"
+    symlink_path.symlink_to(outside_file)
+    definitions = _definitions_by_name(_discover_definitions(allowed_root))
+
+    search_outcome = asyncio.run(
+        definitions["search_files"].callable(
+            _call(
+                "search_files",
+                {
+                    "directory": str(allowed_root),
+                    "query": "revenue",
+                },
+            ),
+            _context(),
+        )
+    )
+
+    assert isinstance(search_outcome, ToolCompletedOutcome)
+    value = cast(Mapping[str, JsonValue], search_outcome.result.value)
+    assert value["matches"] == []
+    assert value["total_matches"] == 0
+
+
 def test_search_files_cancelled_during_iteration_stops_before_later_scan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

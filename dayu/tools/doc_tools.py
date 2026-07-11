@@ -1015,6 +1015,7 @@ def _execute_doc_business_value(
         raw_value = _route_doc_business(
             tool_name=tool_name,
             arguments=path_projection,
+            allowed_roots=allowed_roots,
             limits=limits,
             cancellation_token=cancellation_token,
         )
@@ -1059,6 +1060,7 @@ def _route_doc_business(
     *,
     tool_name: str,
     arguments: Mapping[str, JsonValue],
+    allowed_roots: tuple[Path, ...],
     limits: DocToolLimits,
     cancellation_token: CancellationToken,
 ) -> JsonValue:
@@ -1067,6 +1069,7 @@ def _route_doc_business(
     Args:
         tool_name: 工具名。
         arguments: 已通过 schema 与路径白名单校验的参数。
+        allowed_roots: 已重新解析的允许访问根路径。
         limits: Doc 工具限制配置。
         cancellation_token: 当前执行边界使用的取消观察 token。
 
@@ -1103,6 +1106,7 @@ def _route_doc_business(
             include_types=_optional_string_list(arguments, "include_types"),
             limit=_required_int(arguments, "limit"),
             max_results=limits.search_files_max_results,
+            allowed_roots=allowed_roots,
             cancellation_token=cancellation_token,
         )
     if tool_name == READ_FILE_TOOL_NAME:
@@ -1449,6 +1453,7 @@ def _search_files_business(
     include_types: list[str] | None,
     limit: int,
     max_results: int,
+    allowed_roots: tuple[Path, ...],
     cancellation_token: CancellationToken,
 ) -> JsonValue:
     """在目录中搜索包含关键词的文件。
@@ -1459,6 +1464,7 @@ def _search_files_business(
         include_types: 可选文件扩展名过滤。
         limit: 最大返回数量。
         max_results: 配置硬上限。
+        allowed_roots: 已重新解析的允许访问根路径。
         cancellation_token: Host 注入的取消观察令牌。
 
     Returns:
@@ -1480,11 +1486,17 @@ def _search_files_business(
         _raise_if_doc_cancelled(cancellation_token)
         if not file_path.is_file():
             continue
-        if include_types and file_path.suffix.lstrip(".") not in include_types:
+        resolved_file = _resolve_search_files_candidate(
+            file_path=file_path,
+            allowed_roots=allowed_roots,
+        )
+        if resolved_file is None:
+            continue
+        if include_types and resolved_file.suffix.lstrip(".") not in include_types:
             continue
 
         relative_path = str(file_path.relative_to(dir_path))
-        processor = _try_create_processor(file_path)
+        processor = _try_create_processor(resolved_file)
         if processor is not None:
             _raise_if_doc_cancelled(cancellation_token)
             matches.extend(_search_via_processor(processor, relative_path, query, cancellation_token))
@@ -1495,7 +1507,7 @@ def _search_files_business(
         _raise_if_doc_cancelled(cancellation_token)
         matches.extend(
             _search_via_line_scan(
-                file_path,
+                resolved_file,
                 relative_path,
                 query,
                 actual_limit - len(matches),
@@ -1513,6 +1525,33 @@ def _search_files_business(
         "matches": matches,
         "total_matches": len(matches),
     }
+
+
+def _resolve_search_files_candidate(
+    *, file_path: Path, allowed_roots: tuple[Path, ...]
+) -> Path | None:
+    """解析 search_files 候选文件并重新校验真实路径 containment。
+
+    Args:
+        file_path: ``rglob`` 得到的候选路径。
+        allowed_roots: 允许访问根路径。
+
+    Returns:
+        真实路径仍在允许根内时返回解析后的路径；否则返回 ``None``。
+
+    Raises:
+        无。
+    """
+
+    try:
+        resolved_file = file_path.resolve(strict=True)
+    except OSError:
+        return None
+    if not any(_is_relative_to(resolved_file, root) for root in allowed_roots):
+        return None
+    if not resolved_file.is_file():
+        return None
+    return resolved_file
 
 
 def _read_file_business(

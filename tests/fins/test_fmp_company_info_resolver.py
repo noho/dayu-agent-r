@@ -114,8 +114,8 @@ def test_resolve_company_info_uses_two_hop_same_name_aliases() -> None:
     assert "query=Visa%20Inc." in client.calls[1][0]
 
 
-def test_resolve_company_info_falls_back_to_first_symbol_when_exact_missing() -> None:
-    """search-symbol 无精确 ticker 时应沿用 OLD 行为回退第一条结果。"""
+def test_resolve_company_info_requires_exact_symbol_match() -> None:
+    """search-symbol 无精确 ticker 时不得把第一条模糊结果注入公司身份。"""
 
     client = _FakeFmpHttpClient(
         (
@@ -123,20 +123,18 @@ def test_resolve_company_info_falls_back_to_first_symbol_when_exact_missing() ->
                 url_part="search-symbol",
                 body=json.dumps([{"symbol": "V.BA", "name": "Visa Inc."}]),
             ),
-            _FakeResponse(
-                url_part="search-name",
-                body=json.dumps([{"symbol": "V.BA", "name": "Visa Inc."}]),
-            ),
         )
     )
-
-    result = FmpCompanyInfoResolver(
+    resolver = FmpCompanyInfoResolver(
         api_key="test-key",
         http_client=client,
-    ).resolve_company_info("V")
+    )
 
-    assert result.company_name == "Visa Inc."
-    assert result.ticker_aliases == ("V", "V.BA")
+    with pytest.raises(FmpCompanyInfoResolutionError, match="精确 ticker"):
+        resolver.resolve_company_info("V")
+
+    assert len(client.calls) == 1
+    assert "search-symbol" in client.calls[0][0]
 
 
 def test_resolve_company_info_rejects_empty_symbol_results() -> None:

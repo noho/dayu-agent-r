@@ -29,9 +29,11 @@ import re
 import socket
 import ssl
 import time
+from collections.abc import Callable
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from typing import Final, NoReturn, Optional, TypeAlias, TypedDict, cast
 from urllib.parse import quote, urlparse
 
@@ -222,6 +224,7 @@ class _PlaywrightFallbackKwargs(TypedDict, total=False):
     deadline_monotonic: float | None
     playwright_channel: str | None
     playwright_storage_state_path: str
+    is_url_allowed: Callable[[str], bool]
     cancellation_token: CancellationToken
 
 
@@ -233,6 +236,7 @@ class _StageFetchKwargs(TypedDict, total=False):
     headers: dict[str, str]
     timeout_budget: float | None
     deadline_monotonic: float | None
+    is_url_allowed: Callable[[str], bool]
     cancellation_token: CancellationToken
 
 
@@ -245,6 +249,7 @@ class _FetchConvertKwargs(TypedDict, total=False):
     content_type_probe: ContentProbePayload
     timeout_budget: float | None
     deadline_monotonic: float | None
+    is_url_allowed: Callable[[str], bool]
     cancellation_token: CancellationToken
 
 
@@ -561,7 +566,9 @@ class _WebProcessTargetFactory:
         )
 
 
+_FetchBodyLimitExceeded = _web_fetch_orchestrator._FetchBodyLimitExceeded
 _FetchContentConversionError = _web_fetch_orchestrator._FetchContentConversionError
+_FetchUrlSafetyError = _web_fetch_orchestrator._FetchUrlSafetyError
 
 
 def _load_storage_state_cookies(storage_state_path: str) -> list[WebMapping]:
@@ -725,6 +732,24 @@ def _is_timeout_like_exception(error: BaseException) -> bool:
     return _is_timeout_like_request_exception(error)
 
 
+def _build_fetch_url_safety_predicate(
+    *, allow_private_network_url: bool
+) -> Callable[[str], bool]:
+    """构造 fetch 全网络阶段复用的 URL 安全谓词。
+
+    Args:
+        allow_private_network_url: 是否允许访问私网 URL。
+
+    Returns:
+        接收 URL 并返回是否允许访问的谓词。
+
+    Raises:
+        无。
+    """
+
+    return partial(_is_safe_public_url, allow_private_network_url=allow_private_network_url)
+
+
 def _raise_fetch_cancelled() -> NoReturn:
     """将工具取消投影为 Web 模块内取消信号。
 
@@ -860,6 +885,7 @@ def _try_playwright_fallback(
     deadline_monotonic: float | None,
     playwright_channel: str | None = None,
     playwright_storage_state_path: str = "",
+    is_url_allowed: Callable[[str], bool] | None = None,
     cancellation_token: CancellationToken | None = None,
 ) -> WebPayload | None:
     """尝试使用 Playwright 浏览器回退抓取页面。
@@ -872,6 +898,7 @@ def _try_playwright_fallback(
         deadline_monotonic: 当前工具调用 deadline。
         playwright_channel: 浏览器回退使用的 Chromium channel。
         playwright_storage_state_path: 浏览器回退可选 storage state 文件路径。
+        is_url_allowed: URL 安全谓词。
         cancellation_token: 当前工具调用取消令牌。
 
     Returns:
@@ -879,6 +906,7 @@ def _try_playwright_fallback(
 
     Raises:
         WebToolCancelledError: Playwright 执行期间 Host 取消时抛出。
+        _FetchUrlSafetyError: Playwright URL 被安全策略拒绝时抛出。
     """
 
     _raise_if_host_cancelled(cancellation_token)
@@ -891,6 +919,7 @@ def _try_playwright_fallback(
             deadline_monotonic=deadline_monotonic,
             playwright_channel=playwright_channel,
             playwright_storage_state_path=playwright_storage_state_path,
+            is_url_allowed=is_url_allowed,
             cancellation_token=cancellation_token,
         )
     except _web_playwright_backend.CancelledError:
@@ -1030,6 +1059,7 @@ def _warmup_domain(
     headers: dict[str, str],
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
+    is_url_allowed: Callable[[str], bool] | None = None,
     cancellation_token: CancellationToken | None = None,
 ) -> StagePayload:
     """对目标域做一次预热请求以建立 Cookie。"""
@@ -1041,7 +1071,9 @@ def _warmup_domain(
         headers=headers,
         resolve_timeout_budget=_resolve_timeout_budget,
         build_domain_home_url=_build_domain_home_url,
+        normalize_url_for_http=_normalize_url_for_http,
         is_timeout_like_exception=_is_timeout_like_exception,
+        is_url_allowed=is_url_allowed,
         timeout_budget=timeout_budget,
         deadline_monotonic=deadline_monotonic,
         cancellation_token=cancellation_token,
@@ -1056,6 +1088,7 @@ def _probe_content_type(
     headers: dict[str, str],
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
+    is_url_allowed: Callable[[str], bool] | None = None,
     cancellation_token: CancellationToken | None = None,
 ) -> ContentProbePayload:
     """探测目标资源类型（HEAD 优先，失败降级到 GET）。"""
@@ -1066,7 +1099,9 @@ def _probe_content_type(
         timeout_seconds=timeout_seconds,
         headers=headers,
         resolve_timeout_budget=_resolve_timeout_budget,
+        normalize_url_for_http=_normalize_url_for_http,
         is_timeout_like_exception=_is_timeout_like_exception,
+        is_url_allowed=is_url_allowed,
         timeout_budget=timeout_budget,
         deadline_monotonic=deadline_monotonic,
         cancellation_token=cancellation_token,
@@ -1822,6 +1857,9 @@ def _fetch_web_page_business(
         )
 
     normalized_url = _normalize_url_for_http(url)
+    is_url_allowed = _build_fetch_url_safety_predicate(
+        allow_private_network_url=allow_private_network_url,
+    )
     deadline_monotonic = _compute_deadline_monotonic(timeout_budget)
     playwright_storage_state_path = _resolve_playwright_storage_state_path(
         url=normalized_url,
@@ -1848,6 +1886,7 @@ def _fetch_web_page_business(
         "deadline_monotonic": deadline_monotonic,
         "playwright_channel": playwright_channel,
         "playwright_storage_state_path": playwright_storage_state_path,
+        "is_url_allowed": is_url_allowed,
     }
     if cancellation_token is not None:
         playwright_fallback_kwargs["cancellation_token"] = cancellation_token
@@ -1859,6 +1898,7 @@ def _fetch_web_page_business(
             "headers": headers,
             "timeout_budget": timeout_budget,
             "deadline_monotonic": deadline_monotonic,
+            "is_url_allowed": is_url_allowed,
         }
         if cancellation_token is not None:
             warmup_kwargs["cancellation_token"] = cancellation_token
@@ -1877,6 +1917,7 @@ def _fetch_web_page_business(
             "headers": headers,
             "timeout_budget": timeout_budget,
             "deadline_monotonic": deadline_monotonic,
+            "is_url_allowed": is_url_allowed,
         }
         if cancellation_token is not None:
             probe_kwargs["cancellation_token"] = cancellation_token
@@ -1896,6 +1937,7 @@ def _fetch_web_page_business(
             "content_type_probe": content_type_probe,
             "timeout_budget": timeout_budget,
             "deadline_monotonic": deadline_monotonic,
+            "is_url_allowed": is_url_allowed,
         }
         if cancellation_token is not None:
             fetch_kwargs["cancellation_token"] = cancellation_token
@@ -2036,6 +2078,37 @@ def _fetch_web_page_business(
                 "response_excerpt": _extract_response_snippet(response),
             },
         )
+    except _FetchUrlSafetyError as exc:
+        _raise_fetch_failure(
+            url=url,
+            error_code="permission_denied",
+            message=f"URL is blocked by fetch safety policy: {exc.url}",
+            hint=build_hint(REASON_BLOCKED_BY_SITE_POLICY),
+            next_action=NEXT_ACTION_CHANGE_SOURCE,
+            internal_diagnostics={
+                "blocked_by_safety_policy": True,
+                "blocked_url": exc.url,
+                "blocked_stage": exc.reason,
+                "input_url": url,
+            },
+        )
+    except _FetchBodyLimitExceeded as exc:
+        _raise_fetch_failure(
+            url=url,
+            error_code="response_body_too_large",
+            message="Response body exceeded fetch size limit before conversion.",
+            http_status=exc.response_context.http_status,
+            hint=build_hint(REASON_CONTENT_CONVERSION_FAILED),
+            next_action=NEXT_ACTION_CHANGE_SOURCE,
+            internal_diagnostics={
+                "final_url": exc.final_url or exc.response_context.final_url or url,
+                "limit_kind": exc.limit_kind,
+                "limit_bytes": exc.limit_bytes,
+                "observed_bytes": exc.observed_bytes,
+                "response_headers": _sanitize_plain_response_headers(exc.response_context.response_headers),
+                "response_excerpt": exc.response_context.response_excerpt,
+            },
+        )
     except RuntimeError as exc:
         if cancellation_token.is_cancelled():
             _raise_fetch_cancelled()
@@ -2049,6 +2122,23 @@ def _fetch_web_page_business(
             conversion_failure_reason = exc.failure_reason
             if isinstance(exc.original_error, HtmlPipelineStageError):
                 pipeline_error = exc.original_error
+            if isinstance(exc.original_error, _FetchUrlSafetyError):
+                _raise_fetch_failure(
+                    url=url,
+                    error_code="permission_denied",
+                    message=f"URL is blocked by fetch safety policy: {exc.original_error.url}",
+                    http_status=challenge_context.http_status,
+                    hint=build_hint(REASON_BLOCKED_BY_SITE_POLICY),
+                    next_action=NEXT_ACTION_CHANGE_SOURCE,
+                    internal_diagnostics={
+                        "blocked_by_safety_policy": True,
+                        "blocked_url": exc.original_error.url,
+                        "blocked_stage": exc.original_error.reason,
+                        "final_url": challenge_context.final_url or url,
+                        "response_headers": _sanitize_plain_response_headers(challenge_context.response_headers),
+                        "response_excerpt": challenge_context.response_excerpt,
+                    },
+                )
         elif isinstance(exc, HtmlPipelineStageError):
             pipeline_error = exc
 
@@ -2264,6 +2354,7 @@ def _fetch_and_convert_content(
     session: Optional[requests.Session] = None,
     headers: Mapping[str, str] | None = None,
     content_type_probe: ContentProbePayload | None = None,
+    is_url_allowed: Callable[[str], bool] | None = None,
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
     cancellation_token: CancellationToken | None = None,
@@ -2284,6 +2375,7 @@ def _fetch_and_convert_content(
             get_web_session=_get_web_session,
             headers=dict(headers) if headers is not None else None,
             build_fetch_headers=_build_fetch_headers,
+            is_url_allowed=is_url_allowed,
             content_type_probe=content_type_probe,
             timeout_budget=timeout_budget,
             deadline_monotonic=deadline_monotonic,
@@ -2515,6 +2607,7 @@ def _playwright_sync_worker(
     headers: Mapping[str, str] | None = None,
     playwright_channel: str | None = None,
     playwright_storage_state_path: str = "",
+    is_url_allowed: Callable[[str], bool] | None = None,
 ) -> WebPayload:
     """在独立线程中执行完整的 Playwright 同步抓取流程。
 
@@ -2529,6 +2622,7 @@ def _playwright_sync_worker(
         headers: 可选额外请求头（当前仍以浏览器默认导航画像为准，不直接覆写 Context headers）。
         playwright_channel: 浏览器回退使用的 Chromium channel。
         playwright_storage_state_path: 浏览器回退可选 storage state 文件路径。
+        is_url_allowed: URL 安全谓词。
 
     Returns:
         成功时返回含 ``ok=True`` 的结果字典；失败时抛出异常由调用方处理。
@@ -2544,6 +2638,7 @@ def _playwright_sync_worker(
         playwright_channel=playwright_channel,
         playwright_storage_state_path=playwright_storage_state_path,
         get_playwright_browser=_get_playwright_browser,
+        is_url_allowed=is_url_allowed,
         build_domain_home_url=_build_domain_home_url,
         normalize_url_for_http=_normalize_url_for_http,
         sanitize_response_headers=_sanitize_plain_response_headers,
@@ -2565,6 +2660,7 @@ def _fetch_and_convert_with_playwright(
     deadline_monotonic: float | None = None,
     playwright_channel: str | None = None,
     playwright_storage_state_path: str = "",
+    is_url_allowed: Callable[[str], bool] | None = None,
     cancellation_token: CancellationToken | None = None,
 ) -> WebPayload:
     """使用 Playwright 执行浏览器抓取并转换为 Markdown。
@@ -2580,6 +2676,7 @@ def _fetch_and_convert_with_playwright(
         deadline_monotonic: 当前工具调用的单调时钟 deadline。
         playwright_channel: 浏览器回退使用的 Chromium channel。
         playwright_storage_state_path: 浏览器回退可选 storage state 文件路径。
+        is_url_allowed: URL 安全谓词。
         cancellation_token: 当前工具调用的取消令牌。
 
     Returns:
@@ -2587,7 +2684,7 @@ def _fetch_and_convert_with_playwright(
         失败时：``{ok: False, availability, reason}`` 或超时字典。
 
     Raises:
-        无（所有异常在函数内捕获并转换为失败字典）。
+        _FetchUrlSafetyError: Playwright URL 被安全策略拒绝时抛出。
     """
 
     return _web_playwright_backend._fetch_and_convert_with_playwright(
@@ -2598,6 +2695,7 @@ def _fetch_and_convert_with_playwright(
         deadline_monotonic=deadline_monotonic,
         playwright_channel=playwright_channel,
         playwright_storage_state_path=playwright_storage_state_path,
+        is_url_allowed=is_url_allowed,
         cancellation_token=cancellation_token,
         resolve_timeout_budget=_resolve_timeout_budget,
         playwright_sync_worker=_playwright_sync_worker,

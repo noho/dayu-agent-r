@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+from io import BytesIO
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -22,6 +23,8 @@ from pathlib import Path
 from typing import ParamSpec, TypeVar, cast
 
 import pytest
+import requests
+from urllib3.response import HTTPResponse
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
@@ -66,6 +69,7 @@ from dayu.runtime.tools_discovery import (
 )
 from dayu.tools.web import discover_tools
 from dayu.tools.web import web_playwright_backend
+from dayu.tools.web import web_fetch_orchestrator
 from dayu.tools.web import web_tool_projection_text
 from dayu.tools.web import web_search_providers
 from dayu.tools.web import web_tools
@@ -95,6 +99,82 @@ _FORBIDDEN_IMPORTS = (
     "dayu.web",
     "dayu.tools." + "_legacy" + "_adapter",
 )
+
+
+def _raw_response(
+    *,
+    url: str,
+    status_code: int,
+    body: bytes,
+    headers: Mapping[str, str] | None = None,
+) -> requests.Response:
+    """构造带 raw stream 的 requests 响应。
+
+    :param url: 响应 URL。
+    :param status_code: HTTP 状态码。
+    :param body: wire body 字节。
+    :param headers: 响应头。
+    :returns: 可被 Web fetch owner 消费的响应对象。
+    """
+
+    response = requests.Response()
+    response.status_code = status_code
+    response.url = url
+    response.headers.update(dict(headers or {}))
+    response.raw = HTTPResponse(
+        body=BytesIO(body),
+        headers=dict(headers or {}),
+        preload_content=False,
+    )
+    return response
+
+
+class _QueuedSession:
+    """按调用顺序返回预设 response 的测试 Session。"""
+
+    calls: list[tuple[str, str, bool]]
+    _responses: list[requests.Response]
+
+    def __init__(self, responses: list[requests.Response]) -> None:
+        """初始化测试 Session。
+
+        :param responses: 待返回响应列表。
+        :returns: ``None``。
+        """
+
+        self.calls = []
+        self._responses = responses
+
+    def request(
+        self,
+        method: str | bytes,
+        url: str | bytes,
+        **kwargs: bool | float | Mapping[str, str] | None,
+    ) -> requests.Response:
+        """返回下一条预设响应。
+
+        :param method: HTTP 方法。
+        :param url: 请求 URL。
+        :param kwargs: requests 参数。
+        :returns: 下一条响应。
+        :raises AssertionError: 预设响应耗尽时抛出。
+        """
+
+        stream = kwargs.get("stream")
+        self.calls.append((str(method), str(url), stream is True))
+        if not self._responses:
+            raise AssertionError(f"unexpected request: {method} {url}")
+        return self._responses.pop(0)
+
+
+def _safe_public_test_url(url: str) -> bool:
+    """使用生产谓词校验测试 URL。
+
+    :param url: 待校验 URL。
+    :returns: 允许访问返回 ``True``。
+    """
+
+    return web_tools._is_safe_public_url(url, allow_private_network_url=False)
 
 
 class _OpenCancellationToken:
@@ -364,6 +444,7 @@ class _SyntheticNestedPlaywrightWorker:
         headers: Mapping[str, str] | None = None,
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
+        is_url_allowed: Callable[[str], bool] | None = None,
     ) -> web_playwright_backend.WebPayload:
         """启动长生命周期 nested child 后保持 worker 存活。
 
@@ -376,7 +457,7 @@ class _SyntheticNestedPlaywrightWorker:
         :raises RuntimeError: PID 文件路径为空时抛出。
         """
 
-        del url, timeout_seconds, headers, playwright_channel
+        del url, timeout_seconds, headers, playwright_channel, is_url_allowed
         if not playwright_storage_state_path:
             raise RuntimeError("synthetic nested child pid path is required")
         child = subprocess.Popen(
@@ -407,6 +488,7 @@ class _LiveBrowserLongRunningWorker:
         headers: Mapping[str, str] | None = None,
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
+        is_url_allowed: Callable[[str], bool] | None = None,
     ) -> web_playwright_backend.WebPayload:
         """启动真实浏览器并保持 worker 存活。
 
@@ -419,7 +501,7 @@ class _LiveBrowserLongRunningWorker:
         :raises RuntimeError: ready marker 路径为空时抛出。
         """
 
-        del timeout_seconds, headers, playwright_channel
+        del timeout_seconds, headers, playwright_channel, is_url_allowed
         if not playwright_storage_state_path:
             raise RuntimeError("live browser ready marker path is required")
         from playwright.sync_api import sync_playwright
@@ -435,6 +517,42 @@ class _LiveBrowserLongRunningWorker:
         browser.close()
         playwright.stop()
         return {"ok": True, "content": "unexpected live browser result"}
+
+
+@dataclass(frozen=True, slots=True)
+class _BlockedPlaywrightWorker:
+    """测试用可 pickle Playwright worker，模拟 URL safety 拒绝。"""
+
+    blocked_url: str
+    blocked_stage: str
+
+    def __call__(
+        self,
+        *,
+        url: str,
+        timeout_seconds: float,
+        headers: Mapping[str, str] | None = None,
+        playwright_channel: str | None = None,
+        playwright_storage_state_path: str = "",
+        is_url_allowed: Callable[[str], bool] | None = None,
+    ) -> web_playwright_backend.WebPayload:
+        """抛出 Web fetch owner 的 URL safety 异常。
+
+        :param url: 测试 URL。
+        :param timeout_seconds: worker 总预算。
+        :param headers: 可选请求头。
+        :param playwright_channel: 可选浏览器 channel。
+        :param playwright_storage_state_path: storage state 路径。
+        :param is_url_allowed: URL 安全谓词。
+        :returns: 不返回。
+        :raises web_fetch_orchestrator._FetchUrlSafetyError: 始终抛出。
+        """
+
+        del url, timeout_seconds, headers, playwright_channel, playwright_storage_state_path, is_url_allowed
+        raise web_fetch_orchestrator._FetchUrlSafetyError(
+            url=self.blocked_url,
+            reason=self.blocked_stage,
+        )
 
 
 def test_web_provider_discovers_search_and_fetch() -> None:
@@ -1466,6 +1584,333 @@ def test_fetch_private_url_can_be_allowed_with_explicit_config(
     assert "ok" not in value
 
 
+def test_fetch_redirect_to_private_url_fails_closed() -> None:
+    """HTTP redirect 每一跳都必须复用 private-network safety owner。"""
+
+    session = _QueuedSession(
+        [
+            _raw_response(
+                url="https://example.com/report",
+                status_code=302,
+                body=b"",
+                headers={"Location": "http://127.0.0.1/internal"},
+            )
+        ]
+    )
+
+    with pytest.raises(web_fetch_orchestrator._FetchUrlSafetyError) as exc_info:
+        web_fetch_orchestrator._fetch_and_convert_content(
+            "https://example.com/report",
+            timeout_seconds=1.0,
+            resolve_timeout_budget=lambda timeout_seconds, **kwargs: timeout_seconds,
+            normalize_url_for_http=web_tools._normalize_url_for_http,
+            build_referer=web_tools._build_referer,
+            convert_html=lambda **kwargs: pytest.fail("conversion must not run"),
+            convert_non_html=lambda raw_bytes, stream_name: ("", "", ""),
+            session=cast(requests.Session, session),
+            headers={},
+            is_url_allowed=_safe_public_test_url,
+        )
+
+    assert exc_info.value.url == "http://127.0.0.1/internal"
+    assert session.calls == [("GET", "https://example.com/report", True)]
+
+
+def test_fetch_meta_refresh_to_private_url_fails_closed() -> None:
+    """HTML meta refresh 目标必须在继续抓取前复用同一 URL safety owner。"""
+
+    html = (
+        b'<html><head><meta http-equiv="refresh" '
+        b'content="0;url=http://127.0.0.1/internal"></head></html>'
+    )
+    session = _QueuedSession(
+        [
+            _raw_response(
+                url="https://example.com/report",
+                status_code=200,
+                body=html,
+                headers={"Content-Type": "text/html; charset=utf-8"},
+            )
+        ]
+    )
+
+    with pytest.raises(web_fetch_orchestrator._FetchContentConversionError) as exc_info:
+        web_fetch_orchestrator._fetch_and_convert_content(
+            "https://example.com/report",
+            timeout_seconds=1.0,
+            resolve_timeout_budget=lambda timeout_seconds, **kwargs: timeout_seconds,
+            normalize_url_for_http=web_tools._normalize_url_for_http,
+            build_referer=web_tools._build_referer,
+            convert_html=lambda **kwargs: pytest.fail("conversion must not run"),
+            convert_non_html=lambda raw_bytes, stream_name: ("", "", ""),
+            session=cast(requests.Session, session),
+            headers={},
+            is_url_allowed=_safe_public_test_url,
+        )
+
+    assert isinstance(exc_info.value.original_error, web_fetch_orchestrator._FetchUrlSafetyError)
+    assert session.calls == [("GET", "https://example.com/report", True)]
+
+
+def test_fetch_meta_refresh_treats_redirect_hop_as_visited() -> None:
+    """meta refresh 防环必须消费 HTTP redirect 已访问 URL 记录。"""
+
+    html = (
+        b'<html><head><meta http-equiv="refresh" '
+        b'content="0;url=https://example.com/redirected"></head></html>'
+    )
+    session = _QueuedSession(
+        [
+            _raw_response(
+                url="https://example.com/report",
+                status_code=302,
+                body=b"",
+                headers={"Location": "https://example.com/redirected"},
+            ),
+            _raw_response(
+                url="https://example.com/redirected",
+                status_code=200,
+                body=html,
+                headers={"Content-Type": "text/html; charset=utf-8"},
+            ),
+        ]
+    )
+
+    with pytest.raises(web_fetch_orchestrator._FetchContentConversionError) as exc_info:
+        web_fetch_orchestrator._fetch_and_convert_content(
+            "https://example.com/report",
+            timeout_seconds=1.0,
+            resolve_timeout_budget=lambda timeout_seconds, **kwargs: timeout_seconds,
+            normalize_url_for_http=web_tools._normalize_url_for_http,
+            build_referer=web_tools._build_referer,
+            convert_html=lambda **kwargs: pytest.fail("conversion must not run"),
+            convert_non_html=lambda raw_bytes, stream_name: ("", "", ""),
+            session=cast(requests.Session, session),
+            headers={},
+            is_url_allowed=_safe_public_test_url,
+        )
+
+    assert exc_info.value.failure_reason == "meta_refresh_requires_browser"
+    assert session.calls == [
+        ("GET", "https://example.com/report", True),
+        ("GET", "https://example.com/redirected", True),
+    ]
+
+
+def test_fetch_body_limit_maps_to_structured_tool_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """body 超限必须投影为结构化 fetch_web_page 失败。"""
+
+    session = _QueuedSession(
+        [
+            _raw_response(
+                url="https://example.com/",
+                status_code=200,
+                body=b"home",
+                headers={"Content-Type": "text/html"},
+            ),
+            _raw_response(
+                url="https://example.com/report",
+                status_code=200,
+                body=b"head",
+                headers={"Content-Type": "text/html"},
+            ),
+            _raw_response(
+                url="https://example.com/report",
+                status_code=200,
+                body=b"0123456789",
+                headers={"Content-Type": "text/html"},
+            ),
+        ]
+    )
+    monkeypatch.setattr(web_tools, "_get_web_session", lambda: cast(requests.Session, session))
+    monkeypatch.setattr(web_fetch_orchestrator, "_FETCH_MAX_WIRE_BODY_BYTES", 4)
+    monkeypatch.setattr(web_fetch_orchestrator, "_FETCH_MAX_DECOMPRESSED_BODY_BYTES", 4)
+    definition = _definitions_by_name(_discover_definitions({}))["fetch_web_page"]
+
+    outcome = asyncio.run(
+        definition.callable(
+            _call("fetch_web_page", {"url": "https://example.com/report"}),
+            _context(timeout_seconds=None),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "response_body_too_large"
+    assert "size limit" in outcome.result.message
+    assert outcome.result.meta is not None
+
+
+def test_fetch_body_limit_context_does_not_decode_unbounded_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """body limit 异常上下文不得调用会读取剩余 raw body 的解码 helper。"""
+
+    response = _raw_response(
+        url="https://example.com/report",
+        status_code=200,
+        body=b"0123456789",
+        headers={"Content-Type": "text/html"},
+    )
+    decode_calls: list[str] = []
+
+    def fake_decode_response_text(decoded_response: requests.Response) -> str:
+        """记录非预期响应解码调用。
+
+        :param decoded_response: 当前响应对象。
+        :returns: 空字符串。
+        """
+
+        decode_calls.append(str(decoded_response.url))
+        return ""
+
+    monkeypatch.setattr(web_fetch_orchestrator, "_FETCH_MAX_WIRE_BODY_BYTES", 4)
+    monkeypatch.setattr(web_fetch_orchestrator, "_decode_response_text", fake_decode_response_text)
+
+    with pytest.raises(web_fetch_orchestrator._FetchBodyLimitExceeded):
+        web_fetch_orchestrator._read_limited_response_body(response)
+
+    assert decode_calls == []
+
+
+def test_playwright_route_blocks_private_request_before_continue() -> None:
+    """Playwright request 目标必须在 continue 前复用 URL safety owner。"""
+
+    class FakeRequest:
+        """测试用 Playwright request。"""
+
+        resource_type: str = "document"
+        url: str = "http://127.0.0.1/internal"
+
+    class FakeRoute:
+        """测试用 Playwright route。"""
+
+        request: web_playwright_backend._RouteRequestProtocol = FakeRequest()
+        aborted: bool = False
+        continued: bool = False
+
+        def abort(self) -> None:
+            """记录 abort 调用。"""
+
+            self.aborted = True
+
+        def continue_(self) -> None:
+            """记录 continue 调用。"""
+
+            self.continued = True
+
+    route = FakeRoute()
+
+    web_playwright_backend._route_handler_abort_resources(
+        route,
+        is_url_allowed=_safe_public_test_url,
+    )
+
+    assert route.aborted is True
+    assert route.continued is False
+
+
+def test_playwright_url_safety_error_survives_worker_process() -> None:
+    """Playwright worker 子进程必须保留 Web fetch URL safety 异常语义。"""
+
+    worker_kwargs: web_playwright_backend._WorkerKwargs = {
+        "url": "https://example.com/report",
+        "timeout_seconds": 1.0,
+        "headers": None,
+        "playwright_channel": None,
+        "playwright_storage_state_path": "",
+    }
+
+    with pytest.raises(web_fetch_orchestrator._FetchUrlSafetyError) as exc_info:
+        web_playwright_backend._run_playwright_worker_process(
+            playwright_sync_worker=_BlockedPlaywrightWorker(
+                blocked_url="http://127.0.0.1/internal",
+                blocked_stage="playwright_goto",
+            ),
+            worker_kwargs=worker_kwargs,
+            total_timeout=5.0,
+            cancellation_token=None,
+        )
+
+    assert exc_info.value.url == "http://127.0.0.1/internal"
+    assert exc_info.value.reason == "playwright_goto"
+
+
+def test_fetch_playwright_url_safety_projects_permission_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Playwright URL safety 拒绝必须投影为 permission_denied。"""
+
+    monkeypatch.setattr(
+        web_tools,
+        "_warmup_domain",
+        lambda *args, **kwargs: {"attempted": True, "timeout_like": True},
+    )
+    monkeypatch.setattr(web_tools, "_should_escalate_stage_result_to_browser", lambda stage_result: True)
+
+    def fake_fetch_and_convert_with_playwright(
+        *,
+        url: str,
+        timeout_seconds: float,
+        headers: Mapping[str, str] | None = None,
+        timeout_budget: float | None = None,
+        deadline_monotonic: float | None = None,
+        playwright_channel: str | None = None,
+        playwright_storage_state_path: str = "",
+        is_url_allowed: Callable[[str], bool] | None = None,
+        cancellation_token: CancellationToken | None = None,
+    ) -> web_playwright_backend.WebPayload:
+        """模拟 Playwright 导航阶段 URL safety 拒绝。
+
+        :param url: 目标 URL。
+        :param timeout_seconds: 浏览器抓取超时。
+        :param headers: 请求头。
+        :param timeout_budget: 工具总预算。
+        :param deadline_monotonic: 工具调用 deadline。
+        :param playwright_channel: 浏览器 channel。
+        :param playwright_storage_state_path: storage state 路径。
+        :param is_url_allowed: URL 安全谓词。
+        :param cancellation_token: 取消令牌。
+        :returns: 不返回。
+        :raises web_fetch_orchestrator._FetchUrlSafetyError: 始终抛出。
+        """
+
+        del (
+            url,
+            timeout_seconds,
+            headers,
+            timeout_budget,
+            deadline_monotonic,
+            playwright_channel,
+            playwright_storage_state_path,
+            is_url_allowed,
+            cancellation_token,
+        )
+        raise web_fetch_orchestrator._FetchUrlSafetyError(
+            url="http://127.0.0.1/internal",
+            reason="playwright_goto",
+        )
+
+    monkeypatch.setattr(
+        web_tools,
+        "_fetch_and_convert_with_playwright",
+        fake_fetch_and_convert_with_playwright,
+    )
+    definition = _definitions_by_name(_discover_definitions({}))["fetch_web_page"]
+
+    outcome = asyncio.run(
+        definition.callable(
+            _call("fetch_web_page", {"url": "https://example.com/report"}),
+            _context(timeout_seconds=None),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "permission_denied"
+    assert outcome.result.meta is not None
+
+
 def test_fetch_playwright_cancel_projects_to_host_cancelled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1485,6 +1930,7 @@ def test_fetch_playwright_cancel_projects_to_host_cancelled(
         deadline_monotonic: float | None = None,
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
+        is_url_allowed: Callable[[str], bool] | None = None,
         cancellation_token: CancellationToken | None = None,
     ) -> dict[str, JsonValue]:
         """模拟 Playwright worker 在 fallback 内部收到取消。
@@ -1496,6 +1942,7 @@ def test_fetch_playwright_cancel_projects_to_host_cancelled(
         :param deadline_monotonic: 工具调用 deadline。
         :param playwright_channel: 浏览器 channel。
         :param playwright_storage_state_path: storage state 路径。
+        :param is_url_allowed: URL 安全谓词。
         :param cancellation_token: 取消令牌。
         :returns: 不返回。
         :raises web_playwright_backend.CancelledError: 始终抛出。
@@ -1510,6 +1957,7 @@ def test_fetch_playwright_cancel_projects_to_host_cancelled(
             deadline_monotonic,
             playwright_channel,
             playwright_storage_state_path,
+            is_url_allowed,
         )
         raise web_playwright_backend.CancelledError("cancelled by host")
 
@@ -1628,6 +2076,7 @@ def test_try_playwright_fallback_pre_cancel_does_not_start_playwright(
         deadline_monotonic: float | None = None,
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
+        is_url_allowed: Callable[[str], bool] | None = None,
         cancellation_token: CancellationToken | None = None,
     ) -> dict[str, JsonValue]:
         """记录非预期 Playwright worker 调用。
@@ -1639,6 +2088,7 @@ def test_try_playwright_fallback_pre_cancel_does_not_start_playwright(
         :param deadline_monotonic: 工具调用 deadline。
         :param playwright_channel: 浏览器 channel。
         :param playwright_storage_state_path: storage state 路径。
+        :param is_url_allowed: URL 安全谓词。
         :param cancellation_token: 取消令牌。
         :returns: 成功结果。
         :raises Exception: 不主动抛出异常。
@@ -1651,6 +2101,7 @@ def test_try_playwright_fallback_pre_cancel_does_not_start_playwright(
             deadline_monotonic,
             playwright_channel,
             playwright_storage_state_path,
+            is_url_allowed,
             cancellation_token,
         )
         playwright_calls.append(url)
@@ -1695,10 +2146,11 @@ def test_playwright_unpicklable_worker_fails_closed(
         headers: Mapping[str, str] | None = None,
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
+        is_url_allowed: Callable[[str], bool] | None = None,
     ) -> dict[str, JsonValue]:
         """记录不应发生的同进程 Playwright 调用。"""
 
-        del timeout_seconds, headers, playwright_channel, playwright_storage_state_path
+        del timeout_seconds, headers, playwright_channel, playwright_storage_state_path, is_url_allowed
         worker_calls.append(url)
         return {"ok": True, "content": "unexpected"}
 
@@ -1927,6 +2379,7 @@ def test_fetch_playwright_fallback_receives_channel_and_storage_state_path(
         deadline_monotonic: float | None = None,
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
+        is_url_allowed: Callable[[str], bool] | None = None,
         cancellation_token: CancellationToken | None = None,
     ) -> Mapping[str, JsonValue]:
         """记录 browser fallback 参数并返回确定性内容。
@@ -1938,11 +2391,12 @@ def test_fetch_playwright_fallback_receives_channel_and_storage_state_path(
         :param deadline_monotonic: 工具 deadline。
         :param playwright_channel: 浏览器 channel。
         :param playwright_storage_state_path: storage state 文件路径。
+        :param is_url_allowed: URL 安全谓词。
         :param cancellation_token: 取消令牌。
         :returns: 确定性抓取内容。
         """
 
-        del headers, timeout_budget, deadline_monotonic, cancellation_token
+        del headers, timeout_budget, deadline_monotonic, is_url_allowed, cancellation_token
         calls.append(
             {
                 "url": url,
@@ -2017,6 +2471,7 @@ def test_fetch_playwright_fallback_uses_empty_storage_state_when_dir_empty(
         deadline_monotonic: float | None = None,
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
+        is_url_allowed: Callable[[str], bool] | None = None,
         cancellation_token: CancellationToken | None = None,
     ) -> Mapping[str, JsonValue]:
         """记录空 storage state dir 的 browser fallback 参数。
@@ -2028,11 +2483,12 @@ def test_fetch_playwright_fallback_uses_empty_storage_state_when_dir_empty(
         :param deadline_monotonic: 工具 deadline。
         :param playwright_channel: 浏览器 channel。
         :param playwright_storage_state_path: storage state 文件路径。
+        :param is_url_allowed: URL 安全谓词。
         :param cancellation_token: 取消令牌。
         :returns: 确定性抓取内容。
         """
 
-        del headers, timeout_budget, deadline_monotonic, cancellation_token
+        del headers, timeout_budget, deadline_monotonic, is_url_allowed, cancellation_token
         calls.append(
             {
                 "url": url,

@@ -269,7 +269,7 @@ Stream 术语固定如下：
 - 只有在 effective stream 为 `True` 且 HTTP 200 response 的 media type 是 `text/event-stream` 时按 SSE 解析；流式请求缺失 `Content-Type` 时保留 SSE fallback 并记录诊断；其它 media type 按非流式 JSON 解析。
 - `supports_stream_usage=True` 时，流式请求写入 `stream_options.include_usage=True`；否则不写该字段。
 - SSE 与非流式响应都在 OpenAI-compatible Runner adapter 边界校验 `choices` 与 `finish_reason`：多 assistant choice、显式非零 choice index、非法 choice shape、未知或非法 `finish_reason` 都按 provider protocol error fail closed；`finish_reason` 缺失或 `null` 只表示 absent，不会默认成 `stop`。
-- 按 `RunnerSpec.max_retries`、HTTP 分类、网络异常、timeout 和 `Retry-After` 执行重试；若一次 attempt 已经产出事件，后续 retriable failure 不再重试，而是以 error 收口。
+- 按 `RunnerSpec.max_retries`、HTTP 分类、网络异常、timeout 和 `Retry-After` 执行重试；`max_retries` 表示首次失败后的重试次数，`0` 表示不重试；若一次 attempt 已经产出事件，后续 retriable failure 不再重试，而是以 error 收口。
 - 取消 token 命中时 Runner 生成器自然结束，不补 `RunnerDoneData`。
 - fatal provider protocol error 的 `RunnerProtocolErrorData.error_code` 是
   `RunnerSpecificErrorCode`；Agent 提升为 `ProviderProtocolErrorData` 时保留

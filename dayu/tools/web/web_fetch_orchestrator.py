@@ -8,8 +8,13 @@ HTML/Docling 路由与浏览器升级判定，避免这些编排细节继续膨�
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Collection
+import gzip
+import importlib
+import zlib
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
+from types import ModuleType
+from typing import Protocol, cast
 from threading import Lock
 from urllib.parse import urljoin, urlparse
 
@@ -26,13 +31,24 @@ from dayu.documents.processors.html_pipeline import HtmlPipelineResult, HtmlPipe
 from dayu.documents.processors.text_utils import infer_suffix_from_uri
 
 from .web_challenge_detection import detect_bot_challenge
-from .web_http_encoding import _decode_response_text, _find_unsupported_content_encodings
+from .web_http_encoding import (
+    _decode_response_text,
+    _extract_content_encoding_tokens,
+    _find_unsupported_content_encodings,
+)
 
 _WARMUP_TIMEOUT_SECONDS = 6.0
 _RESPONSE_SNIPPET_MAX_CHARS = 500
 _EMPTY_CONTENT_MIN_CHARS = 5
 _MAX_META_REFRESH_HOPS = 3
 _META_REFRESH_IMMEDIATE_MAX_SECONDS = 1.0
+_MEBIBYTE_BYTES = 1024 * 1024
+_FETCH_BODY_CHUNK_BYTES = 64 * 1024
+_FETCH_MAX_WIRE_BODY_BYTES = 25 * _MEBIBYTE_BYTES
+_FETCH_MAX_DECOMPRESSED_BODY_BYTES = 50 * _MEBIBYTE_BYTES
+_FETCH_LIMIT_CONTEXT_EXCERPT_BYTES = 4096
+_MAX_HTTP_REDIRECT_HOPS = 30
+_HTTP_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _PLAYWRIGHT_HTTP_ESCALATION_STATUSES = frozenset(
     {
         412,
@@ -64,6 +80,46 @@ _PLAYWRIGHT_HTTP_ESCALATION_STATUSES = frozenset(
     }
 )
 _WARMED_HOSTS_LOCK = Lock()
+
+
+class _BytesDecompressorModule(Protocol):
+    """提供 ``decompress(bytes)`` 的可选解码模块协议。"""
+
+    def decompress(self, data: bytes) -> bytes:
+        """解压字节。"""
+        ...
+
+
+class _ZstandardDecompressor(Protocol):
+    """zstandard 解压器协议。"""
+
+    def decompress(self, data: bytes) -> bytes:
+        """解压字节。"""
+        ...
+
+
+class _ZstandardModule(Protocol):
+    """zstandard 模块协议。"""
+
+    def ZstdDecompressor(self) -> _ZstandardDecompressor:
+        """创建 zstd 解压器。"""
+        ...
+
+
+def _import_optional_module(module_name: str) -> ModuleType:
+    """按名称导入可选模块。
+
+    Args:
+        module_name: 模块名。
+
+    Returns:
+        导入的模块对象。
+
+    Raises:
+        ImportError: 模块不存在或导入失败时抛出。
+    """
+
+    return importlib.import_module(module_name)
 
 
 @dataclass(frozen=True)
@@ -117,6 +173,67 @@ class _FetchContentConversionError(RuntimeError):
         self.response_context = response_context
         self.original_error = original_error
         self.failure_reason = str(failure_reason or "").strip()
+
+
+class _FetchBodyLimitExceeded(RuntimeError):
+    """响应 body 超过 Web fetch owner 允许的读取上限。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        final_url: str,
+        limit_kind: str,
+        limit_bytes: int,
+        observed_bytes: int,
+        response_context: _FetchContentRuntimeContext,
+    ) -> None:
+        """初始化 body 上限异常。
+
+        Args:
+            message: 错误消息。
+            final_url: 当前响应 URL。
+            limit_kind: 命中的限制类型。
+            limit_bytes: 对应上限字节数。
+            observed_bytes: 已观察到的字节数。
+            response_context: 原始响应上下文。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        super().__init__(message)
+        self.final_url = final_url
+        self.limit_kind = limit_kind
+        self.limit_bytes = limit_bytes
+        self.observed_bytes = observed_bytes
+        self.response_context = response_context
+
+
+class _FetchUrlSafetyError(RuntimeError):
+    """网络跳转目标被 Web URL safety owner 拒绝。"""
+
+    def __init__(self, *, url: str, reason: str) -> None:
+        """初始化 URL safety 异常。
+
+        Args:
+            url: 被拒绝的 URL。
+            reason: 被拒绝的网络阶段。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        super().__init__(f"URL is blocked by fetch safety policy during {reason}: {url}")
+        self.url = url
+        self.reason = reason
+
 
 def _raise_if_cancelled(cancellation_token: CancellationToken | None) -> None:
     """在进入下一网络阶段前执行协作式取消检查。
@@ -222,6 +339,390 @@ def _sanitize_response_headers(headers: CaseInsensitiveDict[str] | dict[str, str
     return normalized
 
 
+def _is_redirect_response(response: requests.Response) -> bool:
+    """判断响应是否为需要 Web fetch owner 手动处理的 HTTP redirect。
+
+    Args:
+        response: HTTP 响应。
+
+    Returns:
+        需要继续跳转时返回 ``True``。
+
+    Raises:
+        无。
+    """
+
+    return int(response.status_code) in _HTTP_REDIRECT_STATUSES
+
+
+def _resolve_redirect_target(
+    *,
+    response: requests.Response,
+    current_url: str,
+    normalize_url_for_http: Callable[[str], str],
+) -> str:
+    """解析 HTTP redirect 的下一跳 URL。
+
+    Args:
+        response: 当前 redirect 响应。
+        current_url: 当前请求 URL。
+        normalize_url_for_http: URL 规范化函数。
+
+    Returns:
+        已规范化的下一跳 URL。
+
+    Raises:
+        RuntimeError: redirect 响应缺少或包含非法 ``Location`` 时抛出。
+    """
+
+    location = str(response.headers.get("Location", "") or response.headers.get("location", "") or "").strip()
+    if not location:
+        raise RuntimeError("HTTP redirect 响应缺少 Location 头。")
+    try:
+        return normalize_url_for_http(urljoin(str(getattr(response, "url", "") or current_url), location))
+    except ValueError as exc:
+        raise RuntimeError(f"HTTP redirect Location 无法解析: {location}") from exc
+
+
+def _raise_if_url_blocked(
+    *,
+    url: str,
+    is_url_allowed: Callable[[str], bool] | None,
+    reason: str,
+) -> None:
+    """在网络跳转边界复用 Web URL 安全谓词。
+
+    Args:
+        url: 待校验 URL。
+        is_url_allowed: Web fetch owner 提供的安全谓词；为空时表示调用方未启用该校验。
+        reason: 诊断用阶段标识。
+
+    Returns:
+        无。
+
+    Raises:
+        RuntimeError: URL 被安全策略拒绝时抛出。
+    """
+
+    if is_url_allowed is None:
+        return
+    if not is_url_allowed(url):
+        raise _FetchUrlSafetyError(url=url, reason=reason)
+
+
+def _append_limited_body_chunk(
+    *,
+    chunks: list[bytes],
+    chunk: bytes,
+    observed_bytes: int,
+    limit_bytes: int,
+    limit_kind: str,
+    response: requests.Response,
+) -> int:
+    """累计 body chunk 并在超过上限时失败。
+
+    Args:
+        chunks: 已读取 chunk 列表。
+        chunk: 当前 chunk。
+        observed_bytes: 此前已观察字节数。
+        limit_bytes: 字节上限。
+        limit_kind: 限制类型。
+        response: 当前 HTTP 响应。
+
+    Returns:
+        新的已观察字节数。
+
+    Raises:
+        _FetchBodyLimitExceeded: body 超过上限时抛出。
+    """
+
+    if not chunk:
+        return observed_bytes
+    next_size = observed_bytes + len(chunk)
+    if next_size > limit_bytes:
+        raise _FetchBodyLimitExceeded(
+            f"HTTP response {limit_kind} body exceeded fetch limit.",
+            final_url=str(getattr(response, "url", "") or ""),
+            limit_kind=limit_kind,
+            limit_bytes=limit_bytes,
+            observed_bytes=next_size,
+            response_context=_build_fetch_body_limit_runtime_context(response),
+        )
+    chunks.append(chunk)
+    return next_size
+
+
+def _iter_raw_response_chunks(response: requests.Response) -> Iterable[bytes]:
+    """按 wire bytes 读取 ``requests`` 响应。
+
+    Args:
+        response: 使用 ``stream=True`` 创建的响应。
+
+    Returns:
+        原始 wire chunk 迭代器。
+
+    Raises:
+        requests.RequestException: 底层读取失败时由 requests/urllib3 抛出。
+    """
+
+    return response.raw.stream(_FETCH_BODY_CHUNK_BYTES, decode_content=False)
+
+
+def _decode_brotli_body(data: bytes) -> bytes:
+    """解码 brotli body。
+
+    Args:
+        data: brotli 压缩字节。
+
+    Returns:
+        解压后的字节。
+
+    Raises:
+        RuntimeError: 当前运行时缺少 brotli 解码器时抛出。
+    """
+
+    try:
+        brotli = cast(_BytesDecompressorModule, _import_optional_module("brotli"))
+    except ImportError:
+        try:
+            brotli = cast(_BytesDecompressorModule, _import_optional_module("brotlicffi"))
+        except ImportError as exc:
+            raise RuntimeError("当前运行时缺少 brotli 解码器。") from exc
+    return brotli.decompress(data)
+
+
+def _decode_zstd_body(data: bytes) -> bytes:
+    """解码 zstd body。
+
+    Args:
+        data: zstd 压缩字节。
+
+    Returns:
+        解压后的字节。
+
+    Raises:
+        RuntimeError: 当前运行时缺少 zstd 解码器时抛出。
+    """
+
+    try:
+        zstandard = cast(_ZstandardModule, _import_optional_module("zstandard"))
+        return zstandard.ZstdDecompressor().decompress(data)
+    except ImportError:
+        try:
+            zstd = cast(_BytesDecompressorModule, _import_optional_module("zstd"))
+        except ImportError as exc:
+            raise RuntimeError("当前运行时缺少 zstd 解码器。") from exc
+        return zstd.decompress(data)
+
+
+def _decode_deflate_body(data: bytes) -> bytes:
+    """解码 deflate body，兼容 zlib wrapper 与 raw deflate。
+
+    Args:
+        data: deflate 压缩字节。
+
+    Returns:
+        解压后的字节。
+
+    Raises:
+        zlib.error: 解压失败时抛出。
+    """
+
+    try:
+        return zlib.decompress(data)
+    except zlib.error:
+        return zlib.decompress(data, -zlib.MAX_WBITS)
+
+
+def _decompress_limited_response_body(response: requests.Response, wire_body: bytes) -> bytes:
+    """按 ``Content-Encoding`` 解压并限制 decompressed body 大小。
+
+    Args:
+        response: 当前 HTTP 响应。
+        wire_body: 已按 wire 上限读取的原始字节。
+
+    Returns:
+        解压后的 body 字节。
+
+    Raises:
+        _FetchBodyLimitExceeded: 解压后字节数超过上限时抛出。
+        RuntimeError: 内容编码声明存在但当前运行时无法解码时抛出。
+    """
+
+    decoded = wire_body
+    for encoding in reversed(_extract_content_encoding_tokens(getattr(response, "headers", {}))):
+        if encoding == "identity":
+            continue
+        if encoding == "gzip":
+            decoded = gzip.decompress(decoded)
+        elif encoding == "deflate":
+            decoded = _decode_deflate_body(decoded)
+        elif encoding == "br":
+            decoded = _decode_brotli_body(decoded)
+        elif encoding == "zstd":
+            decoded = _decode_zstd_body(decoded)
+        else:
+            raise RuntimeError(f"不支持的 HTTP 内容编码: {encoding}")
+        if len(decoded) > _FETCH_MAX_DECOMPRESSED_BODY_BYTES:
+            raise _FetchBodyLimitExceeded(
+                "HTTP response decompressed body exceeded fetch limit.",
+                final_url=str(getattr(response, "url", "") or ""),
+                limit_kind="decompressed",
+                limit_bytes=_FETCH_MAX_DECOMPRESSED_BODY_BYTES,
+                observed_bytes=len(decoded),
+                response_context=_build_fetch_body_limit_runtime_context(
+                    response,
+                    body_excerpt=decoded[:_FETCH_LIMIT_CONTEXT_EXCERPT_BYTES],
+                ),
+            )
+    if len(decoded) > _FETCH_MAX_DECOMPRESSED_BODY_BYTES:
+        raise _FetchBodyLimitExceeded(
+            "HTTP response decompressed body exceeded fetch limit.",
+            final_url=str(getattr(response, "url", "") or ""),
+            limit_kind="decompressed",
+            limit_bytes=_FETCH_MAX_DECOMPRESSED_BODY_BYTES,
+            observed_bytes=len(decoded),
+            response_context=_build_fetch_body_limit_runtime_context(
+                response,
+                body_excerpt=decoded[:_FETCH_LIMIT_CONTEXT_EXCERPT_BYTES],
+            ),
+        )
+    return decoded
+
+
+def _read_limited_response_body(response: requests.Response) -> bytes:
+    """读取响应 body，并同时执行 wire/decompressed 上限。
+
+    Args:
+        response: 使用 ``stream=True`` 创建的 HTTP 响应。
+
+    Returns:
+        已解压、可供后续 HTML/Docling 转换消费的 body 字节。
+
+    Raises:
+        _FetchBodyLimitExceeded: wire 或 decompressed body 超过上限时抛出。
+        RuntimeError: 内容编码声明存在但当前运行时无法解码时抛出。
+    """
+
+    content_length = str(response.headers.get("Content-Length", "") or response.headers.get("content-length", ""))
+    if content_length.strip():
+        try:
+            declared_length = int(content_length)
+        except ValueError:
+            declared_length = 0
+        if declared_length > _FETCH_MAX_WIRE_BODY_BYTES:
+            raise _FetchBodyLimitExceeded(
+                "HTTP response declared body exceeded fetch wire limit.",
+                final_url=str(getattr(response, "url", "") or ""),
+                limit_kind="wire",
+                limit_bytes=_FETCH_MAX_WIRE_BODY_BYTES,
+                observed_bytes=declared_length,
+                response_context=_build_fetch_body_limit_runtime_context(response),
+            )
+
+    chunks: list[bytes] = []
+    observed_bytes = 0
+    for chunk in _iter_raw_response_chunks(response):
+        observed_bytes = _append_limited_body_chunk(
+            chunks=chunks,
+            chunk=chunk,
+            observed_bytes=observed_bytes,
+            limit_bytes=_FETCH_MAX_WIRE_BODY_BYTES,
+            limit_kind="wire",
+            response=response,
+        )
+    return _decompress_limited_response_body(response, b"".join(chunks))
+
+
+def _materialize_response_body(response: requests.Response) -> None:
+    """把有界读取后的响应 body 写回 ``requests.Response``。
+
+    Args:
+        response: 当前 HTTP 响应。
+
+    Returns:
+        无。
+
+    Raises:
+        _FetchBodyLimitExceeded: body 超过上限时抛出。
+        RuntimeError: body 解码失败时抛出。
+    """
+
+    decoded_body = _read_limited_response_body(response)
+    setattr(response, "_content", decoded_body)
+    response.raw.decode_content = False
+
+
+def _request_with_safe_redirects(
+    session: requests.Session,
+    *,
+    method: str,
+    url: str,
+    timeout: float,
+    headers: dict[str, str],
+    normalize_url_for_http: Callable[[str], str],
+    is_url_allowed: Callable[[str], bool] | None,
+    stream: bool,
+    cancellation_token: CancellationToken | None,
+) -> tuple[requests.Response, int, tuple[str, ...]]:
+    """执行带逐跳安全校验的 HTTP 请求。
+
+    Args:
+        session: requests Session。
+        method: HTTP 方法。
+        url: 初始 URL。
+        timeout: 请求超时。
+        headers: 请求头。
+        normalize_url_for_http: URL 规范化函数。
+        is_url_allowed: URL 安全谓词。
+        stream: 是否以 stream 模式读取响应。
+        cancellation_token: 取消令牌。
+
+    Returns:
+        ``(最终响应, HTTP redirect 跳数, 已访问 URL 记录)``。
+
+    Raises:
+        requests.TooManyRedirects: redirect 超过上限时抛出。
+        RuntimeError: redirect 目标被安全策略拒绝时抛出。
+    """
+
+    current_url = url
+    current_headers = dict(headers)
+    redirect_hops = 0
+    visited_urls = [url]
+    while True:
+        _raise_if_url_blocked(url=current_url, is_url_allowed=is_url_allowed, reason="http_request")
+        _raise_if_cancelled(cancellation_token)
+        response = session.request(
+            method,
+            current_url,
+            timeout=timeout,
+            headers=current_headers,
+            allow_redirects=False,
+            stream=stream,
+        )
+        _raise_if_cancelled(cancellation_token)
+        response_url = str(getattr(response, "url", "") or current_url)
+        visited_urls.append(response_url)
+        _raise_if_url_blocked(url=response_url, is_url_allowed=is_url_allowed, reason="http_response")
+        if not _is_redirect_response(response):
+            return response, redirect_hops, tuple(dict.fromkeys(visited_urls))
+        if redirect_hops >= _MAX_HTTP_REDIRECT_HOPS:
+            raise requests.TooManyRedirects("HTTP redirect chain exceeded fetch limit", response=response)
+        next_url = _resolve_redirect_target(
+            response=response,
+            current_url=current_url,
+            normalize_url_for_http=normalize_url_for_http,
+        )
+        _raise_if_url_blocked(url=next_url, is_url_allowed=is_url_allowed, reason="http_redirect")
+        visited_urls.append(next_url)
+        current_headers = dict(headers)
+        current_headers["Referer"] = response_url
+        current_url = next_url
+        redirect_hops += 1
+        _close_response_safely(response)
+
+
 def _build_fetch_content_runtime_context(response: requests.Response) -> _FetchContentRuntimeContext:
     """从响应对象构造抓取转换失败上下文。
 
@@ -245,6 +746,56 @@ def _build_fetch_content_runtime_context(response: requests.Response) -> _FetchC
         response_headers={str(key): str(value) for key, value in dict(getattr(response, "headers", {}) or {}).items()},
         response_excerpt=_extract_response_snippet(response),
         raw_content_text=raw_content_text,
+    )
+
+
+def _decode_bounded_body_excerpt(body_excerpt: bytes) -> str:
+    """把已受限的 body 前缀解码为诊断文本。
+
+    Args:
+        body_excerpt: 已由调用方裁剪过的 body 前缀。
+
+    Returns:
+        限长后的单行诊断文本；没有内容时返回空字符串。
+
+    Raises:
+        无。
+    """
+
+    if not body_excerpt:
+        return ""
+    decoded = body_excerpt[:_FETCH_LIMIT_CONTEXT_EXCERPT_BYTES].decode("utf-8", errors="replace").strip()
+    if not decoded:
+        return ""
+    compact = re.sub(r"\s+", " ", decoded)
+    return compact[:_RESPONSE_SNIPPET_MAX_CHARS]
+
+
+def _build_fetch_body_limit_runtime_context(
+    response: requests.Response,
+    *,
+    body_excerpt: bytes = b"",
+) -> _FetchContentRuntimeContext:
+    """为 body 上限异常构造不会读取响应剩余 body 的上下文。
+
+    Args:
+        response: 当前 HTTP 响应。
+        body_excerpt: 已读取且已裁剪的 body 前缀。
+
+    Returns:
+        body-limit 专用响应上下文。
+
+    Raises:
+        无。
+    """
+
+    response_excerpt = _decode_bounded_body_excerpt(body_excerpt)
+    return _FetchContentRuntimeContext(
+        http_status=getattr(response, "status_code", None),
+        final_url=str(getattr(response, "url", "") or ""),
+        response_headers={str(key): str(value) for key, value in dict(getattr(response, "headers", {}) or {}).items()},
+        response_excerpt=response_excerpt,
+        raw_content_text=response_excerpt,
     )
 
 
@@ -344,6 +895,7 @@ def _resolve_meta_refresh_follow_target(
     visited_urls: Collection[str],
     meta_refresh_hops: int,
     normalize_url_for_http: Callable[[str], str],
+    is_url_allowed: Callable[[str], bool] | None,
 ) -> str | None:
     """判断当前 HTML 是否需要按 meta refresh 继续抓取。
 
@@ -353,6 +905,7 @@ def _resolve_meta_refresh_follow_target(
         visited_urls: 已访问 URL 集合，用于防环。
         meta_refresh_hops: 已发生的 meta refresh 跳数。
         normalize_url_for_http: URL 规范化函数。
+        is_url_allowed: URL 安全谓词。
 
     Returns:
         若需要继续抓取则返回下一跳 URL；否则返回 `None`。
@@ -392,6 +945,19 @@ def _resolve_meta_refresh_follow_target(
             original_error=RuntimeError("meta_refresh_requires_browser"),
             failure_reason="meta_refresh_requires_browser",
         )
+    try:
+        _raise_if_url_blocked(
+            url=directive.target_url,
+            is_url_allowed=is_url_allowed,
+            reason="meta_refresh",
+        )
+    except RuntimeError as exc:
+        raise _FetchContentConversionError(
+            "HTML 页面 meta refresh 跳转目标被 fetch safety policy 拒绝。",
+            response_context=_build_fetch_content_runtime_context(response),
+            original_error=exc,
+            failure_reason="blocked_by_safety_policy",
+        ) from exc
     return directive.target_url
 
 
@@ -530,7 +1096,9 @@ def _warmup_domain(
     headers: dict[str, str],
     resolve_timeout_budget: Callable[..., float],
     build_domain_home_url: Callable[[str], str],
+    normalize_url_for_http: Callable[[str], str],
     is_timeout_like_exception: Callable[[BaseException], bool],
+    is_url_allowed: Callable[[str], bool] | None = None,
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
     cancellation_token: CancellationToken | None = None,
@@ -558,11 +1126,16 @@ def _warmup_domain(
     )
     try:
         _raise_if_cancelled(cancellation_token)
-        response = session.get(
-            warmup_url,
+        response, redirect_hops, _redirect_visited_urls = _request_with_safe_redirects(
+            session,
+            method="GET",
+            url=warmup_url,
             timeout=warmup_timeout,
             headers=headers,
-            allow_redirects=True,
+            normalize_url_for_http=normalize_url_for_http,
+            is_url_allowed=is_url_allowed,
+            stream=False,
+            cancellation_token=cancellation_token,
         )
         _raise_if_cancelled(cancellation_token)
         with _WARMED_HOSTS_LOCK:
@@ -572,6 +1145,7 @@ def _warmup_domain(
             "success": True,
             "http_status": response.status_code,
             "final_url": response.url,
+            "redirect_hops": redirect_hops,
         }
     except Exception as exc:
         _raise_if_cancelled(cancellation_token)
@@ -591,7 +1165,9 @@ def _probe_content_type(
     timeout_seconds: float,
     headers: dict[str, str],
     resolve_timeout_budget: Callable[..., float],
+    normalize_url_for_http: Callable[[str], str],
     is_timeout_like_exception: Callable[[BaseException], bool],
+    is_url_allowed: Callable[[str], bool] | None = None,
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
     cancellation_token: CancellationToken | None = None,
@@ -608,7 +1184,17 @@ def _probe_content_type(
     )
     try:
         _raise_if_cancelled(cancellation_token)
-        response = session.head(url, timeout=timeout, headers=headers, allow_redirects=True)
+        response, redirect_hops, _redirect_visited_urls = _request_with_safe_redirects(
+            session,
+            method="HEAD",
+            url=url,
+            timeout=timeout,
+            headers=headers,
+            normalize_url_for_http=normalize_url_for_http,
+            is_url_allowed=is_url_allowed,
+            stream=False,
+            cancellation_token=cancellation_token,
+        )
         _raise_if_cancelled(cancellation_token)
         content_type = str(response.headers.get("Content-Type", "")).lower()
         return {
@@ -616,12 +1202,23 @@ def _probe_content_type(
             "content_type": content_type,
             "http_status": response.status_code,
             "final_url": response.url,
+            "redirect_hops": redirect_hops,
             "ok": True,
         }
     except Exception as head_exc:
         try:
             _raise_if_cancelled(cancellation_token)
-            response = session.get(url, timeout=timeout, headers=headers, stream=True, allow_redirects=True)
+            response, redirect_hops, _redirect_visited_urls = _request_with_safe_redirects(
+                session,
+                method="GET",
+                url=url,
+                timeout=timeout,
+                headers=headers,
+                normalize_url_for_http=normalize_url_for_http,
+                is_url_allowed=is_url_allowed,
+                stream=True,
+                cancellation_token=cancellation_token,
+            )
             _raise_if_cancelled(cancellation_token)
             content_type = str(response.headers.get("Content-Type", "")).lower()
             response.close()
@@ -630,6 +1227,7 @@ def _probe_content_type(
                 "content_type": content_type,
                 "http_status": response.status_code,
                 "final_url": response.url,
+                "redirect_hops": redirect_hops,
                 "ok": True,
                 "head_error": type(head_exc).__name__,
             }
@@ -743,6 +1341,7 @@ def _fetch_and_convert_content(
     get_web_session: Callable[[], requests.Session] | None = None,
     headers: dict[str, str] | None = None,
     build_fetch_headers: Callable[[str], dict[str, str]] | None = None,
+    is_url_allowed: Callable[[str], bool] | None = None,
     content_type_probe: dict[str, str | bool | int | None] | None = None,
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
@@ -762,6 +1361,7 @@ def _fetch_and_convert_content(
         get_web_session: 默认 Session 提供器。
         headers: 可选请求头。
         build_fetch_headers: 默认请求头构造器。
+        is_url_allowed: URL 安全谓词。
         content_type_probe: 可选内容类型探测结果。
         timeout_budget: Runner 注入的单次 tool call 总预算。
         deadline_monotonic: 当前工具调用的单调时钟 deadline。
@@ -790,6 +1390,7 @@ def _fetch_and_convert_content(
     current_headers = dict(resolved_headers)
     visited_urls = {url}
     meta_refresh_hops = 0
+    http_redirect_hops = 0
 
     while True:
         _raise_if_cancelled(cancellation_token)
@@ -799,13 +1400,22 @@ def _fetch_and_convert_content(
             deadline_monotonic=deadline_monotonic,
         )
         _raise_if_cancelled(cancellation_token)
-        response = resolved_session.get(
-            current_url,
+        response, current_redirect_hops, redirect_visited_urls = _request_with_safe_redirects(
+            resolved_session,
+            method="GET",
+            url=current_url,
             timeout=timeout,
             headers=current_headers,
-            allow_redirects=True,
+            normalize_url_for_http=normalize_url_for_http,
+            is_url_allowed=is_url_allowed,
+            stream=True,
+            cancellation_token=cancellation_token,
         )
+        http_redirect_hops += current_redirect_hops
+        visited_urls.update(redirect_visited_urls)
         response.raise_for_status()
+        _raise_if_cancelled(cancellation_token)
+        _materialize_response_body(response)
         _raise_if_cancelled(cancellation_token)
 
         probe = (
@@ -828,6 +1438,7 @@ def _fetch_and_convert_content(
                 visited_urls=visited_urls,
                 meta_refresh_hops=meta_refresh_hops,
                 normalize_url_for_http=normalize_url_for_http,
+                is_url_allowed=is_url_allowed,
             )
             if next_meta_refresh_url is not None:
                 _raise_if_cancelled(cancellation_token)
@@ -894,7 +1505,7 @@ def _fetch_and_convert_content(
             "content_stats": content_stats,
             "http_status": response.status_code,
             "final_url": response.url,
-            "redirect_hops": len(response.history) + meta_refresh_hops,
+            "redirect_hops": http_redirect_hops + meta_refresh_hops,
             "response": response,
             "response_headers": dict(response.headers),
             "response_excerpt": _extract_response_snippet(response),
