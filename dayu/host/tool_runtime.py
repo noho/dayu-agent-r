@@ -3716,14 +3716,25 @@ class ToolRuntimeExecutor:
             or duplicate_decision.kind is not DuplicateDecisionKind.ALLOW
         ):
             return False
-        await self._duplicate_governance.record_accepted(
-            duplicate_request,
-            DuplicateAcceptedEntry(
-                accepted_event_refs=accepted_ack.accepted_event_refs,
-                accepted_outcome=accepted_outcome,
-                result_digest=accepted_ack.result_digest,
-            ),
-        )
+        try:
+            await self._duplicate_governance.record_accepted(
+                duplicate_request,
+                DuplicateAcceptedEntry(
+                    accepted_event_refs=accepted_ack.accepted_event_refs,
+                    accepted_outcome=accepted_outcome,
+                    result_digest=accepted_ack.result_digest,
+                ),
+            )
+        except Exception:
+            self._diagnostic_emitter.emit(
+                ToolTraceDiagnosticRecord(
+                    reason_code="duplicate_accepted_index_failed",
+                    message=(
+                        "工具结果已完成持久化接受；重复调用索引更新失败，"
+                        "后续治理必须以已持久化事实为准。"
+                    ),
+                )
+            )
         return True
 
     async def _record_duplicate_awaiting_accepted(

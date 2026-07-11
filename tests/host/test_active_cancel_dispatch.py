@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
+from dayu.contracts.json_value import JsonValue
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import (
@@ -49,6 +52,7 @@ from dayu.host.api import (
 from dayu.host.command import HostCommandHandle, create_host_command_handle, start_run
 from dayu.host.dispatch import ActiveWorkerRegistry, HostDispatchScheduler
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
+from dayu.host.durable.event_log import EventClass, EventLogAppendRequest, EventLogStore
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
     HostSQLiteStoragePolicy,
@@ -57,9 +61,11 @@ from dayu.host.durable.options import (
 from dayu.host.durable.state import (
     DispatchRecordRow,
     DispatchRecordStatus,
+    StateMutationStatus,
     WorkerKind,
     is_dispatch_record_direct_cancelable,
     mark_dispatch_waiting_for_lane_row,
+    mark_dispatch_worker_accepted_row,
     mark_dispatching_after_lane_row,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
@@ -490,6 +496,67 @@ def test_cancel_run_dispatching_pre_accept_stays_cancelled(
         assert _run_status(options.db_path, refs.run_id) == RunStatus.CANCELLED
         assert _attempt_status(options.db_path, refs.attempt_id) == (
             AttemptStatus.CANCELLED
+        )
+    finally:
+        host.close()
+
+
+def test_cancel_run_starting_worker_accepted_enters_active_cancel(
+    tmp_path: Path,
+) -> None:
+    """STARTING 且 worker 已接受的竞态窗口按 active worker cancel 处理。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    """
+
+    options = _command_options(tmp_path)
+    host = create_host_command_handle(options)
+    try:
+        session_id = _session_id(host)
+        refs: _RunRefs | None = None
+        with open_host_durable_store(_durable_options(tmp_path)) as store:
+            async def _prepare_worker_accepted_starting() -> _RunRefs:
+                """构造 dispatch 已 worker accepted 但 Attempt 仍 STARTING 的窗口。
+
+                :returns: 构造完成的 Run refs。
+                """
+
+                scheduler = await _open_scheduler(
+                    tmp_path,
+                    store,
+                    _CancelAwareHandle(
+                        local_worker_id="worker-accepted-starting",
+                        terminal="hang",
+                    ),
+                )
+                try:
+                    start_run(
+                        host,
+                        _start_request(session_id, "start-worker-accepted"),
+                    )
+                    prepared = await _start_governed_refs(scheduler, session_id)
+                    _mark_worker_accepted_without_attempt_running(
+                        store.transaction_runner,
+                        prepared,
+                    )
+                    return prepared
+                finally:
+                    await scheduler.close()
+
+            refs = asyncio.run(_prepare_worker_accepted_starting())
+
+        assert refs is not None
+        cancelling = cancel_run(
+            host,
+            refs.run_id,
+            _cancel_request("cancel-worker-accepted"),
+        )
+
+        assert cancelling.status == RunStatus.CANCELLING
+        assert _run_status(options.db_path, refs.run_id) == RunStatus.CANCELLING
+        assert _attempt_status(options.db_path, refs.attempt_id) == (
+            AttemptStatus.RUNNING
         )
     finally:
         host.close()
@@ -1009,10 +1076,14 @@ async def test_cancel_session_replay_after_watchdog_does_not_append_or_propagate
 
 
 @pytest.mark.asyncio
-async def test_scheduler_close_does_not_write_active_cancel_watchdog_closeout_terminal(
+async def test_scheduler_close_writes_active_cancel_closeout_terminal(
     tmp_path: Path,
 ) -> None:
-    """scheduler close 只停止本地 runtime，不写 watchdog terminal facts。"""
+    """scheduler close 对 active CANCELLING Run 写 durable cancel terminal facts。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    """
 
     options = _command_options(tmp_path)
     active_registry = ActiveWorkerRegistry()
@@ -1037,9 +1108,18 @@ async def test_scheduler_close_does_not_write_active_cancel_watchdog_closeout_te
             await scheduler.close()
 
         assert refs is not None
-        assert _run_status(options.db_path, refs.run_id) == RunStatus.CANCELLING
-        assert _attempt_status(options.db_path, refs.attempt_id) == AttemptStatus.RUNNING
-        assert _event_type_count(options.db_path, "RUN_CANCELLED") == 0
+        assert _run_status(options.db_path, refs.run_id) == RunStatus.CANCELLED
+        assert _attempt_status(options.db_path, refs.attempt_id) == AttemptStatus.CANCELLED
+        assert _event_type_count(options.db_path, "RUN_CANCELLED") == 1
+        cancel_requested_at = _latest_event_occurred_at(
+            options.db_path,
+            "CANCEL_REQUESTED",
+        )
+        run_cancelled_payload = _latest_event_payload(
+            options.db_path,
+            "RUN_CANCELLED",
+        )
+        assert run_cancelled_payload["requested_at"] == cancel_requested_at
     finally:
         host.close()
 
@@ -1352,6 +1432,46 @@ def _mark_dispatching(
     """
 
     def _operation(transaction: HostTransaction) -> None:
+        waiting = mark_dispatch_waiting_for_lane_row(
+            transaction,
+            attempt_id=refs.attempt_id,
+            owner_host_instance_id="host-active-cancel",
+            lane_name=_LANE_NAME,
+            waiting_for_lane_at="2026-05-15T01:02:03.000000Z",
+        )
+        assert waiting.status == StateMutationStatus.UPDATED
+        dispatching = mark_dispatching_after_lane_row(
+            transaction,
+            attempt_id=refs.attempt_id,
+            owner_host_instance_id="host-active-cancel",
+            lane_name=_LANE_NAME,
+            lane_claim_id="claim-active-cancel",
+            lane_owner_id="owner-active-cancel",
+            lane_acquired_at="2026-05-15T01:02:03.000000Z",
+            dispatching_at="2026-05-15T01:02:03.000000Z",
+        )
+        assert dispatching.status == StateMutationStatus.UPDATED
+
+    transaction_runner.run_write(_operation)
+
+
+def _mark_worker_accepted_without_attempt_running(
+    transaction_runner: HostTransactionRunner, refs: _RunRefs
+) -> None:
+    """构造 dispatch worker accept fact 已提交但 Attempt 仍 STARTING 的窗口。
+
+    :param transaction_runner: transaction runner。
+    :param refs: durable refs。
+    :returns: ``None``。
+    """
+
+    def _operation(transaction: HostTransaction) -> None:
+        """写入 worker accept event refs。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        """
+
         mark_dispatch_waiting_for_lane_row(
             transaction,
             attempt_id=refs.attempt_id,
@@ -1369,6 +1489,41 @@ def _mark_dispatching(
             lane_acquired_at="2026-05-15T01:02:03.000000Z",
             dispatching_at="2026-05-15T01:02:03.000000Z",
         )
+        event = EventLogStore().append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id="event-worker-accepted-starting",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=refs.session_id,
+                run_id=refs.run_id,
+                attempt_id=refs.attempt_id,
+                execution_id=refs.execution_id,
+                event_type="ATTEMPT_RUNNING",
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                client_request_id=None,
+                idempotency_key=None,
+                policy_decision=None,
+                reason="worker_accepted",
+                payload_json={
+                    "attempt_id": refs.attempt_id,
+                    "execution_id": refs.execution_id,
+                    "dispatch_record_id": refs.dispatch_record_id,
+                    "reason": "worker_accepted",
+                },
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        ).row
+        accepted = mark_dispatch_worker_accepted_row(
+            transaction,
+            attempt_id=refs.attempt_id,
+            worker_accept_event_id=event.event_id,
+            worker_accept_event_sequence=event.event_sequence,
+            worker_accepted_at="2026-05-15T01:02:03.000000Z",
+        )
+        assert accepted.status == StateMutationStatus.UPDATED
 
     transaction_runner.run_write(_operation)
 
@@ -1435,6 +1590,57 @@ def _event_type_count(db_path: Path, event_type: str) -> int:
         ).fetchone()
     assert row is not None
     return int(row[0])
+
+
+def _latest_event_occurred_at(db_path: Path, event_type: str) -> str:
+    """读取指定 EventLog 类型的最新发生时间。
+
+    :param db_path: SQLite DB 路径。
+    :param event_type: event type。
+    :returns: 最新事件的 ``occurred_at``。
+    """
+
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            """
+            SELECT occurred_at
+            FROM event_log
+            WHERE event_type = ?
+            ORDER BY event_sequence DESC
+            LIMIT 1
+            """,
+            (event_type,),
+        ).fetchone()
+    assert row is not None
+    return str(row[0])
+
+
+def _latest_event_payload(
+    db_path: Path,
+    event_type: str,
+) -> Mapping[str, JsonValue]:
+    """读取指定 EventLog 类型的最新 JSON payload。
+
+    :param db_path: SQLite DB 路径。
+    :param event_type: event type。
+    :returns: 最新事件的 JSON object payload。
+    """
+
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            """
+            SELECT payload_json
+            FROM event_log
+            WHERE event_type = ?
+            ORDER BY event_sequence DESC
+            LIMIT 1
+            """,
+            (event_type,),
+        ).fetchone()
+    assert row is not None
+    value = cast(JsonValue, json.loads(str(row[0])))
+    assert isinstance(value, Mapping)
+    return cast(Mapping[str, JsonValue], value)
 
 
 async def _wait_for_run_status(

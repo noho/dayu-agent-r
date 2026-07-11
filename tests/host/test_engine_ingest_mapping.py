@@ -2693,6 +2693,42 @@ def test_run_cancelled_with_malformed_active_cancel_payload_uses_typed_link(
         assert attempt_status == AttemptStatus.CANCELLED
 
 
+def test_run_cancelled_requested_at_uses_cancel_requested_event_time(
+    tmp_path: Path,
+) -> None:
+    """cancel terminal requested_at 来自 committed CANCEL_REQUESTED fact。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        store.transaction_runner.run_write(_RequestActiveCancelOperation(seeded))
+        engine_requested_at = _NOW.replace(second=33)
+        candidate = _candidate(
+            seeded,
+            worker_event_index=17,
+            data=RunCancelledData(
+                reason="user_stop",
+                requested_at=engine_requested_at,
+                accepted_at=_NOW.replace(second=34),
+                finished_at=_NOW.replace(second=35),
+            ),
+            event_type=EngineEventType.RUN_CANCELLED,
+        )
+
+        result = EngineEventIngestor(
+            transaction_runner=store.transaction_runner
+        ).ingest(candidate)
+
+        assert result.status == EngineIngestStatus.ACCEPTED
+        run_cancelled = _latest_event(store.transaction_runner, "RUN_CANCELLED")
+        payload = _payload(run_cancelled)
+        assert payload["requested_at"] == "2026-05-15T01:02:03.000000Z"
+        assert payload["requested_at"] != engine_requested_at.isoformat()
+
+
 def test_late_worker_terminal_after_timeout_is_rejected_as_terminal_closed(
     tmp_path: Path,
 ) -> None:

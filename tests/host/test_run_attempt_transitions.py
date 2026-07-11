@@ -73,6 +73,7 @@ from dayu.host.durable.state import (
     StateMutationStatus,
     WorkerKind,
     cancel_queued_run_row,
+    cancel_recovering_run_row,
     cancel_running_run_row,
     cancel_starting_dispatch_record_row,
     mark_attempt_running_row,
@@ -1397,6 +1398,83 @@ def test_terminal_run_row_reports_cas_lost_for_deferred_active_statuses(
         assert store.transaction_runner.run_write(operation) == (
             StateMutationStatus.CAS_LOST.value,
             active_status.value,
+        )
+
+
+def test_cancel_recovering_run_row_cas_requires_current_attempt(
+    tmp_path: Path,
+) -> None:
+    """recovering cancel CAS 必须匹配 current Attempt id。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_running_run(store, tmp_path)
+
+        def operation(transaction: HostTransaction) -> tuple[str, str, str]:
+            """构造 recovering Run 并验证 current Attempt CAS。
+
+            :param transaction: Host transaction。
+            :returns: 错误 attempt 的 mutation 状态、正确 attempt 的 mutation
+                状态与最终 Run 状态。
+            """
+
+            transaction.execute(
+                f"""
+                UPDATE {TABLE_HOST_RUNS}
+                SET status = ?
+                WHERE run_id = ?
+                """,
+                (RunStatus.RECOVERING.value, seeded.run_id),
+            )
+            EventLogStore().append_event(
+                transaction,
+                _test_event(
+                    event_id="event-cancel-requested-correct",
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    event_type="CANCEL_REQUESTED",
+                    payload={"reason": "test_cancel"},
+                ),
+            )
+            terminal_event = EventLogStore().append_event(
+                transaction,
+                _test_event(
+                    event_id="event-recovering-cancelled-correct",
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    event_type="RUN_CANCELLED",
+                    payload={"terminal_reason": "test_cancel"},
+                ),
+            )
+            wrong = cancel_recovering_run_row(
+                transaction,
+                run_id=seeded.run_id,
+                current_attempt_id="attempt-other",
+                terminal_event_id="event-recovering-cancelled-wrong",
+                terminal_event_sequence=101,
+                cancel_request_event_id="event-cancel-requested-wrong",
+                terminal_at="2026-05-14T01:02:09.000000Z",
+            )
+            correct = cancel_recovering_run_row(
+                transaction,
+                run_id=seeded.run_id,
+                current_attempt_id=seeded.attempt_id,
+                terminal_event_id="event-recovering-cancelled-correct",
+                terminal_event_sequence=terminal_event.row.event_sequence,
+                cancel_request_event_id="event-cancel-requested-correct",
+                terminal_at="2026-05-14T01:02:10.000000Z",
+            )
+            latest = read_run_by_id(transaction, seeded.run_id)
+            assert latest is not None
+            return wrong.status.value, correct.status.value, latest.status.value
+
+        assert store.transaction_runner.run_write(operation) == (
+            StateMutationStatus.CAS_LOST.value,
+            StateMutationStatus.UPDATED.value,
+            RunStatus.CANCELLED.value,
         )
 
 

@@ -109,6 +109,7 @@ from dayu.host.wait_adapter import (
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.errors import HostTransactionRetryExhaustedError
 from dayu.host.tool_duplicate_governance import (
+    DuplicateAcceptedEntry,
     DuplicateAwaitingAcceptedEntry,
     DuplicateDurableMissingReason,
     DuplicateGovernanceRequest,
@@ -1582,6 +1583,80 @@ async def test_duplicate_cleanup_failure_does_not_replace_original_exception(
 
     with pytest.raises(TimeoutError, match="sync timeout"):
         await executor.execute(_request(_call("tool-call-1")))
+
+
+@pytest.mark.asyncio
+async def test_duplicate_accepted_index_failure_keeps_durable_accept_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """durable accept 后 duplicate accepted index 失败不改写工具结果。
+
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    """
+
+    durable_missing_reasons: list[DuplicateDurableMissingReason] = []
+
+    async def _raise_record_accepted(
+        self: InMemoryAttemptDuplicateGovernance,
+        request: DuplicateGovernanceRequest,
+        entry: DuplicateAcceptedEntry,
+    ) -> None:
+        """模拟 accepted index 写入失败。
+
+        :param self: duplicate governance 实例。
+        :param request: duplicate accepted 请求。
+        :param entry: accepted entry。
+        :returns: ``None``。
+        :raises RuntimeError: 始终抛出 index 失败。
+        """
+
+        del self, request, entry
+        raise RuntimeError("duplicate accepted index failed")
+
+    async def _record_durable_missing(
+        self: InMemoryAttemptDuplicateGovernance,
+        request: DuplicateGovernanceRequest,
+        reason: DuplicateDurableMissingReason,
+    ) -> None:
+        """记录是否错误写入 durable_missing。
+
+        :param self: duplicate governance 实例。
+        :param request: duplicate cleanup 请求。
+        :param reason: durable missing 原因。
+        :returns: ``None``。
+        """
+
+        del self, request
+        durable_missing_reasons.append(reason)
+
+    monkeypatch.setattr(
+        InMemoryAttemptDuplicateGovernance,
+        "record_accepted",
+        _raise_record_accepted,
+    )
+    monkeypatch.setattr(
+        InMemoryAttemptDuplicateGovernance,
+        "record_durable_missing",
+        _record_durable_missing,
+    )
+    callable_ = _CountingCallable({"secret": "accepted"})
+    accept_port = _SequencedAcceptPort((_accepted_ack_for_call("tool-call-1"),))
+    diagnostics = InMemoryToolTraceDiagnosticEmitter()
+    executor = _executor(
+        callable_,
+        accept_port,
+        diagnostic_emitter=diagnostics,
+    )
+
+    outcome = await executor.execute(_request(_call("tool-call-1")))
+
+    record = outcome.records[0]
+    assert isinstance(record.outcome, ToolCompletedOutcome)
+    assert record.outcome.result.value == {"secret": "accepted"}
+    assert len(accept_port.candidates) == 1
+    assert durable_missing_reasons == []
+    assert diagnostics.records[-1].reason_code == "duplicate_accepted_index_failed"
 
 
 @pytest.mark.asyncio

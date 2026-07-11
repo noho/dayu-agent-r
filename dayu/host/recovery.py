@@ -164,9 +164,10 @@ class StartupRecoveryScanner:
         Slice 2 closeout / classification，不创建 startup recovery dispatch。
     :param recovery_owner_host_instance_id: 当前 opener 的 Host instance id；
         创建 recovery dispatch record 时写入 owner 诊断字段。
-    :param defer_accepted_cancel_to_watchdog: 为 ``True`` 时，带有已接受 active
-        cancel durable facts 的 ``CANCELLING`` Run 由 active cancel watchdog
-        收口，startup recovery 不把它转成 ``LOST``。
+    :param defer_accepted_cancel_to_watchdog: 为 ``True`` 且已注入 scheduler
+        wakeup port 时，带有已接受 active cancel durable facts 的
+        ``CANCELLING`` Run 由 active cancel watchdog 收口；未注入 scheduler
+        时 recovery 按 orphan proof 执行 fallback closeout。
     """
 
     transaction_runner: HostTransactionRunner
@@ -288,6 +289,7 @@ class StartupRecoveryScanner:
             if (
                 run.status is RunStatus.CANCELLING
                 and self.defer_accepted_cancel_to_watchdog
+                and self.dispatch_wakeup_port is not None
                 and _has_accepted_cancel_fact(
                     transaction,
                     self.event_log_store,

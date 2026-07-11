@@ -4159,6 +4159,7 @@ def cancel_recovering_run_row(
     transaction: HostTransaction,
     *,
     run_id: str,
+    current_attempt_id: str,
     terminal_event_id: str,
     terminal_event_sequence: int,
     cancel_request_event_id: str,
@@ -4168,6 +4169,7 @@ def cancel_recovering_run_row(
 
     :param transaction: 调用方提供的 Host transaction。
     :param run_id: 目标 Run id。
+    :param current_attempt_id: 期望的 current Attempt id。
     :param terminal_event_id: ``RUN_CANCELLED`` 事件 id。
     :param terminal_event_sequence: ``RUN_CANCELLED`` 全局事件序号。
     :param cancel_request_event_id: 对应 ``CANCEL_REQUESTED`` event id。
@@ -4182,6 +4184,7 @@ def cancel_recovering_run_row(
         terminal_event_sequence=terminal_event_sequence,
         terminal_at=terminal_at,
     )
+    _require_non_empty_text(current_attempt_id, field_name="current_attempt_id")
     _require_non_empty_text(
         cancel_request_event_id, field_name="cancel_request_event_id"
     )
@@ -4197,6 +4200,7 @@ def cancel_recovering_run_row(
           terminal_at = ?
         WHERE run_id = ?
           AND status = ?
+          AND current_attempt_id = ?
 {_TERMINAL_REFS_UNSET_WHERE_SQL}
         """,
         (
@@ -4208,6 +4212,7 @@ def cancel_recovering_run_row(
             terminal_at,
             run_id,
             serialize_run_status(RunStatus.RECOVERING),
+            current_attempt_id,
         ),
     )
     row = read_run_by_id(transaction, run_id)

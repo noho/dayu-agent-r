@@ -1996,6 +1996,7 @@ class _CancelSessionRunsOperation:
             return _idempotent_session_cancel_result(
                 transaction,
                 existing,
+                event_log_store=self.event_log_store,
                 reason=self.request.reason,
             )
 
@@ -4055,12 +4056,17 @@ def _idempotent_cancel_result(
 
 
 def _idempotent_session_cancel_result(
-    transaction: HostTransaction, record: IdempotencyRecord, *, reason: str
+    transaction: HostTransaction,
+    record: IdempotencyRecord,
+    *,
+    event_log_store: EventLogStore,
+    reason: str,
 ) -> SessionCancelResult:
     """从幂等记录恢复 cancel_session_runs 结果。
 
     :param transaction: 当前 Host transaction。
     :param record: 已持久化幂等记录。
+    :param event_log_store: 注入的 EventLog primitive。
     :param reason: 本次 replay 的取消原因，用于 best-effort 重新传播。
     :returns: 当前 Session snapshot；不会取消首次操作后新增的 Run。
     :raises HostApiError: 结果类型错误或 Session 缺失时抛出。
@@ -4087,6 +4093,7 @@ def _idempotent_session_cancel_result(
         ),
         active_cancel_targets=_active_cancelling_targets_for_session_replay(
             transaction,
+            event_log_store,
             session.session_id,
             record=record,
             reason=reason,
@@ -4213,6 +4220,7 @@ def _active_cancel_target_for_session_target(
 
 def _active_cancelling_targets_for_session_replay(
     transaction: HostTransaction,
+    event_log_store: EventLogStore,
     session_id: str,
     *,
     record: IdempotencyRecord,
@@ -4221,6 +4229,7 @@ def _active_cancelling_targets_for_session_replay(
     """读取 session cancel replay 可重新传播的同源 active CANCELLING 目标。
 
     :param transaction: 当前 Host transaction。
+    :param event_log_store: 注入的 EventLog primitive。
     :param session_id: Session id。
     :param record: 首次 session cancel 的幂等记录。
     :param reason: replay 请求中的 cancel reason。
@@ -4229,7 +4238,7 @@ def _active_cancelling_targets_for_session_replay(
 
     if record.created_event_id is None:
         return ()
-    event = EventLogStore().read_event_by_id(transaction, record.created_event_id)
+    event = event_log_store.read_event_by_id(transaction, record.created_event_id)
     if event is None or event.session_id != session_id or event.run_id is None:
         return ()
     run = read_run_by_id(transaction, event.run_id)
@@ -4445,7 +4454,7 @@ def _promote_after_release(
         dispatch_record=None,
         pending_dispatch=None,
         skipped=True,
-        skip_reason=PromotionSkipReason.ACTIVE_RUN_EXISTS,
+        skip_reason=PromotionSkipReason.DELEGATED_TO_GOVERNANCE,
     )
 
 

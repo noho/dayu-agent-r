@@ -442,6 +442,38 @@ class _ActiveCancelWatchdogOperationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class _ReadCommittedCancelRequestedAtOperation:
+    """读取 Run linked ``CANCEL_REQUESTED`` canonical fact 的发生时间。
+
+    :param event_log_store: EventLog primitive。
+    :param run_id: 目标 Run id。
+    """
+
+    event_log_store: EventLogStore
+    run_id: str
+
+    def __call__(self, transaction: HostTransaction) -> datetime | None:
+        """执行 durable read 并返回 committed cancel 请求时间。
+
+        :param transaction: Host durable read transaction。
+        :returns: linked ``CANCEL_REQUESTED`` 发生时间；Run 缺失或 link
+            不存在时返回 ``None``。
+        """
+
+        run = read_run_by_id(transaction, self.run_id)
+        if run is None:
+            return None
+        cancel_requested = read_cancel_requested_event_from_run_link(
+            transaction,
+            self.event_log_store,
+            run,
+        )
+        if cancel_requested is None:
+            return None
+        return parse_utc_timestamp(cancel_requested.occurred_at)
+
+
+@dataclass(frozen=True, slots=True)
 class ActiveCancelMessage:
     """active worker cancel registry 的最小取消消息。
 
@@ -1036,11 +1068,17 @@ class HostDispatchScheduler:
 
         :param session_id: 目标 Session id。
         :returns: ``None``。
-        :raises RuntimeError: scheduler 已关闭时抛出。
+        :raises Exception: 不主动抛出异常。
         """
 
         if self._closed:
-            raise RuntimeError("HostDispatchScheduler is closed")
+            _LOGGER.debug(
+                "dispatch.queue_promotion.wake_ignored_after_close "
+                "host_handle_id=%s session_id=%s",
+                self._host_handle_id,
+                session_id,
+            )
+            return
         self._promotion_queue.put_nowait(session_id)
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
@@ -2459,7 +2497,11 @@ class HostDispatchScheduler:
         while not self._queue.empty():
             record = self._queue.get_nowait()
             processed += 1
-            outcome = await self._dispatch_one(record)
+            try:
+                outcome = await self._dispatch_one(record)
+            except HostTransactionRetryExhaustedError:
+                self._queue.put_nowait(record)
+                raise
             if outcome == "dispatched":
                 dispatched += 1
             elif outcome == "timed_out":
@@ -2791,14 +2833,27 @@ class HostDispatchScheduler:
                             session_id,
                         )
                     else:
+                        self._requeue_promotion_after_backoff(session_id)
                         _LOGGER.warning(
-                            "dispatch.queue_promotion.runtime_error " "host_handle_id=%s session_id=%s error_type=%s",
+                            "dispatch.queue_promotion.runtime_error "
+                            "host_handle_id=%s session_id=%s error_type=%s",
                             self._host_handle_id,
                             session_id,
                             exc.__class__.__name__,
                             exc_info=True,
                         )
+                except HostTransactionRetryExhaustedError as exc:
+                    self._requeue_promotion_after_backoff(session_id)
+                    _LOGGER.warning(
+                        "dispatch.queue_promotion.durable_retry_exhausted "
+                        "host_handle_id=%s session_id=%s error_type=%s",
+                        self._host_handle_id,
+                        session_id,
+                        exc.__class__.__name__,
+                        exc_info=True,
+                    )
                 except Exception as exc:
+                    self._requeue_promotion_after_backoff(session_id)
                     _LOGGER.warning(
                         "dispatch.queue_promotion.unexpected_exception "
                         "host_handle_id=%s session_id=%s error_type=%s",
@@ -2813,6 +2868,22 @@ class HostDispatchScheduler:
                 self._host_handle_id,
             )
             raise
+
+    def _requeue_promotion_after_backoff(self, session_id: str) -> None:
+        """在 promotion transient failure 后重新投递 session wakeup。
+
+        :param session_id: 需要重新执行 promotion reconciliation 的 Session id。
+        :returns: ``None``。
+        """
+
+        if self._closed:
+            return
+        loop = asyncio.get_running_loop()
+        loop.call_later(
+            self._local_execution.dispatch_poll_interval_seconds,
+            self._promotion_queue.put_nowait,
+            session_id,
+        )
 
     async def _dispatch_one(self, record: PendingDispatchRecord) -> str:
         """处理一个 dispatch wakeup。
@@ -3799,16 +3870,23 @@ class HostDispatchScheduler:
                     event = await anext(events)
                 except StopAsyncIteration:
                     if not terminal_seen:
-                        if cancellation_token.is_cancelled() and not self._closed:
-                            result = ingestor.ingest(
-                                _cancelled_eof_candidate(
-                                    envelope=envelope,
-                                    worker_event_index=worker_event_index + 1,
-                                    observed_at=datetime.now(UTC),
-                                    cancellation_token=cancellation_token,
-                                )
+                        if cancellation_token.is_cancelled():
+                            cancel_requested_at = _read_committed_cancel_requested_at(
+                                transaction_runner=self._transaction_runner,
+                                event_log_store=self._event_log_store,
+                                run_id=record.run_id,
                             )
-                            run_terminal_closed = _ingest_closed_run(result)
+                            if cancel_requested_at is not None:
+                                result = ingestor.ingest(
+                                    _cancelled_eof_candidate(
+                                        envelope=envelope,
+                                        worker_event_index=worker_event_index + 1,
+                                        observed_at=datetime.now(UTC),
+                                        cancel_requested_at=cancel_requested_at,
+                                        cancellation_token=cancellation_token,
+                                    )
+                                )
+                                run_terminal_closed = _ingest_closed_run(result)
                         if not run_terminal_closed:
                             _LOGGER.critical(
                                 "dispatch.worker_events.clean_eof_without_terminal "
@@ -3830,6 +3908,36 @@ class HostDispatchScheduler:
                             run_terminal_closed = _ingest_closed_run(result)
                     break
                 except asyncio.CancelledError:
+                    if cancellation_token.is_cancelled():
+                        try:
+                            cancel_requested_at = _read_committed_cancel_requested_at(
+                                transaction_runner=self._transaction_runner,
+                                event_log_store=self._event_log_store,
+                                run_id=record.run_id,
+                            )
+                            if cancel_requested_at is not None:
+                                result = ingestor.ingest(
+                                    _cancelled_eof_candidate(
+                                        envelope=envelope,
+                                        worker_event_index=worker_event_index + 1,
+                                        observed_at=datetime.now(UTC),
+                                        cancel_requested_at=cancel_requested_at,
+                                        cancellation_token=cancellation_token,
+                                    )
+                                )
+                                run_terminal_closed = _ingest_closed_run(result)
+                        except Exception as closeout_exc:
+                            run_terminal_closed = self._safe_close_worker_lost(
+                                ingestor=ingestor,
+                                envelope=envelope,
+                                record=record,
+                                local_worker_id=local_worker_id,
+                                worker_lifecycle_signal="worker_stream_cancelled",
+                                stream_error_code=closeout_exc.__class__.__name__,
+                                last_observed_worker_event_index=worker_event_index,
+                                last_accepted_event_id=last_accepted_event_id,
+                                original_error=closeout_exc,
+                            )
                     raise
                 except Exception as exc:
                     _LOGGER.error(
@@ -3977,11 +4085,37 @@ def _is_dispatchable_recheck(
     )
 
 
+def _read_committed_cancel_requested_at(
+    *,
+    transaction_runner: HostTransactionRunner,
+    event_log_store: EventLogStore,
+    run_id: str,
+) -> datetime | None:
+    """读取 Run linked ``CANCEL_REQUESTED`` canonical fact 的发生时间。
+
+    :param transaction_runner: Host durable transaction runner。
+    :param event_log_store: EventLog primitive。
+    :param run_id: 目标 Run id。
+    :returns: committed cancel 请求时间；Run 缺失或 link 不存在时返回
+        ``None``。
+    :raises HostTransactionRetryExhaustedError: durable read transaction 重试耗尽时抛出。
+    :raises HostDurableError: durable read 失败时抛出。
+    """
+
+    return transaction_runner.run_read(
+        _ReadCommittedCancelRequestedAtOperation(
+            event_log_store=event_log_store,
+            run_id=run_id,
+        )
+    )
+
+
 def _cancelled_eof_candidate(
     *,
     envelope: LocalEngineEnvelope,
     worker_event_index: int,
     observed_at: datetime,
+    cancel_requested_at: datetime,
     cancellation_token: _HostCancellationToken,
 ) -> EngineEventCandidate:
     """把 cancel 后的 clean EOF 转为明确 run_cancelled candidate。
@@ -3989,14 +4123,13 @@ def _cancelled_eof_candidate(
     :param envelope: 当前 worker envelope。
     :param worker_event_index: 合成 EngineEvent 的 worker event 序号。
     :param observed_at: Host 观察时间。
+    :param cancel_requested_at: committed ``CANCEL_REQUESTED`` canonical fact
+        的发生时间。
     :param cancellation_token: Host 注入 Engine 的取消 token。
     :returns: 可交给 EngineEventIngestor 的 cancel candidate。
     :raises Exception: 不主动抛出异常。
     """
 
-    requested_at = cancellation_token.requested_at()
-    if requested_at is None:
-        requested_at = observed_at
     reason = cancellation_token.cancel_reason()
     if reason is None:
         reason = "host_cancelled"
@@ -4011,7 +4144,7 @@ def _cancelled_eof_candidate(
             type=EngineEventType.RUN_CANCELLED,
             data=RunCancelledData(
                 reason=reason,
-                requested_at=requested_at,
+                requested_at=cancel_requested_at,
                 accepted_at=observed_at,
                 finished_at=observed_at,
             ),

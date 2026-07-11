@@ -1447,7 +1447,7 @@ class EngineEventIngestor:
                 reason=data.reason,
                 cancel_request_event_id=cancel_requested.event_id,
                 engine_event_ref=_engine_event_ref(candidate),
-                requested_at=format_utc_timestamp(data.requested_at),
+                requested_at=cancel_requested.occurred_at,
                 accepted_at=format_utc_timestamp(data.accepted_at),
                 finished_at=format_utc_timestamp(data.finished_at),
             ),

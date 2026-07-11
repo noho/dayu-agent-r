@@ -688,16 +688,22 @@ def test_scan_cancelling_positive_orphan_loses_attempt_then_run(
 def test_scan_defers_accepted_cancel_cancelling_to_watchdog_when_enabled(
     tmp_path: Path,
 ) -> None:
-    """watchdog enabled 时 accepted-cancel CANCELLING 不被 recovery 标为 LOST。"""
+    """watchdog enabled 且 scheduler 已注入时 accepted-cancel 交给 watchdog。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    """
 
     with open_host_durable_store(_options(tmp_path)) as store:
         _seed_running_dispatching_run(store.transaction_runner, "run-1")
         _append_accepted_cancel_facts(store.transaction_runner, "run-1")
+        wakeup = _RecordingWakeup()
 
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             process_probe=_PidMissingProbe(),
+            dispatch_wakeup_port=wakeup,
             defer_accepted_cancel_to_watchdog=True,
         ).scan(_policy())
 
@@ -711,19 +717,52 @@ def test_scan_defers_accepted_cancel_cancelling_to_watchdog_when_enabled(
         assert _event_type_count(store.transaction_runner, _EVENT_TYPE_RUN_LOST) == 0
 
 
-def test_scan_malformed_cancelling_payload_uses_typed_cancel_link(
+def test_scan_accepted_cancel_without_scheduler_uses_recovery_fallback(
     tmp_path: Path,
 ) -> None:
-    """malformed RUN_CANCELLING payload 不影响 typed cancel link 判断。"""
+    """watchdog 可能不运行时 recovery 不再永久 defer CANCELLING Run。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    """
 
     with open_host_durable_store(_options(tmp_path)) as store:
         _seed_running_dispatching_run(store.transaction_runner, "run-1")
-        _append_malformed_run_cancelling_payload(store.transaction_runner, "run-1")
+        _append_accepted_cancel_facts(store.transaction_runner, "run-1")
 
         result = StartupRecoveryScanner(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             process_probe=_PidMissingProbe(),
+            defer_accepted_cancel_to_watchdog=True,
+        ).scan(_policy())
+
+        assert tuple(action.decision for action in result.actions) == (
+            StartupRecoveryDecision.RUN_LOST,
+        )
+        assert _run_status(store.transaction_runner, "run-1") == RunStatus.LOST.value
+        assert _event_type_count(store.transaction_runner, _EVENT_TYPE_RUN_LOST) == 1
+
+
+def test_scan_malformed_cancelling_payload_uses_typed_cancel_link(
+    tmp_path: Path,
+) -> None:
+    """malformed RUN_CANCELLING payload 不影响 typed cancel link 判断。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        _seed_running_dispatching_run(store.transaction_runner, "run-1")
+        _append_malformed_run_cancelling_payload(store.transaction_runner, "run-1")
+        wakeup = _RecordingWakeup()
+
+        result = StartupRecoveryScanner(
+            transaction_runner=store.transaction_runner,
+            event_log_store=EventLogStore(),
+            process_probe=_PidMissingProbe(),
+            dispatch_wakeup_port=wakeup,
             defer_accepted_cancel_to_watchdog=True,
         ).scan(_policy())
 

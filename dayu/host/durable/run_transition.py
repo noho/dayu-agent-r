@@ -114,6 +114,7 @@ class PromotionSkipReason(StrEnum):
     NO_QUEUED_RUN = "no_queued_run"
     ACTIVE_RUN_EXISTS = "active_run_exists"
     CAS_LOST_OR_NO_LONGER_ELIGIBLE = "cas_lost_or_no_longer_eligible"
+    DELEGATED_TO_GOVERNANCE = "delegated_to_governance"
 
 
 @dataclass(frozen=True, slots=True)
@@ -848,7 +849,7 @@ class ActiveCancelCloseoutInput:
     :param reason: 取消原因。
     :param cancel_request_event_id: 对应 ``CANCEL_REQUESTED`` event id。
     :param engine_event_ref: 触发收口的 EngineEvent Host event id。
-    :param requested_at: Host/Engine 观察到的取消请求时间文本。
+    :param requested_at: committed ``CANCEL_REQUESTED`` fact 的发生时间文本。
     :param accepted_at: Engine 接受取消时间文本。
     :param finished_at: Engine 完成取消时间文本。
     """
@@ -2583,6 +2584,13 @@ def cancel_recovering_run_in_transaction(
                 transaction, run
             ),
         )
+    if run.current_attempt_id is None:
+        return RunTransitionResult(
+            status=StateMutationStatus.INVALID_STATE,
+            run=run,
+            attempt=None,
+            dispatch_record=None,
+        )
 
     cancel_request_event = event_log_store.append_event(
         transaction, _cancel_requested_event_request(request, run)
@@ -2601,6 +2609,7 @@ def cancel_recovering_run_in_transaction(
     run_result = cancel_recovering_run_row(
         transaction,
         run_id=run.run_id,
+        current_attempt_id=run.current_attempt_id,
         terminal_event_id=run_cancelled_event.event_id,
         terminal_event_sequence=run_cancelled_event.event_sequence,
         cancel_request_event_id=cancel_request_event.event_id,
@@ -2836,12 +2845,29 @@ def request_active_attempt_cancel_in_transaction(
             dispatch_record=None,
         )
     attempt = read_attempt_by_id(transaction, run.current_attempt_id)
+    dispatch_record = _read_dispatch_for_attempt(transaction, attempt)
+    worker_accepted_at = _dispatch_record_worker_accepted_at(dispatch_record)
+    if (
+        attempt is not None
+        and attempt.status is AttemptStatus.STARTING
+        and worker_accepted_at is not None
+    ):
+        attempt_result = mark_attempt_running_row(
+            transaction,
+            attempt_id=attempt.attempt_id,
+            updated_at=worker_accepted_at,
+        )
+        attempt_result = _require_attempt_mutation_updated(
+            attempt_result,
+            mutation_name="mark accepted worker Attempt running before cancel",
+        )
+        attempt = attempt_result.row
     if attempt is None or attempt.status != AttemptStatus.RUNNING:
         return RunTransitionResult(
             status=StateMutationStatus.INVALID_STATE,
             run=run,
             attempt=attempt,
-            dispatch_record=_read_dispatch_for_attempt(transaction, attempt),
+            dispatch_record=dispatch_record,
         )
 
     cancel_request_event = event_log_store.append_event(
@@ -5499,6 +5525,28 @@ def _read_dispatch_for_attempt(
     if attempt is None:
         return None
     return read_dispatch_record_by_attempt_id(transaction, attempt.attempt_id)
+
+
+def _dispatch_record_worker_accepted_at(
+    dispatch_record: DispatchRecordRow | None,
+) -> str | None:
+    """读取完整 worker accept durable fact 的接受时间。
+
+    :param dispatch_record: dispatch record row；缺失时为 ``None``。
+    :returns: worker accept fact 完整且未被 direct cancel 时返回接受时间；
+        否则返回 ``None``。
+    """
+
+    if (
+        dispatch_record is not None
+        and dispatch_record.worker_accepted_at is not None
+        and dispatch_record.worker_accept_event_id is not None
+        and dispatch_record.worker_accept_event_sequence is not None
+        and dispatch_record.cancelled_event_id is None
+        and dispatch_record.cancelled_event_sequence is None
+    ):
+        return dispatch_record.worker_accepted_at
+    return None
 
 
 def _read_current_attempt_if_present(

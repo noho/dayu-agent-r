@@ -3251,6 +3251,57 @@ async def test_worker_startup_timeout_closes_starting_attempt_failed(
 
 
 @pytest.mark.asyncio
+async def test_dispatch_first_durable_retry_exhausted_requeues_current_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """首次 durable 写 retry exhausted 时当前 dispatch record 不会丢失。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_current_run(store)
+        scheduler = await _open_scheduler(tmp_path, store, _FakeWorkerFactory())
+
+        def _raise_retry_exhausted(
+            record: PendingDispatchRecord,
+        ) -> DispatchRecordRow | None:
+            """模拟首次 durable waiting-for-lane 写入 retry exhausted。
+
+            :param record: pending dispatch record。
+            :returns: 不会返回。
+            :raises HostTransactionRetryExhaustedError: 始终抛出。
+            """
+
+            del record
+            raise HostTransactionRetryExhaustedError(
+                "waiting_for_lane busy",
+                attempts=3,
+            )
+
+        monkeypatch.setattr(
+            scheduler,
+            "_mark_waiting_for_lane",
+            _raise_retry_exhausted,
+        )
+        try:
+            scheduler._queue.put_nowait(_pending_dispatch(seeded))
+
+            with pytest.raises(HostTransactionRetryExhaustedError):
+                await scheduler.drain_once()
+
+            assert scheduler._queue.qsize() == 1
+            queued = scheduler._queue.get_nowait()
+            assert queued.dispatch_record_id == seeded.dispatch_record_id
+            assert queued.attempt_id == seeded.attempt_id
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
 async def test_scheduler_queue_promotion_survives_projection_catchup_failure(
     tmp_path: Path,
 ) -> None:
@@ -4698,6 +4749,48 @@ async def test_wake_queue_promotion_logs_promotion_task_exception(
 
 
 @pytest.mark.asyncio
+async def test_wake_queue_promotion_requeues_after_transient_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """promotion transient exception 后同一 session wakeup 会被重投。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        scheduler = await _open_scheduler(tmp_path, store, _FakeWorkerFactory())
+        attempts = 0
+        recovered = asyncio.Event()
+
+        async def _flaky_promotion(session_id: str) -> None:
+            """第一次失败，第二次记录恢复。
+
+            :param session_id: promotion session id。
+            :returns: ``None``。
+            :raises RuntimeError: 第一次调用时模拟 transient failure。
+            """
+
+            nonlocal attempts
+            assert session_id == "session-promotion-retry"
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("promotion transient")
+            recovered.set()
+
+        monkeypatch.setattr(scheduler, "run_queue_promotion", _flaky_promotion)
+        try:
+            scheduler.wake_queue_promotion("session-promotion-retry")
+            await asyncio.wait_for(recovered.wait(), timeout=1)
+
+            assert attempts == 2
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
 async def test_scheduler_close_cancels_tracked_promotion_task(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4754,8 +4847,8 @@ async def test_scheduler_wake_methods_fail_after_close_and_close_is_idempotent(
 
         with pytest.raises(RuntimeError, match="HostDispatchScheduler is closed"):
             scheduler.wake_dispatch(_pending_dispatch(seeded))
-        with pytest.raises(RuntimeError, match="HostDispatchScheduler is closed"):
-            scheduler.wake_queue_promotion(seeded.session_id)
+        scheduler.wake_queue_promotion(seeded.session_id)
+        assert scheduler._promotion_queue.qsize() == 0
 
 
 @pytest.mark.asyncio
