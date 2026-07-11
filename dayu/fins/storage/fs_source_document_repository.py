@@ -7,6 +7,7 @@ from typing import Optional
 
 from dayu.documents.processors.source import Source
 from dayu.fins.domain.document_models import (
+    BatchToken,
     DocumentHandle,
     DocumentMeta,
     FilingCreateRequest,
@@ -295,6 +296,54 @@ class FsSourceDocumentRepository(SourceDocumentRepositoryProtocol):
             repository_set=repository_set,
             create_directories=create_directories,
         )
+
+    def begin_batch(self, ticker: str) -> BatchToken:
+        """开启源文档写入 batch。
+
+        Args:
+            ticker: 股票代码。
+
+        Returns:
+            批处理 token。
+
+        Raises:
+            RuntimeError: 同 ticker 已存在其它活动 batch 时抛出。
+            OSError: 底层 batch 初始化失败时抛出。
+        """
+
+        return self._repository_set.core.begin_batch(ticker)
+
+    def commit_batch(self, token: BatchToken) -> None:
+        """提交源文档写入 batch。
+
+        Args:
+            token: 批处理 token。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: token 不是当前 owner 的活动 batch 时抛出。
+            OSError: 提交失败时抛出。
+        """
+
+        self._repository_set.core.commit_batch(token)
+
+    def rollback_batch(self, token: BatchToken) -> None:
+        """回滚源文档写入 batch。
+
+        Args:
+            token: 批处理 token。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: token 不是当前 owner 的活动 batch 时抛出。
+            OSError: 回滚失败时抛出。
+        """
+
+        self._repository_set.core.rollback_batch(token)
 
     def has_source_storage_root(self, ticker: str, source_kind: SourceKind) -> bool:
         """判断某类源文档根目录是否存在且为目录。"""

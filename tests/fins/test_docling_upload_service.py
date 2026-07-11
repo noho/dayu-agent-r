@@ -127,6 +127,44 @@ class _StagingAwareUploadBlobRepository(FsDocumentBlobRepository):
         )
 
 
+class _CancelOnNthCheck:
+    """第 N 次检查起返回取消的测试检查器。"""
+
+    def __init__(self, cancel_at: int) -> None:
+        """初始化检查器。
+
+        Args:
+            cancel_at: 从 1 开始计数的取消命中次数。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: 取消次数不是正整数时抛出。
+        """
+
+        if cancel_at <= 0:
+            raise ValueError("cancel_at 必须为正整数")
+        self.cancel_at = cancel_at
+        self.calls = 0
+
+    def __call__(self) -> bool:
+        """返回当前是否应取消。
+
+        Args:
+            无。
+
+        Returns:
+            达到指定检查次数后返回 ``True``。
+
+        Raises:
+            无。
+        """
+
+        self.calls += 1
+        return self.calls >= self.cancel_at
+
+
 def _convert_docling_stub(raw_data: bytes, stream_name: str) -> dict[str, JsonValue]:
     """返回固定 Docling 转换结果。
 
@@ -355,6 +393,102 @@ def test_execute_upload_skips_when_source_fingerprint_matches(tmp_path: Path) ->
     assert second.status == "skipped"
     assert calls == ["deck.pdf"]
     assert all(event.event_type == "file_skipped" for event in second.file_events)
+
+
+def test_execute_upload_overwrite_cancel_after_conversion_keeps_previous_document(tmp_path: Path) -> None:
+    """overwrite 在转换后取消时应保留旧 source document。"""
+
+    context = _build_service_context(tmp_path)
+    old_file = tmp_path / "deck.pdf"
+    old_file.write_text("old", encoding="utf-8")
+    context.service.execute_upload(
+        ticker="AAPL",
+        source_kind=SourceKind.MATERIAL,
+        action="create",
+        document_id="mat_demo",
+        internal_document_id="mat_demo",
+        form_type="MATERIAL_OTHER",
+        files=[old_file],
+        overwrite=False,
+        meta={"material_name": "Deck", "ingest_method": "upload"},
+    )
+    old_meta = context.source_repository.get_source_meta("AAPL", "mat_demo", SourceKind.MATERIAL)
+    handle = SourceHandle(ticker="AAPL", document_id="mat_demo", source_kind=SourceKind.MATERIAL.value)
+    old_entries = {entry.name for entry in context.blob_repository.list_entries(handle)}
+    new_file = tmp_path / "deck-new.pdf"
+    new_file.write_text("new", encoding="utf-8")
+    cancellation_checker = _CancelOnNthCheck(cancel_at=5)
+
+    result = context.service.execute_upload(
+        ticker="AAPL",
+        source_kind=SourceKind.MATERIAL,
+        action="update",
+        document_id="mat_demo",
+        internal_document_id="mat_demo",
+        form_type="MATERIAL_OTHER",
+        files=[new_file],
+        overwrite=True,
+        cancellation_checker=cancellation_checker,
+        meta={"material_name": "Deck", "ingest_method": "upload"},
+    )
+
+    assert result.status == "cancelled"
+    assert context.source_repository.get_source_meta("AAPL", "mat_demo", SourceKind.MATERIAL) == old_meta
+    assert {entry.name for entry in context.blob_repository.list_entries(handle)} == old_entries
+
+
+def test_execute_upload_overwrite_final_failure_keeps_previous_document(tmp_path: Path) -> None:
+    """overwrite final upsert 失败时应通过 batch rollback 保留旧 source document。"""
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    seed_source_repository = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    seed_blob_repository = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    seed_service = DoclingUploadService(
+        source_repository=seed_source_repository,
+        blob_repository=seed_blob_repository,
+        convert_with_docling=_convert_docling_stub,
+    )
+    old_file = tmp_path / "deck.pdf"
+    old_file.write_text("old", encoding="utf-8")
+    seed_service.execute_upload(
+        ticker="AAPL",
+        source_kind=SourceKind.MATERIAL,
+        action="create",
+        document_id="mat_demo",
+        internal_document_id="mat_demo",
+        form_type="MATERIAL_OTHER",
+        files=[old_file],
+        overwrite=False,
+        meta={"material_name": "Deck", "ingest_method": "upload"},
+    )
+    old_meta = seed_source_repository.get_source_meta("AAPL", "mat_demo", SourceKind.MATERIAL)
+    handle = SourceHandle(ticker="AAPL", document_id="mat_demo", source_kind=SourceKind.MATERIAL.value)
+    old_entries = {entry.name for entry in seed_blob_repository.list_entries(handle)}
+    events: list[str] = []
+    failing_source_repository = _FailingFinalUploadSourceRepository(tmp_path, repository_set, events)
+    failing_service = DoclingUploadService(
+        source_repository=failing_source_repository,
+        blob_repository=seed_blob_repository,
+        convert_with_docling=_convert_docling_stub,
+    )
+    new_file = tmp_path / "deck-new.pdf"
+    new_file.write_text("new", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="forced final upsert failure"):
+        failing_service.execute_upload(
+            ticker="AAPL",
+            source_kind=SourceKind.MATERIAL,
+            action="update",
+            document_id="mat_demo",
+            internal_document_id="mat_demo",
+            form_type="MATERIAL_OTHER",
+            files=[new_file],
+            overwrite=True,
+            meta={"material_name": "Deck", "ingest_method": "upload"},
+        )
+
+    assert failing_source_repository.get_source_meta("AAPL", "mat_demo", SourceKind.MATERIAL) == old_meta
+    assert {entry.name for entry in seed_blob_repository.list_entries(handle)} == old_entries
 
 
 def test_execute_upload_delete_material(tmp_path: Path) -> None:

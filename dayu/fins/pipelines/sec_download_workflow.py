@@ -239,7 +239,6 @@ async def run_download_stream_impl(
     parse_date: Callable[[str, bool], dt.date],
     extract_sec_ticker_aliases: Callable[..., list[str]],
     merge_ticker_aliases: Callable[..., list[str]],
-    clear_filings_dir: Callable[[FilingMaintenanceRepositoryProtocol, str], None],
     load_rejection_registry: Callable[
         [FilingMaintenanceRepositoryProtocol, str],
         DownloadRejectionRegistry,
@@ -272,7 +271,6 @@ async def run_download_stream_impl(
         parse_date: 日期解析 helper。
         extract_sec_ticker_aliases: SEC alias 提取 helper。
         merge_ticker_aliases: alias 合并 helper。
-        clear_filings_dir: 清空 filings 目录 helper。
         load_rejection_registry: 加载拒绝注册表 helper。
         save_rejection_registry: 保存拒绝注册表 helper。
         should_warn_missing_sc13: SC13 缺失 warning helper。
@@ -424,8 +422,6 @@ async def run_download_stream_impl(
         ticker_aliases=merged_ticker_aliases,
     )
     sc13_direction_cache: dict[str, Optional[bool]] = {}
-    if overwrite:
-        clear_filings_dir(host._filing_maintenance_repository, normalized_ticker)
     rejection_registry = load_rejection_registry(host._filing_maintenance_repository, normalized_ticker)
     try:
         filings, filenums = await host._filter_filings(

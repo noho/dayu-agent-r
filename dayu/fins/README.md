@@ -98,6 +98,10 @@ source document meta 中的 `source_provider` 是来源提供方真源，当前�
 
 source document acknowledgement 由 source repository 持有：完成态 source meta 或 `stage_source_document(...)` 写入的 `ingest_complete=false` staging meta 都表示该 source 已被仓储承认。`DocumentBlobRepositoryProtocol.store_file(SourceHandle, ...)` 只能在 source meta 已存在后写入 blob；下载与上传 pipeline 在首次 blob 写入前必须通过 source repository staging 或既有完成态 meta 获得承认。
 
+batch/staging owner 由 storage batch token 持有：同 ticker 活动 batch 会绑定创建它的 owner token 与本地执行 scope，只有持有该 token 的 owner 可以读写 staging、提交或回滚。其它 task / thread / repository facade 不得加入同一 staging；需要让 source 与 blob 在同一替换事务中协作时，调用方必须使用共享 repository set 或显式注入共享 core 的仓储实例。
+
+download / upload overwrite 是单目标替换语义，不是 ticker 级清空语义。下载路径不得在发现本轮有效目标 document_id 之前清空 ticker 的全部 filings；空结果、失败或取消不得删除非目标旧文档。上传覆盖路径先完成文件校验、Docling 转换和取消检查，再在 source storage owner batch 内 reset 目标文档、写入 staging/blob 和最终 meta；失败或取消通过 rollback 保留旧文档。
+
 `FilingMaintenanceRepositoryProtocol` 持有 SEC 下载拒绝注册表。注册表条目使用 `DownloadRejectionEntry` typed contract，包含 document id、拒绝原因、分类、SEC form、filing date 和下载版本；文件系统仓储读取非法 registry 时失败关闭，保存时只通过 typed entry 序列化，SEC 下载、SC13 过滤和下载诊断只消费该 typed registry。
 
 文件系统仓储统一持有 document id 的路径组件边界：source、processed、blob handle、rejected filing artifact、download rejection registry 和 manifest 写入 / 删除入口都必须把 `document_id` 校验为单个路径组件。调用方不得用下游路径拼接、展示层过滤或测试夹具来补偿非法 document id。
@@ -455,6 +459,8 @@ Storage 是财报文件系统的唯一访问边界。仓储协议按职责拆分
 
 source repository 拥有 source document acknowledgement 与 provenance；blob repository 拥有最终文件写入边界，并在 `SourceHandle` 写入时拒绝未被 source repository 承认的 source。pipeline 可以请求 staging，但不能绕过 `stage_source_document(...)` 自行发明第二份 staging 真源。
 
+batching repository 拥有同 ticker staging / commit / rollback 的 owner token 语义；source repository 也暴露同一 storage core 的 batch 操作，供单文档 download / upload 替换把 reset、blob 写入、final meta 与 processed reprocess 标记收束到一个 owner 边界。非 owner 读写活动 batch staging 会 fail fast，不回退到下游 retry 或展示层补偿。
+
 ### Downloaders 与 CN/HK report selection
 
 CNInfo / HKEXNews downloader 只负责 HTTP 请求响应、provider JSON 解析、provider raw 字段归一、股票代码匹配、PDF URL 归一、HEAD / GET 与 PDF 字节校验。产品级财报候选语义由 `dayu.fins.pipelines.cn_report_selection` 持有：title blocklist、语言过滤、report kind / fiscal period / fiscal year 推断、同 period/year 去重、amended 优先和 `CnReportCandidate` 构造都在 pipeline helper 内完成。
@@ -495,9 +501,13 @@ Legacy job helpers 仍保留 `start_*`、`read_job(...)`、`read_job_events(...)
 
 当前 `DefaultFinsRuntime` 内置三个 production download adapter：`source="sec"` 与 `source="auto"` 且 market 为 `US` 时走 SEC 下载；`source="cninfo"` 与 `source="auto"` 且 market 为 `CN` 时走巨潮下载；`source="hkexnews"` 与 `source="auto"` 且 market 为 `HK` 时走披露易下载。没有匹配 adapter 时，download job 会进入明确的 failed 终态，不伪造成功。
 
+production download overwrite 只替换本轮实际写入的目标文档。SEC 下载在单 filing staging、文件写入、final meta 与 reprocess 标记之间使用 storage batch；文件下载失败、取消或本轮无有效目标文档时，不提交本轮 staging，也不清理其它旧 filing。CN/HK 下载不再把 overwrite 映射成 ticker 级 filings 清空。
+
 Production download adapter 必须消费 `FinsDownloadRequest.rebuild_processed`。对于已在 adapter 内完成持久化并返回 persisted summary 的 SEC、CNInfo 与 HKEXNews 下载路径，`rebuild_processed=true` 表示根据摘要中的 `written_document_ids` 标记既有 processed 产物需要重处理；它不等同于来源侧 pipeline 的本地 meta/manifest rebuild 开关。
 
 当前 `DefaultFinsRuntime` 内置 production upload runner：US filing/material 上传走 SEC upload workflow，CN/HK filing/material 上传走 CN/HK upload facade，通用文件校验、Docling 转换、source document create/update/delete/skip/overwrite 与 blob 写入由 `DoclingUploadService` 通过仓储协议完成。production upload runner 把 pipeline JSON result 收敛为 Fins-local typed upload result，`status` 必须由 pipeline 显式提供，runtime 不用缺省值伪造上传状态。直接调用 `FinsIngestionRuntime.create(...)` 且不装配 `FinsUploadRunner` 时，upload job 仍会进入明确的 failed 终态，不执行真实上传、文件读取或仓储写入。
+
+production upload overwrite 的删除/替换动作由 `DoclingUploadService` 在 storage batch 内执行。SEC/CN/HK upload facade 只解析动作、写 company meta 并调用 upload service；它们不得在 Docling 转换、取消检查或新材料构建前删除旧 source document。
 
 ### Wait adapter
 

@@ -59,7 +59,6 @@ from dayu.fins.pipelines.docling_upload_service import (
     build_material_ids,
     derive_report_kind,
     normalize_cn_fiscal_period,
-    reset_upload_target_for_overwrite,
     resolve_upload_action,
     validate_material_upload_ids,
 )
@@ -850,15 +849,6 @@ class CnPipeline:
                 company_name=company_name,
                 ticker_aliases=ticker_aliases,
             )
-            reset_upload_target_for_overwrite(
-                source_repository=self._source_repository,
-                ticker=normalized_ticker,
-                document_id=document_id,
-                source_kind=SourceKind.FILING,
-                action=resolved_action,
-                overwrite=overwrite,
-                previous_meta=previous_meta,
-            )
             upload_result = self._upload_service.execute_upload(
                 ticker=normalized_ticker,
                 source_kind=SourceKind.FILING,
@@ -1111,15 +1101,6 @@ class CnPipeline:
                 company_id=company_id,
                 company_name=company_name,
                 ticker_aliases=ticker_aliases,
-            )
-            reset_upload_target_for_overwrite(
-                source_repository=self._source_repository,
-                ticker=normalized_ticker,
-                document_id=resolved_document_id,
-                source_kind=SourceKind.MATERIAL,
-                action=resolved_action,
-                overwrite=overwrite,
-                previous_meta=previous_meta,
             )
             upload_result = self._upload_service.execute_upload(
                 ticker=normalized_ticker,

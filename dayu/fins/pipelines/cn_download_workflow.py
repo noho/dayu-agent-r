@@ -230,10 +230,6 @@ async def run_cn_download_stream_impl(
             period_windows=period_windows,
             use_default_business_limits=start_date is None,
         )
-        if overwrite:
-            _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
-            host.filing_maintenance_repository.clear_filing_documents(normalized_ticker)
-            _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
         missing_periods = _resolve_missing_periods(periods.target_periods, selected)
         for period in missing_periods:
             skipped = _build_missing_period_result(period=period)

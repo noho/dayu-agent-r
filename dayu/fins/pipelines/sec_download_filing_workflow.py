@@ -8,7 +8,7 @@ import inspect
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import BinaryIO, Optional, Protocol, TypeVar, cast
 
-from dayu.fins.domain.document_models import DownloadRejectionRegistry, FileObjectMeta, SourceHandle
+from dayu.fins.domain.document_models import BatchToken, DownloadRejectionRegistry, FileObjectMeta, SourceHandle
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.downloaders.sec_downloader import (
     DownloaderEvent,
@@ -409,137 +409,213 @@ async def run_download_single_filing_stream(
             return
         preferred_primary = selected_name
 
-    existing_files = index_file_entries(previous_meta)
-    file_results: list[DownloadFileResult] = []
-    source_handle = stage_downloaded_filing_source_document(
-        ticker=ticker,
-        cik=cik,
-        document_id=document_id,
-        internal_document_id=internal_document_id,
-        filing=filing,
-        previous_meta=previous_meta,
-        source_fingerprint=source_fingerprint,
-        download_version=download_version,
-        source_repository=host._source_repository,
-        resolve_document_version=host._resolve_document_version,
-    )
-    download_stream_func = getattr(host._downloader, "download_files_stream", None)
-    if callable(download_stream_func):
-        download_stream = cast(
-            Callable[..., AsyncIterator[DownloaderEvent]],
-            download_stream_func,
+    token: BatchToken | None = host._source_repository.begin_batch(ticker)
+    try:
+        existing_files = index_file_entries(previous_meta)
+        file_results: list[DownloadFileResult] = []
+        source_handle = stage_downloaded_filing_source_document(
+            ticker=ticker,
+            cik=cik,
+            document_id=document_id,
+            internal_document_id=internal_document_id,
+            filing=filing,
+            previous_meta=previous_meta,
+            source_fingerprint=source_fingerprint,
+            download_version=download_version,
+            source_repository=host._source_repository,
+            resolve_document_version=host._resolve_document_version,
         )
-        async for event in download_stream(
-            remote_files=remote_files,
-            overwrite=overwrite,
-            store_file=host._build_store_file(source_handle=source_handle),
-            existing_files=existing_files,
-            primary_document=filing.primary_document,
-            cancellation_checker=cancel_checker,
-        ):
-            if event.event_type == DownloadEventType.FILE_DOWNLOAD_STARTED.value:
-                yield DownloadEvent(
-                    event_type=DownloadEventType.FILE_DOWNLOAD_STARTED,
-                    ticker=ticker,
-                    document_id=document_id,
-                    payload={
-                        "name": event.name,
-                        "source_url": event.source_url,
-                        "http_etag": event.http_etag,
-                        "http_last_modified": event.http_last_modified,
-                        "http_status": event.http_status,
-                    },
-                )
-                continue
-            mapped_result = build_file_result_from_downloader_event(event)
-            file_results.append(mapped_result)
-            yield DownloadEvent(
-                event_type=DownloadEventType(event.event_type),
-                ticker=ticker,
-                document_id=document_id,
-                payload=build_download_file_event_payload(mapped_result),
+        download_stream_func = getattr(host._downloader, "download_files_stream", None)
+        if callable(download_stream_func):
+            download_stream = cast(
+                Callable[..., AsyncIterator[DownloaderEvent]],
+                download_stream_func,
             )
-    else:
-        download_files = cast(
-            Callable[..., Awaitable[list[DownloadFileResult]] | list[DownloadFileResult]],
-            host._downloader.download_files,
-        )
-        legacy_file_results = await _maybe_await(
-            download_files(
+            async for event in download_stream(
                 remote_files=remote_files,
                 overwrite=overwrite,
                 store_file=host._build_store_file(source_handle=source_handle),
                 existing_files=existing_files,
                 primary_document=filing.primary_document,
                 cancellation_checker=cancel_checker,
+            ):
+                if event.event_type == DownloadEventType.FILE_DOWNLOAD_STARTED.value:
+                    yield DownloadEvent(
+                        event_type=DownloadEventType.FILE_DOWNLOAD_STARTED,
+                        ticker=ticker,
+                        document_id=document_id,
+                        payload={
+                            "name": event.name,
+                            "source_url": event.source_url,
+                            "http_etag": event.http_etag,
+                            "http_last_modified": event.http_last_modified,
+                            "http_status": event.http_status,
+                        },
+                    )
+                    continue
+                mapped_result = build_file_result_from_downloader_event(event)
+                file_results.append(mapped_result)
+                yield DownloadEvent(
+                    event_type=DownloadEventType(event.event_type),
+                    ticker=ticker,
+                    document_id=document_id,
+                    payload=build_download_file_event_payload(mapped_result),
+                )
+        else:
+            download_files = cast(
+                Callable[..., Awaitable[list[DownloadFileResult]] | list[DownloadFileResult]],
+                host._downloader.download_files,
             )
-        )
-        for item in legacy_file_results:
-            mapped_result = normalize_download_file_result(dict(item))
-            file_results.append(mapped_result)
-            status = str(mapped_result.get("status", "failed"))
-            event_type = map_file_status_to_event_type(status)
+            legacy_file_results = await _maybe_await(
+                download_files(
+                    remote_files=remote_files,
+                    overwrite=overwrite,
+                    store_file=host._build_store_file(source_handle=source_handle),
+                    existing_files=existing_files,
+                    primary_document=filing.primary_document,
+                    cancellation_checker=cancel_checker,
+                )
+            )
+            for item in legacy_file_results:
+                mapped_result = normalize_download_file_result(dict(item))
+                file_results.append(mapped_result)
+                status = str(mapped_result.get("status", "failed"))
+                event_type = map_file_status_to_event_type(status)
+                yield DownloadEvent(
+                    event_type=event_type,
+                    ticker=ticker,
+                    document_id=document_id,
+                    payload=build_download_file_event_payload(mapped_result),
+                )
+
+        downloaded_files = sum(1 for item in file_results if item["status"] == "downloaded")
+        skipped_files = sum(1 for item in file_results if item["status"] == "skipped")
+        failed_files = [item for item in file_results if item["status"] == "failed"]
+        if failed_files:
+            Log.warn(
+                (
+                    "filling 下载失败（不落盘 meta）: "
+                    f"ticker={ticker} document_id={document_id} failed={len(failed_files)}"
+                ),
+                module=host.MODULE,
+            )
+            filing_result = {
+                "document_id": document_id,
+                "internal_document_id": internal_document_id,
+                "status": "failed",
+                "form_type": filing.form_type,
+                "filing_date": filing.filing_date,
+                "report_date": filing.report_date,
+                "failed_files": [build_download_file_event_payload(item) for item in failed_files],
+                "reason_code": "file_download_failed",
+                "reason_message": summarize_failed_download_file_reasons(failed_files),
+            }
+            assert token is not None
+            host._source_repository.rollback_batch(token)
+            token = None
             yield DownloadEvent(
-                event_type=event_type,
+                event_type=DownloadEventType.FILING_FAILED,
                 ticker=ticker,
                 document_id=document_id,
-            payload=build_download_file_event_payload(mapped_result),
+                payload=build_download_filing_event_payload(filing_result),
             )
+            return
 
-    downloaded_files = sum(1 for item in file_results if item["status"] == "downloaded")
-    skipped_files = sum(1 for item in file_results if item["status"] == "skipped")
-    failed_files = [item for item in file_results if item["status"] == "failed"]
-    if failed_files:
-        Log.warn(
-            (
-                "filling 下载失败（不落盘 meta）: "
-                f"ticker={ticker} document_id={document_id} failed={len(failed_files)}"
-            ),
-            module=host.MODULE,
+        has_xbrl = host._source_repository.has_filing_xbrl_instance(
+            ticker=source_handle.ticker,
+            document_id=source_handle.document_id,
         )
-        filing_result = {
-            "document_id": document_id,
-            "internal_document_id": internal_document_id,
-            "status": "failed",
-            "form_type": filing.form_type,
-            "filing_date": filing.filing_date,
-            "report_date": filing.report_date,
-            "failed_files": [build_download_file_event_payload(item) for item in failed_files],
-            "reason_code": "file_download_failed",
-            "reason_message": summarize_failed_download_file_reasons(failed_files),
-        }
-        yield DownloadEvent(
-            event_type=DownloadEventType.FILING_FAILED,
+
+        if (
+            previous_meta is not None
+            and not overwrite
+            and downloaded_files == 0
+            and skipped_files == len(file_results)
+            and has_same_file_name_set(remote_files, existing_files)
+        ):
+            filing_result = {
+                "document_id": document_id,
+                "internal_document_id": internal_document_id,
+                "status": "skipped",
+                "form_type": filing.form_type,
+                "filing_date": filing.filing_date,
+                "report_date": filing.report_date,
+                "downloaded_files": downloaded_files,
+                "skipped_files": skipped_files,
+                "skip_reason": "not_modified",
+                "reason_code": "not_modified",
+                "reason_message": "所有文件均未修改，跳过重新下载",
+                "has_xbrl": has_xbrl,
+            }
+            assert token is not None
+            host._source_repository.rollback_batch(token)
+            token = None
+            yield DownloadEvent(
+                event_type=DownloadEventType.FILING_COMPLETED,
+                ticker=ticker,
+                document_id=document_id,
+                payload=build_download_filing_event_payload(filing_result),
+            )
+            return
+
+        primary_document = preferred_primary or filing.primary_document
+        file_entries = host._build_file_entries(file_results=file_results, previous_files=existing_files)
+        inferred_fiscal_year, inferred_fiscal_period = resolve_download_fiscal_fields(
+            source_handle=source_handle,
+            source_repository=host._source_repository,
+            file_entries=file_entries,
+            form_type=filing.form_type,
+            report_date=filing.report_date,
+        )
+        upsert_downloaded_filing_source_document(
             ticker=ticker,
+            cik=cik,
             document_id=document_id,
-            payload=build_download_filing_event_payload(filing_result),
+            internal_document_id=internal_document_id,
+            filing=filing,
+            primary_document=primary_document,
+            file_entries=file_entries,
+            previous_meta=previous_meta,
+            source_fingerprint=source_fingerprint,
+            download_version=download_version,
+            has_xbrl=has_xbrl,
+            inferred_fiscal_year=inferred_fiscal_year,
+            inferred_fiscal_period=inferred_fiscal_period,
+            source_repository=host._source_repository,
+            resolve_document_version=host._resolve_document_version,
+            safe_get_processed_meta=host._safe_get_processed_meta,
+            mark_processed_reprocess_required=host._mark_processed_reprocess_required,
         )
-        return
-
-    has_xbrl = host._source_repository.has_filing_xbrl_instance(
-        ticker=source_handle.ticker,
-        document_id=source_handle.document_id,
-    )
-
-    if (
-        previous_meta is not None
-        and not overwrite
-        and downloaded_files == 0
-        and skipped_files == len(file_results)
-        and has_same_file_name_set(remote_files, existing_files)
-    ):
+        if filing.form_type == "6-K":
+            try:
+                reconcile_active_6k_primary_document(
+                    source_repository=host._source_repository,
+                    ticker=ticker,
+                    document_id=document_id,
+                    mark_processed_reprocess_required=host._mark_processed_reprocess_required,
+                )
+            except Exception as exc:
+                Log.warn(
+                    (
+                        "6-K primary reconcile 失败，保留预筛选主文件: "
+                        f"ticker={ticker} document_id={document_id} "
+                        f"primary_document={primary_document} error={exc}"
+                    ),
+                    module=host.MODULE,
+                )
+        assert token is not None
+        commit_token = token
+        token = None
+        host._source_repository.commit_batch(commit_token)
         filing_result = {
             "document_id": document_id,
             "internal_document_id": internal_document_id,
-            "status": "skipped",
+            "status": "downloaded",
             "form_type": filing.form_type,
             "filing_date": filing.filing_date,
             "report_date": filing.report_date,
             "downloaded_files": downloaded_files,
             "skipped_files": skipped_files,
-            "skip_reason": "not_modified",
-            "reason_code": "not_modified",
-            "reason_message": "所有文件均未修改，跳过重新下载",
             "has_xbrl": has_xbrl,
         }
         yield DownloadEvent(
@@ -548,67 +624,6 @@ async def run_download_single_filing_stream(
             document_id=document_id,
             payload=build_download_filing_event_payload(filing_result),
         )
-        return
-
-    primary_document = preferred_primary or filing.primary_document
-    file_entries = host._build_file_entries(file_results=file_results, previous_files=existing_files)
-    inferred_fiscal_year, inferred_fiscal_period = resolve_download_fiscal_fields(
-        source_handle=source_handle,
-        source_repository=host._source_repository,
-        file_entries=file_entries,
-        form_type=filing.form_type,
-        report_date=filing.report_date,
-    )
-    upsert_downloaded_filing_source_document(
-        ticker=ticker,
-        cik=cik,
-        document_id=document_id,
-        internal_document_id=internal_document_id,
-        filing=filing,
-        primary_document=primary_document,
-        file_entries=file_entries,
-        previous_meta=previous_meta,
-        source_fingerprint=source_fingerprint,
-        download_version=download_version,
-        has_xbrl=has_xbrl,
-        inferred_fiscal_year=inferred_fiscal_year,
-        inferred_fiscal_period=inferred_fiscal_period,
-        source_repository=host._source_repository,
-        resolve_document_version=host._resolve_document_version,
-        safe_get_processed_meta=host._safe_get_processed_meta,
-        mark_processed_reprocess_required=host._mark_processed_reprocess_required,
-    )
-    if filing.form_type == "6-K":
-        try:
-            reconcile_active_6k_primary_document(
-                source_repository=host._source_repository,
-                ticker=ticker,
-                document_id=document_id,
-                mark_processed_reprocess_required=host._mark_processed_reprocess_required,
-            )
-        except Exception as exc:
-            Log.warn(
-                (
-                    "6-K primary reconcile 失败，保留预筛选主文件: "
-                    f"ticker={ticker} document_id={document_id} "
-                    f"primary_document={primary_document} error={exc}"
-                ),
-                module=host.MODULE,
-            )
-    filing_result = {
-        "document_id": document_id,
-        "internal_document_id": internal_document_id,
-        "status": "downloaded",
-        "form_type": filing.form_type,
-        "filing_date": filing.filing_date,
-        "report_date": filing.report_date,
-        "downloaded_files": downloaded_files,
-        "skipped_files": skipped_files,
-        "has_xbrl": has_xbrl,
-    }
-    yield DownloadEvent(
-        event_type=DownloadEventType.FILING_COMPLETED,
-        ticker=ticker,
-        document_id=document_id,
-        payload=build_download_filing_event_payload(filing_result),
-    )
+    finally:
+        if token is not None:
+            host._source_repository.rollback_batch(token)

@@ -54,6 +54,7 @@ from dayu.fins.direct_event_text import (
     direct_upload_runtime_unavailable_message,
 )
 from dayu.fins.domain.document_models import (
+    BatchToken,
     DocumentMeta,
     DownloadRejectionEntry,
     FinsIngestMethod,
@@ -3768,10 +3769,10 @@ class FinsIngestionRuntime:
         """
 
         document_id = _bounded_text(document.document_id, "document_id", reject_path_separators=False)
-        if _source_document_exists(self.source_repository, ticker, document_id, document.source_kind):
+        source_exists = _source_document_exists(self.source_repository, ticker, document_id, document.source_kind)
+        if source_exists:
             if not overwrite_existing:
                 return False
-            self.source_repository.reset_source_document(ticker, document_id, document.source_kind)
 
         primary_document = _bounded_text(document.primary_document, "primary_document")
         create_request = SourceDocumentUpsertRequest(
@@ -3786,18 +3787,29 @@ class FinsIngestionRuntime:
             primary_document=primary_document,
             meta=_download_document_meta(document.meta),
         )
-        self.source_repository.create_source_document(create_request, document.source_kind)
-        handle = self.source_repository.get_source_handle(ticker, document_id, document.source_kind)
-        file_metas = tuple(
-            self._store_downloaded_file(handle=handle, downloaded_file=downloaded_file)
-            for downloaded_file in document.files
-        )
-        self.source_repository.update_source_document(
-            replace(create_request, files=list(file_metas)),
-            document.source_kind,
-        )
-        if rebuild_processed:
-            _mark_processed_reprocess_required_if_present(self.processed_repository, ticker, document_id)
+        token: BatchToken | None = self.source_repository.begin_batch(ticker)
+        try:
+            if source_exists:
+                self.source_repository.reset_source_document(ticker, document_id, document.source_kind)
+            self.source_repository.create_source_document(create_request, document.source_kind)
+            handle = self.source_repository.get_source_handle(ticker, document_id, document.source_kind)
+            file_metas = tuple(
+                self._store_downloaded_file(handle=handle, downloaded_file=downloaded_file)
+                for downloaded_file in document.files
+            )
+            self.source_repository.update_source_document(
+                replace(create_request, files=list(file_metas)),
+                document.source_kind,
+            )
+            if rebuild_processed:
+                _mark_processed_reprocess_required_if_present(self.processed_repository, ticker, document_id)
+            commit_token = token
+            token = None
+            self.source_repository.commit_batch(commit_token)
+        except Exception:
+            if token is not None:
+                self.source_repository.rollback_batch(token)
+            raise
         return True
 
     def _store_downloaded_file(

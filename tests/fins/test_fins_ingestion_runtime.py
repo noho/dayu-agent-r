@@ -1200,6 +1200,49 @@ def test_start_download_persists_queued_record_and_uses_public_ticker_normalizat
     assert len(executor.operations) == 1
 
 
+def test_store_downloaded_document_overwrite_failure_rolls_back_target_scope(tmp_path: Path) -> None:
+    """download overwrite 单文档写入失败时应保留旧目标和非目标文档。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    _add_unmatched_source_documents(workspace_root=workspace_root, count=1)
+    runtime = _build_ingestion_runtime(workspace_root, executor=_HoldingExecutor())
+    old_meta = runtime.source_repository.get_source_meta("AAPL", "aapl-2024-10k", SourceKind.FILING)
+    non_target_meta = runtime.source_repository.get_source_meta("AAPL", "aapl-2024-10q-00", SourceKind.FILING)
+    document = FinsDownloadedSourceDocument(
+        source_kind=SourceKind.FILING,
+        document_id="aapl-2024-10k",
+        internal_document_id="aapl-2024-10k-new",
+        form_type="10-K",
+        primary_document="aapl-2024-10k-new.md",
+        meta={
+            "form_type": "10-K",
+            "filing_date": "2025-11-01",
+            "report_date": "2025-09-28",
+            "fiscal_year": 2025,
+            "fiscal_period": "FY",
+            "amended": False,
+        },
+        files=(
+            FinsDownloadedFile(
+                filename="",
+                content=b"broken",
+                content_type="text/markdown",
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="filename 不能为空"):
+        runtime._store_downloaded_document(
+            ticker="AAPL",
+            document=document,
+            overwrite_existing=True,
+            rebuild_processed=False,
+        )
+
+    assert runtime.source_repository.get_source_meta("AAPL", "aapl-2024-10k", SourceKind.FILING) == old_meta
+    assert runtime.source_repository.get_source_meta("AAPL", "aapl-2024-10q-00", SourceKind.FILING) == non_target_meta
+
+
 def test_start_download_allows_sec_amended_form_type(tmp_path: Path) -> None:
     """下载请求应允许 SEC 修正表单类型中的业务合法斜杠。"""
 

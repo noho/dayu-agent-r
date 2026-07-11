@@ -2023,6 +2023,57 @@ def test_same_ticker_batch_fails_fast_across_independent_repository_cores(tmp_pa
     second_repository.rollback_batch(second_token)
 
 
+def test_same_ticker_active_batch_rejects_non_owner_task_on_shared_core(tmp_path: Path) -> None:
+    """同 core 的活动 batch 不允许其它执行 owner 加入 staging。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    token = batching_repository.begin_batch("AAPL")
+
+    try:
+        asyncio.run(_attempt_non_owner_source_create(source_repository))
+    finally:
+        batching_repository.rollback_batch(token)
+
+    assert source_repository.list_source_document_ids("AAPL", SourceKind.FILING) == []
+
+
+async def _attempt_non_owner_source_create(source_repository: FsSourceDocumentRepository) -> None:
+    """在另一个 asyncio task 中尝试写入同 ticker source document。
+
+    Args:
+        source_repository: 共享同一 storage core 的 source repository。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 未按预期拒绝非 owner 写入时由 pytest 抛出。
+    """
+
+    with pytest.raises(RuntimeError, match="ticker=AAPL 活动 batch 属于其他 owner"):
+        source_repository.create_source_document(
+            SourceDocumentUpsertRequest(
+                ticker="AAPL",
+                document_id="aapl-non-owner",
+                internal_document_id="aapl-non-owner",
+                form_type="10-K",
+                primary_document="aapl-non-owner.md",
+                meta={
+                    "fiscal_year": 2024,
+                    "fiscal_period": "FY",
+                    "filing_date": "2024-11-01",
+                    "report_date": "2024-09-28",
+                    "amended": False,
+                    "ingest_method": "upload",
+                },
+            ),
+            SourceKind.FILING,
+        )
+
+
 def test_fins_workspace_root_must_be_explicit_absolute_path() -> None:
     """workspace_root 不得从 cwd 或环境隐式解析。"""
 

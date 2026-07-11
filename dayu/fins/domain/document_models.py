@@ -385,6 +385,8 @@ class BatchToken:
 
     Attributes:
         token_id: 批处理唯一标识。
+        owner_token: 持有该 batch 的调用 owner token。
+        owner_scope_id: 创建 batch 的本地执行 scope 标识。
         ticker: 对应股票代码。
         target_ticker_dir: 正式 `portfolio/{ticker}` 目录。
         staging_root_dir: 批处理暂存根目录。
@@ -396,6 +398,8 @@ class BatchToken:
     """
 
     token_id: str
+    owner_token: str
+    owner_scope_id: str
     ticker: str
     target_ticker_dir: Path
     staging_root_dir: Path

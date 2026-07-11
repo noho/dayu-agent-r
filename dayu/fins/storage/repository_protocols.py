@@ -94,6 +94,18 @@ class CompanyMetaRepositoryProtocol(Protocol):
 class SourceDocumentRepositoryProtocol(Protocol):
     """源文档仓储协议。"""
 
+    def begin_batch(self, ticker: str) -> BatchToken:
+        """开启源文档写入 batch。"""
+        ...
+
+    def commit_batch(self, token: BatchToken) -> None:
+        """提交源文档写入 batch。"""
+        ...
+
+    def rollback_batch(self, token: BatchToken) -> None:
+        """回滚源文档写入 batch。"""
+        ...
+
     def has_source_storage_root(self, ticker: str, source_kind: SourceKind) -> bool:
         """判断某类源文档根目录是否存在且为目录。"""
         ...

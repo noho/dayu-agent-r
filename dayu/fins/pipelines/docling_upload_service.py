@@ -23,6 +23,7 @@ from dayu.documents.docling_runtime import (
 )
 from dayu.fins._log import Log
 from dayu.fins.domain.document_models import (
+    BatchToken,
     FinsSourceProvider,
     FileObjectMeta,
     SourceDocumentStateChangeRequest,
@@ -248,8 +249,6 @@ class DoclingUploadService:
         )
         if _is_cancelled(cancellation_checker):
             return _build_cancelled_result(document_id=document_id, internal_document_id=internal_document_id)
-        stored_entries: list[JsonObject] = []
-        file_events: list[UploadFileEventPayload] = list(conversion_events)
         current_version = _resolve_document_version(previous_meta, source_fingerprint)
         staging_meta = self._build_upsert_meta(
             previous_meta=previous_meta,
@@ -257,77 +256,168 @@ class DoclingUploadService:
             document_version=current_version,
             base_meta=meta,
         )
-        handle = self._acknowledge_source_before_blob_write(
+        result = self._store_upload_assets(
             ticker=normalized_ticker,
             source_kind=source_kind,
-            document_id=document_id,
-            internal_document_id=internal_document_id,
-            form_type=form_type,
-            previous_meta=previous_meta,
-            meta=staging_meta,
-        )
-        for asset in pending_assets:
-            if _is_cancelled(cancellation_checker):
-                return _build_cancelled_result(document_id=document_id, internal_document_id=internal_document_id)
-            file_meta = self._blob_repository.store_file(
-                handle=handle,
-                filename=asset.name,
-                data=BytesIO(asset.data),
-                content_type=asset.content_type,
-            )
-            stored_entries.append(_build_stored_file_entry(asset=asset, file_meta=file_meta))
-            file_events.append(
-                UploadFileEventPayload(
-                    event_type="file_uploaded",
-                    name=asset.name,
-                    payload={
-                        "source": asset.source,
-                        "size": file_meta.size,
-                        "content_type": file_meta.content_type,
-                    },
-                )
-            )
-
-        primary_document = _pick_primary_docling_file(stored_entries)
-        if primary_document is None:
-            raise RuntimeError("未生成 docling 主文件，无法写入 primary_document")
-        upsert_mode = _resolve_upsert_mode(
             action=normalized_action,
-            previous_meta=previous_meta,
-            overwrite=overwrite,
-        )
-        self._upsert_source_document(
-            upsert_mode=upsert_mode,
-            source_kind=source_kind,
-            ticker=normalized_ticker,
             document_id=document_id,
             internal_document_id=internal_document_id,
             form_type=form_type,
-            primary_document=primary_document,
-            file_entries=stored_entries,
+            overwrite=overwrite,
+            pending_assets=pending_assets,
+            conversion_events=conversion_events,
+            previous_meta=previous_meta,
             meta=staging_meta,
+            source_fingerprint=source_fingerprint,
+            document_version=current_version,
+            cancellation_checker=cancellation_checker,
         )
-        Log.verbose(
-            (
-                f"Docling 转换与源文档落盘完成: ticker={normalized_ticker} "
-                f"document_id={document_id} mode={upsert_mode} files={len(stored_entries)}"
-            ),
-            module=self.MODULE,
-        )
-        return UploadOperationResult(
-            status="uploaded",
-            document_id=document_id,
-            internal_document_id=internal_document_id,
-            file_events=file_events,
-            payload={
-                "document_id": document_id,
-                "internal_document_id": internal_document_id,
-                "primary_document": primary_document,
-                "uploaded_files": len(stored_entries),
-                "source_fingerprint": source_fingerprint,
-                "document_version": current_version,
-            },
-        )
+        if result.status == "uploaded":
+            Log.verbose(
+                (
+                    f"Docling 转换与源文档落盘完成: ticker={normalized_ticker} "
+                    f"document_id={document_id} files={result.payload.get('uploaded_files')}"
+                ),
+                module=self.MODULE,
+            )
+        return result
+
+    def _store_upload_assets(
+        self,
+        *,
+        ticker: str,
+        source_kind: SourceKind,
+        action: str,
+        document_id: str,
+        internal_document_id: str,
+        form_type: str,
+        overwrite: bool,
+        pending_assets: list[_PendingFileAsset],
+        conversion_events: list[UploadFileEventPayload],
+        previous_meta: JsonObject | None,
+        meta: JsonObject,
+        source_fingerprint: str,
+        document_version: str,
+        cancellation_checker: UploadCancellationChecker | None,
+    ) -> UploadOperationResult:
+        """在 storage owner 边界写入上传文件和最终 source meta。
+
+        Args:
+            ticker: 已规范化股票代码。
+            source_kind: 文档来源类型。
+            action: 已解析上传动作。
+            document_id: 文档 ID。
+            internal_document_id: 内部文档 ID。
+            form_type: 表单类型。
+            overwrite: 是否开启覆盖。
+            pending_assets: 已完成转换、等待落盘的文件资产。
+            conversion_events: 转换阶段产生的文件事件。
+            previous_meta: 旧 source meta。
+            meta: 本次写入的 source meta。
+            source_fingerprint: 本次上传源指纹。
+            document_version: 本次文档版本。
+            cancellation_checker: 可选协作式取消检查器。
+
+        Returns:
+            上传操作结果。
+
+        Raises:
+            RuntimeError: 未生成主 Docling 文件时抛出。
+            OSError: 仓储写入失败时抛出。
+        """
+
+        replace_existing = overwrite and previous_meta is not None and action in {"create", "update"}
+        token: BatchToken | None = None
+        if replace_existing:
+            token = self._source_repository.begin_batch(ticker)
+        try:
+            effective_previous_meta = previous_meta
+            upsert_mode = _resolve_upsert_mode(
+                action=action,
+                previous_meta=previous_meta,
+                overwrite=overwrite,
+            )
+            if replace_existing:
+                self._source_repository.reset_source_document(
+                    ticker=ticker,
+                    document_id=document_id,
+                    source_kind=source_kind,
+                )
+                effective_previous_meta = None
+                upsert_mode = "create"
+
+            stored_entries: list[JsonObject] = []
+            file_events: list[UploadFileEventPayload] = list(conversion_events)
+            handle = self._acknowledge_source_before_blob_write(
+                ticker=ticker,
+                source_kind=source_kind,
+                document_id=document_id,
+                internal_document_id=internal_document_id,
+                form_type=form_type,
+                previous_meta=effective_previous_meta,
+                meta=meta,
+            )
+            for asset in pending_assets:
+                if _is_cancelled(cancellation_checker):
+                    if token is not None:
+                        self._source_repository.rollback_batch(token)
+                        token = None
+                    return _build_cancelled_result(document_id=document_id, internal_document_id=internal_document_id)
+                file_meta = self._blob_repository.store_file(
+                    handle=handle,
+                    filename=asset.name,
+                    data=BytesIO(asset.data),
+                    content_type=asset.content_type,
+                )
+                stored_entries.append(_build_stored_file_entry(asset=asset, file_meta=file_meta))
+                file_events.append(
+                    UploadFileEventPayload(
+                        event_type="file_uploaded",
+                        name=asset.name,
+                        payload={
+                            "source": asset.source,
+                            "size": file_meta.size,
+                            "content_type": file_meta.content_type,
+                        },
+                    )
+                )
+
+            primary_document = _pick_primary_docling_file(stored_entries)
+            if primary_document is None:
+                raise RuntimeError("未生成 docling 主文件，无法写入 primary_document")
+            self._upsert_source_document(
+                upsert_mode=upsert_mode,
+                source_kind=source_kind,
+                ticker=ticker,
+                document_id=document_id,
+                internal_document_id=internal_document_id,
+                form_type=form_type,
+                primary_document=primary_document,
+                file_entries=stored_entries,
+                meta=meta,
+            )
+            if token is not None:
+                commit_token = token
+                token = None
+                self._source_repository.commit_batch(commit_token)
+            return UploadOperationResult(
+                status="uploaded",
+                document_id=document_id,
+                internal_document_id=internal_document_id,
+                file_events=file_events,
+                payload={
+                    "document_id": document_id,
+                    "internal_document_id": internal_document_id,
+                    "primary_document": primary_document,
+                    "uploaded_files": len(stored_entries),
+                    "source_fingerprint": source_fingerprint,
+                    "document_version": document_version,
+                },
+            )
+        except Exception:
+            if token is not None:
+                self._source_repository.rollback_batch(token)
+            raise
 
     def resolve_document_id_by_internal(
         self,
@@ -1009,47 +1099,6 @@ def resolve_upload_action(
     return "update"
 
 
-def reset_upload_target_for_overwrite(
-    *,
-    source_repository: SourceDocumentRepositoryProtocol,
-    ticker: str,
-    document_id: str,
-    source_kind: SourceKind,
-    action: str,
-    overwrite: bool,
-    previous_meta: Mapping[str, JsonValue] | None,
-) -> None:
-    """在覆盖模式下重置当前上传目标。
-
-    Args:
-        source_repository: 源文档仓储实现。
-        ticker: 股票代码。
-        document_id: 文档 ID。
-        source_kind: 来源类型。
-        action: 已解析的最终动作。
-        overwrite: 是否开启覆盖模式。
-        previous_meta: 当前目标的既有 meta。
-
-    Returns:
-        无。
-
-    Raises:
-        OSError: 仓储重置失败时抛出。
-    """
-
-    if not overwrite:
-        return
-    if previous_meta is None:
-        return
-    if action not in {"create", "update"}:
-        return
-    source_repository.reset_source_document(
-        ticker=ticker,
-        document_id=document_id,
-        source_kind=source_kind,
-    )
-
-
 def build_cn_filing_ids(
     *,
     ticker: str,
@@ -1307,7 +1356,6 @@ __all__ = [
     "build_sec_filing_ids",
     "derive_report_kind",
     "normalize_cn_fiscal_period",
-    "reset_upload_target_for_overwrite",
     "resolve_upload_action",
     "validate_material_upload_ids",
 ]

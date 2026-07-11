@@ -669,7 +669,6 @@ class SecPipeline:
             parse_date=parse_date,
             extract_sec_ticker_aliases=extract_sec_ticker_aliases,
             merge_ticker_aliases=merge_ticker_aliases,
-            clear_filings_dir=lambda repo, ticker_value: repo.clear_filing_documents(ticker_value),
             load_rejection_registry=_load_rejection_registry_impl,
             save_rejection_registry=_save_rejection_registry_impl,
             should_warn_missing_sc13=should_warn_missing_sc13,
@@ -2041,6 +2040,8 @@ def _cleanup_stale_filing_dirs(
         for result in filing_results
         if result.get("status") in {"downloaded", "skipped"}
     }
+    if not valid_doc_ids:
+        return 0
     return repository.cleanup_stale_filing_documents(
         ticker,
         active_form_types=set(form_windows.keys()),

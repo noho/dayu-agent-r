@@ -6,11 +6,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import socket
 import uuid
+from contextvars import ContextVar
 from pathlib import Path
+from threading import get_ident
 from typing import Any, Callable, Optional, TypeVar
 
 from dayu.fins._log import Log
@@ -57,6 +60,10 @@ _PHASE_BACKED_UP_TARGET = "backed_up_target"
 _PHASE_SWAPPED_TARGET = "swapped_target"
 _PHASE_COMMITTED = "committed"
 _PHASE_ROLLED_BACK = "rolled_back"
+_BATCH_OWNER_CONTEXT: ContextVar[dict[str, str]] = ContextVar(
+    "fins_storage_batch_owner_context",
+    default={},
+)
 
 
 def _parse_backup_directory_name(name: str) -> tuple[str, str] | None:
@@ -76,6 +83,28 @@ def _parse_backup_directory_name(name: str) -> tuple[str, str] | None:
     if not separator or not ticker or not token_id:
         return None
     return ticker, token_id
+
+
+def _current_execution_scope_id() -> str:
+    """返回当前本地执行 scope 标识。
+
+    Args:
+        无。
+
+    Returns:
+        当前 asyncio task 或线程标识。
+
+    Raises:
+        无。
+    """
+
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    if task is not None:
+        return f"async-task:{id(task)}"
+    return f"thread:{get_ident()}"
 
 
 class _FsStorageInfra:
@@ -169,6 +198,8 @@ class _FsStorageInfra:
         self.ensure_batch_recovery()
         lock_token = self._acquire_ticker_lock(normalized_ticker)
         token_id = uuid.uuid4().hex
+        owner_token = uuid.uuid4().hex
+        owner_scope_id = _current_execution_scope_id()
         target_ticker_dir = self._target_ticker_dir(normalized_ticker)
         staging_root_dir = self.batch_root / token_id
         staging_ticker_dir = staging_root_dir / normalized_ticker
@@ -176,6 +207,8 @@ class _FsStorageInfra:
         journal_path = staging_root_dir / _JOURNAL_FILENAME
         token = BatchToken(
             token_id=token_id,
+            owner_token=owner_token,
+            owner_scope_id=owner_scope_id,
             ticker=normalized_ticker,
             target_ticker_dir=target_ticker_dir,
             staging_root_dir=staging_root_dir,
@@ -197,6 +230,7 @@ class _FsStorageInfra:
             raise
 
         self._active_batches[normalized_ticker] = token
+        self._bind_batch_owner(token)
         return token
 
     def commit_batch(self, token: BatchToken) -> None:
@@ -216,6 +250,7 @@ class _FsStorageInfra:
         current = self._active_batches.get(token.ticker)
         if current is None or current.token_id != token.token_id:
             raise ValueError("无效的 batch token，无法提交")
+        self._require_batch_owner(token.ticker)
 
         target_dir = token.target_ticker_dir
         staging_dir = token.staging_ticker_dir
@@ -254,6 +289,7 @@ class _FsStorageInfra:
             raise
         finally:
             self._active_batches.pop(token.ticker, None)
+            self._unbind_batch_owner(token)
             shutil.rmtree(token.staging_root_dir, ignore_errors=True)
             self._release_ticker_lock(token.ticker)
 
@@ -274,7 +310,9 @@ class _FsStorageInfra:
         current = self._active_batches.get(token.ticker)
         if current is None or current.token_id != token.token_id:
             raise ValueError("无效的 batch token，无法回滚")
+        self._require_batch_owner(token.ticker)
         self._active_batches.pop(token.ticker, None)
+        self._unbind_batch_owner(token)
         self._invalidate_company_meta_caches()
         rollback_error: Exception | None = None
         try:
@@ -317,6 +355,7 @@ class _FsStorageInfra:
 
         normalized_ticker = _normalize_ticker(ticker)
         if normalized_ticker in self._active_batches:
+            self._require_batch_owner(normalized_ticker)
             return operation(*args, **kwargs)
         token = self.begin_batch(normalized_ticker)
         try:
@@ -334,6 +373,64 @@ class _FsStorageInfra:
             raise
         self.commit_batch(token)
         return result
+
+    def _bind_batch_owner(self, token: BatchToken) -> None:
+        """把当前执行 scope 绑定为 batch owner。
+
+        Args:
+            token: 已创建的 batch token。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        context = dict(_BATCH_OWNER_CONTEXT.get())
+        context[token.ticker] = token.owner_token
+        _BATCH_OWNER_CONTEXT.set(context)
+
+    def _unbind_batch_owner(self, token: BatchToken) -> None:
+        """移除当前执行 scope 对 batch owner token 的绑定。
+
+        Args:
+            token: 即将结束的 batch token。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        context = dict(_BATCH_OWNER_CONTEXT.get())
+        if context.get(token.ticker) == token.owner_token:
+            context.pop(token.ticker)
+            _BATCH_OWNER_CONTEXT.set(context)
+
+    def _require_batch_owner(self, ticker: str) -> BatchToken:
+        """确认当前执行 scope 持有 ticker 活动 batch。
+
+        Args:
+            ticker: 股票代码。
+
+        Returns:
+            当前活动 batch token。
+
+        Raises:
+            RuntimeError: 当前 scope 不是活动 batch owner 时抛出。
+        """
+
+        normalized_ticker = _normalize_ticker(ticker)
+        token = self._active_batches.get(normalized_ticker)
+        if token is None:
+            raise RuntimeError(f"ticker={normalized_ticker} 不存在活动 batch")
+        context_owner_token = _BATCH_OWNER_CONTEXT.get().get(normalized_ticker)
+        current_scope_id = _current_execution_scope_id()
+        if context_owner_token != token.owner_token or current_scope_id != token.owner_scope_id:
+            raise RuntimeError(f"ticker={normalized_ticker} 活动 batch 属于其他 owner")
+        return token
 
     def _invalidate_company_meta_caches(self) -> None:
         """清空公司级元数据与 alias 索引缓存。
@@ -536,6 +633,8 @@ class _FsStorageInfra:
 
         payload = {
             "token_id": token.token_id,
+            "owner_token": token.owner_token,
+            "owner_scope_id": token.owner_scope_id,
             "ticker": token.ticker,
             "created_at": token.created_at,
             "owner_pid": str(self._current_pid()),
@@ -1130,6 +1229,7 @@ class _FsStorageInfra:
 
         token = self._active_batches.get(ticker)
         if token is not None:
+            self._require_batch_owner(ticker)
             self._ensure_ticker_structure(token.staging_ticker_dir)
             return token.staging_ticker_dir
         target = self._target_ticker_dir(ticker)
@@ -1151,6 +1251,7 @@ class _FsStorageInfra:
 
         token = self._active_batches.get(ticker)
         if token is not None:
+            self._require_batch_owner(ticker)
             return token.staging_ticker_dir
         return self._target_ticker_dir(ticker)
 
@@ -1169,6 +1270,7 @@ class _FsStorageInfra:
 
         token = self._active_batches.get(ticker)
         if token is not None:
+            self._require_batch_owner(ticker)
             self._ensure_ticker_structure(token.staging_ticker_dir)
             return token.staging_ticker_dir.parent
         self._ensure_ticker_structure(self._target_ticker_dir(ticker))

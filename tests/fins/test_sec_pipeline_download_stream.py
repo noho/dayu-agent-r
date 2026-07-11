@@ -1046,11 +1046,14 @@ def test_download_stream_filing_skip_event_exposes_reason_fields(tmp_path: Path)
 def test_download_stream_resolves_has_xbrl_via_source_repository(tmp_path: Path) -> None:
     """验证下载完成后的 has_xbrl 由源文档仓储事实接口回填。"""
 
-    source_repository = _SpySourceRepository(tmp_path)
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source_repository = _SpySourceRepository(tmp_path, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
     pipeline = SecPipeline(
         workspace_root=tmp_path,
         downloader=StreamXbrlStubDownloader(),
         source_repository=source_repository,
+        blob_repository=blob_repository,
         processor_registry=build_fins_processor_registry(),
     )
 

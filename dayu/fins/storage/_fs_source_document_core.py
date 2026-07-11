@@ -595,8 +595,8 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             该方法作为 ``overwrite`` 重建路径的第一步，一旦删除失败（例如权限
             受限、文件系统忙），**必须**让异常向上传播；宁可让整个 upload
             流程失败，也不允许仓储侧保留"旧数据残留 + 新 manifest 条目"的
-            不一致状态。上层（``reset_upload_target_for_overwrite`` →
-            ``execute_upload``）因此不会吞掉这里抛出的 ``OSError``。
+            不一致状态。上传覆盖路径在准备好新材料后，于同一 batch 内调用
+            该方法并感知这里抛出的 ``OSError``。
 
         Args:
             ticker: 股票代码。

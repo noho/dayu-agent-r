@@ -43,7 +43,7 @@ from dayu.fins.pipelines.sec_pipeline import (
     SecPipeline as _SecPipeline,
 )
 from dayu.fins.pipelines.sec_sc13_filtering import SC13_FORMS as _SC13_FORMS, SC13_RETRY_MAX as _SC13_RETRY_MAX
-from dayu.fins.storage import FsProcessedDocumentRepository, SourceDocumentRepositoryProtocol
+from dayu.fins.storage import FsFilingMaintenanceRepository, FsProcessedDocumentRepository, SourceDocumentRepositoryProtocol
 from dayu.fins.ticker_normalization import normalize_ticker
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 
@@ -1308,16 +1308,38 @@ def test_sec_pipeline_remote_change_marks_reprocess(tmp_path: Path) -> None:
     # 快速预检跳过时不应调用 list_filing_files（避免 SEC HEAD 请求）
     assert downloader.list_filing_files_call_count == 0
 
-    # overwrite=True 清空 filings 目录后重新下载，以空白 previous_meta 全量重建
+    # overwrite=True 仅替换当前目标文档，仍使用 previous_meta 递增版本。
     result = pipeline.download(ticker="AAPL", overwrite=True)
 
     assert result["summary"]["downloaded"] == 1
     updated_meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    # previous_meta=None（filings 目录已清空）→ 版本从 v1 重新开始
-    assert updated_meta["document_version"] == "v1"
+    assert updated_meta["document_version"] == "v2"
     processed_meta = json.loads(processed_meta_path.read_text(encoding="utf-8"))
-    # 清空重建时若 processed 快照存在，应标记 reprocess_required
+    # 目标文档替换时若 processed 快照存在，应标记 reprocess_required
     assert processed_meta["reprocess_required"] is True
+
+
+def test_sec_cleanup_stale_filing_dirs_keeps_existing_docs_when_result_empty(tmp_path: Path) -> None:
+    """本轮没有有效目标 document_id 时不得清理旧 filing。"""
+
+    document_dir = tmp_path / "portfolio" / "AAPL" / "filings" / "fil_old"
+    document_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = document_dir / "meta.json"
+    meta_path.write_text(
+        json.dumps({"document_id": "fil_old", "form_type": "10-K"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    repository = FsFilingMaintenanceRepository(tmp_path)
+
+    cleaned = sec_pipeline._cleanup_stale_filing_dirs(
+        repository,
+        "AAPL",
+        {"10-K": "2024-01-01"},
+        [],
+    )
+
+    assert cleaned == 0
+    assert meta_path.exists()
 
 
 def test_sec_pipeline_download_parses_year_month_date_inputs(tmp_path: Path) -> None:
