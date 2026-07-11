@@ -85,7 +85,7 @@ pytest tests/engine/test_smoke_async_agent_providers.py -q
 
 ### `tests/cli/`
 
-CLI UI adapter 测试，当前覆盖 `dayu.cli` 的 parser factory、scoped command help、未纳入旧命令的 unknown command
+CLI UI adapter 测试，当前覆盖公开包入口 `dayu-web` / `dayu-wechat` / `dayu-render` 的 pyproject target import、help smoke、模块执行 help、可选重依赖 import 边界和当前不可用诊断；也覆盖 `dayu.cli` 的 parser factory、scoped command help、未纳入旧命令的 unknown command
 用法错误、尚未实现命令的 not-implemented 退出、`KeyboardInterrupt` 到 130 的映射、全局参数位置，以及 `init`
 对 current schema workspace config / prompts 的 bootstrap、existing file / overwrite、reset 硬编码白名单、symlink
 escape fail-fast、旧配置文件不生成、生成配置可由 `ConfigLoader` 加载和复制阶段 SIGINT 130；

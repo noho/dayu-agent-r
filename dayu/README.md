@@ -69,7 +69,7 @@ flowchart TD
 
 ## 稳定边界
 
-- `UI` 当前是外部调用者角色，不是 `dayu/` 下的实现包。它只通过 Service / Host public view 发起动作和订阅结果，不写 Host truth。
+- `UI` 当前主要是外部调用者角色。`dayu.web`、`dayu.wechat` 和 `dayu.render` 当前只提供已声明公开命令的 import/help 与当前不可用诊断，不实现 Web UI、微信 daemon / service 或渲染转换，也不写 Host truth。真实 UI 入口实现时必须通过 Service / Host public view 发起动作和订阅结果。
 - `dayu.service` 是 Host 外部 composition boundary。它把 runtime typed config、runtime locations、工具发现结果、prepared scene、显式 override 和 env / secret mapping 映射成 `OpenHostOptions` 与 `SubmitFollowupRequest`，并提供可复用 entrypoint runtime helper 处理 Session ensure/create、follow-up terminal observation、cancel request 构造和 watcher failure 诊断；Fins direct 命令入口通过 `dayu.service.fins_direct` 暴露 `AsyncIterator[FinsEvent]`，不伪装成 Host Run，也不把 CLI 操作建模为 durable job。
 - `dayu.host` 是宿主治理真源。它拥有 Session / Run / Attempt / EventLog、admission、dispatch、cancel、steer、wait-resume、retry、replay、ToolRuntime、context governance、Conversation Memory、projection、outbox、purge 和 startup recovery。
 - `dayu.engine` 是单次 run 执行边界。它不导入 Host，不读取 Host durable store，不管理 Session / Run / Attempt，不发现工具，不持有工具权限或财报业务语义。

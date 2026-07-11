@@ -6,9 +6,12 @@
 
 当前你可以用它完成四类工作：
 - 财报数据管线：美股 / A 股 / 港股财报下载，美股 / A 股 / 港股财报上传。
-- 投研问答：下载、上传财报后，执行 `prompt` 单次提问、`interactive` 多轮提问、或通过微信向`大愚 Agent` 提问。
+- 投研问答：下载、上传财报后，执行 `prompt` 单次提问或 `interactive` 多轮提问。
 - 买方分析报告写作：下载、上传财报后，执行 `write` 写作。
-- 结果渲染：把 Markdown 报告渲染为 HTML / PDF / Word。
+- 结果渲染：`dayu-render` 公开入口已保留，但 Markdown 到 HTML / PDF / Word 的转换当前尚未实现。
+
+当前限制：
+- `dayu-web`、`dayu-wechat` 和 `dayu-render` 是已保留的公开命令入口，目前只支持 `--help` 和当前能力诊断；完整 Web UI、微信 daemon / service、Markdown 渲染转换尚未实现。
 
 本文档面向读者：
 - 最终使用者。
@@ -33,8 +36,8 @@
   - 同一行业里，不同公司写出公司自己的特殊结构变量。
 - 位于 Engine 的 web tools 现在的对抗challenge能力很弱，很多网站无法访问。
 - **GUI 尚未实现**；
-- **Web UI 已支持自选股、财报下载和交互式分析，仍处于早期阶段**。
-- **WeChat UI 仅支持文本消息首版，还可添加更多好玩的功能**。
+- **Web UI 尚未实现；`dayu-web` 当前只提供 help 和当前能力诊断**。
+- **WeChat UI 尚未实现；`dayu-wechat` 当前只提供 help、子命令 help 和当前能力诊断**。
 - 财报电话会议记录音频转录文字后信息提取（起码要区分信息来自提问还是回答）尚未实现。
 - 财报presentation信息提取尚未实现。
 - 欢迎围绕以下方向提交 issue 或 PR：
@@ -135,7 +138,7 @@ pip install -e ".[test,dev,browser,web]" -c constraints/lock-macos-arm64-py311.t
 - macOS Intel 开发环境改用 `constraints/lock-macos-x64-py311.txt`
 - Linux 开发环境改用 `constraints/lock-linux-x64-py311.txt`
 - Windows 开发环境改用 `constraints/lock-windows-x64-py311.txt`
-- `web` extras 启用 `dayu-web`（streamlit）入口；不需要 Web UI 时可从 extras 列表中省略
+- `web` extras 当前只安装 Web 相关可选依赖；`dayu-web` 入口已保留，但完整 Web UI 尚未实现
 
 #### 1.1.4 安装额外依赖
 
@@ -145,12 +148,6 @@ pip install -e ".[test,dev,browser,web]" -c constraints/lock-macos-arm64-py311.t
 playwright install chromium
 ```
 
-如需使用 `dayu-render` 将 Markdown 导出为 **HTML、Word（.docx）或 PDF**，需要安装 `pandoc`，详见「§6 渲染输出」。可选安装方式：
-
-- macOS：`brew install pandoc`
-- Ubuntu / Debian：`sudo apt-get install pandoc`
-- Windows：`choco install pandoc` 或从 [pandoc 官网](https://pandoc.org/installing.html) 下载安装
-
 ### 1.2 验证安装
 
 安装完成后，先确认命令入口可用：
@@ -159,13 +156,10 @@ playwright install chromium
 dayu-cli --help
 dayu-wechat --help
 dayu-render --help
-```
-
-`dayu-web` 入口需要先安装 `[web]` extras（参考 1.1.3 节示例命令），再执行：
-
-```bash
 dayu-web --help
 ```
+
+说明：`dayu-web`、`dayu-wechat` 和 `dayu-render` 当前执行真实功能时会返回“尚未提供对应实现”的诊断；这三个入口目前只用于确认公开命令存在和查看帮助。
 
 ### 1.3 初始化工作区与配置
 
@@ -321,80 +315,34 @@ dayu-cli prompt "总结苹果最新财报中的主要风险" --debug-stream --lo
 dayu-cli download --ticker AAPL --verbose --log-file workspace/tmp/download.log
 ```
 
-### 2.2 Web 入口（Streamlit）
+### 2.2 Web 入口
 
-基于 Streamlit 的 Web UI，可在浏览器中管理自选股、下载财报并进行按 ticker 绑定历史的交互式分析：
+`dayu-web` 公开入口当前已保留，但完整 Web UI 尚未实现。可用命令：
 
 ```bash
-dayu-web
+dayu-web --help
 ```
 
 也可以用模块入口启动（等价）：
 
 ```bash
-python -m dayu.web
+python -m dayu.web --help
 ```
 
-默认使用 `./workspace` 作为工作区
-
-启动后，默认打开 Local URL: http://localhost:8501 （如果 8501 端口被占用将按尝试其他端口）
-
-功能说明：详见[dayu/web/README.md](dayu/web/README.md)
+直接执行 `dayu-web` 不会启动浏览器或本地服务；当前会返回“尚未提供可运行的 Web UI”的诊断。
 
 ### 2.3 WeChat 入口
 
-统一入口：
+`dayu-wechat` 公开入口当前已保留，但微信登录、前台 daemon 与后台 service 尚未实现。可用命令：
 
 ```bash
-dayu-wechat <command> [参数]
+dayu-wechat --help
+dayu-wechat login --help
+dayu-wechat run --help
+dayu-wechat service --help
 ```
 
-直接执行 `dayu-wechat` 会打印总帮助和全部命令简介；需要查看某个命令的完整参数时，继续使用 `dayu-wechat <command> --help`。
-
-当前支持的命令：
-
-| 命令 | 用途 |
-|------|------|
-| `login` | 扫码建立微信登录态 |
-| `run` | 以前台方式运行微信问答 daemon |
-| `service install` | 安装后台托管配置 |
-| `service start` | 启动后台托管 |
-| `service restart` | 重启后台托管 |
-| `service stop` | 停止后台托管 |
-| `service status` | 查看后台托管状态 |
-| `service list` | 列出当前 workspace 下已安装的后台托管实例 |
-| `service uninstall` | 删除后台托管配置 |
-
-常用参数：
-
-| 参数 | 适用命令 | 说明 |
-|------|------|------|
-| `--base` | 全部命令 | 工作区根目录，默认 `./workspace` |
-| `--config` | `login` `run` `service install` | 配置目录，默认 `workspace/config` |
-| `--label` | 全部命令 | WeChat 实例标签，默认 `default`；状态目录映射到 `<base>/.dayu/wechat-<label>` |
-| `--relogin` | `login` | 忽略已有登录态，强制重新扫码 |
-| `--qrcode-timeout-sec` | `login` | 扫码登录超时秒数 |
-| `--model-name` | `run` `service install` | 指定模型配置名称 |
-| `--temperature` | `run` `service install` | 覆盖模型 temperature |
-| `--web-provider` | `run` `service install` | 指定联网检索 provider |
-| `--tool-timeout-seconds` | `run` `service install` | 覆盖工具超时 |
-| `--max-iterations` | `run` `service install` | 覆盖 Agent 最大迭代次数 |
-| `--fallback-mode` | `run` `service install` | 覆盖超限处理模式 |
-| `--fallback-prompt` | `run` `service install` | 覆盖超限补充提示 |
-| `--max-consecutive-failed-tool-batches` | `run` `service install` | 覆盖连续失败工具批次上限 |
-| `--max-duplicate-tool-calls` | `run` `service install` | 覆盖重复工具调用连续上限 |
-| `--duplicate-tool-hint-prompt` | `run` `service install` | 覆盖重复工具调用提示词 |
-| `--doc-limits-json` | `run` `service install` | 覆盖文档工具 limits |
-| `--fins-limits-json` | `run` `service install` | 覆盖财报工具 limits |
-| `--typing-interval-sec` | `run` `service install` | 控制 typing 提示发送间隔 |
-| `--delivery-max-attempts` | `run` `service install` | 控制微信 reply delivery 的最大发送次数 |
-
-说明：
-- `login` 用于建立或刷新登录态。
-- `run` 用于在当前终端以前台方式运行。
-- 同一个 `--label` 对应同一个 `state_dir`；当前实现会对 `state_dir` 加 daemon 单实例锁，避免前台 `run` 和后台 service 或两个前台进程并发运行导致重复补发。
-- `service install/start/stop/status/list/uninstall` 用于以后台服务的形式运行。
-- Windows 目前不支持 `service` 相关命令；在 Windows 上可继续使用 `login` 和 `run`。
+直接执行 `dayu-wechat`、`dayu-wechat login`、`dayu-wechat run` 或 `dayu-wechat service ...` 不会登录微信、启动 daemon 或安装后台服务；当前会返回“尚未提供可运行的微信登录、daemon 或后台 service”的诊断。
 
 ## 3. 最常用工作流
 
@@ -624,81 +572,16 @@ dayu-cli interactive --debug-stream
 ### 3.5 微信对话 daemon：
 
 命令用途：
-以ClawBot的形式运行微信问答通道。
-
-参数 / 说明：
-
-| 命令 | 关键参数 | 说明 |
-|------|------|------|
-| `login` | `--label` `--relogin` `--qrcode-timeout-sec` | 建立或刷新登录态 |
-| `run` | `--model-name` `--temperature` `--web-provider` `--fallback-mode` | 在当前终端以前台方式运行 |
-| `service install` | `--label` `--model-name` `--temperature` `--web-provider` `--fallback-mode` | 安装后台服务 |
-| `service start` | `--label` | 启动后台服务 |
-| `service restart` | `--label` | 重启后台服务 |
-| `service stop` | `--label` | 停止后台服务 |
-| `service status` | `--label` | 查看后台服务状态 |
-| `service list` | 无 | 列出当前 workspace 下已安装的后台服务实例 |
-| `service uninstall` | `--label` | 删除后台服务 |
-
-说明：
-- 使用之前请先下载/上传财报。
-- 首次使用时，一般先执行 `login`，再执行 `run` 或 `service install`。
-- `run` 直接在命令行窗口前台运行。
-- `service` 适合长期后台运行。
-- `service` 相关命令目前支持 macOS 和 Linux；Windows 暂未支持。
-- 用不同的 `--label`，并分别由不同扫码主体执行 `login`，可以多开。默认实例标签是 `default`，对应状态目录 `workspace/.dayu/wechat-default`。一个完整例子如下：
+微信问答 daemon 当前尚未实现。`dayu-wechat` 只保留公开入口和 help：
 
 ```bash
-# 实例 A：扫码主体 A 登录，安装并启动 service
-dayu-wechat login --label a
-dayu-wechat service install --label a --model-name mimo-v2.5-pro-thinking
-dayu-wechat service start --label a
-
-# 实例 B：扫码主体 B 登录，安装并启动 service
-dayu-wechat login --label b
-dayu-wechat service install --label b --model-name deepseek-v4-flash-thinking
-dayu-wechat service start --label b
-
-# 列出当前 workspace 下已安装的实例
-dayu-wechat service list
+dayu-wechat --help
+dayu-wechat login --help
+dayu-wechat run --help
+dayu-wechat service --help
 ```
 
-- 多开后，`start` / `restart` / `stop` / `status` / `uninstall` 都要继续带对应实例的同一个 `--label`，这样命中的才是同一个后台 service；忘记有哪些实例时可直接执行 `dayu-wechat service list`。
-
-命令示例：
-
-```bash
-dayu-wechat login
-dayu-wechat run
-```
-
-常见命令示例：
-
-```bash
-dayu-wechat login --relogin
-dayu-wechat run --model-name mimo-v2.5-pro-thinking --temperature 0.4
-dayu-wechat service install
-dayu-wechat service start
-dayu-wechat service restart
-dayu-wechat service stop
-dayu-wechat service status
-dayu-wechat service list
-dayu-wechat service uninstall
-```
-
-命令说明：
-- 同一微信会话里的连续追问会自动延续上下文，适合做多轮分析。
-- 当前版本主要支持文本问答；更适合问财报、公司、行业和研究相关问题。
-- 首次使用时先执行 `dayu-wechat login`；命令会打印并尝试打开登录二维码链接，用手机微信扫码确认即可。若你在管理多实例，统一用 `--label` 指定实例标签。
-- `dayu-wechat run` 依赖本地已有登录态；若登录态失效，重新执行同一个 `--label` 的 `login` 即可。
-- 同一个 `--label` 的前台 `run` 和后台 service 不能并发运行；新的 daemon 若发现该 `state_dir` 已被占用，会直接拒绝启动。
-- macOS / Linux：如果你希望它长期后台运行，先执行 `dayu-wechat service install`，再执行 `dayu-wechat service start`。后续可用 `service restart`、`service stop`、`service status`、`service list`、`service uninstall` 管理。
-- `service install` 会把当前 shell 里已设置的关键环境变量快照进后台 service 定义，包括配置文件里 `{{ENV_VAR}}` 占位符引用到的变量，以及少量代码直读变量（如 `SEC_USER_AGENT`、联网检索/FMP API key）。如果你后来改了 API key，需要重新执行一次 `dayu-wechat service install`；若后台 service 已在运行，再执行 `dayu-wechat service restart` 让新配置生效。
-- `dayu-wechat service status --label <name>` 会直接打印日志定位信息：macOS 打印 stdout/stderr 文件路径；Linux 打印 `journalctl --user -u <label>.service -f` 查看命令。
-- `dayu-wechat service list` 只列出当前 workspace 下已安装的实例，并回显实例标签、状态目录、系统 service label、运行状态和是否已有登录态。
-- macOS 下默认日志分流语义是：stdout 文件保留全量运行日志，stderr 文件额外记录真正错误与异常堆栈；因此 ERROR 会同时出现在两边。
-- Windows：目前没有后台托管命令，使用方式是先执行 `dayu-wechat login`，再执行 `dayu-wechat run`，需要持续运行时请保持终端窗口开启。
-- 若需要重新扫码登录，可重启命令并加上 `--relogin`。
+真实微信登录、前台 daemon、后台 service install/start/restart/stop/status/list/uninstall 当前不可用。
 
 ### 3.6 自动写作：`write`
 
@@ -1085,26 +968,12 @@ python utils/smoke_async_agent_providers.py --case mimo-v2.5-pro-plan
 Markdown 报告渲染入口：
 
 ```bash
-dayu-render <输入文件.md> [输出文件]
+dayu-render --help
 ```
-
-常见示例：
-
-```bash
-dayu-render workspace/draft/AAPL/AAPL_qual_report.md
-dayu-render workspace/draft/AAPL/AAPL_qual_report.md report.pdf
-dayu-render workspace/draft/AAPL/AAPL_qual_report.md report.html
-```
-
-支持格式：
-- `.docx`（默认）
-- `.html`
-- `.pdf`
 
 说明：
-- 生成 **HTML**、**Word（.docx）** 需要 `pandoc`；生成 **PDF** 需要 `pandoc`（先由 Pandoc 生成 HTML）以及 Chrome（Headless 打印为 PDF）
-- 若 Chrome 不在标准位置，可设置 `PUPPETEER_EXECUTABLE_PATH`
-- 渲染器会保留 Markdown 里的普通换行；例如列表项里单独一行的“标签”与下一行正文，在 `.docx` 中会继续换行显示
+- `dayu-render` 当前只保留公开入口和 help。
+- 直接传入 Markdown 输入路径或输出路径不会生成 HTML、Word（.docx）或 PDF；当前会返回“尚未提供 Markdown 到 HTML、Word 或 PDF 的转换实现”的诊断。
 
 ## 7. 配置文件从哪里改
 
