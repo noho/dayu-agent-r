@@ -51,7 +51,7 @@ from dayu.host.llm_compaction import (
     LLMContextCompactor,
     parse_conversation_compact_output_vnext,
 )
-from tests.host.fake_cancellation import StubCancellationToken
+from tests.host.fake_cancellation import ControllableCancellationToken
 from tests.host.fake_compaction import fake_compaction_proposal_from_material_json
 
 _TEST_SYSTEM_PROMPT = "test compactor system prompt"
@@ -166,7 +166,7 @@ def test_llm_context_compactor_prepares_same_source_runner_input() -> None:
     compaction_request = _request_with_long_input_material()
     prepared = _llm_compactor().prepare_compactor_proposal_run_input(
         compaction_request,
-        StubCancellationToken(),
+        ControllableCancellationToken(),
         compaction_operation_id="event-context-compact-requested-test",
         compaction_attempt_number=2,
     )
@@ -771,7 +771,7 @@ async def test_llm_context_compactor_compact_uses_vnext_material(
 
     monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", fake_run)
 
-    candidate = await _llm_compactor().compact(_request(), StubCancellationToken())
+    candidate = await _llm_compactor().compact(_request(), ControllableCancellationToken())
 
     assert isinstance(candidate, ConversationCompactOutputVNext)
     assert len(calls) == 1
@@ -825,7 +825,7 @@ async def test_llm_context_compactor_rejects_non_final_outcome(
     monkeypatch.setattr("dayu.host.llm_compaction.run_agent_and_wait", fake_run)
 
     with pytest.raises(LLMCompactionProposalError, match="<redacted>"):
-        await _llm_compactor().compact(_request(), StubCancellationToken())
+        await _llm_compactor().compact(_request(), ControllableCancellationToken())
 
 
 def _proposal_json(compact_input: ConversationCompactInputVNext) -> dict[str, JsonValue]:

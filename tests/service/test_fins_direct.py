@@ -38,39 +38,9 @@ from dayu.service.fins_direct import (
     FinsDirectCommandService,
     FinsDirectUsageError,
 )
+from tests.host.fake_cancellation import ControllableCancellationToken
 
 _NOW: datetime = datetime(2026, 6, 14, tzinfo=timezone.utc)
-
-
-class _FakeCancellationToken:
-    """测试用取消 token。"""
-
-    def is_cancelled(self) -> bool:
-        """返回当前是否已取消。
-
-        :returns: 始终返回 ``False``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return False
-
-    def cancel_reason(self) -> str | None:
-        """返回取消原因。
-
-        :returns: 始终返回 ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return None
-
-    def requested_at(self) -> datetime | None:
-        """返回取消请求时间。
-
-        :returns: 始终返回 ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return None
 
 
 class _FakeIngestionRuntime:
@@ -289,7 +259,7 @@ async def _consume_until_cancelled(events: AsyncIterator[FinsEvent]) -> None:
 async def test_download_stream_builds_request_and_yields_progress_result() -> None:
     """download 必须构造请求并产出 progress -> result。"""
 
-    token = _FakeCancellationToken()
+    token = ControllableCancellationToken()
     runtime = _FakeIngestionRuntime((_progress_event(), _result_event()))
     service = FinsDirectCommandService(runtime)
 

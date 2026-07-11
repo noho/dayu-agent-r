@@ -49,7 +49,7 @@ from dayu.host.context_events import build_context_compaction_attempt_rejected_p
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.durable.codec import sha256_digest_json
-from tests.host.fake_cancellation import StubCancellationToken
+from tests.host.fake_cancellation import ControllableCancellationToken
 from tests.host.fake_compaction import FakeContextCompactor
 
 _DIGEST = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -162,7 +162,7 @@ class _EmptyMessageFailingCompactor(FakeContextCompactor):
 class _CancelAfterFailureCompactor(FakeContextCompactor):
     """首次失败后请求取消的 compactor。"""
 
-    def __init__(self, token: StubCancellationToken) -> None:
+    def __init__(self, token: ControllableCancellationToken) -> None:
         """初始化可控 token 与调用计数。
 
         :param token: 测试用可控 cancellation token。
@@ -572,7 +572,7 @@ class _PreparedManifestCompactor(FakeContextCompactor):
 class _PreparedCancelledCompactor(_PreparedManifestCompactor):
     """prepared proposal run 阶段请求取消并抛出 CancelledError。"""
 
-    def __init__(self, events: list[str], token: StubCancellationToken) -> None:
+    def __init__(self, events: list[str], token: ControllableCancellationToken) -> None:
         """初始化 compactor。
 
         :param events: 共享顺序记录列表。
@@ -644,7 +644,7 @@ def _proposal_agent_request(
         ),
         tool_schemas=(),
         tool_executor=_RejectingToolExecutor(),
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
 
 
@@ -679,7 +679,7 @@ async def test_run_compaction_operation_retries_async_proposal_failure() -> None
         request=_request(),
         compactor=compactor,
         max_attempts=2,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
 
     assert compactor.calls == 2
@@ -702,7 +702,7 @@ async def test_run_compaction_operation_records_prepared_proposal_manifest_befor
         request=_request(),
         compactor=_PreparedManifestCompactor(events),
         max_attempts=1,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
         compaction_operation_id="operation-prepared-accepted",
         proposal_manifest_recorder=recorder,
     )
@@ -725,7 +725,7 @@ def test_compactor_proposal_manifest_uses_initial_trigger_for_first_attempt() ->
     compactor = _PreparedManifestCompactor([])
     prepared_input = compactor.prepare_compactor_proposal_run_input(
         request,
-        StubCancellationToken(),
+        ControllableCancellationToken(),
         compaction_operation_id="operation-trigger",
         compaction_attempt_number=1,
     )
@@ -767,7 +767,7 @@ async def test_run_compaction_operation_rejected_attempt_keeps_proposal_manifest
         request=_request(),
         compactor=_PreparedManifestCompactor(events, fail_run=True),
         max_attempts=1,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
         compaction_operation_id="operation-prepared-failed",
         proposal_manifest_recorder=recorder,
     )
@@ -787,7 +787,7 @@ async def test_run_compaction_operation_cancelled_proposal_keeps_manifest_ref() 
     """proposal 已写 manifest 后被 Host 取消时仍返回 rejected attempt。"""
 
     events: list[str] = []
-    token = StubCancellationToken()
+    token = ControllableCancellationToken()
     recorder = _RecordingProposalManifestRecorder(events)
 
     result = await run_compaction_operation(
@@ -858,7 +858,7 @@ async def test_run_compaction_operation_retries_quality_rejection() -> None:
         request=_request(),
         compactor=compactor,
         max_attempts=2,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
 
     assert compactor.calls == 2
@@ -906,7 +906,7 @@ async def test_run_compaction_operation_retries_hard_threshold_after_compact() -
         request=_request(),
         compactor=compactor,
         max_attempts=2,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
 
     assert compactor.calls == 2
@@ -937,7 +937,7 @@ async def test_run_compaction_operation_accepts_reactive_budget_estimate_overflo
         request=_request(trigger_source=ContextCompactionTriggerSource.REACTIVE),
         compactor=compactor,
         max_attempts=2,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
 
     assert compactor.calls == 1
@@ -955,7 +955,7 @@ async def test_run_compaction_operation_fails_after_async_attempt_budget() -> No
         request=_request(),
         compactor=_AlwaysFailingCompactor(),
         max_attempts=2,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
 
     assert result.accepted_candidate is None
@@ -984,7 +984,7 @@ async def test_run_compaction_operation_logs_terminal_reject_as_warning(
             request=_request(),
             compactor=_AlwaysFailingCompactor(),
             max_attempts=1,
-            cancellation_token=StubCancellationToken(),
+            cancellation_token=ControllableCancellationToken(),
         )
 
     assert result.failure_reason is not None
@@ -1011,7 +1011,7 @@ async def test_run_compaction_operation_budget_excludes_candidate_diagnostics() 
         request=request,
         compactor=_DiagnosticsOnlyLargeCompactor(),
         max_attempts=1,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
         compaction_operation_id="operation-diagnostics-budget",
     )
 
@@ -1027,7 +1027,7 @@ async def test_run_compaction_operation_budget_excludes_candidate_diagnostics() 
 async def test_run_compaction_operation_stops_before_retry_when_cancelled() -> None:
     """首次失败后 token 被取消时，不发起第二次 compactor 调用。"""
 
-    token = StubCancellationToken()
+    token = ControllableCancellationToken()
     compactor = _CancelAfterFailureCompactor(token)
 
     result = await run_compaction_operation(
@@ -1067,7 +1067,7 @@ async def test_run_compaction_operation_redacts_exception_diagnostic_refs() -> N
         request=_request(),
         compactor=_SensitiveFailingCompactor(),
         max_attempts=1,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
 
     diagnostic_ref = result.rejected_attempts[0].diagnostic_refs[0]
@@ -1124,7 +1124,7 @@ async def test_run_compaction_operation_redacts_each_value_bearing_secret_patter
         request=_request(),
         compactor=_SensitiveFailingCompactor(message),
         max_attempts=1,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
 
     diagnostic_ref = result.rejected_attempts[0].diagnostic_refs[0]
@@ -1145,7 +1145,7 @@ async def test_run_compaction_operation_keeps_plain_token_expired_context() -> N
         request=_request(),
         compactor=_SensitiveFailingCompactor("provider failed: JWT token has expired"),
         max_attempts=1,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
 
     diagnostic_ref = result.rejected_attempts[0].diagnostic_refs[0]
@@ -1165,7 +1165,7 @@ async def test_exception_diagnostic_suffix_uses_exception_type_for_empty_message
         request=_request(),
         compactor=_EmptyMessageFailingCompactor(),
         max_attempts=1,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
 
     diagnostic_ref = result.rejected_attempts[0].diagnostic_refs[0]
@@ -1184,7 +1184,7 @@ async def test_reactive_multi_pass_commits_single_merged_context_compacted() -> 
         request=request,
         compactor=compactor,
         max_attempts=2,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
         pass_queue=(request, request),
     )
 
@@ -1205,7 +1205,7 @@ async def test_reactive_multi_pass_uses_last_whole_vnext_fact_tuple() -> None:
         request=request,
         compactor=compactor,
         max_attempts=2,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
         pass_queue=(request, request),
     )
 
@@ -1228,7 +1228,7 @@ async def test_reactive_multi_pass_uses_last_whole_vnext_candidate() -> None:
         request=request,
         compactor=compactor,
         max_attempts=2,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
         pass_queue=(request, request),
     )
 
@@ -1282,7 +1282,7 @@ async def test_vnext_quality_reject_records_rejected_attempt(
         request=request,
         compactor=_RecordingCompactor(),
         max_attempts=2,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
 
     assert result.accepted_candidate is not None
@@ -1310,7 +1310,7 @@ async def test_reactive_multi_pass_intermediate_failure_commits_single_failed_ev
         request=request,
         compactor=compactor,
         max_attempts=2,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
         pass_queue=(request, request),
     )
 
@@ -1332,7 +1332,7 @@ async def test_reactive_passes_share_operation_attempt_budget() -> None:
         request=request,
         compactor=compactor,
         max_attempts=1,
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
         pass_queue=(request, request),
     )
 

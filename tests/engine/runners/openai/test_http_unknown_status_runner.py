@@ -19,9 +19,9 @@ from dayu.engine.contracts.runner_events import (
 )
 from dayu.engine.runners.openai.runner import AsyncOpenAIRunner
 
+from tests.host.fake_cancellation import ControllableCancellationToken
 from tests.engine.runners.openai._factories import make_options, make_spec
 from tests.engine.runners.openai._fakes import (
-    FakeCancellationToken,
     FakeResponseSpec,
     FakeSession,
 )
@@ -45,7 +45,7 @@ async def test_non_200_status_classified_as_unknown_http_status(
 
     runner = AsyncOpenAIRunner(
         spec=make_spec(max_retries=0),
-        cancellation_token=FakeCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
     session = FakeSession()
     session.enqueue_response(

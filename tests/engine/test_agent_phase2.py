@@ -97,6 +97,7 @@ from dayu.contracts.tool_schema import (
     ToolParametersSchema,
     ToolSchema,
 )
+from tests.host.fake_cancellation import ControllableCancellationToken
 
 _TOOL_EXECUTION_TIMEOUT_SECONDS: float = 5.0
 _CONTINUATION_MAX_ATTEMPTS: int = 3
@@ -147,54 +148,6 @@ def _utc_now() -> datetime:
     return datetime.now(tz=timezone.utc)
 
 
-@dataclass(slots=True)
-class _Token:
-    """测试用 cancellation token。"""
-
-    cancelled: bool = False
-    reason: str | None = None
-    requested: datetime | None = None
-
-    def is_cancelled(self) -> bool:
-        """返回是否已取消。
-
-        :returns: 已取消返回 ``True``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return self.cancelled
-
-    def cancel_reason(self) -> str | None:
-        """返回取消原因。
-
-        :returns: 取消原因或 ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return self.reason
-
-    def requested_at(self) -> datetime | None:
-        """返回取消请求时间。
-
-        :returns: 请求时间或 ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return self.requested
-
-    def trigger(self, reason: str = "test_cancelled") -> None:
-        """触发取消。
-
-        :param reason: 取消原因。
-        :returns: 无返回值。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        self.cancelled = True
-        self.reason = reason
-        self.requested = _utc_now()
-
-
 class _NoopToolExecutor:
     """测试用 no-op ToolExecutor。"""
 
@@ -232,7 +185,7 @@ class _ScriptedRunner:
 
     events: tuple[RunnerEvent, ...]
     token_to_cancel_after_event_index: int | None = None
-    token: _Token | None = None
+    token: ControllableCancellationToken | None = None
     raise_on_call: bool = False
     raise_on_close: bool = False
     raise_cancelled_on_close: bool = False
@@ -310,7 +263,7 @@ class _ScriptedRunner:
                 and self.token is not None
                 and index == self.token_to_cancel_after_event_index
             ):
-                self.token.trigger()
+                self.token.request_cancel()
             if index == 0 and self.block_after_first_event:
                 await self.release_event.wait()
 
@@ -428,7 +381,7 @@ def _event(event_type: RunnerEventType, data: RunnerEventData) -> RunnerEvent:
 
 def _request(
     *,
-    token: _Token | None = None,
+    token: ControllableCancellationToken | None = None,
     max_iterations: int = 1,
     tool_schemas: tuple[ToolSchema, ...] = (),
 ) -> AgentRunRequest:
@@ -441,7 +394,7 @@ def _request(
     :raises Exception: 不主动抛出异常。
     """
 
-    actual_token = token or _Token()
+    actual_token = token or ControllableCancellationToken()
     return AgentRunRequest(
         run_id="run_phase2",
         session_id="session_phase2",
@@ -1277,8 +1230,8 @@ def test_safe_log_message_preserves_false_positive_guards(
 async def test_cancelled_before_run_closes_then_emits_cancelled() -> None:
     """入口已取消时不调用 Runner，但先 close 再产出 run_cancelled。"""
 
-    token = _Token()
-    token.trigger()
+    token = ControllableCancellationToken()
+    token.request_cancel()
     runner = _ScriptedRunner(events=())
     events = await _collect(
         _AsyncAgent(request=_request(token=token), runner=runner)
@@ -1298,7 +1251,7 @@ async def test_cancelled_before_run_closes_then_emits_cancelled() -> None:
 async def test_runner_cancelled_naturally_without_done_maps_cancelled() -> None:
     """Runner 因取消自然结束且无 done 时由 Agent 收口 run_cancelled。"""
 
-    token = _Token()
+    token = ControllableCancellationToken()
     runner = _ScriptedRunner(
         events=(
             _event(
@@ -1321,7 +1274,7 @@ async def test_runner_cancelled_naturally_without_done_maps_cancelled() -> None:
 async def test_cancel_before_final_answer_wins_over_final() -> None:
     """final_answer 前取消优先于最终回答。"""
 
-    token = _Token()
+    token = ControllableCancellationToken()
     runner = _ScriptedRunner(
         events=(
             _event(
@@ -1351,7 +1304,7 @@ async def test_cancel_before_final_answer_wins_over_final() -> None:
 async def test_provider_error_and_cancel_same_run_cancel_wins() -> None:
     """provider error 与取消同时出现时取消优先于 failure terminal。"""
 
-    token = _Token()
+    token = ControllableCancellationToken()
     runner = _ScriptedRunner(
         events=(
             _event(
@@ -1382,7 +1335,7 @@ async def test_provider_error_and_cancel_same_run_cancel_wins() -> None:
 async def test_http_error_and_cancel_same_run_cancel_wins() -> None:
     """HTTP error 后若取消同时到达，取消优先于 failure terminal。"""
 
-    token = _Token()
+    token = ControllableCancellationToken()
     runner = _ScriptedRunner(
         events=(
             _event(
@@ -1792,7 +1745,8 @@ async def test_run_agent_and_wait_maps_final_failed_cancelled(
         ),
         _ScriptedRunner(events=()),
     ]
-    token = _Token(cancelled=True, reason="stop", requested=_utc_now())
+    token = ControllableCancellationToken()
+    token.request_cancel("stop")
     requests = [request, request, _request(token=token)]
 
     for runner, current_request, expected_type in zip(

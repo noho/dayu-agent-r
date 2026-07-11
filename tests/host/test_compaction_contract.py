@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from datetime import UTC
 
 import pytest
 
@@ -34,11 +35,38 @@ from dayu.host.compaction import (
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_governance import check_conversation_compact_output_vnext
 from dayu.host.context_policy import ContextCompactionTriggerSource
-from tests.host.fake_cancellation import StubCancellationToken
+from tests.host.fake_cancellation import ControllableCancellationToken
 from tests.host.fake_compaction import FakeContextCompactor
 
 _LLM_FACING_OUTPUT_CONTRACT_IDENTIFIER = "conversation_compact_output_v1"
 _INTERNAL_COMPACT_OUTPUT_TYPE_NAME = "ConversationCompactOutputVNext"
+
+
+def test_controllable_cancellation_token_contract_is_protocol_faithful() -> None:
+    """测试侧可控 token 必须保持 CancellationToken 观察协议语义。
+
+    :returns: ``None``。
+    :raises AssertionError: token 默认状态、取消状态或幂等语义不符合契约时抛出。
+    """
+
+    token = ControllableCancellationToken()
+
+    assert token.is_cancelled() is False
+    assert token.cancel_reason() is None
+    assert token.requested_at() is None
+
+    token.request_cancel("first_reason")
+    first_requested_at = token.requested_at()
+
+    assert token.is_cancelled() is True
+    assert token.cancel_reason() == "first_reason"
+    assert first_requested_at is not None
+    assert first_requested_at.tzinfo is UTC
+
+    token.request_cancel("second_reason")
+
+    assert token.cancel_reason() == "first_reason"
+    assert token.requested_at() == first_requested_at
 
 
 @pytest.mark.asyncio
@@ -46,7 +74,7 @@ async def test_context_compactor_single_public_compact_returns_vnext_output() ->
     """ContextCompactor 只通过 compact() 返回 vNext output。"""
 
     request = _request()
-    candidate = await FakeContextCompactor().compact(request, StubCancellationToken())
+    candidate = await FakeContextCompactor().compact(request, ControllableCancellationToken())
 
     assert isinstance(candidate, ConversationCompactOutputVNext)
     assert candidate.schema_version == CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT
@@ -120,7 +148,7 @@ async def test_vnext_quality_checker_accepts_fake_candidate() -> None:
     compact_input = conversation_compact_input_vnext_from_material_pack(
         request.material_pack
     )
-    candidate = await FakeContextCompactor().compact(request, StubCancellationToken())
+    candidate = await FakeContextCompactor().compact(request, ControllableCancellationToken())
 
     result = check_conversation_compact_output_vnext(compact_input, candidate)
 

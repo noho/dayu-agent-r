@@ -84,6 +84,7 @@ from dayu.contracts.tool_schema import (
     ToolParametersSchema,
     ToolSchema,
 )
+from tests.host.fake_cancellation import ControllableCancellationToken
 from tests.engine.runners.openai._sse_helpers import make_no_thought_hook
 
 _TOOL_EXECUTION_TIMEOUT_SECONDS: float = 5.0
@@ -117,65 +118,17 @@ def _utc_now() -> datetime:
 
 
 @dataclass(slots=True)
-class _Token:
-    """测试用 cancellation token。"""
-
-    cancelled: bool = False
-    reason: str | None = None
-    requested: datetime | None = None
-
-    def is_cancelled(self) -> bool:
-        """返回是否已取消。
-
-        :returns: 已取消返回 ``True``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return self.cancelled
-
-    def cancel_reason(self) -> str | None:
-        """返回取消原因。
-
-        :returns: 取消原因或 ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return self.reason
-
-    def requested_at(self) -> datetime | None:
-        """返回取消请求时间。
-
-        :returns: 请求时间或 ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        return self.requested
-
-    def trigger(self, reason: str = "test_cancelled") -> None:
-        """触发取消。
-
-        :param reason: 取消原因。
-        :returns: 无返回值。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        self.cancelled = True
-        self.reason = reason
-        self.requested = _utc_now()
-
-
-@dataclass(slots=True)
 class _ScriptedRunner:
     """按调用次数产出 RunnerEvent 的 fake Runner。"""
 
     scripts: tuple[tuple[RunnerEvent, ...], ...]
     supports_tools: bool = True
     raise_on_call_indices: frozenset[int] = field(default_factory=frozenset)
-    token_to_cancel: _Token | None = None
+    token_to_cancel: ControllableCancellationToken | None = None
     cancel_after_call_indices: frozenset[int] = field(default_factory=frozenset)
     call_count: int = 0
     close_count: int = 0
-    token_to_cancel_on_close: _Token | None = None
+    token_to_cancel_on_close: ControllableCancellationToken | None = None
     tools_seen: list[tuple[ToolSchema, ...]] = field(default_factory=list)
     messages_seen: list[tuple[AgentMessage, ...]] = field(default_factory=list)
     request_identities_seen: list[RunnerRequestIdentity | None] = field(
@@ -232,7 +185,7 @@ class _ScriptedRunner:
 
         self.close_count += 1
         if self.token_to_cancel_on_close is not None:
-            self.token_to_cancel_on_close.trigger()
+            self.token_to_cancel_on_close.request_cancel()
 
     async def _iter_events(
         self, events: tuple[RunnerEvent, ...]
@@ -270,7 +223,7 @@ class _ScriptedRunner:
         for event in events:
             yield event
         if self.token_to_cancel is not None:
-            self.token_to_cancel.trigger()
+            self.token_to_cancel.request_cancel()
 
 
 @dataclass(slots=True)
@@ -347,7 +300,7 @@ class _RecordingToolExecutor:
 
     outcomes: Mapping[str, ToolExecutionOutcome]
     records_override: tuple[BatchToolExecutionRecord, ...] | None = None
-    token_to_cancel: _Token | None = None
+    token_to_cancel: ControllableCancellationToken | None = None
     raise_for_call_id: str | None = None
     raise_cancelled_for_call_id: str | None = None
     requests: list[BatchToolExecutionRequest] = field(default_factory=list)
@@ -378,7 +331,7 @@ class _RecordingToolExecutor:
         ):
             raise asyncio.CancelledError()
         if self.token_to_cancel is not None:
-            self.token_to_cancel.trigger()
+            self.token_to_cancel.request_cancel()
         if self.records_override is not None:
             return BatchToolExecutionOutcome(records=self.records_override)
         records = tuple(
@@ -396,7 +349,7 @@ class _HangingToolExecutor:
     """持续挂起直到被取消的 fake ToolExecutor。"""
 
     requests: list[BatchToolExecutionRequest] = field(default_factory=list)
-    token_to_cancel_on_cancel: _Token | None = None
+    token_to_cancel_on_cancel: ControllableCancellationToken | None = None
     cancelled: bool = False
 
     async def execute(
@@ -415,7 +368,7 @@ class _HangingToolExecutor:
         except asyncio.CancelledError:
             self.cancelled = True
             if self.token_to_cancel_on_cancel is not None:
-                self.token_to_cancel_on_cancel.trigger()
+                self.token_to_cancel_on_cancel.request_cancel()
             raise
         records = tuple(
             BatchToolExecutionRecord(
@@ -607,7 +560,7 @@ def _awaiting(
 
 def _request(
     *,
-    token: _Token | None = None,
+    token: ControllableCancellationToken | None = None,
     executor: ToolExecutor | None = None,
     max_iterations: int = 2,
     fallback_mode: AgentFallbackMode = AgentFallbackMode.FORCE_ANSWER,
@@ -673,7 +626,7 @@ def _request(
         tool_executor=executor or _RecordingToolExecutor(
             outcomes={"tc_1": _success(5)}
         ),
-        cancellation_token=token or _Token(),
+        cancellation_token=token or ControllableCancellationToken(),
         attempt_id="attempt_phase3",
         execution_id="execution_phase3",
     )
@@ -1700,7 +1653,7 @@ async def test_tool_awaiting_suspends_run_with_accepted_and_awaiting_records() -
 async def test_awaiting_cancellation_before_and_after_outcome_boundary() -> None:
     """取消在 awaiting outcome 前后命中时遵守提交边界。"""
 
-    token_before = _Token()
+    token_before = ControllableCancellationToken()
     before_executor = _RecordingToolExecutor(
         outcomes={"tc_1": _awaiting()},
         token_to_cancel=token_before,
@@ -1719,7 +1672,7 @@ async def test_awaiting_cancellation_before_and_after_outcome_boundary() -> None
         if event.type is EngineEventType.TOOL_AWAITING
     ] == []
 
-    token_after = _Token()
+    token_after = ControllableCancellationToken()
     after_executor = _RecordingToolExecutor(outcomes={"tc_1": _awaiting()})
     after_agent = _AsyncAgent(
         request=_request(token=token_after, executor=after_executor),
@@ -1729,7 +1682,7 @@ async def test_awaiting_cancellation_before_and_after_outcome_boundary() -> None
     async for event in after_agent.run_messages():
         after_events.append(event)
         if event.type is EngineEventType.TOOL_AWAITING:
-            token_after.trigger("after_awaiting")
+            token_after.request_cancel("after_awaiting")
 
     assert _terminal(after_events).type is EngineEventType.RUN_SUSPENDED
     assert [
@@ -1834,7 +1787,7 @@ async def test_duplicate_and_executor_exception_paths(
 async def test_cancel_before_tool_batch_does_not_register_tool_call_id() -> None:
     """取消命中工具批执行前时，不应先登记本批 tool_call_id。"""
 
-    token = _Token()
+    token = ControllableCancellationToken()
     executor = _RecordingToolExecutor(outcomes={"tc_1": _success(1)})
     runner = _ScriptedRunner(
         scripts=(
@@ -1899,7 +1852,7 @@ async def test_tool_execution_timeout_fails_run_without_tool_result() -> None:
 async def test_tool_execution_timeout_wins_over_cleanup_cancel() -> None:
     """工具握手超时已判定后，清理阶段 late cancel 不覆盖 run_failed。"""
 
-    token = _Token()
+    token = ControllableCancellationToken()
     executor = _HangingToolExecutor(token_to_cancel_on_cancel=token)
     runner = _ScriptedRunner(scripts=(_tool_script(_tool_call("tc_1")),))
 
@@ -1930,7 +1883,7 @@ async def test_tool_execution_timeout_wins_over_cleanup_cancel() -> None:
 async def test_tool_execution_timeout_wins_over_runner_close_cancel() -> None:
     """工具超时后的 runner close 触发 late cancel 时仍保持超时失败。"""
 
-    token = _Token()
+    token = ControllableCancellationToken()
     executor = _HangingToolExecutor()
     runner = _ScriptedRunner(
         scripts=(_tool_script(_tool_call("tc_1")),),
@@ -2255,7 +2208,7 @@ async def test_content_filter_does_not_trigger_continuation() -> None:
 async def test_cancellation_wins_before_length_continuation() -> None:
     """截断后若 Host 已取消，下一轮 Runner 调用前必须取消收口。"""
 
-    token = _Token()
+    token = ControllableCancellationToken()
     runner = _ScriptedRunner(
         scripts=(
             _final_script("partial", finish_reason=FinishReason.LENGTH),
@@ -2350,7 +2303,7 @@ async def test_consecutive_failed_batches_force_answer_raise_and_reset() -> None
 async def test_late_cancellation_after_tool_outcome_preserves_accepted_facts() -> None:
     """工具 outcome 后 late cancel 只阻止下一轮 Runner。"""
 
-    token = _Token()
+    token = ControllableCancellationToken()
     executor = _RecordingToolExecutor(outcomes={"tc_1": _success(5)})
     runner = _ScriptedRunner(
         scripts=(
@@ -2386,7 +2339,7 @@ async def test_late_cancellation_after_tool_outcome_preserves_accepted_facts() -
     async for event in agent.run_messages():
         events.append(event)
         if event.type is EngineEventType.TOOL_RESULT_ACCEPTED:
-            token.trigger("after_tool_result")
+            token.request_cancel("after_tool_result")
 
     assert _terminal(events).type is EngineEventType.RUN_CANCELLED
     assert runner.call_count == 1
@@ -2533,7 +2486,7 @@ async def test_late_cancel_after_accepted_before_awaiting_does_not_swallow_suspe
     tool_awaiting 与 run_suspended，不应降级为 run_cancelled。
     """
 
-    token = _Token()
+    token = ControllableCancellationToken()
     snapshot = ToolAwaitSnapshot(
         snapshot_id="snapshot-late",
         captured_at=_utc_now(),
@@ -2566,7 +2519,7 @@ async def test_late_cancel_after_accepted_before_awaiting_does_not_swallow_suspe
             not triggered
             and event.type is EngineEventType.TOOL_RESULT_ACCEPTED
         ):
-            token.trigger("after_accepted_before_awaiting")
+            token.request_cancel("after_accepted_before_awaiting")
             triggered = True
 
     assert triggered

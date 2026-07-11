@@ -41,9 +41,9 @@ from dayu.engine.runners.openai.runner import (
     _is_sse_response,
 )
 
+from tests.host.fake_cancellation import ControllableCancellationToken
 from tests.engine.runners.openai._factories import make_options, make_spec
 from tests.engine.runners.openai._fakes import (
-    FakeCancellationToken,
     FakeResponseSpec,
     FakeSession,
 )
@@ -100,7 +100,7 @@ def _install_session(
 def _agent_request(
     *,
     spec: RunnerSpec,
-    token: FakeCancellationToken,
+    token: ControllableCancellationToken,
     stream: bool,
 ) -> AgentRunRequest:
     """构造 OpenAI Runner 到 Agent 的集成测试请求。
@@ -160,7 +160,7 @@ async def _collect_agent_events(
     *,
     runner: AsyncOpenAIRunner,
     spec: RunnerSpec,
-    token: FakeCancellationToken,
+    token: ControllableCancellationToken,
     stream: bool,
 ) -> list[EngineEvent]:
     """通过 Agent 执行 OpenAI Runner 并收集 EngineEvent。
@@ -223,7 +223,7 @@ async def test_supports_streaming_false_downgrades_payload_to_non_stream() -> No
 
     runner = AsyncOpenAIRunner(
         spec=make_spec(supports_streaming=False, supports_stream_usage=True),
-        cancellation_token=FakeCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
     session = FakeSession()
     session.enqueue_response(
@@ -343,7 +343,7 @@ async def test_sse_success_provider_request_id_reaches_agent_iteration_completed
     """SSE 正常成功响应的 request id 会传到 Agent iteration_completed。"""
 
     spec = make_spec(supports_streaming=True)
-    token = FakeCancellationToken()
+    token = ControllableCancellationToken()
     runner = AsyncOpenAIRunner(spec=spec, cancellation_token=token)
     session = FakeSession()
     session.enqueue_response(
@@ -381,7 +381,7 @@ async def test_stream_true_json_content_type_uses_non_stream_parser() -> None:
 
     runner = AsyncOpenAIRunner(
         spec=make_spec(supports_streaming=True),
-        cancellation_token=FakeCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
     session = FakeSession()
     session.enqueue_response(
@@ -423,7 +423,7 @@ async def test_stream_true_missing_content_type_falls_back_to_sse(
     )
     runner = AsyncOpenAIRunner(
         spec=make_spec(supports_streaming=True),
-        cancellation_token=FakeCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
     session = FakeSession()
     session.enqueue_response(
@@ -474,7 +474,7 @@ async def test_non_stream_missing_content_type_keeps_json_parse_with_diagnostic(
     )
     runner = AsyncOpenAIRunner(
         spec=make_spec(supports_streaming=True),
-        cancellation_token=FakeCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
     session = FakeSession()
     session.enqueue_response(
@@ -524,7 +524,7 @@ async def test_non_stream_success_provider_request_id_reaches_agent_iteration_co
     """非流式正常成功响应的 request id 会传到 Agent iteration_completed。"""
 
     spec = make_spec(supports_streaming=True)
-    token = FakeCancellationToken()
+    token = ControllableCancellationToken()
     runner = AsyncOpenAIRunner(spec=spec, cancellation_token=token)
     session = FakeSession()
     session.enqueue_response(

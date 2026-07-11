@@ -215,12 +215,12 @@ async def test_runner_sleeps_between_retries(
     from dayu.engine.contracts.runner_events import RunnerEventType
     from dayu.engine.runners.openai.runner import AsyncOpenAIRunner
 
+    from tests.host.fake_cancellation import ControllableCancellationToken
     from tests.engine.runners.openai._factories import (
         make_options,
         make_spec,
     )
     from tests.engine.runners.openai._fakes import (
-        FakeCancellationToken,
         FakeResponseSpec,
         FakeSession,
     )
@@ -235,7 +235,7 @@ async def test_runner_sleeps_between_retries(
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
     runner = AsyncOpenAIRunner(
         spec=make_spec(max_retries=2),
-        cancellation_token=FakeCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
     session = FakeSession()
     # 第一次 429 with Retry-After=3 → sleep 3

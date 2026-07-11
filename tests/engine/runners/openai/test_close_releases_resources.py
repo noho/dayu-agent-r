@@ -7,8 +7,9 @@ import pytest
 from dayu.engine.runners.openai.http_client import HTTPClient
 from dayu.engine.runners.openai.runner import AsyncOpenAIRunner
 
+from tests.host.fake_cancellation import ControllableCancellationToken
 from tests.engine.runners.openai._factories import make_spec
-from tests.engine.runners.openai._fakes import FakeCancellationToken, FakeSession
+from tests.engine.runners.openai._fakes import FakeSession
 
 
 @pytest.mark.asyncio
@@ -31,7 +32,7 @@ async def test_runner_close_releases_resources() -> None:
     """``AsyncOpenAIRunner.close`` 应触发 HTTPClient.close。"""
 
     runner = AsyncOpenAIRunner(
-        spec=make_spec(), cancellation_token=FakeCancellationToken()
+        spec=make_spec(), cancellation_token=ControllableCancellationToken()
     )
     fake_session = FakeSession()
     runner._http_client._session = fake_session  # type: ignore[attr-defined]
@@ -44,7 +45,8 @@ async def test_runner_close_releases_resources() -> None:
 async def test_close_after_cancel_does_not_raise() -> None:
     """已取消状态下 ``close`` 不应抛异常。"""
 
-    token = FakeCancellationToken(cancelled=True)
+    token = ControllableCancellationToken()
+    token.request_cancel()
     runner = AsyncOpenAIRunner(spec=make_spec(), cancellation_token=token)
     fake_session = FakeSession()
     runner._http_client._session = fake_session  # type: ignore[attr-defined]

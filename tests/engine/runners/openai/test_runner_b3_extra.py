@@ -30,9 +30,9 @@ from dayu.engine.contracts.runner_events import (
 )
 from dayu.engine.runners.openai.runner import AsyncOpenAIRunner
 
+from tests.host.fake_cancellation import ControllableCancellationToken
 from tests.engine.runners.openai._factories import make_options, make_spec
 from tests.engine.runners.openai._fakes import (
-    FakeCancellationToken,
     FakeResponseSpec,
     FakeSession,
 )
@@ -70,7 +70,7 @@ async def test_sse_idle_aclose_does_not_leak_pending_task() -> None:
         stream_idle_heartbeat_seconds=0.05,
     )
     runner = AsyncOpenAIRunner(
-        spec=spec, cancellation_token=FakeCancellationToken()
+        spec=spec, cancellation_token=ControllableCancellationToken()
     )
     runner._http_client._session = session  # type: ignore[attr-defined]
 
@@ -126,7 +126,7 @@ async def test_sse_idle_outer_cancel_does_not_leak_pending_task() -> None:
         stream_idle_heartbeat_seconds=0.05,
     )
     runner = AsyncOpenAIRunner(
-        spec=spec, cancellation_token=FakeCancellationToken()
+        spec=spec, cancellation_token=ControllableCancellationToken()
     )
     runner._http_client._session = session  # type: ignore[attr-defined]
 
@@ -154,7 +154,7 @@ async def test_sse_idle_outer_cancel_does_not_leak_pending_task() -> None:
 async def test_sse_idle_cancel_wins_over_timeout() -> None:
     """cancel 与 idle timeout 并发命中时优先返回取消（不发 HTTP_ERROR）。"""
 
-    token = FakeCancellationToken()
+    token = ControllableCancellationToken()
     session = _DelayedSession(
         spec=FakeResponseSpec(
             status=200,
@@ -182,7 +182,7 @@ async def test_sse_idle_cancel_wins_over_timeout() -> None:
     task = asyncio.create_task(_drive())
     # 在 idle timeout 命中前抢先取消。
     await asyncio.sleep(0.01)
-    token.trigger("user-cancel")
+    token.request_cancel("user-cancel")
     events = await task
     # 取消语义：生成器自然终止，不补 RunnerDoneData，也不发 HTTP_ERROR。
     assert not any(
@@ -207,7 +207,7 @@ async def test_terminal_error_with_empty_body_falls_back_to_status() -> None:
     )
     runner = AsyncOpenAIRunner(
         spec=make_spec(max_retries=0),
-        cancellation_token=FakeCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
     runner._http_client._session = session  # type: ignore[attr-defined]
 
@@ -245,7 +245,7 @@ async def test_runner_event_stream_does_not_yield_log_records() -> None:
         )
     )
     runner = AsyncOpenAIRunner(
-        spec=make_spec(), cancellation_token=FakeCancellationToken()
+        spec=make_spec(), cancellation_token=ControllableCancellationToken()
     )
     runner._http_client._session = session  # type: ignore[attr-defined]
 
@@ -270,7 +270,7 @@ async def test_http_client_close_emits_debug_log(
     """``HTTPClient.close`` 应输出 debug 诊断（lazy session 路径）。"""
 
     runner = AsyncOpenAIRunner(
-        spec=make_spec(), cancellation_token=FakeCancellationToken()
+        spec=make_spec(), cancellation_token=ControllableCancellationToken()
     )
     namespace_logger = _attach_caplog_to_dayu(caplog)
     try:
@@ -301,7 +301,7 @@ async def test_idle_timeout_only_no_heartbeat_still_works() -> None:
         stream_idle_timeout_seconds=0.05,
     )
     runner = AsyncOpenAIRunner(
-        spec=spec, cancellation_token=FakeCancellationToken()
+        spec=spec, cancellation_token=ControllableCancellationToken()
     )
     runner._http_client._session = session  # type: ignore[attr-defined]
 
@@ -336,7 +336,7 @@ async def test_protocol_error_emits_warning_log(
         )
     )
     runner = AsyncOpenAIRunner(
-        spec=make_spec(), cancellation_token=FakeCancellationToken()
+        spec=make_spec(), cancellation_token=ControllableCancellationToken()
     )
     runner._http_client._session = session  # type: ignore[attr-defined]
 
@@ -379,7 +379,7 @@ async def test_http_post_and_response_debug_logs(
         )
     )
     runner = AsyncOpenAIRunner(
-        spec=make_spec(), cancellation_token=FakeCancellationToken()
+        spec=make_spec(), cancellation_token=ControllableCancellationToken()
     )
     runner._http_client._session = session  # type: ignore[attr-defined]
 

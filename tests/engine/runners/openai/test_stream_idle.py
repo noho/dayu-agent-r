@@ -30,9 +30,9 @@ from dayu.engine.contracts.runner_events import (
 from dayu.engine.runners.openai.runner import AsyncOpenAIRunner
 from dayu.runtime.log_levels import STREAM_DEBUG_LOG_LEVEL
 
+from tests.host.fake_cancellation import ControllableCancellationToken
 from tests.engine.runners.openai._factories import make_options, make_spec
 from tests.engine.runners.openai._fakes import (
-    FakeCancellationToken,
     FakeContent,
     FakeResponse,
     FakeResponseSpec,
@@ -161,7 +161,7 @@ def _heartbeat_runner() -> AsyncOpenAIRunner:
         stream_idle_heartbeat_seconds=0.02,
     )
     runner = AsyncOpenAIRunner(
-        spec=spec, cancellation_token=FakeCancellationToken()
+        spec=spec, cancellation_token=ControllableCancellationToken()
     )
     runner._http_client._session = session  # type: ignore[attr-defined]
     return runner
@@ -184,7 +184,7 @@ async def test_idle_timeout_emits_retriable_timeout() -> None:
         stream_idle_timeout_seconds=0.05,
     )
     runner = AsyncOpenAIRunner(
-        spec=spec, cancellation_token=FakeCancellationToken()
+        spec=spec, cancellation_token=ControllableCancellationToken()
     )
     runner._http_client._session = session  # type: ignore[attr-defined]
 
@@ -303,7 +303,7 @@ async def test_idle_disabled_does_not_emit_heartbeat_log(
     )
     spec = make_spec(max_retries=0)  # 不启用 idle
     runner = AsyncOpenAIRunner(
-        spec=spec, cancellation_token=FakeCancellationToken()
+        spec=spec, cancellation_token=ControllableCancellationToken()
     )
     runner._http_client._session = session  # type: ignore[attr-defined]
 

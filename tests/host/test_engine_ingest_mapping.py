@@ -181,7 +181,7 @@ from dayu.host.lifecycle_events import (
 from dayu.host.memory import MemoryProjectionPolicy
 from dayu.host.payload_resolution import event_payload_object
 from tests.host._context_compaction_assertions import assert_failed_payload_no_fallback
-from tests.host.fake_cancellation import StubCancellationToken
+from tests.host.fake_cancellation import ControllableCancellationToken
 from tests.host.fake_compaction import FakeContextCompactor
 from dayu.host.wait_adapter import WaitAdapterBinding, WaitExternalJobRefSource
 from dayu.host.waiting import (
@@ -4781,7 +4781,7 @@ def _candidate(
             worker_kind=WorkerKind.LOCAL,
             execution_target="target-ingest",
             local_worker_id="local-worker-ingest",
-            cancellation_token=StubCancellationToken(),
+            cancellation_token=ControllableCancellationToken(),
         ),
         worker_event_index=worker_event_index,
         engine_event=EngineEvent(
@@ -4863,7 +4863,7 @@ def _proposal_agent_request(
         ),
         tool_schemas=(),
         tool_executor=_RejectingToolExecutor(),
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
 
 
@@ -4905,7 +4905,7 @@ def _envelope(seeded: _SeededRun) -> LocalEngineEnvelope:
         worker_kind=WorkerKind.LOCAL,
         execution_target="target-ingest",
         local_worker_id="local-worker-ingest",
-        cancellation_token=StubCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
 
 

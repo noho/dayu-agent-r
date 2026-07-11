@@ -11,21 +11,21 @@ from datetime import UTC, datetime
 from dayu.contracts.cancellation import CancellationToken
 
 
-class StubCancellationToken(CancellationToken):
+class ControllableCancellationToken(CancellationToken):
     """测试专用可控 cancellation token。
 
-    :param reason: 初始取消原因；不传表示未取消。
+    该 helper 只在测试侧拥有取消 mutation；对被测代码只暴露
+    :class:`dayu.contracts.cancellation.CancellationToken` 观察协议。
     """
 
-    def __init__(self, reason: str | None = None) -> None:
-        """初始化测试 token。
+    def __init__(self) -> None:
+        """初始化为未取消状态。
 
-        :param reason: 初始取消原因；不传表示未取消。
         :returns: ``None``。
         """
 
-        self._reason = reason
-        self._requested_at = datetime.now(UTC) if reason is not None else None
+        self._reason: str | None = None
+        self._requested_at: datetime | None = None
 
     def is_cancelled(self) -> bool:
         """返回是否已取消。
@@ -51,7 +51,7 @@ class StubCancellationToken(CancellationToken):
 
         return self._requested_at
 
-    def request_cancel(self, reason: str) -> None:
+    def request_cancel(self, reason: str = "test_cancelled") -> None:
         """将 token 标记为已取消。
 
         :param reason: 取消原因。
@@ -61,3 +61,6 @@ class StubCancellationToken(CancellationToken):
         if self._reason is None:
             self._reason = reason
             self._requested_at = datetime.now(UTC)
+
+
+__all__ = ["ControllableCancellationToken"]

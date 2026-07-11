@@ -46,9 +46,9 @@ from tests.engine.runners.openai._diagnostic_helpers import (
     leaf_strings,
     serialized_size,
 )
+from tests.host.fake_cancellation import ControllableCancellationToken
 from tests.engine.runners.openai._factories import make_options, make_spec
 from tests.engine.runners.openai._fakes import (
-    FakeCancellationToken,
     FakeContent,
     FakeResponse,
     FakeResponseSpec,
@@ -281,7 +281,7 @@ def _make_runner(*, max_retries: int = 0) -> AsyncOpenAIRunner:
 
     return AsyncOpenAIRunner(
         spec=make_spec(max_retries=max_retries),
-        cancellation_token=FakeCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
 
 
@@ -475,7 +475,7 @@ async def test_stream_read_failure_after_event_does_not_retry(
     _patch_no_sleep(monkeypatch)
     runner = AsyncOpenAIRunner(
         spec=make_spec(max_retries=2),
-        cancellation_token=FakeCancellationToken(),
+        cancellation_token=ControllableCancellationToken(),
     )
     session = _ReadanyFailingSession(exc=exc)
     _install_session(runner, session)

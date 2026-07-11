@@ -21,9 +21,9 @@ from dayu.engine.contracts.messages import AgentMessageRole, UserMessage
 from dayu.engine.contracts.runner_events import RunnerEvent, RunnerEventType
 from dayu.engine.runners.openai.runner import AsyncOpenAIRunner
 
+from tests.host.fake_cancellation import ControllableCancellationToken
 from tests.engine.runners.openai._factories import make_options, make_spec
 from tests.engine.runners.openai._fakes import (
-    FakeCancellationToken,
     FakeResponseSpec,
     FakeSession,
 )
@@ -33,7 +33,8 @@ from tests.engine.runners.openai._fakes import (
 async def test_cancel_before_connect_returns_no_done() -> None:
     """连接前 token 已取消 → 立即退出，不发出 Done。"""
 
-    token = FakeCancellationToken(cancelled=True)
+    token = ControllableCancellationToken()
+    token.request_cancel()
     runner = AsyncOpenAIRunner(spec=make_spec(), cancellation_token=token)
     session = FakeSession()
     # 排队一个响应做兜底；预期 await_or_cancel 在 __aenter__ 处立即抛
@@ -63,7 +64,7 @@ async def test_cancel_before_connect_returns_no_done() -> None:
 async def test_cancel_during_sse_chunk_wait_returns_no_done() -> None:
     """SSE chunk 等待中 token 触发取消 → 立即终止，不发 Done。"""
 
-    token = FakeCancellationToken()
+    token = ControllableCancellationToken()
 
     class _SlowReadFakeContent:
         """模拟一个永不返回的 ``readany``，由测试侧 trigger token。"""
@@ -112,7 +113,7 @@ async def test_cancel_during_sse_chunk_wait_returns_no_done() -> None:
 
     async def trigger_cancel_after_delay() -> None:
         await asyncio.sleep(0.05)
-        token.trigger("test")
+        token.request_cancel("test")
 
     asyncio.get_running_loop().create_task(trigger_cancel_after_delay())
 
@@ -138,12 +139,12 @@ async def test_cancel_during_retry_sleep(
     """重试 sleep 中触发取消 → 立即终止，不发 Done。"""
 
     real_sleep = asyncio.sleep
-    token = FakeCancellationToken()
+    token = ControllableCancellationToken()
 
     async def cancel_during_sleep(delay: float) -> None:
         # 真实指数退避 sleep 触发时把 token 标记为取消
         if delay >= 1.0:
-            token.trigger("during retry sleep")
+            token.request_cancel("during retry sleep")
         await real_sleep(0)
 
     monkeypatch.setattr(asyncio, "sleep", cancel_during_sleep)
