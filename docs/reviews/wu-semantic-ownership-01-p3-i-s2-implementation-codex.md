@@ -107,4 +107,3 @@ environment.
 - This slice only handles terminal results that the CLI receives and renders. It
   does not change whether Host or Service produce a terminal result for a given
   `RUN_LOST` scenario.
-
