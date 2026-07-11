@@ -8,7 +8,12 @@ from pathlib import Path
 
 import pytest
 
-from dayu.host.api import AttemptStatus, RunStatus, SessionStatus
+from dayu.host.api import (
+    TERMINAL_RUN_STATUSES as PUBLIC_TERMINAL_RUN_STATUSES,
+    AttemptStatus,
+    RunStatus,
+    SessionStatus,
+)
 from dayu.host.durable import state as state_module
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
 from dayu.host.durable._row_rules import (
@@ -41,6 +46,7 @@ from dayu.host.durable.state import (
     TERMINAL_RUN_STATUSES,
     WorkerKind,
     attempt_row_from_host_row,
+    decode_run_started_payload,
     deserialize_dispatch_record_status,
     deserialize_run_status,
     deserialize_run_start_reason,
@@ -75,11 +81,8 @@ from dayu.host.queue_policy import RunQueuePolicy
 
 _TIMESTAMP = "2026-05-14T00:00:00Z"
 _EVENT_DIGEST = "0" * 64
-_TERMINAL_RUN_STATUSES = (
-    RunStatus.SUCCEEDED,
-    RunStatus.FAILED,
-    RunStatus.CANCELLED,
-    RunStatus.LOST,
+_TERMINAL_RUN_STATUSES = tuple(
+    status for status in RunStatus if status in PUBLIC_TERMINAL_RUN_STATUSES
 )
 _STARTED_RUN_STATUSES = (
     RunStatus.RUNNING,
@@ -712,6 +715,31 @@ def test_run_start_reason_resume_codec_round_trips() -> None:
         "RESUME": "resume",
         "STEER": "steer",
     }
+
+
+def test_run_started_payload_decoder_uses_run_start_reason_codec() -> None:
+    """RUN_STARTED payload decoder 复用 RunStartReason 闭集 codec。"""
+
+    payload = decode_run_started_payload(
+        {"start_reason": serialize_run_start_reason(RunStartReason.RESUME)}
+    )
+
+    assert payload.start_reason is RunStartReason.RESUME
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {},
+        {"start_reason": ""},
+        {"start_reason": "unknown"},
+    ),
+)
+def test_run_started_payload_decoder_fails_closed(payload: dict[str, str]) -> None:
+    """RUN_STARTED payload 缺失或未知 start_reason 必须 fail closed。"""
+
+    with pytest.raises(HostDurableError, match="RunStartReason|start_reason"):
+        decode_run_started_payload(payload)
 
 
 def test_queue_fifo_index_shape(tmp_path: Path) -> None:

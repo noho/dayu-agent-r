@@ -59,10 +59,12 @@ from dayu.host import (
     SourceRunRelation,
     SteerConflictDetail,
     SubmitFollowupRequest,
+    TERMINAL_RUN_STATUSES,
     TerminalResultSummary,
     WaitAdapterKey,
     WaitProviderStatusRef,
     WaitResolutionSource,
+    is_terminal_run_status,
 )
 from dayu.host.api import (
     HostCommandHandleOptions,
@@ -923,6 +925,91 @@ def test_run_snapshot_rejects_source_run_id_without_relation() -> None:
             terminal_result_summary=None,
             event_cursor=HostStreamCursor(event_sequence=0),
             source_run_id="source-run-1",
+            source_run_relation=None,
+            outbox_summary=None,
+        )
+
+
+def test_run_terminal_status_helper_matches_public_terminal_set() -> None:
+    """Host public terminal helper 与 public terminal set 同源。"""
+
+    assert TERMINAL_RUN_STATUSES == frozenset(
+        {
+            RunStatus.SUCCEEDED,
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+            RunStatus.LOST,
+        }
+    )
+    for status in RunStatus:
+        assert is_terminal_run_status(status) is (status in TERMINAL_RUN_STATUSES)
+
+
+def test_terminal_result_summary_requires_terminal_status() -> None:
+    """TerminalResultSummary 只能表达 Run 终态摘要。"""
+
+    with pytest.raises(ValueError, match="terminal"):
+        TerminalResultSummary(
+            status=RunStatus.RUNNING,
+            summary_ref=None,
+            summary_digest=None,
+        )
+
+
+def test_run_snapshot_requires_summary_for_terminal_status() -> None:
+    """RunSnapshot 终态 status 必须携带一致的 terminal summary。"""
+
+    with pytest.raises(ValueError, match="required"):
+        RunSnapshot(
+            run_id="run-terminal",
+            session_id="session-1",
+            status=RunStatus.SUCCEEDED,
+            current_attempt_id=None,
+            terminal_result_summary=None,
+            event_cursor=HostStreamCursor(event_sequence=0),
+            source_run_id=None,
+            source_run_relation=None,
+            outbox_summary=None,
+        )
+
+
+def test_run_snapshot_rejects_summary_for_non_terminal_status() -> None:
+    """RunSnapshot 非终态 status 不得携带 terminal summary。"""
+
+    with pytest.raises(ValueError, match="requires terminal"):
+        RunSnapshot(
+            run_id="run-non-terminal",
+            session_id="session-1",
+            status=RunStatus.RUNNING,
+            current_attempt_id=None,
+            terminal_result_summary=TerminalResultSummary(
+                status=RunStatus.SUCCEEDED,
+                summary_ref=None,
+                summary_digest=None,
+            ),
+            event_cursor=HostStreamCursor(event_sequence=0),
+            source_run_id=None,
+            source_run_relation=None,
+            outbox_summary=None,
+        )
+
+
+def test_run_snapshot_rejects_terminal_summary_status_mismatch() -> None:
+    """RunSnapshot 终态 status 必须与 terminal summary status 一致。"""
+
+    with pytest.raises(ValueError, match="must match"):
+        RunSnapshot(
+            run_id="run-terminal-mismatch",
+            session_id="session-1",
+            status=RunStatus.FAILED,
+            current_attempt_id=None,
+            terminal_result_summary=TerminalResultSummary(
+                status=RunStatus.SUCCEEDED,
+                summary_ref=None,
+                summary_digest=None,
+            ),
+            event_cursor=HostStreamCursor(event_sequence=0),
+            source_run_id=None,
             source_run_relation=None,
             outbox_summary=None,
         )

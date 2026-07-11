@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, is_dataclass
 from enum import StrEnum
-from typing import Protocol, cast
+from typing import Protocol, cast, get_type_hints
 
 import pytest
 
@@ -37,6 +37,11 @@ from dayu.host.tool_duplicate_governance import (
     DuplicateDecisionKind,
     DuplicateGovernanceMessages,
     DuplicateGovernancePolicy,
+)
+from dayu.host.tooling import (
+    WaitActivationRegistry,
+    WaitAdapterRegistry,
+    WaitPollAdapterRegistry,
 )
 
 
@@ -238,6 +243,39 @@ def test_host_tooling_options_accepts_normal_business_bundle() -> None:
     )
     assert options.duplicate_governance_policy.messages.reuse.strip() != ""
     assert cast(tuple[str, ...], options.__slots__) != ()
+
+
+def test_host_tooling_options_type_hints_resolve_wait_registries() -> None:
+    """HostToolingOptions runtime type hints 必须能解析 wait registries。"""
+
+    hints = get_type_hints(HostToolingOptions)
+
+    assert hints["wait_adapter_registry"] == WaitAdapterRegistry | None
+    assert hints["wait_activation_registry"] == WaitActivationRegistry | None
+    assert hints["wait_poll_adapter_registry"] == WaitPollAdapterRegistry | None
+
+
+def test_host_tooling_options_rejects_invalid_wait_registries() -> None:
+    """HostToolingOptions 构造期拒绝非法 wait registry 输入。"""
+
+    with pytest.raises(TypeError, match="wait_adapter_registry"):
+        HostToolingOptions(
+            business_tool_bundle=ToolBundle(definitions=(_definition("lookup_filing"),)),
+            source_refs=(_source_ref(),),
+            wait_adapter_registry=cast(WaitAdapterRegistry, "bad"),
+        )
+    with pytest.raises(TypeError, match="wait_activation_registry"):
+        HostToolingOptions(
+            business_tool_bundle=ToolBundle(definitions=(_definition("lookup_filing"),)),
+            source_refs=(_source_ref(),),
+            wait_activation_registry=cast(WaitActivationRegistry, "bad"),
+        )
+    with pytest.raises(TypeError, match="wait_poll_adapter_registry"):
+        HostToolingOptions(
+            business_tool_bundle=ToolBundle(definitions=(_definition("lookup_filing"),)),
+            source_refs=(_source_ref(),),
+            wait_poll_adapter_registry=cast(WaitPollAdapterRegistry, "bad"),
+        )
 
 
 def test_duplicate_governance_policy_zero_config_uses_default_messages() -> None:

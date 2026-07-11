@@ -16,7 +16,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING, Protocol, TypeAlias
+from typing import TYPE_CHECKING, Final, Protocol, TypeAlias, runtime_checkable
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
@@ -52,6 +52,22 @@ if TYPE_CHECKING:
         HostStorageUsageReport,
     )
     from dayu.host.wait_adapter import WaitPollerRuntimePolicy
+else:
+
+    @runtime_checkable
+    class WaitPollerRuntimePolicy(Protocol):
+        """Host opener 接收的 wait poller runtime policy 运行时契约。"""
+
+        enabled: bool
+        poll_interval_seconds: float
+        claim_ttl_seconds: float
+        claim_batch_size: int
+        backoff_initial_delay_seconds: float
+        backoff_multiplier: float
+        backoff_max_delay_seconds: float
+        not_ready_observe_interval_seconds: float
+        idle_poll_interval_seconds: float
+        close_drain_timeout_seconds: float | None
 
 _DEFAULT_COMMAND_MINIMUM_PROTECTION_TOKENS = 256
 
@@ -133,6 +149,22 @@ def _require_positive_float(value: float, *, field_name: str) -> None:
         raise TypeError(f"{field_name} must be float")
     if value <= 0:
         raise ValueError(f"{field_name} must be positive")
+
+
+def _require_optional_positive_float(
+    value: float | None, *, field_name: str
+) -> None:
+    """校验可选浮点配置值存在时大于零。
+
+    :param value: 待校验的浮点值或 ``None``。
+    :param field_name: 错误消息中使用的字段名。
+    :returns: 无返回值。
+    :raises TypeError: ``value`` 存在但不是严格数值时抛出。
+    :raises ValueError: ``value`` 存在但小于或等于零时抛出。
+    """
+
+    if value is not None:
+        _require_positive_float(value, field_name=field_name)
 
 
 def _require_path(value: pathlib.Path, *, field_name: str) -> None:
@@ -262,6 +294,64 @@ def _require_graceful_cancel(mode: "CancelMode", *, field_name: str) -> None:
         raise ValueError(f"{field_name} must be graceful")
 
 
+def _validate_wait_poller_policy(policy: WaitPollerRuntimePolicy) -> None:
+    """校验 Host opener wait poller runtime policy。
+
+    :param policy: 待校验的 wait poller runtime policy。
+    :returns: 无返回值。
+    :raises TypeError: ``policy`` 不是运行时可解析的 policy 契约，或字段类型非法时抛出。
+    :raises ValueError: 数值字段不满足正数约束时抛出。
+    """
+
+    if not isinstance(policy, WaitPollerRuntimePolicy):
+        raise TypeError(
+            "OpenHostOptions.wait_poller_policy must be WaitPollerRuntimePolicy"
+        )
+    _require_bool(
+        policy.enabled,
+        field_name="OpenHostOptions.wait_poller_policy.enabled",
+    )
+    _require_positive_float(
+        policy.poll_interval_seconds,
+        field_name="OpenHostOptions.wait_poller_policy.poll_interval_seconds",
+    )
+    _require_positive_float(
+        policy.claim_ttl_seconds,
+        field_name="OpenHostOptions.wait_poller_policy.claim_ttl_seconds",
+    )
+    _require_positive_int(
+        policy.claim_batch_size,
+        field_name="OpenHostOptions.wait_poller_policy.claim_batch_size",
+    )
+    _require_positive_float(
+        policy.backoff_initial_delay_seconds,
+        field_name="OpenHostOptions.wait_poller_policy.backoff_initial_delay_seconds",
+    )
+    _require_positive_float(
+        policy.backoff_multiplier,
+        field_name="OpenHostOptions.wait_poller_policy.backoff_multiplier",
+    )
+    _require_positive_float(
+        policy.backoff_max_delay_seconds,
+        field_name="OpenHostOptions.wait_poller_policy.backoff_max_delay_seconds",
+    )
+    _require_positive_float(
+        policy.not_ready_observe_interval_seconds,
+        field_name=(
+            "OpenHostOptions.wait_poller_policy."
+            "not_ready_observe_interval_seconds"
+        ),
+    )
+    _require_positive_float(
+        policy.idle_poll_interval_seconds,
+        field_name="OpenHostOptions.wait_poller_policy.idle_poll_interval_seconds",
+    )
+    _require_optional_positive_float(
+        policy.close_drain_timeout_seconds,
+        field_name="OpenHostOptions.wait_poller_policy.close_drain_timeout_seconds",
+    )
+
+
 class SessionStatus(StrEnum):
     """Session 生命周期状态。
 
@@ -293,6 +383,30 @@ class RunStatus(StrEnum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     LOST = "lost"
+
+
+TERMINAL_RUN_STATUSES: Final[frozenset[RunStatus]] = frozenset(
+    {
+        RunStatus.SUCCEEDED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+        RunStatus.LOST,
+    }
+)
+"""Host public Run 终态集合。"""
+
+
+def is_terminal_run_status(status: RunStatus) -> bool:
+    """判断 Host public Run 状态是否为终态。
+
+    :param status: Host public ``RunStatus``。
+    :returns: 终态返回 ``True``，非终态返回 ``False``。
+    :raises TypeError: ``status`` 不是 ``RunStatus`` 时抛出。
+    """
+
+    if not isinstance(status, RunStatus):
+        raise TypeError("status must be RunStatus")
+    return status in TERMINAL_RUN_STATUSES
 
 
 class AttemptStatus(StrEnum):
@@ -1164,6 +1278,8 @@ class OpenHostOptions:
             self.enable_truncation_manager,
             field_name="OpenHostOptions.enable_truncation_manager",
         )
+        if self.wait_poller_policy is not None:
+            _validate_wait_poller_policy(self.wait_poller_policy)
 
 
 class HostApiErrorCode(StrEnum):
@@ -2122,9 +2238,14 @@ class TerminalResultSummary:
         """校验终态结果摘要引用字段。
 
         :returns: 无返回值。
-        :raises ValueError: 可选引用或摘要存在但为空时抛出。
+        :raises TypeError: ``status`` 类型非法时抛出。
+        :raises ValueError: ``status`` 不是终态，或可选引用、摘要存在但为空时抛出。
         """
 
+        if not isinstance(self.status, RunStatus):
+            raise TypeError("TerminalResultSummary.status must be RunStatus")
+        if not is_terminal_run_status(self.status):
+            raise ValueError("TerminalResultSummary.status must be terminal")
         _require_optional_non_empty(
             self.summary_ref, field_name="TerminalResultSummary.summary_ref"
         )
@@ -2318,11 +2439,34 @@ class RunSnapshot:
         """校验 Run 快照 id 字段。
 
         :returns: 无返回值。
-        :raises ValueError: id 字段为空，或 source relation 与 source id 不一致时抛出。
+        :raises TypeError: ``status`` 或终态摘要字段类型非法时抛出。
+        :raises ValueError: id 字段为空，source relation 与 source id 不一致，
+            或终态 status 与终态摘要不一致时抛出。
         """
 
         _require_non_empty(self.run_id, field_name="RunSnapshot.run_id")
         _require_non_empty(self.session_id, field_name="RunSnapshot.session_id")
+        if not isinstance(self.status, RunStatus):
+            raise TypeError("RunSnapshot.status must be RunStatus")
+        if self.terminal_result_summary is not None and not isinstance(
+            self.terminal_result_summary, TerminalResultSummary
+        ):
+            raise TypeError(
+                "RunSnapshot.terminal_result_summary must be TerminalResultSummary"
+            )
+        if is_terminal_run_status(self.status):
+            if self.terminal_result_summary is None:
+                raise ValueError(
+                    "RunSnapshot.terminal_result_summary is required for terminal status"
+                )
+            if self.terminal_result_summary.status is not self.status:
+                raise ValueError(
+                    "RunSnapshot.terminal_result_summary.status must match status"
+                )
+        elif self.terminal_result_summary is not None:
+            raise ValueError(
+                "RunSnapshot.terminal_result_summary requires terminal status"
+            )
         _require_optional_non_empty(
             self.current_attempt_id,
             field_name="RunSnapshot.current_attempt_id",
@@ -3545,6 +3689,7 @@ __all__ = [
     "HOST_EVENT_STREAM_MAX_LIMIT",
     "HOST_OUTBOX_TERMINAL_READ_MAX_LIMIT",
     "HOST_OUTBOX_TERMINAL_SEEN_IDS_MAX_COUNT",
+    "TERMINAL_RUN_STATUSES",
     "HOST_WAIT_ADAPTER_KEY_MAX_LENGTH",
     "HOST_WAIT_EXTERNAL_JOB_ID_MAX_LENGTH",
     "HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH",
@@ -3612,4 +3757,5 @@ __all__ = [
     "WaitAdapterKey",
     "WaitProviderStatusRef",
     "WaitResolutionSource",
+    "is_terminal_run_status",
 ]

@@ -39,6 +39,7 @@ from dayu.host.durable.errors import (
 )
 from dayu.host.durable.payload import PayloadKind, read_payload_descriptor
 from dayu.host.durable.schema import TABLE_EVENT_LOG
+from dayu.host.durable.state import RunStartReason, decode_run_started_payload
 from dayu.host.durable.transaction import HostRow, HostTransaction
 from dayu.host.lifecycle_events import parse_host_event_type
 
@@ -858,9 +859,9 @@ def count_recovery_dispatches_for_run(
     """统计某个 Run 已提交的 recovery dispatch 次数。
 
     该 helper 只读取 EventLog canonical facts，按 ``run_id`` 和
-    ``RUN_STARTED`` 精确过滤，并只计入 inline payload 中
-    ``start_reason == "recovery"`` 的事件；不读取 projection/read-model，也不做
-    diagnostic 文本匹配。
+    ``RUN_STARTED`` 精确过滤，通过 typed ``RUN_STARTED`` payload decoder
+    读取 ``RunStartReason``，并只计入 ``RunStartReason.RECOVERY`` 的事件；
+    不读取 projection/read-model，也不做 diagnostic 文本匹配。
 
     :param transaction: 调用方提供的 Host durable transaction。
     :param run_id: 目标 Run id。
@@ -868,16 +869,29 @@ def count_recovery_dispatches_for_run(
     :raises HostDurableError: 输入非法或 payload 无法验证时抛出。
     """
 
-    return count_committed_events_by_run_and_type(
-        transaction,
-        run_id=run_id,
-        event_type="RUN_STARTED",
-        payload_filter=EventPayloadTextEqualsFilter(
-            field_name="start_reason",
-            expected_value="recovery",
-            allowed_values=("initial", "queue_promotion", "resume", "steer", "recovery"),
-        ),
+    rows = transaction.fetchall(
+        f"""
+        SELECT
+          event_id,
+          event_sequence,
+          payload_json
+        FROM {TABLE_EVENT_LOG}
+        WHERE run_id = ?
+          AND event_type = ?
+          AND event_class = ?
+        ORDER BY event_sequence ASC
+        """,
+        (run_id, "RUN_STARTED", EventClass.CANONICAL_FACT.value),
     )
+    count = 0
+    for row in rows:
+        payload = _payload_mapping_from_text(
+            _require_text(row.get("payload_json"), field_name="payload_json")
+        )
+        started_payload = decode_run_started_payload(payload)
+        if started_payload.start_reason is RunStartReason.RECOVERY:
+            count += 1
+    return count
 
 
 @dataclass(frozen=True, slots=True)

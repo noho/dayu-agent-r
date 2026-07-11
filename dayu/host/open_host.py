@@ -1058,8 +1058,6 @@ def _enabled_wait_poller_configuration(
     policy = options.wait_poller_policy
     if policy is None:
         return None
-    if not isinstance(policy, WaitPollerRuntimePolicy):
-        raise TypeError("OpenHostOptions.wait_poller_policy must be WaitPollerRuntimePolicy")
     if not policy.enabled:
         return None
     tooling_options = options.tooling_options
@@ -1073,11 +1071,6 @@ def _enabled_wait_poller_configuration(
             retryable=False,
         )
     adapter_registry = tooling_options.wait_poll_adapter_registry
-    if not isinstance(adapter_registry, WaitPollAdapterRegistry):
-        raise TypeError(
-            "HostToolingOptions.wait_poll_adapter_registry must be "
-            "WaitPollAdapterRegistry"
-        )
     return _EnabledWaitPollerConfiguration(
         policy=policy,
         adapter_registry=adapter_registry,

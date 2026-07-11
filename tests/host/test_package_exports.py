@@ -29,6 +29,7 @@ EXPECTED_API_EXPORTS: frozenset[str] = frozenset(
         "HOST_EVENT_STREAM_MAX_LIMIT",
         "HOST_OUTBOX_TERMINAL_READ_MAX_LIMIT",
         "HOST_OUTBOX_TERMINAL_SEEN_IDS_MAX_COUNT",
+        "TERMINAL_RUN_STATUSES",
         "HOST_WAIT_ADAPTER_KEY_MAX_LENGTH",
         "HOST_WAIT_EXTERNAL_JOB_ID_MAX_LENGTH",
         "HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH",
@@ -96,6 +97,7 @@ EXPECTED_API_EXPORTS: frozenset[str] = frozenset(
         "WaitAdapterKey",
         "WaitProviderStatusRef",
         "WaitResolutionSource",
+        "is_terminal_run_status",
     }
 )
 

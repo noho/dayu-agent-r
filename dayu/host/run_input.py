@@ -116,6 +116,8 @@ from dayu.host.durable.state import (
     DispatchRecordRow,
     DispatchRecordStatus,
     RunRow,
+    RunStartReason,
+    decode_run_started_payload,
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
     read_run_by_id,
@@ -167,7 +169,6 @@ _PAYLOAD_FIELD_DISPLAY_TEXT = "display_text"
 _PAYLOAD_FIELD_SYSTEM_PROMPT = "system_prompt"
 _PAYLOAD_FIELD_OPERATION_KIND = "operation_kind"
 _PAYLOAD_FIELD_EXECUTION_TARGET = "execution_target"
-_PAYLOAD_FIELD_START_REASON = "start_reason"
 _PAYLOAD_FIELD_TOOL_RESULT_EVENT_REF = "tool_result_event_ref"
 _PAYLOAD_FIELD_EVENT_ID = "event_id"
 _PAYLOAD_FIELD_TOOL_CALL_ID = "tool_call_id"
@@ -3463,8 +3464,8 @@ def _resume_wait_messages_from_current_start(
     """
 
     start_payload = _payload_object(current_facts.run_started_event)
-    start_reason = _optional_payload_text(start_payload, field_name=_PAYLOAD_FIELD_START_REASON)
-    if start_reason != "resume":
+    started_payload = decode_run_started_payload(start_payload)
+    if started_payload.start_reason is not RunStartReason.RESUME:
         return ()
     tool_result_event_id = _event_id_from_payload_ref(start_payload, field_name=_PAYLOAD_FIELD_TOOL_RESULT_EVENT_REF)
     tool_result_event = read_event_by_id(transaction, tool_result_event_id)
@@ -4753,13 +4754,16 @@ def _runner_call_kind_and_trigger(
     """
 
     start_payload = _payload_object(record_input.current_facts.run_started_event)
-    start_reason = start_payload.get(_PAYLOAD_FIELD_START_REASON)
-    if start_reason == "recovery" or record_input.fallback is not None:
+    started_payload = decode_run_started_payload(start_payload)
+    if (
+        started_payload.start_reason is RunStartReason.RECOVERY
+        or record_input.fallback is not None
+    ):
         return (
             _RUNNER_CALL_KIND_POST_COMPACTION_DISPATCH,
             _RUNNER_CALL_TRIGGER_CONTEXT_COMPACTION_COMPLETED,
         )
-    if start_reason == "resume":
+    if started_payload.start_reason is RunStartReason.RESUME:
         return (
             _RUNNER_CALL_KIND_FOLLOWUP_USER_DISPATCH,
             _RUNNER_CALL_TRIGGER_HOST_RESUME,

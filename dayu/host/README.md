@@ -72,7 +72,7 @@ Host 与其它层的稳定边界如下：
 - `create_session(request)`：显式创建新 Session，可选择重绑定 slot。
 - `get_session(session_id)`：读取 Session snapshot。
 - `list_sessions()`：读取全部未 purge Session 的 durable 列表摘要。
-- `get_run(run_id)`：读取 Run snapshot。
+- `get_run(run_id)`：读取 Run snapshot。Run 是否终态以 Host public `is_terminal_run_status(status)` 为准；终态 `RunSnapshot` 必须携带同状态的 `TerminalResultSummary`，非终态不得携带 terminal summary。
 - `submit_followup(session_id, request)`：提交普通 queue 或 steer follow-up。
 - `retry_run(run_id, request)`：基于失败源 Run 创建关联的新 Run。
 - `replay_run(run_id, request)`：基于成功源 Run 创建 no-tool 结构修复 Run。

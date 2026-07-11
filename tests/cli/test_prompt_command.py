@@ -63,6 +63,8 @@ from dayu.host.api import (
     SessionSnapshot,
     SessionStatus,
     SubmitFollowupRequest,
+    TerminalResultSummary,
+    is_terminal_run_status,
 )
 from dayu.service.entrypoint_runtime import EntrypointRuntimeRequest
 from dayu.service.entrypoint_runtime import EntrypointRuntimeResult
@@ -2240,12 +2242,19 @@ def _run_snapshot(*, run_id: str, status: RunStatus) -> RunSnapshot:
     :raises Exception: 不主动抛出异常。
     """
 
+    terminal_summary = None
+    if is_terminal_run_status(status):
+        terminal_summary = TerminalResultSummary(
+            status=status,
+            summary_ref=None,
+            summary_digest=None,
+        )
     return RunSnapshot(
         run_id=run_id,
         session_id="session-1",
         status=status,
         current_attempt_id=None,
-        terminal_result_summary=None,
+        terminal_result_summary=terminal_summary,
         event_cursor=HostStreamCursor(event_sequence=0),
         source_run_id=None,
         source_run_relation=None,

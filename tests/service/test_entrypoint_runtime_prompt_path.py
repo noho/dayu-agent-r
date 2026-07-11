@@ -29,6 +29,7 @@ from dayu.host.api import (
     RunSnapshot,
     RunStatus,
     SubmitFollowupRequest,
+    TerminalResultSummary,
 )
 from dayu.runtime.scene_prepare import ScenePrepareError
 from dayu.service.entrypoint_runtime import (
@@ -187,7 +188,11 @@ class _FakeHost:
             session_id="session-1",
             status=RunStatus.SUCCEEDED,
             current_attempt_id=None,
-            terminal_result_summary=None,
+            terminal_result_summary=TerminalResultSummary(
+                status=RunStatus.SUCCEEDED,
+                summary_ref=None,
+                summary_digest=None,
+            ),
             event_cursor=HostStreamCursor(event_sequence=2),
             source_run_id=None,
             source_run_relation=None,

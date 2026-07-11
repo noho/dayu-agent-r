@@ -7,7 +7,7 @@ Session lifecycle、admission、promotion、cancel 或 command path 语义。
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -29,9 +29,12 @@ from dayu.host.api import (
     SessionSnapshot,
     SessionStatus,
     SourceRunRelation,
+    TERMINAL_RUN_STATUSES as PUBLIC_TERMINAL_RUN_STATUSES,
     TerminalResultSummary,
     WaitAdapterKey,
+    is_terminal_run_status as is_public_terminal_run_status,
 )
+from dayu.contracts.json_value import JsonValue
 from dayu.host.durable._row_rules import (
     TERMINAL_ATTEMPT_STATUS_VALUES,
     TERMINAL_RUN_STATUS_VALUES,
@@ -69,7 +72,7 @@ from dayu.host.durable.transaction import HostRow, SQLiteScalar
 from dayu.host.durable.transaction import HostTransaction
 
 _StatusT = TypeVar("_StatusT", bound=StrEnum)
-TERMINAL_RUN_STATUSES = frozenset(RunStatus(value) for value in TERMINAL_RUN_STATUS_VALUES)
+TERMINAL_RUN_STATUSES = PUBLIC_TERMINAL_RUN_STATUSES
 """Run 终态集合，作为 durable state / purge 等持久化逻辑的状态真源。"""
 
 NON_TERMINAL_RUN_STATUSES = frozenset(status for status in RunStatus if status not in TERMINAL_RUN_STATUSES)
@@ -167,6 +170,26 @@ class RunStartReason(StrEnum):
     RESUME = "resume"
     STEER = "steer"
     RECOVERY = "recovery"
+
+
+@dataclass(frozen=True, slots=True)
+class RunStartedPayload:
+    """``RUN_STARTED`` canonical fact payload 的 typed projection。
+
+    :param start_reason: Run 进入 active Attempt lifecycle 的闭集原因。
+    """
+
+    start_reason: RunStartReason
+
+    def __post_init__(self) -> None:
+        """校验 ``RUN_STARTED`` payload typed projection。
+
+        :returns: 无返回值。
+        :raises HostDurableError: ``start_reason`` 不是 ``RunStartReason`` 时抛出。
+        """
+
+        if not isinstance(self.start_reason, RunStartReason):
+            raise HostDurableError("RUN_STARTED.start_reason is invalid")
 
 
 class WaitRecordStatus(StrEnum):
@@ -561,10 +584,10 @@ def is_terminal_run_status(status: RunStatus) -> bool:
 
     :param status: Run 状态。
     :returns: 属于 durable Run 终态集合时返回 ``True``。
-    :raises: 无主动抛出。
+    :raises TypeError: ``status`` 不是 ``RunStatus`` 时抛出。
     """
 
-    return status in TERMINAL_RUN_STATUSES
+    return is_public_terminal_run_status(status)
 
 
 def serialized_run_status_values(
@@ -730,6 +753,24 @@ def deserialize_run_start_reason(value: str) -> RunStartReason:
     """
 
     return _deserialize_str_enum(value, enum_type=RunStartReason, enum_name="RunStartReason")
+
+
+def decode_run_started_payload(payload: Mapping[str, JsonValue]) -> RunStartedPayload:
+    """解码 ``RUN_STARTED`` canonical fact payload。
+
+    ``start_reason`` 是必填闭集字段。缺失、非文本、空字符串或未知枚举值都
+    表示 durable canonical fact 不满足 Host lifecycle contract，必须 fail
+    closed，不能投影为 initial / follow-up fallback。
+
+    :param payload: ``RUN_STARTED`` inline payload 映射。
+    :returns: ``RunStartedPayload`` typed projection。
+    :raises HostDurableError: payload 字段缺失、类型非法或枚举值未知时抛出。
+    """
+
+    value = payload.get("start_reason")
+    if not isinstance(value, str) or value.strip() == "":
+        raise HostDurableError("RUN_STARTED.start_reason is required")
+    return RunStartedPayload(start_reason=deserialize_run_start_reason(value))
 
 
 def serialize_wait_record_status(status: WaitRecordStatus) -> str:

@@ -54,6 +54,7 @@ from dayu.host.durable.state import (
     read_attempt_by_id,
     read_dispatch_record_by_attempt_id,
     read_run_by_id,
+    serialize_run_start_reason,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
 from dayu.host.recovery import (
@@ -1485,7 +1486,9 @@ def _append_recovery_started_event(
                 event_type="RUN_STARTED",
                 payload={
                     "run_id": run_id,
-                    "start_reason": "recovery",
+                    "start_reason": serialize_run_start_reason(
+                        RunStartReason.RECOVERY
+                    ),
                     "source_attempt_id": f"attempt-{run_id}",
                     "attempt_id": f"attempt-recovery-{run_id}",
                     "dispatch_record_id": f"dispatch-recovery-{run_id}",

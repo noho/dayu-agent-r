@@ -20,6 +20,7 @@ from dayu.host.durable.event_log import (
     EventLogStore,
     FilteredEventLogPage,
     append_event,
+    count_recovery_dispatches_for_run,
     read_event_by_id,
     read_events_after,
     read_events_after_matching,
@@ -36,6 +37,7 @@ from dayu.host.durable.options import (
     PayloadStoragePolicy,
 )
 from dayu.host.durable.schema import TABLE_EVENT_LOG
+from dayu.host.durable.state import RunStartReason, serialize_run_start_reason
 from dayu.host.durable.transaction import HostTransaction
 
 _CUSTOM_INLINE_THRESHOLD_BYTES = 8
@@ -151,6 +153,85 @@ def test_append_canonical_event_returns_first_sequence(tmp_path: Path) -> None:
             return result.row.event_sequence
 
         assert store.transaction_runner.run_write(operation) == 1
+
+
+def test_count_recovery_dispatches_uses_typed_run_started_payload(
+    tmp_path: Path,
+) -> None:
+    """recovery dispatch 计数必须通过 typed RUN_STARTED payload 判断。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+
+        def operation(transaction: HostTransaction) -> int:
+            """追加 RUN_STARTED 事件并统计 recovery 次数。
+
+            :param transaction: Host durable transaction。
+            :returns: recovery dispatch 次数。
+            """
+
+            append_event(
+                transaction,
+                _request(
+                    "event-run-started-initial",
+                    event_type="RUN_STARTED",
+                    payload_json={
+                        "start_reason": serialize_run_start_reason(
+                            RunStartReason.INITIAL
+                        )
+                    },
+                ),
+            )
+            append_event(
+                transaction,
+                _request(
+                    "event-run-started-recovery",
+                    event_type="RUN_STARTED",
+                    payload_json={
+                        "start_reason": serialize_run_start_reason(
+                            RunStartReason.RECOVERY
+                        )
+                    },
+                ),
+            )
+            return count_recovery_dispatches_for_run(transaction, run_id="run-1")
+
+        assert store.transaction_runner.run_write(operation) == 1
+
+
+@pytest.mark.parametrize(
+    "payload_json",
+    (
+        {},
+        {"start_reason": "unknown"},
+    ),
+)
+def test_count_recovery_dispatches_fails_closed_for_invalid_start_reason(
+    tmp_path: Path,
+    payload_json: JsonValue,
+) -> None:
+    """recovery dispatch 计数遇到非法 RUN_STARTED payload 必须 fail closed。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+
+        def operation(transaction: HostTransaction) -> None:
+            """追加非法 RUN_STARTED 事件并触发 recovery 计数。
+
+            :param transaction: Host durable transaction。
+            :returns: 无返回值。
+            """
+
+            append_event(
+                transaction,
+                _request(
+                    "event-run-started-invalid",
+                    event_type="RUN_STARTED",
+                    payload_json=payload_json,
+                ),
+            )
+            count_recovery_dispatches_for_run(transaction, run_id="run-1")
+
+        with pytest.raises(HostDurableError, match="RunStartReason|start_reason"):
+            store.transaction_runner.run_write(operation)
 
 
 def test_append_rejects_unknown_event_type(tmp_path: Path) -> None:

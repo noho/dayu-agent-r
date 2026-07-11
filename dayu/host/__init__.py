@@ -24,6 +24,7 @@ from dayu.host.api import (
     HOST_EVENT_STREAM_MAX_LIMIT,
     HOST_OUTBOX_TERMINAL_READ_MAX_LIMIT,
     HOST_OUTBOX_TERMINAL_SEEN_IDS_MAX_COUNT,
+    TERMINAL_RUN_STATUSES,
     HOST_WAIT_ADAPTER_KEY_MAX_LENGTH,
     HOST_WAIT_EXTERNAL_JOB_ID_MAX_LENGTH,
     HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH,
@@ -91,6 +92,7 @@ from dayu.host.api import (
     WaitAdapterKey,
     WaitProviderStatusRef,
     WaitResolutionSource,
+    is_terminal_run_status,
 )
 from dayu.host.command import (
     cancel_run,
@@ -164,6 +166,7 @@ __all__ = [
     "HOST_EVENT_STREAM_MAX_LIMIT",
     "HOST_OUTBOX_TERMINAL_READ_MAX_LIMIT",
     "HOST_OUTBOX_TERMINAL_SEEN_IDS_MAX_COUNT",
+    "TERMINAL_RUN_STATUSES",
     "HOST_WAIT_ADAPTER_KEY_MAX_LENGTH",
     "HOST_WAIT_EXTERNAL_JOB_ID_MAX_LENGTH",
     "HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH",
@@ -261,6 +264,7 @@ __all__ = [
     "ensure_session",
     "get_run",
     "get_session",
+    "is_terminal_run_status",
     "list_sessions",
     "open_host",
     "purge_session",

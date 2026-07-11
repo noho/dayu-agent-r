@@ -103,6 +103,7 @@ from dayu.host.durable.state import (
     WorkerKind,
     mark_dispatch_waiting_for_lane_row,
     mark_dispatching_after_lane_row,
+    serialize_run_start_reason,
 )
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
@@ -152,12 +153,16 @@ from dayu.host.run_input import (
     NoopMemorySnapshotProvider,
     NoToolExecutor,
     PolicySnapshot,
+    RunnerCallManifestRecordInput,
+    SessionContinuityView,
     ToolExecutionMode,
     MemorySnapshotView,
+    ToolSchemaSnapshot,
     _SYSTEM_ENVELOPE_FORBIDDEN_FRAGMENTS,
     _fallback_context_messages,
     _normalize_ordinary_run_messages,
     _resume_wait_messages_from_current_start,
+    _runner_call_kind_and_trigger,
     create_no_tool_run_input_builder,
     create_tool_enabled_run_input_builder,
 )
@@ -514,6 +519,107 @@ def test_resume_wait_messages_rebuild_tool_result_roundtrip(
         assert isinstance(tool, ToolMessage)
         assert tool.tool_call_id == "tool-call-private"
         assert tool.content == '{"answer": 42}'
+
+
+@pytest.mark.parametrize(
+    "payload_json",
+    (
+        {},
+        {"start_reason": "unknown"},
+    ),
+)
+def test_resume_wait_messages_fail_closed_for_invalid_start_reason(
+    tmp_path: Path,
+    payload_json: JsonValue,
+) -> None:
+    """resume continuity 遇到非法 RUN_STARTED.start_reason 必须 fail closed。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("resume prompt"),
+        )
+        _append_resume_wait_projection_events(store.transaction_runner, seeded)
+        current_facts = DurableCurrentRunFactProvider(
+            store.transaction_runner
+        ).load_current_run_facts(_attempt_snapshot(seeded))
+        resume_started = replace(
+            _read_event_by_id(store.transaction_runner, "event-run-started-resume"),
+            payload_json=canonical_json_dumps(payload_json),
+        )
+
+        def operation(transaction: HostTransaction) -> tuple[AgentMessage, ...]:
+            """尝试从非法 RUN_STARTED payload 构造 resume messages。
+
+            :param transaction: Host durable transaction。
+            :returns: resume wait messages。
+            """
+
+            return _resume_wait_messages_from_current_start(
+                transaction,
+                replace(current_facts, run_started_event=resume_started),
+            )
+
+        with pytest.raises(HostDurableError, match="RunStartReason|start_reason"):
+            store.transaction_runner.run_read(operation)
+
+
+def test_runner_call_manifest_classifies_resume_from_typed_start_reason(
+    tmp_path: Path,
+) -> None:
+    """runner-call manifest 分类必须消费 typed RUN_STARTED.start_reason。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("resume prompt"),
+        )
+        current_facts = DurableCurrentRunFactProvider(
+            store.transaction_runner
+        ).load_current_run_facts(_attempt_snapshot(seeded))
+        resume_started = replace(
+            current_facts.run_started_event,
+            payload_json=canonical_json_dumps(
+                {
+                    "start_reason": serialize_run_start_reason(
+                        RunStartReason.RESUME
+                    )
+                }
+            ),
+        )
+        record_input = RunnerCallManifestRecordInput(
+            attempt_snapshot=_attempt_snapshot(seeded),
+            current_facts=replace(current_facts, run_started_event=resume_started),
+            policy_snapshot=_policy_snapshot(),
+            memory=MemorySnapshotView(
+                messages=(),
+                memory_snapshot_cursor=None,
+                policy_digest=None,
+                diagnostics=(),
+            ),
+            compact=CompactArtifactView(
+                compaction_event_ref=None,
+                compact_artifact_ref=None,
+                compact_artifact_digest=None,
+            ),
+            continuity=SessionContinuityView(messages=()),
+            tool_snapshot=ToolSchemaSnapshot(
+                tool_schemas=(),
+                disable_tools=True,
+                tool_runtime_handle=None,
+            ),
+            messages=(UserMessage(role=AgentMessageRole.USER, content="resume prompt"),),
+            fallback=None,
+        )
+
+        assert _runner_call_kind_and_trigger(record_input) == (
+            "followup_user_dispatch",
+            "host_resume",
+        )
 
 
 def test_resume_wait_legacy_message_appends_shared_duplicate_result_guidance(
@@ -5655,10 +5761,16 @@ def _append_resume_wait_projection_events(
                 client_request_id=None,
                 idempotency_key="resolve-resume",
                 policy_decision=None,
-                reason={"start_reason": "resume"},
+                reason={
+                    "start_reason": serialize_run_start_reason(
+                        RunStartReason.RESUME
+                    )
+                },
                 payload_json={
                     "run_id": seeded.run_id,
-                    "start_reason": "resume",
+                    "start_reason": serialize_run_start_reason(
+                        RunStartReason.RESUME
+                    ),
                     "wait_id": "wait-resume-private",
                     "source_attempt_id": seeded.attempt_id,
                     "attempt_id": "attempt-resume-private",
