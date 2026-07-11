@@ -12,6 +12,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
+from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.document_models import FileObjectMeta, now_iso8601
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ticker_normalization import try_normalize_ticker
@@ -378,7 +379,7 @@ def _file_object_meta_from_dict(payload: dict[str, Any]) -> FileObjectMeta:
     )
 
 
-def _coerce_optional_int(value: object) -> int | None:
+def _coerce_optional_int(value: JsonValue) -> int | None:
     """把未知值收窄为可选整数。
 
     Args:

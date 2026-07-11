@@ -136,6 +136,8 @@ resolver 只提供业务解析能力；调用方负责读取环境变量、配�
 - `get_financial_statement`
 - `query_xbrl_facts`
 
+read runtime 持有 `document_id -> source_kind -> source -> processor` 路由和 read tool 输出投影。processor 的可选能力边界使用 typed protocol 显式判断：分页、财务报表、XBRL facts 与 XBRL taxonomy 能力都由 protocol 方法承诺，不通过字符串属性名探测。source meta 在 read runtime 内先从仓储 raw JSON 收窄为本地 typed projection，再进入 citation、source document 列表、文档别名解析和 fiscal 推断；实例级 source meta cache 使用有界 LRU，容量由 `source_meta_cache_max_entries` 控制。
+
 `dayu.fins.tools.provider.discover_tools(spec)` 是 read tools 的 ToolsDiscovery provider 入口，provider id 为 `financial-read-tools`。启用时必须通过 effective spec 提供绝对 `workspace_root`，并返回九个 read tools；read provider 是否参与发现只由 provider-level `enabled` 控制。
 
 当前 read tools 名称为：

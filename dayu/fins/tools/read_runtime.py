@@ -4,15 +4,16 @@
 - 参数校验与标准化。
 - `document_id -> source_kind -> source -> processor` 路由。
 - 统一能力降级（`not_supported`）。
-- 仅缓存 Processor 实例（key=`ticker + document_id`，仅 LRU）。
+- 仅做进程内 LRU 缓存：Processor 按 `ticker + document_id`，source meta 按来源维度隔离。
 """
 
 from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from threading import Lock, RLock
-from typing import Any, Final, Literal, Optional, cast
+from typing import Any, Final, Literal, Optional, Protocol, TypedDict, runtime_checkable
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
@@ -67,9 +68,11 @@ from .result_types import (
     NotSupportedResult,
     PageContentResult,
     SearchDocumentResult,
+    StatementLocator,
     SectionContentResult,
     TableDetailResult,
     TablesListResult,
+    XbrlQueryParams,
     XbrlQueryResult,
 )
 from dayu.fins._converters import normalize_optional_text, require_non_empty_text
@@ -81,7 +84,6 @@ from .read_runtime_helpers import (
     _collect_parent_titles,
     _normalize_form_type_for_matching,
     _normalize_document_types,
-    _build_recommended_documents,
     _normalize_section_children,
     _normalize_periods,
     _build_not_supported_result,
@@ -92,20 +94,22 @@ from .read_runtime_helpers import (
     _resolve_fiscal_period_with_fallback,
     _build_table_data_payload,
     _normalize_table_type,
+    _normalize_json_scalar_text,
     _resolve_processor_taxonomy,
     _resolve_default_xbrl_concepts,
     _normalize_xbrl_query_payload,
-    _collect_available_document_types,
     _build_match_quality,
     _build_search_hint,
     build_search_next_section_fields,
-    build_document_recency_sort_key,
     raise_if_fins_cancelled,
     resolve_has_financial_data,
     resolve_document_type_for_source,
 )
+
 # 匹配 CJK 统一汉字（基本区 + 扩展A），用于检测查询词是否含中文
 _CN_CHAR_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
+
+
 def _any_query_has_chinese(queries: list[str]) -> bool:
     """检测查询列表中是否存在含中文字符的查询词。"""
     return any(_CN_CHAR_RE.search(q) for q in queries)
@@ -136,6 +140,190 @@ _FILING_SOURCE_TYPES_BY_PROVIDER: Final[dict[FinsSourceProvider, SourceType]] = 
 }
 """filing citation source_type 的 provider 派生规则。"""
 
+_SOURCE_META_CACHE_DEFAULT_MAX_ENTRIES: Final[int] = 512
+"""source meta 实例缓存默认容量。"""
+
+_RECOMMENDED_DOCUMENT_KEYS: Final[tuple[str, ...]] = (
+    "latest_document_id",
+    "recommended_for_company_overview_document_id",
+    "latest_annual_report_document_id",
+    "latest_quarterly_report_document_id",
+    "latest_current_report_document_id",
+    "latest_proxy_document_id",
+    "latest_ownership_document_id",
+    "latest_earnings_call_document_id",
+    "latest_earnings_presentation_document_id",
+    "latest_material_document_id",
+)
+"""list_documents 推荐槽位键集合。"""
+
+_FISCAL_PERIOD_SORT_ORDER: Final[dict[str, int]] = {
+    "FY": 5,
+    "H1": 4,
+    "Q4": 4,
+    "Q3": 3,
+    "Q2": 2,
+    "Q1": 1,
+}
+"""source document 财期排序权重。"""
+
+
+class _SourceDocumentMeta(TypedDict):
+    """read runtime 使用的 source meta 投影。
+
+    该类型只承诺 read runtime 当前需要消费的字段；仓储 raw meta 的完整
+    JSON schema 仍由 storage owner 持有。
+    """
+
+    form_type: str | None
+    material_name: JsonValue | None
+    fiscal_year: int | None
+    fiscal_period: str | None
+    report_date: str | None
+    filing_date: str | None
+    amended: bool
+    internal_document_id: str | None
+    accession_number: str | None
+    ingest_method: str | None
+    source_provider: str | None
+    is_deleted: bool
+    ingest_complete: bool
+
+
+@dataclass(frozen=True)
+class _CachedSourceDocumentMeta:
+    """source meta 缓存值。
+
+    Attributes:
+        meta: 已收窄的 source meta；文档不存在时为 ``None``。
+    """
+
+    meta: _SourceDocumentMeta | None
+
+
+class _SourceDocumentSummary(TypedDict):
+    """list_documents 内部 source 文档摘要。"""
+
+    document_id: str
+    source_kind: str
+    form_type: str | None
+    material_name: JsonValue | None
+    fiscal_year: int | None
+    fiscal_period: str | None
+    report_date: str | None
+    filing_date: str | None
+    amended: bool
+    has_financial_data: bool | None
+
+
+class _ListedDocumentSummary(_SourceDocumentSummary):
+    """附加 LLM-facing document_type 后的文档摘要。"""
+
+    document_type: str
+
+
+class _ProcessorPageContentPayload(TypedDict, total=False):
+    """processor 分页能力返回载荷。"""
+
+    sections: list[SectionSummary]
+    tables: list[TableSummary]
+    text_preview: str
+    has_content: bool
+    total_items: int
+    supported: bool
+
+
+class _ProcessorFinancialStatementPayload(TypedDict, total=False):
+    """processor 财务报表能力返回载荷。"""
+
+    statement_type: str
+    currency: str | None
+    units: str | None
+    rows: list[dict[str, JsonValue]]
+    statement_locator: StatementLocator
+    period_labels: list[str]
+    column_headers: list[str]
+    header: dict[str, JsonValue]
+    supported: bool
+    data_quality: str
+    reason: str
+
+
+@runtime_checkable
+class _PageContentReadProcessor(Protocol):
+    """read runtime 的分页 processor 能力协议。"""
+
+    def get_page_content(self, page_no: int) -> _ProcessorPageContentPayload:
+        """读取指定页内容。
+
+        Args:
+            page_no: 1-based 页码。
+
+        Returns:
+            页面内容载荷。
+
+        Raises:
+            RuntimeError: 底层读取失败时抛出。
+        """
+
+        ...
+
+
+@runtime_checkable
+class _FinancialStatementReadProcessor(Protocol):
+    """read runtime 的财务报表 processor 能力协议。"""
+
+    def get_financial_statement(self, statement_type: str) -> _ProcessorFinancialStatementPayload:
+        """读取指定类型的财务报表。
+
+        Args:
+            statement_type: 报表类型。
+
+        Returns:
+            财务报表载荷。
+
+        Raises:
+            RuntimeError: 底层读取失败时抛出。
+        """
+
+        ...
+
+
+@runtime_checkable
+class _XbrlFactsReadProcessor(Protocol):
+    """read runtime 的 XBRL facts processor 能力协议。"""
+
+    def query_xbrl_facts(
+        self,
+        *,
+        concepts: list[str],
+        statement_type: str | None = None,
+        period_end: str | None = None,
+        fiscal_year: int | None = None,
+        fiscal_period: str | None = None,
+        min_value: float | None = None,
+        max_value: float | None = None,
+    ) -> Mapping[str, JsonValue]:
+        """查询 XBRL facts。
+
+        Args:
+            concepts: XBRL concept 列表。
+            statement_type: 可选报表类型。
+            period_end: 可选期间结束日。
+            fiscal_year: 可选财年。
+            fiscal_period: 可选财期。
+            min_value: 可选最小值。
+            max_value: 可选最大值。
+
+        Returns:
+            XBRL facts 原始载荷。
+
+        Raises:
+            RuntimeError: 底层查询失败时抛出。
+        """
+
+        ...
+
 
 def _raise_if_fins_cancelled(cancellation_token: CancellationToken | None) -> None:
     """在财报读取慢边界执行协作式取消检查。
@@ -151,6 +339,205 @@ def _raise_if_fins_cancelled(cancellation_token: CancellationToken | None) -> No
     """
 
     raise_if_fins_cancelled(cancellation_token, message="财报读取工具调用已被取消。")
+
+
+def _parse_source_document_meta(raw_meta: Mapping[str, JsonValue]) -> _SourceDocumentMeta:
+    """把仓储 raw meta 收窄为 read runtime 本地投影。
+
+    Args:
+        raw_meta: 仓储返回的 source meta JSON 对象。
+
+    Returns:
+        read runtime 当前消费的 typed meta 投影。
+
+    Raises:
+        ValueError: bool 字段存在但不是 bool 时抛出。
+        RuntimeError: 其它字段收窄失败时抛出。
+    """
+
+    fiscal_year_value = raw_meta.get("fiscal_year")
+    fiscal_year = (
+        fiscal_year_value if isinstance(fiscal_year_value, int) and not isinstance(fiscal_year_value, bool) else None
+    )
+    return {
+        "form_type": _normalize_json_scalar_text(raw_meta.get("form_type")),
+        "material_name": raw_meta.get("material_name"),
+        "fiscal_year": fiscal_year,
+        "fiscal_period": _normalize_json_scalar_text(raw_meta.get("fiscal_period")),
+        "report_date": _normalize_json_scalar_text(raw_meta.get("report_date")),
+        "filing_date": _normalize_json_scalar_text(raw_meta.get("filing_date")),
+        "amended": _read_bool_meta_field(raw_meta, field_name="amended", default=False),
+        "internal_document_id": _normalize_json_scalar_text(raw_meta.get("internal_document_id")),
+        "accession_number": _normalize_json_scalar_text(raw_meta.get("accession_number")),
+        "ingest_method": _normalize_json_scalar_text(raw_meta.get("ingest_method")),
+        "source_provider": _normalize_json_scalar_text(raw_meta.get("source_provider")),
+        "is_deleted": _read_bool_meta_field(raw_meta, field_name="is_deleted", default=False),
+        "ingest_complete": _read_bool_meta_field(raw_meta, field_name="ingest_complete", default=True),
+    }
+
+
+def _read_bool_meta_field(raw_meta: Mapping[str, JsonValue], *, field_name: str, default: bool) -> bool:
+    """读取 source meta 的 bool 字段并执行严格校验。
+
+    Args:
+        raw_meta: 仓储返回的 source meta JSON 对象。
+        field_name: 需要读取的字段名。
+        default: 字段缺省时使用的 storage contract 默认值。
+
+    Returns:
+        字段 bool 值或缺省默认值。
+
+    Raises:
+        ValueError: 字段存在但不是 bool 时抛出。
+    """
+
+    if field_name not in raw_meta:
+        return default
+    value = raw_meta[field_name]
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"source meta 字段 {field_name} 必须为 bool")
+
+
+def _source_document_meta_to_storage_payload(meta: _SourceDocumentMeta) -> dict[str, JsonValue]:
+    """把 read runtime meta 投影转换为 storage provenance 可消费的 JSON。
+
+    Args:
+        meta: read runtime typed meta 投影。
+
+    Returns:
+        可传给 storage provenance helper 的 JSON 对象。
+
+    Raises:
+        RuntimeError: 转换失败时抛出。
+    """
+
+    return {
+        "form_type": meta["form_type"],
+        "material_name": meta["material_name"],
+        "fiscal_year": meta["fiscal_year"],
+        "fiscal_period": meta["fiscal_period"],
+        "report_date": meta["report_date"],
+        "filing_date": meta["filing_date"],
+        "amended": meta["amended"],
+        "internal_document_id": meta["internal_document_id"],
+        "accession_number": meta["accession_number"],
+        "ingest_method": meta["ingest_method"],
+        "source_provider": meta["source_provider"],
+        "is_deleted": meta["is_deleted"],
+        "ingest_complete": meta["ingest_complete"],
+    }
+
+
+def _source_document_recency_sort_key(
+    item: _SourceDocumentSummary,
+) -> tuple[int, str, str, int, int, str]:
+    """构建 source document 摘要排序键。
+
+    Args:
+        item: read runtime typed source 文档摘要。
+
+    Returns:
+        可直接用于倒序排序的确定性键。
+
+    Raises:
+        RuntimeError: 构建失败时抛出。
+    """
+
+    report_date = item["report_date"] or ""
+    filing_date = item["filing_date"] or ""
+    has_explicit_date = bool(report_date or filing_date)
+    fiscal_year = item["fiscal_year"] if item["fiscal_year"] is not None else -1
+    fiscal_period_rank = _FISCAL_PERIOD_SORT_ORDER.get(item["fiscal_period"] or "", 0)
+    has_fiscal_recency = fiscal_year > 0 or fiscal_period_rank > 0
+    temporal_rank = 2 if has_explicit_date else 1 if has_fiscal_recency else 0
+    primary_date = report_date or filing_date
+    secondary_date = filing_date or report_date
+    return (
+        temporal_rank,
+        primary_date,
+        secondary_date,
+        fiscal_year,
+        fiscal_period_rank,
+        item["document_id"],
+    )
+
+
+def _collect_available_document_types_for_source_documents(
+    documents: list[_SourceDocumentSummary],
+) -> list[str]:
+    """提取 source document 列表中可用的 LLM-facing 文档类型。
+
+    Args:
+        documents: read runtime typed source 文档摘要列表。
+
+    Returns:
+        去重后的 document_type 列表。
+
+    Raises:
+        RuntimeError: 推导失败时抛出。
+    """
+
+    doc_types: set[str] = set()
+    for item in documents:
+        doc_types.add(
+            resolve_document_type_for_source(
+                form_type=item["form_type"],
+                source_kind=item["source_kind"],
+            )
+        )
+    return sorted(doc_types)
+
+
+def _build_recommended_documents_for_list_result(
+    documents: list[_ListedDocumentSummary],
+) -> dict[str, str | None]:
+    """构建 list_documents 推荐文档槽位。
+
+    Args:
+        documents: 已按时间倒序排列且附带 document_type 的文档列表。
+
+    Returns:
+        推荐槽位到 document_id 的映射；无推荐时值为 ``None``。
+
+    Raises:
+        RuntimeError: 构建失败时抛出。
+    """
+
+    recommendations: dict[str, str | None] = {key: None for key in _RECOMMENDED_DOCUMENT_KEYS}
+    for item in documents:
+        document_id = item["document_id"]
+        doc_type = item["document_type"]
+        if recommendations["latest_document_id"] is None:
+            recommendations["latest_document_id"] = document_id
+        if recommendations["latest_annual_report_document_id"] is None and doc_type == "annual_report":
+            recommendations["latest_annual_report_document_id"] = document_id
+        if recommendations["latest_quarterly_report_document_id"] is None and doc_type in {
+            "quarterly_report",
+            "semi_annual_report",
+        }:
+            recommendations["latest_quarterly_report_document_id"] = document_id
+        if recommendations["latest_current_report_document_id"] is None and doc_type == "current_report":
+            recommendations["latest_current_report_document_id"] = document_id
+        if recommendations["latest_proxy_document_id"] is None and doc_type == "proxy":
+            recommendations["latest_proxy_document_id"] = document_id
+        if recommendations["latest_ownership_document_id"] is None and doc_type == "ownership":
+            recommendations["latest_ownership_document_id"] = document_id
+        if recommendations["latest_earnings_call_document_id"] is None and doc_type == "earnings_call":
+            recommendations["latest_earnings_call_document_id"] = document_id
+        if recommendations["latest_earnings_presentation_document_id"] is None and doc_type == "earnings_presentation":
+            recommendations["latest_earnings_presentation_document_id"] = document_id
+        if recommendations["latest_material_document_id"] is None and doc_type == "material":
+            recommendations["latest_material_document_id"] = document_id
+    recommendations["recommended_for_company_overview_document_id"] = (
+        recommendations["latest_annual_report_document_id"]
+        or recommendations["latest_quarterly_report_document_id"]
+        or recommendations["latest_proxy_document_id"]
+        or recommendations["latest_current_report_document_id"]
+        or recommendations["latest_ownership_document_id"]
+        or recommendations["latest_document_id"]
+    )
+    return recommendations
 
 
 class FinsReadRuntime:
@@ -172,6 +559,7 @@ class FinsReadRuntime:
         processed_repository: ProcessedDocumentRepositoryProtocol,
         processor_registry: ProcessorRegistry,
         processor_cache_max_entries: int = 128,
+        source_meta_cache_max_entries: int = _SOURCE_META_CACHE_DEFAULT_MAX_ENTRIES,
     ) -> None:
         """初始化服务。
 
@@ -181,6 +569,7 @@ class FinsReadRuntime:
             processed_repository: processed 文档仓储实现。
             processor_registry: 处理器注册表。
             processor_cache_max_entries: Processor LRU 缓存容量。
+            source_meta_cache_max_entries: source meta LRU 缓存容量。
 
         Returns:
             无。
@@ -191,6 +580,8 @@ class FinsReadRuntime:
 
         if processor_cache_max_entries <= 0:
             raise ValueError("processor_cache_max_entries must be greater than 0")
+        if source_meta_cache_max_entries <= 0:
+            raise ValueError("source_meta_cache_max_entries must be greater than 0")
         self._company_repository = company_repository
         self._source_repository = source_repository
         self._processed_repository = processed_repository
@@ -198,7 +589,9 @@ class FinsReadRuntime:
         self._processor_cache: ProcessorLRUCache[DocumentProcessor] = ProcessorLRUCache(
             max_entries=processor_cache_max_entries,
         )
-        self._meta_cache: dict[tuple[str, str], Optional[dict[str, Any]]] = {}
+        self._meta_cache: ProcessorLRUCache[_CachedSourceDocumentMeta] = ProcessorLRUCache(
+            max_entries=source_meta_cache_max_entries,
+        )
         self._creation_locks: dict[ProcessorCacheKey, Lock] = {}
         self._creation_locks_guard = RLock()
 
@@ -247,38 +640,51 @@ class FinsReadRuntime:
         )
 
         # 先为全量文档附加 document_type，供推荐槽位与过滤逻辑共享。
-        documents_with_type: list[dict[str, Any]] = []
+        documents_with_type: list[_ListedDocumentSummary] = []
         for item in base_documents:
             _raise_if_fins_cancelled(cancellation_token)
-            output = dict(item)
-            output["document_type"] = resolve_document_type_for_source(
-                form_type=item.get("form_type"),
-                source_kind=item.get("source_kind"),
-            )
+            output: _ListedDocumentSummary = {
+                **item,
+                "document_type": resolve_document_type_for_source(
+                    form_type=item["form_type"],
+                    source_kind=item["source_kind"],
+                ),
+            }
             documents_with_type.append(output)
 
         # 主过滤逻辑：按类型 / 财年 / 财期筛选；推荐槽位仍基于全量文档构建。
-        filtered_documents: list[dict[str, Any]] = []
+        filtered_documents: list[dict[str, JsonValue]] = []
         for item in documents_with_type:
             _raise_if_fins_cancelled(cancellation_token)
             doc_type = item["document_type"]
             if normalized_document_types is not None and doc_type not in normalized_document_types:
                 continue
-            fiscal_year = item.get("fiscal_year")
+            fiscal_year = item["fiscal_year"]
             if fiscal_years and fiscal_year not in fiscal_years:
                 continue
-            fiscal_period = item.get("fiscal_period")
+            fiscal_period = item["fiscal_period"]
             if normalized_fiscal_periods and fiscal_period not in normalized_fiscal_periods:
                 continue
-            output = dict(item)
-            # 屏蔽底层 SEC 表单名，不对 LLM 暴露
-            output.pop("form_type", None)
-            filtered_documents.append(output)
-        recommended_documents = _build_recommended_documents(documents_with_type)
+            # 屏蔽底层 SEC 表单名，不对 LLM 暴露。
+            filtered_documents.append(
+                {
+                    "document_id": item["document_id"],
+                    "source_kind": item["source_kind"],
+                    "material_name": item["material_name"],
+                    "fiscal_year": item["fiscal_year"],
+                    "fiscal_period": item["fiscal_period"],
+                    "report_date": item["report_date"],
+                    "filing_date": item["filing_date"],
+                    "amended": item["amended"],
+                    "has_financial_data": item["has_financial_data"],
+                    "document_type": item["document_type"],
+                }
+            )
+        recommended_documents = _build_recommended_documents_for_list_result(documents_with_type)
 
         # 判定匹配状态并构建 suggestion
         if normalized_document_types is not None and len(filtered_documents) == 0:
-            available = _collect_available_document_types(base_documents)
+            available = _collect_available_document_types_for_source_documents(base_documents)
             match_status = "no_match"
             suggestion: Optional[dict[str, Any]] = {
                 "action": "broaden_filter",
@@ -566,7 +972,9 @@ class FinsReadRuntime:
         )
         # 校验互斥：query 与 queries 必须提供其一
         resolved_queries = _resolve_search_queries(
-            query=query, queries=queries, max_queries=_QUERIES_MAX,
+            query=query,
+            queries=queries,
+            max_queries=_QUERIES_MAX,
         )
         # 保存查询词副本，供中文无结果 hint 检测使用
         original_queries = resolved_queries
@@ -646,16 +1054,14 @@ class FinsReadRuntime:
             document_count=max(1, len(semantic_profiles)),
             mode=resolved_mode,
         )
-        ranked_entries, strategy_hit_counts, exact_matches, expansion_queries = (
-            _execute_query_search(
-                processor=processor,
-                query=normalized_query,
-                within_ref=normalized_within_ref,
-                mode=resolved_mode,
-                diagnosis=diagnosis,
-                semantic_profiles=semantic_profiles,
-                cancellation_token=cancellation_token,
-            )
+        ranked_entries, strategy_hit_counts, exact_matches, expansion_queries = _execute_query_search(
+            processor=processor,
+            query=normalized_query,
+            within_ref=normalized_within_ref,
+            mode=resolved_mode,
+            diagnosis=diagnosis,
+            semantic_profiles=semantic_profiles,
+            cancellation_token=cancellation_token,
         )
 
         _raise_if_fins_cancelled(cancellation_token)
@@ -789,14 +1195,14 @@ class FinsReadRuntime:
                 document_count=max(1, len(semantic_profiles)),
                 mode=resolved_mode,
             )
-            ranked, strategy_hits, exact_matches, expansion_queries = (
-                _execute_query_search(
-                    processor=processor, query=q,
-                    within_ref=normalized_within_ref, mode=resolved_mode,
-                    diagnosis=query_diagnosis,
-                    semantic_profiles=semantic_profiles,
-                    cancellation_token=cancellation_token,
-                )
+            ranked, strategy_hits, exact_matches, expansion_queries = _execute_query_search(
+                processor=processor,
+                query=q,
+                within_ref=normalized_within_ref,
+                mode=resolved_mode,
+                diagnosis=query_diagnosis,
+                semantic_profiles=semantic_profiles,
+                cancellation_token=cancellation_token,
             )
             _raise_if_fins_cancelled(cancellation_token)
             all_ranked.extend(ranked)
@@ -804,14 +1210,16 @@ class FinsReadRuntime:
             for strat, cnt in strategy_hits.items():
                 _raise_if_fins_cancelled(cancellation_token)
                 merged_strategy_hits[strat] = merged_strategy_hits.get(strat, 0) + cnt
-            per_query_stats.append({
-                "query": q,
-                "hits": len(ranked),
-                "exact_hits": len(exact_matches),
-                "expansion_count": len(expansion_queries),
-                "is_high_ambiguity": query_diagnosis.is_high_ambiguity,
-                "intent": query_diagnosis.intent,
-            })
+            per_query_stats.append(
+                {
+                    "query": q,
+                    "hits": len(ranked),
+                    "exact_hits": len(exact_matches),
+                    "expansion_count": len(expansion_queries),
+                    "is_high_ambiguity": query_diagnosis.is_high_ambiguity,
+                    "intent": query_diagnosis.intent,
+                }
+            )
 
         _raise_if_fins_cancelled(cancellation_token)
         deduplicated = _deduplicate_ranked_search_entries(all_ranked)
@@ -946,11 +1354,7 @@ class FinsReadRuntime:
                 "col_count": int(item.get("col_count", 0) or 0),
                 "is_financial": is_financial,
                 "table_type": _normalize_table_type(item.get("table_type")),
-                "headers": (
-                    [str(h)[:80] for h in raw_headers if h]
-                    if isinstance(raw_headers, list)
-                    else None
-                ),
+                "headers": ([str(h)[:80] for h in raw_headers if h] if isinstance(raw_headers, list) else None),
             }
             # within_section：与请求参数 within_section_ref 语义同源，表达 table 所属 section
             if section_ref:
@@ -1139,8 +1543,7 @@ class FinsReadRuntime:
             document_id=normalized_document_id,
             cancellation_token=cancellation_token,
         )
-        page_method = getattr(processor, "get_page_content", None)
-        if not callable(page_method):
+        if not isinstance(processor, _PageContentReadProcessor):
             return _build_not_supported_result(
                 ticker=normalized_ticker,
                 document_id=normalized_document_id,
@@ -1149,7 +1552,7 @@ class FinsReadRuntime:
             )
 
         _raise_if_fins_cancelled(cancellation_token)
-        page_payload = cast(dict[str, Any], page_method(page_no))
+        page_payload = processor.get_page_content(page_no)
         _raise_if_fins_cancelled(cancellation_token)
         # processor 贡献的子字段通过 .get() 提取；已知字段由 PageContentResult 声明。
         result: PageContentResult = {
@@ -1218,8 +1621,7 @@ class FinsReadRuntime:
             document_id=normalized_document_id,
             cancellation_token=cancellation_token,
         )
-        statement_method = getattr(processor, "get_financial_statement", None)
-        if not callable(statement_method):
+        if not isinstance(processor, _FinancialStatementReadProcessor):
             return _build_not_supported_result(
                 ticker=normalized_ticker,
                 document_id=normalized_document_id,
@@ -1228,25 +1630,49 @@ class FinsReadRuntime:
             )
 
         _raise_if_fins_cancelled(cancellation_token)
-        statement_payload = cast(dict[str, Any], statement_method(normalized_statement_type))
+        statement_payload = processor.get_financial_statement(normalized_statement_type)
         _raise_if_fins_cancelled(cancellation_token)
         citation = self._build_citation(
             ticker=normalized_ticker,
             document_id=normalized_document_id,
         )
-        # processor 贡献的字段（statement_type, rows, currency 等）通过 spread 合入；
-        # 已知字段由 FinancialStatementResult TypedDict 声明，运行时由 processor 保证。
-        result: dict[str, Any] = {
+        rows = statement_payload.get("rows")
+        if not isinstance(rows, list):
+            raise ValueError("processor get_financial_statement result rows must be list")
+        for _row in rows:
+            _raise_if_fins_cancelled(cancellation_token)
+        raw_statement_locator = statement_payload.get("statement_locator")
+        if raw_statement_locator is None:
+            statement_locator: StatementLocator = {
+                "statement_type": normalized_statement_type,
+                "period_labels": [],
+                "row_labels": [],
+            }
+        else:
+            statement_locator = raw_statement_locator
+        result: FinancialStatementResult = {
             "ticker": normalized_ticker,
             "document_id": normalized_document_id,
-            **statement_payload,
             "citation": citation,
+            "statement_type": statement_payload.get("statement_type") or normalized_statement_type,
+            "currency": statement_payload.get("currency"),
+            "units": statement_payload.get("units"),
+            "rows": rows,
+            "statement_locator": statement_locator,
         }
-        rows = result.get("rows")
-        if isinstance(rows, list):
-            for _row in rows:
-                _raise_if_fins_cancelled(cancellation_token)
-        return cast(FinancialStatementResult, result)
+        period_labels = statement_payload.get("period_labels")
+        if period_labels is not None:
+            result["period_labels"] = period_labels
+        column_headers = statement_payload.get("column_headers")
+        if column_headers is not None:
+            result["column_headers"] = column_headers
+        header = statement_payload.get("header")
+        if header is not None:
+            result["header"] = header
+        supported = statement_payload.get("supported")
+        if supported is not None:
+            result["supported"] = supported
+        return result
 
     def query_xbrl_facts(
         self,
@@ -1322,8 +1748,7 @@ class FinsReadRuntime:
             if normalized_concepts
             else _resolve_default_xbrl_concepts(form_type=form_type, taxonomy=taxonomy)
         )
-        query_method = getattr(processor, "query_xbrl_facts", None)
-        if not callable(query_method):
+        if not isinstance(processor, _XbrlFactsReadProcessor):
             return _build_not_supported_result(
                 ticker=normalized_ticker,
                 document_id=normalized_document_id,
@@ -1332,17 +1757,14 @@ class FinsReadRuntime:
             )
 
         _raise_if_fins_cancelled(cancellation_token)
-        payload = cast(
-            dict[str, JsonValue],
-            query_method(
-                concepts=resolved_concepts,
-                statement_type=normalize_optional_text(statement_type),
-                period_end=normalize_optional_text(period_end),
-                fiscal_year=fiscal_year,
-                fiscal_period=normalize_optional_text(fiscal_period),
-                min_value=min_value,
-                max_value=max_value,
-            ),
+        payload = processor.query_xbrl_facts(
+            concepts=resolved_concepts,
+            statement_type=normalize_optional_text(statement_type),
+            period_end=normalize_optional_text(period_end),
+            fiscal_year=fiscal_year,
+            fiscal_period=normalize_optional_text(fiscal_period),
+            min_value=min_value,
+            max_value=max_value,
         )
         _raise_if_fins_cancelled(cancellation_token)
         raw_facts_for_checkpoint = payload.get("facts")
@@ -1357,18 +1779,59 @@ class FinsReadRuntime:
         if isinstance(facts, list):
             for _fact in facts:
                 _raise_if_fins_cancelled(cancellation_token)
-        # processor 贡献的字段（query_params, facts, total 等）通过 spread 合入；
-        # 已知字段由 XbrlQueryResult TypedDict 声明，运行时由 normalizer 保证。
-        result: dict[str, Any] = {
+        query_params: XbrlQueryParams = {
+            "concepts": resolved_concepts,
+        }
+        normalized_query_params = normalized_payload.get("query_params")
+        if isinstance(normalized_query_params, Mapping):
+            statement_type_value = normalized_query_params.get("statement_type")
+            period_end_value = normalized_query_params.get("period_end")
+            fiscal_year_value = normalized_query_params.get("fiscal_year")
+            fiscal_period_value = normalized_query_params.get("fiscal_period")
+            min_value_value = normalized_query_params.get("min_value")
+            max_value_value = normalized_query_params.get("max_value")
+            query_params["statement_type"] = statement_type_value if isinstance(statement_type_value, str) else None
+            query_params["period_end"] = period_end_value if isinstance(period_end_value, str) else None
+            query_params["fiscal_year"] = (
+                fiscal_year_value
+                if isinstance(fiscal_year_value, int) and not isinstance(fiscal_year_value, bool)
+                else None
+            )
+            query_params["fiscal_period"] = fiscal_period_value if isinstance(fiscal_period_value, str) else None
+            query_params["min_value"] = (
+                float(min_value_value)
+                if isinstance(min_value_value, int | float) and not isinstance(min_value_value, bool)
+                else None
+            )
+            query_params["max_value"] = (
+                float(max_value_value)
+                if isinstance(max_value_value, int | float) and not isinstance(max_value_value, bool)
+                else None
+            )
+        normalized_facts = normalized_payload.get("facts")
+        if not isinstance(normalized_facts, list):
+            raise ValueError("normalized XBRL payload missing facts")
+        normalized_total = normalized_payload.get("total")
+        if not isinstance(normalized_total, int) or isinstance(normalized_total, bool):
+            raise ValueError("normalized XBRL payload missing total")
+        result: XbrlQueryResult = {
             "ticker": normalized_ticker,
             "document_id": normalized_document_id,
-            **normalized_payload,
+            "query_params": query_params,
+            "facts": normalized_facts,
+            "total": normalized_total,
             "citation": self._build_citation(
                 ticker=normalized_ticker,
                 document_id=normalized_document_id,
             ),
         }
-        return cast(XbrlQueryResult, result)
+        deduped_fact_count = normalized_payload.get("deduped_fact_count")
+        if isinstance(deduped_fact_count, int) and not isinstance(deduped_fact_count, bool):
+            result["deduped_fact_count"] = deduped_fact_count
+        supported = normalized_payload.get("supported")
+        if isinstance(supported, bool):
+            result["supported"] = supported
+        return result
 
     def _normalize_document_identity(
         self,
@@ -1550,7 +2013,7 @@ class FinsReadRuntime:
         self,
         *,
         candidate_document_id: str,
-        meta: Mapping[str, Any],
+        meta: _SourceDocumentMeta,
     ) -> dict[str, str]:
         """构建单个文档可接受的身份别名集合。
 
@@ -1569,8 +2032,7 @@ class FinsReadRuntime:
             re.sub(r"\s+", "", candidate_document_id).strip(): "document_id",
         }
         for field_name in ("internal_document_id", "accession_number"):
-            raw_value = meta.get(field_name)
-            normalized_value = normalize_optional_text(raw_value)
+            normalized_value = meta.get(field_name)
             if not normalized_value:
                 continue
             aliases[re.sub(r"\s+", "", normalized_value).strip()] = field_name
@@ -1582,7 +2044,7 @@ class FinsReadRuntime:
         ticker: str,
         *,
         cancellation_token: CancellationToken | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[_SourceDocumentSummary]:
         """汇总 source 层文档摘要。
 
         Args:
@@ -1596,7 +2058,7 @@ class FinsReadRuntime:
             RuntimeError: 仓储读取失败时抛出。
         """
 
-        documents: list[dict[str, Any]] = []
+        documents: list[_SourceDocumentSummary] = []
         _raise_if_fins_cancelled(cancellation_token)
         documents.extend(
             self._collect_source_documents_by_kind(
@@ -1614,7 +2076,7 @@ class FinsReadRuntime:
             )
         )
         _raise_if_fins_cancelled(cancellation_token)
-        documents.sort(key=build_document_recency_sort_key, reverse=True)
+        documents.sort(key=_source_document_recency_sort_key, reverse=True)
         return documents
 
     def _collect_source_documents_by_kind(
@@ -1623,7 +2085,7 @@ class FinsReadRuntime:
         source_kind: SourceKind,
         *,
         cancellation_token: CancellationToken | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[_SourceDocumentSummary]:
         """按来源类型采集文档摘要。
 
         Args:
@@ -1641,43 +2103,45 @@ class FinsReadRuntime:
         _raise_if_fins_cancelled(cancellation_token)
         document_ids = self._source_repository.list_source_document_ids(ticker, source_kind)
         _raise_if_fins_cancelled(cancellation_token)
-        results: list[dict[str, Any]] = []
+        results: list[_SourceDocumentSummary] = []
         for document_id in document_ids:
             _raise_if_fins_cancelled(cancellation_token)
             try:
-                meta = self._source_repository.get_source_meta(ticker, document_id, source_kind)
+                meta = self._get_source_meta_cached_by_kind(ticker, document_id, source_kind)
             except FileNotFoundError:
                 continue
-            if bool(meta.get("is_deleted", False)):
+            if meta.get("is_deleted", False):
                 continue
-            if not bool(meta.get("ingest_complete", True)):
+            if not meta.get("ingest_complete", True):
                 continue
-            inferred_period = _infer_fiscal_period(meta)
-            inferred_year = _infer_fiscal_year(meta, inferred_period)
+            meta_payload = _source_document_meta_to_storage_payload(meta)
+            inferred_period = _infer_fiscal_period(meta_payload)
+            inferred_year = _infer_fiscal_year(meta_payload, inferred_period)
             resolved_fiscal_year = _resolve_fiscal_year_with_fallback(
-                raw_value=meta.get("fiscal_year"),
+                raw_value=meta["fiscal_year"],
                 inferred_year=inferred_year,
             )
             resolved_fiscal_period = _resolve_fiscal_period_with_fallback(
-                raw_value=meta.get("fiscal_period"),
+                raw_value=meta["fiscal_period"],
                 inferred_period=inferred_period,
             )
             # 从 processed meta 读取能力标志（轻量 JSON），处理缺失的情况
             has_financial_data = self._read_capability_flags(
-                ticker, document_id,
+                ticker,
+                document_id,
             )
             _raise_if_fins_cancelled(cancellation_token)
             results.append(
                 {
                     "document_id": document_id,
                     "source_kind": source_kind.value,
-                    "form_type": _normalize_form_type_for_matching(meta.get("form_type")),
-                    "material_name": meta.get("material_name"),
+                    "form_type": _normalize_form_type_for_matching(meta["form_type"]),
+                    "material_name": meta["material_name"],
                     "fiscal_year": resolved_fiscal_year,
                     "fiscal_period": resolved_fiscal_period,
-                    "report_date": meta.get("report_date"),
-                    "filing_date": meta.get("filing_date"),
-                    "amended": bool(meta.get("amended", False)),
+                    "report_date": meta["report_date"],
+                    "filing_date": meta["filing_date"],
+                    "amended": meta["amended"],
                     "has_financial_data": has_financial_data,
                 }
             )
@@ -1711,7 +2175,7 @@ class FinsReadRuntime:
             ticker,
             document_id,
             source_kind,
-            meta=meta,
+            meta=_source_document_meta_to_storage_payload(meta),
         )
         if not provenance.ingest_complete:
             raise FileNotFoundError(f"source document 尚未完成入库: ticker={ticker}, document_id={document_id}")
@@ -1721,20 +2185,20 @@ class FinsReadRuntime:
             source_type = _FILING_SOURCE_TYPES_BY_PROVIDER[provenance.source_provider].value
         source_provider = _CITATION_PROVIDER_LABELS[provenance.source_provider]
 
-        form_type = _normalize_form_type_for_matching(meta.get("form_type")) if meta else None
+        form_type = _normalize_form_type_for_matching(meta["form_type"])
         # 美股 filing 的 accession_number 存储在 meta.json 中
-        accession_no = normalize_optional_text(meta.get("accession_number")) if meta else None
+        accession_no = meta["accession_number"]
 
         citation = Citation(
             source_type=source_type,
             document_id=document_id,
             ticker=ticker,
             form_type=form_type,
-            filing_date=normalize_optional_text(meta.get("filing_date")) if meta else None,
+            filing_date=meta["filing_date"],
             accession_no=accession_no,
             source_provider=source_provider,
-            fiscal_year=meta.get("fiscal_year") if meta else None,
-            fiscal_period=normalize_optional_text(meta.get("fiscal_period")) if meta else None,
+            fiscal_year=meta["fiscal_year"],
+            fiscal_period=meta["fiscal_period"],
             item=item,
             heading=heading,
         )
@@ -1745,7 +2209,7 @@ class FinsReadRuntime:
         ticker: str,
         document_id: str,
         source_kind: SourceKind,
-    ) -> dict[str, Any]:
+    ) -> _SourceDocumentMeta:
         """按已知 source kind 读取并缓存 source meta。
 
         Args:
@@ -1760,15 +2224,16 @@ class FinsReadRuntime:
             FileNotFoundError: source meta 不存在时抛出。
         """
 
-        cache_key = (ticker, document_id)
-        cached_meta = self._meta_cache.get(cache_key)
-        if cached_meta is not None:
-            return cached_meta
-        meta = self._source_repository.get_source_meta(ticker, document_id, source_kind)
-        self._meta_cache[cache_key] = meta
+        cache_key = ProcessorCacheKey(ticker=ticker, document_id=document_id, source_kind=source_kind.value)
+        cached = self._meta_cache.get(cache_key)
+        if cached is not None and cached.meta is not None:
+            return cached.meta
+        raw_meta = self._source_repository.get_source_meta(ticker, document_id, source_kind)
+        meta = _parse_source_document_meta(raw_meta)
+        self._meta_cache.put(cache_key, _CachedSourceDocumentMeta(meta=meta))
         return meta
 
-    def _get_document_meta_cached(self, ticker: str, document_id: str) -> Optional[dict[str, Any]]:
+    def _get_document_meta_cached(self, ticker: str, document_id: str) -> _SourceDocumentMeta | None:
         """读取文档元数据（带实例级缓存）。
 
         同一 FinsReadRuntime 实例内，对相同 (ticker, document_id) 的
@@ -1781,15 +2246,17 @@ class FinsReadRuntime:
         Returns:
             meta 字典；文档不存在时返回 None。
         """
-        cache_key = (ticker, document_id)
-        if cache_key in self._meta_cache:
-            return self._meta_cache[cache_key]
+        cache_key = ProcessorCacheKey(ticker=ticker, document_id=document_id)
+        cached = self._meta_cache.get(cache_key)
+        if cached is not None:
+            return cached.meta
         try:
             source_kind = self._resolve_source_kind(ticker=ticker, document_id=document_id)
-            meta = self._source_repository.get_source_meta(ticker, document_id, source_kind)
+            raw_meta = self._source_repository.get_source_meta(ticker, document_id, source_kind)
+            meta = _parse_source_document_meta(raw_meta)
         except FileNotFoundError:
             meta = None
-        self._meta_cache[cache_key] = meta
+        self._meta_cache.put(cache_key, _CachedSourceDocumentMeta(meta=meta))
         return meta
 
     def _enrich_sections_with_semantic(

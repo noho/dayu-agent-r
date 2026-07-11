@@ -6,7 +6,7 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any, Optional
+from typing import Any, Optional, Protocol, runtime_checkable
 
 import pandas as pd
 
@@ -50,6 +50,26 @@ class _SectionBlock:
     table_refs: list[str]
     table_fingerprints: set[str]
     contains_full_text: bool
+
+
+@runtime_checkable
+class _TableTextLike(Protocol):
+    """edgartools 表格文本能力协议。"""
+
+    def text(self) -> str:
+        """读取表格文本。
+
+        Args:
+            无。
+
+        Returns:
+            表格文本。
+
+        Raises:
+            RuntimeError: 底层读取失败时可能抛出。
+        """
+
+        ...
 
 
 # ---------------------------------------------------------------------------
@@ -772,7 +792,7 @@ def _safe_table_text(table_obj: Any) -> str:
     return str(text or "")
 
 
-def _normalize_table_objects(table_objects: object) -> list[object]:
+def _normalize_table_objects(table_objects: Iterable[_TableTextLike] | None) -> list[_TableTextLike]:
     """将动态表格结果收敛为可安全遍历的对象列表。
 
     Args:
@@ -837,9 +857,16 @@ def _extract_section_table_fingerprints(section_obj: Any) -> set[str]:
     if not callable(table_method):
         return table_fingerprints
     try:
-        section_tables = table_method()
+        raw_section_tables = table_method()
     except Exception:
         return table_fingerprints
+    if not isinstance(raw_section_tables, Iterable) or isinstance(raw_section_tables, (str, bytes)):
+        return table_fingerprints
+    section_tables: list[_TableTextLike] = []
+    for table_obj in raw_section_tables:
+        if not isinstance(table_obj, _TableTextLike):
+            continue
+        section_tables.append(table_obj)
     for table_obj in _normalize_table_objects(section_tables):
         fingerprint = _table_fingerprint(_normalize_whitespace(_safe_table_text(table_obj)))
         if fingerprint:

@@ -15,7 +15,7 @@ import json
 import re
 from collections.abc import Mapping
 from html import unescape
-from typing import Any, NoReturn, Optional, cast
+from typing import Any, NoReturn, Optional, Protocol, cast, runtime_checkable
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
@@ -149,19 +149,21 @@ _FISCAL_PERIOD_SORT_ORDER: dict[str, int] = {
 }
 
 # LLM 可传入的合法 document_type 值集合（含预留值）
-_VALID_DOCUMENT_TYPES: frozenset[str] = frozenset({
-    "annual_report",
-    "semi_annual_report",
-    "quarterly_report",
-    "current_report",
-    "proxy",
-    "ownership",
-    "earnings_call",
-    "earnings_presentation",
-    "corporate_governance",
-    "material",
-    "other",
-})
+_VALID_DOCUMENT_TYPES: frozenset[str] = frozenset(
+    {
+        "annual_report",
+        "semi_annual_report",
+        "quarterly_report",
+        "current_report",
+        "proxy",
+        "ownership",
+        "earnings_call",
+        "earnings_presentation",
+        "corporate_governance",
+        "material",
+        "other",
+    }
+)
 
 # material form_type → document_type 精细映射表
 # 未列出的 form_type 回落到通用 "material"
@@ -367,7 +369,7 @@ def _resolve_document_type(form_type: Optional[str], source_kind: str) -> str:
     return _FORM_TYPE_TO_DOCUMENT_TYPE.get(form_type, "other")
 
 
-def build_document_recency_sort_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
+def build_document_recency_sort_key(item: Mapping[str, JsonValue]) -> tuple[int, str, str, int, int, str]:
     """构建文档摘要的统一排序键。
 
     排序目标：
@@ -385,20 +387,20 @@ def build_document_recency_sort_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
         无。
     """
 
-    report_date = normalize_optional_text(item.get("report_date")) or ""
-    filing_date = normalize_optional_text(item.get("filing_date")) or ""
+    report_date = _normalize_json_scalar_text(item.get("report_date")) or ""
+    filing_date = _normalize_json_scalar_text(item.get("filing_date")) or ""
     has_explicit_date = bool(report_date or filing_date)
 
     fiscal_year = item.get("fiscal_year")
     normalized_fiscal_year = fiscal_year if isinstance(fiscal_year, int) else -1
-    normalized_fiscal_period = normalize_optional_text(item.get("fiscal_period"))
+    normalized_fiscal_period = _normalize_json_scalar_text(item.get("fiscal_period"))
     fiscal_period_rank = _FISCAL_PERIOD_SORT_ORDER.get(normalized_fiscal_period or "", 0)
     has_fiscal_recency = normalized_fiscal_year > 0 or fiscal_period_rank > 0
     temporal_rank = 2 if has_explicit_date else 1 if has_fiscal_recency else 0
 
     primary_date = report_date or filing_date
     secondary_date = filing_date or report_date
-    document_id = normalize_optional_text(item.get("document_id")) or ""
+    document_id = _normalize_json_scalar_text(item.get("document_id")) or ""
     return (
         temporal_rank,
         primary_date,
@@ -409,7 +411,7 @@ def build_document_recency_sort_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def resolve_document_type_for_source(*, form_type: Any, source_kind: Any) -> str:
+def resolve_document_type_for_source(*, form_type: JsonValue | None, source_kind: JsonValue | None) -> str:
     """根据原始源文档元数据推导稳定 document_type。
 
     该函数统一封装工具链路的 document_type 推导逻辑：
@@ -428,11 +430,29 @@ def resolve_document_type_for_source(*, form_type: Any, source_kind: Any) -> str
     """
 
     normalized_form_type = _normalize_form_type_for_matching(form_type)
-    normalized_source_kind = normalize_optional_text(source_kind) or ""
+    normalized_source_kind = _normalize_json_scalar_text(source_kind) or ""
     return _resolve_document_type(normalized_form_type, normalized_source_kind)
 
 
-def _collect_available_document_types(documents: list[dict[str, Any]]) -> list[str]:
+def _normalize_json_scalar_text(value: JsonValue | None) -> Optional[str]:
+    """把 JSON 标量值标准化为可选文本。
+
+    Args:
+        value: JSON 字段值。
+
+    Returns:
+        标准化文本；数组或对象等非标量返回 ``None``。
+
+    Raises:
+        RuntimeError: 标准化失败时抛出。
+    """
+
+    if isinstance(value, list) or isinstance(value, Mapping):
+        return None
+    return normalize_optional_text(value)
+
+
+def _collect_available_document_types(documents: list[Mapping[str, JsonValue]]) -> list[str]:
     """提取文档列表中出现的所有 document_type（去重、排序）。
 
     对尚未附加 document_type 字段的原始文档（base_documents）也适用，
@@ -451,7 +471,8 @@ def _collect_available_document_types(documents: list[dict[str, Any]]) -> list[s
     doc_types: set[str] = set()
     for doc in documents:
         # 若已附加 document_type 字段则直接取；否则实时推导
-        dt = doc.get("document_type")
+        raw_doc_type = doc.get("document_type")
+        dt = raw_doc_type if isinstance(raw_doc_type, str) else None
         if dt is None:
             dt = resolve_document_type_for_source(
                 form_type=doc.get("form_type"),
@@ -550,7 +571,7 @@ def _normalize_document_types(document_types: Optional[list[str]]) -> Optional[l
     return result or None
 
 
-def _build_recommended_documents(documents: list[dict[str, Any]]) -> dict[str, Optional[str]]:
+def _build_recommended_documents(documents: list[Mapping[str, JsonValue]]) -> dict[str, Optional[str]]:
     """构建 `list_documents.recommended_documents` 固定槽位。
 
     Args:
@@ -568,17 +589,21 @@ def _build_recommended_documents(documents: list[dict[str, Any]]) -> dict[str, O
         return recommendations
 
     for item in documents:
-        document_id = normalize_optional_text(item.get("document_id"))
+        document_id = _normalize_json_scalar_text(item.get("document_id"))
         if document_id is None:
             continue
         # document_type 由调用方在过滤循环中已附加
-        doc_type = item.get("document_type") or ""
+        raw_doc_type = item.get("document_type")
+        doc_type = raw_doc_type if isinstance(raw_doc_type, str) else ""
 
         if recommendations["latest_document_id"] is None:
             recommendations["latest_document_id"] = document_id
         if recommendations["latest_annual_report_document_id"] is None and doc_type == "annual_report":
             recommendations["latest_annual_report_document_id"] = document_id
-        if recommendations["latest_quarterly_report_document_id"] is None and doc_type in {"quarterly_report", "semi_annual_report"}:
+        if recommendations["latest_quarterly_report_document_id"] is None and doc_type in {
+            "quarterly_report",
+            "semi_annual_report",
+        }:
             recommendations["latest_quarterly_report_document_id"] = document_id
         if recommendations["latest_current_report_document_id"] is None and doc_type == "current_report":
             recommendations["latest_current_report_document_id"] = document_id
@@ -588,10 +613,7 @@ def _build_recommended_documents(documents: list[dict[str, Any]]) -> dict[str, O
             recommendations["latest_ownership_document_id"] = document_id
         if recommendations["latest_earnings_call_document_id"] is None and doc_type == "earnings_call":
             recommendations["latest_earnings_call_document_id"] = document_id
-        if (
-            recommendations["latest_earnings_presentation_document_id"] is None
-            and doc_type == "earnings_presentation"
-        ):
+        if recommendations["latest_earnings_presentation_document_id"] is None and doc_type == "earnings_presentation":
             recommendations["latest_earnings_presentation_document_id"] = document_id
         if recommendations["latest_material_document_id"] is None and doc_type == "material":
             recommendations["latest_material_document_id"] = document_id
@@ -672,7 +694,7 @@ def build_search_next_section_fields(
     *,
     matches: list[dict[str, Any]],
     queries: Optional[list[str]] = None,
- ) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Optional[dict[str, Any]]]]]:
+) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Optional[dict[str, Any]]]]]:
     """基于搜索命中构建下一步阅读章节字段。
 
     Args:
@@ -746,10 +768,7 @@ def build_search_next_section_fields(
     )
 
     if queries is None:
-        next_section_to_read = (
-            _strip_search_section_internal_fields(ranked_sections[0])
-            if ranked_sections else None
-        )
+        next_section_to_read = _strip_search_section_internal_fields(ranked_sections[0]) if ranked_sections else None
         return next_section_to_read, None
 
     next_section_by_query: dict[str, Optional[dict[str, Any]]] = {}
@@ -796,6 +815,7 @@ def _strip_search_section_internal_fields(section_stat: dict[str, Any]) -> dict[
 # =====================================================================
 # 章节标准化
 # =====================================================================
+
 
 def _normalize_section_children(raw_children: Any) -> list[dict[str, Any]]:
     """标准化 `read_section.children` 字段。
@@ -920,7 +940,8 @@ def _extract_page_range(section: SectionSummary | SectionContent | Mapping[str, 
 # 财务日期推断
 # =====================================================================
 
-def _infer_fiscal_period(meta: dict[str, Any]) -> Optional[str]:
+
+def _infer_fiscal_period(meta: Mapping[str, JsonValue]) -> Optional[str]:
     """推断财期。
 
     Args:
@@ -933,11 +954,11 @@ def _infer_fiscal_period(meta: dict[str, Any]) -> Optional[str]:
         RuntimeError: 推断失败时抛出。
     """
 
-    raw_period = normalize_optional_text(meta.get("fiscal_period"))
+    raw_period = _normalize_json_scalar_text(meta.get("fiscal_period"))
     if raw_period is not None:
         return raw_period
 
-    form_type = normalize_optional_text(meta.get("form_type"))
+    form_type = _normalize_json_scalar_text(meta.get("form_type"))
     if form_type in {"10-K", "20-F"}:
         return "FY"
     return None
@@ -993,7 +1014,7 @@ def _resolve_fiscal_period_with_fallback(raw_value: Any, inferred_period: Option
     return inferred_period
 
 
-def _infer_fiscal_year(meta: dict[str, Any], fiscal_period: Optional[str]) -> Optional[int]:
+def _infer_fiscal_year(meta: Mapping[str, JsonValue], fiscal_period: Optional[str]) -> Optional[int]:
     """推断财年。
 
     Args:
@@ -1069,6 +1090,7 @@ def _to_optional_float(value: Any) -> Optional[float]:
 # =====================================================================
 # 表格标准化
 # =====================================================================
+
 
 def _build_table_data_payload(table_raw: TableContent | Mapping[str, Any]) -> dict[str, Any]:
     """构建 `get_table.data` 的自解释结构。
@@ -1298,7 +1320,32 @@ def _normalize_table_type(raw_table_type: Any) -> Optional[str]:
 # XBRL 辅助
 # =====================================================================
 
-def _resolve_processor_taxonomy(processor: Any) -> Optional[str]:
+
+@runtime_checkable
+class XbrlTaxonomyProcessor(Protocol):
+    """XBRL taxonomy 读取能力协议。
+
+    该协议是 read runtime 判断 processor taxonomy 能力的唯一 typed boundary，
+    避免调用方通过字符串属性名探测能力。
+    """
+
+    def get_xbrl_taxonomy(self) -> Optional[str]:
+        """读取 processor 识别出的 XBRL taxonomy。
+
+        Args:
+            无。
+
+        Returns:
+            原始 taxonomy 名称；无法识别时返回 ``None``。
+
+        Raises:
+            RuntimeError: 底层 XBRL 读取失败时可能抛出。
+        """
+
+        ...
+
+
+def _resolve_processor_taxonomy(processor: object) -> Optional[str]:
     """从处理器中读取 XBRL taxonomy。
 
     Args:
@@ -1311,14 +1358,9 @@ def _resolve_processor_taxonomy(processor: Any) -> Optional[str]:
         RuntimeError: 解析失败时抛出。
     """
 
-    taxonomy_method = getattr(processor, "get_xbrl_taxonomy", None)
-    if callable(taxonomy_method):
-        try:
-            return _normalize_taxonomy_name(taxonomy_method())
-        except Exception:
-            return None
-    raw_taxonomy = getattr(processor, "xbrl_taxonomy", None)
-    return _normalize_taxonomy_name(raw_taxonomy)
+    if not isinstance(processor, XbrlTaxonomyProcessor):
+        return None
+    return _normalize_taxonomy_name(processor.get_xbrl_taxonomy())
 
 
 def _normalize_taxonomy_name(taxonomy: Any) -> Optional[str]:
@@ -1538,9 +1580,7 @@ def _looks_like_html_text(text: str) -> bool:
     return bool(_HTML_TAG_PATTERN.search(text))
 
 
-def _deduplicate_xbrl_facts(
-    normalized_pairs: list[tuple[dict[str, Any], dict[str, Any], int]]
-) -> list[dict[str, Any]]:
+def _deduplicate_xbrl_facts(normalized_pairs: list[tuple[dict[str, Any], dict[str, Any], int]]) -> list[dict[str, Any]]:
     """按确定性策略去重 XBRL facts。
 
     去重键：`(canonical_concept, period_start, period_end, fiscal_year, dedup_fiscal_period, unit, segment_signature)`。
@@ -1854,11 +1894,7 @@ def _build_search_hint(
     # mixed
     exact_count = sum(1 for m in matches if m.get("is_exact_phrase"))
     top_ref = _extract_top_section_ref(matches)
-    next_step = (
-        f"下一步：先调用 read_section(ref='{top_ref}')。"
-        if top_ref
-        else "下一步：先读取最相关命中的章节。"
-    )
+    next_step = f"下一步：先调用 read_section(ref='{top_ref}')。" if top_ref else "下一步：先读取最相关命中的章节。"
     return (
         f"目标：先读最相关的精确命中。允许动作：先读取前面的精确命中。"
         f"不允许：先枚举后面的低相关扩展命中。"

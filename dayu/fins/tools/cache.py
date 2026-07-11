@@ -19,15 +19,19 @@ ProcessorT = TypeVar("ProcessorT")
 
 @dataclass(frozen=True)
 class ProcessorCacheKey:
-    """Processor 缓存键。
+    """Processor 及同源运行时缓存键。
 
     Attributes:
         ticker: 股票代码（标准化后）。
         document_id: 文档唯一标识。
+        source_kind: 可选来源类型维度。Processor 实例缓存与构建锁保持
+            ``None``，source meta 这类已按来源类型读取的缓存必须填入稳定
+            的来源类型字符串，避免同一文档 ID 在不同来源目录下互相污染。
     """
 
     ticker: str
     document_id: str
+    source_kind: str | None = None
 
 
 class ProcessorLRUCache(Generic[ProcessorT]):

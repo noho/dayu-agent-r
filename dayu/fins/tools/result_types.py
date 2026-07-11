@@ -15,12 +15,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from typing import Any, NotRequired, TypedDict
 
+from dayu.contracts.json_value import JsonValue
+from dayu.documents.processors.base import SectionSummary, TableSummary
 
 # ---------------------------------------------------------------------------
 # 共享子结构
 # ---------------------------------------------------------------------------
+
 
 class ErrorDetail(TypedDict):
     """工具错误详情。"""
@@ -49,6 +53,7 @@ class ListDocumentsFilters(TypedDict):
 # NotSupportedResult — 三个降级路径共享
 # ---------------------------------------------------------------------------
 
+
 class _NotSupportedBase(TypedDict):
     """降级返回的基础字段，始终由 ``_build_not_supported_result`` 填充。"""
 
@@ -76,13 +81,14 @@ class NotSupportedResult(_NotSupportedBase, total=False):
 # list_documents
 # ---------------------------------------------------------------------------
 
+
 class ListDocumentsResult(TypedDict):
     """``list_documents`` 返回结构。"""
 
     company: CompanyInfo
     filters: ListDocumentsFilters
     recommended_documents: dict[str, str | None]
-    documents: list[dict[str, Any]]
+    documents: Sequence[Mapping[str, JsonValue]]
     total: int
     matched: int
     match_status: str
@@ -92,6 +98,7 @@ class ListDocumentsResult(TypedDict):
 # ---------------------------------------------------------------------------
 # get_document_sections
 # ---------------------------------------------------------------------------
+
 
 class DocumentSectionsResult(TypedDict):
     """``get_document_sections`` 返回结构。"""
@@ -105,6 +112,7 @@ class DocumentSectionsResult(TypedDict):
 # ---------------------------------------------------------------------------
 # read_section
 # ---------------------------------------------------------------------------
+
 
 class SectionContentResult(TypedDict):
     """``read_section`` 返回结构。
@@ -129,6 +137,7 @@ class SectionContentResult(TypedDict):
 # ---------------------------------------------------------------------------
 # search_document（单查询 + 批量查询）
 # ---------------------------------------------------------------------------
+
 
 class SearchDocumentResult(TypedDict):
     """``search_document`` 返回结构。
@@ -163,6 +172,7 @@ class SearchDocumentResult(TypedDict):
 # list_tables
 # ---------------------------------------------------------------------------
 
+
 class TablesListResult(TypedDict):
     """``list_tables`` 返回结构。"""
 
@@ -177,6 +187,7 @@ class TablesListResult(TypedDict):
 # ---------------------------------------------------------------------------
 # get_table
 # ---------------------------------------------------------------------------
+
 
 class TableDetailResult(TypedDict):
     """``get_table`` 返回结构。
@@ -203,14 +214,15 @@ class TableDetailResult(TypedDict):
 # get_page_content
 # ---------------------------------------------------------------------------
 
+
 class PageContentResult(TypedDict):
     """``get_page_content`` 返回结构。"""
 
     ticker: str
     document_id: str
     page_no: int
-    sections: list[dict[str, Any]]
-    tables: list[dict[str, Any]]
+    sections: list[SectionSummary]
+    tables: list[TableSummary]
     text_preview: str
     has_content: bool
     total_items: int
@@ -221,6 +233,7 @@ class PageContentResult(TypedDict):
 # ---------------------------------------------------------------------------
 # get_financial_statement
 # ---------------------------------------------------------------------------
+
 
 class StatementLocator(TypedDict, total=False):
     """财务报表定位信息。"""
@@ -239,7 +252,7 @@ class _FinancialStatementBase(TypedDict):
     statement_type: str
     currency: str | None
     units: str | None
-    rows: list[dict[str, Any]]
+    rows: list[dict[str, JsonValue]]
     statement_locator: StatementLocator
 
 
@@ -254,13 +267,14 @@ class FinancialStatementResult(_FinancialStatementBase, total=False):
     # processor 可能附带的额外字段
     period_labels: list[str]
     column_headers: list[str]
-    header: dict[str, Any]
+    header: dict[str, JsonValue]
     supported: bool
 
 
 # ---------------------------------------------------------------------------
 # query_xbrl_facts
 # ---------------------------------------------------------------------------
+
 
 class _XbrlQueryParamsBase(TypedDict):
     """查询参数核心字段。"""
@@ -286,7 +300,7 @@ class _XbrlQueryBase(TypedDict):
     document_id: str
     citation: dict[str, Any]
     query_params: XbrlQueryParams
-    facts: list[dict[str, Any]]
+    facts: list[dict[str, JsonValue]]
     total: int
 
 

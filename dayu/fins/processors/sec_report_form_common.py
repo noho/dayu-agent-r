@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar, Optional, Protocol
 
 from bs4 import BeautifulSoup
 import pandas as pd
@@ -57,6 +57,32 @@ _LATE_NOTES_TOC_CONTEXT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?i)\bnotes?\s+to\s+(?:the\s+)?consolidated\s+financial\s+statements?\b"),
     re.compile(r"(?i)\bnotes?\s+to\s+financial\s+statements?\b"),
 )
+
+
+class _EdgarSectionLike(Protocol):
+    """edgartools section 文本能力协议。"""
+
+    def text(self) -> str:
+        """读取章节文本。
+
+        Args:
+            无。
+
+        Returns:
+            章节文本。
+
+        Raises:
+            RuntimeError: 底层解析失败时可能抛出。
+        """
+
+        ...
+
+
+class _EdgarDocumentWithSections(Protocol):
+    """edgartools 文档 sections 能力协议。"""
+
+    sections: dict[str, _EdgarSectionLike]
+
 
 # ToC 条目自适应检测参数
 # 相邻 marker 之间 span 低于此阈值视为 ToC 条目（标题 + 页码，通常 < 300 字符）
@@ -490,7 +516,7 @@ class _BaseSecReportFormProcessor(_VirtualSectionProcessorMixin, SecProcessor):
         )
 
 
-def _rebuild_virtual_sections_from_edgartools(document: object) -> list[_VirtualSection]:
+def _rebuild_virtual_sections_from_edgartools(document: _EdgarDocumentWithSections) -> list[_VirtualSection]:
     """从 edgartools sections 惰性重建虚拟章节。
 
     当 ``single_full_text`` 优化启用但 marker 检测不足时调用。
@@ -516,9 +542,7 @@ def _rebuild_virtual_sections_from_edgartools(document: object) -> list[_Virtual
         content = _normalize_whitespace(_safe_section_text(section_obj))
         if not content:
             continue
-        title = _normalize_optional_string(
-            _build_section_title(section_key=section_key, section_obj=section_obj)
-        )
+        title = _normalize_optional_string(_build_section_title(section_key=section_key, section_obj=section_obj))
         content = _trim_trailing_part_heading(content)
         content = _trim_trailing_page_locator(content, title)
         if not content:
@@ -1085,7 +1109,9 @@ def _skip_toc_like_markers(
         if len(retry) < min_items:
             break
         next_toc_end = _find_toc_cluster_end(
-            full_text, retry, check_partial_toc=False,
+            full_text,
+            retry,
+            check_partial_toc=False,
         )
         if next_toc_end is None:
             return retry
@@ -1161,7 +1187,9 @@ def _select_ordered_item_markers_after_toc(
         ):
             result = default_selected
         return _refine_inline_reference_markers(
-            full_text, result, item_pattern=item_pattern,
+            full_text,
+            result,
+            item_pattern=item_pattern,
         )
 
     # 自适应迭代：从 toc_start 开始，逐步跳过 ToC 条目
@@ -1182,7 +1210,8 @@ def _select_ordered_item_markers_after_toc(
         # 已完成 ToC 跳过后禁用部分 ToC 检测（check 1b），
         # 避免正文连续短节被误判
         toc_end = _find_toc_cluster_end(
-            full_text, selected,
+            full_text,
+            selected,
             check_partial_toc=not has_skipped_toc,
         )
         if toc_end is None:
@@ -1233,7 +1262,9 @@ def _select_ordered_item_markers_after_toc(
                 best_result = candidate
 
     return _refine_inline_reference_markers(
-        full_text, best_result, item_pattern=item_pattern,
+        full_text,
+        best_result,
+        item_pattern=item_pattern,
     )
 
 
@@ -1348,13 +1379,9 @@ def _find_item_token_position_after(
         return None
 
     filtered_positions = [
-        position
-        for position in candidate_positions
-        if not _looks_like_inline_item_reference(full_text, position)
+        position for position in candidate_positions if not _looks_like_inline_item_reference(full_text, position)
     ]
-    positions_for_selection = (
-        filtered_positions if filtered_positions else candidate_positions
-    )
+    positions_for_selection = filtered_positions if filtered_positions else candidate_positions
 
     # 优先选择“非行内引用”位置，减少 "see Item X ..." 被误当成标题。
     # 若全文结构已被压平（几乎无换行）导致所有候选都像行内引用，

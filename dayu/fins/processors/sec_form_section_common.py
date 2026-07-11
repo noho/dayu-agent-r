@@ -58,10 +58,10 @@ SIGNATURE_PATTERN = re.compile(r"(?i)\bsignatures?\b")
 # 参考 SEC Regulation S-K: Part I–IV + 可选法定副标题
 # 匹配位于文本末尾的 Part 标题（允许前后空白、可选副标题文本）
 _TRAILING_PART_HEADING_RE = re.compile(
-    r"\s*"                          # 前导空白
-    r"PART\s+(?:I{1,3}|IV)\b"      # "PART I" / "PART II" / "PART III" / "PART IV"
-    r"(?:"                          # 可选法定副标题组
-    r"[\s\.\-—–:]*"                 # 分隔符
+    r"\s*"  # 前导空白
+    r"PART\s+(?:I{1,3}|IV)\b"  # "PART I" / "PART II" / "PART III" / "PART IV"
+    r"(?:"  # 可选法定副标题组
+    r"[\s\.\-—–:]*"  # 分隔符
     r"(?:FINANCIAL\s+(?:INFORMATION|STATEMENTS)"
     r"|OTHER\s+INFORMATION"
     r"|FINANCIAL\s+DATA\s+AND\s+SUPPLEMENTARY\s+DATA"
@@ -69,16 +69,14 @@ _TRAILING_PART_HEADING_RE = re.compile(
     r"|EXHIBITS,?\s+FINANCIAL\s+STATEMENT\s+SCHEDULES"
     r")?"
     r")"
-    r"[\s\.]*$",                    # 尾部空白/句点直到文本结束
+    r"[\s\.]*$",  # 尾部空白/句点直到文本结束
     re.IGNORECASE,
 )
 # 仅在 section 末尾 N 个字符内搜索，防止误剪正文中的 "Part" 引用
 _TRAILING_PART_TRIM_WINDOW = 200
 _SHORT_ITEM_SECTION_MAX_CHARS = 400
 _SHORT_ITEM_SECTION_MAX_WORDS = 48
-_PAGE_LOCATOR_TOKEN_PATTERN = (
-    r"(?:[A-Z]-\d{1,3}|\d{1,3})(?:\s*[—–-]\s*(?:[A-Z]-\d{1,3}|\d{1,3}))?"
-)
+_PAGE_LOCATOR_TOKEN_PATTERN = r"(?:[A-Z]-\d{1,3}|\d{1,3})(?:\s*[—–-]\s*(?:[A-Z]-\d{1,3}|\d{1,3}))?"
 _PAGE_LOCATOR_TAIL_RE = re.compile(
     rf"(?:\s*(?:,|/|;)?\s*{_PAGE_LOCATOR_TOKEN_PATTERN}){{1,6}}\s*$",
     re.IGNORECASE,
@@ -123,17 +121,57 @@ _TITLE_CASE_HEADING_MIN_CAPITALIZED_RATIO = 0.75
 _TITLE_CASE_HEADING_LOOKAHEAD_LINES = 6
 _TITLE_CASE_HEADING_PROSE_WINDOW = 3
 _TITLE_CASE_HEADING_MIN_PROSE_WORDS = 12
-_TITLE_CASE_HEADING_ARTIFACT_TITLES = frozenset({
-    "table of contents",
-})
-_FALLBACK_HEADING_TRAILING_STOPWORDS = frozenset({
-    "a", "an", "and", "as", "at", "by", "for", "from", "in", "into",
-    "of", "on", "or", "per", "the", "to", "under", "upon", "with",
-})
-_FALLBACK_HEADING_CAPITALIZATION_STOPWORDS = frozenset({
-    "a", "an", "and", "as", "at", "by", "for", "from", "in", "into",
-    "of", "on", "or", "per", "the", "to", "under", "upon", "with",
-})
+_TITLE_CASE_HEADING_ARTIFACT_TITLES = frozenset(
+    {
+        "table of contents",
+    }
+)
+_FALLBACK_HEADING_TRAILING_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "as",
+        "at",
+        "by",
+        "for",
+        "from",
+        "in",
+        "into",
+        "of",
+        "on",
+        "or",
+        "per",
+        "the",
+        "to",
+        "under",
+        "upon",
+        "with",
+    }
+)
+_FALLBACK_HEADING_CAPITALIZATION_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "as",
+        "at",
+        "by",
+        "for",
+        "from",
+        "in",
+        "into",
+        "of",
+        "on",
+        "or",
+        "per",
+        "the",
+        "to",
+        "under",
+        "upon",
+        "with",
+    }
+)
 _FALLBACK_HEADING_MIN_CAPITALIZED_RATIO = 0.5
 _NOTE_HEADING_ALLOWED_PARENT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?i)\bfinancial statements?\b"),
@@ -161,12 +199,9 @@ _REFERENCE_GUIDE_NOTE_PATTERN = re.compile(
     r"(?:to\s+each\s+set\s+of\s+)?"
     r"(?:the\s+)?(?:consolidated\s+)?financial\s+statements?\b"
 )
-_REFERENCE_GUIDE_CODE_PATTERN = re.compile(
-    r"(?i)\b(?:AFR|IAR|GRR)\s+\d{1,3}(?:\s*[—–-]\s*\d{1,3})?\b"
-)
+_REFERENCE_GUIDE_CODE_PATTERN = re.compile(r"(?i)\b(?:AFR|IAR|GRR)\s+\d{1,3}(?:\s*[—–-]\s*\d{1,3})?\b")
 _REFERENCE_GUIDE_PAGE_RANGE_PATTERN = re.compile(
-    rf"(?i)\((?:{_PAGE_LOCATOR_TOKEN_PATTERN})"
-    rf"(?:\s*(?:and|,)\s*(?:{_PAGE_LOCATOR_TOKEN_PATTERN}))*\)"
+    rf"(?i)\((?:{_PAGE_LOCATOR_TOKEN_PATTERN})" rf"(?:\s*(?:and|,)\s*(?:{_PAGE_LOCATOR_TOKEN_PATTERN}))*\)"
 )
 _REFERENCE_GUIDE_ACTION_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?i)\bnot\s+applicable\b"),
@@ -257,6 +292,31 @@ class _VirtualSectionTextProviderProtocol(Protocol):
         """返回带表格占位符的文档全文。"""
 
         ...
+
+
+class _VirtualDocumentTextLike(Protocol):
+    """虚拟章节切分所需的 edgartools 文档文本协议。"""
+
+    def text(self) -> str:
+        """读取文档全文。
+
+        Args:
+            无。
+
+        Returns:
+            文档全文文本。
+
+        Raises:
+            RuntimeError: 底层解析失败时可能抛出。
+        """
+
+        ...
+
+
+class _VirtualDocumentOwner(Protocol):
+    """持有 edgartools 文档对象的 processor 协议。"""
+
+    _document: _VirtualDocumentTextLike
 
 
 class _VirtualSectionProcessorMixin:
@@ -417,7 +477,10 @@ class _VirtualSectionProcessorMixin:
         try:
             base_sections = self._get_base_processor().list_sections()
         except Exception as exc:
-            Log.warn(f"_collect_structured_split_candidates: 行基类 list_sections 失败，返回空列表: {exc}", module=self.MODULE)
+            Log.warn(
+                f"_collect_structured_split_candidates: 行基类 list_sections 失败，返回空列表: {exc}",
+                module=self.MODULE,
+            )
             return []
 
         candidates: list[_StructuredSplitCandidate] = []
@@ -432,8 +495,9 @@ class _VirtualSectionProcessorMixin:
             if level <= 1:
                 continue
             preview = _normalize_optional_string(section.get("preview")) or ""
+            section_ref = _normalize_optional_string(section.get("ref"))
             anchor_text = self._build_structured_split_anchor(
-                section_ref=section.get("ref"),
+                section_ref=section_ref,
                 title=title,
                 preview=preview,
             )
@@ -468,7 +532,9 @@ class _VirtualSectionProcessorMixin:
         try:
             base_sections = self._get_base_processor().list_sections()
         except Exception as exc:
-            Log.warn(f"_build_virtual_sections_from_base: 行基类 list_sections 失败，返回空列表: {exc}", module=self.MODULE)
+            Log.warn(
+                f"_build_virtual_sections_from_base: 行基类 list_sections 失败，返回空列表: {exc}", module=self.MODULE
+            )
             return []
 
         virtual_sections: list[_VirtualSection] = []
@@ -520,7 +586,7 @@ class _VirtualSectionProcessorMixin:
     def _build_structured_split_anchor(
         self,
         *,
-        section_ref: object,
+        section_ref: str | None,
         title: str,
         preview: str,
     ) -> Optional[str]:
@@ -536,8 +602,7 @@ class _VirtualSectionProcessorMixin:
         """
 
         normalized_preview = _normalize_whitespace(preview)
-        normalized_ref = _normalize_optional_string(section_ref)
-        if normalized_ref is None:
+        if section_ref is None:
             return None
         # 优先使用 preview 作为锚点，避免触发底层 read_section 渲染成本。
         for candidate in (normalized_preview, title):
@@ -951,9 +1016,7 @@ class _VirtualSectionProcessorMixin:
             return []
 
         target_sections = (
-            [self._virtual_section_by_ref[within_ref]]
-            if within_ref is not None
-            else self._virtual_sections
+            [self._virtual_section_by_ref[within_ref]] if within_ref is not None else self._virtual_sections
         )
         hits_raw: list[SearchHit] = []
         section_content_map: dict[str, str] = {}
@@ -967,9 +1030,7 @@ class _VirtualSectionProcessorMixin:
                 continue
             # 若 title 命中而 content 无命中，将 title 前置进搜索文本，确保 snippet 能定位到匹配词。
             searchable_text = (
-                (title_text + "\n" + section.content).strip()
-                if title_hit and not content_hit
-                else section.content
+                (title_text + "\n" + section.content).strip() if title_hit and not content_hit else section.content
             )
             # enrich_hits_by_section 需要完整章节文本用于生成上下文 snippet。
             section_content_map[section.ref] = searchable_text
@@ -1070,7 +1131,7 @@ def _find_lettered_marker_after(
     return int(match.start()), f"{title_prefix} {suffix.upper()}"
 
 
-def _safe_virtual_document_text(processor: SecProcessor) -> str:
+def _safe_virtual_document_text(processor: _VirtualDocumentOwner) -> str:
     """安全读取专项切分可用的文档全文文本。
 
     Args:
@@ -1083,11 +1144,8 @@ def _safe_virtual_document_text(processor: SecProcessor) -> str:
         RuntimeError: 读取失败时抛出。
     """
 
-    document_obj = getattr(processor, "_document", None)
-    if document_obj is None:
-        return ""
     try:
-        text = document_obj.text()
+        text = processor._document.text()
     except Exception:
         return ""
     return _normalize_whitespace(str(text or ""))
@@ -1199,7 +1257,7 @@ def _strip_leading_title(content: str, title: Optional[str]) -> str:
 
     # 策略 1: 直接前缀匹配
     if content_lower.startswith(title_lower):
-        remainder = content[len(title):].lstrip(" .:;-\n\r\t")
+        remainder = content[len(title) :].lstrip(" .:;-\n\r\t")
         return remainder if remainder else content
 
     # 策略 2: 复合标题（如 "Part II - Item 7"），试匹配后半段
@@ -1207,7 +1265,7 @@ def _strip_leading_title(content: str, title: Optional[str]) -> str:
         item_part = title.split(" - ", 1)[1].strip()
         item_part_lower = item_part.lower()
         if content_lower.startswith(item_part_lower):
-            remainder = content[len(item_part):].lstrip(" .:;-\n\r\t")
+            remainder = content[len(item_part) :].lstrip(" .:;-\n\r\t")
             return remainder if remainder else content
 
     return content
@@ -1347,11 +1405,7 @@ def _build_virtual_sections(
 
     next_index = len(sections) + 1
     for marker_index, (start, title) in enumerate(normalized_markers):
-        end = (
-            normalized_markers[marker_index + 1][0]
-            if marker_index + 1 < len(normalized_markers)
-            else len(full_text)
-        )
+        end = normalized_markers[marker_index + 1][0] if marker_index + 1 < len(normalized_markers) else len(full_text)
         content = full_text[start:end].strip()
         allow_short = _allow_short_section(title)
         # 尾段章节（如 SIGNATURE）允许更短文本，其余章节保持较高信息密度阈值。
@@ -1425,10 +1479,7 @@ def _build_child_sections_from_candidates(
         candidates=candidates,
         candidates_by_level=candidates_by_level,
     ):
-        if (
-            not allow_note_headings
-            and re.match(r"^(?:Note|NOTES?)\s+", candidate.title) is not None
-        ):
+        if not allow_note_headings and re.match(r"^(?:Note|NOTES?)\s+", candidate.title) is not None:
             continue
         anchor_position = _find_anchor_position_in_text(
             text=parent_text,
@@ -1450,24 +1501,36 @@ def _build_child_sections_from_candidates(
     )
     fallback_marker_pairs = sec_subitem_marker_pairs
 
-    structured_children = _build_child_sections_from_markers(
-        parent_section=parent_section,
-        markers=marker_pairs,
-    ) if len(marker_pairs) >= 2 else []
-    fallback_children = _build_child_sections_from_markers(
-        parent_section=parent_section,
-        markers=fallback_marker_pairs,
-    ) if len(fallback_marker_pairs) >= 2 else []
+    structured_children = (
+        _build_child_sections_from_markers(
+            parent_section=parent_section,
+            markers=marker_pairs,
+        )
+        if len(marker_pairs) >= 2
+        else []
+    )
+    fallback_children = (
+        _build_child_sections_from_markers(
+            parent_section=parent_section,
+            markers=fallback_marker_pairs,
+        )
+        if len(fallback_marker_pairs) >= 2
+        else []
+    )
     if len(fallback_children) < 2:
         fallback_marker_pairs = _extract_fallback_heading_markers(
             parent_text,
             parent_title=parent_section.title,
             sec_subitems_only=False,
         )
-        fallback_children = _build_child_sections_from_markers(
-            parent_section=parent_section,
-            markers=fallback_marker_pairs,
-        ) if len(fallback_marker_pairs) >= 2 else []
+        fallback_children = (
+            _build_child_sections_from_markers(
+                parent_section=parent_section,
+                markers=fallback_marker_pairs,
+            )
+            if len(fallback_marker_pairs) >= 2
+            else []
+        )
     return _select_preferred_child_sections(
         structured_children=structured_children,
         fallback_children=fallback_children,
@@ -1803,11 +1866,7 @@ def _extract_fallback_heading_markers(
         parent_title=parent_title,
         content=content,
     ):
-        markers = [
-            (pos, title)
-            for pos, title in markers
-            if re.match(r"^(?:Note|NOTES?)\s+", title) is None
-        ]
+        markers = [(pos, title) for pos, title in markers if re.match(r"^(?:Note|NOTES?)\s+", title) is None]
     if not markers:
         return []
 
@@ -1907,19 +1966,11 @@ def _count_reference_guide_signals(content: str) -> tuple[int, int, int, int, in
     """
 
     normalized_prefix = _normalize_whitespace(str(content or ""))[:_REFERENCE_GUIDE_PREFIX_WINDOW]
-    source_hits = sum(
-        1
-        for pattern in _REFERENCE_GUIDE_SOURCE_PATTERNS
-        for _ in pattern.finditer(normalized_prefix)
-    )
+    source_hits = sum(1 for pattern in _REFERENCE_GUIDE_SOURCE_PATTERNS for _ in pattern.finditer(normalized_prefix))
     note_hits = len(list(_REFERENCE_GUIDE_NOTE_PATTERN.finditer(normalized_prefix)))
     code_hits = len(list(_REFERENCE_GUIDE_CODE_PATTERN.finditer(normalized_prefix)))
     page_hits = len(list(_REFERENCE_GUIDE_PAGE_RANGE_PATTERN.finditer(normalized_prefix)))
-    action_hits = sum(
-        1
-        for pattern in _REFERENCE_GUIDE_ACTION_PATTERNS
-        for _ in pattern.finditer(normalized_prefix)
-    )
+    action_hits = sum(1 for pattern in _REFERENCE_GUIDE_ACTION_PATTERNS for _ in pattern.finditer(normalized_prefix))
     return source_hits, note_hits, code_hits, page_hits, action_hits
 
 
@@ -2165,16 +2216,12 @@ def _looks_like_title_case_heading(title: str) -> bool:
     if words[-1].lower() in _FALLBACK_HEADING_TRAILING_STOPWORDS:
         return False
 
-    significant_words = [
-        word for word in words if word.lower() not in _FALLBACK_HEADING_CAPITALIZATION_STOPWORDS
-    ]
+    significant_words = [word for word in words if word.lower() not in _FALLBACK_HEADING_CAPITALIZATION_STOPWORDS]
     if len(significant_words) < 2:
         return False
-    capitalized_ratio = sum(
-        1
-        for word in significant_words
-        if word.isupper() or word[:1].isupper()
-    ) / len(significant_words)
+    capitalized_ratio = sum(1 for word in significant_words if word.isupper() or word[:1].isupper()) / len(
+        significant_words
+    )
     if capitalized_ratio < _TITLE_CASE_HEADING_MIN_CAPITALIZED_RATIO:
         return False
     return True
@@ -2260,7 +2307,7 @@ def _has_title_case_heading_prose_context(
     """
 
     following_lines: list[str] = []
-    for _, raw_line in lines[index + 1: index + 1 + _TITLE_CASE_HEADING_LOOKAHEAD_LINES]:
+    for _, raw_line in lines[index + 1 : index + 1 + _TITLE_CASE_HEADING_LOOKAHEAD_LINES]:
         normalized_line = _normalize_optional_string(raw_line)
         if normalized_line is None:
             continue
@@ -2276,9 +2323,7 @@ def _has_title_case_heading_prose_context(
         return False
 
     prose_lines = [
-        line
-        for line in following_lines[:_TITLE_CASE_HEADING_PROSE_WINDOW]
-        if _looks_like_prose_followup_line(line)
+        line for line in following_lines[:_TITLE_CASE_HEADING_PROSE_WINDOW] if _looks_like_prose_followup_line(line)
     ]
     if not prose_lines:
         return False
@@ -2372,7 +2417,7 @@ def _is_valid_inline_heading(
         return False
     if _looks_like_truncated_heading_fragment(title):
         return False
-    context = lowered_content[max(0, start - _INLINE_HEADING_CONTEXT_WINDOW):start]
+    context = lowered_content[max(0, start - _INLINE_HEADING_CONTEXT_WINDOW) : start]
     for pattern in _INLINE_REF_CONTEXT_PATTERNS:
         if pattern.search(context):
             return False
@@ -2405,10 +2450,14 @@ def _looks_like_truncated_heading_fragment(title: str) -> bool:
         return False
     if re.match(r"^[A-Z]\.", normalized_title) is not None:
         return False
-    if re.match(r"^(?:Note|NOTES?)\s+", normalized_title) is None and re.match(
-        r"^\d+\.",
-        normalized_title,
-    ) is None:
+    if (
+        re.match(r"^(?:Note|NOTES?)\s+", normalized_title) is None
+        and re.match(
+            r"^\d+\.",
+            normalized_title,
+        )
+        is None
+    ):
         return False
 
     words = re.findall(r"[A-Za-z][A-Za-z'&/\-]*", normalized_title)
@@ -2420,18 +2469,12 @@ def _looks_like_truncated_heading_fragment(title: str) -> bool:
         return True
 
     significant_words = [
-        word
-        for word in words
-        if len(word) > 2 and word.lower() not in _FALLBACK_HEADING_CAPITALIZATION_STOPWORDS
+        word for word in words if len(word) > 2 and word.lower() not in _FALLBACK_HEADING_CAPITALIZATION_STOPWORDS
     ]
     if len(significant_words) < 4:
         return False
 
-    capitalized_count = sum(
-        1
-        for word in significant_words
-        if word.isupper() or word[0].isupper()
-    )
+    capitalized_count = sum(1 for word in significant_words if word.isupper() or word[0].isupper())
     capitalized_ratio = capitalized_count / len(significant_words)
     return capitalized_ratio < _FALLBACK_HEADING_MIN_CAPITALIZED_RATIO
 
@@ -2659,10 +2702,7 @@ def _remap_tables_to_deepest_virtual_sections(
     if not section_ranges:
         return
 
-    table_positions = {
-        match.group(1): int(match.start())
-        for match in _TABLE_REF_PATTERN.finditer(marked_text)
-    }
+    table_positions = {match.group(1): int(match.start()) for match in _TABLE_REF_PATTERN.finditer(marked_text)}
 
     for tbl_ref, current_ref in list(table_ref_to_virtual_ref.items()):
         position = table_positions.get(tbl_ref)
@@ -2870,11 +2910,7 @@ def _tokenize_query(query: str) -> list[str]:
         有效 token 列表（全部小写）。
     """
 
-    return [
-        token
-        for token in re.split(r"\W+", query.strip().lower())
-        if len(token) >= _MIN_SEARCH_TOKEN_LEN
-    ]
+    return [token for token in re.split(r"\W+", query.strip().lower()) if len(token) >= _MIN_SEARCH_TOKEN_LEN]
 
 
 def _token_fallback_search(
