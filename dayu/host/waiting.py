@@ -16,6 +16,7 @@ from enum import StrEnum
 
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_await import ToolAwaitSpec
+from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolFailedOutcome
 from dayu.host._event_payload import (
     attempt_suspended_payload,
     llm_safe_replay_arguments,
@@ -101,15 +102,16 @@ from dayu.host.evidence import (
     accepted_evidence_envelope_to_json_value,
     derive_accepted_evidence_id,
 )
+from dayu.host.accepted_tool_outcome import (
+    accepted_tool_outcome_digest,
+    accepted_tool_outcome_json,
+)
 from dayu.host.durable.wait_resolution_digest import (
     WAIT_RESOLUTION_OUTCOME_KIND_CANCELLED as _TOOL_FACT_KIND_CANCELLED,
     WAIT_RESOLUTION_OUTCOME_KIND_COMPLETED as _TOOL_FACT_KIND_COMPLETED,
     WAIT_RESOLUTION_OUTCOME_KIND_FAILED as _TOOL_FACT_KIND_FAILED,
     WAIT_RESOLUTION_OUTCOME_KIND_LOST as _TOOL_FACT_KIND_LOST,
     resolve_wait_outcome_json,
-    resolve_wait_cancelled_result_json as _tool_cancelled_json,
-    resolve_wait_completed_result_json as _tool_success_json,
-    resolve_wait_failed_result_json as _tool_failure_json,
     resolve_wait_lost_result_json as _tool_lost_json,
     wait_resolution_digest,
 )
@@ -1318,53 +1320,43 @@ def _wait_resolution_payload_plan(
 
     outcome = request.outcome
     if isinstance(outcome, ResolveWaitCompletedOutcome):
-        result_json = _tool_success_json(outcome.result)
+        tool_outcome = ToolCompletedOutcome(outcome.result)
+        result_json = accepted_tool_outcome_json(tool_outcome)
         return _WaitResolutionPayloadPlan(
             resolution_kind=_TOOL_FACT_KIND_COMPLETED,
             tool_fact_kind=_TOOL_FACT_KIND_COMPLETED,
-            outcome_digest=sha256_digest_json(
-                {"kind": _TOOL_FACT_KIND_COMPLETED, "result": result_json}
-            ),
+            outcome_digest=accepted_tool_outcome_digest(tool_outcome),
             payload_digest=_completed_payload_digest(outcome),
             payload_ref=outcome.payload_ref,
             provider_status_ref=None,
-            result_json={
-                "kind": _TOOL_FACT_KIND_COMPLETED,
-                "result": result_json,
-            },
+            result_json=result_json,
         )
     if isinstance(outcome, ResolveWaitFailedOutcome):
-        result_json = _tool_failure_json(outcome.result)
+        tool_outcome = ToolFailedOutcome(outcome.result)
+        result_json = accepted_tool_outcome_json(tool_outcome)
         return _WaitResolutionPayloadPlan(
             resolution_kind=_TOOL_FACT_KIND_FAILED,
             tool_fact_kind=_TOOL_FACT_KIND_FAILED,
-            outcome_digest=sha256_digest_json(
-                {"kind": _TOOL_FACT_KIND_FAILED, "result": result_json}
-            ),
+            outcome_digest=accepted_tool_outcome_digest(tool_outcome),
             payload_digest=outcome.payload_ref.payload_digest
             if outcome.payload_ref is not None
             else None,
             payload_ref=outcome.payload_ref,
             provider_status_ref=None,
-            result_json={"kind": _TOOL_FACT_KIND_FAILED, "result": result_json},
+            result_json=result_json,
         )
     if isinstance(outcome, ResolveWaitCancelledOutcome):
-        result_json = _tool_cancelled_json(outcome.result)
+        result_json = accepted_tool_outcome_json(outcome.result)
         return _WaitResolutionPayloadPlan(
             resolution_kind=_TOOL_FACT_KIND_CANCELLED,
             tool_fact_kind=_TOOL_FACT_KIND_CANCELLED,
-            outcome_digest=sha256_digest_json(
-                {"kind": _TOOL_FACT_KIND_CANCELLED, "result": result_json}
-            ),
+            outcome_digest=accepted_tool_outcome_digest(outcome.result),
             payload_digest=outcome.payload_ref.payload_digest
             if outcome.payload_ref is not None
             else None,
             payload_ref=outcome.payload_ref,
             provider_status_ref=None,
-            result_json={
-                "kind": _TOOL_FACT_KIND_CANCELLED,
-                "result": result_json,
-            },
+            result_json=result_json,
         )
     if isinstance(outcome, ResolveWaitLostOutcome):
         result_json = _tool_lost_json(outcome)

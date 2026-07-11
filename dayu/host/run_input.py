@@ -3563,22 +3563,37 @@ def _resume_wait_tool_message_content(
     :raises HostDurableError: result 结构缺失或非法时抛出。
     """
 
-    result = tool_result_payload.get("result")
+    result = tool_result_payload.get("raw_tool_outcome")
     if not isinstance(result, Mapping):
-        raise HostDurableError("resume wait result must be object")
+        raise HostDurableError("resume wait raw_tool_outcome must be object")
     kind = _required_payload_text(result, field_name="kind")
-    body = result.get("result")
-    if not isinstance(body, Mapping):
-        raise HostDurableError("resume wait result body must be object")
     if kind == "completed":
+        body = _required_resume_tool_result_body(result)
         projected = _resume_wait_completed_tool_content(body)
     elif kind == "failed":
+        body = _required_resume_tool_result_body(result)
         projected = _resume_wait_failed_tool_content(body)
     elif kind == "cancelled":
-        projected = _resume_wait_cancelled_tool_content(body)
+        projected = _resume_wait_cancelled_tool_content(result)
     else:
         raise HostDurableError("resume wait result kind is not resumable")
     return json.dumps(projected, ensure_ascii=False, sort_keys=True)
+
+
+def _required_resume_tool_result_body(
+    raw_tool_outcome: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    """读取 canonical completed / failed outcome 的 result body。
+
+    :param raw_tool_outcome: accepted tool outcome canonical atom。
+    :returns: ``result`` 字段中的 JSON object。
+    :raises HostDurableError: ``result`` 缺失或非 object 时抛出。
+    """
+
+    body = raw_tool_outcome.get("result")
+    if not isinstance(body, Mapping):
+        raise HostDurableError("resume wait raw_tool_outcome.result must be object")
+    return body
 
 
 def _resume_wait_completed_tool_content(

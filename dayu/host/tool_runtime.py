@@ -67,6 +67,11 @@ from dayu.contracts.tool_schema import (
     ToolTruncationStrategy,
 )
 from dayu.contracts.tool_source import ToolBundleSourceRef
+from dayu.host.accepted_tool_outcome import (
+    accepted_tool_outcome_digest,
+    accepted_tool_outcome_inline_size_bytes,
+    accepted_tool_outcome_json,
+)
 from dayu.host.api import AttemptStatus, HostPayloadRef, RunStatus
 from dayu.host.durable.codec import (
     canonical_json_dumps,
@@ -7009,6 +7014,10 @@ def _tool_outcome_digest(outcome: ToolExecutionOutcome) -> str:
     :returns: Host canonical sha256 digest。
     """
 
+    if isinstance(
+        outcome, ToolCompletedOutcome | ToolFailedOutcome | ToolCancelledOutcome
+    ):
+        return accepted_tool_outcome_digest(outcome)
     return sha256_digest_json(_tool_outcome_json(outcome))
 
 
@@ -7020,6 +7029,10 @@ def _tool_outcome_inline_size_bytes(outcome: ToolExecutionOutcome) -> int:
     :raises TypeError: 收到不支持的工具 outcome 时抛出。
     """
 
+    if isinstance(
+        outcome, ToolCompletedOutcome | ToolFailedOutcome | ToolCancelledOutcome
+    ):
+        return accepted_tool_outcome_inline_size_bytes(outcome)
     return len(canonical_json_dumps(_tool_outcome_json(outcome)).encode("utf-8"))
 
 
@@ -7265,34 +7278,10 @@ def _tool_outcome_json(outcome: ToolExecutionOutcome) -> JsonValue:
     :raises TypeError: 收到 awaiting outcome 时抛出。
     """
 
-    if isinstance(outcome, ToolCompletedOutcome):
-        return {
-            "kind": "completed",
-            "result": {
-                "ok": outcome.result.ok,
-                "value": outcome.result.value,
-                "meta": _tool_result_meta_json(outcome.result.meta),
-            },
-        }
-    if isinstance(outcome, ToolFailedOutcome):
-        return {
-            "kind": "failed",
-            "result": {
-                "ok": outcome.result.ok,
-                "error": outcome.result.error,
-                "message": outcome.result.message,
-                "hint": outcome.result.hint,
-                "meta": _tool_result_meta_json(outcome.result.meta),
-            },
-        }
-    if isinstance(outcome, ToolCancelledOutcome):
-        return {
-            "kind": "cancelled",
-            "reason": outcome.reason,
-            "message": outcome.message,
-            "hint": outcome.hint,
-            "meta": _tool_result_meta_json(outcome.meta),
-        }
+    if isinstance(
+        outcome, ToolCompletedOutcome | ToolFailedOutcome | ToolCancelledOutcome
+    ):
+        return accepted_tool_outcome_json(outcome)
     if isinstance(outcome, ToolAwaitingOutcome):
         return {
             "kind": "awaiting",
@@ -7315,22 +7304,6 @@ def _tool_outcome_json(outcome: ToolExecutionOutcome) -> JsonValue:
             ),
         }
     raise TypeError("unsupported tool outcome")
-
-
-def _tool_result_meta_json(meta: ToolResultMeta | None) -> JsonValue:
-    """把工具结果 meta 投影为 JSON。
-
-    :param meta: 工具结果 meta。
-    :returns: JSON 值。
-    """
-
-    if meta is None:
-        return None
-    return {
-        "tool_name": meta.tool_name,
-        "started_at": meta.started_at.isoformat(),
-        "finished_at": meta.finished_at.isoformat(),
-    }
 
 
 def _duplicate_decision_json(decision: DuplicateDecision) -> JsonValue:

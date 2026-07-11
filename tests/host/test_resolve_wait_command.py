@@ -77,6 +77,10 @@ from dayu.host.durable.state import (
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.admission import create_host_admission_service
+from dayu.host.accepted_tool_outcome import (
+    accepted_tool_outcome_digest,
+    accepted_tool_outcome_json,
+)
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
     default_memory_projection_policy,
@@ -575,6 +579,29 @@ def test_resolve_wait_tool_cancelled_resumes_as_resolved_wait(
         )
 
         wait_record = _read_wait(host._transaction_runner(), seeded.wait_id)
+        tool_events = _events_by_type(
+            _events(host._transaction_runner()), "TOOL_RESULT_ACCEPTED"
+        )
+        result_payload = cast(
+            Mapping[str, JsonValue], json.loads(tool_events[-1].payload_json)
+        )
+        request = _cancelled_request("resolve-cancelled-tool")
+        assert isinstance(request.outcome, ResolveWaitCancelledOutcome)
+        expected_atom = accepted_tool_outcome_json(request.outcome.result)
+        assert result_payload["raw_tool_outcome"] == expected_atom
+        assert result_payload["result"] == expected_atom
+        assert result_payload["outcome_digest"] == accepted_tool_outcome_digest(
+            request.outcome.result
+        )
+        assert snapshot.current_attempt_id is not None
+        request_for_resume = _build_resume_request(
+            host._transaction_runner(), seeded.session_id, snapshot.current_attempt_id
+        )
+        tool_message = request_for_resume.messages[3]
+        assert isinstance(tool_message, ToolMessage)
+        assert tool_message.content == (
+            '{"cancelled": true, "message": "tool timed out", "reason": "timeout"}'
+        )
         assert snapshot.status is RunStatus.RUNNING
         assert snapshot.current_attempt_id != seeded.attempt_id
         assert wait_record.status is WaitRecordStatus.RESOLVED

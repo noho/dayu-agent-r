@@ -162,6 +162,7 @@ from dayu.host.run_input import (
     _fallback_context_messages,
     _normalize_ordinary_run_messages,
     _resume_wait_messages_from_current_start,
+    _resume_wait_tool_message_content,
     _runner_call_kind_and_trigger,
     create_no_tool_run_input_builder,
     create_tool_enabled_run_input_builder,
@@ -829,6 +830,28 @@ def test_resume_wait_completed_tool_content_wraps_non_object_value(
         tool = messages[2]
         assert isinstance(tool, ToolMessage)
         assert tool.content == '{"content": "download finished"}'
+
+
+def test_resume_wait_cancelled_tool_content_consumes_canonical_raw_outcome() -> None:
+    """resume cancelled tool content 消费 canonical raw_tool_outcome atom。
+
+    :returns: ``None``。
+    :raises AssertionError: resume 消费非 canonical raw atom 时抛出。
+    """
+
+    payload: dict[str, JsonValue] = {
+        "raw_tool_outcome": {
+            "kind": "cancelled",
+            "reason": "timeout",
+            "message": "tool timed out",
+            "hint": None,
+            "meta": None,
+        },
+    }
+
+    assert _resume_wait_tool_message_content(payload) == (
+        '{"cancelled": true, "message": "tool timed out", "reason": "timeout"}'
+    )
 
 
 def test_resume_wait_replays_only_llm_safe_arguments(tmp_path: Path) -> None:
@@ -5684,12 +5707,14 @@ def _append_resume_wait_projection_events(
                 "result": {
                     "ok": True,
                     "value": {"answer": 42} if completed_value is None else completed_value,
+                    "meta": None,
                 },
             },
             "payload_ref": "payload-ref-private",
             "result_digest": _DIGEST_A,
             "normalized_arguments_digest": normalized_arguments_digest,
         }
+        tool_result_payload["raw_tool_outcome"] = tool_result_payload["result"]
         if include_accepted_evidence_envelope:
             tool_result_payload["accepted_evidence_envelope"] = accepted_evidence_envelope_to_json_value(
                 AcceptedEvidenceEnvelope(
@@ -5712,7 +5737,6 @@ def _append_resume_wait_projection_events(
                     locator_refs=(),
                 )
             )
-            tool_result_payload["raw_tool_outcome"] = tool_result_payload["result"]
         if wait_created_ref_case == "valid" or wait_created_ref_case == "wrong_event_type":
             tool_result_payload["wait_created_event_ref"] = {
                 "event_id": tool_awaiting.event_id,

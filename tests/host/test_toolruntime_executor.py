@@ -49,6 +49,10 @@ from dayu.contracts.tool_schema import (
     ToolTruncateSpec,
     ToolTruncationStrategy,
 )
+from dayu.host.accepted_tool_outcome import (
+    accepted_tool_outcome_digest,
+    accepted_tool_outcome_json,
+)
 from dayu.host.api import WaitAdapterKey
 from dayu.host.durable.state import WaitResumePolicy
 from dayu.host.tool_runtime import (
@@ -1239,6 +1243,9 @@ async def test_tool_runtime_produces_tool_failed_failure_metadata(
     result = await executor.execute(_request(_call("tool-call-1")))
 
     assert result.records[0].outcome == outcome
+    candidate_result = _required_result(accept_port.candidates[0])
+    assert candidate_result.raw_tool_outcome == accepted_tool_outcome_json(outcome)
+    assert candidate_result.outcome_digest == accepted_tool_outcome_digest(outcome)
     metadata = _required_failure_metadata(accept_port.candidates[0])
     assert metadata["failure_kind"] == "tool_failed"
     assert metadata["error_code"] == "lookup_failed"
@@ -1276,6 +1283,9 @@ async def test_tool_runtime_produces_tool_cancelled_failure_metadata(
     result = await executor.execute(_request(_call("tool-call-1")))
 
     assert result.records[0].outcome == outcome
+    candidate_result = _required_result(accept_port.candidates[0])
+    assert candidate_result.raw_tool_outcome == accepted_tool_outcome_json(outcome)
+    assert candidate_result.outcome_digest == accepted_tool_outcome_digest(outcome)
     metadata = _required_failure_metadata(accept_port.candidates[0])
     assert metadata["failure_kind"] == "tool_cancelled"
     assert metadata["failure_kind"] != "tool_failed"
