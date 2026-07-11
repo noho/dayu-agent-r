@@ -17,9 +17,12 @@ from dayu.cli.exit_codes import (
 from dayu.runtime.config_loader import (
     ConfigLoader,
     config_file_names,
-    legacy_config_file_names,
 )
 from dayu.runtime.location import resolve_runtime_locations
+
+_REMOVED_CONFIG_FILE_NAMES: frozenset[str] = frozenset(
+    {"llm_models.json", "run.json"}
+)
 
 
 def test_init_empty_workspace_copies_current_config(
@@ -45,7 +48,7 @@ def test_init_empty_workspace_copies_current_config(
         assert (workspace_config / file_name).is_file()
     assert (workspace_config / "prompts" / "manifests" / "prompt.json").is_file()
     assert (workspace_config / "prompts" / "scenes" / "interactive.md").is_file()
-    for legacy_name in legacy_config_file_names():
+    for legacy_name in _REMOVED_CONFIG_FILE_NAMES:
         assert not (workspace_config / legacy_name).exists()
 
 
@@ -275,8 +278,70 @@ def test_init_does_not_generate_legacy_config_files(tmp_path: Path) -> None:
 
     assert cli_main.main(("init", "--base", str(workspace_root))) == EXIT_SUCCESS
 
-    for legacy_name in legacy_config_file_names():
+    for legacy_name in _REMOVED_CONFIG_FILE_NAMES:
         assert not (workspace_root / "config" / legacy_name).exists()
+
+
+def test_init_rejects_legacy_top_level_config_asset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证包内顶层旧配置文件不会被 init 复制到 workspace config。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 旧顶层配置文件未被拒绝时抛出。
+    """
+
+    package_config_root = tmp_path / "package-config"
+    _write_minimal_current_config_assets(package_config_root)
+    _write_text(package_config_root / "llm_models.json", "{}")
+
+    def config_names_with_removed_file() -> tuple[str, ...]:
+        """模拟当前顶层配置白名单被错误加入旧 schema 文件。
+
+        :returns: 包含旧配置文件名的顶层配置文件名元组。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return (*config_file_names(), "llm_models.json")
+
+    monkeypatch.setattr(
+        init_command,
+        "config_file_names",
+        config_names_with_removed_file,
+    )
+
+    with pytest.raises(
+        init_command.CliInitOperationError,
+        match="legacy config file must not be generated: llm_models.json",
+    ):
+        init_command._collect_current_config_assets(
+            workspace_config_dir=tmp_path / "workspace" / "config",
+            package_config_root=package_config_root,
+        )
+
+
+def test_init_allows_prompt_asset_with_removed_config_file_name(
+    tmp_path: Path,
+) -> None:
+    """验证旧配置名只拦截顶层配置资产，不误伤 prompt 子文件。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: prompt 子文件被错误拒绝时抛出。
+    """
+
+    package_config_root = tmp_path / "package-config"
+    _write_minimal_current_config_assets(package_config_root)
+    _write_text(package_config_root / "prompts" / "scenes" / "run.json", "{}")
+
+    assets = init_command._collect_current_config_assets(
+        workspace_config_dir=tmp_path / "workspace" / "config",
+        package_config_root=package_config_root,
+    )
+
+    assert any(asset.destination.name == "run.json" for asset in assets)
 
 
 def test_init_sigint_maps_to_130(
@@ -323,3 +388,16 @@ def _write_text(path: Path, value: str) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(value, encoding="utf-8")
+
+
+def _write_minimal_current_config_assets(package_config_root: Path) -> None:
+    """写入 init 资产收集所需的最小 current schema 文件集合。
+
+    :param package_config_root: 测试包内配置根目录。
+    :returns: ``None``。
+    :raises OSError: 文件写入失败时抛出。
+    """
+
+    for file_name in config_file_names():
+        _write_text(package_config_root / file_name, "{}")
+    _write_text(package_config_root / "prompts" / "scenes" / "prompt.md", "prompt")

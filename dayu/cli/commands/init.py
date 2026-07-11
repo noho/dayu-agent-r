@@ -23,12 +23,15 @@ from dayu.cli.exit_codes import (
     EXIT_SUCCESS,
     EXIT_USAGE_ERROR,
 )
-from dayu.runtime.config_loader import config_file_names, legacy_config_file_names
+from dayu.runtime.config_loader import config_file_names
 from dayu.runtime.workspace_paths import WorkspacePaths, workspace_paths
 
 _BASE_OPTION: Final[str] = "--base"
 _PACKAGE_CONFIG_ROOT: Final[Path] = Path(__file__).resolve().parents[2] / "config"
 _PROMPTS_DIR_NAME: Final[str] = "prompts"
+_LEGACY_CONFIG_FILE_NAMES: Final[frozenset[str]] = frozenset(
+    {"llm_models.json", "run.json"}
+)
 _TEMP_FILE_PREFIX: Final[str] = ".dayu-init-"
 _RESET_CONTAINMENT_ERROR_TEMPLATE: Final[str] = (
     "dayu-cli init: reset whitelist path escapes workspace: {path}"
@@ -198,21 +201,29 @@ def _collect_current_config_assets(
                 destination=workspace_config_dir / relative_path,
             )
         )
-    _raise_if_legacy_asset_selected(assets)
+    _raise_if_legacy_top_level_config_asset_selected(
+        assets=assets,
+        workspace_config_dir=workspace_config_dir,
+    )
     return tuple(assets)
 
 
-def _raise_if_legacy_asset_selected(assets: Sequence[_CopyAsset]) -> None:
-    """防止旧 schema 文件进入 init 复制集合。
+def _raise_if_legacy_top_level_config_asset_selected(
+    *, assets: Sequence[_CopyAsset], workspace_config_dir: Path
+) -> None:
+    """防止旧 schema 顶层配置文件进入 init 复制集合。
 
     :param assets: 待复制文件列表。
+    :param workspace_config_dir: workspace root 下的 config 目标目录。
     :returns: ``None``。
-    :raises CliInitOperationError: 复制集合包含旧配置文件时抛出。
+    :raises CliInitOperationError: 复制集合包含旧顶层配置文件时抛出。
     """
 
-    legacy_names = legacy_config_file_names()
     for asset in assets:
-        if asset.destination.name in legacy_names:
+        if (
+            asset.destination.parent == workspace_config_dir
+            and asset.destination.name in _LEGACY_CONFIG_FILE_NAMES
+        ):
             raise CliInitOperationError(
                 f"legacy config file must not be generated: {asset.destination.name}"
             )

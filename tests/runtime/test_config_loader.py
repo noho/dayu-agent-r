@@ -19,11 +19,13 @@ from dayu.runtime.config_loader import (
     RuntimeConfig,
     config_file_names,
     default_fallback_prompt,
-    legacy_config_file_names,
     load_runtime_config,
 )
 
 _EXPECTED_COMPACTION_ATTEMPTS_PER_OPERATION: Final[int] = 5
+_REMOVED_CONFIG_FILE_NAMES: Final[frozenset[str]] = frozenset(
+    {"llm_models.json", "run.json"}
+)
 
 
 def _write_json(path: Path, value: JsonValue) -> None:
@@ -802,7 +804,9 @@ def test_legacy_files_do_not_exist_and_are_not_read(tmp_path: Path) -> None:
     config = load_runtime_config(workspace_config_dir=workspace_root)
 
     assert isinstance(config, RuntimeConfig)
-    for file_name in legacy_config_file_names():
+    current_file_names = set(config_file_names())
+    for file_name in _REMOVED_CONFIG_FILE_NAMES:
+        assert file_name not in current_file_names
         assert not (Path("dayu/config") / file_name).exists()
 
 

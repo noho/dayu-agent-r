@@ -24,9 +24,6 @@ _EXECUTION_PROFILES_FILE: Final[str] = "execution_profiles.json"
 _HOST_RUNTIME_FILE: Final[str] = "host_runtime.json"
 _RUNTIME_LANES_FILE: Final[str] = "runtime_lanes.json"
 _TOOL_DISCOVERY_FILE: Final[str] = "tool_discovery.json"
-_LEGACY_CONFIG_FILES: Final[frozenset[str]] = frozenset(
-    {"llm_models.json", "run.json"}
-)
 _CONFIG_FILE_NAMES: Final[tuple[str, ...]] = (
     _MODELS_FILE,
     _EXECUTION_PROFILES_FILE,
@@ -891,16 +888,6 @@ def load_runtime_config(workspace_config_dir: Path | None = None) -> RuntimeConf
     """
 
     return ConfigLoader().load(workspace_config_dir=workspace_config_dir)
-
-
-def legacy_config_file_names() -> frozenset[str]:
-    """返回已移除的旧配置文件名集合。
-
-    :returns: 旧配置文件名集合；仅用于诊断或测试确认不会读取旧路径。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    return _LEGACY_CONFIG_FILES
 
 
 def config_file_names() -> tuple[str, ...]:
