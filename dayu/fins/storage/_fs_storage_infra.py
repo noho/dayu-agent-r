@@ -35,6 +35,7 @@ from ._fs_storage_utils import (
     _PROCESSED_META_FILENAME,
     _REJECTED_FILINGS_DIRNAME,
     _SOURCE_META_FILENAME,
+    _normalize_document_id,
     _normalize_entry_name,
     _normalize_source_kind,
     _normalize_ticker,
@@ -750,7 +751,8 @@ class _FsStorageInfra:
         if isinstance(handle, ProcessedHandle):
             return self._processed_dir_for_read(normalized_ticker, handle.document_id)
         source_kind = _normalize_source_kind(handle.source_kind)
-        return self._source_root_for_read(normalized_ticker, source_kind) / handle.document_id
+        normalized_document_id = _normalize_document_id(handle.document_id)
+        return self._source_root_for_read(normalized_ticker, source_kind) / normalized_document_id
 
     def _resolve_handle_child_path(self, handle: SourceHandle | ProcessedHandle, name: str) -> Path:
         """解析句柄目录下的直系条目路径。
@@ -850,10 +852,11 @@ class _FsStorageInfra:
         """
 
         normalized_ticker = _normalize_ticker(handle.ticker)
+        normalized_document_id = _normalize_document_id(handle.document_id)
         if isinstance(handle, ProcessedHandle):
-            return f"{normalized_ticker}/processed/{handle.document_id}/{filename}"
+            return f"{normalized_ticker}/processed/{normalized_document_id}/{filename}"
         source_kind = _normalize_source_kind(handle.source_kind)
-        return f"{normalized_ticker}/{_source_dir_name(source_kind)}/{handle.document_id}/{filename}"
+        return f"{normalized_ticker}/{_source_dir_name(source_kind)}/{normalized_document_id}/{filename}"
 
     def _select_primary_document(
         self,
@@ -1024,7 +1027,10 @@ class _FsStorageInfra:
         manifest = self._read_manifest(path, ticker)
         documents_map = {doc["document_id"]: doc for doc in manifest["documents"] if "document_id" in doc}
         for item in items:
-            documents_map[item["document_id"]] = item
+            normalized_document_id = _normalize_document_id(str(item["document_id"]))
+            normalized_item = dict(item)
+            normalized_item["document_id"] = normalized_document_id
+            documents_map[normalized_document_id] = normalized_item
         manifest["documents"] = sorted(documents_map.values(), key=lambda x: x["document_id"])
         manifest["updated_at"] = now_iso8601()
         _write_json(path, manifest)
@@ -1044,8 +1050,11 @@ class _FsStorageInfra:
             OSError: 写入失败。
         """
 
+        normalized_document_id = _normalize_document_id(document_id)
         manifest = self._read_manifest(path, ticker)
-        manifest["documents"] = [doc for doc in manifest["documents"] if doc.get("document_id") != document_id]
+        manifest["documents"] = [
+            doc for doc in manifest["documents"] if doc.get("document_id") != normalized_document_id
+        ]
         manifest["updated_at"] = now_iso8601()
         _write_json(path, manifest)
 
@@ -1064,7 +1073,7 @@ class _FsStorageInfra:
             OSError: 写入失败时抛出。
         """
 
-        stale_set = set(document_ids)
+        stale_set = {_normalize_document_id(document_id) for document_id in document_ids}
         manifest = self._read_manifest(path, ticker)
         manifest["documents"] = [doc for doc in manifest["documents"] if doc.get("document_id") not in stale_set]
         manifest["updated_at"] = now_iso8601()
@@ -1218,7 +1227,8 @@ class _FsStorageInfra:
             OSError: 路径构建失败时抛出。
         """
 
-        return self._source_root(ticker, source_kind) / document_id / _SOURCE_META_FILENAME
+        normalized_document_id = _normalize_document_id(document_id)
+        return self._source_root(ticker, source_kind) / normalized_document_id / _SOURCE_META_FILENAME
 
     def _source_meta_path_for_read(self, ticker: str, document_id: str, source_kind: SourceKind) -> Path:
         """返回源文档 meta 路径（用于读取）。
@@ -1235,7 +1245,8 @@ class _FsStorageInfra:
             无。
         """
 
-        return self._source_root_for_read(ticker, source_kind) / document_id / _SOURCE_META_FILENAME
+        normalized_document_id = _normalize_document_id(document_id)
+        return self._source_root_for_read(ticker, source_kind) / normalized_document_id / _SOURCE_META_FILENAME
 
     def _company_meta_path(self, ticker: str) -> Path:
         """返回公司级 meta 路径。
@@ -1374,7 +1385,8 @@ class _FsStorageInfra:
         """
 
         normalized_ticker = _normalize_ticker(ticker)
-        return self._ticker_dir_for_write(normalized_ticker) / "processed" / document_id
+        normalized_document_id = _normalize_document_id(document_id)
+        return self._ticker_dir_for_write(normalized_ticker) / "processed" / normalized_document_id
 
     def _processed_dir_for_read(self, ticker: str, document_id: str) -> Path:
         """获取解析产物目录路径（用于读取）。
@@ -1391,7 +1403,8 @@ class _FsStorageInfra:
         """
 
         normalized_ticker = _normalize_ticker(ticker)
-        return self._ticker_dir_for_read(normalized_ticker) / "processed" / document_id
+        normalized_document_id = _normalize_document_id(document_id)
+        return self._ticker_dir_for_read(normalized_ticker) / "processed" / normalized_document_id
 
     def _processed_meta_path(self, ticker: str, document_id: str) -> Path:
         """获取解析产物 tool_snapshot_meta.json 路径。
@@ -1499,7 +1512,8 @@ class _FsStorageInfra:
             OSError: 路径构建失败时抛出。
         """
 
-        return self._rejected_filings_root(ticker) / document_id
+        normalized_document_id = _normalize_document_id(document_id)
+        return self._rejected_filings_root(ticker) / normalized_document_id
 
     def _rejected_filing_dir_for_read(self, ticker: str, document_id: str) -> Path:
         """返回单个 rejected filing 目录（用于读取）。
@@ -1515,7 +1529,8 @@ class _FsStorageInfra:
             无。
         """
 
-        return self._rejected_filings_root_for_read(ticker) / document_id
+        normalized_document_id = _normalize_document_id(document_id)
+        return self._rejected_filings_root_for_read(ticker) / normalized_document_id
 
     def _rejected_filing_meta_path(self, ticker: str, document_id: str) -> Path:
         """返回 rejected filing meta 路径。

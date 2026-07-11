@@ -19,6 +19,7 @@ from dayu.fins.domain.document_models import (
 from ._fs_storage_infra import _FsStorageInfra
 from ._fs_storage_utils import (
     _PROCESSED_META_FILENAME,
+    _normalize_document_id,
     _normalize_ticker,
     _read_json_array,
     _read_json_object,
@@ -108,11 +109,12 @@ class _FsProcessedMixin(_FsStorageInfra):
         """
 
         ticker = _normalize_ticker(req.ticker)
-        processed_dir = self._processed_dir_for_write(ticker, req.document_id)
+        normalized_document_id = _normalize_document_id(req.document_id)
+        processed_dir = self._processed_dir_for_write(ticker, normalized_document_id)
         if not processed_dir.exists():
             raise FileNotFoundError(f"processed 文档不存在: {processed_dir}")
         shutil.rmtree(processed_dir)
-        self._remove_manifest_item(self._processed_manifest_path(ticker), ticker, req.document_id)
+        self._remove_manifest_item(self._processed_manifest_path(ticker), ticker, normalized_document_id)
 
     # ========== handle & 元数据 ==========
 
@@ -131,12 +133,13 @@ class _FsProcessedMixin(_FsStorageInfra):
         """
 
         normalized_ticker = _normalize_ticker(ticker)
-        meta_path = self._processed_meta_path_for_read(normalized_ticker, document_id)
+        normalized_document_id = _normalize_document_id(document_id)
+        meta_path = self._processed_meta_path_for_read(normalized_ticker, normalized_document_id)
         if not meta_path.exists():
             raise FileNotFoundError(f"processed 文档不存在: {meta_path}")
         return ProcessedHandle(
             ticker=normalized_ticker,
-            document_id=document_id,
+            document_id=normalized_document_id,
         )
 
     def get_processed_meta(self, ticker: str, document_id: str) -> DocumentMeta:
@@ -158,7 +161,8 @@ class _FsProcessedMixin(_FsStorageInfra):
         """
 
         normalized_ticker = _normalize_ticker(ticker)
-        meta_path = self._processed_meta_path_for_read(normalized_ticker, document_id)
+        normalized_document_id = _normalize_document_id(document_id)
+        meta_path = self._processed_meta_path_for_read(normalized_ticker, normalized_document_id)
         if meta_path.exists():
             return _read_json_object(meta_path)
         raise FileNotFoundError(f"processed 元数据不存在: {meta_path}")
@@ -200,7 +204,10 @@ class _FsProcessedMixin(_FsStorageInfra):
             OSError: 读写失败时抛出。
         """
 
-        processed_meta_path = self._processed_meta_path(_normalize_ticker(ticker), document_id)
+        processed_meta_path = self._processed_meta_path(
+            _normalize_ticker(ticker),
+            _normalize_document_id(document_id),
+        )
         if not processed_meta_path.exists():
             return False
         processed_meta = _read_json_object(processed_meta_path)
@@ -272,7 +279,8 @@ class _FsProcessedMixin(_FsStorageInfra):
         """
 
         ticker = _normalize_ticker(req.ticker)
-        processed_dir = self._processed_dir_for_write(ticker, req.document_id)
+        normalized_document_id = _normalize_document_id(req.document_id)
+        processed_dir = self._processed_dir_for_write(ticker, normalized_document_id)
         meta_path = processed_dir / _PROCESSED_META_FILENAME
 
         exists = processed_dir.exists()
@@ -304,7 +312,7 @@ class _FsProcessedMixin(_FsStorageInfra):
 
         merged_meta = dict(previous_meta)
         merged_meta.update(req.meta)
-        merged_meta["document_id"] = req.document_id
+        merged_meta["document_id"] = normalized_document_id
         merged_meta["internal_document_id"] = req.internal_document_id
         merged_meta["source_kind"] = req.source_kind
         merged_meta.setdefault("source_document_version", "v1")
@@ -323,7 +331,7 @@ class _FsProcessedMixin(_FsStorageInfra):
             ticker,
             [
                 ProcessedManifestItem(
-                    document_id=req.document_id,
+                    document_id=normalized_document_id,
                     internal_document_id=req.internal_document_id,
                     source_kind=req.source_kind,
                     form_type=req.form_type,
@@ -345,6 +353,6 @@ class _FsProcessedMixin(_FsStorageInfra):
 
         return DocumentHandle(
             ticker=ticker,
-            document_id=req.document_id,
+            document_id=normalized_document_id,
             form_type=req.form_type,
         )

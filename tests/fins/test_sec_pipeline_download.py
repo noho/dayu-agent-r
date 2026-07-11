@@ -21,8 +21,9 @@ from dayu.fins.downloaders.sec_downloader import (
     SecDownloader,
     build_source_fingerprint,
 )
-from dayu.fins.domain.document_models import DownloadRejectionEntry, FileObjectMeta
+from dayu.fins.domain.document_models import DownloadRejectionEntry, FileObjectMeta, ProcessedCreateRequest
 from dayu.fins.ingestion_runtime import FinsSourceDownloadAdapterRequest
+from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.pipelines import sec_download_filing_workflow as _sec_download_filing_workflow
 from dayu.fins.pipelines import sec_6k_primary_document_repair as _sec_6k_primary_repair
 from dayu.fins.pipelines import sec_pipeline
@@ -34,6 +35,7 @@ from dayu.fins.domain.filing_semantics import (
     parse_sec_form_filter_value,
     parse_sec_form_type,
 )
+from dayu.fins.domain.enums import SourceKind
 from dayu.fins.processors.registry import build_fins_processor_registry
 from dayu.fins.pipelines.sec_download_event_mapping import DownloadFileResult
 from dayu.fins.pipelines.sec_pipeline import (
@@ -41,7 +43,7 @@ from dayu.fins.pipelines.sec_pipeline import (
     SecPipeline as _SecPipeline,
 )
 from dayu.fins.pipelines.sec_sc13_filtering import SC13_FORMS as _SC13_FORMS, SC13_RETRY_MAX as _SC13_RETRY_MAX
-from dayu.fins.storage import SourceDocumentRepositoryProtocol
+from dayu.fins.storage import FsProcessedDocumentRepository, SourceDocumentRepositoryProtocol
 from dayu.fins.ticker_normalization import normalize_ticker
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 
@@ -53,6 +55,85 @@ class _NeverCancelled:
         """始终返回未取消。"""
 
         return False
+
+
+class _RecordingSecPipelineForAdapter:
+    """仅覆盖 SEC adapter 所需面的测试 pipeline。"""
+
+    def __init__(self, workspace_root: Path, document_id: str) -> None:
+        """初始化测试 pipeline。
+
+        Args:
+            workspace_root: 测试工作区根目录。
+            document_id: adapter 摘要中返回的已写入文档 ID。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: processed 仓储初始化失败时抛出。
+        """
+
+        self._processed_repository = FsProcessedDocumentRepository(workspace_root)
+        self.document_id = document_id
+        self.recorded_rebuild_values: list[bool] = []
+
+    async def download_stream(
+        self,
+        ticker: str,
+        form_type: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        overwrite: bool = False,
+        rebuild: bool = False,
+        *,
+        cancel_checker: Optional[Callable[[], bool]] = None,
+    ) -> AsyncIterator[DownloadEvent]:
+        """记录 OLD rebuild 参数并返回完成事件。
+
+        Args:
+            ticker: 股票代码。
+            form_type: 表单过滤。
+            start_date: 起始披露日期。
+            end_date: 结束披露日期。
+            overwrite: 是否覆盖。
+            rebuild: OLD 本地 rebuild 标记。
+            cancel_checker: 取消检查器。
+
+        Yields:
+            单个完成事件。
+
+        Raises:
+            无。
+        """
+
+        del form_type, start_date, end_date, overwrite, cancel_checker
+        self.recorded_rebuild_values.append(rebuild)
+        result: sec_pipeline.SecPipelineDownloadResult = {
+            "pipeline": "sec_download",
+            "action": "download",
+            "status": "ok",
+            "ticker": ticker,
+            "market_profile": {},
+            "filters": {},
+            "warnings": [],
+            "filings": [{"document_id": self.document_id, "status": "downloaded"}],
+            "summary": {
+                "total": 1,
+                "downloaded": 1,
+                "skipped": 0,
+                "rejected": 0,
+                "failed": 0,
+                "elapsed_ms": 0,
+                "reused_downloads": 0,
+                "converted": 0,
+            },
+        }
+        yield DownloadEvent(
+            event_type=DownloadEventType.PIPELINE_COMPLETED,
+            ticker=ticker,
+            payload={"result": cast(JsonValue, result)},
+        )
 
 
 def _require_json_mapping(value: JsonValue) -> Mapping[str, JsonValue]:
@@ -1580,6 +1661,44 @@ def test_sec_download_adapter_summary_classifies_skipped_and_rejected_exclusivel
         + summary.rejected_count
         + summary.failed_count
     )
+
+
+def test_sec_adapter_marks_processed_rebuild_for_written_documents(tmp_path: Path) -> None:
+    """SEC adapter 应消费 rebuild_processed 并标记已写入文档的 processed。"""
+
+    document_id = "fil_sec_rebuild"
+    pipeline = _RecordingSecPipelineForAdapter(tmp_path, document_id)
+    pipeline._processed_repository.create_processed(
+        ProcessedCreateRequest(
+            ticker="AAPL",
+            document_id=document_id,
+            internal_document_id=document_id,
+            source_kind=SourceKind.FILING.value,
+            form_type="10-K",
+            meta={"reprocess_required": False},
+            sections=[],
+            tables=[],
+        )
+    )
+    adapter = sec_pipeline.SecDownloadAdapter(pipeline=cast(sec_pipeline.SecPipeline, pipeline))
+
+    adapter.download(
+        FinsSourceDownloadAdapterRequest(
+            normalized_ticker=normalize_ticker("AAPL"),
+            source="sec",
+            form_types=("10-K",),
+            filed_after=None,
+            filed_before=None,
+            overwrite_existing=False,
+            rebuild_processed=True,
+            cancellation_checker=_NeverCancelled(),
+        )
+    )
+
+    processed_meta = pipeline._processed_repository.get_processed_meta("AAPL", document_id)
+
+    assert pipeline.recorded_rebuild_values == [False]
+    assert processed_meta["reprocess_required"] is True
 
 
 def test_sec_pipeline_keeps_6k_results_release(tmp_path: Path) -> None:

@@ -38,6 +38,7 @@ from dayu.fins.ingestion_runtime import (
     FinsSourceDownloadAdapter,
     FinsSourceDownloadAdapterRequest,
     FinsSourceDownloadAdapterResult,
+    mark_downloaded_processed_rebuild_required,
 )
 from dayu.fins.domain.document_models import FinsIngestMethod
 from dayu.fins.domain.enums import SourceKind
@@ -1290,10 +1291,10 @@ class CnDownloadAdapter(FinsSourceDownloadAdapter):
         """执行 CN/HK 下载并返回已持久化摘要。
 
         CN/HK adapter 是 persisted-summary adapter：迁移的 OLD workflow 已经
-        通过 NEW storage repositories 完成 company/source/blob/reprocess 副作用。
-        ``request.rebuild_processed`` 只代表 NEW processed 重处理治理语义，不映射为
-        OLD ``CnPipeline.download(rebuild=...)``；OLD ``rebuild`` 仅表示基于本地
-        已下载 source 文件重建 meta/manifest。
+        通过 NEW storage repositories 完成 company/source/blob 副作用。
+        ``request.rebuild_processed`` 只代表 NEW processed 重处理治理语义；
+        adapter 在下载摘要确认后按 ``written_document_ids`` 标记既有 processed
+        需要重处理，不映射为 OLD ``CnPipeline.download(rebuild=...)``。
 
         Args:
             request: runtime 传入的已归一化下载请求。
@@ -1326,9 +1327,16 @@ class CnDownloadAdapter(FinsSourceDownloadAdapter):
                 progress_sink=request.progress_sink,
             )
         )
+        persisted_summary = _summary_from_pipeline_result(result)
+        if request.rebuild_processed:
+            mark_downloaded_processed_rebuild_required(
+                self._pipeline.processed_repository,
+                ticker=request.normalized_ticker.canonical,
+                summary=persisted_summary,
+            )
         return FinsSourceDownloadAdapterResult(
             discovered_count=_summary_int(result, "total"),
-            persisted_summary=_summary_from_pipeline_result(result),
+            persisted_summary=persisted_summary,
         )
 
 

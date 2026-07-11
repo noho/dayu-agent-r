@@ -5471,6 +5471,31 @@ def _mark_processed_reprocess_required_if_present(
     repository.mark_processed_reprocess_required(ticker, document_id, True)
 
 
+def mark_downloaded_processed_rebuild_required(
+    repository: ProcessedDocumentRepositoryProtocol,
+    *,
+    ticker: str,
+    summary: FinsDownloadResultSummary,
+) -> None:
+    """按下载摘要标记已写入文档的 processed 产物需要重处理。
+
+    Args:
+        repository: processed 仓储协议。
+        ticker: 标准化 ticker。
+        summary: 下载 adapter 持久化摘要。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: 底层仓储写入失败时抛出。
+        ValueError: processed 元数据格式或文档 ID 非法时抛出。
+    """
+
+    for document_id in summary.written_document_ids:
+        _mark_processed_reprocess_required_if_present(repository, ticker, document_id)
+
+
 def _download_document_meta(meta: Mapping[str, JsonValue]) -> DocumentMeta:
     """构建下载源文档 meta。
 

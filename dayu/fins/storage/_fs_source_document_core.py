@@ -43,6 +43,7 @@ from ._fs_storage_utils import (
     _infer_filename_from_uri,
     _list_directory_names,
     _local_path_from_uri,
+    _normalize_document_id,
     _normalize_file_entries,
     _normalize_source_kind,
     _normalize_ticker,
@@ -298,10 +299,11 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         """
 
         normalized_ticker = _normalize_ticker(ticker)
+        normalized_document_id = _normalize_document_id(document_id)
         meta_candidates = [
-            self._source_meta_path_for_read(normalized_ticker, document_id, SourceKind.FILING),
-            self._source_meta_path_for_read(normalized_ticker, document_id, SourceKind.MATERIAL),
-            self._processed_meta_path_for_read(normalized_ticker, document_id),
+            self._source_meta_path_for_read(normalized_ticker, normalized_document_id, SourceKind.FILING),
+            self._source_meta_path_for_read(normalized_ticker, normalized_document_id, SourceKind.MATERIAL),
+            self._processed_meta_path_for_read(normalized_ticker, normalized_document_id),
         ]
         for meta_path in meta_candidates:
             if meta_path.exists():
@@ -325,8 +327,9 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         """
 
         normalized_ticker = _normalize_ticker(ticker)
+        normalized_document_id = _normalize_document_id(document_id)
         normalized_source_kind = _normalize_source_kind(source_kind)
-        meta_path = self._source_meta_path_for_read(normalized_ticker, document_id, normalized_source_kind)
+        meta_path = self._source_meta_path_for_read(normalized_ticker, normalized_document_id, normalized_source_kind)
         if not meta_path.exists():
             raise FileNotFoundError(
                 f"document_id={document_id} 的 {normalized_source_kind.value} meta.json 不存在"
@@ -414,8 +417,9 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         """
 
         normalized_ticker = _normalize_ticker(ticker)
+        normalized_document_id = _normalize_document_id(document_id)
         normalized_source_kind = _normalize_source_kind(source_kind)
-        meta_path = self._source_meta_path(normalized_ticker, document_id, normalized_source_kind)
+        meta_path = self._source_meta_path(normalized_ticker, normalized_document_id, normalized_source_kind)
         if not meta_path.exists():
             raise FileNotFoundError(
                 f"document_id={document_id} 的 {normalized_source_kind.value} meta.json 不存在"
@@ -428,7 +432,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
                 normalized_ticker,
                 [
                     FilingManifestItem(
-                        document_id=document_id,
+                        document_id=normalized_document_id,
                         internal_document_id=str(normalized_meta.get("internal_document_id", "")),
                         form_type=normalized_meta.get("form_type"),
                         fiscal_year=normalized_meta.get("fiscal_year"),
@@ -451,7 +455,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
                 normalized_ticker,
                 [
                     MaterialManifestItem(
-                        document_id=document_id,
+                        document_id=normalized_document_id,
                         internal_document_id=str(normalized_meta.get("internal_document_id", "")),
                         form_type=normalized_meta.get("form_type"),
                         material_name=normalized_meta.get("material_name"),
@@ -564,7 +568,8 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         """
 
         normalized_ticker = _normalize_ticker(ticker)
-        filing_dir = self._source_root_for_read(normalized_ticker, SourceKind.FILING) / document_id
+        normalized_document_id = _normalize_document_id(document_id)
+        filing_dir = self._source_root_for_read(normalized_ticker, SourceKind.FILING) / normalized_document_id
         if not filing_dir.exists():
             raise FileNotFoundError(f"filing 目录不存在: {filing_dir}")
         if not filing_dir.is_dir():
@@ -607,8 +612,9 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         """
 
         normalized_ticker = _normalize_ticker(ticker)
+        normalized_document_id = _normalize_document_id(document_id)
         normalized_source_kind = _normalize_source_kind(source_kind)
-        document_dir = self._source_root(normalized_ticker, normalized_source_kind) / document_id
+        document_dir = self._source_root(normalized_ticker, normalized_source_kind) / normalized_document_id
         if document_dir.exists():
             if document_dir.is_dir():
                 shutil.rmtree(document_dir)
@@ -619,7 +625,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         else:
             manifest_path = self._material_manifest_path(normalized_ticker)
         if manifest_path.exists():
-            self._remove_manifest_item(manifest_path, normalized_ticker, document_id)
+            self._remove_manifest_item(manifest_path, normalized_ticker, normalized_document_id)
 
     # ========== handle & 文件访问 ==========
 
@@ -639,13 +645,14 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         """
 
         normalized_ticker = _normalize_ticker(ticker)
+        normalized_document_id = _normalize_document_id(document_id)
         normalized_source_kind = _normalize_source_kind(source_kind)
-        meta_path = self._source_meta_path_for_read(normalized_ticker, document_id, normalized_source_kind)
+        meta_path = self._source_meta_path_for_read(normalized_ticker, normalized_document_id, normalized_source_kind)
         if not meta_path.exists():
             raise FileNotFoundError(f"document_id={document_id} 不存在于 {normalized_source_kind}")
         return SourceHandle(
             ticker=normalized_ticker,
-            document_id=document_id,
+            document_id=normalized_document_id,
             source_kind=normalized_source_kind.value,
         )
 
@@ -756,9 +763,10 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         """
 
         ticker = _normalize_ticker(req.ticker)
+        normalized_document_id = _normalize_document_id(req.document_id)
         source_root = self._source_root(ticker, source_kind)
         source_root.mkdir(parents=True, exist_ok=True)
-        document_dir = source_root / req.document_id
+        document_dir = source_root / normalized_document_id
         meta_path = document_dir / _SOURCE_META_FILENAME
 
         meta_exists = meta_path.exists()
@@ -797,7 +805,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         merged_meta = dict(previous_meta)
         merged_meta.update(req.meta)
         merged_meta["ticker"] = ticker
-        merged_meta["document_id"] = req.document_id
+        merged_meta["document_id"] = normalized_document_id
         merged_meta["internal_document_id"] = req.internal_document_id
         merged_meta["form_type"] = req.form_type or merged_meta.get("form_type")
         merged_meta["updated_at"] = now
@@ -826,7 +834,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
                 ticker,
                 [
                     FilingManifestItem(
-                        document_id=req.document_id,
+                        document_id=normalized_document_id,
                         internal_document_id=req.internal_document_id,
                         form_type=merged_meta.get("form_type"),
                         fiscal_year=merged_meta.get("fiscal_year"),
@@ -849,7 +857,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
                 ticker,
                 [
                     MaterialManifestItem(
-                        document_id=req.document_id,
+                        document_id=normalized_document_id,
                         internal_document_id=req.internal_document_id,
                         form_type=merged_meta.get("form_type"),
                         material_name=merged_meta.get("material_name"),
@@ -867,7 +875,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         primary_file_uri = _resolve_primary_uri(file_payloads, selected_primary_document)
         return DocumentHandle(
             ticker=ticker,
-            document_id=req.document_id,
+            document_id=normalized_document_id,
             form_type=merged_meta.get("form_type"),
             primary_file_uri=primary_file_uri,
             file_uris=[str(item.get("uri")) for item in file_payloads if isinstance(item, dict)],
@@ -895,9 +903,10 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         """
 
         ticker = _normalize_ticker(req.ticker)
+        normalized_document_id = _normalize_document_id(req.document_id)
         normalized_source_kind = _normalize_source_kind(source_kind)
         SourceDocumentProvenance.from_meta(req.meta, normalized_source_kind)
-        meta_path = self._source_meta_path(ticker, req.document_id, normalized_source_kind)
+        meta_path = self._source_meta_path(ticker, normalized_document_id, normalized_source_kind)
         if meta_path.exists():
             existing_meta = _read_json_object(meta_path)
             existing_provenance = SourceDocumentProvenance.from_meta(existing_meta, normalized_source_kind)
@@ -911,7 +920,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
                 raise FileExistsError(f"staging source meta 稳定字段冲突: {meta_path}")
             return SourceHandle(
                 ticker=ticker,
-                document_id=req.document_id,
+                document_id=normalized_document_id,
                 source_kind=normalized_source_kind.value,
             )
 
@@ -919,7 +928,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         staging_meta["ingest_complete"] = False
         staging_req = SourceDocumentUpsertRequest(
             ticker=ticker,
-            document_id=req.document_id,
+            document_id=normalized_document_id,
             internal_document_id=req.internal_document_id,
             form_type=req.form_type,
             primary_document=None,
@@ -930,7 +939,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         self._upsert_source_document(staging_req, normalized_source_kind, True)
         return SourceHandle(
             ticker=ticker,
-            document_id=req.document_id,
+            document_id=normalized_document_id,
             source_kind=normalized_source_kind.value,
         )
 
@@ -958,7 +967,8 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         """
 
         normalized_ticker = _normalize_ticker(ticker)
-        meta_path = self._source_meta_path(normalized_ticker, document_id, source_kind)
+        normalized_document_id = _normalize_document_id(document_id)
+        meta_path = self._source_meta_path(normalized_ticker, normalized_document_id, source_kind)
         if not meta_path.exists():
             raise FileNotFoundError(f"文档不存在: {meta_path}")
 
@@ -973,7 +983,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
                 normalized_ticker,
                 [
                     FilingManifestItem(
-                        document_id=document_id,
+                        document_id=normalized_document_id,
                         internal_document_id=str(meta.get("internal_document_id", "")),
                         form_type=meta.get("form_type"),
                         fiscal_year=meta.get("fiscal_year"),
@@ -996,7 +1006,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
                 normalized_ticker,
                 [
                     MaterialManifestItem(
-                        document_id=document_id,
+                        document_id=normalized_document_id,
                         internal_document_id=str(meta.get("internal_document_id", "")),
                         form_type=meta.get("form_type"),
                         material_name=meta.get("material_name"),
@@ -1014,7 +1024,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         file_payloads = _extract_file_payloads(meta)
         return DocumentHandle(
             ticker=normalized_ticker,
-            document_id=document_id,
+            document_id=normalized_document_id,
             form_type=meta.get("form_type"),
             primary_file_uri=_resolve_primary_uri(
                 file_payloads,
@@ -1063,7 +1073,7 @@ def _staging_stable_fields_match(
 
     if str(existing_meta.get("ticker", "")).strip() != ticker:
         return False
-    if str(existing_meta.get("document_id", "")).strip() != req.document_id:
+    if str(existing_meta.get("document_id", "")).strip() != _normalize_document_id(req.document_id):
         return False
     if str(existing_meta.get("internal_document_id", "")).strip() != req.internal_document_id:
         return False
@@ -1107,7 +1117,7 @@ def _staging_completion_stable_fields_match(
 
     if str(existing_meta.get("ticker", "")).strip() != ticker:
         return False
-    if str(existing_meta.get("document_id", "")).strip() != req.document_id:
+    if str(existing_meta.get("document_id", "")).strip() != _normalize_document_id(req.document_id):
         return False
     if str(existing_meta.get("internal_document_id", "")).strip() != req.internal_document_id:
         return False

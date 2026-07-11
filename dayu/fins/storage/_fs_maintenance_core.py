@@ -23,6 +23,7 @@ from ._fs_storage_utils import (
     _REJECTED_FILINGS_DIRNAME,
     _SOURCE_META_FILENAME,
     _list_directory_names,
+    _normalize_document_id,
     _normalize_ticker,
     _read_json_object,
     _write_json,
@@ -56,11 +57,12 @@ class _FsMaintenanceMixin(_FsStorageInfra):
         for document_id, payload in data.items():
             if not isinstance(document_id, str) or not isinstance(payload, dict):
                 raise ValueError("download rejection registry 条目必须是 document_id 到对象的映射")
+            normalized_document_id = _normalize_document_id(document_id)
             entry = DownloadRejectionEntry.from_dict(
                 cast(Mapping[str, JsonValue], payload),
-                expected_document_id=document_id,
+                expected_document_id=normalized_document_id,
             )
-            result[document_id] = entry
+            result[normalized_document_id] = entry
         return result
 
     def save_download_rejection_registry(
@@ -110,9 +112,12 @@ class _FsMaintenanceMixin(_FsStorageInfra):
         path = self._download_rejections_path(normalized_ticker)
         payload: dict[str, dict[str, str]] = {}
         for document_id, entry in registry.items():
-            if document_id != entry.document_id:
+            normalized_document_id = _normalize_document_id(document_id)
+            if normalized_document_id != _normalize_document_id(entry.document_id):
                 raise ValueError("download rejection registry key 与条目 document_id 不一致")
-            payload[document_id] = entry.to_dict()
+            entry_payload = entry.to_dict()
+            entry_payload["document_id"] = normalized_document_id
+            payload[normalized_document_id] = entry_payload
         _write_json(path, payload)
 
     # ========== rejected filing artifact ==========
@@ -146,12 +151,13 @@ class _FsMaintenanceMixin(_FsStorageInfra):
         """
 
         normalized_ticker = _normalize_ticker(ticker)
+        normalized_document_id = _normalize_document_id(document_id)
         normalized_filename = str(filename).strip()
         if not normalized_filename:
             raise ValueError("filename 不能为空")
         file_store = self._build_file_store(normalized_ticker)
         return file_store.put_object(
-            f"{normalized_ticker}/filings/{_REJECTED_FILINGS_DIRNAME}/{document_id}/{normalized_filename}",
+            f"{normalized_ticker}/filings/{_REJECTED_FILINGS_DIRNAME}/{normalized_document_id}/{normalized_filename}",
             data,
             content_type=content_type,
             metadata=metadata,
@@ -196,12 +202,13 @@ class _FsMaintenanceMixin(_FsStorageInfra):
         """
 
         normalized_ticker = _normalize_ticker(req.ticker)
-        meta_path = self._rejected_filing_meta_path(normalized_ticker, req.document_id)
+        normalized_document_id = _normalize_document_id(req.document_id)
+        meta_path = self._rejected_filing_meta_path(normalized_ticker, normalized_document_id)
         now = now_iso8601()
         previous_meta = _read_json_object(meta_path) if meta_path.exists() else {}
         artifact = RejectedFilingArtifact(
             ticker=normalized_ticker,
-            document_id=req.document_id,
+            document_id=normalized_document_id,
             internal_document_id=req.internal_document_id,
             accession_number=req.accession_number,
             company_id=req.company_id,
@@ -248,7 +255,10 @@ class _FsMaintenanceMixin(_FsStorageInfra):
         """
 
         normalized_ticker = _normalize_ticker(ticker)
-        meta = _read_json_object(self._rejected_filing_meta_path_for_read(normalized_ticker, document_id))
+        normalized_document_id = _normalize_document_id(document_id)
+        meta = _read_json_object(
+            self._rejected_filing_meta_path_for_read(normalized_ticker, normalized_document_id)
+        )
         return RejectedFilingArtifact.from_meta_dict(meta)
 
     def list_rejected_filing_artifacts(
@@ -305,7 +315,11 @@ class _FsMaintenanceMixin(_FsStorageInfra):
             OSError: 读取失败时抛出。
         """
 
-        path = self._rejected_filing_file_path_for_read(_normalize_ticker(ticker), document_id, filename)
+        path = self._rejected_filing_file_path_for_read(
+            _normalize_ticker(ticker),
+            _normalize_document_id(document_id),
+            filename,
+        )
         if not path.exists():
             raise FileNotFoundError(f"rejected filing 文件不存在: {path}")
         if path.is_dir():
@@ -408,6 +422,9 @@ class _FsMaintenanceMixin(_FsStorageInfra):
         """
 
         normalized_ticker = _normalize_ticker(ticker)
+        normalized_valid_document_ids = {
+            _normalize_document_id(document_id) for document_id in valid_document_ids
+        }
         filings_dir = self._ticker_dir_for_write(normalized_ticker) / "filings"
         if not filings_dir.exists() or not active_form_types:
             return 0
@@ -426,7 +443,7 @@ class _FsMaintenanceMixin(_FsStorageInfra):
             form_type = str(meta.get("form_type", "")).strip()
             if form_type not in active_form_types:
                 continue
-            if child.name in valid_document_ids:
+            if child.name in normalized_valid_document_ids:
                 continue
             stale_document_ids.append(child.name)
 

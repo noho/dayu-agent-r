@@ -34,6 +34,7 @@ from dayu.fins.ingestion_runtime import (
     FinsSourceDownloadAdapter,
     FinsSourceDownloadAdapterRequest,
     FinsSourceDownloadAdapterResult,
+    mark_downloaded_processed_rebuild_required,
 )
 from dayu.fins.pipelines.docling_upload_service import DoclingUploadService, UploadCancellationChecker
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
@@ -1827,10 +1828,10 @@ class SecDownloadAdapter(FinsSourceDownloadAdapter):
         """执行 SEC 下载并返回已持久化摘要。
 
         SEC adapter 是 persisted-summary adapter：迁移的 SEC workflow 已经通过
-        NEW storage repositories 完成 source/rejected/reprocess 相关副作用。
-        `request.rebuild_processed` 只代表 NEW processed 重处理治理语义，不映射为
-        OLD `SecPipeline.download(rebuild=...)`；OLD `rebuild` 仅表示基于本地已下载
-        source 文件重建 meta/manifest。
+        NEW storage repositories 完成 source/rejected 相关副作用。`request.rebuild_processed`
+        只代表 NEW processed 重处理治理语义；adapter 在下载摘要确认后按
+        `written_document_ids` 标记既有 processed 需要重处理，不映射为 OLD
+        `SecPipeline.download(rebuild=...)`。
 
         Args:
             request: runtime 传入的已归一化下载请求。
@@ -1860,6 +1861,12 @@ class SecDownloadAdapter(FinsSourceDownloadAdapter):
             )
         )
         persisted_summary = _summary_from_pipeline_result(result)
+        if request.rebuild_processed:
+            mark_downloaded_processed_rebuild_required(
+                self._pipeline._processed_repository,
+                ticker=request.normalized_ticker.canonical,
+                summary=persisted_summary,
+            )
         return FinsSourceDownloadAdapterResult(
             discovered_count=persisted_summary.discovered_count,
             persisted_summary=persisted_summary,

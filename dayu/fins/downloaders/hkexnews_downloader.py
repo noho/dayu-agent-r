@@ -75,7 +75,8 @@ _HKEXNEWS_T2_GROUP_RESULTS: Final[str] = "3"
 _HKEXNEWS_T2_ANNUAL_REPORT: Final[str] = "40100"
 _HKEXNEWS_T2_INTERIM_REPORT: Final[str] = "40200"
 _HKEXNEWS_T2_QUARTERLY_RESULTS: Final[str] = "13600"
-_HKEXNEWS_ROW_RANGE: Final[str] = "100"
+_HKEXNEWS_ROW_LIMIT: Final[int] = 100
+_HKEXNEWS_ROW_RANGE: Final[str] = str(_HKEXNEWS_ROW_LIMIT)
 _HKEXNEWS_MB_DATE_RANGE: Final[str] = "0"
 _HKEXNEWS_SORT_BY_DATETIME: Final[str] = "DateTime"
 _HKEXNEWS_SORT_DIR_DESC: Final[str] = "0"
@@ -103,6 +104,18 @@ class _HkStockMappingEntry:
     stock_code: str
     stock_id: str
     company_name: str
+
+
+@dataclass(frozen=True)
+class _HkexnewsRowsPage:
+    """披露易 title search 单页响应。"""
+
+    rows: list[JsonValue]
+    total_count: int | None
+
+
+class HkexnewsDiscoveryTruncatedError(RuntimeError):
+    """披露易 title search 结果无法证明完整。"""
 
 
 _PERIOD_TO_CATEGORY_SPEC: Final[dict[CnFiscalPeriod, _HkCategorySpec]] = {
@@ -280,6 +293,8 @@ class HkexnewsDiscoveryClient:
                     start_date=query.start_date,
                     end_date=query.end_date,
                 )
+            except HkexnewsDiscoveryTruncatedError:
+                raise
             except RuntimeError as exc:
                 raise RuntimeError(
                     f"披露易公告分类查询失败: stock_code={stock_code} periods={','.join(requested_periods)} error={exc}"
@@ -406,7 +421,14 @@ class HkexnewsDiscoveryClient:
                     "sortDir": _HKEXNEWS_SORT_DIR_DESC,
                 },
             )
-            rows = _extract_json_rows(payload)
+            page = _extract_title_search_rows_page(payload)
+            _raise_if_title_search_truncated(
+                page,
+                stock_code=stock_code,
+                category_spec=category_spec,
+                language=language,
+            )
+            rows = page.rows
             parsed_rows = [
                 item
                 for item in (_parse_announcement(row, language=language) for row in rows)
@@ -600,6 +622,122 @@ def _extract_json_rows(payload: JsonValue) -> list[JsonValue]:
             if parsed is not None:
                 return parsed
     return []
+
+
+def _extract_title_search_rows_page(payload: JsonValue) -> _HkexnewsRowsPage:
+    """从 title search JSON 中提取行与显式总数。
+
+    Args:
+        payload: 披露易 title search JSON 响应。
+
+    Returns:
+        单页行数据与可选总数。
+
+    Raises:
+        无。
+    """
+
+    return _HkexnewsRowsPage(
+        rows=_extract_json_rows(payload),
+        total_count=_extract_title_search_total_count(payload),
+    )
+
+
+def _extract_title_search_total_count(payload: JsonValue) -> int | None:
+    """提取 title search 响应声明的结果总数。
+
+    Args:
+        payload: 披露易 title search JSON 响应。
+
+    Returns:
+        非负总数；响应未声明时返回 ``None``。
+
+    Raises:
+        无。
+    """
+
+    if not isinstance(payload, dict):
+        return None
+    for key in (
+        "total",
+        "totalCount",
+        "total_count",
+        "recordCount",
+        "record_count",
+        "recordsTotal",
+        "records_total",
+        "count",
+    ):
+        value = payload.get(key)
+        count = _coerce_non_negative_int(value)
+        if count is not None:
+            return count
+    return None
+
+
+def _coerce_non_negative_int(value: JsonValue | None) -> int | None:
+    """把 JSON 值收窄为非负整数。
+
+    Args:
+        value: JSON 值。
+
+    Returns:
+        非负整数；无法收窄时返回 ``None``。
+
+    Raises:
+        无。
+    """
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        return int(value) if value >= 0.0 and value.is_integer() else None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdecimal():
+            return int(text)
+    return None
+
+
+def _raise_if_title_search_truncated(
+    page: _HkexnewsRowsPage,
+    *,
+    stock_code: str,
+    category_spec: _HkCategorySpec,
+    language: CnLanguage,
+) -> None:
+    """在 title search 结果无法证明完整时失败关闭。
+
+    Args:
+        page: 已解析的单页响应。
+        stock_code: 5 位股票代码。
+        category_spec: 查询分类参数。
+        language: 查询语言。
+
+    Returns:
+        无。
+
+    Raises:
+        HkexnewsDiscoveryTruncatedError: 响应显示仍有更多结果或满页且缺少总数时抛出。
+    """
+
+    row_count = len(page.rows)
+    if page.total_count is not None:
+        if page.total_count > row_count:
+            raise HkexnewsDiscoveryTruncatedError(
+                "披露易 title search 响应被截断: "
+                f"stock_code={stock_code} lang={language} t1code={category_spec.t1code} "
+                f"t2code={category_spec.t2code} rows={row_count} total={page.total_count}"
+            )
+        return
+    if row_count >= _HKEXNEWS_ROW_LIMIT:
+        raise HkexnewsDiscoveryTruncatedError(
+            "披露易 title search 响应达到单页上限且缺少总数，无法证明完整: "
+            f"stock_code={stock_code} lang={language} t1code={category_spec.t1code} "
+            f"t2code={category_spec.t2code} rows={row_count}"
+        )
 
 
 def _parse_embedded_json_list(raw: str) -> list[JsonValue] | None:

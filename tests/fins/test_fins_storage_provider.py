@@ -55,6 +55,9 @@ from dayu.fins.domain.document_models import (
     DocumentSummary,
     DownloadRejectionEntry,
     FinsSourceProvider,
+    ProcessedCreateRequest,
+    ProcessedDeleteRequest,
+    SourceDocumentStateChangeRequest,
     SourceDocumentUpsertRequest,
     SourceHandle,
     now_iso8601,
@@ -1101,6 +1104,111 @@ def test_download_rejection_registry_rejects_mismatched_storage_key(tmp_path: Pa
 
     with pytest.raises(ValueError, match="document_id 不一致"):
         repository.save_download_rejection_registry("AAPL", {"fil_other": entry})
+
+
+def test_storage_document_id_must_be_single_path_component(tmp_path: Path) -> None:
+    """storage owner 必须统一拒绝带路径组件的 document_id。"""
+
+    workspace_root = tmp_path / "fins-document-id-owner-workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    processed_repository = FsProcessedDocumentRepository(workspace_root, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    filing_repository = FsFilingMaintenanceRepository(workspace_root, repository_set=repository_set)
+    source_request = SourceDocumentUpsertRequest(
+        ticker="AAPL",
+        document_id="fil_safe",
+        internal_document_id="fil_safe",
+        form_type="10-K",
+        primary_document="filing.htm",
+        file_entries=[{"name": "filing.htm", "uri": "local://AAPL/filings/fil_safe/filing.htm"}],
+        meta={
+            "ingest_method": "download",
+            "source_provider": "sec_edgar",
+            "source_fingerprint": "fingerprint-v1",
+            "company_id": "0000320193",
+            "ingest_complete": True,
+        },
+    )
+    processed_request = ProcessedCreateRequest(
+        ticker="AAPL",
+        document_id="fil_safe",
+        internal_document_id="fil_safe",
+        source_kind=SourceKind.FILING.value,
+        form_type="10-K",
+        meta={},
+        sections=[],
+        tables=[],
+    )
+    invalid_document_id = "../MSFT/filings/fil_safe"
+
+    source_repository.create_source_document(source_request, SourceKind.FILING)
+    processed_repository.create_processed(processed_request)
+
+    invalid_handle = SourceHandle(
+        ticker="AAPL",
+        document_id=invalid_document_id,
+        source_kind=SourceKind.FILING.value,
+    )
+    with pytest.raises(ValueError, match="document_id"):
+        source_repository.create_source_document(
+            SourceDocumentUpsertRequest(
+                ticker="AAPL",
+                document_id=invalid_document_id,
+                internal_document_id="fil_bad",
+                form_type="10-K",
+                meta={"ingest_method": "download"},
+            ),
+            SourceKind.FILING,
+        )
+    with pytest.raises(ValueError, match="document_id"):
+        source_repository.get_source_meta("AAPL", invalid_document_id, SourceKind.FILING)
+    with pytest.raises(ValueError, match="document_id"):
+        source_repository.delete_source_document(
+            SourceDocumentStateChangeRequest(
+                ticker="AAPL",
+                document_id=invalid_document_id,
+                source_kind=SourceKind.FILING.value,
+            )
+        )
+    with pytest.raises(ValueError, match="document_id"):
+        blob_repository.list_entries(invalid_handle)
+    with pytest.raises(ValueError, match="document_id"):
+        processed_repository.create_processed(
+            ProcessedCreateRequest(
+                ticker="AAPL",
+                document_id=invalid_document_id,
+                internal_document_id="fil_bad",
+                source_kind=SourceKind.FILING.value,
+            )
+        )
+    with pytest.raises(ValueError, match="document_id"):
+        processed_repository.get_processed_meta("AAPL", invalid_document_id)
+    with pytest.raises(ValueError, match="document_id"):
+        processed_repository.delete_processed(
+            ProcessedDeleteRequest(ticker="AAPL", document_id=invalid_document_id)
+        )
+    with pytest.raises(ValueError, match="document_id"):
+        filing_repository.store_rejected_filing_file(
+            "AAPL",
+            invalid_document_id,
+            "rejected.htm",
+            io.BytesIO(b"payload"),
+        )
+    with pytest.raises(ValueError, match="document_id"):
+        filing_repository.save_download_rejection_registry(
+            "AAPL",
+            {
+                invalid_document_id: DownloadRejectionEntry(
+                    document_id=invalid_document_id,
+                    reason="filtered",
+                    category="test",
+                    form_type="10-K",
+                    filing_date="2025-01-02",
+                    download_version="test",
+                )
+            },
+        )
 
 
 def test_read_runtime_citation_projects_provider_owned_source_types(tmp_path: Path) -> None:

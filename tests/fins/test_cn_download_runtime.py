@@ -9,8 +9,9 @@ from pathlib import Path
 
 import pytest
 
+from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.processor_registry import ProcessorRegistry
-from dayu.fins.domain.document_models import FinsSourceProvider
+from dayu.fins.domain.document_models import FinsSourceProvider, ProcessedCreateRequest
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ingestion_runtime import (
     FinsDownloadRequest,
@@ -21,6 +22,7 @@ from dayu.fins.ingestion_runtime import (
     FsFinsIngestionJobStore,
 )
 from dayu.fins.pipelines.cn_download_models import (
+    CnMarketKind,
     CnCompanyProfile,
     CnReportCandidate,
     CnReportQuery,
@@ -44,7 +46,7 @@ from dayu.fins.storage import (
     FsSourceDocumentRepository,
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
-from dayu.fins.ticker_normalization import NormalizedTicker
+from dayu.fins.ticker_normalization import Exchange, NormalizedTicker
 
 _PDF_BYTES = b"%PDF-1.7\n" + b"1" * 2048
 _DOCLING_BYTES = b'{"document": "runtime-ok"}'
@@ -220,6 +222,7 @@ class _RecordingPipeline(CnPipeline):
             convert_pdf_to_docling_json=_RuntimeFakeConverter(),
         )
         self.recorded_rebuild_values: list[bool] = []
+        self.result_filings: list[JsonValue] = []
 
     def download(
         self,
@@ -263,10 +266,10 @@ class _RecordingPipeline(CnPipeline):
             "filters": {},
             "warnings": [],
             "notes": [],
-            "filings": [],
+            "filings": self.result_filings,
             "summary": {
-                "total": 0,
-                "downloaded": 0,
+                "total": len(self.result_filings),
+                "downloaded": len(self.result_filings),
                 "skipped": 0,
                 "failed": 0,
                 "elapsed_ms": 0,
@@ -498,7 +501,7 @@ def test_cn_hk_adapter_factories_use_source_specific_downloader_defaults(
 
 
 def test_cn_adapter_receives_rebuild_processed_without_old_rebuild(tmp_path: Path) -> None:
-    """adapter 应记录 NEW rebuild_processed，但不映射为 OLD download rebuild。
+    """adapter 应单独消费 NEW rebuild_processed，并保持 OLD download rebuild=False。
 
     Args:
         tmp_path: 临时目录。
@@ -527,6 +530,59 @@ def test_cn_adapter_receives_rebuild_processed_without_old_rebuild(tmp_path: Pat
     )
 
     assert pipeline.recorded_rebuild_values == [False]
+
+
+@pytest.mark.parametrize(
+    ("source", "market", "ticker", "exchange"),
+    [
+        (CN_DOWNLOAD_SOURCE, "CN", "600519", "SSE"),
+        (HK_DOWNLOAD_SOURCE, "HK", "0700", "HKEX"),
+    ],
+)
+def test_cn_hk_adapter_marks_processed_rebuild_for_written_documents(
+    tmp_path: Path,
+    source: str,
+    market: CnMarketKind,
+    ticker: str,
+    exchange: Exchange,
+) -> None:
+    """CN/HK adapter 应消费 rebuild_processed 并标记已写入文档的 processed。"""
+
+    pipeline = _RecordingPipeline(workspace_root=tmp_path)
+    document_id = "fil_cn_rebuild"
+    filing_payload: dict[str, JsonValue] = {"document_id": document_id, "status": "downloaded"}
+    pipeline.result_filings = [filing_payload]
+    pipeline.processed_repository.create_processed(
+        ProcessedCreateRequest(
+            ticker=ticker,
+            document_id=document_id,
+            internal_document_id=document_id,
+            source_kind=SourceKind.FILING.value,
+            form_type="FY",
+            meta={"reprocess_required": False},
+            sections=[],
+            tables=[],
+        )
+    )
+    adapter = CnDownloadAdapter(pipeline=pipeline, source=source, market=market)
+
+    adapter.download(
+        FinsSourceDownloadAdapterRequest(
+            normalized_ticker=NormalizedTicker(canonical=ticker, market=market, exchange=exchange, raw=ticker),
+            source=source,
+            form_types=("FY",),
+            filed_after=None,
+            filed_before=None,
+            overwrite_existing=False,
+            rebuild_processed=True,
+            cancellation_checker=lambda: False,
+        )
+    )
+
+    processed_meta = pipeline.processed_repository.get_processed_meta(ticker, document_id)
+
+    assert pipeline.recorded_rebuild_values == [False]
+    assert processed_meta["reprocess_required"] is True
 
 
 def _build_runtime_with_cn_hk_adapters(

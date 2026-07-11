@@ -24,6 +24,7 @@ from dayu.fins.downloaders.hkexnews_downloader import (
     HKEXNEWS_INACTIVE_STOCK_ZH_URL,
     HKEXNEWS_TITLE_SEARCH_URL,
     HkexnewsDiscoveryClient,
+    HkexnewsDiscoveryTruncatedError,
 )
 from dayu.fins.pipelines.cn_download_models import (
     CnCompanyProfile,
@@ -180,7 +181,7 @@ def _query_from_request(request: httpx.Request) -> dict[str, tuple[str, ...]]:
     return {key: tuple(values) for key, values in parsed.items()}
 
 
-def _title_search_payload(rows: list[dict[str, str]]) -> dict[str, str]:
+def _title_search_payload(rows: list[dict[str, str]]) -> dict[str, JsonValue]:
     """构造披露易 title search 响应。
 
     Args:
@@ -403,6 +404,176 @@ def test_list_report_candidates_gets_title_search_and_builds_absolute_url() -> N
     assert posted_forms[0]["t2code"] == ("40100",)
     assert posted_forms[0]["fromDate"] == ("20240101",)
     assert posted_forms[0]["toDate"] == ("20261231",)
+
+
+def test_list_report_candidates_raises_typed_truncated_when_full_page_lacks_total() -> None:
+    """title search 满页且无总数时必须 typed fail closed。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 断言失败时抛出。
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).startswith(HKEXNEWS_TITLE_SEARCH_URL) and request.method == "GET":
+            rows = [
+                _announcement(
+                    document_id=f"DOC_{index}",
+                    title=f"腾讯控股有限公司：2024年年度报告 {index}",
+                )
+                for index in range(100)
+            ]
+            return httpx.Response(200, json=_title_search_payload(rows))
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    client = _build_client(handler)
+
+    with pytest.raises(HkexnewsDiscoveryTruncatedError, match="无法证明完整"):
+        client.list_report_candidates(_query(), _profile())
+
+
+def test_list_report_candidates_accepts_full_page_when_total_proves_complete() -> None:
+    """title search 显式总数等于行数时可证明完整。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 断言失败时抛出。
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).startswith(HKEXNEWS_TITLE_SEARCH_URL) and request.method == "GET":
+            rows = [
+                _announcement(
+                    document_id=f"DOC_{index}",
+                    title=f"腾讯控股有限公司：2024年年度报告 {index}",
+                    file_link=f"/listedco/listconews/sehk/2025/0401/doc_{index}.pdf",
+                )
+                for index in range(100)
+            ]
+            payload = _title_search_payload(rows)
+            payload["total"] = "100"
+            return httpx.Response(200, json=payload)
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={})
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    client = _build_client(handler)
+    candidates = client.list_report_candidates(_query(), _profile())
+
+    assert len(candidates) == 1
+
+
+def test_list_report_candidates_raises_typed_truncated_when_total_exceeds_rows() -> None:
+    """title search 显式总数大于行数时必须 typed fail closed。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 断言失败时抛出。
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).startswith(HKEXNEWS_TITLE_SEARCH_URL) and request.method == "GET":
+            rows = [
+                _announcement(
+                    document_id=f"DOC_{index}",
+                    title=f"腾讯控股有限公司：2024年年度报告 {index}",
+                )
+                for index in range(2)
+            ]
+            payload = _title_search_payload(rows)
+            payload["total"] = 3
+            return httpx.Response(200, json=payload)
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    client = _build_client(handler)
+
+    with pytest.raises(HkexnewsDiscoveryTruncatedError, match="响应被截断"):
+        client.list_report_candidates(_query(), _profile())
+
+
+def test_list_report_candidates_accepts_integral_float_total() -> None:
+    """title search 非负整数 float 总数应视为可证明完整。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 断言失败时抛出。
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).startswith(HKEXNEWS_TITLE_SEARCH_URL) and request.method == "GET":
+            rows = [
+                _announcement(
+                    document_id=f"DOC_{index}",
+                    title=f"腾讯控股有限公司：2024年年度报告 {index}",
+                    file_link=f"/listedco/listconews/sehk/2025/0401/float_{index}.pdf",
+                )
+                for index in range(100)
+            ]
+            payload = _title_search_payload(rows)
+            payload["total"] = 100.0
+            return httpx.Response(200, json=payload)
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={})
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    client = _build_client(handler)
+    candidates = client.list_report_candidates(_query(), _profile())
+
+    assert len(candidates) == 1
+
+
+@pytest.mark.parametrize("invalid_total", [100.5, -100.0])
+def test_list_report_candidates_rejects_invalid_float_total(invalid_total: float) -> None:
+    """title search 非整数或负数 float 总数不能证明完整。
+
+    Args:
+        invalid_total: 待注入的非法显式总数。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 断言失败时抛出。
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).startswith(HKEXNEWS_TITLE_SEARCH_URL) and request.method == "GET":
+            rows = [
+                _announcement(
+                    document_id=f"DOC_{index}",
+                    title=f"腾讯控股有限公司：2024年年度报告 {index}",
+                )
+                for index in range(100)
+            ]
+            payload = _title_search_payload(rows)
+            payload["total"] = invalid_total
+            return httpx.Response(200, json=payload)
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    client = _build_client(handler)
+
+    with pytest.raises(HkexnewsDiscoveryTruncatedError, match="无法证明完整"):
+        client.list_report_candidates(_query(), _profile())
 
 
 def test_list_report_candidates_does_not_use_english_fallback_when_primary_empty() -> None:

@@ -101,6 +101,29 @@ def _normalize_entry_name(name: str) -> str:
     return normalized
 
 
+def _normalize_document_id(document_id: str) -> str:
+    """标准化并校验仓储文档 ID。
+
+    Args:
+        document_id: 原始文档 ID。
+
+    Returns:
+        可作为单个路径组件使用的文档 ID。
+
+    Raises:
+        ValueError: 文档 ID 为空、包含路径分隔或为 ``.`` / ``..`` 时抛出。
+    """
+
+    normalized = str(document_id).strip()
+    if not normalized:
+        raise ValueError("document_id 不能为空")
+    if normalized in {".", ".."}:
+        raise ValueError("document_id 非法")
+    if "/" in normalized or "\\" in normalized:
+        raise ValueError("document_id 不能包含路径分隔符")
+    return normalized
+
+
 def _normalize_source_kind(source_kind: str | SourceKind) -> SourceKind:
     """标准化来源类型。
 
@@ -458,8 +481,8 @@ def _write_json(path: Path, payload: Any) -> None:
         stream.write(serialized)
         stream.flush()
         os.fsync(stream.fileno())
-    # 复杂逻辑说明：通过原子替换确保意外退出时不会留下半写入的 JSON 文件。
-    temp_path.replace(path)
+    # 复杂逻辑说明：通过明确的 same-directory 原子替换确保意外退出时不会留下半写入 JSON。
+    os.replace(temp_path, path)
     _fsync_directory(path.parent)
 
 
