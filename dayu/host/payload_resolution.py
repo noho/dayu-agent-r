@@ -13,14 +13,14 @@ from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import EventLogRow
 from dayu.host.durable.payload import PayloadKind, read_payload_descriptor
 from dayu.host.durable.schema import (
+    PayloadDescriptorKind,
     TABLE_SQLITE_PAYLOADS,
-    TOOL_CALL_ARGUMENTS_DESCRIPTOR_KIND,
     TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
     TOOL_CALL_ARGUMENTS_STORAGE_PAYLOAD_DESCRIPTOR,
-    TOOL_CALL_SEMANTIC_QUERY_DESCRIPTOR_KIND,
     TOOL_CALL_SEMANTIC_QUERY_STORAGE_ABSENT,
     TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT,
     TOOL_CALL_SEMANTIC_QUERY_STORAGE_PAYLOAD_DESCRIPTOR,
+    parse_payload_descriptor_kind,
 )
 from dayu.host.durable.transaction import HostTransaction
 
@@ -243,7 +243,7 @@ def _read_arguments_json(
         _validate_descriptor_kind(
             transaction,
             payload_ref=payload_ref,
-            expected_kind=TOOL_CALL_ARGUMENTS_DESCRIPTOR_KIND,
+            expected_kind=PayloadDescriptorKind.TOOL_CALL_ARGUMENTS_JSON,
             payload_label="tool call arguments",
         )
         arguments_json = sqlite_payload_object(
@@ -294,7 +294,7 @@ def _read_semantic_query(
         _validate_descriptor_kind(
             transaction,
             payload_ref=payload_ref,
-            expected_kind=TOOL_CALL_SEMANTIC_QUERY_DESCRIPTOR_KIND,
+            expected_kind=PayloadDescriptorKind.TOOL_CALL_SEMANTIC_QUERY_TEXT,
             payload_label="tool call semantic query",
         )
         query_json = sqlite_payload_object(
@@ -315,7 +315,7 @@ def _validate_descriptor_kind(
     transaction: HostTransaction,
     *,
     payload_ref: str,
-    expected_kind: str,
+    expected_kind: PayloadDescriptorKind,
     payload_label: str,
 ) -> None:
     """校验 payload descriptor metadata 中的业务 descriptor kind。
@@ -331,11 +331,16 @@ def _validate_descriptor_kind(
     descriptor = read_payload_descriptor(transaction, payload_ref)
     if descriptor is None:
         raise HostDurableError(f"{payload_label} payload descriptor is missing")
+    expected_descriptor_kind = parse_payload_descriptor_kind(expected_kind)
     metadata = _json_object(
         descriptor.metadata_json,
         payload_label=f"{payload_label} descriptor metadata",
     )
-    if metadata.get(_FIELD_DESCRIPTOR_KIND) != expected_kind:
+    descriptor_kind = metadata.get(_FIELD_DESCRIPTOR_KIND)
+    if not isinstance(descriptor_kind, str) or descriptor_kind.strip() == "":
+        raise HostDurableError(f"{payload_label} descriptor kind is missing")
+    actual_descriptor_kind = parse_payload_descriptor_kind(descriptor_kind)
+    if actual_descriptor_kind is not expected_descriptor_kind:
         raise HostDurableError(f"{payload_label} descriptor kind mismatch")
 
 

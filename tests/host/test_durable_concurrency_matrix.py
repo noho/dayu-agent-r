@@ -34,7 +34,9 @@ from dayu.host.durable.event_log import (
 from dayu.host.durable.idempotency import (
     IdempotencyRecord,
     IdempotencyResultRef,
+    IdempotencyResultKind,
     IdempotencyScope,
+    IdempotencyScopeKind,
     record_idempotent_result,
 )
 from dayu.host.durable.memory import (
@@ -71,10 +73,10 @@ _STATUS_OK = "ok"
 _STATUS_CONFLICT = "conflict"
 _MODE_SAME_DIGEST = "same_digest"
 _MODE_DIFFERENT_DIGEST = "different_digest"
-_SCOPE_KIND = "durable_matrix"
+_SCOPE_KIND = IdempotencyScopeKind.CLOSE_SESSION
 _SCOPE_ID = "session-1"
 _IDEMPOTENCY_KEY = "client-request-1"
-_RESULT_KIND = "event"
+_RESULT_KIND = IdempotencyResultKind.SESSION
 _CONSUMER_ID = "host.matrix.consumer"
 _SESSION_ID = "session-1"
 _NOW = "2026-06-01T00:00:00.000000Z"
@@ -162,7 +164,7 @@ class _ReadIdempotencySummaryOperation:
                   AND scope_id = ?
                   AND idempotency_key = ?
                 """,
-                (_SCOPE_KIND, _SCOPE_ID, _IDEMPOTENCY_KEY),
+                (_SCOPE_KIND.value, _SCOPE_ID, _IDEMPOTENCY_KEY),
             ),
             "idempotency record",
         )

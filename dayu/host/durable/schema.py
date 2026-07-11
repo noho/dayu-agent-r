@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from collections.abc import Mapping
+from enum import StrEnum
 
+from dayu.contracts.json_value import JsonValue
 from dayu.host.durable._row_rules import (
     TERMINAL_ATTEMPT_STATUS_VALUES,
     TERMINAL_RUN_STATUS_VALUES,
@@ -31,7 +34,7 @@ from dayu.host.api import (
     HOST_WAIT_TOOL_CALL_ID_MAX_LENGTH,
     HOST_WAIT_TOOL_NAME_MAX_LENGTH,
 )
-from dayu.host.durable.errors import HostSchemaMismatchError
+from dayu.host.durable.errors import HostDurableError, HostSchemaMismatchError
 
 HOST_SCHEMA_VERSION = 23
 """当前 Host durable SQLite schema version。"""
@@ -229,10 +232,79 @@ _EVENT_LOG_EVENT_TYPE_CHECK_VALUES_SQL = _sql_text_in_values(
 )
 """EventLog event_type fresh-schema CHECK 使用的 owner-owned 合法值列表。"""
 
-TOOL_CALL_ARGUMENTS_DESCRIPTOR_KIND = "tool_call_arguments_json"
+class PayloadDescriptorKind(StrEnum):
+    """Host payload descriptor metadata 中的 descriptor kind 闭集。"""
+
+    TOOL_CALL_ARGUMENTS_JSON = "tool_call_arguments_json"
+    TOOL_CALL_SEMANTIC_QUERY_TEXT = "tool_call_semantic_query_text"
+    RUNNER_CALL_INPUT_MANIFEST = "runner_call_input_manifest"
+    RUNNER_CALL_INPUT_PROJECTION = "runner_call_input_projection"
+    SELECTED_TOOL_SCHEMA_SNAPSHOT = "selected_tool_schema_snapshot"
+    COMPACTOR_INPUT_PROJECTION = "compactor_input_projection"
+    COMPACTION_REJECTED_ATTEMPT_DIAGNOSTIC = (
+        "compaction_rejected_attempt_diagnostic"
+    )
+
+
+def parse_payload_descriptor_kind(
+    value: str | PayloadDescriptorKind,
+) -> PayloadDescriptorKind:
+    """解析 payload descriptor kind。
+
+    :param value: 待解析的 descriptor kind 文本或 typed 值。
+    :returns: typed descriptor kind。
+    :raises HostDurableError: 值为空或不在 Host owner 闭集内时抛出。
+    """
+
+    if isinstance(value, PayloadDescriptorKind):
+        return value
+    if not isinstance(value, str) or value == "" or value.isspace():
+        raise HostDurableError("payload descriptor kind must be non-empty text")
+    try:
+        return PayloadDescriptorKind(value)
+    except ValueError as exc:
+        raise HostDurableError("payload descriptor kind is invalid") from exc
+
+
+def payload_descriptor_kind_values() -> tuple[str, ...]:
+    """返回 payload descriptor kind 合法值。
+
+    :returns: 按 owner 定义顺序排列的 descriptor kind 文本。
+    """
+
+    return tuple(kind.value for kind in PayloadDescriptorKind)
+
+
+def payload_descriptor_metadata(
+    descriptor_kind: str | PayloadDescriptorKind,
+    fields: Mapping[str, JsonValue],
+) -> dict[str, JsonValue]:
+    """构造带 typed descriptor kind 的 payload metadata。
+
+    :param descriptor_kind: descriptor kind 文本或 typed 值。
+    :param fields: 除 ``descriptor_kind`` 外的 metadata 字段。
+    :returns: 可直接写入 payload descriptor 的 metadata JSON object。
+    :raises HostDurableError: descriptor kind 非法，或 ``fields`` 试图覆盖
+        owner 写入的 ``descriptor_kind`` 时抛出。
+    """
+
+    if "descriptor_kind" in fields:
+        raise HostDurableError("payload metadata must not override descriptor_kind")
+    metadata: dict[str, JsonValue] = {
+        "descriptor_kind": parse_payload_descriptor_kind(descriptor_kind).value
+    }
+    metadata.update(fields)
+    return metadata
+
+
+TOOL_CALL_ARGUMENTS_DESCRIPTOR_KIND = (
+    PayloadDescriptorKind.TOOL_CALL_ARGUMENTS_JSON.value
+)
 """TOOL_CALL_REQUESTED accepted arguments payload descriptor kind。"""
 
-TOOL_CALL_SEMANTIC_QUERY_DESCRIPTOR_KIND = "tool_call_semantic_query_text"
+TOOL_CALL_SEMANTIC_QUERY_DESCRIPTOR_KIND = (
+    PayloadDescriptorKind.TOOL_CALL_SEMANTIC_QUERY_TEXT.value
+)
 """TOOL_CALL_REQUESTED readable semantic query payload descriptor kind。"""
 
 TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON = "inline_json"
@@ -250,7 +322,9 @@ TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT = "inline_text"
 TOOL_CALL_SEMANTIC_QUERY_STORAGE_PAYLOAD_DESCRIPTOR = "payload_descriptor"
 """TOOL_CALL_REQUESTED readable semantic query 以 payload descriptor 存储。"""
 
-RUNNER_CALL_INPUT_MANIFEST_DESCRIPTOR_KIND = "runner_call_input_manifest"
+RUNNER_CALL_INPUT_MANIFEST_DESCRIPTOR_KIND = (
+    PayloadDescriptorKind.RUNNER_CALL_INPUT_MANIFEST.value
+)
 """RUNNER_CALL_INPUT_ASSEMBLED manifest body payload descriptor kind。"""
 
 RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION = "runner_call_input_manifest.v1"
@@ -261,7 +335,9 @@ RUNNER_CALL_INPUT_MANIFEST_MEDIA_TYPE = (
 )
 """RUNNER_CALL_INPUT_ASSEMBLED manifest body media type。"""
 
-RUNNER_CALL_INPUT_PROJECTION_DESCRIPTOR_KIND = "runner_call_input_projection"
+RUNNER_CALL_INPUT_PROJECTION_DESCRIPTOR_KIND = (
+    PayloadDescriptorKind.RUNNER_CALL_INPUT_PROJECTION.value
+)
 """RUNNER_CALL_INPUT_ASSEMBLED LLM-facing input projection descriptor kind。"""
 
 RUNNER_CALL_INPUT_PROJECTION_SCHEMA_VERSION = "runner_call_input_projection.v1"
@@ -272,7 +348,9 @@ RUNNER_CALL_INPUT_PROJECTION_MEDIA_TYPE = (
 )
 """RUNNER_CALL_INPUT_ASSEMBLED LLM-facing input projection media type。"""
 
-SELECTED_TOOL_SCHEMA_SNAPSHOT_DESCRIPTOR_KIND = "selected_tool_schema_snapshot"
+SELECTED_TOOL_SCHEMA_SNAPSHOT_DESCRIPTOR_KIND = (
+    PayloadDescriptorKind.SELECTED_TOOL_SCHEMA_SNAPSHOT.value
+)
 """Runner-call selected tool schema full JSON snapshot descriptor kind。"""
 
 SELECTED_TOOL_SCHEMA_SNAPSHOT_SCHEMA_VERSION = "selected_tool_schema_snapshot.v1"
@@ -283,7 +361,9 @@ SELECTED_TOOL_SCHEMA_SNAPSHOT_MEDIA_TYPE = (
 )
 """Runner-call selected tool schema full JSON snapshot media type。"""
 
-COMPACTOR_INPUT_PROJECTION_DESCRIPTOR_KIND = "compactor_input_projection"
+COMPACTOR_INPUT_PROJECTION_DESCRIPTOR_KIND = (
+    PayloadDescriptorKind.COMPACTOR_INPUT_PROJECTION.value
+)
 """compactor proposal input projection payload descriptor kind。"""
 
 _SQLITE_PAYLOADS_DDL = f"""

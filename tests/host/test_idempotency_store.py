@@ -23,11 +23,16 @@ from dayu.host.durable.event_log import (
 )
 from dayu.host.durable.idempotency import (
     IdempotencyResultRef,
+    IdempotencyResultKind,
     IdempotencyScope,
+    IdempotencyScopeKind,
     IdempotencyStore,
+    idempotency_result_kind_values,
+    idempotency_scope_kind_values,
     record_idempotent_result,
     read_idempotency_record,
 )
+from dayu.host.durable.schema import TABLE_IDEMPOTENCY_RECORDS
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
     HostSQLiteStoragePolicy,
@@ -64,7 +69,7 @@ def _scope() -> IdempotencyScope:
     """
 
     return IdempotencyScope(
-        scope_kind="session_command",
+        scope_kind=IdempotencyScopeKind.CLOSE_SESSION,
         scope_id="session-1",
         idempotency_key="key-1",
     )
@@ -83,7 +88,7 @@ def _result_ref(
     """
 
     return IdempotencyResultRef(
-        result_kind="event",
+        result_kind=IdempotencyResultKind.SESSION,
         result_ref="event-1",
         created_event_id=created_event_id,
         created_event_sequence=created_event_sequence,
@@ -138,11 +143,11 @@ def _idempotency_host_row(semantic_input_digest: str) -> HostRow:
             "created_at",
         ),
         values=(
-            "session_command",
+            "close_session",
             "session-1",
             "key-1",
             semantic_input_digest,
-            "event",
+            "session",
             "event-existing",
             None,
             None,
@@ -203,7 +208,9 @@ def test_first_idempotency_insert_stores_digest_and_result(
     digest = sha256_digest_json({"command": "start"})
     with open_host_durable_store(_options(tmp_path)) as store:
 
-        def operation(transaction: HostTransaction) -> tuple[str, str, str]:
+        def operation(
+            transaction: HostTransaction,
+        ) -> tuple[str, IdempotencyResultKind, str]:
             """写入并读取幂等记录。
 
             :param transaction: Host transaction。
@@ -223,7 +230,7 @@ def test_first_idempotency_insert_stores_digest_and_result(
 
         assert store.transaction_runner.run_write(operation) == (
             digest,
-            "event",
+            IdempotencyResultKind.SESSION,
             "event-1",
         )
 
@@ -251,7 +258,7 @@ def test_repeat_same_scope_key_and_digest_returns_existing_record(
                 _scope(),
                 digest,
                 IdempotencyResultRef(
-                    result_kind="event",
+                    result_kind=IdempotencyResultKind.SESSION,
                     result_ref="event-other",
                     created_event_id=None,
                     created_event_sequence=None,
@@ -375,7 +382,7 @@ def test_idempotency_rejects_whitespace_only_text_fields(
             record_idempotent_result(
                 transaction,
                 IdempotencyScope(
-                    scope_kind=" \t",
+                    scope_kind=cast(IdempotencyScopeKind, " \t"),
                     scope_id="session-1",
                     idempotency_key="key-1",
                 ),
@@ -395,7 +402,7 @@ def test_idempotency_rejects_whitespace_only_text_fields(
                 _scope(),
                 digest,
                 IdempotencyResultRef(
-                    result_kind=" \n",
+                    result_kind=cast(IdempotencyResultKind, " \n"),
                     result_ref="event-1",
                     created_event_id=None,
                     created_event_sequence=None,
@@ -406,6 +413,99 @@ def test_idempotency_rejects_whitespace_only_text_fields(
             store.transaction_runner.run_write(whitespace_scope)
         with pytest.raises(HostDurableError):
             store.transaction_runner.run_write(whitespace_result)
+
+
+def test_idempotency_owner_values_match_current_host_baseline() -> None:
+    """幂等 owner 暴露的合法值与当前 Host baseline 一致。"""
+
+    assert idempotency_scope_kind_values() == (
+        "ensure_session",
+        "create_session",
+        "close_session",
+        "start_run",
+        "submit_followup_queue",
+        "submit_followup_steer",
+        "retry_run",
+        "replay_run",
+        "cancel_run",
+        "cancel_session_runs",
+        "tool_fact_accept",
+        "tool_awaiting_accept",
+        "wait_resolution",
+        "wait_late_rejection",
+        "purge_session",
+    )
+    assert idempotency_result_kind_values() == (
+        "session",
+        "run",
+        "tool_fact_accept_ack",
+        "tool_awaiting_accept_ack",
+        "wait_resolution",
+        "wait_late_rejection_diagnostic",
+        "purge_tombstone",
+    )
+
+
+def test_idempotency_dataclass_construction_rejects_unknown_kind() -> None:
+    """幂等 dataclass 构造边界拒绝 owner 闭集外的 kind。"""
+
+    with pytest.raises(HostDurableError, match="Idempotency scope kind is invalid"):
+        IdempotencyScope(
+            scope_kind=cast(IdempotencyScopeKind, "external_plugin_scope"),
+            scope_id="session-1",
+            idempotency_key="key-1",
+        )
+    with pytest.raises(HostDurableError, match="Idempotency result kind is invalid"):
+        IdempotencyResultRef(
+            result_kind=cast(IdempotencyResultKind, "external_ack"),
+            result_ref="external-ack-1",
+            created_event_id=None,
+            created_event_sequence=None,
+        )
+
+
+def test_idempotency_read_rejects_mutated_unknown_result_kind(
+    tmp_path: Path,
+) -> None:
+    """幂等 row decoder 拒绝手工篡改出的未知 result kind。"""
+
+    digest = sha256_digest_json({"command": "start"})
+    with open_host_durable_store(_options(tmp_path)) as store:
+
+        def seed_and_mutate(transaction: HostTransaction) -> None:
+            """写入合法幂等 row 后绕过 owner 篡改 result kind。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            record_idempotent_result(transaction, _scope(), digest, _result_ref())
+            transaction.execute(
+                f"""
+                UPDATE {TABLE_IDEMPOTENCY_RECORDS}
+                SET result_kind = ?
+                WHERE scope_kind = ? AND scope_id = ? AND idempotency_key = ?
+                """,
+                (
+                    "external_ack",
+                    _scope().scope_kind.value,
+                    _scope().scope_id,
+                    _scope().idempotency_key,
+                ),
+            )
+
+        def read_mutated(transaction: HostTransaction) -> None:
+            """读取被篡改的幂等 row。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            read_idempotency_record(transaction, _scope())
+
+        store.transaction_runner.run_write(seed_and_mutate)
+        with pytest.raises(HostDurableError, match="Idempotency result kind is invalid"):
+            store.transaction_runner.run_read(read_mutated)
 
 
 def test_idempotency_rejects_one_sided_created_event_ref(

@@ -38,6 +38,7 @@ from dayu.host.durable.errors import (
 from dayu.host.durable.schema import (
     TABLE_PAYLOAD_DESCRIPTORS,
     TABLE_SQLITE_PAYLOADS,
+    parse_payload_descriptor_kind,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction
 
@@ -455,6 +456,7 @@ def _insert_payload_descriptor(
     :raises sqlite3.Error: SQLite 写入失败时由 transaction runner 结构化转换。
     """
 
+    _validate_payload_descriptor_metadata(metadata)
     try:
         metadata_json = canonical_json_dumps(metadata)
     except (TypeError, ValueError) as exc:
@@ -501,6 +503,26 @@ def _validate_bounded_json_payload_request(
     _require_non_empty_text(request.sqlite_payload_id, field_name="sqlite_payload_id")
     _require_optional_non_empty_text(request.media_type, field_name="media_type")
     _require_optional_digest(request.expected_digest, field_name="expected_digest")
+
+
+def _validate_payload_descriptor_metadata(metadata: Mapping[str, JsonValue]) -> None:
+    """校验 payload descriptor metadata 中的 owner-owned 字段。
+
+    普通 metadata 仍保持中立；只有 metadata 明确携带 ``descriptor_kind`` 时，
+    该字段必须通过 descriptor-kind owner 校验，避免未知 descriptor kind
+    在写入边界进入 durable state。
+
+    :param metadata: 待写入 payload descriptor 的 metadata JSON object。
+    :returns: ``None``。
+    :raises HostDurableError: ``descriptor_kind`` 字段类型或取值非法时抛出。
+    """
+
+    descriptor_kind = metadata.get("descriptor_kind")
+    if descriptor_kind is None:
+        return
+    if not isinstance(descriptor_kind, str):
+        raise HostDurableError("payload descriptor kind must be non-empty text")
+    parse_payload_descriptor_kind(descriptor_kind)
 
 
 def _encode_bounded_json_payload(

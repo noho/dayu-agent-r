@@ -46,10 +46,10 @@ from dayu.host.durable.event_log import (
 )
 from dayu.host.durable.payload import PayloadStore
 from dayu.host.durable.schema import (
-    COMPACTOR_INPUT_PROJECTION_DESCRIPTOR_KIND,
-    RUNNER_CALL_INPUT_MANIFEST_DESCRIPTOR_KIND,
+    PayloadDescriptorKind,
     RUNNER_CALL_INPUT_MANIFEST_MEDIA_TYPE,
     RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
+    payload_descriptor_metadata,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.runtime.diagnostic_text import (
@@ -94,9 +94,6 @@ _EVENT_ID_COMPACTION_REJECTED_DIAGNOSTIC_PREFIX = (
 )
 _EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED = (
     "CONTEXT_COMPACTION_ATTEMPT_REJECTED"
-)
-_DIAGNOSTIC_DESCRIPTOR_KIND_COMPACTION_REJECTED_ATTEMPT = (
-    "compaction_rejected_attempt_diagnostic"
 )
 _DIAGNOSTIC_STAGE_MATERIAL_PACK_TO_COMPACT_INPUT = (
     "material_pack_to_compact_input"
@@ -286,14 +283,18 @@ class DurableCompactorProposalManifestRecorder(CompactorProposalManifestRecorder
                 projection_ref,
                 projection_artifact_ref,
                 _COMPACTOR_INPUT_PROJECTION_MEDIA_TYPE,
-                {
-                    "descriptor_kind": COMPACTOR_INPUT_PROJECTION_DESCRIPTOR_KIND,
-                    "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
-                    "event_id": event_id,
-                    "compaction_operation_id": compaction_operation_id,
-                    "compaction_attempt_number": compaction_attempt_number,
-                    "compaction_request_digest": prepared_input.compaction_request_digest,
-                },
+                payload_descriptor_metadata(
+                    PayloadDescriptorKind.COMPACTOR_INPUT_PROJECTION,
+                    {
+                        "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
+                        "event_id": event_id,
+                        "compaction_operation_id": compaction_operation_id,
+                        "compaction_attempt_number": compaction_attempt_number,
+                        "compaction_request_digest": (
+                            prepared_input.compaction_request_digest
+                        ),
+                    },
+                ),
             )
             manifest = _compactor_runner_call_manifest_body(
                 request=request,
@@ -314,14 +315,16 @@ class DurableCompactorProposalManifestRecorder(CompactorProposalManifestRecorder
                 manifest_payload_ref,
                 manifest_artifact_ref,
                 RUNNER_CALL_INPUT_MANIFEST_MEDIA_TYPE,
-                {
-                    "descriptor_kind": RUNNER_CALL_INPUT_MANIFEST_DESCRIPTOR_KIND,
-                    "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
-                    "event_id": event_id,
-                    "schema_version": RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
-                    "compaction_operation_id": compaction_operation_id,
-                    "compaction_attempt_number": compaction_attempt_number,
-                },
+                payload_descriptor_metadata(
+                    PayloadDescriptorKind.RUNNER_CALL_INPUT_MANIFEST,
+                    {
+                        "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
+                        "event_id": event_id,
+                        "schema_version": RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
+                        "compaction_operation_id": compaction_operation_id,
+                        "compaction_attempt_number": compaction_attempt_number,
+                    },
+                ),
             )
             self._event_log_store.append_event(
                 transaction,
@@ -1029,21 +1032,23 @@ def write_compaction_rejected_attempt_diagnostic_artifact(
         payload_ref,
         artifact_ref,
         _COMPACTION_REJECTED_DIAGNOSTIC_MEDIA_TYPE,
-        {
-            "descriptor_kind": _DIAGNOSTIC_DESCRIPTOR_KIND_COMPACTION_REJECTED_ATTEMPT,
-            "schema_version": _COMPACTION_REJECTED_DIAGNOSTIC_SCHEMA_VERSION,
-            "event_type": _EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED,
-            "diagnostic_event_id": diagnostic_event_id,
-            "compaction_operation_id": compaction_operation_id,
-            "compaction_attempt_number": compaction_attempt_number,
-            "compaction_request_digest": diagnostic.compaction_request_digest,
-            "failure_stage": diagnostic.failure_stage,
-            "failure_category": diagnostic.failure_category.value,
-            "exception_class": diagnostic.exception_class,
-            "parser_or_validator": diagnostic.parser_or_validator,
-            "contains_raw_material": True,
-            "confidential": True,
-        },
+        payload_descriptor_metadata(
+            PayloadDescriptorKind.COMPACTION_REJECTED_ATTEMPT_DIAGNOSTIC,
+            {
+                "schema_version": _COMPACTION_REJECTED_DIAGNOSTIC_SCHEMA_VERSION,
+                "event_type": _EVENT_TYPE_CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+                "diagnostic_event_id": diagnostic_event_id,
+                "compaction_operation_id": compaction_operation_id,
+                "compaction_attempt_number": compaction_attempt_number,
+                "compaction_request_digest": diagnostic.compaction_request_digest,
+                "failure_stage": diagnostic.failure_stage,
+                "failure_category": diagnostic.failure_category.value,
+                "exception_class": diagnostic.exception_class,
+                "parser_or_validator": diagnostic.parser_or_validator,
+                "contains_raw_material": True,
+                "confidential": True,
+            },
+        ),
     )
     return CompactionRejectedAttemptDiagnosticReference(
         payload_ref=descriptor.payload_ref,

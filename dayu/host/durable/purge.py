@@ -30,7 +30,9 @@ from dayu.host.durable.errors import HostDurableError, HostIdempotencyConflictEr
 from dayu.host.durable.idempotency import (
     IdempotencyRecord,
     IdempotencyResultRef,
+    IdempotencyResultKind,
     IdempotencyScope,
+    IdempotencyScopeKind,
     IdempotencyStore,
 )
 from dayu.host.durable.projection import reset_projection_refs_for_deleted_events
@@ -63,10 +65,10 @@ from dayu.host.durable.state import (
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction, SQLiteScalar
 
-PURGE_IDEMPOTENCY_SCOPE_KIND = "purge_session"
+PURGE_IDEMPOTENCY_SCOPE_KIND = IdempotencyScopeKind.PURGE_SESSION
 """purge command 幂等记录的 scope kind。"""
 
-PURGE_IDEMPOTENCY_RESULT_KIND = "purge_tombstone"
+PURGE_IDEMPOTENCY_RESULT_KIND = IdempotencyResultKind.PURGE_TOMBSTONE
 """purge command 幂等记录的 result kind。"""
 
 _PURGE_OPERATION = "purge_session"
@@ -137,16 +139,16 @@ _PURGE_REBUILDABLE_PROJECTION_CONSUMER_IDS = (
     "host.outbox-terminal",
 )
 _SESSION_FACT_SCOPE_KINDS = (
-    "ensure_session",
-    "create_session",
-    "close_session",
-    "start_run",
-    "submit_followup_queue",
-    "submit_followup_steer",
-    "retry_run",
-    "replay_run",
-    "cancel_run",
-    "cancel_session_runs",
+    IdempotencyScopeKind.ENSURE_SESSION.value,
+    IdempotencyScopeKind.CREATE_SESSION.value,
+    IdempotencyScopeKind.CLOSE_SESSION.value,
+    IdempotencyScopeKind.START_RUN.value,
+    IdempotencyScopeKind.SUBMIT_FOLLOWUP_QUEUE.value,
+    IdempotencyScopeKind.SUBMIT_FOLLOWUP_STEER.value,
+    IdempotencyScopeKind.RETRY_RUN.value,
+    IdempotencyScopeKind.REPLAY_RUN.value,
+    IdempotencyScopeKind.CANCEL_RUN.value,
+    IdempotencyScopeKind.CANCEL_SESSION_RUNS.value,
 )
 
 _REFS_EVENT_IDS = "event_ids"

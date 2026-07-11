@@ -89,7 +89,9 @@ from dayu.host.durable.event_log import (
 from dayu.host.durable.idempotency import (
     IdempotencyRecord,
     IdempotencyResultRef,
+    IdempotencyResultKind,
     IdempotencyScope,
+    IdempotencyScopeKind,
     IdempotencyStore,
 )
 from dayu.host.durable.payload import read_payload_descriptor
@@ -99,13 +101,13 @@ from dayu.host.durable.payload import (
     SQLitePayloadWriteRequest,
 )
 from dayu.host.durable.schema import (
-    TOOL_CALL_ARGUMENTS_DESCRIPTOR_KIND,
+    PayloadDescriptorKind,
     TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
     TOOL_CALL_ARGUMENTS_STORAGE_PAYLOAD_DESCRIPTOR,
-    TOOL_CALL_SEMANTIC_QUERY_DESCRIPTOR_KIND,
     TOOL_CALL_SEMANTIC_QUERY_STORAGE_ABSENT,
     TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT,
     TOOL_CALL_SEMANTIC_QUERY_STORAGE_PAYLOAD_DESCRIPTOR,
+    payload_descriptor_metadata,
 )
 from dayu.host.durable.state import (
     AttemptRow,
@@ -215,8 +217,8 @@ _UNSUPPORTED_EXECUTOR_ERROR = "tool_runtime_not_connected"
 _UNSUPPORTED_EXECUTOR_MESSAGE = (
     "ToolRuntime executor is not connected in Phase 6 S1"
 )
-_TOOL_FACT_ACCEPT_SCOPE_KIND = "tool_fact_accept"
-_TOOL_FACT_ACCEPT_RESULT_KIND = "tool_fact_accept_ack"
+_TOOL_FACT_ACCEPT_SCOPE_KIND = IdempotencyScopeKind.TOOL_FACT_ACCEPT
+_TOOL_FACT_ACCEPT_RESULT_KIND = IdempotencyResultKind.TOOL_FACT_ACCEPT_ACK
 _EVENT_ID_TOOL_CALL_REQUESTED_PREFIX = "event-tool-call-requested-"
 _EVENT_ID_TOOL_CALL_GOVERNED_PREFIX = "event-tool-call-governed-"
 _EVENT_ID_TOOL_RESULT_ACCEPTED_PREFIX = "event-tool-result-accepted-"
@@ -4362,13 +4364,15 @@ def _tool_call_request_payload_plan(
                 payload_format=SQLitePayloadFormat.CANONICAL_JSON,
                 payload_json=arguments_json,
                 media_type="application/json",
-                metadata={
-                    "descriptor_kind": TOOL_CALL_ARGUMENTS_DESCRIPTOR_KIND,
-                    "event_type": _EVENT_TYPE_TOOL_CALL_REQUESTED,
-                    "event_id": requested_event_id,
-                    "tool_name": candidate.call.tool_name,
-                    "tool_call_id": candidate.call.tool_call_id,
-                },
+                metadata=payload_descriptor_metadata(
+                    PayloadDescriptorKind.TOOL_CALL_ARGUMENTS_JSON,
+                    {
+                        "event_type": _EVENT_TYPE_TOOL_CALL_REQUESTED,
+                        "event_id": requested_event_id,
+                        "tool_name": candidate.call.tool_name,
+                        "tool_call_id": candidate.call.tool_call_id,
+                    },
+                ),
                 expected_digest=arguments_payload_digest,
             ),
         )
@@ -4477,13 +4481,15 @@ def _semantic_query_payload_plan(
             payload_format=SQLitePayloadFormat.CANONICAL_JSON,
             payload_json=query_json,
             media_type="text/plain; charset=utf-8",
-            metadata={
-                "descriptor_kind": TOOL_CALL_SEMANTIC_QUERY_DESCRIPTOR_KIND,
-                "event_type": _EVENT_TYPE_TOOL_CALL_REQUESTED,
-                "event_id": requested_event_id,
-                "tool_name": candidate.call.tool_name,
-                "tool_call_id": candidate.call.tool_call_id,
-            },
+            metadata=payload_descriptor_metadata(
+                PayloadDescriptorKind.TOOL_CALL_SEMANTIC_QUERY_TEXT,
+                {
+                    "event_type": _EVENT_TYPE_TOOL_CALL_REQUESTED,
+                    "event_id": requested_event_id,
+                    "tool_name": candidate.call.tool_name,
+                    "tool_call_id": candidate.call.tool_call_id,
+                },
+            ),
             expected_digest=query_digest,
         ),
     )

@@ -37,7 +37,9 @@ from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.idempotency import (
     IdempotencyResultRef,
+    IdempotencyResultKind,
     IdempotencyScope,
+    IdempotencyScopeKind,
     IdempotencyStore,
 )
 from dayu.host.durable.options import (
@@ -945,7 +947,7 @@ class _ReadPurgeIdempotencyOperation:
             FROM {TABLE_IDEMPOTENCY_RECORDS}
             WHERE scope_kind = ? AND scope_id = ? AND idempotency_key = ?
             """,
-            (PURGE_IDEMPOTENCY_SCOPE_KIND, _SESSION_ID, _CLIENT_REQUEST_ID),
+            (PURGE_IDEMPOTENCY_SCOPE_KIND.value, _SESSION_ID, _CLIENT_REQUEST_ID),
         )
         assert row is not None
         result_ref = row.get("result_ref")
@@ -2517,13 +2519,13 @@ def _insert_old_idempotency_rows(transaction: HostTransaction, events: _TargetEv
     IdempotencyStore().record_idempotent_result(
         transaction,
         IdempotencyScope(
-            scope_kind="close_session",
+            scope_kind=IdempotencyScopeKind.CLOSE_SESSION,
             scope_id=_SESSION_ID,
             idempotency_key="old-close-key",
         ),
         _DIGEST_A,
         IdempotencyResultRef(
-            result_kind="session",
+            result_kind=IdempotencyResultKind.SESSION,
             result_ref=_SESSION_ID,
             created_event_id=events.session_closed[0],
             created_event_sequence=events.session_closed[1],
@@ -2532,31 +2534,42 @@ def _insert_old_idempotency_rows(transaction: HostTransaction, events: _TargetEv
     IdempotencyStore().record_idempotent_result(
         transaction,
         IdempotencyScope(
-            scope_kind="cancel_run",
+            scope_kind=IdempotencyScopeKind.CANCEL_RUN,
             scope_id=_PARENT_RUN_ID,
             idempotency_key="old-cancel-key",
         ),
         _DIGEST_B,
         IdempotencyResultRef(
-            result_kind="run",
+            result_kind=IdempotencyResultKind.RUN,
             result_ref=_PARENT_RUN_ID,
             created_event_id=events.parent_terminal[0],
             created_event_sequence=events.parent_terminal[1],
         ),
     )
-    IdempotencyStore().record_idempotent_result(
-        transaction,
-        IdempotencyScope(
-            scope_kind=_OUT_OF_SCOPE_IDEMPOTENCY_SCOPE_KIND,
-            scope_id=_SESSION_ID,
-            idempotency_key=_OUT_OF_SCOPE_IDEMPOTENCY_KEY,
-        ),
-        _DIGEST_C,
-        IdempotencyResultRef(
-            result_kind="external_ack",
-            result_ref="external-ack-1",
-            created_event_id=None,
-            created_event_sequence=None,
+    transaction.execute(
+        f"""
+        INSERT INTO {TABLE_IDEMPOTENCY_RECORDS} (
+          scope_kind,
+          scope_id,
+          idempotency_key,
+          semantic_input_digest,
+          result_kind,
+          result_ref,
+          created_event_id,
+          created_event_sequence,
+          created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            _OUT_OF_SCOPE_IDEMPOTENCY_SCOPE_KIND,
+            _SESSION_ID,
+            _OUT_OF_SCOPE_IDEMPOTENCY_KEY,
+            _DIGEST_C,
+            "external_ack",
+            "external-ack-1",
+            None,
+            None,
+            _TIMESTAMP,
         ),
     )
 

@@ -57,7 +57,9 @@ from dayu.host.durable.errors import HostDurableError, HostIdempotencyConflictEr
 from dayu.host.durable.idempotency import (
     IdempotencyRecord,
     IdempotencyResultRef,
+    IdempotencyResultKind,
     IdempotencyScope,
+    IdempotencyScopeKind,
     IdempotencyStore,
 )
 from dayu.host.durable.schema import (
@@ -119,16 +121,18 @@ from dayu.host.wait_adapter import WaitAdapterBinding
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _LOGGER = logging.getLogger(__name__)
-_TOOL_AWAITING_ACCEPT_SCOPE_KIND = "tool_awaiting_accept"
-_TOOL_AWAITING_ACCEPT_RESULT_KIND = "tool_awaiting_accept_ack"
+_TOOL_AWAITING_ACCEPT_SCOPE_KIND = IdempotencyScopeKind.TOOL_AWAITING_ACCEPT
+_TOOL_AWAITING_ACCEPT_RESULT_KIND = IdempotencyResultKind.TOOL_AWAITING_ACCEPT_ACK
 _EVENT_TYPE_TOOL_CALL_REQUESTED = "TOOL_CALL_REQUESTED"
 _EVENT_TYPE_TOOL_AWAITING = "TOOL_AWAITING"
 _EVENT_TYPE_RUN_WAITING = "RUN_WAITING"
 _EVENT_TYPE_ATTEMPT_SUSPENDED = "ATTEMPT_SUSPENDED"
-_WAIT_RESOLUTION_SCOPE_KIND = "wait_resolution"
-_WAIT_RESOLUTION_RESULT_KIND = "wait_resolution"
-_WAIT_LATE_REJECTION_SCOPE_KIND = "wait_late_rejection"
-_WAIT_LATE_REJECTION_RESULT_KIND = "wait_late_rejection_diagnostic"
+_WAIT_RESOLUTION_SCOPE_KIND = IdempotencyScopeKind.WAIT_RESOLUTION
+_WAIT_RESOLUTION_RESULT_KIND = IdempotencyResultKind.WAIT_RESOLUTION
+_WAIT_LATE_REJECTION_SCOPE_KIND = IdempotencyScopeKind.WAIT_LATE_REJECTION
+_WAIT_LATE_REJECTION_RESULT_KIND = (
+    IdempotencyResultKind.WAIT_LATE_REJECTION_DIAGNOSTIC
+)
 _AWAITING_ACCEPT_ACTOR = "host.tool_runtime"
 _AWAITING_ACCEPT_SOURCE = "host.tool_runtime.awaiting_accept"
 _EVENT_ID_TOOL_CALL_REQUESTED_PREFIX = "event-tool-call-requested-awaiting-"

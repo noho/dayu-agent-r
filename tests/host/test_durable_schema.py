@@ -75,6 +75,7 @@ from dayu.host.durable.schema import (
     TABLE_PAYLOAD_DESCRIPTORS,
     TABLE_SQLITE_PAYLOADS,
     bootstrap_host_durable_store,
+    payload_descriptor_kind_values,
 )
 
 _CREATE_INDEX_NAME_PATTERN = re.compile(
@@ -920,6 +921,15 @@ def test_tool_call_request_payload_descriptor_kinds_are_stable() -> None:
         TOOL_CALL_SEMANTIC_QUERY_DESCRIPTOR_KIND
         == "tool_call_semantic_query_text"
     )
+    assert payload_descriptor_kind_values() == (
+        "tool_call_arguments_json",
+        "tool_call_semantic_query_text",
+        "runner_call_input_manifest",
+        "runner_call_input_projection",
+        "selected_tool_schema_snapshot",
+        "compactor_input_projection",
+        "compaction_rejected_attempt_diagnostic",
+    )
 
 
 def test_foundation_query_indexes_are_created(tmp_path: Path) -> None:
@@ -1113,6 +1123,14 @@ def test_schema_constraints_are_explicit(tmp_path: Path) -> None:
                 "scope_id",
                 "idempotency_key",
             )
+            idempotency_sql_row = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                (TABLE_IDEMPOTENCY_RECORDS,),
+            ).fetchone()
+            assert idempotency_sql_row is not None
+            idempotency_sql = str(idempotency_sql_row[0])
+            assert "scope_kind TEXT NOT NULL CHECK" not in idempotency_sql
+            assert "result_kind TEXT NOT NULL CHECK" not in idempotency_sql
             assert _primary_key_columns(connection, TABLE_PAYLOAD_DESCRIPTORS) == ("payload_ref",)
             assert _primary_key_columns(connection, TABLE_SQLITE_PAYLOADS) == ("payload_id",)
             assert _primary_key_columns(connection, TABLE_HOST_INSTANCES) == ("host_instance_id",)

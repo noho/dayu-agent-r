@@ -40,6 +40,7 @@ from dayu.host.durable.options import (
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
+from dayu.host.durable.schema import TABLE_PAYLOAD_DESCRIPTORS
 from dayu.host.durable.run_transition import (
     AcceptWorkerRunningInput,
     CreateRunningRunInput,
@@ -321,6 +322,123 @@ def test_tool_call_requested_large_arguments_use_payload_descriptor(
         )
         assert atoms.arguments_json == {"arguments": large_arguments}
         assert canonical_json_dumps(large_arguments) not in requested.payload_json
+
+
+def test_tool_call_request_atoms_reject_missing_descriptor_kind(
+    tmp_path: Path,
+) -> None:
+    """reader 对 expected descriptor kind 缺失 fail closed。"""
+
+    with open_host_durable_store(
+        _options(tmp_path, payload_inline_threshold_bytes=4096)
+    ) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        base = _completed_candidate(seeded, tool_call_id="tool-call-kind-missing")
+        large_arguments: Mapping[str, JsonValue] = {
+            "ticker": "MSFT",
+            "query": "x" * 8192,
+        }
+        candidate = replace(
+            base,
+            call=replace(
+                base.call,
+                accepted_arguments=large_arguments,
+                normalized_arguments_digest=sha256_digest_json(
+                    {"arguments": large_arguments}
+                ),
+            ),
+        )
+        accept_port = DefaultHostToolFactAcceptPort(
+            transaction_runner=store.transaction_runner
+        )
+
+        result = accept_port.accept_tool_fact(candidate)
+        requested = _tool_requested_events(store.transaction_runner)[0]
+        payload = payload_object(requested)
+        payload_ref = cast(str, payload["arguments_payload_ref"])
+
+        def mutate(transaction: HostTransaction) -> None:
+            """移除 descriptor metadata 中的 descriptor kind。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            transaction.execute(
+                f"""
+                UPDATE {TABLE_PAYLOAD_DESCRIPTORS}
+                SET metadata_json = ?
+                WHERE payload_ref = ?
+                """,
+                ('{"event_type":"TOOL_CALL_REQUESTED"}', payload_ref),
+            )
+
+        assert isinstance(result, ToolFactAcceptedAck)
+        store.transaction_runner.run_write(mutate)
+        with pytest.raises(HostDurableError, match="descriptor kind is missing"):
+            store.transaction_runner.run_read(
+                lambda transaction: tool_call_request_atoms(transaction, requested)
+            )
+
+
+def test_tool_call_request_atoms_reject_mismatched_descriptor_kind(
+    tmp_path: Path,
+) -> None:
+    """reader 对 caller expected descriptor kind 不匹配 fail closed。"""
+
+    with open_host_durable_store(
+        _options(tmp_path, payload_inline_threshold_bytes=4096)
+    ) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        base = _completed_candidate(seeded, tool_call_id="tool-call-kind-mismatch")
+        large_arguments: Mapping[str, JsonValue] = {
+            "ticker": "MSFT",
+            "query": "x" * 8192,
+        }
+        candidate = replace(
+            base,
+            call=replace(
+                base.call,
+                accepted_arguments=large_arguments,
+                normalized_arguments_digest=sha256_digest_json(
+                    {"arguments": large_arguments}
+                ),
+            ),
+        )
+        accept_port = DefaultHostToolFactAcceptPort(
+            transaction_runner=store.transaction_runner
+        )
+
+        result = accept_port.accept_tool_fact(candidate)
+        requested = _tool_requested_events(store.transaction_runner)[0]
+        payload = payload_object(requested)
+        payload_ref = cast(str, payload["arguments_payload_ref"])
+
+        def mutate(transaction: HostTransaction) -> None:
+            """把 arguments descriptor kind 篡改为另一个合法 kind。
+
+            :param transaction: Host transaction。
+            :returns: ``None``。
+            """
+
+            transaction.execute(
+                f"""
+                UPDATE {TABLE_PAYLOAD_DESCRIPTORS}
+                SET metadata_json = ?
+                WHERE payload_ref = ?
+                """,
+                (
+                    '{"descriptor_kind":"tool_call_semantic_query_text"}',
+                    payload_ref,
+                ),
+            )
+
+        assert isinstance(result, ToolFactAcceptedAck)
+        store.transaction_runner.run_write(mutate)
+        with pytest.raises(HostDurableError, match="descriptor kind mismatch"):
+            store.transaction_runner.run_read(
+                lambda transaction: tool_call_request_atoms(transaction, requested)
+            )
 
 
 def test_tool_call_request_atoms_reject_inline_arguments_payload_ref(

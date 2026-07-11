@@ -165,13 +165,13 @@ from dayu.host.durable.run_transition import (
     terminal_closeout_in_transaction,
 )
 from dayu.host.durable.schema import (
-    RUNNER_CALL_INPUT_MANIFEST_DESCRIPTOR_KIND,
+    PayloadDescriptorKind,
     RUNNER_CALL_INPUT_MANIFEST_MEDIA_TYPE,
     RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
-    RUNNER_CALL_INPUT_PROJECTION_DESCRIPTOR_KIND,
     RUNNER_CALL_INPUT_PROJECTION_MEDIA_TYPE,
     RUNNER_CALL_INPUT_PROJECTION_SCHEMA_VERSION,
     TABLE_EVENT_LOG,
+    payload_descriptor_metadata,
 )
 from dayu.host.durable.state import (
     AttemptRow,
@@ -5826,11 +5826,13 @@ def _write_runner_call_manifest_payload(
             payload_format=SQLitePayloadFormat.CANONICAL_JSON,
             payload_json=manifest,
             media_type=RUNNER_CALL_INPUT_MANIFEST_MEDIA_TYPE,
-            metadata={
-                "descriptor_kind": RUNNER_CALL_INPUT_MANIFEST_DESCRIPTOR_KIND,
-                "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
-                "event_id": event_id,
-            },
+            metadata=payload_descriptor_metadata(
+                PayloadDescriptorKind.RUNNER_CALL_INPUT_MANIFEST,
+                {
+                    "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
+                    "event_id": event_id,
+                },
+            ),
             expected_digest=manifest_digest,
         ),
     )
@@ -5862,12 +5864,14 @@ def _write_runner_call_projection_payload(
             sqlite_payload_id=_runner_call_projection_sqlite_payload_id(event_id),
             payload_json=projection,
             media_type=RUNNER_CALL_INPUT_PROJECTION_MEDIA_TYPE,
-            metadata={
-                "descriptor_kind": RUNNER_CALL_INPUT_PROJECTION_DESCRIPTOR_KIND,
-                "schema_version": RUNNER_CALL_INPUT_PROJECTION_SCHEMA_VERSION,
-                "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
-                "event_id": event_id,
-            },
+            metadata=payload_descriptor_metadata(
+                PayloadDescriptorKind.RUNNER_CALL_INPUT_PROJECTION,
+                {
+                    "schema_version": RUNNER_CALL_INPUT_PROJECTION_SCHEMA_VERSION,
+                    "event_type": _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED,
+                    "event_id": event_id,
+                },
+            ),
             expected_digest=projection_digest,
         ),
     )

@@ -10,6 +10,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 
 from dayu.host.durable._validation import (
     optional_int as _optional_int,
@@ -25,6 +26,94 @@ from dayu.host.durable.schema import TABLE_IDEMPOTENCY_RECORDS
 from dayu.host.durable.transaction import HostRow, HostTransaction
 
 
+class IdempotencyScopeKind(StrEnum):
+    """Host 幂等作用域类型闭集。"""
+
+    ENSURE_SESSION = "ensure_session"
+    CREATE_SESSION = "create_session"
+    CLOSE_SESSION = "close_session"
+    START_RUN = "start_run"
+    SUBMIT_FOLLOWUP_QUEUE = "submit_followup_queue"
+    SUBMIT_FOLLOWUP_STEER = "submit_followup_steer"
+    RETRY_RUN = "retry_run"
+    REPLAY_RUN = "replay_run"
+    CANCEL_RUN = "cancel_run"
+    CANCEL_SESSION_RUNS = "cancel_session_runs"
+    TOOL_FACT_ACCEPT = "tool_fact_accept"
+    TOOL_AWAITING_ACCEPT = "tool_awaiting_accept"
+    WAIT_RESOLUTION = "wait_resolution"
+    WAIT_LATE_REJECTION = "wait_late_rejection"
+    PURGE_SESSION = "purge_session"
+
+
+class IdempotencyResultKind(StrEnum):
+    """Host 幂等结果引用类型闭集。"""
+
+    SESSION = "session"
+    RUN = "run"
+    TOOL_FACT_ACCEPT_ACK = "tool_fact_accept_ack"
+    TOOL_AWAITING_ACCEPT_ACK = "tool_awaiting_accept_ack"
+    WAIT_RESOLUTION = "wait_resolution"
+    WAIT_LATE_REJECTION_DIAGNOSTIC = "wait_late_rejection_diagnostic"
+    PURGE_TOMBSTONE = "purge_tombstone"
+
+
+def parse_idempotency_scope_kind(
+    value: str | IdempotencyScopeKind,
+) -> IdempotencyScopeKind:
+    """解析并校验 Host 幂等作用域类型。
+
+    :param value: 待解析的作用域类型文本或 typed 值。
+    :returns: typed 幂等作用域类型。
+    :raises HostDurableError: 文本为空或不在 Host owner 闭集内时抛出。
+    """
+
+    if isinstance(value, IdempotencyScopeKind):
+        return value
+    _require_non_empty_text(value, field_name="scope_kind")
+    try:
+        return IdempotencyScopeKind(value)
+    except ValueError as exc:
+        raise HostDurableError("Idempotency scope kind is invalid") from exc
+
+
+def parse_idempotency_result_kind(
+    value: str | IdempotencyResultKind,
+) -> IdempotencyResultKind:
+    """解析并校验 Host 幂等结果类型。
+
+    :param value: 待解析的结果类型文本或 typed 值。
+    :returns: typed 幂等结果类型。
+    :raises HostDurableError: 文本为空或不在 Host owner 闭集内时抛出。
+    """
+
+    if isinstance(value, IdempotencyResultKind):
+        return value
+    _require_non_empty_text(value, field_name="result_kind")
+    try:
+        return IdempotencyResultKind(value)
+    except ValueError as exc:
+        raise HostDurableError("Idempotency result kind is invalid") from exc
+
+
+def idempotency_scope_kind_values() -> tuple[str, ...]:
+    """返回当前 Host 幂等作用域类型合法值。
+
+    :returns: 按 owner 定义顺序排列的合法作用域类型文本。
+    """
+
+    return tuple(kind.value for kind in IdempotencyScopeKind)
+
+
+def idempotency_result_kind_values() -> tuple[str, ...]:
+    """返回当前 Host 幂等结果类型合法值。
+
+    :returns: 按 owner 定义顺序排列的合法结果类型文本。
+    """
+
+    return tuple(kind.value for kind in IdempotencyResultKind)
+
+
 @dataclass(frozen=True, slots=True)
 class IdempotencyScope:
     """幂等记录作用域。
@@ -34,9 +123,22 @@ class IdempotencyScope:
     :param idempotency_key: 幂等 key。
     """
 
-    scope_kind: str
+    scope_kind: IdempotencyScopeKind
     scope_id: str
     idempotency_key: str
+
+    def __post_init__(self) -> None:
+        """在构造边界把 scope kind 归一到 owner typed 值。
+
+        :returns: ``None``。
+        :raises HostDurableError: scope kind 不在 owner 闭集内时抛出。
+        """
+
+        object.__setattr__(
+            self,
+            "scope_kind",
+            parse_idempotency_scope_kind(self.scope_kind),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,10 +151,23 @@ class IdempotencyResultRef:
     :param created_event_sequence: 该结果创建的 EventLog 全局序号。
     """
 
-    result_kind: str
+    result_kind: IdempotencyResultKind
     result_ref: str
     created_event_id: str | None
     created_event_sequence: int | None
+
+    def __post_init__(self) -> None:
+        """在构造边界把 result kind 归一到 owner typed 值。
+
+        :returns: ``None``。
+        :raises HostDurableError: result kind 不在 owner 闭集内时抛出。
+        """
+
+        object.__setattr__(
+            self,
+            "result_kind",
+            parse_idempotency_result_kind(self.result_kind),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,15 +185,33 @@ class IdempotencyRecord:
     :param created_at: 创建时间，固定 UTC 微秒精度 ``Z`` timestamp 文本。
     """
 
-    scope_kind: str
+    scope_kind: IdempotencyScopeKind
     scope_id: str
     idempotency_key: str
     semantic_input_digest: str
-    result_kind: str
+    result_kind: IdempotencyResultKind
     result_ref: str
     created_event_id: str | None
     created_event_sequence: int | None
     created_at: str
+
+    def __post_init__(self) -> None:
+        """在构造边界把 row kind 字段归一到 owner typed 值。
+
+        :returns: ``None``。
+        :raises HostDurableError: kind 字段不在 owner 闭集内时抛出。
+        """
+
+        object.__setattr__(
+            self,
+            "scope_kind",
+            parse_idempotency_scope_kind(self.scope_kind),
+        )
+        object.__setattr__(
+            self,
+            "result_kind",
+            parse_idempotency_result_kind(self.result_kind),
+        )
 
 
 class IdempotencyStore:
@@ -171,11 +304,11 @@ def record_idempotent_result(
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                scope.scope_kind,
+                scope.scope_kind.value,
                 scope.scope_id,
                 scope.idempotency_key,
                 semantic_input_digest,
-                result.result_kind,
+                result.result_kind.value,
                 result.result_ref,
                 result.created_event_id,
                 result.created_event_sequence,
@@ -224,7 +357,7 @@ def read_idempotency_record(
         FROM {TABLE_IDEMPOTENCY_RECORDS}
         WHERE scope_kind = ? AND scope_id = ? AND idempotency_key = ?
         """,
-        (scope.scope_kind, scope.scope_id, scope.idempotency_key),
+        (scope.scope_kind.value, scope.scope_id, scope.idempotency_key),
     )
     if row is None:
         return None
@@ -239,7 +372,7 @@ def _validate_scope(scope: IdempotencyScope) -> None:
     :raises HostDurableError: 任一字段为空时抛出。
     """
 
-    _require_non_empty_text(scope.scope_kind, field_name="scope_kind")
+    parse_idempotency_scope_kind(scope.scope_kind)
     _require_non_empty_text(scope.scope_id, field_name="scope_id")
     _require_non_empty_text(scope.idempotency_key, field_name="idempotency_key")
 
@@ -252,7 +385,7 @@ def _validate_result_ref(result: IdempotencyResultRef) -> None:
     :raises HostDurableError: 结果字段无效时抛出。
     """
 
-    _require_non_empty_text(result.result_kind, field_name="result_kind")
+    parse_idempotency_result_kind(result.result_kind)
     _require_non_empty_text(result.result_ref, field_name="result_ref")
     _require_optional_non_empty_text(
         result.created_event_id, field_name="created_event_id"
@@ -278,8 +411,12 @@ def _idempotency_record_from_host_row(row: HostRow) -> IdempotencyRecord:
     :raises HostDurableError: durable row 类型不符合 schema 预期时抛出。
     """
 
+    scope_kind = _require_text(row.get("scope_kind"), field_name="scope_kind")
+    result_kind = _require_text(row.get("result_kind"), field_name="result_kind")
+    parsed_scope_kind = parse_idempotency_scope_kind(scope_kind)
+    parsed_result_kind = parse_idempotency_result_kind(result_kind)
     return IdempotencyRecord(
-        scope_kind=_require_text(row.get("scope_kind"), field_name="scope_kind"),
+        scope_kind=parsed_scope_kind,
         scope_id=_require_text(row.get("scope_id"), field_name="scope_id"),
         idempotency_key=_require_text(
             row.get("idempotency_key"), field_name="idempotency_key"
@@ -287,7 +424,7 @@ def _idempotency_record_from_host_row(row: HostRow) -> IdempotencyRecord:
         semantic_input_digest=_require_text(
             row.get("semantic_input_digest"), field_name="semantic_input_digest"
         ),
-        result_kind=_require_text(row.get("result_kind"), field_name="result_kind"),
+        result_kind=parsed_result_kind,
         result_ref=_require_text(row.get("result_ref"), field_name="result_ref"),
         created_event_id=_optional_text(
             row.get("created_event_id"), field_name="created_event_id"

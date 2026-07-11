@@ -61,7 +61,9 @@ from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.idempotency import (
     IdempotencyRecord,
     IdempotencyResultRef,
+    IdempotencyResultKind,
     IdempotencyScope,
+    IdempotencyScopeKind,
     IdempotencyStore,
 )
 from dayu.host.durable.payload import (
@@ -162,15 +164,15 @@ _RUN_ID_PREFIX = "run"
 _ATTEMPT_ID_PREFIX = "attempt"
 _EXECUTION_ID_PREFIX = "execution"
 _DISPATCH_RECORD_ID_PREFIX = "dispatch"
-_OPERATION_START_RUN = "start_run"
-_OPERATION_SUBMIT_FOLLOWUP_QUEUE = "submit_followup_queue"
-_OPERATION_SUBMIT_FOLLOWUP_STEER = "submit_followup_steer"
-_OPERATION_RETRY_RUN = "retry_run"
-_OPERATION_REPLAY_RUN = "replay_run"
-_OPERATION_CANCEL_RUN = "cancel_run"
-_OPERATION_CANCEL_SESSION_RUNS = "cancel_session_runs"
-_IDEMPOTENCY_RESULT_KIND_RUN = "run"
-_IDEMPOTENCY_RESULT_KIND_SESSION = "session"
+_OPERATION_START_RUN = IdempotencyScopeKind.START_RUN
+_OPERATION_SUBMIT_FOLLOWUP_QUEUE = IdempotencyScopeKind.SUBMIT_FOLLOWUP_QUEUE
+_OPERATION_SUBMIT_FOLLOWUP_STEER = IdempotencyScopeKind.SUBMIT_FOLLOWUP_STEER
+_OPERATION_RETRY_RUN = IdempotencyScopeKind.RETRY_RUN
+_OPERATION_REPLAY_RUN = IdempotencyScopeKind.REPLAY_RUN
+_OPERATION_CANCEL_RUN = IdempotencyScopeKind.CANCEL_RUN
+_OPERATION_CANCEL_SESSION_RUNS = IdempotencyScopeKind.CANCEL_SESSION_RUNS
+_IDEMPOTENCY_RESULT_KIND_RUN = IdempotencyResultKind.RUN
+_IDEMPOTENCY_RESULT_KIND_SESSION = IdempotencyResultKind.SESSION
 _QUEUE_REASON_ACTIVE_RUN_EXISTS = "active_run_exists"
 _TERMINAL_CLOSEOUT_REASON = "phase3_internal_closeout"
 _TOOL_SNAPSHOT_REF_PREFIX = "tools:"
@@ -3915,7 +3917,10 @@ def _require_existing_session(
 
 
 def _idempotency_scope(
-    *, operation: str, scope_id: str, idempotency_key: str
+    *,
+    operation: IdempotencyScopeKind,
+    scope_id: str,
+    idempotency_key: str,
 ) -> IdempotencyScope:
     """构造 admission 幂等 scope。
 
