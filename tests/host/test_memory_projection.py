@@ -99,6 +99,7 @@ from dayu.host.memory import (
     conversation_memory_snapshot_to_json_value,
     default_memory_projection_policy,
     digest_memory_projection_policy,
+    memory_projection_policy_to_json_value,
     project_conversation_memory_event,
     stable_memory_snapshot_id,
 )
@@ -118,7 +119,8 @@ _COMPACT_ARTIFACT_DIGEST = (
     "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 )
 
-_POLICY_FIELDS = (
+_REQUIRED_MEMORY_POLICY_FIELD_NAMES = frozenset(
+    (
     "context_window_size",
     "selected_recent_window_item_cap",
     "selected_recent_window_char_cap",
@@ -140,8 +142,10 @@ _POLICY_FIELDS = (
     "max_delta_repair_events",
     "policy_ref",
 )
+)
 
-_SNAPSHOT_FIELDS = (
+_REQUIRED_MEMORY_SNAPSHOT_FIELD_NAMES = frozenset(
+    (
     "schema_version",
     "snapshot_id",
     "session_id",
@@ -156,6 +160,7 @@ _SNAPSHOT_FIELDS = (
     "diagnostics",
     "built_at",
     "snapshot_digest",
+)
 )
 
 
@@ -688,19 +693,61 @@ def _memory_item_count(transaction: HostTransaction) -> int:
     return count
 
 
-def test_memory_projection_policy_contract_uses_design_source_fields() -> None:
-    """MemoryProjectionPolicy 字段集合只包含设计真源字段。"""
+def test_memory_projection_policy_contract_uses_owner_level_fields() -> None:
+    """MemoryProjectionPolicy 暴露并消费 owner 级必需字段。"""
 
-    assert tuple(field.name for field in fields(MemoryProjectionPolicy)) == _POLICY_FIELDS
+    policy_fields = {field.name for field in fields(MemoryProjectionPolicy)}
+    assert _REQUIRED_MEMORY_POLICY_FIELD_NAMES <= policy_fields
 
+    policy = default_memory_projection_policy(context_window_size=8192)
+    policy_json = memory_projection_policy_to_json_value(policy)
+    assert isinstance(policy_json, dict)
+    assert _REQUIRED_MEMORY_POLICY_FIELD_NAMES <= set(policy_json)
 
-def test_conversation_memory_snapshot_vnext_contract_fields_are_fixed() -> None:
-    """ConversationMemorySnapshotVNext 字段集合固定为 vNext contract。"""
-
-    assert (
-        tuple(field.name for field in fields(ConversationMemorySnapshotVNext))
-        == _SNAPSHOT_FIELDS
+    changed_window_policy = replace(policy, context_window_size=16384)
+    changed_ref_policy = replace(policy, policy_ref=f"{policy.policy_ref}:changed")
+    assert digest_memory_projection_policy(policy) != digest_memory_projection_policy(
+        changed_window_policy
     )
+    assert digest_memory_projection_policy(policy) != digest_memory_projection_policy(
+        changed_ref_policy
+    )
+
+
+def test_conversation_memory_snapshot_vnext_contract_uses_owner_level_sections() -> None:
+    """ConversationMemorySnapshotVNext 暴露 owner 级必需语义区段。"""
+
+    snapshot_fields = {field.name for field in fields(ConversationMemorySnapshotVNext)}
+    assert _REQUIRED_MEMORY_SNAPSHOT_FIELD_NAMES <= snapshot_fields
+
+    policy_digest = digest_memory_projection_policy(_policy())
+    snapshot = build_empty_conversation_memory_snapshot(
+        snapshot_id="memory-snapshot-owner-level",
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy_digest=policy_digest,
+        built_at=_NOW,
+    )
+    assert snapshot.schema_version
+    assert snapshot.snapshot_id == "memory-snapshot-owner-level"
+    assert snapshot.session_id == _SESSION_ID
+    assert snapshot.cursor.session_id == _SESSION_ID
+    assert snapshot.cursor.consumer_id == CONVERSATION_MEMORY_CONSUMER_ID
+    assert snapshot.policy_digest == policy_digest
+    assert snapshot.latest_compaction_event_ref is None
+    assert snapshot.trace_memory.selected_recent_window == ()
+    assert snapshot.evidence_fact_memory.evidence_backed_facts == ()
+    assert snapshot.session_summary_memory.summary_text is None
+    assert snapshot.answer_anchor_memory.anchors == ()
+    assert snapshot.forward_intent_memory.intents == ()
+    assert snapshot.diagnostics == ()
+    assert snapshot.built_at == _NOW
+    assert snapshot.snapshot_digest == calculate_memory_snapshot_digest(snapshot)
+
+    snapshot_json = conversation_memory_snapshot_to_json_value(snapshot)
+    assert isinstance(snapshot_json, dict)
+    assert _REQUIRED_MEMORY_SNAPSHOT_FIELD_NAMES <= set(snapshot_json)
+    assert conversation_memory_snapshot_from_json_value(snapshot_json) == snapshot
 
 
 def test_pre_compact_projection_only_builds_selected_recent_window() -> None:

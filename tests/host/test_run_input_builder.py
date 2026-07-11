@@ -211,6 +211,24 @@ _INPUT_DIGEST = sha256_digest_json({"input": "current"})
 _POLICY_REF = "policy-snapshot-p5-s2"
 _DIGEST_A = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 _DIGEST_B = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+_RESUME_GUIDANCE_COMPLETED_INTRO = "上一轮被等待中断的外部工具步骤已经完成。"
+_RESUME_GUIDANCE_NO_REPEAT = (
+    "这是同一次用户请求中已完成的工具结果。继续回答用户；不要为了"
+    "同一次请求再次启动相同下载、上传或处理。"
+)
+_RESUME_GUIDANCE_FORBIDDEN_INTERNAL_FRAGMENTS = (
+    "Resume guidance",
+    '"kind"',
+    '"result"',
+    '"ok"',
+    "wait-resume-private",
+    "tool-call-private",
+    "event-tool-result-resume",
+    "payload-ref-private",
+    "sha256:",
+    "attempt-current",
+    "execution-current",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -542,22 +560,12 @@ def test_resume_wait_legacy_message_appends_shared_duplicate_result_guidance(
         assert len(messages) == 1
         message = messages[0]
         assert isinstance(message, SystemMessage)
-        assert "上一轮被等待中断的外部工具步骤已经完成。" in message.content
-        assert "完成的工具：fake_tool" in message.content
-        assert "完成状态：completed" in message.content
-        assert '工具结果：{"answer": 42}' in message.content
-        assert "不要为了同一次请求再次启动相同下载、上传或处理" in (message.content)
-        assert "Resume guidance" not in message.content
-        assert '"kind"' not in message.content
-        assert '"result"' not in message.content
-        assert '"ok"' not in message.content
-        assert "wait-resume-private" not in message.content
-        assert "tool-call-private" not in message.content
-        assert "event-tool-result-resume" not in message.content
-        assert "payload-ref-private" not in message.content
-        assert "sha256:" not in message.content
-        assert "attempt-current" not in message.content
-        assert "execution-current" not in message.content
+        _assert_resume_guidance_semantics(
+            message.content,
+            tool_name="fake_tool",
+            status="completed",
+            result_text='{"answer": 42}',
+        )
 
 
 @pytest.mark.parametrize(
@@ -616,8 +624,12 @@ def test_resume_wait_abnormal_awaiting_event_falls_back_to_guidance(
         assert len(messages) == 1
         message = messages[0]
         assert isinstance(message, SystemMessage)
-        assert "上一轮被等待中断的外部工具步骤已经完成。" in message.content
-        assert '工具结果：{"answer": 42}' in message.content
+        _assert_resume_guidance_semantics(
+            message.content,
+            tool_name="fake_tool",
+            status="completed",
+            result_text='{"answer": 42}',
+        )
 
 
 def test_resume_wait_rejects_digest_mismatch_after_new_arguments_fields(
@@ -661,7 +673,12 @@ def test_resume_wait_rejects_digest_mismatch_after_new_arguments_fields(
 
         assert len(messages) == 1
         assert isinstance(messages[0], SystemMessage)
-        assert "上一轮被等待中断的外部工具步骤已经完成。" in messages[0].content
+        _assert_resume_guidance_semantics(
+            messages[0].content,
+            tool_name="fake_tool",
+            status="completed",
+            result_text='{"answer": 42}',
+        )
 
 
 def test_resume_wait_completed_tool_content_wraps_non_object_value(
@@ -6579,6 +6596,38 @@ def _message_content(message: AgentMessage) -> str:
     if isinstance(message, SystemMessage | UserMessage):
         return message.content
     raise AssertionError("tool messages are not expected in RunInputBuilder tests")
+
+
+def _assert_resume_guidance_semantics(
+    content: str,
+    *,
+    tool_name: str,
+    status: str,
+    result_text: str,
+) -> None:
+    """断言生产 resume guidance owner 承诺的 LLM-facing 语义。
+
+    本 helper 的固定行镜像 ``dayu.host.run_input`` 当前拥有的 guidance
+    语义：已等待的外部工具步骤完成、同一请求不得重复启动下载/上传/处理。
+    ``tool_name``、``status`` 与 ``result_text`` 是 wait completion 投影和
+    result payload 派生的动态事实，必须精确出现在对应行中。
+
+    :param content: LLM-facing resume guidance 文本。
+    :param tool_name: 已完成工具名。
+    :param status: 已完成工具状态。
+    :param result_text: 已完成工具结果文本。
+    :returns: ``None``。
+    :raises AssertionError: guidance 缺少必需语义或泄漏内部引用时抛出。
+    """
+
+    lines = tuple(content.splitlines())
+    assert _RESUME_GUIDANCE_COMPLETED_INTRO in lines
+    assert f"完成的工具：{tool_name}" in lines
+    assert f"完成状态：{status}" in lines
+    assert f"工具结果：{result_text}" in lines
+    assert _RESUME_GUIDANCE_NO_REPEAT in lines
+    for fragment in _RESUME_GUIDANCE_FORBIDDEN_INTERNAL_FRAGMENTS:
+        assert fragment not in content
 
 
 def _assert_terminal_answer_text_has_no_internal_refs(

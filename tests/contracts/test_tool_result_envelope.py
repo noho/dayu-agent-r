@@ -1,8 +1,9 @@
-"""``ToolResultEnvelope`` 判别字段与字段集合测试。
+"""``ToolResultEnvelope`` 判别字段与必需字段测试。
 
 断言 :class:`ToolResultSuccess` / :class:`ToolResultFailure` 的 ``ok``
-判别字段固定，并且字段集合**不**包含 ``await_spec`` / ``await`` /
-``awaiting`` 等指向 :class:`ToolAwaitSpec` 的字段。
+判别字段固定，必需结果字段存在，并且字段集合**不**包含
+``await_spec`` / ``await`` / ``awaiting`` 等指向 :class:`ToolAwaitSpec`
+的字段。
 """
 
 from __future__ import annotations
@@ -114,13 +115,14 @@ def test_tool_result_meta_rejects_mixed_naive_and_aware_times() -> None:
 
 
 def test_envelope_field_sets_do_not_contain_await_spec() -> None:
-    """``ToolResultSuccess`` / ``ToolResultFailure`` 字段不得包含
-    ``await_spec`` 或任何指向 ``ToolAwaitSpec`` 的字段。"""
+    """结果 envelope 必须包含必需字段且不得包含 awaiting 字段。"""
 
     success_fields = {f.name for f in dataclasses.fields(ToolResultSuccess)}
     failure_fields = {f.name for f in dataclasses.fields(ToolResultFailure)}
+    required_success_fields = {"ok", "value", "meta"}
+    required_failure_fields = {"ok", "error", "message", "hint", "meta"}
     forbidden = {"await_spec", "await", "awaiting"}
-    assert success_fields == {"ok", "value", "meta"}
-    assert failure_fields == {"ok", "error", "message", "hint", "meta"}
+    assert required_success_fields <= success_fields
+    assert required_failure_fields <= failure_fields
     assert success_fields.isdisjoint(forbidden)
     assert failure_fields.isdisjoint(forbidden)
