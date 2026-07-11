@@ -71,7 +71,7 @@ from dayu.cli.activity import CliActivityRenderer, CliActivityRendererOptions
 from dayu.cli.output import render_prompt_terminal_result
 from dayu.cli.run_keys import RunningKeyAction
 from dayu.cli.runtime_display import RuntimeDisplayController
-from dayu.cli.session_terminal_cursor import read_cli_terminal_cursor
+from dayu.cli.session_terminal_cursor import CliTerminalCursorError, read_cli_terminal_cursor
 from dayu.cli.thinking import CliThinkingRenderer, CliThinkingRendererOptions
 from dayu.service.entrypoint_runtime import EntrypointRunTerminalResult, EntrypointThinking
 from dayu.fins.resolver import FmpCompanyInfo
@@ -94,6 +94,26 @@ _PROMPT_CURRENT_TIME_TEXT = (
 _DEFAULT_PROMPT_TOOL_NAME = "get_financial_statement"
 _DEFAULT_TIME_TOOL_NAME = "get_current_time"
 _EXCLUDED_UPLOAD_TOOL_NAME = "start_fins_upload"
+
+
+async def _raise_cli_terminal_cursor_error(
+    *,
+    workspace_root: Path,
+    session_id: str,
+    terminal_event_id: str,
+    event_sequence: int,
+) -> None:
+    """模拟 CLI terminal cursor 持久化失败。
+
+    :param workspace_root: workspace 根目录。
+    :param session_id: Host Session id。
+    :param terminal_event_id: 已渲染 terminal event id。
+    :param event_sequence: 已渲染 terminal event sequence。
+    :returns: ``None``。
+    :raises CliTerminalCursorError: 始终抛出，模拟本地 cursor 写入失败。
+    """
+
+    raise CliTerminalCursorError("cursor write failed")
 
 
 @dataclass(frozen=True, slots=True)
@@ -926,6 +946,132 @@ async def test_prompt_existing_session_execution_does_not_create_or_ensure(
     )
     assert cursor_record.terminal_cursor == OutboxTerminalCursor(event_sequence=2)
     assert cursor_record.seen_terminal_event_ids == ("terminal-run-1-2",)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("terminal_status", "expected_exit_code"),
+    (
+        (HostTerminalStatus.FAILED, EXIT_FAILURE),
+        (HostTerminalStatus.CANCELLED, EXIT_KEYBOARD_INTERRUPT),
+        (HostTerminalStatus.LOST, EXIT_FAILURE),
+    ),
+)
+async def test_prompt_existing_session_advances_terminal_cursor_after_rendering_non_success_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_status: HostTerminalStatus,
+    expected_exit_code: int,
+) -> None:
+    """prompt 已渲染非成功 terminal 后必须推进本地 cursor。
+
+    :param tmp_path: pytest 临时目录夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param terminal_status: 本轮 Host terminal status。
+    :param expected_exit_code: renderer policy 产生的 CLI 退出码。
+    :returns: ``None``。
+    :raises AssertionError: cursor 未推进或退出码被 cursor 逻辑改写时抛出。
+    """
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    args = parse_cli_args(
+        (
+            "session",
+            "resume",
+            "--session-id",
+            "session-existing",
+            "--mode",
+            "prompt",
+            "--base",
+            str(tmp_path),
+            "请继续分析",
+        )
+    )
+    prepared = await session_execution.prepare_prompt_session_execution(
+        args,
+        command_name="session",
+        scenario="prompt",
+        user_prompt="请继续分析",
+        ticker=None,
+        context_slot_values=prompt_command.build_prompt_context_slot_values(
+            ticker=None,
+            fmp_api_key=_API_KEY,
+        ),
+        usage_error_factory=prompt_command.CliCommandUsageError,
+    )
+    fake_host = _FakeHost(submit_terminal=_terminal_event(status=terminal_status))
+
+    exit_code = await session_execution.execute_prompt_on_session(
+        host=cast(Host, fake_host),
+        prepared=prepared,
+        session_id="session-existing",
+        sigint_monitor=_NoopSigintMonitor(),
+    )
+
+    cursor_record = await read_cli_terminal_cursor(
+        workspace_root=tmp_path,
+        session_id="session-existing",
+    )
+    assert exit_code == expected_exit_code
+    assert cursor_record.terminal_cursor == OutboxTerminalCursor(event_sequence=2)
+    assert cursor_record.seen_terminal_event_ids == ("terminal-run-1-2",)
+
+
+@pytest.mark.asyncio
+async def test_prompt_cursor_write_failure_propagates_after_terminal_render(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """prompt 已渲染 terminal 后 cursor 写失败必须作为本地投递错误传播。
+
+    :param tmp_path: pytest 临时目录夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: cursor 异常被吞掉或改写成 renderer 退出码时抛出。
+    """
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.setattr(
+        session_execution,
+        "advance_cli_terminal_cursor",
+        _raise_cli_terminal_cursor_error,
+    )
+    args = parse_cli_args(
+        (
+            "session",
+            "resume",
+            "--session-id",
+            "session-existing",
+            "--mode",
+            "prompt",
+            "--base",
+            str(tmp_path),
+            "请继续分析",
+        )
+    )
+    prepared = await session_execution.prepare_prompt_session_execution(
+        args,
+        command_name="session",
+        scenario="prompt",
+        user_prompt="请继续分析",
+        ticker=None,
+        context_slot_values=prompt_command.build_prompt_context_slot_values(
+            ticker=None,
+            fmp_api_key=_API_KEY,
+        ),
+        usage_error_factory=prompt_command.CliCommandUsageError,
+    )
+    fake_host = _FakeHost(
+        submit_terminal=_terminal_event(status=HostTerminalStatus.FAILED),
+    )
+
+    with pytest.raises(CliTerminalCursorError, match="cursor write failed"):
+        await session_execution.execute_prompt_on_session(
+            host=cast(Host, fake_host),
+            prepared=prepared,
+            session_id="session-existing",
+            sigint_monitor=_NoopSigintMonitor(),
+        )
 
 
 def test_prompt_host_api_error_uses_structured_presentation(
@@ -1934,6 +2080,64 @@ async def test_prompt_sigint_before_run_id_returns_local_interrupt(
 
     assert result is None
     assert fake_host.cancel_requests == []
+
+
+@pytest.mark.asyncio
+async def test_prompt_sigint_before_run_id_does_not_advance_terminal_cursor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run accepted 前本地退出没有 terminal 可渲染，不得推进 cursor。
+
+    :param tmp_path: pytest 临时目录夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: 本地退出推进 cursor 或返回码错误时抛出。
+    """
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    args = parse_cli_args(
+        (
+            "session",
+            "resume",
+            "--session-id",
+            "session-existing",
+            "--mode",
+            "prompt",
+            "--base",
+            str(tmp_path),
+            "请总结收入变化",
+        )
+    )
+    prepared = await session_execution.prepare_prompt_session_execution(
+        args,
+        command_name="session",
+        scenario="prompt",
+        user_prompt="请总结收入变化",
+        ticker=None,
+        context_slot_values=prompt_command.build_prompt_context_slot_values(
+            ticker=None,
+            fmp_api_key=_API_KEY,
+        ),
+        usage_error_factory=prompt_command.CliCommandUsageError,
+    )
+    fake_host = _BlockingSubmitHost(submit_terminal=None)
+
+    exit_code = await session_execution.execute_prompt_on_session(
+        host=cast(Host, fake_host),
+        prepared=prepared,
+        session_id="session-existing",
+        sigint_monitor=_ImmediateSigintMonitor(),
+    )
+
+    cursor_record = await read_cli_terminal_cursor(
+        workspace_root=tmp_path,
+        session_id="session-existing",
+    )
+    assert exit_code == EXIT_KEYBOARD_INTERRUPT
+    assert fake_host.cancel_requests == []
+    assert cursor_record.terminal_cursor == OutboxTerminalCursor(event_sequence=0)
+    assert cursor_record.seen_terminal_event_ids == ()
 
 
 @pytest.mark.asyncio

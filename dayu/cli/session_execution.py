@@ -371,13 +371,12 @@ async def execute_prompt_on_session(
     if terminal is None:
         return EXIT_KEYBOARD_INTERRUPT
     render_exit_code = render_prompt_terminal_result(terminal)
-    if render_exit_code == EXIT_SUCCESS:
-        await advance_cli_terminal_cursor(
-            workspace_root=prepared.workspace_root,
-            session_id=session_id,
-            terminal_event_id=terminal.terminal_event_id,
-            event_sequence=terminal.event_sequence,
-        )
+    await advance_cli_terminal_cursor(
+        workspace_root=prepared.workspace_root,
+        session_id=session_id,
+        terminal_event_id=terminal.terminal_event_id,
+        event_sequence=terminal.event_sequence,
+    )
     return render_exit_code
 
 
@@ -520,14 +519,14 @@ async def _run_existing_session_startup_reconnect(
     )
     for terminal in startup.terminal_results:
         render_exit_code = render_interactive_terminal_result(terminal)
-        if render_exit_code != EXIT_SUCCESS:
-            return render_exit_code
         await advance_cli_terminal_cursor(
             workspace_root=prepared.workspace_root,
             session_id=session_id,
             terminal_event_id=terminal.terminal_event_id,
             event_sequence=terminal.event_sequence,
         )
+        if render_exit_code != EXIT_SUCCESS:
+            return render_exit_code
     return EXIT_SUCCESS
 
 
@@ -851,14 +850,14 @@ async def _run_interactive_repl(
                 render_exit_code = render_interactive_terminal_result(terminal)
             else:
                 render_exit_code = effective_run_view.render_terminal_result(terminal)
-            if render_exit_code != EXIT_SUCCESS:
-                return render_exit_code
             await advance_cli_terminal_cursor(
                 workspace_root=workspace_root,
                 session_id=session_id,
                 terminal_event_id=terminal.terminal_event_id,
                 event_sequence=terminal.event_sequence,
             )
+            if render_exit_code != EXIT_SUCCESS:
+                return render_exit_code
             turn_index += 1
     finally:
         if effective_run_view is not None:
