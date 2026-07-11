@@ -104,7 +104,7 @@ def _event_request(event_id: str) -> EventLogAppendRequest:
         run_id=None,
         attempt_id=None,
         execution_id=None,
-        event_type="host.idempotent",
+        event_type="USER_INPUT_ACCEPTED",
         occurred_at=datetime(2026, 5, 14, 1, 2, 3, 123456, tzinfo=UTC),
         actor=None,
         source="test",

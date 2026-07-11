@@ -19,6 +19,7 @@ from dayu.host.durable._row_rules import (
     terminal_event_refs_unset_check_sql,
     wait_terminal_at_check_sql,
 )
+from dayu.host.lifecycle_events import all_host_event_type_values
 from dayu.host.api import (
     HOST_WAIT_ADAPTER_KEY_MAX_LENGTH,
     HOST_WAIT_EXTERNAL_JOB_ID_MAX_LENGTH,
@@ -31,7 +32,7 @@ from dayu.host.api import (
 )
 from dayu.host.durable.errors import HostSchemaMismatchError
 
-HOST_SCHEMA_VERSION = 21
+HOST_SCHEMA_VERSION = 22
 """当前 Host durable SQLite schema version。"""
 
 TABLE_EVENT_LOG = "event_log"
@@ -203,6 +204,30 @@ _HOST_ATTEMPT_TERMINAL_REFS_UNSET_CHECK_SQL = terminal_event_refs_unset_check_sq
 _HOST_WAIT_TERMINAL_AT_CHECK_SQL = wait_terminal_at_check_sql(status_column="status")
 """WaitRecord status 与 terminal_at 形状 CHECK 表达式。"""
 
+
+def _sql_text_in_values(values: tuple[str, ...]) -> str:
+    """把稳定文本集合渲染为 SQLite ``IN`` 字面量列表。
+
+    :param values: 待渲染的非空稳定文本集合。
+    :returns: 形如 ``'a', 'b'`` 的 SQL 字面量列表。
+    :raises ValueError: ``values`` 为空或包含空文本时抛出。
+    """
+
+    if len(values) == 0:
+        raise ValueError("SQL IN values cannot be empty")
+    quoted: list[str] = []
+    for value in values:
+        if value.strip() == "":
+            raise ValueError("SQL IN value cannot be empty")
+        quoted.append("'" + value.replace("'", "''") + "'")
+    return ", ".join(quoted)
+
+
+_EVENT_LOG_EVENT_TYPE_CHECK_VALUES_SQL = _sql_text_in_values(
+    all_host_event_type_values()
+)
+"""EventLog event_type fresh-schema CHECK 使用的 owner-owned 合法值列表。"""
+
 TOOL_CALL_ARGUMENTS_DESCRIPTOR_KIND = "tool_call_arguments_json"
 """TOOL_CALL_REQUESTED accepted arguments payload descriptor kind。"""
 
@@ -326,7 +351,9 @@ CREATE TABLE IF NOT EXISTS {TABLE_EVENT_LOG} (
   run_id TEXT NULL,
   attempt_id TEXT NULL,
   execution_id TEXT NULL,
-  event_type TEXT NOT NULL,
+  event_type TEXT NOT NULL CHECK (
+    event_type IN ({_EVENT_LOG_EVENT_TYPE_CHECK_VALUES_SQL})
+  ),
   occurred_at TEXT NOT NULL,
   actor TEXT NULL,
   source TEXT NULL,

@@ -133,7 +133,7 @@ _RUN_STATUS_RECOVERING = "recovering"
 _RUN_STATUS_FAILED = "failed"
 _RUN_STATUS_CANCELLED = "cancelled"
 _RUN_STATUS_LOST = "lost"
-_EVENT_TYPE_TEST = "TEST_EVENT"
+_EVENT_TYPE_TEST = "USER_INPUT_ACCEPTED"
 _EVENT_TYPE_CANCEL_REQUESTED = "CANCEL_REQUESTED"
 _NON_TERMINAL_RUN_STATUSES = (
     _RUN_STATUS_ACCEPTED,
@@ -2188,7 +2188,7 @@ def _insert_timeline_item(
             event_ref[0],
             event_ref[1],
             "run_lifecycle",
-            "TEST_EVENT",
+            "USER_INPUT_ACCEPTED",
             "display",
             payload_ref,
             _DIGEST_A if payload_ref is not None else None,

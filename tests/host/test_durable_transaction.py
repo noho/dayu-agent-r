@@ -47,7 +47,7 @@ from dayu.host.durable.transaction import (
 
 _SQLITE_BUSY_EXTENDED_TEST_CODE = sqlite3.SQLITE_BUSY | (1 << 8)
 _SQLITE_LOCKED_EXTENDED_TEST_CODE = sqlite3.SQLITE_LOCKED | (2 << 8)
-_TEST_EVENT_TYPE = "TEST_EVENT"
+_USER_INPUT_ACCEPTED_TYPE = "USER_INPUT_ACCEPTED"
 _TEST_ACTOR = "durable-test"
 _TEST_SOURCE = "durable-test"
 _COUNT_COLUMN = "event_count"
@@ -170,7 +170,7 @@ def _event_request(event_id: str) -> EventLogAppendRequest:
         run_id="run-read-stale",
         attempt_id=None,
         execution_id=None,
-        event_type=_TEST_EVENT_TYPE,
+        event_type=_USER_INPUT_ACCEPTED_TYPE,
         occurred_at=datetime(2026, 6, 1, tzinfo=UTC),
         actor=_TEST_ACTOR,
         source=_TEST_SOURCE,

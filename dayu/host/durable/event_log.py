@@ -40,6 +40,7 @@ from dayu.host.durable.errors import (
 from dayu.host.durable.payload import PayloadKind, read_payload_descriptor
 from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.transaction import HostRow, HostTransaction
+from dayu.host.lifecycle_events import parse_host_event_type
 
 _MIN_READ_LIMIT = 1
 _MIN_EVENT_CURSOR = 0
@@ -1125,6 +1126,8 @@ def _validate_append_request(request: EventLogAppendRequest) -> None:
         raise HostDurableError("EventLog event_class is invalid")
     _require_non_empty_text(request.session_id, field_name="session_id")
     _require_non_empty_text(request.event_type, field_name="event_type")
+    if parse_host_event_type(request.event_type) is None:
+        raise HostDurableError("EventLog event_type is unknown")
     _require_optional_non_empty_text(request.run_id, field_name="run_id")
     _require_optional_non_empty_text(request.attempt_id, field_name="attempt_id")
     _require_optional_non_empty_text(request.execution_id, field_name="execution_id")
@@ -1245,6 +1248,9 @@ def _event_log_row_from_host_row(row: HostRow) -> EventLogRow:
         event_class = EventClass(event_class_text)
     except ValueError as exc:
         raise HostDurableError("EventLog row has invalid event_class") from exc
+    event_type = _require_text(row.get("event_type"), field_name="event_type")
+    if parse_host_event_type(event_type) is None:
+        raise HostDurableError("EventLog row has invalid event_type")
     return EventLogRow(
         event_sequence=_require_int(
             row.get("event_sequence"), field_name="event_sequence"
@@ -1258,7 +1264,7 @@ def _event_log_row_from_host_row(row: HostRow) -> EventLogRow:
         run_id=_optional_text(row.get("run_id"), field_name="run_id"),
         attempt_id=_optional_text(row.get("attempt_id"), field_name="attempt_id"),
         execution_id=_optional_text(row.get("execution_id"), field_name="execution_id"),
-        event_type=_require_text(row.get("event_type"), field_name="event_type"),
+        event_type=event_type,
         occurred_at=_require_text(row.get("occurred_at"), field_name="occurred_at"),
         actor=_optional_text(row.get("actor"), field_name="actor"),
         source=_optional_text(row.get("source"), field_name="source"),

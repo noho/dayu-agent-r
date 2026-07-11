@@ -390,6 +390,8 @@ def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> Non
                 "tool_name": "lookup_filing",
                 "normalized_arguments_digest": arguments_digest,
                 "semantic_input_digest": semantic_query_digest,
+                "resolution_kind": "completed",
+                "tool_fact_kind": "completed",
                 "outcome_digest": outcome_digest,
                 "payload_ref": {
                     "payload_ref": "artifact://tool-result",

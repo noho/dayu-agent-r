@@ -478,10 +478,10 @@ def test_projection_checkpoint_lost_cas_keeps_persisted_checkpoint(
     options = _options(tmp_path / "durable.sqlite3", tmp_path / "artifacts")
     with open_host_durable_store(options) as store:
         first_event = store.transaction_runner.run_write(
-            _AppendEventOperation("event-projection-1", "TYPE_A")
+            _AppendEventOperation("event-projection-1", "USER_INPUT_ACCEPTED")
         )
         second_event = store.transaction_runner.run_write(
-            _AppendEventOperation("event-projection-2", "TYPE_B")
+            _AppendEventOperation("event-projection-2", "RUN_ACCEPTED")
         )
         store.transaction_runner.run_write(_AdvanceCheckpointOperation(first_event))
 
@@ -512,10 +512,10 @@ def test_memory_snapshot_checkpoint_lost_cas_rolls_back_snapshot(
     snapshot_id = "snapshot-stale-cas"
     with open_host_durable_store(options) as store:
         first_event = store.transaction_runner.run_write(
-            _AppendEventOperation("event-memory-1", "TYPE_A")
+            _AppendEventOperation("event-memory-1", "USER_INPUT_ACCEPTED")
         )
         second_event = store.transaction_runner.run_write(
-            _AppendEventOperation("event-memory-2", "TYPE_B")
+            _AppendEventOperation("event-memory-2", "RUN_ACCEPTED")
         )
         store.transaction_runner.run_write(_AdvanceCheckpointOperation(first_event))
         snapshot = _memory_snapshot_for_event(
@@ -555,7 +555,7 @@ def test_memory_snapshot_write_and_checkpoint_commit_together(
     snapshot_id = "snapshot-same-transaction"
     with open_host_durable_store(options) as store:
         first_event = store.transaction_runner.run_write(
-            _AppendEventOperation("event-memory-positive-1", "TYPE_A")
+            _AppendEventOperation("event-memory-positive-1", "USER_INPUT_ACCEPTED")
         )
         snapshot = _memory_snapshot_for_event(
             snapshot_id=snapshot_id,

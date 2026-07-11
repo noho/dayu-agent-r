@@ -225,7 +225,7 @@ def _insert_event(
             run_id,
             attempt_id,
             execution_id,
-            "TEST_EVENT",
+            "USER_INPUT_ACCEPTED",
             _TIMESTAMP,
             None,
             None,

@@ -1864,7 +1864,7 @@ def _insert_event_tx(
     *,
     event_id: str,
     session_id: str,
-    event_type: str = "TEST_EVENT",
+    event_type: str = "USER_INPUT_ACCEPTED",
     run_id: str | None = None,
     attempt_id: str | None = None,
     execution_id: str | None = None,

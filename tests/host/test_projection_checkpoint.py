@@ -136,8 +136,8 @@ def test_advancing_checkpoint_backwards_is_rejected(tmp_path: Path) -> None:
 
     options = _options(tmp_path)
     with open_host_durable_store(options) as store:
-        first_event = _append_event(store.transaction_runner, "event-1", "TYPE_A")
-        second_event = _append_event(store.transaction_runner, "event-2", "TYPE_B")
+        first_event = _append_event(store.transaction_runner, "event-1", "USER_INPUT_ACCEPTED")
+        second_event = _append_event(store.transaction_runner, "event-2", "RUN_ACCEPTED")
         store.transaction_runner.run_write(
             lambda transaction: advance_projection_checkpoint(
                 transaction,
@@ -166,7 +166,7 @@ def test_advancing_checkpoint_to_same_event_sequence_is_rejected(
 
     options = _options(tmp_path)
     with open_host_durable_store(options) as store:
-        event = _append_event(store.transaction_runner, "event-1", "TYPE_A")
+        event = _append_event(store.transaction_runner, "event-1", "USER_INPUT_ACCEPTED")
         store.transaction_runner.run_write(
             lambda transaction: advance_projection_checkpoint(
                 transaction,
@@ -213,7 +213,7 @@ def test_failure_row_increments_and_clear_removes_it(tmp_path: Path) -> None:
 
     options = _options(tmp_path)
     with open_host_durable_store(options) as store:
-        event = _append_event(store.transaction_runner, "event-1", "TYPE_A")
+        event = _append_event(store.transaction_runner, "event-1", "USER_INPUT_ACCEPTED")
         first = store.transaction_runner.run_write(
             lambda transaction: write_projection_failure(
                 transaction,
@@ -267,8 +267,8 @@ def test_reset_refs_for_deleted_events_deletes_only_rebuildable_consumers(
     target_failure: ProjectionFailureRow | None = None
     other_event_id = ""
     with open_host_durable_store(options) as store:
-        target = _append_event(store.transaction_runner, "event-target", "TYPE_A")
-        other = _append_event(store.transaction_runner, "event-other", "TYPE_B")
+        target = _append_event(store.transaction_runner, "event-target", "USER_INPUT_ACCEPTED")
+        other = _append_event(store.transaction_runner, "event-other", "RUN_ACCEPTED")
         other_event_id = other.event_id
         store.transaction_runner.run_write(
             lambda transaction: (
@@ -348,7 +348,7 @@ def test_reset_refs_for_deleted_events_rejects_non_rebuildable_consumer(
     checkpoint: ProjectionCheckpointRow | None = None
     target_event_id = ""
     with open_host_durable_store(options) as store:
-        target = _append_event(store.transaction_runner, "event-target", "TYPE_A")
+        target = _append_event(store.transaction_runner, "event-target", "USER_INPUT_ACCEPTED")
         target_event_id = target.event_id
         store.transaction_runner.run_write(
             lambda transaction: advance_projection_checkpoint(

@@ -1,17 +1,26 @@
-"""Host Run lifecycle event type、Attempt terminal event type 与状态契约。
+"""Host EventLog event type 与 lifecycle 状态契约。
 
-本模块是 Host Run lifecycle event type、Host Attempt terminal event type、
-terminal event set、closeout-supported Attempt terminal subset 与 public
-outbox terminal item set 的代码真源。调用方可以传入 EventLog 中的原始
-``event_type`` 字符串，由本模块统一完成解析与分类，避免 projection、read
-API、dispatch 或 durable helper 各自复制 terminal 集合。
+本模块是 Host EventLog ``event_type`` 合法集合、Run lifecycle event type、
+Attempt lifecycle event type、terminal event set、closeout-supported Attempt
+terminal subset 与 public outbox terminal item set 的代码真源。调用方可以传入
+EventLog 中的原始 ``event_type`` 字符串，由本模块统一完成解析与分类，避免
+durable schema、row decoder、projection、read API、dispatch 或 durable helper
+各自复制合法集合。
 """
 
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import TypeAlias
 
 from dayu.host.api import AttemptStatus, HostTerminalStatus, RunStatus
+
+
+class HostSessionEventType(StrEnum):
+    """Host Session lifecycle EventLog 事件类型。"""
+
+    SESSION_CREATED = "SESSION_CREATED"
+    SESSION_CLOSED = "SESSION_CLOSED"
 
 
 class HostRunEventType(StrEnum):
@@ -30,12 +39,10 @@ class HostRunEventType(StrEnum):
 
 
 class HostAttemptEventType(StrEnum):
-    """Host Attempt terminal EventLog 事件类型。
+    """Host Attempt lifecycle EventLog 事件类型。"""
 
-    当前 P3-A 只定义 terminal 成员；非终态 Attempt event type 不属于本轮
-    terminal closeout owner 收敛范围。
-    """
-
+    ATTEMPT_STARTED = "ATTEMPT_STARTED"
+    ATTEMPT_RUNNING = "ATTEMPT_RUNNING"
     ATTEMPT_SUCCEEDED = "ATTEMPT_SUCCEEDED"
     ATTEMPT_FAILED = "ATTEMPT_FAILED"
     ATTEMPT_CANCELLED = "ATTEMPT_CANCELLED"
@@ -43,6 +50,85 @@ class HostAttemptEventType(StrEnum):
     ATTEMPT_STEERED = "ATTEMPT_STEERED"
     ATTEMPT_LOST = "ATTEMPT_LOST"
 
+
+class HostAdmissionCommandEventType(StrEnum):
+    """Host admission 与 command request EventLog 事件类型。"""
+
+    USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
+    STEER_REQUESTED = "STEER_REQUESTED"
+    RETRY_REQUESTED = "RETRY_REQUESTED"
+    REPLAY_REQUESTED = "REPLAY_REQUESTED"
+    CANCEL_REQUESTED = "CANCEL_REQUESTED"
+    RESUME_REQUESTED = "RESUME_REQUESTED"
+
+
+class HostToolWaitEventType(StrEnum):
+    """Host tool runtime 与 wait governance EventLog 事件类型。"""
+
+    TOOL_CALL_REQUESTED = "TOOL_CALL_REQUESTED"
+    TOOL_CALL_GOVERNED = "TOOL_CALL_GOVERNED"
+    TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
+    TOOL_AWAITING = "TOOL_AWAITING"
+    TOOL_CALLS_BATCH_READY = "TOOL_CALLS_BATCH_READY"
+    TOOL_CALLS_BATCH_DONE = "TOOL_CALLS_BATCH_DONE"
+    WAIT_LATE_RESULT_REJECTED = "WAIT_LATE_RESULT_REJECTED"
+
+
+class HostContextGovernanceEventType(StrEnum):
+    """Host context governance EventLog 事件类型。"""
+
+    CONTEXT_COMPACTION_REQUESTED = "CONTEXT_COMPACTION_REQUESTED"
+    CONTEXT_COMPACTED = "CONTEXT_COMPACTED"
+    CONTEXT_COMPACTION_FAILED = "CONTEXT_COMPACTION_FAILED"
+    CONTEXT_COMPACTION_ATTEMPT_REJECTED = "CONTEXT_COMPACTION_ATTEMPT_REJECTED"
+
+
+class HostRunnerInputEventType(StrEnum):
+    """Host runner input 与 usage projection EventLog 事件类型。"""
+
+    RUNNER_CALL_INPUT_ASSEMBLED = "RUNNER_CALL_INPUT_ASSEMBLED"
+    RUNNER_CALL_INPUT_ITERATION_LINKED = "RUNNER_CALL_INPUT_ITERATION_LINKED"
+    USAGE_REPORTED = "USAGE_REPORTED"
+
+
+class HostEngineDiagnosticEventType(StrEnum):
+    """Host Engine / provider diagnostic EventLog 事件类型。"""
+
+    ENGINE_EVENT_REJECTED = "ENGINE_EVENT_REJECTED"
+    ENGINE_EVENT_DIAGNOSTIC = "ENGINE_EVENT_DIAGNOSTIC"
+    HOST_LIFECYCLE_DIAGNOSTIC = "HOST_LIFECYCLE_DIAGNOSTIC"
+    PROVIDER_DIAGNOSTIC = "PROVIDER_DIAGNOSTIC"
+    PROVIDER_PROTOCOL_ERROR = "PROVIDER_PROTOCOL_ERROR"
+
+
+class HostPreviewEventType(StrEnum):
+    """Host preview-only Engine EventLog 事件类型。"""
+
+    ITERATION_STARTED = "ITERATION_STARTED"
+    CONTENT_COMPLETED = "CONTENT_COMPLETED"
+    ITERATION_COMPLETED = "ITERATION_COMPLETED"
+    REASONING_DELTA = "REASONING_DELTA"
+
+
+HostEventType: TypeAlias = (
+    HostSessionEventType
+    | HostRunEventType
+    | HostAttemptEventType
+    | HostAdmissionCommandEventType
+    | HostToolWaitEventType
+    | HostContextGovernanceEventType
+    | HostRunnerInputEventType
+    | HostEngineDiagnosticEventType
+    | HostPreviewEventType
+)
+"""Host EventLog ``event_type`` 的完整 typed 联合。"""
+
+
+HOST_SESSION_LIFECYCLE_EVENT_TYPES: tuple[HostSessionEventType, ...] = (
+    HostSessionEventType.SESSION_CREATED,
+    HostSessionEventType.SESSION_CLOSED,
+)
+"""Host Session lifecycle canonical fact 事件集合。"""
 
 HOST_RUN_TERMINAL_EVENT_TYPES: tuple[HostRunEventType, ...] = (
     HostRunEventType.RUN_SUCCEEDED,
@@ -91,6 +177,85 @@ HOST_RUN_LIFECYCLE_EVENT_TYPES: tuple[HostRunEventType, ...] = (
     *HOST_RUN_TERMINAL_EVENT_TYPES,
 )
 """Host Run lifecycle 与 terminal canonical fact 事件集合。"""
+
+HOST_ATTEMPT_LIFECYCLE_EVENT_TYPES: tuple[HostAttemptEventType, ...] = (
+    HostAttemptEventType.ATTEMPT_STARTED,
+    HostAttemptEventType.ATTEMPT_RUNNING,
+    *HOST_ATTEMPT_TERMINAL_EVENT_TYPES,
+)
+"""Host Attempt lifecycle 与 terminal canonical fact 事件集合。"""
+
+HOST_ADMISSION_COMMAND_EVENT_TYPES: tuple[HostAdmissionCommandEventType, ...] = (
+    HostAdmissionCommandEventType.USER_INPUT_ACCEPTED,
+    HostAdmissionCommandEventType.STEER_REQUESTED,
+    HostAdmissionCommandEventType.RETRY_REQUESTED,
+    HostAdmissionCommandEventType.REPLAY_REQUESTED,
+    HostAdmissionCommandEventType.CANCEL_REQUESTED,
+    HostAdmissionCommandEventType.RESUME_REQUESTED,
+)
+"""Host admission 与 command request 事件集合。"""
+
+HOST_TOOL_WAIT_EVENT_TYPES: tuple[HostToolWaitEventType, ...] = (
+    HostToolWaitEventType.TOOL_CALL_REQUESTED,
+    HostToolWaitEventType.TOOL_CALL_GOVERNED,
+    HostToolWaitEventType.TOOL_RESULT_ACCEPTED,
+    HostToolWaitEventType.TOOL_AWAITING,
+    HostToolWaitEventType.TOOL_CALLS_BATCH_READY,
+    HostToolWaitEventType.TOOL_CALLS_BATCH_DONE,
+    HostToolWaitEventType.WAIT_LATE_RESULT_REJECTED,
+)
+"""Host tool runtime 与 wait governance 事件集合。"""
+
+HOST_CONTEXT_GOVERNANCE_EVENT_TYPES: tuple[HostContextGovernanceEventType, ...] = (
+    HostContextGovernanceEventType.CONTEXT_COMPACTION_REQUESTED,
+    HostContextGovernanceEventType.CONTEXT_COMPACTED,
+    HostContextGovernanceEventType.CONTEXT_COMPACTION_FAILED,
+    HostContextGovernanceEventType.CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+)
+"""Host context governance 事件集合。"""
+
+HOST_RUNNER_INPUT_EVENT_TYPES: tuple[HostRunnerInputEventType, ...] = (
+    HostRunnerInputEventType.RUNNER_CALL_INPUT_ASSEMBLED,
+    HostRunnerInputEventType.RUNNER_CALL_INPUT_ITERATION_LINKED,
+    HostRunnerInputEventType.USAGE_REPORTED,
+)
+"""Host runner input 与 usage 事件集合。"""
+
+HOST_ENGINE_DIAGNOSTIC_EVENT_TYPES: tuple[HostEngineDiagnosticEventType, ...] = (
+    HostEngineDiagnosticEventType.ENGINE_EVENT_REJECTED,
+    HostEngineDiagnosticEventType.ENGINE_EVENT_DIAGNOSTIC,
+    HostEngineDiagnosticEventType.HOST_LIFECYCLE_DIAGNOSTIC,
+    HostEngineDiagnosticEventType.PROVIDER_DIAGNOSTIC,
+    HostEngineDiagnosticEventType.PROVIDER_PROTOCOL_ERROR,
+)
+"""Host Engine / provider diagnostic 事件集合。"""
+
+HOST_PREVIEW_EVENT_TYPES: tuple[HostPreviewEventType, ...] = (
+    HostPreviewEventType.ITERATION_STARTED,
+    HostPreviewEventType.CONTENT_COMPLETED,
+    HostPreviewEventType.ITERATION_COMPLETED,
+    HostPreviewEventType.REASONING_DELTA,
+)
+"""Host preview-only Engine 事件集合。"""
+
+HOST_EVENT_TYPE_CATEGORIES: tuple[tuple[HostEventType, ...], ...] = (
+    HOST_SESSION_LIFECYCLE_EVENT_TYPES,
+    HOST_RUN_LIFECYCLE_EVENT_TYPES,
+    HOST_ATTEMPT_LIFECYCLE_EVENT_TYPES,
+    HOST_ADMISSION_COMMAND_EVENT_TYPES,
+    HOST_TOOL_WAIT_EVENT_TYPES,
+    HOST_CONTEXT_GOVERNANCE_EVENT_TYPES,
+    HOST_RUNNER_INPUT_EVENT_TYPES,
+    HOST_ENGINE_DIAGNOSTIC_EVENT_TYPES,
+    HOST_PREVIEW_EVENT_TYPES,
+)
+"""Host EventLog event type 分类集合，顺序用于 DDL 和测试稳定断言。"""
+
+_HOST_EVENT_TYPE_BY_VALUE: dict[str, HostEventType] = {
+    event_type.value: event_type
+    for category in HOST_EVENT_TYPE_CATEGORIES
+    for event_type in category
+}
 
 _RUN_STATUS_BY_TERMINAL_EVENT_TYPE: dict[HostRunEventType, RunStatus] = {
     HostRunEventType.RUN_SUCCEEDED: RunStatus.SUCCEEDED,
@@ -146,6 +311,44 @@ def parse_host_run_event_type(event_type: str) -> HostRunEventType | None:
         return HostRunEventType(event_type)
     except ValueError:
         return None
+
+
+def parse_host_event_type(event_type: str) -> HostEventType | None:
+    """解析 Host EventLog event type 字符串。
+
+    :param event_type: EventLog row 或 append request 中的原始 ``event_type``。
+    :returns: 识别到的 Host EventLog event type；未知值返回 ``None``。
+    :raises: 无主动抛出。
+    """
+
+    return _HOST_EVENT_TYPE_BY_VALUE.get(event_type)
+
+
+def serialize_host_event_type(event_type: HostEventType) -> str:
+    """把 Host EventLog event type 序列化为 durable 文本。
+
+    :param event_type: typed Host EventLog event type。
+    :returns: 可写入 SQLite ``event_log.event_type`` 的稳定文本。
+    :raises ValueError: 输入不是 Host EventLog event type 时抛出。
+    """
+
+    if parse_host_event_type(event_type.value) is event_type:
+        return event_type.value
+    raise ValueError("unsupported Host EventLog event type")
+
+
+def all_host_event_type_values() -> tuple[str, ...]:
+    """返回 Host EventLog event type 的完整合法文本集合。
+
+    :returns: 按分类稳定排序的所有合法 ``event_type`` 文本。
+    :raises: 无主动抛出。
+    """
+
+    return tuple(
+        event_type.value
+        for category in HOST_EVENT_TYPE_CATEGORIES
+        for event_type in category
+    )
 
 
 def run_status_for_terminal_event(event_type: str) -> RunStatus | None:
@@ -273,6 +476,17 @@ def attempt_event_type_values(
 
     :param event_types: typed Host Attempt event type tuple。
     :returns: 可供 SQL ``IN`` 参数或 projection filter 使用的字符串 tuple。
+    :raises: 无主动抛出。
+    """
+
+    return tuple(event_type.value for event_type in event_types)
+
+
+def host_event_type_values(event_types: tuple[HostEventType, ...]) -> tuple[str, ...]:
+    """把 typed Host EventLog event type 集合转换为 EventLog 字符串集合。
+
+    :param event_types: typed Host EventLog event type tuple。
+    :returns: 可供 SQL ``IN`` 参数、DDL 或 projection filter 使用的字符串 tuple。
     :raises: 无主动抛出。
     """
 

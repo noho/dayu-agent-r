@@ -80,7 +80,7 @@ def _event_request(payload_ref: str, payload_digest: str) -> EventLogAppendReque
         run_id="run-1",
         attempt_id="attempt-1",
         execution_id="execution-1",
-        event_type="host.artifact.accepted",
+        event_type="USER_INPUT_ACCEPTED",
         occurred_at=datetime(2026, 5, 14, 1, 2, 3, 123456, tzinfo=UTC),
         actor="host",
         source="artifact-test",

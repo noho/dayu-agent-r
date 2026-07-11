@@ -30,7 +30,7 @@ from dayu.host.durable.options import (
 from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.transaction import HostTransaction, configure_connection_pragmas
 
-_TEST_EVENT_TYPE = "TEST_EVENT"
+_USER_INPUT_ACCEPTED_TYPE = "USER_INPUT_ACCEPTED"
 _TEST_ACTOR = "durable-test"
 _TEST_SOURCE = "durable-test"
 _COUNT_COLUMN = "event_count"
@@ -81,7 +81,7 @@ def _event_request(event_id: str) -> EventLogAppendRequest:
         run_id="run-wal",
         attempt_id=None,
         execution_id=None,
-        event_type=_TEST_EVENT_TYPE,
+        event_type=_USER_INPUT_ACCEPTED_TYPE,
         occurred_at=datetime(2026, 6, 1, tzinfo=UTC),
         actor=_TEST_ACTOR,
         source=_TEST_SOURCE,

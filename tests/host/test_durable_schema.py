@@ -11,6 +11,7 @@ import pytest
 import dayu.host.durable.schema as durable_schema
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.errors import HostSchemaMismatchError
+from dayu.host.lifecycle_events import all_host_event_type_values
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
     HostSQLiteStoragePolicy,
@@ -328,7 +329,7 @@ def _insert_event_log_probe(connection: sqlite3.Connection, event_id: str) -> No
           'digest',
           'canonical_fact',
           'session-1',
-          'TYPE_A',
+          'USER_INPUT_ACCEPTED',
           '2026-05-16T00:00:00.000000Z',
           '{{}}',
           '2026-05-16T00:00:00.000000Z'
@@ -831,10 +832,10 @@ def test_normalize_schema_sql_only_strips_and_collapses_whitespace() -> None:
     )
 
 
-def test_host_schema_version_is_cancel_link_version() -> None:
-    """当前 committed Host schema version 是 typed cancel link fresh schema 21。"""
+def test_host_schema_version_is_event_type_check_version() -> None:
+    """当前 committed Host schema version 是 EventLog event type CHECK schema 22。"""
 
-    assert HOST_SCHEMA_VERSION == 21
+    assert HOST_SCHEMA_VERSION == 22
 
 
 def test_tool_call_request_payload_descriptor_kinds_are_stable() -> None:
@@ -1021,7 +1022,11 @@ def test_schema_constraints_are_explicit(tmp_path: Path) -> None:
                 (TABLE_EVENT_LOG,),
             ).fetchone()
             assert create_sql_row is not None
-            assert "AUTOINCREMENT" in str(create_sql_row[0]).upper()
+            event_log_sql = str(create_sql_row[0])
+            assert "AUTOINCREMENT" in event_log_sql.upper()
+            assert "event_type TEXT NOT NULL CHECK" in event_log_sql
+            for event_type in all_host_event_type_values():
+                assert f"'{event_type}'" in event_log_sql
 
             event_indexes = connection.execute(f"PRAGMA index_list({TABLE_EVENT_LOG})").fetchall()
             assert any(int(row[2]) == 1 for row in event_indexes)
@@ -1037,6 +1042,39 @@ def test_schema_constraints_are_explicit(tmp_path: Path) -> None:
             assert _primary_key_columns(connection, TABLE_PAYLOAD_DESCRIPTORS) == ("payload_ref",)
             assert _primary_key_columns(connection, TABLE_SQLITE_PAYLOADS) == ("payload_id",)
             assert _primary_key_columns(connection, TABLE_HOST_INSTANCES) == ("host_instance_id",)
+        finally:
+            connection.close()
+
+
+def test_event_log_schema_rejects_unknown_event_type(tmp_path: Path) -> None:
+    """EventLog fresh-schema DDL CHECK 拒绝未知 event type。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        connection = store.connect()
+        try:
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(f"""
+                    INSERT INTO {TABLE_EVENT_LOG} (
+                      event_id,
+                      event_body_digest,
+                      event_class,
+                      session_id,
+                      event_type,
+                      occurred_at,
+                      payload_json,
+                      appended_at
+                    ) VALUES (
+                      'event-invalid-type',
+                      'digest',
+                      'canonical_fact',
+                      'session-1',
+                      'INVALID_TEST_EVENT_TYPE',
+                      '2026-05-16T00:00:00.000000Z',
+                      '{{}}',
+                      '2026-05-16T00:00:00.000000Z'
+                    )
+                    """)
         finally:
             connection.close()
 
@@ -1068,7 +1106,7 @@ def test_event_log_schema_rejects_unpaired_payload_reference(
                       'digest',
                       'canonical_fact',
                       'session-1',
-                      'TYPE_A',
+                      'USER_INPUT_ACCEPTED',
                       '2026-05-16T00:00:00.000000Z',
                       '{{}}',
                       'payload-ref-1',
@@ -1092,7 +1130,7 @@ def test_event_log_schema_rejects_unpaired_payload_reference(
                       'digest',
                       'canonical_fact',
                       'session-1',
-                      'TYPE_A',
+                      'USER_INPUT_ACCEPTED',
                       '2026-05-16T00:00:00.000000Z',
                       '{{}}',
                       'sha256:0000000000000000000000000000000000000000000000000000000000000000',
