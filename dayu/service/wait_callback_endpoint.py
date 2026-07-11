@@ -748,7 +748,6 @@ def _http_status_code_for_adapter_result(result: WaitCallbackAdapterResult) -> i
     if result.status in {
         WaitCallbackAdapterStatus.LATE_WAIT_CANCELLED,
         WaitCallbackAdapterStatus.LATE_WAIT_LOST,
-        WaitCallbackAdapterStatus.STALE_CALLBACK,
     }:
         return 410
     return 500

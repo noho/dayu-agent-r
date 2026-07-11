@@ -1667,8 +1667,8 @@ def test_fins_wait_poll_adapter_corrupt_and_missing_handles_are_lost() -> None:
     assert isinstance(missing_poll.outcome, ResolveWaitLostOutcome)
 
 
-def test_fins_wait_poll_adapter_transient_unavailable_uses_host_wait_boundaries() -> None:
-    """transient unavailable 只消费 Host wait deadline/expires 边界。"""
+def test_fins_wait_poll_adapter_transient_unavailable_does_not_read_host_boundaries() -> None:
+    """transient unavailable 只表达 provider observation，Host 边界由 poll owner 判断。"""
 
     handle = _observation_handle_with_id("abababababababab")
     runtime = _FakeObservationRuntime(
@@ -1725,10 +1725,10 @@ def test_fins_wait_poll_adapter_transient_unavailable_uses_host_wait_boundaries(
     )
 
     assert isinstance(future_deadline_poll, WaitPollNotReady)
-    assert isinstance(past_deadline_poll, WaitPollLost)
-    assert isinstance(past_expires_poll, WaitPollLost)
-    assert isinstance(invalid_deadline_poll, WaitPollLost)
-    assert isinstance(invalid_expires_poll, WaitPollLost)
+    assert isinstance(past_deadline_poll, WaitPollNotReady)
+    assert isinstance(past_expires_poll, WaitPollNotReady)
+    assert isinstance(invalid_deadline_poll, WaitPollNotReady)
+    assert isinstance(invalid_expires_poll, WaitPollNotReady)
     assert isinstance(no_boundary_old_created_poll, WaitPollNotReady)
 
 

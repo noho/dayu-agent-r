@@ -216,8 +216,9 @@ Service / Web transport
 `DefaultWaitCallbackAdapter` 的职责是 callback 边界预处理，不拥有 durable state transition：
 
 - 先执行 callback authenticator；认证失败时不得读取 wait state，也不得调用 resolver。
-- 读取 wait state 只用于 unknown wait、stale、late cancel / lost 与 invalid wait state 的预分类。
+- 读取 wait state 只用于 unknown wait、late cancel / lost 与 invalid wait state 的预分类。
 - 使用与 direct `resolve_wait` 相同的 wait resolution digest helper 校验 callback payload；request id、认证材料、correlation metadata、`observed_at` 和 `completed_at` 不参与 outcome digest。
+- callback adapter 不解析 `deadline_at` / `expires_at`，过期或非法等待时间边界由 Host wait owner 在 `resolve_wait` 管线内统一判定。
 - 把通过预检的 callback completion 转成 `ResolveWaitRequest(source=CALLBACK)`，再通过 `CallbackWaitResolvePort` 进入 command-layer `resolve_wait`。
 - 只返回 typed `WaitCallbackAdapterResult` 与 stable status / diagnostic code；不回显 outcome payload 或 credential material。
 
@@ -242,7 +243,7 @@ Host 公共契约分为 Host 专属契约、Dayu Agent 公共契约和 Engine �
 - `HostCallContext` / `OperationContext` / `AuthorizationClaim` / `HostMetadataEntry`：调用上下文、授权声明与稳定 metadata。
 - `HostToolingOptions` / `FrameworkToolName` / `FrameworkToolPolicyView` / `ProcessCapsuleInterruptPolicy`：业务 ToolBundle、Host framework tool 与 process-backed capsule cleanup interrupt policy 的 construction-time 输入边界。
 - `ContextBudgetPolicy` / `MemoryProjectionPolicy`：context governance 与 conversation memory projection 的 typed policy。
-- `WaitCallbackCompletionEnvelope` / `WaitCallbackAuthInput` / `WaitCallbackAuthAccepted` / `WaitCallbackAuthRejected` / `WaitCallbackAdapterResult` / `WaitCallbackAdapterStatus`：framework-independent wait callback completion 契约。调用方在 Service/Web transport 层完成请求解析后，把强类型 envelope 交给 `DefaultWaitCallbackAdapter`；adapter 只做认证、payload digest 校验、stale / late 预分类和 `ResolveWaitRequest(source=CALLBACK)` 转换，状态迁移仍进入 Host `resolve_wait` 管线。
+- `WaitCallbackCompletionEnvelope` / `WaitCallbackAuthInput` / `WaitCallbackAuthAccepted` / `WaitCallbackAuthRejected` / `WaitCallbackAdapterResult` / `WaitCallbackAdapterStatus`：framework-independent wait callback completion 契约。调用方在 Service/Web transport 层完成请求解析后，把强类型 envelope 交给 `DefaultWaitCallbackAdapter`；adapter 只做认证、payload digest 校验、late 预分类和 `ResolveWaitRequest(source=CALLBACK)` 转换，状态迁移与等待时间边界判定仍进入 Host `resolve_wait` 管线。
 - `CallbackWaitResolvePort` / `CallbackWaitResolveResult` / `WaitCallbackStateReadPort`：callback adapter 接入 command-layer wait resolve 与 wait state 预读的端口契约。command-layer 实现必须保留现有 resolve wakeup 语义：非 replay 且创建 resume dispatch 时唤醒 dispatch，replay 不重复唤醒。
 
 ### Dayu Agent 公共契约
@@ -383,7 +384,7 @@ ToolRuntime 默认从 effective `ToolDefinition.execution` 选择执行 capsule�
 
 Engine 不拥有 wait record、activation 或外部 job 生命周期。Engine 只观察 ToolRuntime 返回的 awaiting outcome，并在本次 run 内产出诊断性的 awaiting / suspended 事件；等待真源、activation 时机和后续 resume 都由 Host / ToolRuntime 治理。
 
-Production wait poller 是 `open_host` 可选装配的 Host runtime。它使用 construction-time poll adapter registry 观察 durable wait record 指向的外部 job，并通过 durable claim / expiry / next-observe / backoff 控制可观察资格；完成或 lost 时仍调用同一个 `resolve_wait` command path。正常 `not_ready` 只表示外部 job 仍在运行，poller 会短间隔复查；adapter error、missing adapter、resolve error 或 shutdown-skipped 才进入可重试 backoff。没有可 claim wait record 时，supervisor 使用 idle 间隔降低空查频率；有 active wait 但未到 next-observe / claim expiry 时，supervisor 睡眠到下一次 due 或 idle 上限，并可被本地 wakeup 打断。空轮询不逐轮输出空摘要日志。poller runtime diagnostics 保持在内存中，不写 EventLog，不成为业务事实或用户结论。
+Production wait poller 是 `open_host` 可选装配的 Host runtime。它使用 construction-time poll adapter registry 观察 durable wait record 指向的外部 job，并通过 durable claim / expiry / next-observe / backoff 控制可观察资格；完成或 lost 时仍调用同一个 `resolve_wait` command path。正常 `not_ready` 只表示外部 job 仍在运行，poller 会短间隔复查；Host 等待时间边界拒绝、adapter error、missing adapter、resolve error 或 shutdown-skipped 才进入可重试 backoff，并分别写入有界 durable poll outcome。没有可 claim wait record 时，supervisor 使用 idle 间隔降低空查频率；有 active wait 但未到 next-observe / claim expiry 时，supervisor 睡眠到下一次 due 或 idle 上限，并可被本地 wakeup 打断。空轮询不逐轮输出空摘要日志。poller runtime diagnostics 保持在内存中，不写 EventLog，不成为业务事实或用户结论。
 
 当 `WAITING` Run 已被 Host cancel 收口后，cancel command transaction 只写 Host durable wait / Run / Attempt 事实，不在事务内执行 provider I/O。后续由 production wait poller 在 cancelled wait row 上 claim 后调用 provider wait adapter 的 external lifecycle 端口。adapter 可以返回三类封闭结果：`WaitExternalJobLifecycleApplied` 表示已执行 `CANCEL` / `REVOKE` / `ABANDON` 中的外部 lifecycle 动作，`WaitExternalJobLifecycleUnsupported` 表示该 wait 明确不支持外部 lifecycle 动作，`WaitExternalJobLifecycleNoop` 表示当前 wait 已无需或无法继续处理。Host poller 只把这些结果折叠成有界 durable outcome：`abandoned`、`abandon_unsupported` 或 `abandon_noop`；adapter 异常记录为 `error` / `abandon_error` 类诊断并按 backoff 重试，缺失 adapter 记录为 missing-adapter retry 诊断。Fins 当前装配的 wait adapter 使用 `ABANDON` 语义做 best-effort observation cancel / cleanup；Host 不把 Fins observation 细节写入自身业务事实。
 

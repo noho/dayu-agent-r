@@ -451,7 +451,6 @@ def test_auth_failed_maps_to_401_or_403_by_reason_code(
         (WaitCallbackAdapterStatus.INVALID_WAIT_STATE, 409),
         (WaitCallbackAdapterStatus.LATE_WAIT_CANCELLED, 410),
         (WaitCallbackAdapterStatus.LATE_WAIT_LOST, 410),
-        (WaitCallbackAdapterStatus.STALE_CALLBACK, 410),
         (WaitCallbackAdapterStatus.INTERNAL_ERROR, 500),
     ],
 )

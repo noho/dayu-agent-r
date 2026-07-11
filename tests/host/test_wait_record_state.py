@@ -415,8 +415,16 @@ def test_wait_record_status_and_policy_codecs_are_closed() -> None:
 
 
 def test_wait_poll_terminal_outcome_codecs_roundtrip_new_values() -> None:
-    """新增 cancelled lifecycle terminal outcome 使用 StrEnum value roundtrip。"""
+    """新增 Host wait poll outcome 使用 StrEnum value roundtrip。"""
 
+    assert (
+        serialize_wait_poll_last_outcome(WaitPollLastOutcome.BOUNDARY_REJECTED)
+        == "boundary_rejected"
+    )
+    assert (
+        deserialize_wait_poll_last_outcome("boundary_rejected")
+        is WaitPollLastOutcome.BOUNDARY_REJECTED
+    )
     assert (
         serialize_wait_poll_last_outcome(WaitPollLastOutcome.ABANDON_UNSUPPORTED)
         == "abandon_unsupported"

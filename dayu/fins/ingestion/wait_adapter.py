@@ -53,7 +53,6 @@ from dayu.host.api import (
     ResolveWaitLostOutcome,
     WaitAdapterKey,
 )
-from dayu.host.durable.codec import parse_utc_timestamp
 from dayu.host.durable.state import WaitRecordRow, WaitResumePolicy
 from dayu.host.wait_adapter import (
     WaitActivationAdapterRegistration,
@@ -402,8 +401,6 @@ def _poll_error_result(
     """
 
     if exc.error_kind is FinsObservationPollErrorKind.TRANSIENT_UNAVAILABLE:
-        if _wait_boundary_lost(wait_record):
-            return WaitPollLost(_lost_outcome())
         return WaitPollNotReady()
     return WaitPollLost(_lost_outcome())
 
@@ -601,29 +598,6 @@ def _timestamp_or_now(value: str) -> datetime:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
-
-
-def _wait_boundary_lost(wait_record: WaitRecordRow) -> bool:
-    """按 Host wait record 边界判断 transient unavailable 是否已 lost。
-
-    :param wait_record: Host wait record 快照。
-    :returns: Host deadline/expires 已过期或边界文本非法时返回 ``True``；
-        没有 Host 边界或边界仍在未来时返回 ``False``。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    boundary_text = (
-        wait_record.deadline_at
-        if wait_record.deadline_at is not None
-        else wait_record.expires_at
-    )
-    if boundary_text is None:
-        return False
-    try:
-        boundary = parse_utc_timestamp(boundary_text)
-    except ValueError:
-        return True
-    return datetime.now(timezone.utc) > boundary
 
 
 def _run_async_observation(

@@ -860,6 +860,7 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_WAIT_RECORDS} (
         'adapter_error',
         'missing_adapter',
         'resolve_error',
+        'boundary_rejected',
         'abandon_error',
         'shutdown_skipped',
         'abandoned',

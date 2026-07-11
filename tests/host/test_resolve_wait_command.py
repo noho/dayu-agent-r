@@ -59,7 +59,7 @@ from dayu.host.durable.run_transition import (
     accept_worker_running_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
 )
-from dayu.host.durable.schema import TABLE_EVENT_LOG
+from dayu.host.durable.schema import TABLE_EVENT_LOG, TABLE_HOST_WAIT_RECORDS
 from dayu.host.durable.session_lifecycle import ensure_session
 from dayu.host.durable.state import (
     DispatchRecordStatus,
@@ -87,6 +87,7 @@ from dayu.host.projection import ProjectionCatchupPort
 from dayu.host.run_input import PolicySnapshot, create_no_tool_run_input_builder
 from dayu.host.wait_adapter import WaitAdapterBinding, WaitExternalJobRefSource
 from dayu.host.waiting import (
+    DefaultHostResolveWaitService,
     DefaultHostToolAwaitingAcceptPort,
     ToolAwaitingAcceptCandidate,
     ToolAwaitingAcceptedAck,
@@ -116,6 +117,31 @@ class _FailingProjectionCatchup(ProjectionCatchupPort):
 
         self.calls += 1
         raise RuntimeError("forced resolve wait projection catch-up failure")
+
+
+class _CountingEventLogStore(EventLogStore):
+    """测试用 EventLog store，记录 read_event_by_id 调用。"""
+
+    def __init__(self) -> None:
+        """初始化调用记录。
+
+        :returns: ``None``。
+        """
+
+        self.read_event_ids: list[str] = []
+
+    def read_event_by_id(
+        self, transaction: HostTransaction, event_id: str
+    ) -> EventLogRow | None:
+        """记录读取的 event id 并委托默认实现。
+
+        :param transaction: 当前 Host transaction。
+        :param event_id: EventLog event id。
+        :returns: EventLog row；不存在时为 ``None``。
+        """
+
+        self.read_event_ids.append(event_id)
+        return super().read_event_by_id(transaction, event_id)
 
 
 def test_resolve_wait_completed_resumes_run_and_wakes_dispatch(
@@ -203,6 +229,58 @@ def test_resolve_wait_survives_projection_catchup_failure(
         host.close()
 
 
+def test_resolve_wait_rejects_expired_wait_from_common_owner(
+    tmp_path: Path,
+) -> None:
+    """过期 wait 在 common resolve owner 内拒绝，不进入 resume 或业务 LOST。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        _set_wait_deadline_text(
+            host._transaction_runner(),
+            seeded.wait_id,
+            "2026-05-16T01:05:05.000000Z",
+        )
+
+        with pytest.raises(HostApiError) as error_info:
+            resolve_wait(host, seeded.wait_id, _completed_request("expired-direct"))
+
+        wait_record = _read_wait(host._transaction_runner(), seeded.wait_id)
+        late_events = _events_by_type(
+            _events(host._transaction_runner()), "WAIT_LATE_RESULT_REJECTED"
+        )
+        assert error_info.value.code is HostApiErrorCode.INVALID_STATE
+        assert wait_record.status is WaitRecordStatus.WAITING
+        assert len(late_events) == 1
+    finally:
+        host.close()
+
+
+def test_resolve_wait_invalid_deadline_fails_closed_without_lost(
+    tmp_path: Path,
+) -> None:
+    """非法持久化 deadline fail closed，不能被转换成业务 LOST。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        _set_wait_deadline_text(
+            host._transaction_runner(), seeded.wait_id, "not-a-timestamp"
+        )
+        before_events = _events(host._transaction_runner())
+
+        with pytest.raises(HostApiError) as error_info:
+            resolve_wait(host, seeded.wait_id, _lost_request("invalid-direct"))
+
+        wait_record = _read_wait(host._transaction_runner(), seeded.wait_id)
+        assert error_info.value.code is HostApiErrorCode.INVALID_STATE
+        assert wait_record.status is WaitRecordStatus.WAITING
+        assert _events(host._transaction_runner()) == before_events
+    finally:
+        host.close()
+
+
 def test_resolve_wait_committed_tool_result_direct_catchup_without_fact(
     tmp_path: Path,
 ) -> None:
@@ -258,6 +336,37 @@ def test_resolve_wait_committed_tool_result_direct_catchup_without_fact(
         assert (
             memory_snapshot.snapshot.cursor.checkpoint_event_sequence
             >= tool_events[-1].event_sequence
+        )
+    finally:
+        host.close()
+
+
+def test_resolve_wait_uses_injected_event_log_store_for_request_atom(
+    tmp_path: Path,
+) -> None:
+    """resolve wait request atom 校验使用注入 EventLogStore，而非临时实例。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    event_log_store = _CountingEventLogStore()
+    service = DefaultHostResolveWaitService(
+        transaction_runner=host._transaction_runner(),
+        event_log_store=event_log_store,
+    )
+    try:
+        seeded = _seed_waiting_run(host)
+
+        result = service.resolve_wait(
+            seeded.wait_id, _completed_request("resolve-di-event-log")
+        )
+
+        assert result.run.status is RunStatus.RUNNING
+        assert (
+            f"event-tool-call-requested-awaiting-{seeded.wait_id.removeprefix('wait-')}"
+            in event_log_store.read_event_ids
+        )
+        assert (
+            f"event-tool-awaiting-{seeded.wait_id.removeprefix('wait-')}"
+            in event_log_store.read_event_ids
         )
     finally:
         host.close()
@@ -777,6 +886,32 @@ def _rewrite_wait_request_atom_digest(
             WHERE event_id = ?
             """,
             (canonical_json_dumps(payload), event_id),
+        )
+
+    transaction_runner.run_write(_operation)
+
+
+def _set_wait_deadline_text(
+    transaction_runner: HostTransactionRunner, wait_id: str, deadline_text: str
+) -> None:
+    """更新测试 wait record deadline 原始文本。
+
+    :param transaction_runner: Host transaction runner。
+    :param wait_id: wait id。
+    :param deadline_text: deadline 原始文本。
+    :returns: ``None``。
+    """
+
+    def _operation(transaction: HostTransaction) -> None:
+        """执行 deadline 文本更新。
+
+        :param transaction: 当前 Host transaction。
+        :returns: ``None``。
+        """
+
+        transaction.execute(
+            f"UPDATE {TABLE_HOST_WAIT_RECORDS} SET deadline_at = ? WHERE wait_id = ?",
+            (deadline_text, wait_id),
         )
 
     transaction_runner.run_write(_operation)

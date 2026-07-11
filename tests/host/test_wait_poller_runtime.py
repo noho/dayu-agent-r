@@ -396,6 +396,64 @@ class _SelfClosingPollerFactory:
         )
 
 
+class _FailingOncePoller(WaitPoller):
+    """第一次 poll 抛出异常，后续返回空轮结果的测试 poller。"""
+
+    def __init__(self, factory: "_FailingOncePollerFactory") -> None:
+        """初始化 poller。
+
+        :param factory: 共享调用计数的 factory。
+        :returns: ``None``。
+        """
+
+        self._factory = factory
+
+    def poll_once(self) -> WaitPollOnceResult:
+        """执行单轮 poll。
+
+        :returns: 第二轮开始返回空 poll result。
+        :raises RuntimeError: 第一轮抛出测试异常。
+        """
+
+        self._factory.calls += 1
+        if self._factory.calls == 1:
+            self._factory.failed_once.set()
+            raise RuntimeError("single round failure")
+        self._factory.recovered.set()
+        return WaitPollOnceResult(
+            observed=0,
+            not_ready=0,
+            resolved=0,
+            lost=0,
+            abandoned=0,
+            adapter_errors=0,
+        )
+
+
+class _FailingOncePollerFactory:
+    """创建单次失败 poller 的测试 factory。"""
+
+    def __init__(self) -> None:
+        """初始化 factory。
+
+        :returns: ``None``。
+        """
+
+        self.calls = 0
+        self.failed_once = threading.Event()
+        self.recovered = threading.Event()
+
+    def create_wait_poller(self, lifecycle_gate: WaitPollLifecycleGate) -> WaitPoller:
+        """创建 poller。
+
+        :param lifecycle_gate: supervisor close gate，本测试不需要读取。
+        :returns: 单次失败 poller。
+        """
+
+        del lifecycle_gate
+        return _FailingOncePoller(self)
+
+
 def test_supervisor_requires_explicit_poller_factory() -> None:
     """WaitPollerSupervisor 不再提供隐式 direct factory 默认路径。"""
 
@@ -846,49 +904,38 @@ def test_close_from_supervisor_thread_marks_failed_diagnostics(
 
     diagnostics = supervisor.diagnostics_snapshot()
     assert diagnostics.fatal_errors == 1
-    assert diagnostics.last_error_type == "RuntimeError"
+    assert diagnostics.round_errors == 0
+    assert diagnostics.last_error_type == "_WaitPollerSelfCloseError"
     assert diagnostics.last_error_message is not None
     assert "cannot close from its own thread" in diagnostics.last_error_message
     assert "wait poller loop failed" in caplog.text
     supervisor.close()
 
 
-def test_unexpected_loop_exception_marks_failed_diagnostics(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+def test_single_round_exception_is_diagnosed_and_next_round_continues(
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """loop-level exception 会记录 failed diagnostics，wait durable 状态不被终态化。"""
+    """单轮 transient exception 只记录诊断，supervisor 继续下一轮。"""
 
-    options = _options(tmp_path)
-    host = create_host_command_handle(options)
-    try:
-        seeded = _seed_waiting_run(host)
-        supervisor = WaitPollerSupervisor(
-            poller_factory=_handle_poller_factory(
-                options=options,
-                adapter_registry=_FailingAdapterRegistry(),
-                owner_id="poller-runtime-fatal",
-                policy=_runtime_policy(),
-            ),
-            policy=_runtime_policy(),
-            owner_id="poller-runtime-fatal",
-        )
+    factory = _FailingOncePollerFactory()
+    supervisor = WaitPollerSupervisor(
+        poller_factory=factory,
+        policy=_runtime_policy(),
+        owner_id="poller-runtime-round-error",
+    )
 
-        with caplog.at_level(logging.ERROR, logger="dayu.host.wait_adapter"):
-            supervisor.open()
-            _wait_until(
-                lambda: supervisor.diagnostics_snapshot().status
-                is WaitPollerLoopStatus.FAILED
-            )
+    with caplog.at_level(logging.ERROR, logger="dayu.host.wait_adapter"):
+        supervisor.open()
+        assert factory.failed_once.wait(1.0)
+        assert factory.recovered.wait(1.0)
 
-        wait_record = _read_wait(host._transaction_runner(), seeded.wait_id)
-        diagnostics = supervisor.diagnostics_snapshot()
-        assert wait_record.status is WaitRecordStatus.WAITING
-        assert diagnostics.fatal_errors == 1
-        assert diagnostics.last_error_type == "RuntimeError"
-        assert "wait poller loop failed" in caplog.text
-        supervisor.close()
-    finally:
-        host.close()
+    diagnostics = supervisor.diagnostics_snapshot()
+    assert diagnostics.status is WaitPollerLoopStatus.RUNNING
+    assert diagnostics.round_errors == 1
+    assert diagnostics.fatal_errors == 0
+    assert diagnostics.last_error_type == "RuntimeError"
+    assert "wait poller round failed; retrying" in caplog.text
+    supervisor.close()
 
 
 def _ready_result() -> WaitPollReady:

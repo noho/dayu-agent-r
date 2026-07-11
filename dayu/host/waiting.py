@@ -118,6 +118,10 @@ from dayu.host.projection import (
     catch_up_projection_best_effort,
 )
 from dayu.host.wait_adapter import WaitAdapterBinding
+from dayu.host.wait_boundary import (
+    WaitBoundaryDecisionKind,
+    classify_wait_time_boundary,
+)
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 _LOGGER = logging.getLogger(__name__)
@@ -173,6 +177,7 @@ class WaitLateRejectionReason(StrEnum):
     """晚到 wait result 拒绝原因。"""
 
     WAIT_CANCELLED = "wait_cancelled"
+    WAIT_EXPIRED = "wait_expired"
     WAIT_LOST = "wait_lost"
     WAIT_ALREADY_RESOLVED = "wait_already_resolved"
     WAIT_ALREADY_FAILED = "wait_already_failed"
@@ -765,6 +770,22 @@ class DefaultHostResolveWaitService:
                 request=request,
                 rejection_reason=WaitLateRejectionReason.INVALID_WAIT_STATE,
             )
+        boundary_decision = classify_wait_time_boundary(
+            wait_record, observed_at=request.observed_at
+        )
+        if boundary_decision.kind is WaitBoundaryDecisionKind.INVALID:
+            raise HostApiError(
+                code=HostApiErrorCode.INVALID_STATE,
+                message="wait record contains invalid time boundary",
+                retryable=False,
+            )
+        if boundary_decision.kind is WaitBoundaryDecisionKind.EXPIRED:
+            return self._reject_late_result(
+                transaction=transaction,
+                wait_record=wait_record,
+                request=request,
+                rejection_reason=WaitLateRejectionReason.WAIT_EXPIRED,
+            )
         if owner_run.status in (
             RunStatus.SUCCEEDED,
             RunStatus.FAILED,
@@ -980,6 +1001,7 @@ class DefaultHostResolveWaitService:
                 ),
                 tool_result_payload=_tool_result_resolution_payload(
                     transaction=transaction,
+                    event_log_store=self._event_log_store,
                     wait_record=wait_record,
                     request=request,
                     payload_plan=payload_plan,
@@ -1049,6 +1071,7 @@ class DefaultHostResolveWaitService:
                 resolution_digest=resolution_digest,
                 tool_result_payload=_tool_result_resolution_payload(
                     transaction=transaction,
+                    event_log_store=self._event_log_store,
                     wait_record=wait_record,
                     request=request,
                     payload_plan=payload_plan,
@@ -1116,6 +1139,7 @@ class DefaultHostResolveWaitService:
                 resolution_digest=resolution_digest,
                 tool_result_payload=_tool_result_resolution_payload(
                     transaction=transaction,
+                    event_log_store=self._event_log_store,
                     wait_record=wait_record,
                     request=request,
                     payload_plan=payload_plan,
@@ -1418,6 +1442,7 @@ def _resume_requested_payload(
 def _tool_result_resolution_payload(
     *,
     transaction: HostTransaction,
+    event_log_store: EventLogStore,
     wait_record: WaitRecordRow,
     request: ResolveWaitRequest,
     payload_plan: _WaitResolutionPayloadPlan,
@@ -1428,6 +1453,7 @@ def _tool_result_resolution_payload(
     """构造 resolve wait ``TOOL_RESULT_ACCEPTED`` payload。
 
     :param transaction: 当前 Host transaction。
+    :param event_log_store: 注入的 EventLog store。
     :param wait_record: active wait record。
     :param request: resolve wait 请求。
     :param payload_plan: payload 规划。
@@ -1437,7 +1463,9 @@ def _tool_result_resolution_payload(
     :returns: JSON payload。
     """
 
-    tool_call_requested = _wait_tool_call_requested_event(transaction, wait_record)
+    tool_call_requested = _wait_tool_call_requested_event(
+        transaction, wait_record, event_log_store=event_log_store
+    )
     request_payload = payload_object(tool_call_requested)
     accepted_evidence_envelope = _wait_resolution_evidence_envelope(
         wait_record=wait_record,
@@ -1497,18 +1525,22 @@ def _tool_result_resolution_payload(
 
 
 def _wait_tool_call_requested_event(
-    transaction: HostTransaction, wait_record: WaitRecordRow
+    transaction: HostTransaction,
+    wait_record: WaitRecordRow,
+    *,
+    event_log_store: EventLogStore,
 ) -> EventLogRow:
     """读取 wait 对应的 canonical ``TOOL_CALL_REQUESTED`` request atom。
 
     :param transaction: 当前 Host transaction。
     :param wait_record: active wait record。
+    :param event_log_store: 注入的 EventLog store。
     :returns: 对应 request atom row。
     :raises HostDurableError: request atom 缺失或身份不匹配时抛出。
     """
 
     event_id = _tool_call_requested_event_id_from_wait_id(wait_record.wait_id)
-    row = EventLogStore().read_event_by_id(transaction, event_id)
+    row = event_log_store.read_event_by_id(transaction, event_id)
     if row is None:
         raise HostDurableError("wait tool call request atom is missing")
     if (
@@ -1531,6 +1563,7 @@ def _wait_tool_call_requested_event(
         transaction,
         wait_record=wait_record,
         request_payload=payload,
+        event_log_store=event_log_store,
     )
     return row
 
@@ -1540,17 +1573,19 @@ def _validate_wait_request_arguments_digest(
     *,
     wait_record: WaitRecordRow,
     request_payload: Mapping[str, JsonValue],
+    event_log_store: EventLogStore,
 ) -> None:
     """校验 wait request atom 与 awaiting accept 事实的参数 digest 同源。
 
     :param transaction: 当前 Host transaction。
     :param wait_record: active wait record。
     :param request_payload: ``TOOL_CALL_REQUESTED`` payload。
+    :param event_log_store: 注入的 EventLog store。
     :returns: ``None``。
     :raises HostDurableError: awaiting 事实缺失、身份错误或参数 digest 不一致时抛出。
     """
 
-    awaiting = EventLogStore().read_event_by_id(transaction, wait_record.created_event_id)
+    awaiting = event_log_store.read_event_by_id(transaction, wait_record.created_event_id)
     if awaiting is None:
         raise HostDurableError("wait created event is missing")
     if (
