@@ -13,6 +13,7 @@ import pytest
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
 from dayu.host.api import AttemptStatus, EnsureSessionRequest, RunStatus, WaitAdapterKey
+from dayu.host.queue_policy import RunQueuePolicy
 from dayu.host.durable.codec import format_utc_timestamp, sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import (
@@ -418,7 +419,7 @@ def _seed_active_run(transaction_runner: HostTransactionRunner) -> _SeededRun:
                 source="pytest",
                 idempotency_key="idem-awaiting",
                 execution_target="target-awaiting",
-                queue_policy="queue",
+                queue_policy=RunQueuePolicy.QUEUE,
                 start_reason=RunStartReason.INITIAL,
                 worker_kind=WorkerKind.LOCAL,
                 owner_host_instance_id=None,

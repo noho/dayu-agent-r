@@ -58,6 +58,7 @@ from dayu.engine.contracts.engine_events import (
     UsageReportedData,
     runner_role_sequence_digest,
 )
+from dayu.host.queue_policy import RunQueuePolicy
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import AgentMessageRole, SystemMessage, UserMessage
 from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
@@ -4535,7 +4536,7 @@ def _seed_active_run(
                 source="pytest",
                 idempotency_key="idem-ingest",
                 execution_target="target-ingest",
-                queue_policy="queue",
+                queue_policy=RunQueuePolicy.QUEUE,
                 start_reason=RunStartReason.INITIAL,
                 worker_kind=WorkerKind.LOCAL,
                 owner_host_instance_id=None,

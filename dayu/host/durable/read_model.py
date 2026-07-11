@@ -320,7 +320,7 @@ def _validate_run_result(row: RunResultRow) -> None:
 
     _require_non_empty_text(row.run_id, field_name="run_id")
     _require_non_empty_text(row.session_id, field_name="session_id")
-    serialize_run_result_terminal_status(row.terminal_status)
+    _validate_run_result_terminal_status(row.terminal_status)
     if row.terminal_event_sequence <= 0:
         raise HostDurableError("terminal_event_sequence must be positive")
     _require_non_empty_text(row.terminal_event_id, field_name="terminal_event_id")
@@ -477,11 +477,22 @@ def serialize_run_result_terminal_status(status: RunStatus) -> str:
     :raises HostDurableError: ``status`` 不是 RunStatus 或不是终态时抛出。
     """
 
+    _validate_run_result_terminal_status(status)
+    return status.value
+
+
+def _validate_run_result_terminal_status(status: RunStatus) -> None:
+    """校验 minimal RunResult terminal status。
+
+    :param status: RunResult row 持有的 typed terminal Run status。
+    :returns: ``None``。
+    :raises HostDurableError: ``status`` 不是 RunStatus 或不是终态时抛出。
+    """
+
     if not isinstance(status, RunStatus):
         raise HostDurableError("RunResult terminal_status is invalid")
     if not is_terminal_run_status(status):
         raise HostDurableError("RunResult terminal_status is not terminal")
-    return status.value
 
 
 def _validate_timeline_item_kind(value: str) -> None:

@@ -27,6 +27,7 @@ from dayu.engine.contracts.engine_events import (
 )
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
+from dayu.host.queue_policy import RunQueuePolicy
 from dayu.host import (
     AuthorizationClaim,
     CancelRunRequest,
@@ -904,7 +905,7 @@ def _seed_active_run(transaction_runner: HostTransactionRunner) -> _SeededRun:
                 source="pytest",
                 idempotency_key="idem-phase5-local",
                 execution_target="target-phase5-local",
-                queue_policy="queue",
+                queue_policy=RunQueuePolicy.QUEUE,
                 start_reason=RunStartReason.INITIAL,
                 worker_kind=WorkerKind.LOCAL,
                 owner_host_instance_id=None,

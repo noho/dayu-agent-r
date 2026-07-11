@@ -14,6 +14,7 @@ import pytest
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host.api import EnsureSessionRequest, HostPayloadRef
+from dayu.host.queue_policy import RunQueuePolicy
 from dayu.host._event_payload import payload_object
 from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
@@ -1367,7 +1368,7 @@ def _seed_active_run(transaction_runner: HostTransactionRunner) -> _SeededRun:
                 source="pytest",
                 idempotency_key="idem-tool-accept",
                 execution_target="target-tool-accept",
-                queue_policy="queue",
+                queue_policy=RunQueuePolicy.QUEUE,
                 start_reason=RunStartReason.INITIAL,
                 worker_kind=WorkerKind.LOCAL,
                 owner_host_instance_id=None,

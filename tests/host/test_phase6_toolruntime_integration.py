@@ -30,6 +30,7 @@ from dayu.contracts.tool_schema import (
 from dayu.engine.agent import _AsyncAgent
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.engine_events import EngineEvent, EngineEventType
+from dayu.host.queue_policy import RunQueuePolicy
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import (
     AgentMessage,
@@ -828,7 +829,7 @@ def _seed_active_run(transaction_runner: HostTransactionRunner) -> _SeededRun:
                 source="pytest",
                 idempotency_key="idem-phase6",
                 execution_target="target-phase6",
-                queue_policy="queue",
+                queue_policy=RunQueuePolicy.QUEUE,
                 start_reason=RunStartReason.INITIAL,
                 worker_kind=WorkerKind.LOCAL,
                 owner_host_instance_id=None,

@@ -30,6 +30,7 @@ from dayu.engine.contracts.engine_events import (
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import AgentMessage, AgentMessageRole, SystemMessage, UserMessage
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
+from dayu.host.queue_policy import RunQueuePolicy
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import (
     BatchToolExecutionContext,
@@ -6589,7 +6590,7 @@ def _seed_current_run(store: HostDurableStore, *, session_id: str | None = None)
                 source="pytest",
                 idempotency_key="idem-dispatch",
                 execution_target="target-dispatch",
-                queue_policy="queue",
+                queue_policy=RunQueuePolicy.QUEUE,
                 start_reason=RunStartReason.INITIAL,
                 worker_kind=WorkerKind.LOCAL,
                 owner_host_instance_id=None,
@@ -6649,7 +6650,7 @@ def _seed_accepted_run(
                 source="pytest",
                 idempotency_key=f"idem-run-{run_id}",
                 execution_target="target-dispatch",
-                queue_policy="queue",
+                queue_policy=RunQueuePolicy.QUEUE,
                 call_context_digest=_CALL_CONTEXT_DIGEST,
             ),
         )

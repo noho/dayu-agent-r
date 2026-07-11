@@ -11,6 +11,7 @@ import pytest
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host.api import RunStatus
+from dayu.host.queue_policy import RunQueuePolicy
 from dayu.host.evidence import (
     ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
     AcceptedToolEvidenceLLMMaterial,
@@ -3133,7 +3134,7 @@ def _run_row(input_event: EventLogRow) -> RunRow:
         source_run_id=None,
         source_run_relation=None,
         execution_target="local",
-        queue_policy="queue",
+        queue_policy=RunQueuePolicy.QUEUE,
         created_at=_NOW,
         updated_at=_NOW,
         terminal_at=None,

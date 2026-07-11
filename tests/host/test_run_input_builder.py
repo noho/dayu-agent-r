@@ -28,6 +28,7 @@ from dayu.contracts.tool_schema import (
 )
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
+from dayu.host.queue_policy import RunQueuePolicy
 from dayu.engine.contracts.messages import (
     AgentMessage,
     AgentMessageRole,
@@ -5258,7 +5259,7 @@ def _seed_current_run(
                 source="pytest",
                 idempotency_key="request-current",
                 execution_target="local-default",
-                queue_policy="queue",
+                queue_policy=RunQueuePolicy.QUEUE,
                 start_reason=RunStartReason.INITIAL,
                 worker_kind=WorkerKind.LOCAL,
                 owner_host_instance_id=None,
@@ -5387,7 +5388,7 @@ def _seed_current_run_with_descriptor(
                 source="pytest",
                 idempotency_key="request-current",
                 execution_target="local-default",
-                queue_policy="queue",
+                queue_policy=RunQueuePolicy.QUEUE,
                 start_reason=RunStartReason.INITIAL,
                 worker_kind=WorkerKind.LOCAL,
                 owner_host_instance_id=None,

@@ -30,6 +30,7 @@ from dayu.host.durable.event_log import (
     EventLogRow,
     EventLogStore,
 )
+from dayu.host.queue_policy import RunQueuePolicy
 from dayu.host.evidence import (
     ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT,
     ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
@@ -1233,7 +1234,7 @@ def _run_row(input_event: EventLogRow) -> RunRow:
         source_run_id=None,
         source_run_relation=None,
         execution_target="local",
-        queue_policy="queue",
+        queue_policy=RunQueuePolicy.QUEUE,
         created_at="2026-07-09T00:00:00.000000Z",
         updated_at="2026-07-09T00:00:00.000000Z",
         terminal_at=None,

@@ -20,6 +20,7 @@ from dayu.host.api import (
     HostMetadataEntry,
     RunStatus,
 )
+from dayu.host.queue_policy import RunQueuePolicy
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import EventClass, EventLogAppendRequest, EventLogStore
@@ -1121,7 +1122,7 @@ def _create_accepted_input(
         source="pytest",
         idempotency_key=f"request-{run_id}",
         execution_target="local-default",
-        queue_policy="queue",
+        queue_policy=RunQueuePolicy.QUEUE,
         call_context_digest=_CALL_CONTEXT_DIGEST,
     )
 
@@ -1150,7 +1151,7 @@ def _create_queued_input(
         source="pytest",
         idempotency_key=f"request-{run_id}",
         execution_target="local-default",
-        queue_policy="queue",
+        queue_policy=RunQueuePolicy.QUEUE,
         queue_reason="active_run_exists",
         active_run_id="run-active",
         call_context_digest=_CALL_CONTEXT_DIGEST,
@@ -1185,7 +1186,7 @@ def _create_running_input(
         source="pytest",
         idempotency_key=f"request-{run_id}",
         execution_target="local-default",
-        queue_policy="queue",
+        queue_policy=RunQueuePolicy.QUEUE,
         start_reason=RunStartReason.INITIAL,
         worker_kind=WorkerKind.LOCAL,
         owner_host_instance_id=None,

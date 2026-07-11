@@ -17,6 +17,7 @@ from dayu.host.durable.options import (
     PayloadStoragePolicy,
 )
 from dayu.host.durable.schema import TABLE_HOST_WAIT_RECORDS
+from dayu.host.queue_policy import RunQueuePolicy
 from dayu.host.durable.state import (
     AttemptRow,
     ExternalJobRef,
@@ -141,7 +142,7 @@ def _seed_run(transaction: HostTransaction, *, run_id: str = "run-1") -> None:
             source_run_id=None,
             source_run_relation=None,
             execution_target="local-default",
-            queue_policy="queue",
+            queue_policy=RunQueuePolicy.QUEUE,
             created_at=_TIMESTAMP,
             updated_at=_TIMESTAMP,
             terminal_at=None,

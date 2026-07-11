@@ -15,6 +15,7 @@ import pytest
 from dayu.contracts.json_value import JsonValue
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
+from dayu.host.queue_policy import RunQueuePolicy
 from dayu.host.admission import (
     AdmissionClock,
     AdmissionIdFactory,
@@ -1547,7 +1548,7 @@ def _seed_active_run(
                 source="pytest",
                 idempotency_key=f"idem-{run_id}",
                 execution_target="target-seeded-active",
-                queue_policy="queue",
+                queue_policy=RunQueuePolicy.QUEUE,
                 start_reason=RunStartReason.INITIAL,
                 worker_kind=WorkerKind.LOCAL,
                 owner_host_instance_id=None,

@@ -46,6 +46,7 @@ from dayu.host.durable.state import (
     run_snapshot_from_row,
 )
 from dayu.host.durable.transaction import HostTransaction
+from dayu.host.queue_policy import RunQueuePolicy
 
 def _options(tmp_path: Path) -> HostCommandHandleOptions:
     """构造测试用 Host command handle options。
@@ -107,7 +108,7 @@ def _durable_run_row(status: RunStatus) -> RunRow:
         source_run_id=None,
         source_run_relation=None,
         execution_target="local",
-        queue_policy="queue",
+        queue_policy=RunQueuePolicy.QUEUE,
         created_at="2026-05-16T00:00:00.000000Z",
         updated_at="2026-05-16T00:00:00.000000Z",
         terminal_at=None,

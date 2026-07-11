@@ -71,6 +71,7 @@ from dayu.host.durable.state import (
     start_unstarted_run_row,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction
+from dayu.host.queue_policy import RunQueuePolicy
 
 _TIMESTAMP = "2026-05-14T00:00:00Z"
 _EVENT_DIGEST = "0" * 64
@@ -812,6 +813,34 @@ def test_active_runs_for_different_sessions_succeed(tmp_path: Path) -> None:
             return _required_row_int(row, column="count")
 
         assert store.transaction_runner.run_write(operation) == 2
+
+
+def test_run_row_queue_policy_decodes_to_owner_type(tmp_path: Path) -> None:
+    """RunRow.queue_policy 从 SQLite 文本解码为 Host queue policy owner 类型。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(transaction: HostTransaction) -> RunQueuePolicy:
+            """写入 Run 后读取 typed queue policy。
+
+            :param transaction: Host transaction。
+            :returns: 解码后的 queue policy。
+            """
+
+            _insert_session_tx(transaction, session_id="session-1")
+            _insert_run_tx(
+                transaction,
+                run_id="run-typed-policy",
+                session_id="session-1",
+                status=RunStatus.ACCEPTED,
+                client_request_id="request-typed-policy",
+            )
+            row = read_run_by_id(transaction, "run-typed-policy")
+            assert row is not None
+            return row.queue_policy
+
+        assert store.transaction_runner.run_write(operation) is RunQueuePolicy.QUEUE
 
 
 @pytest.mark.parametrize("status", _STARTED_RUN_STATUSES)

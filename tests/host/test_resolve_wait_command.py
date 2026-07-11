@@ -23,6 +23,7 @@ from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.messages import AssistantMessage, ToolMessage, UserMessage
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
+from dayu.host.queue_policy import RunQueuePolicy
 from dayu.host import (
     AttemptDispatchSnapshot,
     AuthorizationClaim,
@@ -562,7 +563,7 @@ def _run_row(
         source_run_id=None,
         source_run_relation=None,
         execution_target="target-resolve-helper",
-        queue_policy="queue",
+        queue_policy=RunQueuePolicy.QUEUE,
         created_at="2026-05-16T01:02:03.000000Z",
         updated_at="2026-05-16T01:02:03.000000Z",
         terminal_at=None,
@@ -888,7 +889,7 @@ def _seed_active_run(
                 source="pytest",
                 idempotency_key="idem-resolve",
                 execution_target="target-resolve",
-                queue_policy="queue",
+                queue_policy=RunQueuePolicy.QUEUE,
                 start_reason=RunStartReason.INITIAL,
                 worker_kind=WorkerKind.LOCAL,
                 owner_host_instance_id=None,
