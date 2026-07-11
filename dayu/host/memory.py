@@ -27,10 +27,6 @@ from dayu.host.evidence import (
     AcceptedToolEvidenceLLMMaterial,
     render_accepted_tool_evidence_for_llm,
 )
-from dayu.host.terminal_payload import (
-    PayloadTextReadPolicy,
-    assistant_final_answer_text_from_run_payload,
-)
 
 MemoryPolicyDigest: TypeAlias = str
 """Memory policy canonical JSON digest。"""
@@ -1272,6 +1268,7 @@ def project_conversation_memory_event(
             event,
             accepted_candidate,
             policy,
+            previous_summary=session_summary,
         )
         diagnostics = diagnostics + summary_diagnostics
         new_facts, fact_diagnostics = _facts_from_accepted_event(
@@ -1658,11 +1655,6 @@ def _selected_assistant_item(
 
     text = event.assistant_final_answer_text
     if text is None:
-        text = assistant_final_answer_text_from_run_payload(
-            event.payload,
-            text_policy=PayloadTextReadPolicy.LENIENT_NON_EMPTY,
-        )
-    if text is None:
         return None
     return SelectedRecentWindowItem(
         item_id=_item_id(event, "selected_assistant"),
@@ -1714,19 +1706,22 @@ def _session_summary_from_accepted_event(
     event: MemoryProjectionEvent,
     candidate: ConversationCompactOutputVNext,
     policy: MemoryProjectionPolicy,
+    *,
+    previous_summary: SessionSummaryMemoryView,
 ) -> tuple[SessionSummaryMemoryView, tuple[MemoryDiagnostic, ...]]:
     """从 accepted compact event 物化 Session Summary Memory。
 
     :param event: CONTEXT_COMPACTED event。
     :param candidate: 已由 persisted semantic owner 恢复的 typed candidate。
     :param policy: memory policy。
+    :param previous_summary: compact owner 未提供 replacement 时保留的既有 summary。
     :returns: session summary view 与 diagnostics。
     :raises ValueError: candidate 与 memory contract 不一致时抛出。
     """
 
     summary = candidate.session_summary
     if summary is None:
-        return _empty_session_summary_memory(), ()
+        return previous_summary, ()
     text = summary.summary_text
     if len(text) > policy.session_summary_char_cap:
         item_id = _item_id(event, "session_summary")

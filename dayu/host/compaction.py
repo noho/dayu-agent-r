@@ -80,14 +80,6 @@ class TraceReadableKindVNext(StrEnum):
     USER_VISIBLE_PROGRESS = "user_visible_progress"
 
 
-class FactEvidenceKindVNext(StrEnum):
-    """vNext evidence-backed fact candidate 的证据类型。"""
-
-    TOOL_RESULT = "tool_result"
-    TOOL_SOURCE_TEXT = "tool_source_text"
-    ACCEPTED_EVIDENCE_MATERIAL = "accepted_evidence_material"
-
-
 class ForwardIntentTypeVNext(StrEnum):
     """vNext forward intent 类型。"""
 
@@ -1182,20 +1174,17 @@ class EvidenceBackedFactCandidateVNext:
 
     :param claim_text: fact claim 文本。
     :param evidence_labels: 支撑事实的 evidence labels。
-    :param evidence_kind: Host 根据 evidence labels 派生的内部证据类型。
     :param source_labels: 可选辅助 source labels。
     """
 
     claim_text: str
     evidence_labels: tuple[PromptLocalMaterialLabel, ...]
-    evidence_kind: FactEvidenceKindVNext
     source_labels: tuple[PromptLocalMaterialLabel, ...] = field(default_factory=_empty_string_tuple)
 
     def __post_init__(self) -> None:
         """校验 vNext evidence-backed fact candidate。
 
         :returns: ``None``。
-        :raises TypeError: enum 类型非法时抛出。
         :raises ValueError: 文本或 labels 非法时抛出。
         """
 
@@ -1204,8 +1193,6 @@ class EvidenceBackedFactCandidateVNext:
             self.evidence_labels,
             field_name="EvidenceBackedFactCandidateVNext.evidence_labels",
         )
-        if not isinstance(self.evidence_kind, FactEvidenceKindVNext):
-            raise TypeError("EvidenceBackedFactCandidateVNext.evidence_kind is invalid")
         _require_unique_string_tuple(
             self.source_labels,
             field_name="EvidenceBackedFactCandidateVNext.source_labels",
@@ -1220,7 +1207,6 @@ class EvidenceBackedFactCandidateVNext:
         return {
             "claim_text": self.claim_text,
             "evidence_labels": _string_list_json(self.evidence_labels),
-            "evidence_kind": self.evidence_kind.value,
             "source_labels": _string_list_json(self.source_labels),
         }
 
@@ -2981,7 +2967,6 @@ __all__ = [
     "CurrentInputAnchorVNext",
     "EvidenceBackedFactCandidateVNext",
     "EvidenceReadableItemVNext",
-    "FactEvidenceKindVNext",
     "ForwardIntentCandidateVNext",
     "ForwardIntentStatusVNext",
     "ForwardIntentTypeVNext",

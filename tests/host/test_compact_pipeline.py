@@ -35,7 +35,6 @@ from dayu.host.compaction import (
     CompactMaterialSection,
     ConversationCompactOutputVNext,
     EvidenceBackedFactCandidateVNext,
-    FactEvidenceKindVNext,
     CompactQualityCheckResultVNext,
     ReadableFactItemVNext,
 )
@@ -619,7 +618,6 @@ def _candidate_with_evidence_fact() -> ConversationCompactOutputVNext:
             EvidenceBackedFactCandidateVNext(
                 claim_text="accepted fact",
                 evidence_labels=("E1",),
-                evidence_kind=FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL,
             ),
         ),
         answer_anchors=(),

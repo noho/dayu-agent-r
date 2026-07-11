@@ -20,7 +20,6 @@ from dayu.host.compaction import (
     CompactQualityCheckResultVNext,
     ConversationCompactOutputVNext,
     EvidenceBackedFactCandidateVNext,
-    FactEvidenceKindVNext,
     ForwardIntentCandidateVNext,
     ForwardIntentStatusVNext,
     ForwardIntentTypeVNext,
@@ -307,20 +306,24 @@ def _llm_facing_memory_text_view(
 def _accepted_compact_payload(
     *,
     facts: list[EvidenceBackedFactCandidateVNext] | None = None,
-    summary_text: str = "用户关注收入增速和毛利率变化。",
+    summary_text: str | None = "用户关注收入增速和毛利率变化。",
 ) -> dict[str, JsonValue]:
     """构造 accepted vNext compact payload。
 
     :param facts: 可选 evidence-backed fact candidates。
-    :param summary_text: session summary 文本。
+    :param summary_text: session summary 文本；``None`` 表示 compact owner 未提供替换 summary。
     :returns: CONTEXT_COMPACTED payload。
     """
 
     candidate = ConversationCompactOutputVNext(
         schema_version=CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
-        session_summary=SessionSummaryCandidateVNext(
-            summary_text=summary_text,
-            source_labels=("u1",),
+        session_summary=(
+            None
+            if summary_text is None
+            else SessionSummaryCandidateVNext(
+                summary_text=summary_text,
+                source_labels=("u1",),
+            )
         ),
         evidence_backed_facts=() if facts is None else tuple(facts),
         answer_anchors=(
@@ -672,7 +675,6 @@ def _fact(claim_text: str) -> EvidenceBackedFactCandidateVNext:
     return EvidenceBackedFactCandidateVNext(
         claim_text=claim_text,
         evidence_labels=("e1",),
-        evidence_kind=FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL,
         source_labels=("e1",),
     )
 
@@ -757,7 +759,13 @@ def test_pre_compact_projection_only_builds_selected_recent_window() -> None:
     snapshot = build_conversation_memory_snapshot_from_events(
         events=(
             _event(1, "user-1", "USER_INPUT_ACCEPTED", {"display_text": "请分析收入。"}),
-            _event(2, "run-1", "RUN_SUCCEEDED", {"final_answer": "收入同比增长。"}),
+            _event(
+                2,
+                "run-1",
+                "RUN_SUCCEEDED",
+                {"final_answer": "收入同比增长。"},
+                assistant_final_answer_text="收入同比增长。",
+            ),
             _event(
                 3,
                 "tool-1",
@@ -849,7 +857,13 @@ def test_tool_awaiting_presence_does_not_change_llm_facing_memory_semantics() ->
             "TOOL_RESULT_ACCEPTED",
             {"display_text": "下载工具返回：已保存 Circle 2024 10-K。"},
         ),
-        _event(4, "run-1", "RUN_SUCCEEDED", {"final_answer": "Circle 财报已保存。"}),
+        _event(
+            4,
+            "run-1",
+            "RUN_SUCCEEDED",
+            {"final_answer": "Circle 财报已保存。"},
+            assistant_final_answer_text="Circle 财报已保存。",
+        ),
     )
     arguments = {"ticker": "CRCL"}
     arguments_digest = sha256_digest_json({"arguments": arguments})
@@ -936,6 +950,7 @@ def test_selected_recent_window_floor_protects_recent_run_groups() -> None:
                 "RUN_SUCCEEDED",
                 {"final_answer": "old answer"},
                 run_id="run-old",
+                assistant_final_answer_text="old answer",
             ),
             _event(
                 3,
@@ -950,6 +965,7 @@ def test_selected_recent_window_floor_protects_recent_run_groups() -> None:
                 "RUN_SUCCEEDED",
                 {"final_answer": "mid answer"},
                 run_id="run-mid",
+                assistant_final_answer_text="mid answer",
             ),
             _event(
                 5,
@@ -971,6 +987,7 @@ def test_selected_recent_window_floor_protects_recent_run_groups() -> None:
                 "RUN_SUCCEEDED",
                 {"final_answer": "new answer"},
                 run_id="run-new",
+                assistant_final_answer_text="new answer",
             ),
             _event(
                 8,
@@ -1090,6 +1107,46 @@ def test_accepted_compact_materializes_vnext_memory_sections() -> None:
     )
 
 
+def test_accepted_compact_without_summary_preserves_prior_session_summary() -> None:
+    """compact owner 未提供 summary replacement 时保留既有 session summary。
+
+    :returns: ``None``。
+    :raises AssertionError: facts-only compact 清空既有 session summary 时抛出。
+    """
+
+    policy = _policy()
+    snapshot = build_conversation_memory_snapshot_from_events(
+        events=(
+            _event(
+                1,
+                "compact-prior-summary",
+                CONTEXT_COMPACTED,
+                _accepted_compact_payload(summary_text="上一轮已接受 summary。"),
+            ),
+            _event(
+                2,
+                "compact-facts-only",
+                CONTEXT_COMPACTED,
+                _accepted_compact_payload(
+                    facts=[_fact("facts-only compact 仍保留旧 summary。")],
+                    summary_text=None,
+                ),
+            ),
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+
+    assert snapshot.latest_compaction_event_ref == "compact-facts-only"
+    assert snapshot.session_summary_memory.summary_text == "上一轮已接受 summary。"
+    assert snapshot.session_summary_memory.event_id == "compact-prior-summary"
+    assert snapshot.evidence_fact_memory.evidence_backed_facts[-1].claim_text == (
+        "facts-only compact 仍保留旧 summary。"
+    )
+
+
 def test_run_succeeded_summary_only_does_not_materialize_assistant_window() -> None:
     """只有 summary_text 或 nested summary 时不生成 assistant selected recent item。"""
 
@@ -1114,6 +1171,32 @@ def test_run_succeeded_summary_only_does_not_materialize_assistant_window() -> N
 
     assert snapshot.trace_memory.selected_recent_window == ()
     assert snapshot.session_summary_memory.summary_text is None
+
+
+def test_run_succeeded_raw_final_answer_payload_does_not_materialize_assistant_window() -> None:
+    """memory 不从 RUN_SUCCEEDED raw payload 自行解析 assistant final answer。
+
+    :returns: ``None``。
+    :raises AssertionError: raw payload final answer 进入 selected recent window 时抛出。
+    """
+
+    policy = _policy()
+    snapshot = build_conversation_memory_snapshot_from_events(
+        events=(
+            _event(
+                1,
+                "run-raw-final-answer",
+                "RUN_SUCCEEDED",
+                {"final_answer": "raw payload final answer 不应进入 memory"},
+            ),
+        ),
+        session_id=_SESSION_ID,
+        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+        policy=policy,
+        built_at=_NOW,
+    )
+
+    assert snapshot.trace_memory.selected_recent_window == ()
 
 
 def test_run_succeeded_payload_refs_do_not_materialize_assistant_window() -> None:
@@ -1300,7 +1383,7 @@ def test_memory_direct_consumer_does_not_follow_terminal_descriptor() -> None:
     """直接 memory consumer 在无 typed material 时不跟随 descriptor。
 
     Durable projection / RunInputBuilder 负责提供 digest-checked typed answer
-    material；纯 consumer 没有 typed material 时只读取 inline ``final_answer``。
+    material；纯 consumer 没有 typed material 时不解析 raw terminal payload。
 
     :returns: ``None``。
     :raises AssertionError: direct consumer 错误跟随 descriptor 时抛出。

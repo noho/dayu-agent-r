@@ -925,11 +925,11 @@ async def test_run_compaction_operation_retries_hard_threshold_after_compact() -
 
 
 @pytest.mark.asyncio
-async def test_run_compaction_operation_accepts_reactive_budget_estimate_overflow() -> None:
-    """reactive compact 不用 compact 后估算值阻断 recovery dispatch。
+async def test_run_compaction_operation_retries_reactive_hard_threshold_after_compact() -> None:
+    """reactive compact 后仍越过 hard threshold 时由 operation owner 重试。
 
     :returns: ``None``。
-    :raises AssertionError: reactive path 仍按估算 hard threshold reject 时抛出。
+    :raises AssertionError: reactive path 未在 operation 内执行预算验收时抛出。
     """
 
     compactor = _HardThresholdOnceCompactor()
@@ -940,11 +940,42 @@ async def test_run_compaction_operation_accepts_reactive_budget_estimate_overflo
         cancellation_token=ControllableCancellationToken(),
     )
 
-    assert compactor.calls == 1
+    assert compactor.calls == 2
     assert result.accepted_candidate is not None
     assert result.quality_result is not None
-    assert len(result.rejected_attempts) == 0
+    assert len(result.rejected_attempts) == 1
+    assert (
+        result.rejected_attempts[0].failure_category
+        is compaction_operation.CompactionFailureCategory.HARD_THRESHOLD_AFTER_COMPACT
+    )
     assert result.failure_reason is None
+
+
+@pytest.mark.asyncio
+async def test_run_compaction_operation_fails_closed_for_reactive_over_budget_output() -> None:
+    """reactive compact 超 hard threshold 且无 repair budget 时 fail closed。
+
+    :returns: ``None``。
+    :raises AssertionError: reactive over-budget output 被接受或未 fail closed 时抛出。
+    """
+
+    compactor = _HardThresholdOnceCompactor()
+    result = await run_compaction_operation(
+        request=_request(trigger_source=ContextCompactionTriggerSource.REACTIVE),
+        compactor=compactor,
+        max_attempts=1,
+        cancellation_token=ControllableCancellationToken(),
+    )
+
+    assert compactor.calls == 1
+    assert result.accepted_candidate is None
+    assert len(result.rejected_attempts) == 1
+    assert (
+        result.rejected_attempts[0].failure_category
+        is compaction_operation.CompactionFailureCategory.HARD_THRESHOLD_AFTER_COMPACT
+    )
+    assert result.rejected_attempts[0].repairable is False
+    assert result.failure_reason == "hard_threshold_after_compact"
 
 
 @pytest.mark.asyncio

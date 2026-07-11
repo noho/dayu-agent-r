@@ -91,7 +91,6 @@ from dayu.host import (
 )
 from dayu.host.compaction import (
     CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
-    FactEvidenceKindVNext,
     ForwardIntentStatusVNext,
     ForwardIntentTypeVNext,
     ReferenceContinuityReasonVNext,
@@ -1939,7 +1938,6 @@ def _fake_compaction_proposal_from_material_json(material_json: Mapping[str, Jso
             {
                 "claim_text": f"{_SMOKE_COMPACTOR_FACT_PREFIX}{_sanitize_compactor_material_text(text)}",
                 "evidence_labels": [label],
-                "evidence_kind": FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL.value,
                 "source_labels": [label],
             }
             for label, text in evidence_items

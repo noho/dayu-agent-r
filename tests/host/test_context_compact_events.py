@@ -19,7 +19,6 @@ from dayu.host.compaction import (
     CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
     ConversationCompactOutputVNext,
     EvidenceBackedFactCandidateVNext,
-    FactEvidenceKindVNext,
     ForwardIntentCandidateVNext,
     ForwardIntentStatusVNext,
     ForwardIntentTypeVNext,
@@ -197,17 +196,21 @@ def test_compacted_semantic_parser_rejects_invalid_reference_reason() -> None:
         validate_context_compacted_payload(payload)
 
 
-def test_compacted_semantic_parser_rejects_missing_host_evidence_kind() -> None:
-    """persisted parser 不兼容缺少 Host-owned evidence_kind 的 proposal shape。"""
+def test_compacted_semantic_parser_rejects_unsupported_evidence_kind_field() -> None:
+    """persisted parser 不接受 unsupported evidence_kind 字段。
+
+    :returns: ``None``。
+    :raises AssertionError: persisted parser 接受 unsupported evidence_kind 字段时抛出。
+    """
 
     payload = _valid_compacted_payload()
     candidate = _payload_mapping(payload["accepted_candidate"])
     facts = _mapping_list(candidate["evidence_backed_facts"])
-    del facts[0]["evidence_kind"]
+    facts[0]["evidence_kind"] = "accepted_evidence_material"
     candidate["evidence_backed_facts"] = cast(list[JsonValue], facts)
     _replace_candidate_and_digest(payload, candidate)
 
-    with pytest.raises(ValueError, match="evidence_kind is required"):
+    with pytest.raises(ValueError, match="evidence_kind is not supported"):
         parse_context_compacted_semantic_payload(payload)
 
 
@@ -1084,7 +1087,6 @@ def _candidate() -> ConversationCompactOutputVNext:
             EvidenceBackedFactCandidateVNext(
                 claim_text="Revenue increased.",
                 evidence_labels=("E1",),
-                evidence_kind=FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL,
                 source_labels=("E1",),
             ),
         ),

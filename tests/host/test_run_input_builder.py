@@ -116,7 +116,6 @@ from dayu.host.compaction import (
     CompactQualityCheckResultVNext,
     ConversationCompactOutputVNext,
     EvidenceBackedFactCandidateVNext,
-    FactEvidenceKindVNext,
     ForwardIntentCandidateVNext,
     ForwardIntentStatusVNext,
     ForwardIntentTypeVNext,
@@ -6619,7 +6618,6 @@ def _compact_payload(
             EvidenceBackedFactCandidateVNext(
                 claim_text="Revenue increased year over year",
                 evidence_labels=("evidence:memory-tool",),
-                evidence_kind=FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL,
                 source_labels=("evidence:memory-tool",),
             )
         ]
@@ -6628,7 +6626,6 @@ def _compact_payload(
             EvidenceBackedFactCandidateVNext(
                 claim_text=str(candidate["claim_text"]),
                 evidence_labels=("evidence:memory-tool",),
-                evidence_kind=FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL,
                 source_labels=("evidence:memory-tool",),
             )
             for candidate in fact_candidates

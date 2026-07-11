@@ -70,7 +70,6 @@ from dayu.host.compaction import (
     ContextCompactor,
     ConversationCompactOutputVNext,
     EvidenceBackedFactCandidateVNext,
-    FactEvidenceKindVNext,
     ForwardIntentCandidateVNext,
     ForwardIntentStatusVNext,
     ForwardIntentTypeVNext,
@@ -5129,7 +5128,7 @@ async def test_proactive_compaction_recovery_tier2_degrades_previous_view(
             assert tuple(
                 block.text for block in tier2_request.material_pack.previous_compacted_view
             ) == (
-                "fact=claim_text=previous evidence fact must stay exact; evidence_refs=E1",
+                "previous evidence fact must stay exact",
             )
         finally:
             await scheduler.close()
@@ -5888,6 +5887,7 @@ async def test_reactive_compact_request_uses_latest_previous_view(
             context_budget_policy=_soft_compact_policy(),
             context_compactor=reactive_compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_no_floor_memory_policy(),
         )
         try:
             reactive_scheduler.wake_dispatch(_pending_dispatch(reactive_seed))
@@ -7290,7 +7290,6 @@ def _previous_compacted_candidate() -> ConversationCompactOutputVNext:
             EvidenceBackedFactCandidateVNext(
                 claim_text="previous evidence fact must stay exact",
                 evidence_labels=("E1",),
-                evidence_kind=FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL,
             ),
         ),
         answer_anchors=(

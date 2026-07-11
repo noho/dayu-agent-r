@@ -39,7 +39,6 @@ from dayu.host.compaction import (
     CompactionRequest,
     ConversationCompactInputVNext,
     ConversationCompactOutputVNext,
-    FactEvidenceKindVNext,
     ForwardIntentStatusVNext,
     ForwardIntentTypeVNext,
 )
@@ -489,11 +488,11 @@ def test_parse_conversation_compact_output_vnext_rejects_current_anchor_label() 
         )
 
 
-def test_parse_conversation_compact_output_vnext_derives_fact_evidence_kind() -> None:
-    """vNext parser 由 Host 派生 fact evidence kind，不读取 LLM 字段。
+def test_parse_conversation_compact_output_vnext_does_not_accept_fact_evidence_kind() -> None:
+    """vNext parser 不要求也不保留 unsupported fact evidence kind。
 
     :returns: ``None``。
-    :raises AssertionError: parser 未派生内部 evidence kind 时抛出。
+    :raises AssertionError: parser 错误保留 unsupported 字段时抛出。
     """
 
     compact_input = conversation_compact_input_vnext_from_material_pack(
@@ -504,6 +503,7 @@ def test_parse_conversation_compact_output_vnext_derives_fact_evidence_kind() ->
         {
             "claim_text": "经营现金流同比增长",
             "evidence_labels": ["E1"],
+            "evidence_kind": "tool_result",
             "source_labels": [],
         }
     ]
@@ -513,9 +513,11 @@ def test_parse_conversation_compact_output_vnext_derives_fact_evidence_kind() ->
         json.dumps(proposal, sort_keys=True),
     )
 
-    assert parsed.evidence_backed_facts[0].evidence_kind is (
-        FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL
-    )
+    assert parsed.evidence_backed_facts[0].to_json() == {
+        "claim_text": "经营现金流同比增长",
+        "evidence_labels": ["E1"],
+        "source_labels": [],
+    }
 
 
 def test_parse_conversation_compact_output_vnext_reports_forward_intent_type_enum_value() -> None:

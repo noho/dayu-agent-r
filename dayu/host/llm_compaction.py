@@ -57,7 +57,6 @@ from dayu.host.compaction import (
     ConversationCompactOutputVNext,
     ContextCompactor,
     EvidenceBackedFactCandidateVNext,
-    FactEvidenceKindVNext,
     ForwardIntentCandidateVNext,
     ForwardIntentStatusVNext,
     ForwardIntentTypeVNext,
@@ -101,7 +100,6 @@ _SUMMARY_TEXT_FIELD = "summary_text"
 _SOURCE_LABELS_FIELD = "source_labels"
 _CLAIM_TEXT_FIELD = "claim_text"
 _EVIDENCE_LABELS_FIELD = "evidence_labels"
-_HOST_DERIVED_FACT_EVIDENCE_KIND = FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL
 _ANCHOR_TITLE_FIELD = "anchor_title"
 _ANCHOR_ITEMS_FIELD = "anchor_items"
 _ANSWER_SOURCE_LABELS_FIELD = "answer_source_labels"
@@ -655,7 +653,6 @@ def _fact_candidates_vnext(proposal: Mapping[str, JsonValue]) -> tuple[EvidenceB
             EvidenceBackedFactCandidateVNext(
                 claim_text=_required_string(data, _CLAIM_TEXT_FIELD, parent_path=item_path),
                 evidence_labels=_required_string_tuple(data, _EVIDENCE_LABELS_FIELD, parent_path=item_path),
-                evidence_kind=_HOST_DERIVED_FACT_EVIDENCE_KIND,
                 source_labels=_optional_string_tuple(data, _SOURCE_LABELS_FIELD, parent_path=item_path),
             )
         )

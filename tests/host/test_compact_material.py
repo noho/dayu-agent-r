@@ -51,7 +51,6 @@ from dayu.host.compaction import (
     ConversationCompactInputVNext,
     ConversationCompactOutputVNext,
     EvidenceBackedFactCandidateVNext,
-    FactEvidenceKindVNext,
     ForwardIntentCandidateVNext,
     ForwardIntentStatusVNext,
     ForwardIntentTypeVNext,
@@ -3008,7 +3007,6 @@ def _accepted_candidate() -> ConversationCompactOutputVNext:
             EvidenceBackedFactCandidateVNext(
                 claim_text="accepted fact",
                 evidence_labels=("E1",),
-                evidence_kind=FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL,
             ),
         ),
         answer_anchors=(
@@ -3058,12 +3056,10 @@ def _accepted_candidate_with_multiple_items() -> ConversationCompactOutputVNext:
             EvidenceBackedFactCandidateVNext(
                 claim_text="accepted fact one",
                 evidence_labels=("E1",),
-                evidence_kind=FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL,
             ),
             EvidenceBackedFactCandidateVNext(
                 claim_text="accepted fact two",
                 evidence_labels=("E2",),
-                evidence_kind=FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL,
             ),
         ),
         answer_anchors=(

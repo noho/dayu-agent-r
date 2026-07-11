@@ -20,7 +20,6 @@ from dayu.host.compaction import (
     CompactionRequest,
     ConversationCompactOutputVNext,
     EvidenceBackedFactCandidateVNext,
-    FactEvidenceKindVNext,
     ForwardIntentCandidateVNext,
     ForwardIntentStatusVNext,
     ForwardIntentTypeVNext,
@@ -46,7 +45,6 @@ _FIELD_SOURCE_LABELS = "source_labels"
 _FIELD_EVIDENCE_BACKED_FACTS = "evidence_backed_facts"
 _FIELD_CLAIM_TEXT = "claim_text"
 _FIELD_EVIDENCE_LABELS = "evidence_labels"
-_FIELD_EVIDENCE_KIND = "evidence_kind"
 _FIELD_ANSWER_ANCHORS = "answer_anchors"
 _FIELD_ANCHOR_TITLE = "anchor_title"
 _FIELD_ANCHOR_ITEMS = "anchor_items"
@@ -79,7 +77,6 @@ _FACT_FIELDS = frozenset(
     (
         _FIELD_CLAIM_TEXT,
         _FIELD_EVIDENCE_LABELS,
-        _FIELD_EVIDENCE_KIND,
         _FIELD_SOURCE_LABELS,
     )
 )
@@ -294,7 +291,7 @@ def _parse_fact(
     :param fact: fact JSON object。
     :param index: fact ordinal。
     :returns: typed fact candidate。
-    :raises ValueError: fact shape、文本、labels 或 evidence kind 非法时抛出。
+    :raises ValueError: fact shape、未知字段、文本或 labels 非法时抛出。
     """
 
     path = f"{_FIELD_ACCEPTED_CANDIDATE}.{_FIELD_EVIDENCE_BACKED_FACTS}[{index}]"
@@ -305,9 +302,6 @@ def _parse_fact(
             fact,
             _FIELD_EVIDENCE_LABELS,
             path=f"{path}.{_FIELD_EVIDENCE_LABELS}",
-        ),
-        evidence_kind=FactEvidenceKindVNext(
-            _required_text(fact, _FIELD_EVIDENCE_KIND)
         ),
         source_labels=_required_unique_text_list(
             fact,

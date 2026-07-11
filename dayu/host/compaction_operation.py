@@ -1,9 +1,8 @@
 """Host 内部 context compaction operation helper。
 
-本模块只执行事务外 compaction proposal attempt 循环、质量校验与 proactive
-预算硬阈值校验。reactive path 不把估算值当作是否可重新 dispatch 的真源；
-EventLog 写入、artifact 写入、memory projection 与 durable state recheck 仍由
-调用方所在的 Host governance 路径负责。
+本模块只执行事务外 compaction proposal attempt 循环、质量校验与 compact 后
+预算硬阈值校验。EventLog 写入、artifact 写入、memory projection 与 durable
+state recheck 仍由调用方所在的 Host governance 路径负责。
 """
 
 from __future__ import annotations
@@ -35,7 +34,6 @@ from dayu.host.compaction import (
 )
 from dayu.host.context_budget import estimate_post_compact_budget
 from dayu.host.context_governance import check_conversation_compact_output_vnext
-from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.durable.artifact import LocalArtifactStore
 from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.errors import HostDurableError
@@ -878,15 +876,16 @@ def _operation_pass_requests(
 def _requires_budget_acceptance(request: CompactionRequest) -> bool:
     """判断本次 operation 是否需要 compact 后预算估算闸门。
 
-    proactive path 在 dispatch 前使用估算值决定是否创建 Attempt；reactive path
-    来自真实 provider overflow，compact 后是否足够应交给后续真实 dispatch /
-    Engine event 闭环判断，避免不准估算阻断第二次 reactive compact。
+    compaction owner 必须在接受 candidate 前统一执行 hard threshold 验收；
+    proactive 与 reactive path 都不能把仍明显越界的 compact 输出交给下游
+    dispatch / Engine event 循环处理。
 
     :param request: Host compaction request。
     :returns: 需要估算闸门时返回 ``True``。
     """
 
-    return request.trigger_source is ContextCompactionTriggerSource.PROACTIVE
+    del request
+    return True
 
 
 async def _prepare_compactor_proposal(

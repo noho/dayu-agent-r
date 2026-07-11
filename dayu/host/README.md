@@ -390,7 +390,7 @@ Production wait poller 是 `open_host` 可选装配的 Host runtime。它使用 
 
 ### Context governance
 
-Context governance 使用 `ContextBudgetPolicy`、保守估算器、compact material、compact artifact store、LLM compactor 和 fallback selector 处理上下文预算。它只写 context compaction canonical facts 与 compact artifact refs；accepted compact 后由 memory projection 消费，不直接改写 memory snapshot。accepted compact 后的普通 dispatch 预算由 context budget owner 基于 accepted candidate 的业务文本与当前输入估算，candidate diagnostics 不参与预算。
+Context governance 使用 `ContextBudgetPolicy`、保守估算器、compact material、compact artifact store、LLM compactor 和 fallback selector 处理上下文预算。它只写 context compaction canonical facts 与 compact artifact refs；accepted compact 后由 memory projection 消费，不直接改写 memory snapshot。proactive 与 reactive compact 都必须在 operation owner 内基于 accepted candidate 的业务文本与当前输入通过 compact 后 hard threshold 验收；candidate diagnostics 不参与预算。
 
 ### Conversation Memory
 
@@ -663,7 +663,7 @@ Memory 当前只投影这些事件：
 - `USER_INPUT_ACCEPTED`：生成 selected recent window 的 user item。
 - `RUN_SUCCEEDED`：从 terminal answer continuity 中提取 assistant item；缺失可读 final answer 时跳过，不用 payload ref / digest / event id 补洞。
 - `TOOL_RESULT_ACCEPTED`：生成 self-explaining readable evidence item；durable memory consumer 先通过 Host accepted result projection 取得 typed LLM evidence material，Conversation Memory 总是调用 `dayu.host.evidence` 的唯一 renderer 得到工具名称、查询语义、业务来源和工具结果四行文本。material 缺失时使用同一 renderer 的整体 fallback，不从 envelope、request atom 或 raw outcome 重建 accepted evidence；正常 readable evidence 不暴露 tool call id、EventLog id、payload / artifact ref、digest、wait / poll / cancel lifecycle 或实现类型名。
-- `CONTEXT_COMPACTED`：读取 accepted `conversation_compact_output_v1` candidate，物化 session summary、evidence-backed facts、answer anchors、forward intents、reference continuity items，并记录 latest compaction event ref。
+- `CONTEXT_COMPACTED`：读取 accepted `conversation_compact_output_v1` candidate，物化 session summary、evidence-backed facts、answer anchors、forward intents、reference continuity items，并记录 latest compaction event ref；candidate 未提供 session summary replacement 时保留既有 Session Summary Memory。
 
 Memory 不消费 Host waiting lifecycle 事件。`TOOL_AWAITING`、`RUN_WAITING`、`CANCEL_REQUESTED`、`RUN_CANCELLED`、wait record、poller outcome 与 abandon 只属于 Host durable / audit / wait governance，不进入 LLM-facing memory schema；有无 awaiting 执行机制不能改变下一轮 memory 语义。长事务完成后的可读结果必须经普通 tool result / resume summary 路径进入模型上下文。
 

@@ -29,7 +29,6 @@ from dayu.host.compaction import (
     ConversationCompactInputVNext,
     ConversationCompactOutputVNext,
     EvidenceBackedFactCandidateVNext,
-    FactEvidenceKindVNext,
     SessionSummaryCandidateVNext,
 )
 from dayu.host.context_budget import BudgetEstimate
@@ -312,7 +311,6 @@ def _minimal_candidate(
             EvidenceBackedFactCandidateVNext(
                 claim_text="Fact from accepted evidence",
                 evidence_labels=("E1",),
-                evidence_kind=FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL,
                 source_labels=("E1",),
             ),
         ),

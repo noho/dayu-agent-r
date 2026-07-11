@@ -23,7 +23,6 @@ from dayu.host.compaction import (
     ContextCompactor,
     EvidenceBackedFactCandidateVNext,
     EvidenceReadableItemVNext,
-    FactEvidenceKindVNext,
     ForwardIntentCandidateVNext,
     ForwardIntentStatusVNext,
     ForwardIntentTypeVNext,
@@ -128,7 +127,6 @@ def fake_compaction_proposal_from_material_json(material_json: Mapping[str, Json
             {
                 "claim_text": f"Canonical evidence material: {item.response_text}",
                 "evidence_labels": [item.source_label],
-                "evidence_kind": FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL.value,
                 "source_labels": [item.source_label],
             }
             for item in evidence_items
@@ -196,7 +194,6 @@ def _fake_fact_candidates_vnext(
             EvidenceBackedFactCandidateVNext(
                 claim_text=f"Canonical evidence material: {item.response_text}",
                 evidence_labels=(item.source_label,),
-                evidence_kind=FactEvidenceKindVNext.ACCEPTED_EVIDENCE_MATERIAL,
                 source_labels=(item.source_label,),
             )
         )
