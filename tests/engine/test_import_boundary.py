@@ -53,11 +53,39 @@ def _engine_root() -> Path:
     return Path(package_file).resolve().parent
 
 
+def _tests_engine_root() -> Path:
+    """返回 ``tests/engine/`` 的测试根目录路径。
+
+    :returns: tests/engine 目录路径。
+    :raises AssertionError: 目录不存在时抛出。
+    """
+
+    root = Path(__file__).resolve().parent
+    assert root.name == "engine"
+    return root
+
+
 def _iter_engine_python_files() -> list[Path]:
     """递归收集 ``dayu/engine/`` 下所有 ``.py`` 文件。"""
 
     root = _engine_root()
     return sorted(p for p in root.rglob("*.py") if "__pycache__" not in p.parts)
+
+
+def _iter_engine_agent_test_files() -> list[Path]:
+    """收集非 OpenAI runner 专项的 Engine 测试文件。
+
+    :returns: tests/engine 下排除 runners/openai 子树后的 Python 文件。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    root = _tests_engine_root()
+    return sorted(
+        p
+        for p in root.rglob("*.py")
+        if "__pycache__" not in p.parts
+        and p.relative_to(root).parts[:2] != ("runners", "openai")
+    )
 
 
 def _imported_module_names(source: str) -> list[str]:
@@ -184,6 +212,22 @@ def test_engine_does_not_import_toolruntime_or_tool_declaration_owners() -> None
             )
         )
     assert not violations, f"Engine forbidden tool owner imports: {violations}"
+
+
+def test_engine_agent_tests_do_not_import_openai_runner_internals() -> None:
+    """Agent / contract 测试不得依赖 OpenAI runner 实现模块。
+
+    :returns: ``None``。
+    :raises AssertionError: 非 runner-specific 测试导入 OpenAI runner 时抛出。
+    """
+
+    forbidden_prefix = "dayu.engine.runners.openai"
+    violations: list[tuple[str, str]] = []
+    for file_path in _iter_engine_agent_test_files():
+        for module in _imported_module_names(file_path.read_text(encoding="utf-8")):
+            if module == forbidden_prefix or module.startswith(forbidden_prefix + "."):
+                violations.append((str(file_path), module))
+    assert not violations, f"Engine Agent tests import OpenAI runner internals: {violations}"
 
 
 def test_engine_tool_ownership_boundary_detects_tool_declaration_star_import() -> None:

@@ -25,7 +25,7 @@ import logging
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TypeAlias, assert_never
+from typing import TypeAlias
 
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_call import ToolCallRequest
@@ -40,11 +40,11 @@ from dayu.engine.contracts.runner_events import (
     RunnerDiagnosticSeverity,
     RunnerDiagnosticSource,
     RunnerEvent,
-    RunnerEventType,
     RunnerProtocolErrorData,
     RunnerProviderDiagnosticData,
     RunnerToolCallsCompletedData,
     RunnerUsageRecordedData,
+    runner_event_type_for_data,
 )
 from dayu.engine.runners.openai._types import (
     _OpenAIToolCallDelta,
@@ -99,21 +99,7 @@ def _make_event(data: _NonStreamRunnerEventData) -> RunnerEvent:
     """
 
     occurred_at = datetime.now(tz=timezone.utc)
-    match data:
-        case RunnerContentCompletedData():
-            event_type = RunnerEventType.RUNNER_CONTENT_COMPLETED
-        case RunnerToolCallsCompletedData():
-            event_type = RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED
-        case RunnerUsageRecordedData():
-            event_type = RunnerEventType.RUNNER_USAGE_RECORDED
-        case RunnerProviderDiagnosticData():
-            event_type = RunnerEventType.PROVIDER_DIAGNOSTIC
-        case RunnerProtocolErrorData():
-            event_type = RunnerEventType.PROVIDER_PROTOCOL_ERROR
-        case RunnerDoneData():
-            event_type = RunnerEventType.RUNNER_DONE
-        case _:
-            assert_never(data)
+    event_type = runner_event_type_for_data(data)
     return RunnerEvent(type=event_type, data=data, occurred_at=occurred_at)
 
 

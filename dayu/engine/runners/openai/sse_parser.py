@@ -43,13 +43,13 @@ from dayu.engine.contracts.runner_events import (
     RunnerDiagnosticSource,
     RunnerEvent,
     RunnerEventData,
-    RunnerEventType,
     RunnerProtocolErrorData,
     RunnerProviderDiagnosticData,
     RunnerReasoningDeltaData,
     RunnerToolCallDeltaData,
     RunnerToolCallsCompletedData,
     RunnerUsageRecordedData,
+    runner_event_type_for_data,
 )
 from dayu.engine.runners.openai._types import (
     _OpenAIToolCallDelta,
@@ -103,45 +103,12 @@ def _make_event(data: RunnerEventData) -> RunnerEvent:
 
     :param data: Runner 事件载荷。
     :returns: 带当前 UTC 时间戳的 :class:`RunnerEvent`。
-    :raises AssertionError: 当 ``data`` 不是 SSE parser 支持的事件载荷时抛出。
+    :raises TypeError: 当 ``data`` 不是 RunnerEventData 闭集成员时抛出。
     """
 
     occurred_at = datetime.now(tz=timezone.utc)
-    type_ = _event_type_for(data)
+    type_ = runner_event_type_for_data(data)
     return RunnerEvent(type=type_, data=data, occurred_at=occurred_at)
-
-
-def _event_type_for(data: RunnerEventData) -> RunnerEventType:
-    """根据 data 类型返回对应的 :class:`RunnerEventType`。
-
-    :param data: Runner 事件载荷。
-    :returns: 对应的 :class:`RunnerEventType`。
-    :raises AssertionError: 当 ``data`` 不属于 SSE parser 可产出的载荷类型时抛出。
-    """
-
-    match data:
-        case RunnerContentDeltaData():
-            return RunnerEventType.RUNNER_CONTENT_DELTA
-        case RunnerReasoningDeltaData():
-            return RunnerEventType.RUNNER_REASONING_DELTA
-        case RunnerToolCallDeltaData():
-            return RunnerEventType.RUNNER_TOOL_CALL_DELTA
-        case RunnerToolCallsCompletedData():
-            return RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED
-        case RunnerContentCompletedData():
-            return RunnerEventType.RUNNER_CONTENT_COMPLETED
-        case RunnerUsageRecordedData():
-            return RunnerEventType.RUNNER_USAGE_RECORDED
-        case RunnerProviderDiagnosticData():
-            return RunnerEventType.PROVIDER_DIAGNOSTIC
-        case RunnerProtocolErrorData():
-            return RunnerEventType.PROVIDER_PROTOCOL_ERROR
-        case RunnerDoneData():
-            return RunnerEventType.RUNNER_DONE
-        # RunnerHTTPErrorData 由 runner.py 层产生，不会进本路径。
-        case _:
-            # 不应发生：上方已穷尽 SSE parser 可产出的类型。
-            raise AssertionError(f"unexpected event data type for SSE parser: {type(data)!r}")
 
 
 def _provider_error_message(error_payload: JsonValue) -> str:

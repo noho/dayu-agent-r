@@ -8,9 +8,11 @@ Qwen 等具体协议归一为本事件流，**不**执行工具、**不**拆分�
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from types import MappingProxyType
 from typing import TypeAlias
 
 from dayu.engine.contracts.error_codes import (
@@ -309,6 +311,61 @@ RunnerEventData: TypeAlias = (
 )
 """Runner 事件 data 封闭联合。"""
 
+RUNNER_EVENT_TYPE_TO_DATA: Mapping[RunnerEventType, type[RunnerEventData]] = (
+    MappingProxyType(
+        {
+            RunnerEventType.RUNNER_CONTENT_DELTA: RunnerContentDeltaData,
+            RunnerEventType.RUNNER_REASONING_DELTA: RunnerReasoningDeltaData,
+            RunnerEventType.RUNNER_TOOL_CALL_DELTA: RunnerToolCallDeltaData,
+            RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED: RunnerToolCallsCompletedData,
+            RunnerEventType.RUNNER_CONTENT_COMPLETED: RunnerContentCompletedData,
+            RunnerEventType.RUNNER_USAGE_RECORDED: RunnerUsageRecordedData,
+            RunnerEventType.PROVIDER_DIAGNOSTIC: RunnerProviderDiagnosticData,
+            RunnerEventType.PROVIDER_PROTOCOL_ERROR: RunnerProtocolErrorData,
+            RunnerEventType.RUNNER_HTTP_ERROR: RunnerHTTPErrorData,
+            RunnerEventType.RUNNER_DONE: RunnerDoneData,
+        }
+    )
+)
+"""RunnerEvent type/data 配对真源。"""
+
+
+def runner_event_type_for_data(data: RunnerEventData) -> RunnerEventType:
+    """根据 RunnerEvent data 类型返回对应事件类型。
+
+    :param data: RunnerEvent data 联合成员。
+    :returns: 与 data 类型唯一对应的 RunnerEventType。
+    :raises TypeError: ``data`` 不是 RunnerEventData 闭集成员时抛出。
+    """
+
+    for event_type, data_type in RUNNER_EVENT_TYPE_TO_DATA.items():
+        if isinstance(data, data_type):
+            return event_type
+    raise TypeError("RunnerEvent.data has unsupported type")
+
+
+def validate_runner_event_pairing(
+    event_type: RunnerEventType, data: RunnerEventData
+) -> None:
+    """校验 RunnerEvent type/data 判别关系。
+
+    :param event_type: RunnerEventType。
+    :param data: RunnerEvent data 联合成员。
+    :returns: ``None``。
+    :raises TypeError: ``event_type`` 不是 RunnerEventType，或 ``data`` 不是
+        RunnerEventData 闭集成员时抛出。
+    :raises ValueError: type 与 data 类型不匹配时抛出。
+    """
+
+    if not isinstance(event_type, RunnerEventType):
+        raise TypeError("RunnerEvent.type must be RunnerEventType")
+    actual_type = runner_event_type_for_data(data)
+    if actual_type is not event_type:
+        raise ValueError(
+            "RunnerEvent.type/data mismatch: "
+            f"type={event_type.value} data_type={type(data).__name__}"
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class RunnerEvent:
@@ -325,6 +382,16 @@ class RunnerEvent:
     type: RunnerEventType
     data: RunnerEventData
     occurred_at: datetime
+
+    def __post_init__(self) -> None:
+        """校验 RunnerEvent 公共判别契约。
+
+        :returns: ``None``。
+        :raises TypeError: ``type`` 或 ``data`` 类型非法时抛出。
+        :raises ValueError: ``type`` 与 ``data`` 不匹配时抛出。
+        """
+
+        validate_runner_event_pairing(self.type, self.data)
 
 
 __all__ = [
@@ -346,5 +413,8 @@ __all__ = [
     "RunnerHTTPErrorData",
     "RunnerDoneData",
     "RunnerEventData",
+    "RUNNER_EVENT_TYPE_TO_DATA",
     "RunnerEvent",
+    "runner_event_type_for_data",
+    "validate_runner_event_pairing",
 ]

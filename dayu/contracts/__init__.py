@@ -29,6 +29,8 @@
   parser 与具体工具实现共享，不进入 LLM-facing tool schema。
 - :class:`ToolBundleSourceKind` / :class:`ToolBundleSourceRef` 工具 bundle
   来源引用契约。
+- :class:`AgentFallbackMode` / :data:`AGENT_FALLBACK_MODES` Agent fallback
+  mode 层中立契约。
 
 本包内部模块允许相互 import；**禁止** import :mod:`dayu.engine` 或上层
 任何包。
@@ -36,6 +38,7 @@
 
 from __future__ import annotations
 
+from dayu.contracts.agent_policy import AGENT_FALLBACK_MODES, AgentFallbackMode
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_await import (
@@ -116,6 +119,8 @@ from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 
 __all__ = [
     "ALLOWED_TOOL_CANCELLED_REASONS",
+    "AGENT_FALLBACK_MODES",
+    "AgentFallbackMode",
     "AsyncDirectToolExecutionCapability",
     "BatchToolExecutionContext",
     "BatchToolExecutionOutcome",

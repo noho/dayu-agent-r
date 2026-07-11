@@ -14,7 +14,7 @@ import pytest
 
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
-from dayu.engine.contracts.error_codes import adapter_error_code
+from dayu.engine.contracts.error_codes import EngineRunErrorCode, adapter_error_code
 from dayu.engine.contracts.engine_events import (
     EngineEvent,
     EngineEventType,
@@ -223,7 +223,7 @@ class _FailedHandle:
 
 
 class _EmptyFinalAnswerHandle:
-    """测试用产出空 final answer 的 worker handle。"""
+    """测试用产出 Engine-owned 空 final 失败的 worker handle。"""
 
     def __init__(self, snapshot: AttemptDispatchSnapshot) -> None:
         """初始化 handle。
@@ -244,7 +244,7 @@ class _EmptyFinalAnswerHandle:
         return "watch-empty-final-answer-worker"
 
     async def events(self) -> AsyncIterator[EngineEvent]:
-        """产出空 final answer EngineEvent。
+        """产出 Engine-owned 空 final 失败 EngineEvent。
 
         :returns: EngineEvent 异步迭代器。
         """
@@ -253,12 +253,13 @@ class _EmptyFinalAnswerHandle:
             occurred_at=datetime(2026, 5, 18, 1, 2, 5, tzinfo=UTC),
             session_id=self._snapshot.session_id,
             run_id=self._snapshot.run_id,
-            type=EngineEventType.FINAL_ANSWER,
-            data=FinalAnswerData(
-                content="",
-                filtered=False,
-                degraded=True,
-                finish_reason=FinishReason.LENGTH,
+            type=EngineEventType.RUN_FAILED,
+            data=RunFailedData(
+                error_code=EngineRunErrorCode.RUNNER_EMPTY_FINAL_CONTENT,
+                message="runner did not produce final content",
+                provider_request_id=None,
+                client_correlation_id=None,
+                recoverable=False,
             ),
             metadata=None,
         )
@@ -494,7 +495,7 @@ async def test_failed_and_cancelled_terminal_events_are_typed(
 async def test_empty_final_answer_terminal_projects_as_failed_event(
     tmp_path: pathlib.Path,
 ) -> None:
-    """空 final answer 不会写成 public watch 无法读取的 SUCCEEDED event。"""
+    """Engine-owned 空 final 失败会投影为 failed HostEvent。"""
 
     factory = _Factory(_WORKER_MODE_EMPTY_FINAL)
     async with open_host(_options(tmp_path, factory)) as host:
@@ -512,7 +513,7 @@ async def test_empty_final_answer_terminal_projects_as_failed_event(
     assert terminal.terminal_status is HostTerminalStatus.FAILED
     assert terminal.final_answer is None
     assert terminal.error_message is not None
-    assert "no displayable content" in terminal.error_message
+    assert "runner did not produce final content" in terminal.error_message
 
 
 @pytest.mark.asyncio

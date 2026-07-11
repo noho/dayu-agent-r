@@ -222,6 +222,7 @@ _CONSECUTIVE_FAILED_TOOL_BATCHES_MESSAGE: str = (
 _CONTINUATION_TOOL_CALL_NOT_ALLOWED_MESSAGE: str = (
     "continuation runner call produced tool calls while tools were disabled"
 )
+_FALLBACK_TRIGGER_METADATA_PREFIX: str = "trigger="
 _EXCEPTION_MESSAGE_REDACTED: str = "exception message redacted"
 _EXCEPTION_MESSAGE_MAX_LENGTH: int = 240
 _EXCEPTION_MESSAGE_TRUNCATED_SUFFIX: str = "... [truncated]"
@@ -376,6 +377,37 @@ def _fallback_error_message(error_code: EngineErrorCode) -> str:
     if error_code == _ERROR_CONSECUTIVE_FAILED_TOOL_BATCHES:
         return _CONSECUTIVE_FAILED_TOOL_BATCHES_MESSAGE
     return f"agent fallback raised error: {serialize_engine_error_code(error_code)}"
+
+
+def _fallback_trigger(error_code: EngineRunErrorCode) -> _FallbackTriggerReason:
+    """构造 Agent fallback 触发原因。
+
+    :param error_code: 触发 fallback 的 Engine-owned 错误码。
+    :returns: fallback 触发原因。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return _FallbackTriggerReason(
+        error_code=error_code,
+        message=_fallback_error_message(error_code),
+    )
+
+
+def _fallback_failure_message(
+    *, trigger: _FallbackTriggerReason, failure_message: str
+) -> str:
+    """构造保留原始 trigger 的 fallback 失败消息。
+
+    :param trigger: 触发 fallback 的 Engine-owned 结构化原因。
+    :param failure_message: force-answer 路径自身失败摘要。
+    :returns: 带原始 trigger 错误码的失败消息。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return (
+        f"{failure_message}; {_FALLBACK_TRIGGER_METADATA_PREFIX}"
+        f"{trigger.error_code.value}"
+    )
 
 
 def _build_runner(request: AgentRunRequest) -> AsyncRunner:
@@ -671,6 +703,18 @@ class _ToolBatchCompleted:
     """一批工具调用执行完成。"""
 
     records: tuple[_ToolOutcomeRecord, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _FallbackTriggerReason:
+    """Engine fallback 触发原因。
+
+    :param error_code: 触发 fallback 的 owner-level 错误码。
+    :param message: 触发原因的人类可读摘要。
+    """
+
+    error_code: EngineRunErrorCode
+    message: str
 
 
 _ToolBatchResult: TypeAlias = _ToolBatchCompleted | RunFailedData
@@ -997,7 +1041,9 @@ class _AsyncAgent:
                     async for event in self._fallback_after_tools(
                         messages=messages,
                         next_iteration_index=iteration_index + 1,
-                        error_code=_ERROR_CONSECUTIVE_FAILED_TOOL_BATCHES,
+                        trigger=_fallback_trigger(
+                            _ERROR_CONSECUTIVE_FAILED_TOOL_BATCHES
+                        ),
                     ):
                         yield event
                     return
@@ -1006,7 +1052,9 @@ class _AsyncAgent:
                     async for event in self._fallback_after_tools(
                         messages=messages,
                         next_iteration_index=iteration_index + 1,
-                        error_code=_ERROR_MAX_ITERATIONS_EXCEEDED,
+                        trigger=_fallback_trigger(
+                            _ERROR_MAX_ITERATIONS_EXCEEDED
+                        ),
                     ):
                         yield event
                     return
@@ -1787,7 +1835,7 @@ class _AsyncAgent:
         content = state.completed_content
         if content is None:
             content = "".join(state.content_chunks)
-        if reject_empty_final_content and content == "":
+        if reject_empty_final_content and content.strip() == "":
             return RunFailedData(
                 error_code=_ERROR_RUNNER_EMPTY_FINAL_CONTENT,
                 message=_RUNNER_EMPTY_FINAL_CONTENT_MESSAGE,
@@ -2196,13 +2244,13 @@ class _AsyncAgent:
         *,
         messages: list[AgentMessage],
         next_iteration_index: int,
-        error_code: EngineRunErrorCode,
+        trigger: _FallbackTriggerReason,
     ) -> AsyncIterator[EngineEvent]:
         """工具批次后按策略执行 force-answer 或 raise-error。
 
         :param messages: 可追加的 run-local 消息列表。
         :param next_iteration_index: fallback Runner 使用的迭代序号。
-        :param error_code: ``RAISE_ERROR`` 模式下使用的 Engine-owned 错误码。
+        :param trigger: 触发 fallback 的 Engine-owned 结构化原因。
         :returns: EngineEvent 异步流。
         :raises asyncio.CancelledError: 外层 task 被取消时透传。
         """
@@ -2215,14 +2263,14 @@ class _AsyncAgent:
             self._request.session_id,
             self._request.run_id,
             next_iteration_index,
-            error_code,
+            trigger.error_code,
             mode.value,
         )
         if mode is AgentFallbackMode.RAISE_ERROR:
             yield await self._make_failed_or_cancelled_terminal_with_close(
                 RunFailedData(
-                    error_code=error_code,
-                    message=_fallback_error_message(error_code),
+                    error_code=trigger.error_code,
+                    message=trigger.message,
                     provider_request_id=None,
                     recoverable=False,
                 )
@@ -2238,6 +2286,7 @@ class _AsyncAgent:
             async for event in self._run_force_answer(
                 messages=messages,
                 iteration_index=next_iteration_index,
+                trigger=trigger,
             ):
                 yield event
             return
@@ -2248,11 +2297,13 @@ class _AsyncAgent:
         *,
         messages: Sequence[AgentMessage],
         iteration_index: int,
+        trigger: _FallbackTriggerReason,
     ) -> AsyncIterator[EngineEvent]:
         """禁用工具执行一次 force-answer Runner 调用。
 
         :param messages: 已追加 fallback prompt 的消息序列。
         :param iteration_index: fallback 迭代序号。
+        :param trigger: 触发 force-answer 的 Engine-owned 结构化原因。
         :returns: EngineEvent 异步流。
         :raises asyncio.CancelledError: 外层 task 被取消时透传。
         """
@@ -2307,7 +2358,10 @@ class _AsyncAgent:
             yield await self._make_failed_or_cancelled_terminal_with_close(
                 RunFailedData(
                     error_code=_ERROR_TOOL_CALL_NOT_ENABLED,
-                    message=_TOOL_CALL_NOT_ENABLED_MESSAGE,
+                    message=_fallback_failure_message(
+                        trigger=trigger,
+                        failure_message=_TOOL_CALL_NOT_ENABLED_MESSAGE,
+                    ),
                     provider_request_id=state.provider_request_id,
                     client_correlation_id=_client_correlation_id_from_state(
                         state
@@ -2317,16 +2371,30 @@ class _AsyncAgent:
             )
             return
         if isinstance(decision, RunFailedData):
+            if decision.error_code == _ERROR_TOOL_CALL_NOT_ENABLED:
+                decision = RunFailedData(
+                    error_code=decision.error_code,
+                    message=_fallback_failure_message(
+                        trigger=trigger,
+                        failure_message=_TOOL_CALL_NOT_ENABLED_MESSAGE,
+                    ),
+                    provider_request_id=decision.provider_request_id,
+                    recoverable=decision.recoverable,
+                    client_correlation_id=decision.client_correlation_id,
+                )
             yield await self._make_failed_or_cancelled_terminal_with_close(
                 decision
             )
             return
         if isinstance(decision, _FinalDecision):
-            if decision.content == "":
+            if decision.content.strip() == "":
                 yield await self._make_failed_or_cancelled_terminal_with_close(
                     RunFailedData(
                         error_code=_ERROR_FORCE_ANSWER_EMPTY,
-                        message=_FORCE_ANSWER_EMPTY_MESSAGE,
+                        message=_fallback_failure_message(
+                            trigger=trigger,
+                            failure_message=_FORCE_ANSWER_EMPTY_MESSAGE,
+                        ),
                         provider_request_id=None,
                         client_correlation_id=_client_correlation_id_from_state(
                             state

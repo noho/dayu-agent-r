@@ -587,23 +587,24 @@ def test_terminal_plans_use_lifecycle_event_owner_helpers() -> None:
     )
 
 
-def test_empty_final_answer_closes_failed_without_run_succeeded(
+def test_engine_owned_empty_final_failure_closes_failed(
     tmp_path: Path,
 ) -> None:
-    """空 final_answer 不写入无法 public 投影的 RUN_SUCCEEDED。"""
+    """Engine-owned 空 final 失败事实映射为 Host FAILED。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
         candidate = _candidate(
             seeded,
             worker_event_index=2,
-            data=FinalAnswerData(
-                content="",
-                filtered=False,
-                degraded=True,
-                finish_reason=FinishReason.LENGTH,
+            data=RunFailedData(
+                error_code=EngineRunErrorCode.RUNNER_EMPTY_FINAL_CONTENT,
+                message="runner did not produce final content",
+                provider_request_id=None,
+                client_correlation_id=None,
+                recoverable=False,
             ),
-            event_type=EngineEventType.FINAL_ANSWER,
+            event_type=EngineEventType.RUN_FAILED,
         )
 
         result = EngineEventIngestor(
@@ -618,12 +619,12 @@ def test_empty_final_answer_closes_failed_without_run_succeeded(
         assert _event_count(store.transaction_runner, "RUN_SUCCEEDED") == 0
         assert _event_count(store.transaction_runner, "RUN_FAILED") == 1
         payload = _payload(result.events[0])
-        assert payload["error_code"] == "empty_final_answer"
+        assert payload["error_code"] == "runner_empty_final_content"
         assert payload["recoverable"] is False
         assert "content" not in payload
         assert "final_answer" not in payload
         run_payload = _payload(result.events[1])
-        assert run_payload["error_code"] == "empty_final_answer"
+        assert run_payload["error_code"] == "runner_empty_final_content"
         assert "content" not in run_payload
         assert "final_answer" not in run_payload
         run_status, attempt_status = _statuses(store.transaction_runner, seeded)

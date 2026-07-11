@@ -171,7 +171,7 @@ Engine 公共契约分为 Engine 专属契约与 Dayu Agent 公共契约。
 ### Engine 专属契约
 
 - `AgentRunRequest`：单次 run 的完整输入快照。
-- `AgentPolicy`：Agent loop 策略，包含 iteration 预算、continuation 预算、工具开关、工具握手 timeout、fallback 模式、fallback prompt、continuation prompt 与连续失败工具批次阈值。`fallback_prompt` 与 `continuation_prompt` 是调用方已经解析好的必填文本；Engine 不提供 LLM-facing prompt 默认值。
+- `AgentPolicy`：Agent loop 策略，包含 iteration 预算、continuation 预算、工具开关、工具握手 timeout、fallback 模式、fallback prompt、continuation prompt 与连续失败工具批次阈值。`fallback_mode` 的合法值来自层中立 `AgentFallbackMode`，`AgentPolicy` 构造时校验该字段；runtime、Service 与 scene 装配只能消费同一枚举契约。`fallback_prompt` 与 `continuation_prompt` 是调用方已经解析好的必填文本；Engine 不提供 LLM-facing prompt 默认值。
 - `AgentRunResult`：`run_agent_and_wait` 的终态返回封闭联合。
 - `EngineRunErrorCode` / `RunnerSpecificErrorCode`：Agent / Engine
   已知失败使用 Engine-owned 枚举；provider / runner adapter 专有协议码使用
@@ -181,7 +181,7 @@ Engine 公共契约分为 Engine 专属契约与 Dayu Agent 公共契约。
 - `AssistantToolCall`：assistant 消息中的工具调用记录，保留 `provider_state` 以支持 provider roundtrip。
 - `EngineEvent`：Engine 对调用方暴露的公共事件，字段包括 `occurred_at`、`session_id`、`run_id`、`type`、`data`、`metadata`。
 - `EngineEventData`：Engine 事件 data 封闭联合，每个 `EngineEventType` 对应明确 data dataclass。
-- `RunnerEvent`：Runner 到 Agent 的协议归一事件，不含 `session_id` / `run_id`。
+- `RunnerEvent`：Runner 到 Agent 的协议归一事件，不含 `session_id` / `run_id`；构造时校验 `RunnerEventType` 与 data dataclass 的唯一配对，Runner adapter 复用 Engine contract 中的配对映射与派生 helper。
 - `AsyncRunner`：Engine 调用模型 provider 的协议，定义 `call(...)`、`is_supports_tool_calling()`、`close()`。
 - `RunnerSpec`：Runner 规约，包含 provider、model、endpoint、API key 引用、headers、client correlation policy、tool / stream capability、timeout、retry、provider 请求扩展、SSE idle 配置。
 - `RunnerCallOptions`：单次 Runner 调用参数，包含 `temperature`、`max_tokens`、`top_p`、`stream`。
@@ -351,6 +351,7 @@ Runner tool calls completed
 - `FORCE_ANSWER`：追加 `fallback_prompt`，禁用工具再调用一次 Runner；成功得到最终回答时标记 `degraded=True`。
 
 force-answer Runner 调用前会观察取消；一旦 final content 已被接受，迟到取消不改写 final answer。
+force-answer 自身失败时，Engine 产出的失败原因保留触发 fallback 的原始错误码，避免下游从 message 字符串反推触发来源。
 
 ### Suspend / resume
 
@@ -520,7 +521,7 @@ Engine / Runner 日志不输出完整 prompt、provider headers、API key、完�
 
 扩展 Engine 公共事件时，必须同步扩展 `EngineEventType`、对应 data dataclass、`EngineEventData` 封闭联合，以及 RunnerEvent 提升或 Agent 产出路径。
 
-扩展 RunnerEvent 时，必须同步扩展 `RunnerEventType`、对应 data dataclass、`RunnerEventData` 封闭联合，以及 Runner 实现和 Agent 消费路径。
+扩展 RunnerEvent 时，必须同步扩展 `RunnerEventType`、对应 data dataclass、`RunnerEventData` 封闭联合、Engine contract 中的 type/data 配对映射与派生 helper，以及 Runner 实现和 Agent 消费路径。
 
 扩展 provider 请求参数时，优先进入 `RunnerSpec.provider_request` 的 provider extension；单次采样、输出长度、top-p 和流式开关进入 `RunnerCallOptions`。
 

@@ -253,7 +253,6 @@ _REASON_UNSUPPORTED_RECOVERY_POLICY = "unsupported_recovery_policy"
 _REASON_UNSUPPORTED_WAITING_PATH = "unsupported_waiting_path"
 _REASON_STREAM_ENDED_WITHOUT_TERMINAL = "stream_ended_without_terminal"
 _REASON_WORKER_LOST_BEFORE_TERMINAL = "worker_lost_before_terminal"
-_REASON_EMPTY_FINAL_ANSWER = "empty_final_answer"
 _REASON_STALE_EXECUTION_ID = "stale_execution_id"
 _REASON_TERMINAL_ALREADY_CLOSED = "terminal_already_closed"
 _REASON_TERMINAL_CLOSEOUT_PRECONDITION_FAILED = (
@@ -4963,19 +4962,6 @@ def _final_answer_plan(data: FinalAnswerData) -> _EngineTerminalPlan:
     :raises: 无主动抛出。
     """
 
-    if data.content.strip() == "":
-        return _failed_plan(
-            reason=_REASON_EMPTY_FINAL_ANSWER,
-            error_code=_REASON_EMPTY_FINAL_ANSWER,
-            message=(
-                "Engine final_answer contained no displayable content; "
-                f"finish_reason={data.finish_reason.value}"
-            ),
-            provider_request_id=None,
-            client_correlation_id=None,
-            recoverable=False,
-            unsupported_later_owner=None,
-        )
     return _EngineTerminalPlan(
         terminal=_TerminalFactPlan(
             attempt_event_type=_closeout_attempt_event_type(

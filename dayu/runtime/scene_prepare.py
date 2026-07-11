@@ -18,13 +18,13 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Final, TypeAlias, TypeVar, cast
 
-from dayu.contracts import JsonValue, ToolBundle
-from dayu.runtime._digest import canonical_json_digest, text_digest
-from dayu.runtime._agent_policy_constants import (
-    AGENT_FALLBACK_MODE_FORCE_ANSWER,
-    AGENT_FALLBACK_MODE_RAISE_ERROR,
+from dayu.contracts import (
     AGENT_FALLBACK_MODES,
+    AgentFallbackMode,
+    JsonValue,
+    ToolBundle,
 )
+from dayu.runtime._digest import canonical_json_digest, text_digest
 
 _SCHEMA_VERSION: Final[int] = 1
 _SCENE_FILE_SUFFIX: Final[str] = ".json"
@@ -101,13 +101,6 @@ class SceneToolSelectionMode(StrEnum):
     ALL = "all"
     NONE = "none"
     SELECT = "select"
-
-
-class SceneAgentFallbackMode(StrEnum):
-    """scene agent policy override 支持的 fallback 模式。"""
-
-    FORCE_ANSWER = AGENT_FALLBACK_MODE_FORCE_ANSWER
-    RAISE_ERROR = AGENT_FALLBACK_MODE_RAISE_ERROR
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,7 +264,7 @@ class SceneAgentPolicyOverride:
     continuation_max_attempts: int | None = None
     allow_tool_calls: bool | None = None
     tool_execution_timeout_seconds: float | None = None
-    fallback_mode: SceneAgentFallbackMode | None = None
+    fallback_mode: AgentFallbackMode | None = None
     fallback_prompt: str | None = None
     continuation_prompt: str | None = None
     max_consecutive_failed_tool_batches: int | None = None
@@ -1403,7 +1396,7 @@ def _require_no_unknown_fields(record: JsonObject, *, allowed: frozenset[str], c
         raise ScenePrepareError(f"{context} contains unsupported fields: " + ", ".join(sorted(unknown)))
 
 
-def _parse_optional_fallback_mode(record: JsonObject, *, context: str) -> SceneAgentFallbackMode | None:
+def _parse_optional_fallback_mode(record: JsonObject, *, context: str) -> AgentFallbackMode | None:
     """解析可选 fallback mode。
 
     :param record: agent policy override JSON object。
@@ -1417,7 +1410,7 @@ def _parse_optional_fallback_mode(record: JsonObject, *, context: str) -> SceneA
         return None
     if mode not in AGENT_FALLBACK_MODES:
         raise ScenePrepareError(f"{context}.fallback_mode is unsupported: {mode}")
-    return SceneAgentFallbackMode(mode)
+    return AgentFallbackMode(mode)
 
 
 def _text_sequence_json(values: tuple[str, ...]) -> JsonValue:
@@ -1871,7 +1864,6 @@ def _require_non_empty_text(value: str, *, field_name: str) -> str:
 __all__ = [
     "PreparedSceneInputs",
     "SceneFragmentRef",
-    "SceneAgentFallbackMode",
     "SceneAgentPolicyOverride",
     "SceneModelHints",
     "ScenePrepare",

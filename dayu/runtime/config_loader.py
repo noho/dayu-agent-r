@@ -16,8 +16,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Final, TypeAlias, cast
 
-from dayu.contracts import JsonValue, ToolBundleSourceKind
-from dayu.runtime._agent_policy_constants import AGENT_FALLBACK_MODES
+from dayu.contracts import AGENT_FALLBACK_MODES, JsonValue, ToolBundleSourceKind
 
 _MODELS_FILE: Final[str] = "models.json"
 _EXECUTION_PROFILES_FILE: Final[str] = "execution_profiles.json"

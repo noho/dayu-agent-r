@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Final, Generic, TypeVar
 
-from dayu.contracts import JsonValue
+from dayu.contracts import AGENT_FALLBACK_MODES, JsonValue
 from dayu.contracts.tool_schema import (
     ToolTruncateSpec,
     ToolTruncationStrategy,
@@ -28,9 +28,7 @@ from dayu.runtime.config_loader import (
     RunnerOptionHintConfig,
     ToolTruncationPolicyConfig,
 )
-from dayu.runtime._agent_policy_constants import AGENT_FALLBACK_MODES
 from dayu.runtime.scene_prepare import (
-    SceneAgentFallbackMode,
     SceneAgentPolicyOverride,
     SceneModelHints,
 )

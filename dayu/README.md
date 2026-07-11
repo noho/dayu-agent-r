@@ -179,6 +179,7 @@ HostEvent、outbox、Conversation Memory、tool trace、audit、diagnostic 和 p
 - `ToolExecutor`：只包含 `execute(BatchToolExecutionRequest)` 的批式执行协议。
 - `ToolResultSuccess`、`ToolResultFailure`、`ToolResultEnvelope`、`ToolResultMeta`：工具结果 envelope。
 - `ToolBundleSourceKind`、`ToolBundleSourceRef`：工具 bundle 来源引用。
+- `AgentFallbackMode`、`AGENT_FALLBACK_MODES`：Agent fallback mode 的层中立枚举和值集合，供 runtime、Service 与 Engine `AgentPolicy` construction boundary 同源消费。
 
 `dayu.contracts` 不承载 Host / Engine 状态机，不承载财报业务事实，也不把 tool definition 直接变成 Host-governed execution。definition / bundle 只能投影为 `ToolSchema` 后进入 Engine；实际执行必须由 Host / ToolRuntime 或等价调用方包装成 `ToolExecutor`。
 

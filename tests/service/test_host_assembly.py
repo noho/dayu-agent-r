@@ -13,6 +13,7 @@ import pytest
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts import (
+    AgentFallbackMode,
     AsyncDirectToolExecutionCapability,
     BatchToolExecutionContext,
     JsonValue,
@@ -29,7 +30,7 @@ from dayu.contracts import (
     ToolParametersSchema,
     ToolSchema,
 )
-from dayu.engine import AgentFallbackMode, AgentPolicy
+from dayu.engine import AgentPolicy
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy
 from dayu.fins.direct_events import FinsOperationKind
 from dayu.fins.ingestion.observation_handle import (
@@ -71,7 +72,6 @@ from dayu.runtime.location import RuntimeLocations, resolve_runtime_locations
 from dayu.runtime.assembly import RuntimeAssemblySelectionError
 from dayu.runtime.scene_prepare import (
     PreparedSceneInputs,
-    SceneAgentFallbackMode,
     SceneAgentPolicyOverride,
     ScenePrepareRequest,
     SceneToolCatalog,
@@ -160,7 +160,7 @@ def _complete_compactor_agent_policy_override() -> SceneAgentPolicyOverride:
         continuation_max_attempts=0,
         allow_tool_calls=False,
         tool_execution_timeout_seconds=1.0,
-        fallback_mode=SceneAgentFallbackMode.RAISE_ERROR,
+        fallback_mode=AgentFallbackMode.RAISE_ERROR,
         fallback_prompt="Compactor is not allowed to fallback-answer.",
         continuation_prompt="Continue strict JSON.",
         max_consecutive_failed_tool_batches=1,
@@ -741,10 +741,10 @@ def test_compactor_agent_policy_requires_selected_fields(
 
 
 def test_agent_fallback_mode_from_config_uses_engine_enum_values() -> None:
-    """fallback mode 映射复用 Engine enum 原生值校验。
+    """fallback mode 映射复用共享枚举原生值校验。
 
     :returns: ``None``。
-    :raises AssertionError: 合法值未映射到对应 Engine enum 时抛出。
+    :raises AssertionError: 合法值未映射到对应共享枚举时抛出。
     :raises ValueError: 非法值未保持 ``ValueError`` 语义时抛出。
     """
 

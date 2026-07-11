@@ -8,6 +8,7 @@ from typing import cast
 
 import pytest
 
+from dayu.contracts import AgentFallbackMode
 from dayu.contracts.tool_schema import ToolTruncateSpec, ToolTruncationStrategy
 from dayu.runtime.assembly import (
     AgentPolicyBaseline,
@@ -24,7 +25,6 @@ from dayu.runtime.assembly import (
 )
 from dayu.runtime.config_loader import ExecutionBaselineConfig, load_runtime_config
 from dayu.runtime.scene_prepare import (
-    SceneAgentFallbackMode,
     SceneAgentPolicyOverride,
     SceneModelHints,
 )
@@ -131,9 +131,9 @@ def test_parse_overrides_fail_fast_for_unknown_fields() -> None:
 
 
 def test_parse_agent_policy_override_accepts_scene_fallback_enum_values() -> None:
-    """runtime fallback_mode 白名单必须与 scene typed enum 保持同源。"""
+    """runtime fallback_mode 白名单必须与共享枚举保持同源。"""
 
-    for fallback_mode in SceneAgentFallbackMode:
+    for fallback_mode in AgentFallbackMode:
         override = parse_agent_policy_override_config(
             {"fallback_mode": fallback_mode.value},
             source_name="run_override",
@@ -158,7 +158,7 @@ def test_merge_agent_policy_config_uses_typed_allowlist_precedence() -> None:
     )
     scene_override = SceneAgentPolicyOverride(
         max_iterations=7,
-        fallback_mode=SceneAgentFallbackMode.RAISE_ERROR,
+        fallback_mode=AgentFallbackMode.RAISE_ERROR,
     )
 
     merged = merge_agent_policy_config(

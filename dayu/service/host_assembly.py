@@ -22,7 +22,8 @@ from dayu.contracts import (
     ToolBundleSourceRef,
 )
 from dayu.contracts.tool_declaration import ToolDefinition
-from dayu.engine import AgentFallbackMode, AgentPolicy
+from dayu.contracts import AgentFallbackMode
+from dayu.engine import AgentPolicy
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.engine.provider_extensions import provider_request_extension_from_json
 from dayu.fins.ingestion.observation_handle import FinsObservationRuntime
@@ -1709,10 +1710,10 @@ def _agent_policy_from_merged(config: MergedAgentPolicyConfig) -> AgentPolicy:
 
 
 def _agent_fallback_mode_from_config(value: str) -> AgentFallbackMode:
-    """把 runtime config fallback mode 映射为 Engine AgentFallbackMode。
+    """把 runtime config fallback mode 映射为共享 AgentFallbackMode。
 
     :param value: runtime config fallback mode。
-    :returns: Engine AgentFallbackMode。
+    :returns: 共享 AgentFallbackMode。
     :raises ValueError: fallback mode 不受支持时抛出。
     """
 

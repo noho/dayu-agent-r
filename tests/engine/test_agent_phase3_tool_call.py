@@ -9,6 +9,7 @@ import math
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import cast
 
 import pytest
 from _pytest.logging import LogCaptureFixture
@@ -73,7 +74,6 @@ from dayu.engine.contracts.runner_events import (
 )
 from dayu.engine.contracts.runner_identity import RunnerRequestIdentity
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
-from dayu.engine.runners.openai.non_stream_parser import parse_non_stream_response
 from dayu.contracts.tool_await import (
     ToolAwaitKind,
     ToolAwaitSnapshot,
@@ -85,7 +85,6 @@ from dayu.contracts.tool_schema import (
     ToolSchema,
 )
 from tests.host.fake_cancellation import ControllableCancellationToken
-from tests.engine.runners.openai._sse_helpers import make_no_thought_hook
 
 _TOOL_EXECUTION_TIMEOUT_SECONDS: float = 5.0
 _FAST_TOOL_EXECUTION_TIMEOUT_SECONDS: float = 0.01
@@ -793,7 +792,11 @@ def test_agent_policy_prompt_fields_are_required() -> None:
 
 
 def test_agent_policy_rejects_invalid_values() -> None:
-    """AgentPolicy 非法策略值必须在 contract 构造期 fail fast。"""
+    """AgentPolicy 非法策略值必须在 contract 构造期 fail fast。
+
+    :returns: ``None``。
+    :raises AssertionError: 非法策略值未被构造期校验拒绝时抛出。
+    """
 
     for threshold in _INVALID_FAILED_BATCH_THRESHOLDS:
         with pytest.raises(ValueError):
@@ -858,6 +861,16 @@ def test_agent_policy_rejects_invalid_values() -> None:
                 fallback_prompt=invalid_fallback_prompt,
                 continuation_prompt=_TEST_CONTINUATION_PROMPT,
             )
+    with pytest.raises(TypeError, match="fallback_mode"):
+        AgentPolicy(
+            max_iterations=_MINIMAL_MAX_ITERATIONS,
+            continuation_max_attempts=_NO_CONTINUATION_ATTEMPTS,
+            allow_tool_calls=True,
+            tool_execution_timeout_seconds=_TOOL_EXECUTION_TIMEOUT_SECONDS,
+            fallback_prompt=_TEST_FALLBACK_PROMPT,
+            continuation_prompt=_TEST_CONTINUATION_PROMPT,
+            fallback_mode=cast(AgentFallbackMode, "unsupported"),
+        )
 
 
 def test_tool_await_spec_rejects_invalid_resume_token() -> None:
@@ -1181,38 +1194,31 @@ async def test_tool_call_iteration_empty_tool_content_falls_back_to_completed_co
 
 @pytest.mark.asyncio
 async def test_non_stream_tool_calls_preserve_reasoning_content() -> None:
-    """非流式 tool_calls 的 reasoning_content 必须进入下一轮 assistant。"""
+    """非流式 tool_calls 的 reasoning_content 必须进入下一轮 assistant。
 
-    payload = json.dumps(
-        {
-            "choices": [
-                {
-                    "finish_reason": "tool_calls",
-                    "message": {
-                        "role": "assistant",
-                        "content": None,
-                        "reasoning_content": "非流式推理",
-                        "tool_calls": [
-                            {
-                                "id": "tc_1",
-                                "type": "function",
-                                "function": {
-                                    "name": "add_numbers",
-                                    "arguments": "{\"a\":2,\"b\":3}",
-                                },
-                            }
-                        ],
-                    },
-                }
-            ]
-        }
-    ).encode("utf-8")
-    first_script = tuple(
-        parse_non_stream_response(
-            payload,
-            hook=make_no_thought_hook(),
-            provider_request_id=None,
-        )
+    :returns: ``None``。
+    :raises AssertionError: reasoning_content 未进入下一轮 assistant 时抛出。
+    """
+
+    first_script = (
+        _event(
+            RunnerEventType.RUNNER_CONTENT_COMPLETED,
+            RunnerContentCompletedData(
+                content=None,
+                reasoning_content="非流式推理",
+            ),
+        ),
+        _event(
+            RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED,
+            RunnerToolCallsCompletedData(tool_calls=(_tool_call("tc_1"),)),
+        ),
+        _event(
+            RunnerEventType.RUNNER_DONE,
+            RunnerDoneData(
+                finish_reason=FinishReason.TOOL_CALLS,
+                provider_request_id=None,
+            ),
+        ),
     )
     executor = _RecordingToolExecutor(outcomes={"tc_1": _success({"sum": 5})})
     runner = _ScriptedRunner(scripts=(first_script, _final_script("5")))
@@ -1955,7 +1961,11 @@ async def test_max_iterations_force_answer_and_raise_error() -> None:
 
 @pytest.mark.asyncio
 async def test_force_answer_empty_and_tool_call_are_fail_closed() -> None:
-    """force-answer 空内容或继续 tool call 都不能伪装成 final。"""
+    """force-answer 空内容或继续 tool call 都不能伪装成 final。
+
+    :returns: ``None``。
+    :raises AssertionError: force-answer 失败被伪装成成功 final 时抛出。
+    """
 
     empty_runner = _ScriptedRunner(
         scripts=(_tool_script(_tool_call("tc_1")), _final_script(""))
@@ -1971,6 +1981,7 @@ async def test_force_answer_empty_and_tool_call_are_fail_closed() -> None:
     )
     empty_failure = _failed_data(empty_events)
     assert empty_failure.error_code == "force_answer_empty"
+    assert "trigger=max_iterations_exceeded" in empty_failure.message
     assert empty_runner.request_identities_seen[1] is not None
     assert empty_failure.client_correlation_id == (
         empty_runner.request_identities_seen[1].client_correlation_id
@@ -1996,10 +2007,36 @@ async def test_force_answer_empty_and_tool_call_are_fail_closed() -> None:
     )
     force_tool_failure = _failed_data(tool_call_events)
     assert force_tool_failure.error_code == "tool_call_not_enabled"
+    assert "trigger=max_iterations_exceeded" in force_tool_failure.message
     assert force_tool_failure.provider_request_id == "req_force_tool"
     assert tool_call_runner.request_identities_seen[1] is not None
     assert force_tool_failure.client_correlation_id == (
         tool_call_runner.request_identities_seen[1].client_correlation_id
+    )
+
+    failed_batch_runner = _ScriptedRunner(
+        scripts=(
+            _tool_script(_tool_call("tc_1")),
+            _tool_script(_tool_call("tc_2")),
+            _final_script(""),
+        )
+    )
+    failed_batch_events = await _collect(
+        _AsyncAgent(
+            request=_request(
+                executor=_RecordingToolExecutor(
+                    outcomes={"tc_1": _failed(), "tc_2": _failed()}
+                ),
+                max_iterations=3,
+            ),
+            runner=failed_batch_runner,
+        )
+    )
+    failed_batch_failure = _failed_data(failed_batch_events)
+    assert failed_batch_failure.error_code == "force_answer_empty"
+    assert (
+        "trigger=consecutive_failed_tool_batches"
+        in failed_batch_failure.message
     )
 
 

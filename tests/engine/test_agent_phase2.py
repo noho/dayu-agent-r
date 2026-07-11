@@ -268,6 +268,76 @@ class _ScriptedRunner:
                 await self.release_event.wait()
 
 
+class _MalformedPairingRunner:
+    """测试用 malformed RunnerEvent 生产者。"""
+
+    close_count: int
+
+    def __init__(self) -> None:
+        """初始化测试 Runner。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.close_count = 0
+
+    def call(
+        self,
+        messages: Sequence[AgentMessage],
+        options: RunnerCallOptions,
+        tools: Sequence[ToolSchema],
+        *,
+        request_identity: RunnerRequestIdentity | None,
+    ) -> AsyncIterator[RunnerEvent]:
+        """返回会在迭代时构造非法 RunnerEvent 的事件流。
+
+        :param messages: Agent 消息。
+        :param options: Runner 调用选项。
+        :param tools: 暴露给模型的工具 schema。
+        :param request_identity: 本次逻辑 Runner 调用的请求身份。
+        :returns: RunnerEvent 异步流。
+        :raises ValueError: 迭代时由 RunnerEvent 构造边界抛出。
+        """
+
+        del messages, options, tools, request_identity
+        return self._iter_events()
+
+    def is_supports_tool_calling(self) -> bool:
+        """声明支持工具调用。
+
+        :returns: ``True``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return True
+
+    async def close(self) -> None:
+        """记录 close 调用。
+
+        :returns: 无返回值。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.close_count += 1
+
+    async def _iter_events(self) -> AsyncIterator[RunnerEvent]:
+        """迭代时构造 type/data 矛盾 RunnerEvent。
+
+        :returns: 理论上不会成功产出的 RunnerEvent 流。
+        :raises ValueError: RunnerEvent 公共契约拒绝 malformed pairing。
+        """
+
+        yield RunnerEvent(
+            type=RunnerEventType.RUNNER_CONTENT_DELTA,
+            data=RunnerDoneData(
+                finish_reason=FinishReason.STOP,
+                provider_request_id=None,
+            ),
+            occurred_at=_utc_now(),
+        )
+
+
 class _PublicEntryDefaultRunner:
     """测试 public entry 默认 Runner 装配与关闭的 fake OpenAI Runner。"""
 
@@ -561,6 +631,64 @@ async def test_success_run_lifts_runner_events_and_agent_final() -> None:
     assert len(usage_reported) == 1
     assert isinstance(usage_reported[0].data, UsageReportedData)
     assert usage_reported[0].data.provider_request_id == "req-usage"
+    _assert_single_terminal_at_end(events)
+
+
+@pytest.mark.asyncio
+async def test_whitespace_only_final_answer_fails_closed() -> None:
+    """Engine 拥有 final answer 有效性，纯空白回答必须失败收口。
+
+    :returns: ``None``。
+    :raises AssertionError: 纯空白回答被解释成成功 final 时抛出。
+    """
+
+    runner = _ScriptedRunner(
+        events=(
+            _event(
+                RunnerEventType.RUNNER_CONTENT_COMPLETED,
+                RunnerContentCompletedData(
+                    content=" \n\t ",
+                    reasoning_content=None,
+                ),
+            ),
+            _event(
+                RunnerEventType.RUNNER_DONE,
+                RunnerDoneData(
+                    finish_reason=FinishReason.STOP,
+                    provider_request_id="req_blank",
+                ),
+            ),
+        )
+    )
+
+    events = await _collect(_AsyncAgent(request=_request(), runner=runner))
+
+    terminal = _final_event(events)
+    assert terminal.type is EngineEventType.RUN_FAILED
+    assert isinstance(terminal.data, RunFailedData)
+    assert terminal.data.error_code is EngineRunErrorCode.RUNNER_EMPTY_FINAL_CONTENT
+    assert terminal.data.provider_request_id == "req_blank"
+    assert runner.close_count == 1
+    _assert_single_terminal_at_end(events)
+
+
+@pytest.mark.asyncio
+async def test_malformed_runner_event_pairing_fails_closed() -> None:
+    """custom Runner malformed event 不得被 Agent 解释成成功 final。
+
+    :returns: ``None``。
+    :raises AssertionError: malformed RunnerEvent 被解释成成功 final 时抛出。
+    """
+
+    runner = _MalformedPairingRunner()
+
+    events = await _collect(_AsyncAgent(request=_request(), runner=runner))
+
+    terminal = _final_event(events)
+    assert terminal.type is EngineEventType.RUN_FAILED
+    assert isinstance(terminal.data, RunFailedData)
+    assert terminal.data.error_code is EngineRunErrorCode.RUNNER_EXCEPTION
+    assert runner.close_count == 1
     _assert_single_terminal_at_end(events)
 
 
