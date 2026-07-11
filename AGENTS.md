@@ -23,11 +23,12 @@
 
 ## 语义所有权与修复边界【必须遵守】
 
-- 修复/实现任何问题前，必须先判定出错语义的 owner boundary：谁第一次产生该事实、谁负责校验该事实、谁负责持久化该事实、谁负责投影该事实。
-- 修复/实现必须落在 owner boundary 或其直接上游输入校验处；禁止在下游消费者、展示层、测试夹具或单一入口用特例分支掩盖错误语义。
-- 若多个消费者需要同一语义，必须抽取或复用同一个 source-of-truth / public contract / projection helper；禁止每个消费者各自重建、猜测或格式化一份。
-- durable state、trace、memory、audit、UI 输出、LLM-facing prompt/schema 中出现同一业务事实时，必须能说明它们从同一个真源派生；不能出现“显示正确但持久化错误”或“trace 正确但 memory 错误”。
-- 修复完成前必须做一次 propagation audit：列出该语义从产生、持久化、审计、投影到用户/LLM 可见输出的路径，并确认每一处语义一致。
+- 每个业务事实、状态、错误原因、格式化规则、派生值、LLM-facing 语义、schema 字段或协议字段，都必须有唯一清晰 owner：负责产生、校验、持久化、投影和对外承诺该语义的层、模块、类型、状态机、schema 或 API。
+- 实现/修复前必须先判定语义 owner。代码必须改在 owner boundary 或其直接上游输入校验处；禁止在下游消费者、展示层、adapter、测试夹具或单一入口用 fallback、特例、重算、loose parsing、`hasattr/getattr`、默认值或兼容分支补救错误语义。
+- 多个消费者需要同一语义时，必须复用同一个 source of truth / public contract / projection helper；禁止各自从 raw fields、内部字段、日志、字符串、时间戳、偶然顺序或历史行为中反推语义。
+- durable state、trace、memory、audit、UI 输出、LLM-facing prompt/schema 中出现同一业务事实时，必须从同一真源派生，并保持一致；禁止“显示正确但持久化错误”“trace 正确但 memory 错误”。
+- 测试必须断言 owner 级 contract 行为；禁止让 fake/mock/fixture 或旧测试固化偶然行为，倒逼生产代码保留兼容分支。
+- 若正确 owner 不清楚，先停止实现并澄清所有权；不得用局部 fallback、兼容 shim 或下游补偿继续推进。
 
 ## LLM-facing 文本约束【必须遵守】
 
