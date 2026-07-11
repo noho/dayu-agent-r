@@ -581,7 +581,7 @@ def _run_row(*, input_event_sequence: int) -> RunRow:
         source_run_id=None,
         source_run_relation=None,
         execution_target="local",
-        queue_policy="fifo",
+        queue_policy="queue",
         created_at="2026-06-19T00:00:00.000000Z",
         updated_at="2026-06-19T00:00:00.000000Z",
         terminal_at=None,

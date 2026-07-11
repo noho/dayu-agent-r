@@ -556,7 +556,7 @@ Runner call manifest 由 Host 在 RunInputBuilder 装配普通 runner input 时�
 
 Admission 是所有 Run 输入的 durable 入口。它在事务内判断 Session 状态、active / start-blocking Run、queue 顺序、steer 目标、tool selection、幂等语义和 request digest。显式请求字段必须进入 typed request；不得把语义字段塞进 metadata 或 extra payload。
 
-同一 Session 的 active slot 由 durable Run 状态决定，不由 scheduler 内存队列决定。`submit_followup(queue)` 在没有 active / start-blocking Run 时创建 `ACCEPTED` Run，有 active / start-blocking Run 时创建 `QUEUED` Run；queued promotion 按 accepted `event_sequence` FIFO。unknown tool name、closed Session、幂等语义冲突等错误都必须在 canonical facts 写入前 fail closed。
+同一 Session 的 active slot 由 durable Run 状态决定，不由 scheduler 内存队列决定。显式 start-run queue policy 只允许 `queue`、`reject`、`attach_active` 三种取值，并由 Host queue policy owner 统一校验；fresh durable schema 对 `host_runs.queue_policy` 使用同一闭集 CHECK。`submit_followup(queue)` 在没有 active / start-blocking Run 时创建 `ACCEPTED` Run，有 active / start-blocking Run 时创建 `QUEUED` Run；queued promotion 按 accepted `event_sequence` FIFO。unknown tool name、closed Session、幂等语义冲突等错误都必须在 canonical facts 写入前 fail closed。
 
 ### Steer
 

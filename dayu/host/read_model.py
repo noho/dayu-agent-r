@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host._event_payload import optional_payload_text
+from dayu.host.api import RunStatus
 from dayu.host.durable.codec import format_utc_timestamp
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import EventClass
@@ -236,7 +237,7 @@ def _project_run_result(
         RunResultRow(
             run_id=event.run_id,
             session_id=event.session_id,
-            terminal_status=_require_terminal_status_text(event.event_type),
+            terminal_status=_require_terminal_status(event.event_type),
             terminal_event_id=event.event_id,
             terminal_event_sequence=event.event_sequence,
             result_ref=result_ref,
@@ -285,18 +286,18 @@ def _project_timeline_item(
     )
 
 
-def _require_terminal_status_text(event_type: str) -> str:
-    """读取 terminal event 对应的 durable Run status 文本。
+def _require_terminal_status(event_type: str) -> RunStatus:
+    """读取 terminal event 对应的 durable Run status。
 
     :param event_type: EventLog row 中的原始 ``event_type``。
-    :returns: terminal Run status 字符串。
+    :returns: terminal Run status。
     :raises HostDurableError: 非 Host terminal Run event 时抛出。
     """
 
     status = run_status_for_terminal_event(event_type)
     if status is None:
         raise HostDurableError("read model terminal event type is unsupported")
-    return status.value
+    return status
 
 
 def _timeline_item_kind(event_type: str) -> str:

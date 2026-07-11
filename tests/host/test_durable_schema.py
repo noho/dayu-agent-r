@@ -12,6 +12,7 @@ import dayu.host.durable.schema as durable_schema
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.errors import HostSchemaMismatchError
 from dayu.host.lifecycle_events import all_host_event_type_values
+from dayu.host.queue_policy import run_queue_policy_values
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
     HostSQLiteStoragePolicy,
@@ -832,10 +833,83 @@ def test_normalize_schema_sql_only_strips_and_collapses_whitespace() -> None:
     )
 
 
-def test_host_schema_version_is_event_type_check_version() -> None:
-    """当前 committed Host schema version 是 EventLog event type CHECK schema 22。"""
+def test_host_schema_version_is_queue_policy_check_version() -> None:
+    """当前 committed Host schema version 是 queue policy CHECK schema 23。"""
 
-    assert HOST_SCHEMA_VERSION == 22
+    assert HOST_SCHEMA_VERSION == 23
+
+
+def test_host_runs_queue_policy_check_uses_owner_values(tmp_path: Path) -> None:
+    """fresh host_runs schema 使用 queue policy owner 三值 CHECK。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+        connection = store.connect()
+        try:
+            table_sql = _schema_sql(
+                connection,
+                _SQLITE_OBJECT_TYPE_TABLE,
+                TABLE_HOST_RUNS,
+            )
+            assert "queue_policy IN" in table_sql
+            for policy_value in run_queue_policy_values():
+                assert f"'{policy_value}'" in table_sql
+
+            connection.execute("PRAGMA foreign_keys=OFF")
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(f"""
+                    INSERT INTO {TABLE_HOST_RUNS} (
+                      run_id,
+                      session_id,
+                      status,
+                      client_request_id,
+                      input_event_id,
+                      input_event_sequence,
+                      accepted_event_id,
+                      accepted_event_sequence,
+                      queued_event_id,
+                      queued_event_sequence,
+                      started_event_id,
+                      started_event_sequence,
+                      terminal_event_id,
+                      terminal_event_sequence,
+                      cancel_request_event_id,
+                      current_attempt_id,
+                      source_run_id,
+                      source_run_relation,
+                      execution_target,
+                      queue_policy,
+                      created_at,
+                      updated_at,
+                      terminal_at
+                    ) VALUES (
+                      'run-invalid-policy',
+                      'session-1',
+                      'accepted',
+                      'request-1',
+                      'event-input',
+                      1,
+                      'event-accepted',
+                      2,
+                      NULL,
+                      NULL,
+                      NULL,
+                      NULL,
+                      NULL,
+                      NULL,
+                      NULL,
+                      NULL,
+                      NULL,
+                      NULL,
+                      'local-default',
+                      'invalid_policy',
+                      '2026-05-16T00:00:00.000000Z',
+                      '2026-05-16T00:00:00.000000Z',
+                      NULL
+                    )
+                    """)
+        finally:
+            connection.close()
 
 
 def test_tool_call_request_payload_descriptor_kinds_are_stable() -> None:

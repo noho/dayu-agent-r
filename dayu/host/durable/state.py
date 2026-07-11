@@ -46,6 +46,7 @@ from dayu.host.durable._row_rules import (
     wait_terminal_at_unset_where_sql,
 )
 from dayu.host.durable.codec import format_utc_timestamp, parse_utc_timestamp
+from dayu.host.queue_policy import parse_run_queue_policy, serialize_run_queue_policy
 from dayu.host.durable._validation import (
     optional_int as _optional_int,
     optional_text as _optional_text,
@@ -1183,6 +1184,30 @@ def _slot_row_from_session_list_host_row(row: HostRow) -> SessionSlotRow | None:
     )
 
 
+def _decode_run_queue_policy(row: HostRow, *, row_name: str) -> str:
+    """从 HostRow 读取并解析 Run queue policy。
+
+    :param row: ``HostTransaction`` 查询返回的 row。
+    :param row_name: 发生 decode 的 durable row 名称。
+    :returns: 已由 owner 校验并规范化的 Run queue policy 文本。
+    :raises HostRowDecodeError: 列缺失、非文本或不属于合法闭集时抛出。
+    """
+
+    raw_policy = _decode_required_text(row, row_name=row_name, column="queue_policy")
+    try:
+        return serialize_run_queue_policy(parse_run_queue_policy(raw_policy))
+    except ValueError as exc:
+        raise HostRowDecodeError(
+            _format_row_decode_error(
+                row_name=row_name,
+                field_name="queue_policy",
+                detail=str(exc),
+            ),
+            row_name=row_name,
+            field_name="queue_policy",
+        ) from exc
+
+
 def run_row_from_host_row(row: HostRow) -> RunRow:
     """把通用 HostRow 转换为 RunRow。
 
@@ -1227,7 +1252,7 @@ def run_row_from_host_row(row: HostRow) -> RunRow:
         source_run_id=_decode_optional_text(row, row_name=row_name, column="source_run_id"),
         source_run_relation=source_run_relation,
         execution_target=_decode_required_text(row, row_name=row_name, column="execution_target"),
-        queue_policy=_decode_required_text(row, row_name=row_name, column="queue_policy"),
+        queue_policy=_decode_run_queue_policy(row, row_name=row_name),
         created_at=_decode_required_text(row, row_name=row_name, column="created_at"),
         updated_at=_decode_required_text(row, row_name=row_name, column="updated_at"),
         terminal_at=terminal_at,
@@ -2674,7 +2699,7 @@ def insert_run(transaction: HostTransaction, run: RunRow) -> None:
             run.source_run_id,
             _optional_source_run_relation_text(run.source_run_relation),
             run.execution_target,
-            run.queue_policy,
+            serialize_run_queue_policy(parse_run_queue_policy(run.queue_policy)),
             run.created_at,
             run.updated_at,
             run.terminal_at,
@@ -5235,7 +5260,10 @@ def _validate_run_for_insert(run: RunRow) -> None:
     _require_optional_non_empty_text(run.current_attempt_id, field_name="current_attempt_id")
     _require_optional_non_empty_text(run.source_run_id, field_name="source_run_id")
     _require_non_empty_text(run.execution_target, field_name="execution_target")
-    _require_non_empty_text(run.queue_policy, field_name="queue_policy")
+    try:
+        parse_run_queue_policy(run.queue_policy)
+    except ValueError as exc:
+        raise HostDurableError("Run queue_policy is invalid") from exc
     _require_non_empty_text(run.created_at, field_name="created_at")
     _require_non_empty_text(run.updated_at, field_name="updated_at")
     _require_optional_non_empty_text(run.terminal_at, field_name="terminal_at")

@@ -45,7 +45,7 @@ class RunResultRow:
 
     :param run_id: Run id。
     :param session_id: Session id。
-    :param terminal_status: terminal Run status schema 文本。
+    :param terminal_status: terminal Run status。
     :param terminal_event_id: terminal canonical EventLog id。
     :param terminal_event_sequence: terminal canonical EventLog sequence。
     :param result_ref: 可选 terminal result payload 引用。
@@ -58,7 +58,7 @@ class RunResultRow:
 
     run_id: str
     session_id: str
-    terminal_status: str
+    terminal_status: RunStatus
     terminal_event_id: str
     terminal_event_sequence: int
     result_ref: str | None
@@ -178,7 +178,7 @@ def insert_run_result_if_absent(
         (
             row.run_id,
             row.session_id,
-            row.terminal_status,
+            serialize_run_result_terminal_status(row.terminal_status),
             row.terminal_event_id,
             row.terminal_event_sequence,
             row.result_ref,
@@ -320,7 +320,7 @@ def _validate_run_result(row: RunResultRow) -> None:
 
     _require_non_empty_text(row.run_id, field_name="run_id")
     _require_non_empty_text(row.session_id, field_name="session_id")
-    _terminal_status_from_text(row.terminal_status)
+    serialize_run_result_terminal_status(row.terminal_status)
     if row.terminal_event_sequence <= 0:
         raise HostDurableError("terminal_event_sequence must be positive")
     _require_non_empty_text(row.terminal_event_id, field_name="terminal_event_id")
@@ -402,7 +402,7 @@ def _run_result_from_host_row(row: HostRow) -> RunResultRow:
         session_id=_require_text(row.get("session_id"), field_name="session_id"),
         terminal_status=_terminal_status_from_text(
             _require_text(row.get("terminal_status"), field_name="terminal_status")
-        ).value,
+        ),
         terminal_event_id=_require_text(
             row.get("terminal_event_id"), field_name="terminal_event_id"
         ),
@@ -467,6 +467,21 @@ def _terminal_status_from_text(value: str) -> RunStatus:
     if not is_terminal_run_status(status):
         raise HostDurableError("RunResult terminal_status is not terminal")
     return status
+
+
+def serialize_run_result_terminal_status(status: RunStatus) -> str:
+    """序列化 minimal RunResult terminal status。
+
+    :param status: RunResult row 持有的 typed terminal Run status。
+    :returns: SQLite 与 public text boundary 使用的稳定终态文本。
+    :raises HostDurableError: ``status`` 不是 RunStatus 或不是终态时抛出。
+    """
+
+    if not isinstance(status, RunStatus):
+        raise HostDurableError("RunResult terminal_status is invalid")
+    if not is_terminal_run_status(status):
+        raise HostDurableError("RunResult terminal_status is not terminal")
+    return status.value
 
 
 def _validate_timeline_item_kind(value: str) -> None:

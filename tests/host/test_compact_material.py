@@ -3133,7 +3133,7 @@ def _run_row(input_event: EventLogRow) -> RunRow:
         source_run_id=None,
         source_run_relation=None,
         execution_target="local",
-        queue_policy="fifo",
+        queue_policy="queue",
         created_at=_NOW,
         updated_at=_NOW,
         terminal_at=None,

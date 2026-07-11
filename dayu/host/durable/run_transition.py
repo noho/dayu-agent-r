@@ -31,6 +31,7 @@ from dayu.host.durable.event_log import (
 )
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.liveness import HostInstanceStatus, read_host_instance
+from dayu.host.queue_policy import parse_run_queue_policy, serialize_run_queue_policy
 from dayu.host.durable.state import (
     AttemptMutationResult,
     AttemptRow,
@@ -2995,7 +2996,9 @@ def _run_accepted_event_request(
             "input_event_id": request.input_event_id,
             "input_event_sequence": request.input_event_sequence,
             "execution_target": request.execution_target,
-            "queue_policy": request.queue_policy,
+            "queue_policy": serialize_run_queue_policy(
+                parse_run_queue_policy(request.queue_policy)
+            ),
             "source_run_id": None,
             "source_run_relation": None,
             "call_context_digest": request.call_context_digest,
@@ -5962,7 +5965,10 @@ def _validate_common_create_input(
     _require_non_empty_text(source, field_name="source")
     _require_non_empty_text(idempotency_key, field_name="idempotency_key")
     _require_non_empty_text(execution_target, field_name="execution_target")
-    _require_non_empty_text(queue_policy, field_name="queue_policy")
+    try:
+        parse_run_queue_policy(queue_policy)
+    except ValueError as exc:
+        raise HostDurableError("queue_policy is invalid") from exc
     _require_sha256_digest(call_context_digest, field_name="call_context_digest")
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -56,6 +57,7 @@ from dayu.host.durable.read_model import (
     insert_session_timeline_item_if_absent,
     read_run_result,
     read_session_timeline_items,
+    serialize_run_result_terminal_status,
 )
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.schema import (
@@ -517,7 +519,7 @@ def _stable_run_result(row: RunResultRow | None) -> tuple[str, ...] | None:
     return (
         row.run_id,
         row.session_id,
-        row.terminal_status,
+        serialize_run_result_terminal_status(row.terminal_status),
         row.terminal_event_id,
         str(row.terminal_event_sequence),
         str(row.result_ref),
@@ -644,7 +646,7 @@ def test_terminal_event_projects_run_result_and_duplicate_replay_is_noop(
             )
         )
         assert result is not None
-        assert result.terminal_status == "succeeded"
+        assert result.terminal_status == RunStatus.SUCCEEDED
         assert result.terminal_event_id == terminal.event_id
         assert result.terminal_event_sequence == terminal.event_sequence
         assert result.summary_ref == "summary-success"
@@ -723,7 +725,7 @@ def test_terminal_event_mapping_covers_current_run_terminal_statuses(
                 )
             )
             assert result is not None
-            assert result.terminal_status == status.value
+            assert result.terminal_status == status
     finally:
         host.close()
 
@@ -739,7 +741,7 @@ def test_read_model_python_validation_rejects_unknown_terminal_status(
         row = RunResultRow(
             run_id="run-invalid-status",
             session_id="session-1",
-            terminal_status="future_terminal",
+            terminal_status=cast(RunStatus, "future_terminal"),
             terminal_event_id="event-terminal",
             terminal_event_sequence=1,
             result_ref=None,

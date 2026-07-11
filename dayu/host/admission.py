@@ -14,7 +14,6 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from enum import StrEnum
 from typing import Protocol, cast
 from uuid import uuid4
 
@@ -134,6 +133,11 @@ from dayu.host.projection import (
     ProjectionCatchupPort,
     catch_up_projection_best_effort,
 )
+from dayu.host.queue_policy import (
+    RunQueuePolicy,
+    parse_run_queue_policy,
+    serialize_run_queue_policy,
+)
 from dayu.host.payload_resolution import event_payload_object
 from dayu.host.tool_runtime_schema_projection import (
     business_bundle_digest as _business_bundle_digest,
@@ -174,14 +178,6 @@ _TOOL_SELECTION_ALL = "all"
 _TOOL_SELECTION_NONE = "none"
 _TOOL_SELECTION_SUBSET = "subset"
 _MAX_ORDINARY_RETRY_RUNS_PER_SOURCE = 1
-
-
-class AdmissionPolicy(StrEnum):
-    """start_run admission policy 文本常量。"""
-
-    QUEUE = "queue"
-    REJECT = "reject"
-    ATTACH_ACTIVE = "attach_active"
 
 
 class AdmissionClock(Protocol):
@@ -530,7 +526,7 @@ class HostAdmissionService:
         :raises HostDurableError: durable 写入失败时由底层抛出。
         """
 
-        policy = _parse_admission_policy(request.queue_policy)
+        policy = parse_run_queue_policy(request.queue_policy)
         _require_sha256_digest(
             caller_semantic_digest, field_name="caller_semantic_digest"
         )
@@ -948,7 +944,7 @@ class _StartRunOperation:
     """start_run transaction body。"""
 
     request: StartRunRequest
-    policy: AdmissionPolicy
+    policy: RunQueuePolicy
     caller_semantic_digest: str
     event_log_store: EventLogStore
     idempotency_store: IdempotencyStore
@@ -994,7 +990,7 @@ class _StartRunOperation:
             request=_CreateAdmissionRequest.from_start_request(self.request),
             semantic_digest=semantic_digest,
             scope=scope,
-            queue_policy=self.policy.value,
+            queue_policy=self.policy,
         )
 
     def _handle_active_run(
@@ -1015,13 +1011,13 @@ class _StartRunOperation:
         :raises HostApiError: reject policy 命中 active Run 时抛出 conflict。
         """
 
-        if self.policy == AdmissionPolicy.REJECT:
+        if self.policy == RunQueuePolicy.REJECT:
             raise HostApiError(
                 code=HostApiErrorCode.CONFLICT,
                 message="Session already has an active Run",
                 retryable=False,
             )
-        if self.policy == AdmissionPolicy.ATTACH_ACTIVE:
+        if self.policy == RunQueuePolicy.ATTACH_ACTIVE:
             if active.status == RunStatus.ACCEPTED:
                 self.idempotency_store.record_idempotent_result(
                     transaction,
@@ -1074,7 +1070,7 @@ class _StartRunOperation:
             request=_CreateAdmissionRequest.from_start_request(self.request),
             semantic_digest=semantic_digest,
             scope=scope,
-            queue_policy=self.policy.value,
+            queue_policy=self.policy,
             active_run_id=active.run_id,
         )
 
@@ -1129,7 +1125,7 @@ class _SubmitFollowupQueueOperation:
                 request=create_request,
                 semantic_digest=semantic_digest,
                 scope=scope,
-                queue_policy=AdmissionPolicy.QUEUE.value,
+                queue_policy=RunQueuePolicy.QUEUE,
                 active_run_id=active.run_id,
             )
         return _create_accepted_admission_result(
@@ -1141,7 +1137,7 @@ class _SubmitFollowupQueueOperation:
             request=create_request,
             semantic_digest=semantic_digest,
             scope=scope,
-            queue_policy=AdmissionPolicy.QUEUE.value,
+            queue_policy=RunQueuePolicy.QUEUE,
         )
 
 
@@ -2521,7 +2517,7 @@ def _create_running_admission_result(
     request: _CreateAdmissionRequest,
     semantic_digest: str,
     scope: IdempotencyScope,
-    queue_policy: str,
+    queue_policy: RunQueuePolicy,
     start_reason: RunStartReason,
 ) -> RunAdmissionResult:
     """创建 running Run、STARTING Attempt 和 pending dispatch。
@@ -2613,7 +2609,7 @@ def _create_accepted_admission_result(
     request: _CreateAdmissionRequest,
     semantic_digest: str,
     scope: IdempotencyScope,
-    queue_policy: str,
+    queue_policy: RunQueuePolicy,
 ) -> RunAdmissionResult:
     """创建 pre-start accepted Run admission 结果。
 
@@ -2692,7 +2688,7 @@ def _create_queued_admission_result(
     request: _CreateAdmissionRequest,
     semantic_digest: str,
     scope: IdempotencyScope,
-    queue_policy: str,
+    queue_policy: RunQueuePolicy,
     active_run_id: str,
 ) -> RunAdmissionResult:
     """创建 queued Run admission 结果。
@@ -2808,7 +2804,7 @@ def _create_source_related_admission_result(
             request=request,
             semantic_digest=semantic_digest,
             scope=scope,
-            queue_policy=AdmissionPolicy.QUEUE.value,
+            queue_policy=RunQueuePolicy.QUEUE,
             active_run_id=active.run_id,
         )
         if active is not None
@@ -2821,7 +2817,7 @@ def _create_source_related_admission_result(
             request=request,
             semantic_digest=semantic_digest,
             scope=scope,
-            queue_policy=AdmissionPolicy.QUEUE.value,
+            queue_policy=RunQueuePolicy.QUEUE,
         )
     )
     relation_result = set_new_run_source_relation_row(
@@ -3418,20 +3414,6 @@ def _event_ref_json(event: EventLogRow) -> JsonValue:
     """
 
     return {"event_id": event.event_id, "event_sequence": event.event_sequence}
-
-
-def _parse_admission_policy(queue_policy: str) -> AdmissionPolicy:
-    """解析 start_run queue policy。
-
-    :param queue_policy: 请求中的 queue policy 文本。
-    :returns: admission policy enum。
-    :raises ValueError: policy 不是 Phase 3 允许值时抛出。
-    """
-
-    try:
-        return AdmissionPolicy(queue_policy)
-    except ValueError as exc:
-        raise ValueError("queue_policy must be queue, reject or attach_active") from exc
 
 
 def _validate_followup_queue_input(
@@ -4665,7 +4647,9 @@ def _start_run_semantic_digest(
             "operation": _OPERATION_START_RUN,
             "input_digest": _input_digest(request.input),
             "execution_target": request.execution_target,
-            "queue_policy": request.queue_policy,
+            "queue_policy": serialize_run_queue_policy(
+                parse_run_queue_policy(request.queue_policy)
+            ),
             "caller_semantic_digest": caller_semantic_digest,
             "call_context_digest": _call_context_digest(request.context),
         }

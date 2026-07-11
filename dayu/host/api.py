@@ -42,6 +42,7 @@ from dayu.host.memory import (
     MemoryProjectionPolicy,
     default_memory_projection_policy,
 )
+from dayu.host.queue_policy import parse_run_queue_policy
 from dayu.host.tooling import HostToolingOptions as _HostToolingOptions
 
 if TYPE_CHECKING:
@@ -1815,6 +1816,7 @@ class StartRunRequest:
             field_name="StartRunRequest.execution_target",
         )
         _require_non_empty(self.queue_policy, field_name="StartRunRequest.queue_policy")
+        parse_run_queue_policy(self.queue_policy)
 
 
 @dataclass(frozen=True, slots=True)

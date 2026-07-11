@@ -20,6 +20,7 @@ from dayu.host.durable._row_rules import (
     wait_terminal_at_check_sql,
 )
 from dayu.host.lifecycle_events import all_host_event_type_values
+from dayu.host.queue_policy import run_queue_policy_values
 from dayu.host.api import (
     HOST_WAIT_ADAPTER_KEY_MAX_LENGTH,
     HOST_WAIT_EXTERNAL_JOB_ID_MAX_LENGTH,
@@ -32,7 +33,7 @@ from dayu.host.api import (
 )
 from dayu.host.durable.errors import HostSchemaMismatchError
 
-HOST_SCHEMA_VERSION = 22
+HOST_SCHEMA_VERSION = 23
 """当前 Host durable SQLite schema version。"""
 
 TABLE_EVENT_LOG = "event_log"
@@ -515,7 +516,9 @@ CREATE TABLE IF NOT EXISTS {TABLE_HOST_RUNS} (
     source_run_relation IN ('retry', 'replay') OR source_run_relation IS NULL
   ),
   execution_target TEXT NOT NULL,
-  queue_policy TEXT NOT NULL,
+  queue_policy TEXT NOT NULL CHECK (
+    queue_policy IN ({_sql_text_in_values(run_queue_policy_values())})
+  ),
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   terminal_at TEXT NULL,
