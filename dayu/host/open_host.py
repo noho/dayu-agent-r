@@ -113,7 +113,7 @@ from dayu.host.read_api import (
 from dayu.host.read_api import (
     session_live_event_start_cursor as _session_live_event_start_cursor,
 )
-from dayu.host.recovery import StartupRecoveryScanner
+from dayu.host.recovery import StartupRecoveryScanResult, StartupRecoveryScanner
 from dayu.host.storage_maintenance import (
     HostStorageMaintenanceRequest,
     HostStorageMaintenanceResult,
@@ -362,6 +362,34 @@ class _ThreadsafeActiveWorkerCancelPort(ActiveWorkerCancelPort):
             self.loop,
             lambda: self.active_registry.cancel(message),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _StartupRecoveryActorOperation:
+    """在 S2 durable actor connection 上执行全部 bounded recovery batches。
+
+    :param wakeup_port: actor thread 到 opener loop 的 scheduler wake bridge。
+    :param recovery_owner_host_instance_id: 当前 scheduler Host instance id。
+    """
+
+    wakeup_port: _ThreadsafeSchedulerWakeupPort
+    recovery_owner_host_instance_id: str
+
+    def __call__(self, handle: HostCommandHandle) -> StartupRecoveryScanResult:
+        """使用 actor-owned transaction runner 完成 startup recovery scan。
+
+        :param handle: actor worker thread 独占的 command handle。
+        :returns: 全部 committed batches 的 immutable aggregate result。
+        :raises Exception: 任一 batch、invariant 或 wake bridge 失败时透传。
+        """
+
+        return StartupRecoveryScanner(
+            transaction_runner=handle._transaction_runner(),
+            event_log_store=EventLogStore(),
+            dispatch_wakeup_port=self.wakeup_port,
+            recovery_owner_host_instance_id=self.recovery_owner_host_instance_id,
+            defer_accepted_cancel_to_watchdog=True,
+        ).scan()
 
 
 def _run_callback_on_event_loop(
@@ -1302,13 +1330,6 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                 health_gate=health_gate,
             )
             scheduler.tick_active_cancel_watchdog(datetime.now(UTC))
-            StartupRecoveryScanner(
-                transaction_runner=scheduler_store.transaction_runner,
-                event_log_store=EventLogStore(),
-                dispatch_wakeup_port=scheduler,
-                recovery_owner_host_instance_id=scheduler.host_instance_id,
-                defer_accepted_cancel_to_watchdog=True,
-            ).scan()
             wakeup_port = _ThreadsafeSchedulerWakeupPort(
                 loop=loop,
                 scheduler=scheduler,
@@ -1328,6 +1349,12 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                 thread_name_prefix=(
                     f"{host_handle_id}-{_DURABLE_ACTOR_THREAD_NAME_SUFFIX}"
                 ),
+            )
+            await durable_actor.call(
+                _StartupRecoveryActorOperation(
+                    wakeup_port=wakeup_port,
+                    recovery_owner_host_instance_id=scheduler.host_instance_id,
+                )
             )
             wait_poller = _wait_poller_supervisor_from_open_host_options(
                 self._options,

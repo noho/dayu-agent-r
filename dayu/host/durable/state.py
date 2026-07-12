@@ -315,6 +315,18 @@ class RunRow:
 
 
 @dataclass(frozen=True, slots=True)
+class NonTerminalRunKeysetCursor:
+    """non-terminal Run recovery keyset cursor。
+
+    :param accepted_event_sequence: Run accepted canonical fact 的全局序号。
+    :param run_id: 同 sequence 下的稳定 tie-break Run id。
+    """
+
+    accepted_event_sequence: int
+    run_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class AttemptRow:
     """``host_attempts`` durable row。
 
@@ -1955,6 +1967,199 @@ def read_non_terminal_runs(transaction: HostTransaction) -> tuple[RunRow, ...]:
         status_params,
     )
     return tuple(run_row_from_host_row(row) for row in rows)
+
+
+def read_non_terminal_run_upper_watermark(
+    transaction: HostTransaction,
+) -> NonTerminalRunKeysetCursor | None:
+    """读取 recovery scan 开始时固定的 non-terminal Run upper watermark。
+
+    watermark 只来自 durable Run governance rows，并以
+    ``(accepted_event_sequence, run_id)`` 全序确定边界；projection/read model
+    不参与。
+
+    :param transaction: 调用方提供的 Host read transaction。
+    :returns: 当前最大 keyset；没有 non-terminal Run 时返回 ``None``。
+    :raises HostDurableError: watermark row 字段无效时抛出。
+    :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
+    """
+
+    status_clause, status_params = run_status_in_clause(NON_TERMINAL_RUN_STATUSES)
+    row = transaction.fetchone(
+        f"""
+        SELECT
+          accepted_event_sequence,
+          run_id
+        FROM {TABLE_HOST_RUNS}
+        WHERE status {status_clause}
+        ORDER BY accepted_event_sequence DESC, run_id DESC
+        LIMIT 1
+        """,
+        status_params,
+    )
+    if row is None:
+        return None
+    accepted_event_sequence = _decode_required_int(
+        row,
+        row_name="non_terminal_run_upper_watermark",
+        column="accepted_event_sequence",
+    )
+    run_id = _decode_required_text(
+        row,
+        row_name="non_terminal_run_upper_watermark",
+        column="run_id",
+    )
+    _require_positive_sequence(
+        accepted_event_sequence,
+        "accepted_event_sequence",
+    )
+    _require_non_empty_text(run_id, field_name="run_id")
+    return NonTerminalRunKeysetCursor(
+        accepted_event_sequence=accepted_event_sequence,
+        run_id=run_id,
+    )
+
+
+def read_non_terminal_runs_keyset_page(
+    transaction: HostTransaction,
+    *,
+    upper_watermark: NonTerminalRunKeysetCursor,
+    cursor: NonTerminalRunKeysetCursor | None,
+    batch_size: int,
+) -> tuple[RunRow, ...]:
+    """读取 upper watermark 内下一页 non-terminal Run。
+
+    查询严格使用 keyset，不使用 OFFSET。``fetchall`` 只消费带 ``LIMIT`` 的
+    单个 bounded page。
+
+    :param transaction: 调用方提供的 Host write transaction。
+    :param upper_watermark: scan 开始时固定的最大 keyset。
+    :param cursor: 上一批最后处理的 keyset；首批为 ``None``。
+    :param batch_size: 本页最大 Run row 数。
+    :returns: 按 ``(accepted_event_sequence, run_id)`` 严格升序的 Run rows。
+    :raises ValueError: watermark/cursor/batch size 非法时抛出。
+    :raises HostDurableError: Run row 字段无效时抛出。
+    :raises sqlite3.Error: SQLite 查询失败时由 transaction runner 结构化转换。
+    """
+
+    _validate_non_terminal_run_keyset(
+        upper_watermark,
+        field_name="upper_watermark",
+    )
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+        raise TypeError("batch_size must be int")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if cursor is not None:
+        _validate_non_terminal_run_keyset(cursor, field_name="cursor")
+        if _non_terminal_run_keyset_order(cursor) >= _non_terminal_run_keyset_order(
+            upper_watermark
+        ):
+            return ()
+
+    status_clause, status_params = run_status_in_clause(NON_TERMINAL_RUN_STATUSES)
+    cursor_clause = ""
+    cursor_params: tuple[int | str, ...] = ()
+    if cursor is not None:
+        cursor_clause = """
+          AND (
+            accepted_event_sequence > ?
+            OR (accepted_event_sequence = ? AND run_id > ?)
+          )
+        """
+        cursor_params = (
+            cursor.accepted_event_sequence,
+            cursor.accepted_event_sequence,
+            cursor.run_id,
+        )
+    rows = transaction.fetchall(
+        f"""
+        SELECT
+          run_id,
+          session_id,
+          status,
+          client_request_id,
+          input_event_id,
+          input_event_sequence,
+          accepted_event_id,
+          accepted_event_sequence,
+          queued_event_id,
+          queued_event_sequence,
+          started_event_id,
+          started_event_sequence,
+          terminal_event_id,
+          terminal_event_sequence,
+          cancel_request_event_id,
+          current_attempt_id,
+          source_run_id,
+          source_run_relation,
+          execution_target,
+          queue_policy,
+          created_at,
+          updated_at,
+          terminal_at
+        FROM {TABLE_HOST_RUNS}
+        WHERE status {status_clause}
+          AND (
+            accepted_event_sequence < ?
+            OR (accepted_event_sequence = ? AND run_id <= ?)
+          )
+          {cursor_clause}
+        ORDER BY accepted_event_sequence ASC, run_id ASC
+        LIMIT ?
+        """,
+        (
+            *status_params,
+            upper_watermark.accepted_event_sequence,
+            upper_watermark.accepted_event_sequence,
+            upper_watermark.run_id,
+            *cursor_params,
+            batch_size,
+        ),
+    )
+    return tuple(run_row_from_host_row(row) for row in rows)
+
+
+def _validate_non_terminal_run_keyset(
+    keyset: NonTerminalRunKeysetCursor,
+    *,
+    field_name: str,
+) -> None:
+    """校验 recovery keyset 输入。
+
+    :param keyset: 待校验 keyset。
+    :param field_name: 错误字段前缀。
+    :returns: ``None``。
+    :raises TypeError: keyset 字段类型非法时抛出。
+    :raises ValueError: sequence 非正或 run id 为空时抛出。
+    """
+
+    if isinstance(keyset.accepted_event_sequence, bool) or not isinstance(
+        keyset.accepted_event_sequence,
+        int,
+    ):
+        raise TypeError(f"{field_name}.accepted_event_sequence must be int")
+    if keyset.accepted_event_sequence <= 0:
+        raise ValueError(
+            f"{field_name}.accepted_event_sequence must be positive"
+        )
+    if not isinstance(keyset.run_id, str):
+        raise TypeError(f"{field_name}.run_id must be str")
+    if keyset.run_id.strip() == "":
+        raise ValueError(f"{field_name}.run_id must be non-empty")
+
+
+def _non_terminal_run_keyset_order(
+    keyset: NonTerminalRunKeysetCursor,
+) -> tuple[int, str]:
+    """返回 recovery keyset 的 Python 全序比较值。
+
+    :param keyset: 已校验的 recovery keyset。
+    :returns: sequence/run id tuple。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return keyset.accepted_event_sequence, keyset.run_id
 
 
 def read_cancelling_runs(transaction: HostTransaction) -> tuple[RunRow, ...]:

@@ -3481,6 +3481,10 @@ Recovery scan 不得让旧 Attempt takeover。恢复必须创建新 Attempt。
 
 Recovery 的输入只能是 Host durable truth：Run / Attempt indexes、EventLog canonical facts、dispatch record、wait record、payload descriptors 和 host instance liveness record。Projection checkpoint、Session timeline、RunResult、audit、tool trace、outbox、memory snapshot lag 或其它 read model 不能作为 recovery scan 的前置条件或事实依据；这些 projection 只能在 recovery 提交 canonical facts 后按 `event_sequence` 追平。
 
+同一次 startup recovery scan 必须在开始时冻结 `policy.now`，并从 durable Run governance index 取得固定 upper watermark。扫描顺序固定为 `(accepted_event_sequence, run_id)` keyset 全序；同 sequence 由 `run_id` 稳定打破平局，不允许使用 offset。scanner 在 durable actor 独占连接上按有界 page 执行，每个 page 是独立 write transaction；默认 batch size 为 64。只有当前 page commit 成功后才能投递该 page 的 matching dispatch / queue-promotion wake；rollback page 不得 wake，先前已提交 page 不得因后续失败回滚。失败后的完整重跑只能依赖 durable CAS / idempotency 收敛，不得依赖内存 cursor。
+
+opener 在 execution health 仍为 `STARTING` 时完成全部 recovery pages 与 commit 后 wake；任一 batch、cursor invariant 或 wake bridge 失败时不得进入 `READY`。固定 watermark 之后新接受、且 keyset 高于该 watermark 的 Run 留给下一轮 scan，避免启动扫描因并发 admission 无限延长。
+
 Recovery scan semantic path：
 
 ```text

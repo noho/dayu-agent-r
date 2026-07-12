@@ -92,7 +92,11 @@ from dayu.host.open_host import (
 )
 from dayu.host.llm_compaction import LLMContextCompactor
 from dayu.host.projection import ProjectionCatchupPort
-from dayu.host.recovery import StartupRecoveryScanner
+from dayu.host.recovery import (
+    StartupRecoveryPolicy,
+    StartupRecoveryScanner,
+    StartupRecoveryScanResult,
+)
 from dayu.host.wait_adapter import (
     WaitExternalJobLifecycleResult,
     WaitPollAdapterRegistration,
@@ -1359,6 +1363,82 @@ async def test_open_host_wait_poller_resolves_waiting_run_in_background(
 
 
 @pytest.mark.asyncio
+async def test_startup_recovery_runs_on_actor_before_ready(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """startup recovery 必须在 actor thread 完成后才进入 READY。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises Exception: opener 或真实 recovery scan 失败时透传。
+    """
+
+    opener_thread_id = threading.get_ident()
+    recovery_thread_ids: list[int] = []
+    ready_thread_ids: list[int] = []
+    recovery_started = threading.Event()
+    recovery_release = threading.Event()
+    original_scan = StartupRecoveryScanner.scan
+    original_mark_ready = HostExecutionHealthGate.mark_ready
+
+    def barrier_scan(
+        self: StartupRecoveryScanner,
+        policy: StartupRecoveryPolicy | None = None,
+    ) -> StartupRecoveryScanResult:
+        """记录 actor thread，并以 barrier 固定 recovery/READY 顺序。
+
+        :param self: startup recovery scanner。
+        :param policy: 可选 recovery policy。
+        :returns: 真实 recovery scan 结果。
+        :raises RuntimeError: barrier 未在测试预算内释放时抛出。
+        :raises Exception: 真实 recovery scan 失败时透传。
+        """
+
+        recovery_thread_ids.append(threading.get_ident())
+        recovery_started.set()
+        if not recovery_release.wait(timeout=5):
+            raise RuntimeError("startup recovery barrier timed out")
+        return original_scan(self, policy)
+
+    def record_ready(self: HostExecutionHealthGate) -> None:
+        """记录 READY handoff thread 后委托真实 health owner。
+
+        :param self: execution health gate。
+        :returns: ``None``。
+        :raises Exception: 真实 READY transition 失败时透传。
+        """
+
+        ready_thread_ids.append(threading.get_ident())
+        original_mark_ready(self)
+
+    monkeypatch.setattr(StartupRecoveryScanner, "scan", barrier_scan)
+    monkeypatch.setattr(HostExecutionHealthGate, "mark_ready", record_ready)
+    manager = open_host(_options(tmp_path, _FinalAnswerWorkerFactory()))
+    open_task = asyncio.create_task(manager.__aenter__())
+    try:
+        started = await asyncio.wait_for(
+            asyncio.to_thread(recovery_started.wait),
+            timeout=2,
+        )
+        assert started
+        assert recovery_thread_ids != [opener_thread_id]
+        assert ready_thread_ids == []
+
+        recovery_release.set()
+        await asyncio.wait_for(open_task, timeout=2)
+
+        assert ready_thread_ids == [opener_thread_id]
+    finally:
+        recovery_release.set()
+        if not open_task.done():
+            await open_task
+        if not open_task.cancelled() and open_task.exception() is None:
+            await manager.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
 async def test_open_host_startup_failure_flushes_projection_before_close(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1366,6 +1446,7 @@ async def test_open_host_startup_failure_flushes_projection_before_close(
     """open_host ready 前失败时仍应 best-effort 追平 projection。"""
 
     catch_up_calls = 0
+    ready_calls = 0
 
     def raise_recovery_scan(
         self: StartupRecoveryScanner,
@@ -1393,6 +1474,17 @@ async def test_open_host_startup_failure_flushes_projection_before_close(
         del self
         catch_up_calls += 1
 
+    def record_ready(self: HostExecutionHealthGate) -> None:
+        """记录 recovery 失败路径是否错误进入 READY。
+
+        :param self: execution health gate。
+        :returns: ``None``。
+        """
+
+        nonlocal ready_calls
+        del self
+        ready_calls += 1
+
     monkeypatch.setattr(
         StartupRecoveryScanner,
         "scan",
@@ -1403,12 +1495,14 @@ async def test_open_host_startup_failure_flushes_projection_before_close(
         "catch_up_projection",
         record_catch_up,
     )
+    monkeypatch.setattr(HostExecutionHealthGate, "mark_ready", record_ready)
 
     with pytest.raises(RuntimeError, match="forced startup recovery failure"):
         async with open_host(_options(tmp_path, _FinalAnswerWorkerFactory())):
             raise AssertionError("open_host must fail before yielding")
 
     assert catch_up_calls == 1
+    assert ready_calls == 0
 
 
 @pytest.mark.asyncio

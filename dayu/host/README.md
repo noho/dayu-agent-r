@@ -621,6 +621,8 @@ startup recovery 读取 durable Run / Attempt / dispatch / Host instance livenes
 - `RUNNING` / `CANCELLING` 只有在 positive orphan proof 成立并通过 CAS recheck 后才收口旧 Attempt；带 accepted cancel facts 的 `CANCELLING` Run 由 watchdog 收口为 `CANCELLED`，startup recovery 不先转为 `LOST`。
 - `RECOVERING` 若 recovery dispatch 次数未超过上限，会创建新的 recovery Attempt / execution / pending dispatch；超过上限或缺少可恢复事实时转为 `LOST`。
 
+scanner 在 durable actor 独占的连接上冻结本轮 `policy.now` 与 non-terminal Run upper watermark，并按 `(accepted_event_sequence, run_id)` keyset 读取有界 page；每个 page 独立提交 write transaction，默认最多处理 64 个 Run，不使用 offset。matching dispatch / queue-promotion wake 只在所属 page commit 后经 opener-loop bridge 投递。全部 page 与 wake 完成后 execution health 才从 `STARTING` 进入 `READY`；任一 batch、invariant 或 wake 失败都会中止 opener，后续 healthy opener 只依赖 durable facts 重新扫描，不依赖进程内 offset。
+
 positive orphan proof 需要 durable owner liveness 与本机进程证据支持，例如 owner 已 `STOPPED`、pid 缺失、pid 被复用且 start token / boot id 不匹配等。heartbeat stale 单独不构成 takeover proof；runtime lane TTL、projection lag 或 worker 没有返回也不构成 Host recovery truth。
 
 ### EngineEvent ingest
