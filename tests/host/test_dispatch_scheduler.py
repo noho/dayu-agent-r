@@ -92,7 +92,11 @@ from dayu.host.compact_pipeline import (
     CompactPipelineSourceSnapshot,
     build_fallback_decision_input,
 )
-from dayu.host.compaction_operation import CompactorProposalRunInput
+from dayu.host.compaction_operation import (
+    CompactorProposalManifestReference,
+    CompactorProposalRunInput,
+    DurableCompactorProposalManifestRecorder,
+)
 from dayu.host.context_budget import (
     BudgetEstimateInput,
     BudgetTextFragment,
@@ -5177,6 +5181,83 @@ async def test_proactive_compaction_calls_llm_outside_write_transaction(
                     )
                 )
             )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_proactive_compaction_rechecks_durable_state_after_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """manifest commit 后 Run 失效时，durable token 阻止 provider 调用。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-proactive-stale-after-manifest",
+            display_text=_soft_threshold_prompt(),
+        )
+        compactor = _PreparedManifestProactiveCompactor()
+        original_record = (
+            DurableCompactorProposalManifestRecorder.record_compactor_proposal_manifest
+        )
+
+        def record_then_fail_run(
+            recorder: DurableCompactorProposalManifestRecorder,
+            *,
+            request: CompactionRequest,
+            prepared_input: CompactorProposalRunInput,
+            compaction_operation_id: str,
+            compaction_attempt_number: int,
+        ) -> CompactorProposalManifestReference:
+            """提交真实 manifest 后在独立事务中让 Run 失效。
+
+            :param recorder: durable manifest recorder。
+            :param request: frozen compaction request。
+            :param prepared_input: 已准备的 provider input。
+            :param compaction_operation_id: compaction operation id。
+            :param compaction_attempt_number: attempt 序号。
+            :returns: 已提交的 manifest reference。
+            """
+
+            reference = original_record(
+                recorder,
+                request=request,
+                prepared_input=prepared_input,
+                compaction_operation_id=compaction_operation_id,
+                compaction_attempt_number=compaction_attempt_number,
+            )
+            _fail_unstarted_for_stale_test(store.transaction_runner, request)
+            return reference
+
+        monkeypatch.setattr(
+            DurableCompactorProposalManifestRecorder,
+            "record_compactor_proposal_manifest",
+            record_then_fail_run,
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(),
+            context_compactor=compactor,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            await scheduler.run_queue_promotion(seeded.session_id)
+
+            assert compactor.calls == 0
+            assert _run_status(store.transaction_runner, seeded.run_id) is RunStatus.FAILED
+            assert _event_count(
+                store.transaction_runner,
+                "RUNNER_CALL_INPUT_ASSEMBLED",
+            ) == 1
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
         finally:
             await scheduler.close()
 

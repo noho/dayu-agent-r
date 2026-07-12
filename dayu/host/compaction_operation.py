@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from threading import Lock
 from typing import Protocol, runtime_checkable
 from uuid import uuid4
 
@@ -559,6 +560,84 @@ class _CompactorProposalCancelledError(Exception):
     proposal_manifest_reference: CompactorProposalManifestReference | None
 
 
+class _CompactionAttemptCancellationToken(CancellationToken):
+    """单次 compactor proposal attempt 的 linked cancellation token。
+
+    parent 保存 Run / reactive operation 的生命周期事实；本 token 只拥有当前
+    provider attempt 的局部 timeout。每次 retry 必须新建实例，避免一次 timeout
+    污染后续 repair attempt。读取时 parent cancellation 始终优先。
+
+    :param parent: Host 注入的只读 parent cancellation token。
+    """
+
+    def __init__(self, parent: CancellationToken) -> None:
+        """初始化未取消的 attempt-local 状态。
+
+        :param parent: Host 注入的只读 parent cancellation token。
+        :returns: ``None``。
+        :raises TypeError: ``parent`` 不满足 cancellation 观察协议时抛出。
+        """
+
+        if not isinstance(parent, CancellationToken):
+            raise TypeError("parent must implement CancellationToken")
+        self._parent = parent
+        self._lock = Lock()
+        self._local_reason: str | None = None
+        self._local_requested_at: datetime | None = None
+
+    def is_cancelled(self) -> bool:
+        """返回 parent 或当前 attempt 是否已请求取消。
+
+        :returns: 任一 owner 已请求取消时返回 ``True``。
+        :raises Exception: parent token 读取失败时原样抛出。
+        """
+
+        if self._parent.is_cancelled():
+            return True
+        with self._lock:
+            return self._local_reason is not None
+
+    def cancel_reason(self) -> str | None:
+        """返回当前有效取消原因，并保证 parent 原因优先。
+
+        :returns: parent 原因、attempt-local 原因或 ``None``。
+        :raises Exception: parent token 读取失败时原样抛出。
+        """
+
+        parent_reason = self._parent.cancel_reason()
+        if parent_reason is not None:
+            return parent_reason
+        with self._lock:
+            return self._local_reason
+
+    def requested_at(self) -> datetime | None:
+        """返回当前有效取消请求时间，并保证 parent 时间优先。
+
+        :returns: parent 时间、attempt-local 时间或 ``None``。
+        :raises Exception: parent token 读取失败时原样抛出。
+        """
+
+        if self._parent.cancel_reason() is not None:
+            return self._parent.requested_at()
+        with self._lock:
+            return self._local_requested_at
+
+    def request_cancel(self, reason: str) -> None:
+        """只取消当前 compactor proposal attempt。
+
+        :param reason: attempt-local 结构化取消原因。
+        :returns: ``None``。
+        :raises ValueError: ``reason`` 为空时抛出。
+        """
+
+        if not reason:
+            raise ValueError("reason must be non-empty")
+        with self._lock:
+            if self._local_reason is None:
+                self._local_reason = reason
+                self._local_requested_at = datetime.now(UTC)
+
+
 async def run_compaction_operation(
     *,
     request: CompactionRequest,
@@ -623,11 +702,14 @@ async def run_compaction_operation(
                 )
             repairable = attempt_number < max_attempts
             next_decision = _NEXT_DECISION_RETRY_REPAIR if repairable else _NEXT_DECISION_FAIL_COMPACTION
+            attempt_cancellation_token = _CompactionAttemptCancellationToken(
+                cancellation_token
+            )
             try:
                 proposal = await _prepare_compactor_proposal(
                     compactor,
                     pass_request,
-                    cancellation_token,
+                    attempt_cancellation_token,
                     compaction_operation_id=compaction_operation_id,
                     compaction_attempt_number=attempt_number,
                     proposal_manifest_recorder=proposal_manifest_recorder,
@@ -930,6 +1012,10 @@ async def _prepare_compactor_proposal(
             compaction_operation_id=compaction_operation_id,
             compaction_attempt_number=compaction_attempt_number,
         )
+        _ensure_compactor_proposal_active(
+            cancellation_token,
+            proposal_manifest_reference=manifest_reference,
+        )
         try:
             candidate = await compactor.run_prepared_compactor_proposal(
                 prepared_input
@@ -953,6 +1039,10 @@ async def _prepare_compactor_proposal(
     compact_input = conversation_compact_input_vnext_from_material_pack(
         request.material_pack
     )
+    _ensure_compactor_proposal_active(
+        cancellation_token,
+        proposal_manifest_reference=None,
+    )
     try:
         candidate = await compactor.compact(request, cancellation_token)
     except asyncio.CancelledError as exc:
@@ -966,6 +1056,30 @@ async def _prepare_compactor_proposal(
         candidate=candidate,
         proposal_manifest_reference=None,
     )
+
+
+def _ensure_compactor_proposal_active(
+    cancellation_token: CancellationToken,
+    *,
+    proposal_manifest_reference: CompactorProposalManifestReference | None,
+) -> None:
+    """在 provider 调用前重新确认本 attempt 仍可执行。
+
+    prepared path 必须在 manifest recorder 返回后调用本函数，使 proactive
+    durable parent 能重新读取 Run status 与 input cursor；失效时保留 manifest
+    ref 作为诊断，但不得进入 provider。
+
+    :param cancellation_token: 当前 attempt 的 linked cancellation token。
+    :param proposal_manifest_reference: 已持久化的 manifest 引用。
+    :returns: ``None``。
+    :raises _CompactorProposalCancelledError: parent 或 attempt 已取消时抛出。
+    :raises Exception: parent token 读取失败时原样抛出。
+    """
+
+    if cancellation_token.is_cancelled():
+        raise _CompactorProposalCancelledError(
+            proposal_manifest_reference=proposal_manifest_reference,
+        )
 
 
 def _record_compactor_proposal_manifest(

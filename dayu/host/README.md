@@ -470,6 +470,8 @@ proactive compact 发生在 Attempt 创建前。Host 在 dispatch 前估算当�
 
 reactive compact 只由 EngineEvent `context_compaction_requested` 触发。该事件来自 provider 明确报告输入上下文溢出，不来自 final candidate 的 `finish_reason=LENGTH`；`LENGTH` 表示模型达到输出上限，属于 Engine length continuation / degraded answer 机制。Host ingest reactive request 后会关闭当前 Attempt、把 Run 推进为 `RECOVERING`，冻结 overflow material，执行 compaction，再创建新的 recovery Attempt 或按 fallback / failure / cancel 路径收口。
 
+每次 compactor proposal 都使用新的 Host-private linked attempt token：provider timeout 只取消当前 attempt child，Run / reactive operation parent 保持生命周期真源并拥有取消原因优先级。prepared proposal 先提交 runner-call manifest，再用同一个 child 重新观察 parent；proactive path 因此会在 provider 调用前重新读取 durable Run 前置条件，且不会跨 provider await 持有 Host transaction。
+
 compact attempt 被拒绝时，Host 会在 `CONTEXT_COMPACTION_ATTEMPT_REJECTED` canonical payload 中保留 operation、attempt、failure stage、parser / validator、offending block locator、digest 与 diagnostic artifact ref 等小字段；若失败发生在 material projection 或 proposal 准备边界，raw previous compacted view / offending block text 只写入 Host diagnostic artifact，并通过 `payload_descriptors` 的 artifact descriptor 追踪，不进入 EventLog canonical payload、Conversation Memory、LLM-facing compact material 或普通 RunInput。
 
 ### Purge
