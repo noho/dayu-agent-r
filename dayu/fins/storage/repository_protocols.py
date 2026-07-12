@@ -43,15 +43,51 @@ class BatchingRepositoryProtocol(Protocol):
     """批处理事务仓储协议。"""
 
     def begin_batch(self, ticker: str) -> BatchToken:
-        """开启批处理事务。"""
+        """开启 ticker 级批处理事务。
+
+        Args:
+            ticker: 要绑定的股票代码。
+
+        Returns:
+            仅创建它的执行 owner 可使用的 batch token。
+
+        Raises:
+            RuntimeError: 同 ticker 已存在活动 batch 或当前无法取得 owner lock 时抛出。
+            ValueError: ticker 不满足单路径组件契约时抛出。
+            OSError: staging、journal 或锁文件准备失败时抛出。
+        """
         ...
 
     def commit_batch(self, token: BatchToken) -> None:
-        """提交批处理事务。"""
+        """提交批处理事务并消费 token。
+
+        Args:
+            token: 当前执行 owner 持有的活动 batch token。
+
+        Returns:
+            无；返回即表示 ``COMMITTED`` journal 已成为唯一提交事实。
+
+        Raises:
+            ValueError: token 不是当前活动 batch 时抛出。
+            RuntimeError: 当前执行 scope 不是 token owner 时抛出。
+            OSError: ``COMMITTED`` 前提交失败时，在 storage owner 完成或尝试恢复提交前状态后抛出；token 仍由本方法消费，caller 不得再次 rollback。
+        """
         ...
 
     def rollback_batch(self, token: BatchToken) -> None:
-        """回滚批处理事务。"""
+        """回滚尚未进入 ``commit_batch`` 的活动 batch并消费 token。
+
+        Args:
+            token: 当前执行 owner 持有且尚未交给 ``commit_batch`` 的token。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: token 已失效或不是当前活动 batch 时抛出。
+            RuntimeError: 当前执行 scope 不是 token owner 时抛出。
+            OSError: rollback journal 或 staging 清理失败时抛出。
+        """
         ...
 
     def recover_orphan_batches(self, *, dry_run: bool = False) -> tuple[str, ...]:
@@ -95,15 +131,51 @@ class SourceDocumentRepositoryProtocol(Protocol):
     """源文档仓储协议。"""
 
     def begin_batch(self, ticker: str) -> BatchToken:
-        """开启源文档写入 batch。"""
+        """开启源文档写入 batch。
+
+        Args:
+            ticker: 要绑定的股票代码。
+
+        Returns:
+            仅创建它的执行 owner 可使用的 batch token。
+
+        Raises:
+            RuntimeError: 同 ticker 已存在活动 batch 或当前无法取得 owner lock 时抛出。
+            ValueError: ticker 不满足单路径组件契约时抛出。
+            OSError: staging、journal 或锁文件准备失败时抛出。
+        """
         ...
 
     def commit_batch(self, token: BatchToken) -> None:
-        """提交源文档写入 batch。"""
+        """提交源文档写入 batch并消费 token。
+
+        Args:
+            token: 当前执行 owner 持有的活动 batch token。
+
+        Returns:
+            无；返回即表示 ``COMMITTED`` journal 已成为唯一提交事实。
+
+        Raises:
+            ValueError: token 不是当前活动 batch 时抛出。
+            RuntimeError: 当前执行 scope 不是 token owner 时抛出。
+            OSError: ``COMMITTED`` 前提交失败时，在 storage owner 完成或尝试恢复提交前状态后抛出；token 仍由本方法消费，caller 不得再次 rollback。
+        """
         ...
 
     def rollback_batch(self, token: BatchToken) -> None:
-        """回滚源文档写入 batch。"""
+        """回滚尚未进入 ``commit_batch`` 的源文档写入 batch并消费 token。
+
+        Args:
+            token: 当前执行 owner 持有且尚未交给 ``commit_batch`` 的token。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: token 已失效或不是当前活动 batch 时抛出。
+            RuntimeError: 当前执行 scope 不是 token owner 时抛出。
+            OSError: rollback journal 或 staging 清理失败时抛出。
+        """
         ...
 
     def has_source_storage_root(self, ticker: str, source_kind: SourceKind) -> bool:

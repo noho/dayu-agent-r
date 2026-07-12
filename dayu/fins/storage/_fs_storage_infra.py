@@ -38,6 +38,7 @@ from ._fs_storage_utils import (
     _PROCESSED_META_FILENAME,
     _REJECTED_FILINGS_DIRNAME,
     _SOURCE_META_FILENAME,
+    _fsync_directory,
     _normalize_document_id,
     _normalize_entry_name,
     _normalize_source_kind,
@@ -255,43 +256,131 @@ class _FsStorageInfra:
         target_dir = token.target_ticker_dir
         staging_dir = token.staging_ticker_dir
         backup_dir = token.backup_dir
-        preserved_swapped_target = False
-
         try:
-            # 采用"先备份、再替换"的方式，降低提交中断带来的损坏风险。
+            # 复杂逻辑说明：COMMITTED 写入成功前，target 切换始终只是可回滚的物理阶段。
             if target_dir.exists():
-                shutil.move(str(target_dir), str(backup_dir))
-                self._write_batch_journal(token, _PHASE_BACKED_UP_TARGET)
-            target_dir.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(staging_dir), str(target_dir))
+                self._replace_directory(target_dir, backup_dir)
+            self._write_batch_journal(token, _PHASE_BACKED_UP_TARGET)
+            self._replace_directory(staging_dir, target_dir)
             self._write_batch_journal(token, _PHASE_SWAPPED_TARGET)
-            if backup_dir.exists():
-                shutil.rmtree(backup_dir)
-            self._write_batch_journal(token, _PHASE_COMMITTED)
             self._invalidate_company_meta_caches()
-        except Exception:
-            if backup_dir.exists() and target_dir.exists() and not staging_dir.exists():
-                shutil.rmtree(target_dir, ignore_errors=True)
-            if backup_dir.exists() and not target_dir.exists():
-                shutil.move(str(backup_dir), str(target_dir))
-            elif target_dir.exists() and not staging_dir.exists():
-                preserved_swapped_target = True
-
-            if preserved_swapped_target:
-                self._invalidate_company_meta_caches()
+            self._write_batch_journal(token, _PHASE_COMMITTED)
+        except Exception as commit_error:
+            rollback_error: Exception | None = None
+            try:
+                self._rollback_precommit_batch(token)
+            except Exception as exc:
+                rollback_error = exc
+            self._invalidate_company_meta_caches()
+            if rollback_error is not None:
+                commit_error.add_note(
+                    "commit_batch rollback failed; journal/backup/staging recovery evidence retained"
+                )
                 Log.warn(
-                    f"commit_batch 在目标切换后写入 journal 失败，已保留目标目录: ticker={token.ticker}",
+                    f"commit_batch 与 rollback 均失败，已保留恢复证据: ticker={token.ticker}",
                     module=self.MODULE,
                 )
-            else:
-                self._write_batch_journal(token, _PHASE_ROLLED_BACK)
-                Log.warn(f"commit_batch 失败，已恢复备份: ticker={token.ticker}", module=self.MODULE)
+                raise commit_error from rollback_error
+            Log.warn(f"commit_batch 失败，已恢复提交前状态: ticker={token.ticker}", module=self.MODULE)
             raise
+        else:
+            self._cleanup_committed_batch(token)
         finally:
             self._active_batches.pop(token.ticker, None)
             self._unbind_batch_owner(token)
-            shutil.rmtree(token.staging_root_dir, ignore_errors=True)
             self._release_ticker_lock(token.ticker)
+
+    def _replace_directory(self, source: Path, target: Path) -> None:
+        """原子移动目录并刷新受影响的父目录。
+
+        Args:
+            source: 当前存在的源目录。
+            target: 尚不存在的目标目录。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: target已存在、目标目录准备、原子移动或目录访问失败时抛出。
+        """
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() or target.is_symlink():
+            raise OSError(f"directory replace target 已存在: {target}")
+        source_parent = source.parent
+        target_parent = target.parent
+        os.replace(source, target)
+        _fsync_directory(source_parent)
+        if target_parent != source_parent:
+            _fsync_directory(target_parent)
+
+    def _remove_directory(self, path: Path) -> None:
+        """删除目录并刷新其父目录。
+
+        Args:
+            path: 要删除的目录。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: 目录删除失败时抛出。
+        """
+
+        parent = path.parent
+        shutil.rmtree(path)
+        _fsync_directory(parent)
+
+    def _rollback_precommit_batch(self, token: BatchToken) -> None:
+        """把尚未到达 ``COMMITTED`` 的物理目录恢复到提交前状态。
+
+        Args:
+            token: 正在提交的 batch token。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: new target 撤回、backup 恢复、journal 写入或证据清理失败时抛出。
+        """
+
+        target_dir = token.target_ticker_dir
+        staging_dir = token.staging_ticker_dir
+        backup_dir = token.backup_dir
+        if not staging_dir.exists() and target_dir.exists():
+            # new target 尚未 committed；先移回 staging，既撤销可见状态又保留失败证据。
+            self._replace_directory(target_dir, staging_dir)
+        if backup_dir.exists():
+            if target_dir.exists():
+                raise OSError("rollback target 已存在，无法安全恢复 backup")
+            self._replace_directory(backup_dir, target_dir)
+        self._write_batch_journal(token, _PHASE_ROLLED_BACK)
+        self._remove_directory(token.staging_root_dir)
+
+    def _cleanup_committed_batch(self, token: BatchToken) -> None:
+        """清理已提交 batch 的 backup 与 journal container。
+
+        Args:
+            token: 已 durable 写入 ``COMMITTED`` 的 batch token。
+
+        Returns:
+            无。cleanup 失败只记录诊断并保留恢复证据。
+
+        Raises:
+            无。
+        """
+
+        try:
+            if token.backup_dir.exists():
+                self._remove_directory(token.backup_dir)
+            if token.staging_root_dir.exists():
+                self._remove_directory(token.staging_root_dir)
+        except OSError as cleanup_error:
+            Log.warn(
+                "commit_batch 已提交但 cleanup 失败，保留 orphan recovery 证据: "
+                f"ticker={token.ticker} error_type={cleanup_error.__class__.__name__}",
+                module=self.MODULE,
+            )
 
     def rollback_batch(self, token: BatchToken) -> None:
         """回滚批处理事务。
@@ -717,27 +806,56 @@ class _FsStorageInfra:
         try:
             target_dir = self._target_ticker_dir(normalized_ticker)
             backup_dir = Path(str(journal.get("backup_dir", "")).strip() or self.backup_root / f"{normalized_ticker}.bak.{token_dir.name}")
-            if phase == _PHASE_BACKED_UP_TARGET and backup_dir.exists() and not target_dir.exists():
-                actions.append(f"restore backup ticker={normalized_ticker} token={token_dir.name} phase={phase}")
-                if not dry_run:
-                    target_dir.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(backup_dir), str(target_dir))
-            elif phase == _PHASE_SWAPPED_TARGET and backup_dir.exists() and target_dir.exists():
-                actions.append(f"delete backup ticker={normalized_ticker} token={token_dir.name} phase={phase}")
-                if not dry_run:
-                    shutil.rmtree(backup_dir, ignore_errors=True)
+            staging_dir = Path(
+                str(journal.get("staging_ticker_dir", "")).strip()
+                or token_dir / normalized_ticker
+            )
+            if phase == _PHASE_COMMITTED:
+                if not target_dir.exists():
+                    actions.append(
+                        f"preserve committed evidence ticker={normalized_ticker} "
+                        f"token={token_dir.name} reason=missing_target"
+                    )
+                    return actions
+                if backup_dir.exists():
+                    actions.append(
+                        f"delete backup ticker={normalized_ticker} token={token_dir.name} phase={phase}"
+                    )
+                    if not dry_run:
+                        self._remove_directory(backup_dir)
+            elif phase in {_PHASE_BACKED_UP_TARGET, _PHASE_SWAPPED_TARGET}:
+                if target_dir.exists():
+                    actions.append(
+                        f"remove uncommitted target ticker={normalized_ticker} "
+                        f"token={token_dir.name} phase={phase}"
+                    )
+                    if not dry_run:
+                        if staging_dir.exists():
+                            self._remove_directory(target_dir)
+                        else:
+                            self._replace_directory(target_dir, staging_dir)
+                if backup_dir.exists():
+                    actions.append(
+                        f"restore backup ticker={normalized_ticker} token={token_dir.name} phase={phase}"
+                    )
+                    if not dry_run:
+                        self._replace_directory(backup_dir, target_dir)
             elif backup_dir.exists() and not target_dir.exists():
-                actions.append(f"restore backup ticker={normalized_ticker} token={token_dir.name} phase={phase or 'unknown'}")
+                actions.append(
+                    f"restore backup ticker={normalized_ticker} token={token_dir.name} "
+                    f"phase={phase or 'unknown'}"
+                )
                 if not dry_run:
-                    target_dir.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(backup_dir), str(target_dir))
-            elif backup_dir.exists() and target_dir.exists():
-                actions.append(f"delete backup ticker={normalized_ticker} token={token_dir.name} phase={phase or 'unknown'}")
-                if not dry_run:
-                    shutil.rmtree(backup_dir, ignore_errors=True)
+                    self._replace_directory(backup_dir, target_dir)
+            elif backup_dir.exists() and target_dir.exists() and phase != _PHASE_STARTED:
+                actions.append(
+                    f"preserve ambiguous backup ticker={normalized_ticker} token={token_dir.name} "
+                    f"phase={phase or 'unknown'}"
+                )
+                return actions
             actions.append(f"cleanup batch ticker={normalized_ticker} token={token_dir.name} phase={phase or 'unknown'}")
             if not dry_run:
-                shutil.rmtree(token_dir, ignore_errors=True)
+                self._remove_directory(token_dir)
         finally:
             self._release_lock_token(ticker_token)
         return actions
@@ -777,12 +895,11 @@ class _FsStorageInfra:
                 if target_dir.exists():
                     actions.append(f"delete backup ticker={normalized_ticker} token={token_id}")
                     if not dry_run:
-                        shutil.rmtree(backup_dir, ignore_errors=True)
+                        self._remove_directory(backup_dir)
                     continue
                 actions.append(f"restore backup ticker={normalized_ticker} token={token_id}")
                 if not dry_run:
-                    target_dir.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(backup_dir), str(target_dir))
+                    self._replace_directory(backup_dir, target_dir)
             finally:
                 self._release_lock_token(ticker_token)
         return actions
@@ -936,12 +1053,16 @@ class _FsStorageInfra:
             return self._file_store
         return LocalFileStore(root=self._file_store_root_for_ticker(ticker), scheme="local")
 
-    def _build_store_key(self, handle: SourceHandle | ProcessedHandle, filename: str) -> str:
-        """构建对象存储 key。
+    def _build_store_key_from_normalized_filename(
+        self,
+        handle: SourceHandle | ProcessedHandle,
+        normalized_filename: str,
+    ) -> str:
+        """使用已校验文件名构建对象存储 key。
 
         Args:
             handle: 文档句柄。
-            filename: 文件名。
+            normalized_filename: 已由 filename owner 校验的单组件文件名。
 
         Returns:
             逻辑 key。
@@ -953,9 +1074,12 @@ class _FsStorageInfra:
         normalized_ticker = _normalize_ticker(handle.ticker)
         normalized_document_id = _normalize_document_id(handle.document_id)
         if isinstance(handle, ProcessedHandle):
-            return f"{normalized_ticker}/processed/{normalized_document_id}/{filename}"
+            return f"{normalized_ticker}/processed/{normalized_document_id}/{normalized_filename}"
         source_kind = _normalize_source_kind(handle.source_kind)
-        return f"{normalized_ticker}/{_source_dir_name(source_kind)}/{normalized_document_id}/{filename}"
+        return (
+            f"{normalized_ticker}/{_source_dir_name(source_kind)}/"
+            f"{normalized_document_id}/{normalized_filename}"
+        )
 
     def _select_primary_document(
         self,

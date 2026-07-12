@@ -9,7 +9,7 @@ import json
 import mimetypes
 import os
 import uuid
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Optional
 
 from dayu.contracts.json_value import JsonValue
@@ -27,11 +27,37 @@ _REJECTED_FILINGS_DIRNAME = ".rejections"
 # ---------- 标准化 ----------
 
 
+def _normalize_path_component(value: str, *, field_name: str) -> str:
+    """标准化并校验单个文件系统路径组件。
+
+    Args:
+        value: 原始路径组件。
+        field_name: 错误信息使用的字段名。
+
+    Returns:
+        去除首尾空白后的单路径组件。
+
+    Raises:
+        ValueError: 组件为空、为当前/父目录、包含分隔符或表达绝对路径/盘符时抛出。
+    """
+
+    normalized = str(value).strip()
+    if not normalized:
+        raise ValueError(f"{field_name} 不能为空")
+    if normalized in {".", ".."}:
+        raise ValueError(f"{field_name} 非法")
+    if "/" in normalized or "\\" in normalized:
+        raise ValueError(f"{field_name} 不能包含路径分隔符")
+    if Path(normalized).is_absolute() or PureWindowsPath(normalized).drive:
+        raise ValueError(f"{field_name} 不能是绝对路径或盘符表达")
+    return normalized
+
+
 def _normalize_ticker(ticker: str) -> str:
     """标准化 ticker。
 
-    优先走 ``try_normalize_ticker`` 真源；识别失败（例如输入是公司名）时回退
-    到 ``strip().upper()``，保留仓储在写入路径上对异常 ticker 的宽容能力。
+    优先走 ``try_normalize_ticker`` 真源；识别失败时回退到
+    ``strip().upper()``。canonical 与 fallback 最终都通过同一个单路径组件校验。
 
     Args:
         ticker: 原始 ticker。
@@ -40,16 +66,12 @@ def _normalize_ticker(ticker: str) -> str:
         标准化后的 ticker。
 
     Raises:
-        ValueError: ticker 为空时抛出。
+        ValueError: ticker 为空、包含路径分隔符或表达绝对路径/盘符时抛出。
     """
 
     normalized_source = try_normalize_ticker(ticker)
-    if normalized_source is not None:
-        return normalized_source.canonical
-    normalized = ticker.strip().upper()
-    if not normalized:
-        raise ValueError("ticker 不能为空")
-    return normalized
+    candidate = normalized_source.canonical if normalized_source is not None else ticker.strip().upper()
+    return _normalize_path_component(candidate, field_name="ticker")
 
 
 def _normalize_company_ticker_aliases(
@@ -92,14 +114,7 @@ def _normalize_entry_name(name: str) -> str:
         ValueError: 名称为空、包含路径分隔或为 `.` / `..` 时抛出。
     """
 
-    normalized = str(name).strip()
-    if not normalized:
-        raise ValueError("条目名称不能为空")
-    if normalized in {".", ".."}:
-        raise ValueError("条目名称非法")
-    if "/" in normalized or "\\" in normalized:
-        raise ValueError("条目名称不能包含路径分隔符")
-    return normalized
+    return _normalize_path_component(name, field_name="条目名称")
 
 
 def _normalize_document_id(document_id: str) -> str:
@@ -115,14 +130,53 @@ def _normalize_document_id(document_id: str) -> str:
         ValueError: 文档 ID 为空、包含路径分隔或为 ``.`` / ``..`` 时抛出。
     """
 
-    normalized = str(document_id).strip()
+    return _normalize_path_component(document_id, field_name="document_id")
+
+
+def _normalize_filename(filename: str) -> str:
+    """标准化仓储文件名。
+
+    Args:
+        filename: 原始文件名。
+
+    Returns:
+        可作为单个路径组件使用的文件名。
+
+    Raises:
+        ValueError: 文件名为空、为当前/父目录、包含分隔符或表达绝对路径/盘符时抛出。
+    """
+
+    return _normalize_path_component(filename, field_name="filename")
+
+
+def _normalize_object_key(key: str) -> str:
+    """标准化本地对象存储的多组件 key。
+
+    Args:
+        key: 使用正斜杠分隔的原始对象 key。
+
+    Returns:
+        每个组件均已校验的 canonical 对象 key。
+
+    Raises:
+        ValueError: key 为空、为绝对路径、包含反斜杠、空组件或非法组件时抛出。
+    """
+
+    normalized = str(key).strip()
     if not normalized:
-        raise ValueError("document_id 不能为空")
-    if normalized in {".", ".."}:
-        raise ValueError("document_id 非法")
-    if "/" in normalized or "\\" in normalized:
-        raise ValueError("document_id 不能包含路径分隔符")
-    return normalized
+        raise ValueError("key 不能为空")
+    if normalized.startswith("/"):
+        raise ValueError("key 不能以路径分隔符开头")
+    if "\\" in normalized:
+        raise ValueError("key 不能包含反斜杠")
+    raw_segments = normalized.split("/")
+    if any(segment == "" for segment in raw_segments):
+        raise ValueError("key 不能包含空路径组件")
+    segments = [
+        _normalize_path_component(segment, field_name="key 路径组件")
+        for segment in raw_segments
+    ]
+    return "/".join(segments)
 
 
 def _normalize_source_kind(source_kind: str | SourceKind) -> SourceKind:
@@ -212,10 +266,17 @@ def _local_path_from_uri(portfolio_root: Path, uri: str) -> Path:
         raise ValueError("uri 不能为空")
     if not raw.startswith("local://"):
         raise ValueError(f"不支持的 URI scheme: {raw}")
-    key = raw.split("local://", 1)[1].lstrip("/")
-    if not key:
+    raw_key = raw.split("local://", 1)[1]
+    if not raw_key:
         raise ValueError("local URI 缺少 key")
-    return (portfolio_root / Path(*key.split("/"))).resolve()
+    key = _normalize_object_key(raw_key)
+    normalized_root = portfolio_root.resolve()
+    path = (normalized_root / Path(*key.split("/"))).resolve()
+    try:
+        path.relative_to(normalized_root)
+    except ValueError as exc:
+        raise ValueError("local URI key 越界，禁止访问 portfolio 根目录外路径") from exc
+    return path
 
 
 def _guess_media_type(path: Path) -> Optional[str]:
@@ -478,13 +539,16 @@ def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     serialized = json.dumps(payload, ensure_ascii=False, indent=2)
     temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    with temp_path.open("w", encoding="utf-8") as stream:
-        stream.write(serialized)
-        stream.flush()
-        os.fsync(stream.fileno())
-    # 复杂逻辑说明：通过明确的 same-directory 原子替换确保意外退出时不会留下半写入 JSON。
-    os.replace(temp_path, path)
-    _fsync_directory(path.parent)
+    try:
+        with temp_path.open("w", encoding="utf-8") as stream:
+            stream.write(serialized)
+            stream.flush()
+            os.fsync(stream.fileno())
+        # 复杂逻辑说明：通过明确的 same-directory 原子替换确保意外退出时不会留下半写入 JSON。
+        os.replace(temp_path, path)
+        _fsync_directory(path.parent)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def _fsync_directory(path: Path) -> None:

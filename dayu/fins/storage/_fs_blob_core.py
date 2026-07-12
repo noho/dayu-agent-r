@@ -15,6 +15,7 @@ from dayu.fins.domain.document_models import (
 from ._fs_storage_infra import _FsStorageInfra
 from ._fs_storage_utils import (
     _file_object_meta_from_dict,
+    _normalize_filename,
     _normalize_ticker,
 )
 
@@ -138,13 +139,10 @@ class _FsBlobMixin(_FsStorageInfra):
             OSError: 写入失败时抛出。
         """
 
-        normalized_filename = str(filename).strip()
-        if not normalized_filename:
-            raise ValueError("filename 不能为空")
-        if isinstance(handle, SourceHandle):
-            self._get_handle_meta(handle)
+        normalized_filename = _normalize_filename(filename)
+        self._get_handle_meta(handle)
         normalized_ticker = _normalize_ticker(handle.ticker)
-        key = self._build_store_key(handle, normalized_filename)
+        key = self._build_store_key_from_normalized_filename(handle, normalized_filename)
         file_store = self._build_file_store(normalized_ticker)
         return file_store.put_object(
             key,
