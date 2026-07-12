@@ -10,10 +10,11 @@ from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import TypeVar, cast
 
 import pytest
 
+import dayu.host.admission as host_admission
 from dayu.contracts.json_value import JsonValue
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
@@ -40,12 +41,15 @@ from dayu.host import (
     cancel_session_runs,
     ensure_session,
 )
+from dayu.host._durable_actor import open_durable_actor
 from dayu.host.admission import PendingDispatchRecord
 from dayu.host.api import (
     HostInput,
     AttemptDispatchSnapshot,
     AttemptStatus,
     EnsureSessionRequest,
+    HostApiError,
+    HostApiErrorCode,
     HostCommandHandleOptions,
     HostLocalExecutionOptions,
     StartRunRequest,
@@ -65,6 +69,11 @@ from dayu.host.durable.options import (
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
+from dayu.host.durable.run_transition import (
+    CancelActiveAttemptInput,
+    RunTransitionResult,
+)
+from dayu.host.durable.schema import TABLE_HOST_ATTEMPT_DISPATCH_RECORDS
 from dayu.host.durable.state import (
     DispatchRecordRow,
     DispatchRecordStatus,
@@ -75,10 +84,16 @@ from dayu.host.durable.state import (
     mark_dispatch_worker_accepted_row,
     mark_dispatching_after_lane_row,
 )
-from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.durable.transaction import (
+    HostReadTransactionOperation,
+    HostTransaction,
+    HostTransactionOperation,
+    HostTransactionRunner,
+)
 
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _LANE_NAME = "llm"
+T = TypeVar("T")
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,10 +108,13 @@ class _RunRefs:
 
 
 @pytest.mark.asyncio
-async def test_active_cancel_bridge_runs_worker_hook_on_opener_loop_thread() -> None:
+async def test_active_cancel_bridge_runs_worker_hook_on_opener_loop_thread(
+    tmp_path: Path,
+) -> None:
     """actor thread 发起 cancel 时 token/hook/asyncio primitive 回到 opener loop。"""
 
     opener_thread_id = threading.get_ident()
+    actor_thread_ids: list[int] = []
     registry = ActiveWorkerRegistry()
     handle = _CancelAwareHandle(
         local_worker_id="bridge-worker",
@@ -115,16 +133,35 @@ async def test_active_cancel_bridge_runs_worker_hook_on_opener_loop_thread() -> 
         active_registry=registry,
     )
 
-    found = await asyncio.to_thread(
-        port.cancel,
-        ActiveCancelMessage(
-            run_id="run-bridge",
-            attempt_id="attempt-bridge",
-            execution_id="execution-bridge",
-            reason="bridge-test",
-        ),
+    actor = await open_durable_actor(
+        lambda: create_host_command_handle(_command_options(tmp_path)),
+        thread_name_prefix="test-active-cancel-bridge",
     )
 
+    def cancel_from_actor(_command_handle: HostCommandHandle) -> bool:
+        """从真实 durable actor worker thread 调用 opener-loop bridge。
+
+        :param _command_handle: actor 私有 command handle。
+        :returns: active registry 是否命中目标。
+        :raises Exception: bridge 或 registry cancel 失败时透传。
+        """
+
+        actor_thread_ids.append(threading.get_ident())
+        return port.cancel(
+            ActiveCancelMessage(
+                run_id="run-bridge",
+                attempt_id="attempt-bridge",
+                execution_id="execution-bridge",
+                reason="bridge-test",
+            )
+        )
+
+    try:
+        found = await actor.call(cancel_from_actor)
+    finally:
+        await actor.close()
+
+    assert actor_thread_ids != [opener_thread_id]
     assert found is True
     assert token.cancel_reason() == "bridge-test"
     assert handle.cancel_reasons == ["bridge-test"]
@@ -612,6 +649,139 @@ def test_cancel_run_starting_worker_accepted_enters_active_cancel(
 
 
 @pytest.mark.asyncio
+async def test_cancel_run_deferred_classification_uses_single_write_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """deferred error 由 cancel write snapshot 产生且不再打开 read transaction。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    """
+
+    options = _command_options(tmp_path)
+    host = create_host_command_handle(options)
+    read_calls = 0
+    write_calls = 0
+    original_run_read = HostTransactionRunner.run_read
+    original_run_write = HostTransactionRunner.run_write
+    try:
+        session_id = _session_id(host)
+        with open_host_durable_store(_durable_options(tmp_path)) as store:
+            scheduler = await _open_scheduler(
+                tmp_path,
+                store,
+                _CancelAwareHandle(
+                    local_worker_id="worker-deferred-snapshot",
+                    terminal="hang",
+                ),
+            )
+            try:
+                active = start_run(
+                    host,
+                    _start_request(session_id, "start-deferred-snapshot"),
+                )
+                refs = await _start_governed_refs(scheduler, session_id)
+                _delete_dispatch_record(store.transaction_runner, refs)
+                event_count_before = _event_count(options.db_path)
+                actor_runner = host._transaction_runner()
+
+                def record_read(
+                    self: HostTransactionRunner,
+                    operation: HostReadTransactionOperation[T],
+                ) -> T:
+                    """记录目标 command runner read transaction。
+
+                    :param self: transaction runner。
+                    :param operation: read operation。
+                    :returns: 原始 operation 结果。
+                    :raises Exception: 原始 read 失败时透传。
+                    """
+
+                    nonlocal read_calls
+                    if self is actor_runner:
+                        read_calls += 1
+                    return original_run_read(self, operation)
+
+                def record_write(
+                    self: HostTransactionRunner,
+                    operation: HostTransactionOperation[T],
+                ) -> T:
+                    """记录目标 command runner write transaction。
+
+                    :param self: transaction runner。
+                    :param operation: write operation。
+                    :returns: 原始 operation 结果。
+                    :raises Exception: 原始 write 失败时透传。
+                    """
+
+                    nonlocal write_calls
+                    if self is actor_runner:
+                        write_calls += 1
+                    return original_run_write(self, operation)
+
+                monkeypatch.setattr(HostTransactionRunner, "run_read", record_read)
+                monkeypatch.setattr(HostTransactionRunner, "run_write", record_write)
+
+                with pytest.raises(HostApiError) as exc_info:
+                    cancel_run(
+                        host,
+                        active.run_id,
+                        _cancel_request("cancel-deferred-snapshot"),
+                    )
+
+                assert exc_info.value.code is HostApiErrorCode.UNSUPPORTED_OPERATION
+                assert write_calls == 1
+                assert read_calls == 0
+                assert _event_count(options.db_path) == event_count_before
+
+                def return_cas_lost(
+                    transaction: HostTransaction,
+                    event_log_store: EventLogStore,
+                    request: CancelActiveAttemptInput,
+                ) -> RunTransitionResult:
+                    """模拟同一 write snapshot 内 transition conflict。
+
+                    :param transaction: 当前 Host transaction。
+                    :param event_log_store: EventLog primitive。
+                    :param request: active cancel transition input。
+                    :returns: 固定 CAS_LOST result。
+                    """
+
+                    del transaction, event_log_store, request
+                    return RunTransitionResult(
+                        status=StateMutationStatus.CAS_LOST,
+                        run=None,
+                        attempt=None,
+                        dispatch_record=None,
+                    )
+
+                monkeypatch.setattr(
+                    host_admission,
+                    "request_active_attempt_cancel_in_transaction",
+                    return_cas_lost,
+                )
+                read_calls = 0
+                write_calls = 0
+                with pytest.raises(HostApiError) as conflict_info:
+                    cancel_run(
+                        host,
+                        active.run_id,
+                        _cancel_request("cancel-conflict-snapshot"),
+                    )
+
+                assert conflict_info.value.code is HostApiErrorCode.INVALID_STATE
+                assert write_calls == 1
+                assert read_calls == 0
+                assert _event_count(options.db_path) == event_count_before
+            finally:
+                await scheduler.close()
+    finally:
+        host.close()
+
+
+@pytest.mark.asyncio
 async def test_cancel_run_active_worker_propagates_and_closes_cancelled(
     tmp_path: Path,
 ) -> None:
@@ -867,8 +1037,12 @@ async def test_active_cancel_watchdog_closeout_promotes_queued_run(tmp_path: Pat
                 result = scheduler.tick_active_cancel_watchdog(
                     datetime(2030, 1, 1, tzinfo=UTC)
                 )
+                replay = scheduler.tick_active_cancel_watchdog(
+                    datetime(2030, 1, 1, tzinfo=UTC)
+                )
 
                 assert result.closed == 1
+                assert replay.closed == 0
                 await _wait_for_run_status(
                     options.db_path,
                     queued.run_id,
@@ -1446,6 +1620,35 @@ def _pending_dispatch(refs: _RunRefs) -> PendingDispatchRecord:
         execution_target="target-active-cancel",
         worker_kind=WorkerKind.LOCAL,
     )
+
+
+def _delete_dispatch_record(
+    transaction_runner: HostTransactionRunner,
+    refs: _RunRefs,
+) -> None:
+    """删除 current dispatch row，构造 deferred cancel capability snapshot。
+
+    :param transaction_runner: transaction runner。
+    :param refs: 目标 Run durable refs。
+    :returns: ``None``。
+    """
+
+    def _operation(transaction: HostTransaction) -> None:
+        """删除 current Attempt 的 child dispatch row。
+
+        :param transaction: 当前 Host transaction。
+        :returns: ``None``。
+        """
+
+        transaction.execute(
+            f"""
+            DELETE FROM {TABLE_HOST_ATTEMPT_DISPATCH_RECORDS}
+            WHERE dispatch_record_id = ?
+            """,
+            (refs.dispatch_record_id,),
+        )
+
+    transaction_runner.run_write(_operation)
 
 
 def _mark_waiting_for_lane(

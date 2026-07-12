@@ -999,7 +999,7 @@ class HostDispatchScheduler:
         self._health_gate = health_gate
         self._queue: asyncio.Queue[PendingDispatchRecord] = asyncio.Queue()
         self._promotion_queue: asyncio.Queue[str] = asyncio.Queue()
-        self._active_cancel_watchdog_queue: asyncio.Queue[None] = asyncio.Queue(maxsize=1)
+        self._active_cancel_watchdog_event = asyncio.Event()
         self._closed = False
         self._close_cleanup_done = False
         self._heartbeat_task: asyncio.Task[None] | None = None
@@ -1140,10 +1140,7 @@ class HostDispatchScheduler:
         self._raise_if_wake_unavailable(
             component=_CRITICAL_COMPONENT_ACTIVE_CANCEL_WATCHDOG
         )
-        try:
-            self._active_cancel_watchdog_queue.put_nowait(None)
-        except asyncio.QueueFull:
-            pass
+        self._active_cancel_watchdog_event.set()
         self._start_active_cancel_watchdog_loop()
 
     def tick_active_cancel_watchdog(
@@ -2719,8 +2716,9 @@ class HostDispatchScheduler:
     async def _active_cancel_watchdog_loop(self) -> None:
         """active cancel watchdog 后台循环。
 
-        循环通过 cancel commit wakeup 降低延迟，并通过 periodic fallback scan
-        覆盖丢失 wakeup 或重启后的剩余 ``CANCELLING`` 状态。
+        循环通过 level-triggered cancel commit wakeup 降低延迟，并通过 periodic
+        fallback scan 覆盖重启后的剩余 ``CANCELLING`` 状态。event 必须在 tick
+        前 clear，使 tick 期间到达的新 wake 保持 set 并驱动下一轮。
 
         :returns: ``None``。
         :raises asyncio.CancelledError: scheduler close 时透传取消。
@@ -2731,26 +2729,15 @@ class HostDispatchScheduler:
             while not self._closed:
                 try:
                     await asyncio.wait_for(
-                        self._active_cancel_watchdog_queue.get(),
+                        self._active_cancel_watchdog_event.wait(),
                         timeout=interval,
                     )
                 except TimeoutError:
                     pass
                 if self._closed:
                     break
-                try:
-                    result = self.tick_active_cancel_watchdog(datetime.now(UTC))
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    _LOGGER.error(
-                        "dispatch.active_cancel_watchdog.tick_failed "
-                        "host_handle_id=%s error_type=%s",
-                        self._host_handle_id,
-                        exc.__class__.__name__,
-                        exc_info=True,
-                    )
-                    continue
+                self._active_cancel_watchdog_event.clear()
+                result = self.tick_active_cancel_watchdog(datetime.now(UTC))
                 if result.scanned > 0 or result.closed > 0:
                     _LOGGER.log(
                         VERBOSE_LOG_LEVEL,
@@ -2767,14 +2754,6 @@ class HostDispatchScheduler:
                 self._host_handle_id,
             )
             raise
-        except Exception as exc:
-            _LOGGER.error(
-                "dispatch.active_cancel_watchdog.fatal_exit host_handle_id=%s "
-                "error_type=%s",
-                self._host_handle_id,
-                exc.__class__.__name__,
-                exc_info=True,
-            )
 
     async def _host_instance_heartbeat_loop(self) -> None:
         """后台刷新当前 Host instance heartbeat。

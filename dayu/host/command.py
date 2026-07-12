@@ -103,14 +103,9 @@ from dayu.host.durable.session_lifecycle import (
     ensure_session as _ensure_session_in_durable,
 )
 from dayu.host.durable.state import (
-    AttemptRow,
     DispatchRecordRow,
-    RunRow,
     WaitRecordRow,
     WaitRecordStatus,
-    is_dispatch_record_direct_cancelable,
-    read_attempt_by_id,
-    read_dispatch_record_by_attempt_id,
     read_run_by_id,
     read_wait_record_by_id,
     run_snapshot_from_row,
@@ -651,14 +646,6 @@ def cancel_run(host: HostCommandHandle, run_id: str, request: CancelRunRequest) 
         )
     except HostDurableError as exc:
         raise _host_api_error_from_durable_error(exc) from exc
-    except HostApiError as exc:
-        if exc.code == HostApiErrorCode.INVALID_STATE and _is_deferred_cancel_state(host, run_id):
-            raise HostApiError(
-                code=HostApiErrorCode.UNSUPPORTED_OPERATION,
-                message="Run cancel requires a later cancel owner phase",
-                retryable=False,
-            ) from exc
-        raise
     _propagate_active_cancel_targets(
         host,
         (
@@ -1647,72 +1634,6 @@ def _wake_active_cancel_watchdog(host: HostCommandHandle) -> None:
     wakeup_port.wake_active_cancel_watchdog()
 
 
-def _is_deferred_cancel_state(host: HostCommandHandle, run_id: str) -> bool:
-    """判断当前 Run 状态是否属于后续 phase 的 cancel 能力。
-
-    :param host: Host command handle。
-    :param run_id: 目标 Run id。
-    :returns: 属于 deferred cancel 能力时返回 ``True``。
-    :raises HostApiError: handle 已关闭时由底层抛出。
-    """
-
-    return host._run_read(_IsDeferredCancelStateOperation(run_id=run_id))
-
-
-@dataclass(frozen=True, slots=True)
-class _IsDeferredCancelStateOperation:
-    """deferred cancel 状态判断 read transaction body。"""
-
-    run_id: str
-
-    def __call__(self, transaction: HostTransaction) -> bool:
-        """执行 deferred cancel 状态判断。
-
-        :param transaction: 当前 Host transaction。
-        :returns: 属于 deferred cancel 能力时返回 ``True``。
-        """
-
-        run = read_run_by_id(transaction, self.run_id)
-        if run is None:
-            return False
-        if run.status == RunStatus.WAITING:
-            return True
-        if run.status not in (RunStatus.RUNNING, RunStatus.CANCELLING):
-            return False
-        return not (
-            _is_predispatch_starting_run(transaction, run) or _is_active_worker_cancelable_run(transaction, run)
-        )
-
-
-def _is_predispatch_starting_run(transaction: HostTransaction, run: RunRow) -> bool:
-    """判断 Run 是否仍是可直接取消的 pre-dispatch STARTING。
-
-    :param transaction: 当前 Host transaction。
-    :param run: 目标 Run row。
-    :returns: 满足 pre-dispatch STARTING 前置时返回 ``True``。
-    """
-
-    attempt, dispatch_record = _read_attempt_and_dispatch_for_run(transaction, run)
-    return (
-        attempt is not None
-        and attempt.status == AttemptStatus.STARTING
-        and dispatch_record is not None
-        and is_dispatch_record_direct_cancelable(dispatch_record)
-    )
-
-
-def _is_active_worker_cancelable_run(transaction: HostTransaction, run: RunRow) -> bool:
-    """判断 Run 是否处于 Phase 5 active worker cancel 子集。
-
-    :param transaction: 当前 Host transaction。
-    :param run: 目标 Run row。
-    :returns: 可 active cancel 时返回 ``True``。
-    """
-
-    attempt, _dispatch_record = _read_attempt_and_dispatch_for_run(transaction, run)
-    return attempt is not None and attempt.status == AttemptStatus.RUNNING
-
-
 def _pending_dispatch_from_row(
     dispatch_record: DispatchRecordRow,
 ) -> PendingDispatchRecord:
@@ -1730,23 +1651,6 @@ def _pending_dispatch_from_row(
         execution_target=dispatch_record.execution_target,
         worker_kind=dispatch_record.worker_kind,
     )
-
-
-def _read_attempt_and_dispatch_for_run(
-    transaction: HostTransaction, run: RunRow
-) -> tuple[AttemptRow | None, DispatchRecordRow | None]:
-    """读取 Run 当前 Attempt 与 dispatch record。
-
-    :param transaction: 当前 Host transaction。
-    :param run: 目标 Run row。
-    :returns: Attempt 与 dispatch record；缺失时对应位置为 ``None``。
-    """
-
-    if run.current_attempt_id is None:
-        return None, None
-    attempt = read_attempt_by_id(transaction, run.current_attempt_id)
-    dispatch_record = read_dispatch_record_by_attempt_id(transaction, run.current_attempt_id)
-    return attempt, dispatch_record
 
 
 __all__ = [

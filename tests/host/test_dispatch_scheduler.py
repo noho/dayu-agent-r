@@ -1984,45 +1984,142 @@ class _RetryOnceDrainLoopScheduler(HostDispatchScheduler):
         )
 
 
-class _TransientFailingActiveCancelWatchdogScheduler(HostDispatchScheduler):
-    """测试用 active cancel watchdog 单次 tick 失败 scheduler。"""
+class _LevelTriggeredActiveCancelWatchdogScheduler(HostDispatchScheduler):
+    """记录 Event clear/set 与 tick 次数的 watchdog scheduler。"""
 
     _tick_count: int
+    _first_tick_seen: asyncio.Event
     _second_tick_seen: asyncio.Event
+    _wake_during_first_tick: bool
+    _event_states_before_tick: list[bool]
+    _event_state_after_nested_wake: bool | None
 
-    def configure_transient_watchdog_failure(
-        self, second_tick_seen: asyncio.Event
+    def configure_level_trigger_probe(
+        self,
+        *,
+        first_tick_seen: asyncio.Event,
+        second_tick_seen: asyncio.Event,
+        wake_during_first_tick: bool,
     ) -> None:
-        """配置 transient tick failure 测试观测点。
+        """配置 deterministic level-triggered 观测点。
 
-        :param second_tick_seen: 第二次 tick 执行时置位的事件。
+        :param first_tick_seen: 第一轮 tick 观测事件。
+        :param second_tick_seen: 第二轮 tick 观测事件。
+        :param wake_during_first_tick: 是否在第一轮 tick barrier 内再次 wake。
         :returns: ``None``。
         """
 
         self._tick_count = 0
+        self._first_tick_seen = first_tick_seen
         self._second_tick_seen = second_tick_seen
+        self._wake_during_first_tick = wake_during_first_tick
+        self._event_states_before_tick = []
+        self._event_state_after_nested_wake = None
 
     def tick_active_cancel_watchdog(
         self, now: datetime
     ) -> host_dispatch.ActiveCancelWatchdogTickResult:
-        """模拟第一次 tick 抛普通异常，第二次 tick 成功。
+        """记录 tick 前 event 已 clear，并可在第一轮内注入第二次 wake。
 
         :param now: watchdog tick 的当前时间。
         :returns: 空扫描 tick 结果。
-        :raises RuntimeError: 第一次 tick 固定抛出测试异常。
+        :raises Exception: 不主动抛出异常。
         """
 
         _ = now
         self._tick_count += 1
+        self._event_states_before_tick.append(
+            self._active_cancel_watchdog_event.is_set()
+        )
         if self._tick_count == 1:
-            raise RuntimeError("active cancel watchdog transient failure")
-        self._second_tick_seen.set()
+            self._first_tick_seen.set()
+            if self._wake_during_first_tick:
+                self.wake_active_cancel_watchdog()
+                self._event_state_after_nested_wake = (
+                    self._active_cancel_watchdog_event.is_set()
+                )
+        elif self._tick_count == 2:
+            self._second_tick_seen.set()
         return host_dispatch.ActiveCancelWatchdogTickResult(
             scanned=0,
             eligible=0,
             closed=0,
             ignored=0,
         )
+
+
+class _FailingActiveCancelWatchdogScheduler(HostDispatchScheduler):
+    """测试用 active cancel watchdog fatal tick scheduler。"""
+
+    def tick_active_cancel_watchdog(
+        self, now: datetime
+    ) -> host_dispatch.ActiveCancelWatchdogTickResult:
+        """固定抛出 watchdog unexpected failure。
+
+        :param now: watchdog tick 的当前时间。
+        :returns: 不会返回。
+        :raises RuntimeError: 始终抛出测试异常。
+        """
+
+        _ = now
+        raise RuntimeError("active cancel watchdog private failure")
+
+
+async def _open_watchdog_probe_scheduler(
+    tmp_path: Path,
+    store: HostDurableStore,
+    scheduler_type: type[HostDispatchScheduler],
+    *,
+    suffix: str,
+) -> HostDispatchScheduler:
+    """打开不受 periodic timeout 干扰的 watchdog probe scheduler。
+
+    :param tmp_path: pytest 临时目录。
+    :param store: scheduler durable store。
+    :param scheduler_type: 待实例化 scheduler 类型。
+    :param suffix: lane/handle 隔离后缀。
+    :returns: 已构造但仅按显式 wake 启动 watchdog 的 scheduler。
+    :raises Exception: lane controller 打开失败时透传。
+    """
+
+    lane_db_path = tmp_path / f"lane-active-cancel-{suffix}.sqlite3"
+    lane_controller = await LaneController.open(
+        [
+            LaneConfig(
+                name=_LANE_NAME,
+                capacity=1,
+                default_timeout_seconds=0.1,
+                claim_ttl_seconds=1.0,
+                heartbeat_interval_seconds=0.1,
+            )
+        ],
+        coordinator=SQLiteLaneCoordinatorConfig(db_path=lane_db_path),
+    )
+    return scheduler_type(
+        transaction_runner=store.transaction_runner,
+        event_log_store=EventLogStore(),
+        local_execution=HostLocalExecutionOptions(
+            lane_db_path=lane_db_path,
+            lane_name=_LANE_NAME,
+            lane_capacity=1,
+            lane_default_timeout_seconds=0.1,
+            lane_claim_ttl_seconds=1.0,
+            lane_heartbeat_interval_seconds=0.1,
+            worker_startup_timeout_seconds=1.0,
+            dispatch_poll_interval_seconds=60.0,
+            runner_spec=_runner_spec(),
+            runner_options=RunnerCallOptions(
+                temperature=None,
+                max_tokens=None,
+                top_p=None,
+                stream=False,
+            ),
+            agent_policy=_agent_policy(False),
+            worker_factory=_FakeWorkerFactory(),
+        ),
+        lane_controller=lane_controller,
+        host_handle_id=f"host-active-cancel-{suffix}",
+    )
 
 
 class _CloseWorkerLostFailingIngestor:
@@ -2778,65 +2875,115 @@ async def test_drain_loop_retries_durable_retry_exhausted_without_self_close(
 
 
 @pytest.mark.asyncio
-async def test_active_cancel_watchdog_loop_continues_after_transient_tick_failure(
+async def test_active_cancel_watchdog_wake_during_tick_drives_second_tick(
     tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """active cancel watchdog 单次 tick 普通异常后必须继续下一轮扫描。"""
+    """tick barrier 内第二次 wake 在 clear 后保持 set 并驱动第二轮。"""
 
-    caplog.set_level(logging.ERROR, logger="dayu.host.dispatch")
     with open_host_durable_store(_options(tmp_path)) as store:
-        lane_controller = await LaneController.open(
-            [
-                LaneConfig(
-                    name=_LANE_NAME,
-                    capacity=1,
-                    default_timeout_seconds=0.1,
-                    claim_ttl_seconds=1.0,
-                    heartbeat_interval_seconds=0.1,
-                )
-            ],
-            coordinator=SQLiteLaneCoordinatorConfig(
-                db_path=tmp_path / "lane-active-cancel-watchdog.sqlite3"
+        scheduler = cast(
+            _LevelTriggeredActiveCancelWatchdogScheduler,
+            await _open_watchdog_probe_scheduler(
+                tmp_path,
+                store,
+                _LevelTriggeredActiveCancelWatchdogScheduler,
+                suffix="second-wake",
             ),
         )
-        scheduler = _TransientFailingActiveCancelWatchdogScheduler(
-            transaction_runner=store.transaction_runner,
-            event_log_store=EventLogStore(),
-            local_execution=HostLocalExecutionOptions(
-                lane_db_path=tmp_path / "lane-active-cancel-watchdog.sqlite3",
-                lane_name=_LANE_NAME,
-                lane_capacity=1,
-                lane_default_timeout_seconds=0.1,
-                lane_claim_ttl_seconds=1.0,
-                lane_heartbeat_interval_seconds=0.1,
-                worker_startup_timeout_seconds=1.0,
-                dispatch_poll_interval_seconds=0.01,
-                runner_spec=_runner_spec(),
-                runner_options=RunnerCallOptions(
-                    temperature=None,
-                    max_tokens=None,
-                    top_p=None,
-                    stream=False,
-                ),
-                agent_policy=_agent_policy(False),
-                worker_factory=_FakeWorkerFactory(),
-            ),
-            lane_controller=lane_controller,
-            host_handle_id="host-active-cancel-watchdog-transient",
-        )
+        first_tick_seen = asyncio.Event()
         second_tick_seen = asyncio.Event()
-        scheduler.configure_transient_watchdog_failure(second_tick_seen)
+        scheduler.configure_level_trigger_probe(
+            first_tick_seen=first_tick_seen,
+            second_tick_seen=second_tick_seen,
+            wake_during_first_tick=True,
+        )
         try:
             scheduler.wake_active_cancel_watchdog()
             await asyncio.wait_for(second_tick_seen.wait(), timeout=0.5)
-            assert scheduler._active_cancel_watchdog_task is not None
-            assert scheduler._active_cancel_watchdog_task.done() is False
+
+            assert first_tick_seen.is_set()
+            assert scheduler._tick_count == 2
+            assert scheduler._event_states_before_tick == [False, False]
+            assert scheduler._event_state_after_nested_wake is True
+            assert scheduler._health_gate.state is HostExecutionHealthState.READY
         finally:
             await scheduler.close()
 
-    assert "dispatch.active_cancel_watchdog.tick_failed" in caplog.text
-    assert "error_type=RuntimeError" in caplog.text
+        assert scheduler._health_gate.state is HostExecutionHealthState.READY
+
+
+@pytest.mark.asyncio
+async def test_active_cancel_watchdog_concurrent_wakes_coalesce_to_level_signal(
+    tmp_path: Path,
+) -> None:
+    """多个并发 wake 可合并为一次 level signal，不制造额外 tick。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        scheduler = cast(
+            _LevelTriggeredActiveCancelWatchdogScheduler,
+            await _open_watchdog_probe_scheduler(
+                tmp_path,
+                store,
+                _LevelTriggeredActiveCancelWatchdogScheduler,
+                suffix="coalesced-wakes",
+            ),
+        )
+        first_tick_seen = asyncio.Event()
+        second_tick_seen = asyncio.Event()
+        scheduler.configure_level_trigger_probe(
+            first_tick_seen=first_tick_seen,
+            second_tick_seen=second_tick_seen,
+            wake_during_first_tick=False,
+        )
+        try:
+            scheduler.wake_active_cancel_watchdog()
+            scheduler.wake_active_cancel_watchdog()
+            scheduler.wake_active_cancel_watchdog()
+            await asyncio.wait_for(first_tick_seen.wait(), timeout=0.5)
+
+            assert scheduler._tick_count == 1
+            assert scheduler._event_states_before_tick == [False]
+            assert scheduler._active_cancel_watchdog_event.is_set() is False
+            assert second_tick_seen.is_set() is False
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_active_cancel_watchdog_unexpected_failure_reports_typed_fatal(
+    tmp_path: Path,
+) -> None:
+    """watchdog 普通异常必须由 S3 critical supervisor 提交 typed fatal。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        scheduler = cast(
+            _FailingActiveCancelWatchdogScheduler,
+            await _open_watchdog_probe_scheduler(
+                tmp_path,
+                store,
+                _FailingActiveCancelWatchdogScheduler,
+                suffix="fatal",
+            ),
+        )
+        try:
+            scheduler.wake_active_cancel_watchdog()
+            task = scheduler._active_cancel_watchdog_task
+            assert task is not None
+            await task
+
+            assert scheduler._health_gate.state is HostExecutionHealthState.UNAVAILABLE
+            with pytest.raises(HostApiError) as exc_info:
+                scheduler.wake_active_cancel_watchdog()
+            assert exc_info.value.code is HostApiErrorCode.UNAVAILABLE
+            assert isinstance(exc_info.value.detail, HostUnavailableDetail)
+            assert exc_info.value.detail.component == "active_cancel_watchdog"
+            assert (
+                exc_info.value.detail.reason_code
+                == "critical_task_unexpected_exit"
+            )
+            assert "private failure" not in str(exc_info.value.detail)
+        finally:
+            await scheduler.close()
 
 
 @pytest.mark.asyncio

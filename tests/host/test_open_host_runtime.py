@@ -67,7 +67,11 @@ from dayu.host._execution_health import (
     HostExecutionHealthGate,
     HostExecutionHealthState,
 )
-from dayu.host.dispatch import ActiveWorkerRegistry, HostDispatchScheduler
+from dayu.host.dispatch import (
+    ActiveWorkerRegistry,
+    HostDispatchScheduler,
+    _HostCancellationToken,
+)
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
@@ -799,11 +803,69 @@ async def test_open_host_startup_recovery_dispatches_gracefully_closed_run(
 @pytest.mark.asyncio
 async def test_open_host_active_cancel_watchdog_public_watch_observes_cancelled(
     tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """watchdog closeout 后 public watch 与 get_run 观察到 cancelled 终态。"""
+    """actor cancel bridge 在 opener loop 写 event/token/hook 后 watchdog 收口。"""
 
     factory = _ControlledFinalAnswerWorkerFactory()
     options = _options(tmp_path, factory)
+    opener_thread_id = threading.get_ident()
+    watchdog_threads: list[int] = []
+    watchdog_event_states: list[bool] = []
+    token_threads: list[int] = []
+    hook_threads: list[int] = []
+    hook_event = asyncio.Event()
+    original_watchdog_wake = HostDispatchScheduler.wake_active_cancel_watchdog
+    original_request_cancel = _HostCancellationToken.request_cancel
+    original_on_cancel = _ControlledFinalAnswerHandle.on_cancel
+
+    def record_watchdog_wake(self: HostDispatchScheduler) -> None:
+        """记录 watchdog Event.set 所在线程与 set 后状态。
+
+        :param self: scheduler。
+        :returns: ``None``。
+        :raises Exception: 原始 wake 失败时透传。
+        """
+
+        watchdog_threads.append(threading.get_ident())
+        original_watchdog_wake(self)
+        watchdog_event_states.append(
+            self._active_cancel_watchdog_event.is_set()
+        )
+
+    def record_token_cancel(self: _HostCancellationToken, reason: str) -> None:
+        """记录 token 写入线程后委托真实 token owner。
+
+        :param self: Host cancellation token。
+        :param reason: cancel reason。
+        :returns: ``None``。
+        """
+
+        token_threads.append(threading.get_ident())
+        original_request_cancel(self, reason)
+
+    def record_worker_hook(
+        self: _ControlledFinalAnswerHandle,
+        reason: str,
+    ) -> None:
+        """记录 worker hook 线程并访问 opener-loop asyncio primitive。
+
+        :param self: controlled worker handle。
+        :param reason: cancel reason。
+        :returns: ``None``。
+        """
+
+        hook_threads.append(threading.get_ident())
+        hook_event.set()
+        original_on_cancel(self, reason)
+
+    monkeypatch.setattr(
+        HostDispatchScheduler,
+        "wake_active_cancel_watchdog",
+        record_watchdog_wake,
+    )
+    monkeypatch.setattr(_HostCancellationToken, "request_cancel", record_token_cancel)
+    monkeypatch.setattr(_ControlledFinalAnswerHandle, "on_cancel", record_worker_hook)
     async with open_host(options) as host:
         session = await host.ensure_session(_ensure_request())
         followup = await host.submit_followup(
@@ -819,6 +881,11 @@ async def test_open_host_active_cancel_watchdog_public_watch_observes_cancelled(
             followup.accepted_run_id,
             _cancel_request("cancel-active-watchdog"),
         )
+        assert hook_event.is_set()
+        assert watchdog_threads == [opener_thread_id]
+        assert watchdog_event_states == [True]
+        assert token_threads == [opener_thread_id]
+        assert hook_threads == [opener_thread_id]
         cast(_PublicHostHandle, host)._scheduler.tick_active_cancel_watchdog(
             datetime(2030, 1, 1, tzinfo=UTC)
         )

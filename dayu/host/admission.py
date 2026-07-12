@@ -14,6 +14,7 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Protocol, cast
 from uuid import uuid4
 
@@ -361,6 +362,27 @@ class ActiveCancelTarget:
     attempt_id: str
     execution_id: str
     reason: str
+
+
+class _CancelRunClassification(StrEnum):
+    """单 Run cancel 在唯一 write snapshot 下的闭集分类。"""
+
+    SUPPORTED = "supported"
+    DEFERRED = "deferred"
+    TERMINAL = "terminal"
+    CONFLICT = "conflict"
+
+
+@dataclass(frozen=True, slots=True)
+class _CancelRunOperationResult:
+    """``_CancelRunOperation`` 的 transaction-local 分类结果。
+
+    :param classification: 当前 write snapshot 的闭集分类。
+    :param result: supported/terminal 路径的 cancel result；其它分类为 ``None``。
+    """
+
+    classification: _CancelRunClassification
+    result: CancelRunResult | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -728,7 +750,7 @@ class HostAdmissionService:
         _require_sha256_digest(
             caller_semantic_digest, field_name="caller_semantic_digest"
         )
-        result = self.transaction_runner.run_write(
+        operation_result = self.transaction_runner.run_write(
             _CancelRunOperation(
                 run_id=run_id,
                 request=request,
@@ -739,6 +761,25 @@ class HostAdmissionService:
                 id_factory=self.id_factory,
             )
         )
+        if operation_result.classification is _CancelRunClassification.DEFERRED:
+            raise HostApiError(
+                code=HostApiErrorCode.UNSUPPORTED_OPERATION,
+                message="Run cancel requires a later cancel owner phase",
+                retryable=False,
+            )
+        if operation_result.classification is _CancelRunClassification.CONFLICT:
+            raise HostApiError(
+                code=HostApiErrorCode.INVALID_STATE,
+                message="Run state is not cancellable in Phase 5 admission",
+                retryable=False,
+            )
+        result = operation_result.result
+        if result is None:
+            raise HostApiError(
+                code=HostApiErrorCode.INTERNAL_ERROR,
+                message="Cancel transaction classification is missing its result",
+                retryable=False,
+            )
         if result.released_active_slot:
             promotion = _promote_after_release(
                 service=self,
@@ -1504,11 +1545,12 @@ class _CancelRunOperation:
     clock: AdmissionClock
     id_factory: AdmissionIdFactory
 
-    def __call__(self, transaction: HostTransaction) -> CancelRunResult:
+    def __call__(self, transaction: HostTransaction) -> _CancelRunOperationResult:
         """执行 cancel_run transaction。
 
         :param transaction: 当前 Host transaction。
-        :returns: cancel 结果；本 transaction 不执行 promotion。
+        :returns: 同一 write snapshot 下的 cancel 闭集分类与可选结果；本
+            transaction 不执行 promotion。
         :raises HostApiError: Run 缺失、幂等冲突或状态不支持时抛出。
         """
 
@@ -1523,7 +1565,13 @@ class _CancelRunOperation:
         existing = self.idempotency_store.read_idempotency_record(transaction, scope)
         if existing is not None:
             _raise_if_digest_conflict(existing, semantic_digest)
-            return _idempotent_cancel_result(transaction, existing)
+            result = _idempotent_cancel_result(transaction, existing)
+            return _classified_cancel_result(
+                _CancelRunClassification.TERMINAL
+                if is_terminal_run_status(result.run.status)
+                else _CancelRunClassification.SUPPORTED,
+                result,
+            )
 
         run = read_run_by_id(transaction, self.run_id)
         if run is None:
@@ -1533,10 +1581,13 @@ class _CancelRunOperation:
                 retryable=False,
             )
         if run.status in (RunStatus.ACCEPTED, RunStatus.QUEUED):
-            return self._cancel_queued(
-                transaction=transaction,
-                semantic_digest=semantic_digest,
-                scope=scope,
+            return _classified_cancel_result(
+                _CancelRunClassification.SUPPORTED,
+                self._cancel_queued(
+                    transaction=transaction,
+                    semantic_digest=semantic_digest,
+                    scope=scope,
+                ),
             )
         if run.status == RunStatus.RUNNING:
             predispatch = self._cancel_predispatch_starting_or_none(
@@ -1545,7 +1596,10 @@ class _CancelRunOperation:
                 scope=scope,
             )
             if predispatch is not None:
-                return predispatch
+                return _classified_cancel_result(
+                    _CancelRunClassification.SUPPORTED,
+                    predispatch,
+                )
             return self._cancel_active_attempt(
                 transaction=transaction,
                 semantic_digest=semantic_digest,
@@ -1558,28 +1612,36 @@ class _CancelRunOperation:
                 scope=scope,
             )
         if run.status == RunStatus.WAITING:
-            return self._cancel_waiting(
-                transaction=transaction,
-                semantic_digest=semantic_digest,
-                scope=scope,
+            return _classified_cancel_result(
+                _CancelRunClassification.SUPPORTED,
+                self._cancel_waiting(
+                    transaction=transaction,
+                    semantic_digest=semantic_digest,
+                    scope=scope,
+                ),
             )
         if run.status == RunStatus.RECOVERING:
-            return self._cancel_recovering(
-                transaction=transaction,
-                semantic_digest=semantic_digest,
-                scope=scope,
+            return _classified_cancel_result(
+                _CancelRunClassification.SUPPORTED,
+                self._cancel_recovering(
+                    transaction=transaction,
+                    semantic_digest=semantic_digest,
+                    scope=scope,
+                ),
             )
         if is_terminal_run_status(run.status):
-            return self._record_terminal_cancel_ack(
-                transaction=transaction,
-                run=run,
-                semantic_digest=semantic_digest,
-                scope=scope,
+            return _classified_cancel_result(
+                _CancelRunClassification.TERMINAL,
+                self._record_terminal_cancel_ack(
+                    transaction=transaction,
+                    run=run,
+                    semantic_digest=semantic_digest,
+                    scope=scope,
+                ),
             )
-        raise HostApiError(
-            code=HostApiErrorCode.INVALID_STATE,
-            message="Run status is not cancellable in Phase 5 admission",
-            retryable=False,
+        return _CancelRunOperationResult(
+            classification=_CancelRunClassification.CONFLICT,
+            result=None,
         )
 
     def _cancel_queued(
@@ -1781,14 +1843,15 @@ class _CancelRunOperation:
         transaction: HostTransaction,
         semantic_digest: str,
         scope: IdempotencyScope,
-    ) -> CancelRunResult:
+    ) -> _CancelRunOperationResult:
         """请求取消 active RUNNING Attempt 并记录幂等结果。
 
         :param transaction: 当前 Host transaction。
         :param semantic_digest: cancel semantic digest。
         :param scope: 幂等 scope。
-        :returns: cancel 结果，包含 commit 后 active cancel 传播目标。
-        :raises HostApiError: 当前状态不是 Phase 5 active cancel 子集时抛出。
+        :returns: supported 结果，或由当前 transaction snapshot 派生的
+            deferred/conflict 分类。
+        :raises HostApiError: transition 返回不可恢复的 not-found 时抛出。
         """
 
         now = self.clock.now()
@@ -1810,7 +1873,20 @@ class _CancelRunOperation:
                 call_context_digest=_call_context_digest(self.request.context),
             ),
         )
-        _raise_for_cancel_transition_status(transition_result)
+        if transition_result.status != StateMutationStatus.UPDATED:
+            if transition_result.status == StateMutationStatus.NOT_FOUND:
+                _raise_for_cancel_transition_status(transition_result)
+            return _CancelRunOperationResult(
+                classification=(
+                    _CancelRunClassification.DEFERRED
+                    if transition_result.status == StateMutationStatus.INVALID_STATE
+                    and transition_result.run is not None
+                    and transition_result.run.status
+                    in (RunStatus.RUNNING, RunStatus.CANCELLING)
+                    else _CancelRunClassification.CONFLICT
+                ),
+                result=None,
+            )
         run = _require_transition_run(transition_result.run)
         cancel_request_sequence = _require_event_sequence_if_present(
             transaction,
@@ -1832,18 +1908,21 @@ class _CancelRunOperation:
                 created_event_sequence=cancel_request_sequence,
             ),
         )
-        return CancelRunResult(
-            run=run,
-            attempt=transition_result.attempt,
-            dispatch_record=transition_result.dispatch_record,
-            promotion=None,
-            active_cancel_target=_active_cancel_target_from_transition(
+        return _classified_cancel_result(
+            _CancelRunClassification.SUPPORTED,
+            CancelRunResult(
                 run=run,
                 attempt=transition_result.attempt,
-                reason=self.request.reason,
+                dispatch_record=transition_result.dispatch_record,
+                promotion=None,
+                active_cancel_target=_active_cancel_target_from_transition(
+                    run=run,
+                    attempt=transition_result.attempt,
+                    reason=self.request.reason,
+                ),
+                idempotent_replay=False,
+                released_active_slot=False,
             ),
-            idempotent_replay=False,
-            released_active_slot=False,
         )
 
     def _cancel_waiting(
@@ -4059,6 +4138,29 @@ def _idempotent_steer_result(
             else run_result.run.input_event_id
         ),
         idempotent_replay=True,
+    )
+
+
+def _classified_cancel_result(
+    classification: _CancelRunClassification,
+    result: CancelRunResult,
+) -> _CancelRunOperationResult:
+    """构造带有效 cancel result 的 transaction-local 分类。
+
+    :param classification: 只允许 supported 或 terminal 分类。
+    :param result: 同一 transaction 产生或恢复的 cancel result。
+    :returns: immutable operation result。
+    :raises ValueError: classification 不携带成功 result 时抛出。
+    """
+
+    if classification not in (
+        _CancelRunClassification.SUPPORTED,
+        _CancelRunClassification.TERMINAL,
+    ):
+        raise ValueError("cancel result requires supported or terminal classification")
+    return _CancelRunOperationResult(
+        classification=classification,
+        result=result,
     )
 
 
