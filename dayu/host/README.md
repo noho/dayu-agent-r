@@ -351,11 +351,11 @@ Stream 术语固定如下：
 
 ### Public API 与 opener
 
-`api.py` 定义 public dataclass、enum、独立 `Host` / `HostAdmin` Protocol、error 与两类 opener options；包根 `__all__` 收口 Service-facing 导出。`open_host(options)` 负责装配 scheduler store、public durable actor、admission、scheduler、active worker registry、可选 wait poller、projection catch-up ports、context compactor 和本地 worker typed port；`open_host_admin(options)` 只装配 admin durable actor chain。Conversation Memory 的 required repair / catch-up 由 dispatch 前 correctness path 触发，opener 的 after-commit 热路径不执行 memory projection 追平。
+`api.py` 定义 public dataclass、enum、独立 `Host` / `HostAdmin` Protocol、error 与两类 opener options；包根 `__all__` 收口 Service-facing 导出。`open_host(options)` 负责装配 scheduler store、public durable actor、execution health gate、admission、scheduler、active worker registry、可选 wait poller、projection catch-up ports、context compactor 和本地 worker typed port；`open_host_admin(options)` 只装配 admin durable actor chain。Conversation Memory 的 required repair / catch-up 由 dispatch 前 correctness path 触发，opener 的 after-commit 热路径不执行 memory projection 追平。
 
 ### Admission 与 command
 
-Admission 是 Session active Run、queue、steer、retry、replay、cancel、resolve wait、close 与 purge 的写入边界。它在 durable transaction 内写入 canonical facts、状态索引、幂等记录和必要 dispatch / wait / purge 记录；commit 后再唤醒 scheduler 或 projection。冻结的 effective execution snapshot 在恢复时先对 config canonical JSON 重算 digest，并同时验证 `policy_snapshot_digest` 与由该 digest 派生的 `policy_snapshot_ref`，任一不一致都在反序列化 typed config 前 fail closed。
+Admission 是 Session active Run、queue、steer、retry、replay、cancel、resolve wait、close 与 purge 的写入边界。它在 durable transaction 内写入 canonical facts、状态索引、幂等记录和必要 dispatch / wait / purge 记录；commit 后再唤醒 scheduler 或 projection。幂等 replay 会从最新 Run、current Attempt 与 dispatch row 重新派生 matching dispatch 或 pre-start governance wake，不能用 replay bool 跳过全部 wake。冻结的 effective execution snapshot 在恢复时先对 config canonical JSON 重算 digest，并同时验证 `policy_snapshot_digest` 与由该 digest 派生的 `policy_snapshot_ref`，任一不一致都在反序列化 typed config 前 fail closed。
 
 ### Durable EventLog 与状态索引
 
@@ -363,7 +363,7 @@ EventLog 分配全局 `event_sequence`，记录 canonical facts、preview、diag
 
 ### Dispatch scheduler
 
-Dispatch scheduler 只消费已提交的 accepted / queued / pending dispatch facts。它负责 pre-start governance、本地 runtime lane capacity、worker accept、active worker registry、EngineEvent stream 消费、terminal closeout、queue promotion 和 startup recovery wakeup。
+Dispatch scheduler 只消费已提交的 accepted / queued / pending dispatch facts。它负责 pre-start governance、本地 runtime lane capacity、worker accept、active worker registry、EngineEvent stream 消费、terminal closeout、queue promotion 和 startup recovery wakeup。execution health gate 在 `STARTING / READY / UNAVAILABLE / CLOSING / CLOSED` 间提供 public new-work 与 scheduler fatal 的单一 lifecycle truth；new-work admission lease 覆盖 actor transaction、commit 后 wake 与 actor future。critical task 非预期退出提交稳定 typed fatal；durable transaction retry exhaustion 只按 poll interval 退避并重新 reconcile，不关闭 scheduler或取消 worker。
 
 ### RunInputBuilder
 
@@ -415,10 +415,10 @@ Outbox 从 terminal facts 派生离线 terminal notification item；audit JSONL 
 open_host(options)
   -> validate construction inputs
   -> open durable store and projection ports
-  -> create admission service and scheduler
+  -> create STARTING health gate, admission service and scheduler
   -> run startup recovery scan
-  -> return async Host handle
-  -> handle.close() / context exit closes scheduler, projections, command handle and store
+  -> mark READY and return async Host handle
+  -> handle.close() / context exit enters CLOSING, drains admitted actor wake, then closes scheduler, projections, actor and stores
 ```
 
 `Host.close()` 是 opener runtime lifecycle 操作，不等于 `close_session`，也不等于用户 cancel。关闭时 Host 会向 active worker 传播 lifecycle cancel 并释放本地资源；未终态 Run 的治理归下次 startup recovery。

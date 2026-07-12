@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -99,6 +99,7 @@ from dayu.host.durable.state import (
     read_session_by_id,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
+from dayu.host._execution_health import HostExecutionHealthGate
 from dayu.host._execution_config_projection import (
     effective_execution_snapshot_from_json as _effective_execution_snapshot_from_json,
     required_json_mapping as _required_json_mapping,
@@ -253,7 +254,12 @@ _COMPACTION_PRECONDITION_OPERATION_PREFIX = "precondition"
 _HOST_INSTANCE_HEARTBEAT_INTERVAL_SECONDS = 1.0
 _LOCAL_WORKER_CLOSE_GRACE_SECONDS = 3.0
 _SCHEDULER_CLOSE_REASON = "scheduler_close"
-_DRAIN_LOOP_DURABLE_RETRY_EXHAUSTED_REASON = "drain_loop_durable_retry_exhausted"
+_SCHEDULER_UNAVAILABLE_REASON = "scheduler_not_accepting_wake"
+_CRITICAL_FATAL_REASON = "critical_task_unexpected_exit"
+_CRITICAL_COMPONENT_HEARTBEAT = "heartbeat"
+_CRITICAL_COMPONENT_DISPATCH = "dispatch"
+_CRITICAL_COMPONENT_PROMOTION = "promotion"
+_CRITICAL_COMPONENT_ACTIVE_CANCEL_WATCHDOG = "active_cancel_watchdog"
 
 
 class _MemoryProjectionDispatchDiagnosticError(HostDurableError):
@@ -313,14 +319,12 @@ _LOG_DRAIN_LOOP_CLOSE_EXIT = "dispatch drain loop exiting after close host_handl
 _LOG_DRAIN_LOOP_CANCELLED_FOR_CLOSE = "dispatch drain loop cancelled during close host_handle_id=%s"
 _LOG_DRAIN_LOOP_CANCELLED_EXTERNALLY = "dispatch drain loop cancelled externally host_handle_id=%s"
 _LOG_DRAIN_LOOP_UNEXPECTED_EXCEPTION = (
-    "dispatch drain loop stopped unexpectedly; continuing host_handle_id=%s " "error_type=%s"
+    "dispatch drain loop stopped unexpectedly; reporting fatal host_handle_id=%s "
+    "error_type=%s"
 )
 _LOG_DRAIN_LOOP_DURABLE_RETRY_EXHAUSTED = (
-    "dispatch drain loop durable retry exhausted; closing scheduler " "host_handle_id=%s error_type=%s"
-)
-_LOG_DRAIN_LOOP_QUEUE_CLOSEOUT = (
-    "dispatch.drain_loop.queue_closeout host_handle_id=%s reason=%s "
-    "closeout_count=%s"
+    "dispatch drain loop durable retry exhausted; backing off and retrying "
+    "host_handle_id=%s error_type=%s"
 )
 _LOG_WORKER_LOST_CLOSEOUT_FAILED = (
     "dispatch.worker_events.close_worker_lost_failed run_id=%s "
@@ -956,6 +960,7 @@ class HostDispatchScheduler:
         host_instance_identity: HostInstanceIdentity | None = None,
         active_registry: ActiveWorkerRegistry | None = None,
         projection_catchup_port: ProjectionCatchupPort | None = None,
+        health_gate: HostExecutionHealthGate | None = None,
     ) -> None:
         """初始化 dispatch scheduler。
 
@@ -968,6 +973,8 @@ class HostDispatchScheduler:
             不传时创建仅供测试直接构造使用的身份。
         :param active_registry: active worker registry；不传时创建 scheduler 私有 registry。
         :param projection_catchup_port: commit 后 best-effort projection catch-up 端口。
+        :param health_gate: execution opener 与 scheduler critical task 共享的 health
+            gate；直接测试未传时创建并立即置为 READY。
         :returns: ``None``。
         :raises ValueError: ``host_handle_id`` 为空时抛出。
         """
@@ -986,6 +993,10 @@ class HostDispatchScheduler:
         )
         self._active_registry = active_registry if active_registry is not None else ActiveWorkerRegistry()
         self._projection_catchup_port = projection_catchup_port
+        if health_gate is None:
+            health_gate = HostExecutionHealthGate()
+            health_gate.mark_ready()
+        self._health_gate = health_gate
         self._queue: asyncio.Queue[PendingDispatchRecord] = asyncio.Queue()
         self._promotion_queue: asyncio.Queue[str] = asyncio.Queue()
         self._active_cancel_watchdog_queue: asyncio.Queue[None] = asyncio.Queue(maxsize=1)
@@ -1007,6 +1018,7 @@ class HostDispatchScheduler:
         host_handle_id: str,
         active_registry: ActiveWorkerRegistry | None = None,
         projection_catchup_port: ProjectionCatchupPort | None = None,
+        health_gate: HostExecutionHealthGate | None = None,
     ) -> "HostDispatchScheduler":
         """打开本地 dispatch scheduler。
 
@@ -1015,6 +1027,7 @@ class HostDispatchScheduler:
         :param host_handle_id: Host handle 诊断 id。
         :param active_registry: active worker registry；不传时创建 scheduler 私有 registry。
         :param projection_catchup_port: commit 后 best-effort projection catch-up 端口。
+        :param health_gate: execution opener 持有的共享 health gate。
         :returns: 已打开 scheduler。
         """
 
@@ -1055,6 +1068,7 @@ class HostDispatchScheduler:
             host_instance_identity=host_identity,
             active_registry=active_registry,
             projection_catchup_port=projection_catchup_port,
+            health_gate=health_gate,
         )
         scheduler._start_host_instance_heartbeat()
         scheduler._start_active_cancel_watchdog_loop()
@@ -1074,11 +1088,10 @@ class HostDispatchScheduler:
 
         :param record: 已持久化的 pending dispatch 摘要。
         :returns: ``None``。
-        :raises RuntimeError: scheduler 已关闭时抛出。
+        :raises HostApiError: scheduler 已关闭或 execution unavailable 时抛出。
         """
 
-        if self._closed:
-            raise RuntimeError("HostDispatchScheduler is closed")
+        self._raise_if_wake_unavailable(component=_CRITICAL_COMPONENT_DISPATCH)
         self._queue.put_nowait(record)
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
@@ -1090,24 +1103,20 @@ class HostDispatchScheduler:
             self._queue.qsize(),
         )
         if self._drain_task is None or self._drain_task.done():
-            self._drain_task = asyncio.create_task(self._drain_loop())
+            self._drain_task = self._start_critical_task(
+                self._drain_loop,
+                component=_CRITICAL_COMPONENT_DISPATCH,
+            )
 
     def wake_queue_promotion(self, session_id: str) -> None:
         """唤醒同 Session 的 queued Run promotion。
 
         :param session_id: 目标 Session id。
         :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
+        :raises HostApiError: scheduler lifecycle 不可用时抛出。
         """
 
-        if self._closed:
-            _LOGGER.debug(
-                "dispatch.queue_promotion.wake_ignored_after_close "
-                "host_handle_id=%s session_id=%s",
-                self._host_handle_id,
-                session_id,
-            )
-            return
+        self._raise_if_wake_unavailable(component=_CRITICAL_COMPONENT_PROMOTION)
         self._promotion_queue.put_nowait(session_id)
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
@@ -1116,17 +1125,21 @@ class HostDispatchScheduler:
             self._promotion_queue.qsize(),
         )
         if self._promotion_drain_task is None or self._promotion_drain_task.done():
-            self._promotion_drain_task = asyncio.create_task(self._promotion_drain_loop())
+            self._promotion_drain_task = self._start_critical_task(
+                self._promotion_drain_loop,
+                component=_CRITICAL_COMPONENT_PROMOTION,
+            )
 
     def wake_active_cancel_watchdog(self) -> None:
         """唤醒 active cancel watchdog 执行一次 accepted-cancel 收口扫描。
 
         :returns: ``None``。
-        :raises RuntimeError: scheduler 已关闭时抛出。
+        :raises HostApiError: scheduler 已关闭或 execution unavailable 时抛出。
         """
 
-        if self._closed:
-            raise RuntimeError("HostDispatchScheduler is closed")
+        self._raise_if_wake_unavailable(
+            component=_CRITICAL_COMPONENT_ACTIVE_CANCEL_WATCHDOG
+        )
         try:
             self._active_cancel_watchdog_queue.put_nowait(None)
         except asyncio.QueueFull:
@@ -2604,7 +2617,10 @@ class HostDispatchScheduler:
         """
 
         if self._heartbeat_task is None or self._heartbeat_task.done():
-            self._heartbeat_task = asyncio.create_task(self._host_instance_heartbeat_loop())
+            self._heartbeat_task = self._start_critical_task(
+                self._host_instance_heartbeat_loop,
+                component=_CRITICAL_COMPONENT_HEARTBEAT,
+            )
 
     def _start_active_cancel_watchdog_loop(self) -> None:
         """启动 active cancel watchdog 后台任务。
@@ -2613,9 +2629,92 @@ class HostDispatchScheduler:
         """
 
         if self._active_cancel_watchdog_task is None or self._active_cancel_watchdog_task.done():
-            self._active_cancel_watchdog_task = asyncio.create_task(
-                self._active_cancel_watchdog_loop()
+            self._active_cancel_watchdog_task = self._start_critical_task(
+                self._active_cancel_watchdog_loop,
+                component=_CRITICAL_COMPONENT_ACTIVE_CANCEL_WATCHDOG,
             )
+
+    def _start_critical_task(
+        self,
+        operation_factory: Callable[[], Awaitable[None]],
+        *,
+        component: str,
+    ) -> asyncio.Task[None]:
+        """启动由 shared health gate 监督的 scheduler critical task。
+
+        :param operation_factory: 延迟创建 critical loop awaitable 的 factory。
+        :param component: 稳定 fatal component 标识。
+        :returns: 已启动的 asyncio task。
+        :raises RuntimeError: 当前没有 running event loop 时抛出。
+        """
+
+        return asyncio.create_task(
+            self._supervise_critical_task(
+                operation_factory,
+                component=component,
+            )
+        )
+
+    async def _supervise_critical_task(
+        self,
+        operation_factory: Callable[[], Awaitable[None]],
+        *,
+        component: str,
+    ) -> None:
+        """把 critical task 非预期异常或提前退出映射为 typed fatal。
+
+        :param operation_factory: 延迟创建 critical loop awaitable 的 factory。
+        :param component: 稳定 fatal component 标识。
+        :returns: ``None``。
+        :raises asyncio.CancelledError: scheduler 正常 close 取消时透传。
+        """
+
+        try:
+            await operation_factory()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _LOGGER.error(
+                "dispatch.critical_task.fatal component=%s host_handle_id=%s "
+                "error_type=%s",
+                component,
+                self._host_handle_id,
+                exc.__class__.__name__,
+                exc_info=True,
+            )
+        else:
+            if self._closed:
+                return
+            _LOGGER.error(
+                "dispatch.critical_task.unexpected_exit component=%s "
+                "host_handle_id=%s",
+                component,
+                self._host_handle_id,
+            )
+        if not self._closed:
+            await self._health_gate.report_fatal(
+                component=component,
+                reason_code=_CRITICAL_FATAL_REASON,
+            )
+
+    def _raise_if_wake_unavailable(self, *, component: str) -> None:
+        """让 scheduler wake 对 lifecycle 不可用 fail closed。
+
+        :param component: 当前 wake component。
+        :returns: ``None``。
+        :raises HostApiError: scheduler 已关闭或 shared health 已不可用时抛出。
+        """
+
+        if self._closed:
+            self._health_gate.raise_if_scheduler_unavailable(
+                component=component,
+                reason_code=_SCHEDULER_UNAVAILABLE_REASON,
+                force=True,
+            )
+        self._health_gate.raise_if_scheduler_unavailable(
+            component=component,
+            reason_code=_SCHEDULER_UNAVAILABLE_REASON,
+        )
 
     async def _active_cancel_watchdog_loop(self) -> None:
         """active cancel watchdog 后台循环。
@@ -2808,22 +2907,14 @@ class HostDispatchScheduler:
                     if result.processed > 0:
                         idle_sleep_logged = False
                 except HostTransactionRetryExhaustedError as exc:
-                    _LOGGER.error(
+                    _LOGGER.warning(
                         _LOG_DRAIN_LOOP_DURABLE_RETRY_EXHAUSTED,
                         self._host_handle_id,
                         exc.__class__.__name__,
                         exc_info=True,
                     )
-                    self._best_effort_closeout_pending_queue_for_shutdown(
-                        reason=_DRAIN_LOOP_DURABLE_RETRY_EXHAUSTED_REASON,
-                        original_error=exc,
-                    )
-                    self._closed = True
-                    self._active_registry.cancel_all(
-                        _DRAIN_LOOP_DURABLE_RETRY_EXHAUSTED_REASON
-                    )
-                    self._best_effort_mark_host_instance_stopped(
-                        _DRAIN_LOOP_DURABLE_RETRY_EXHAUSTED_REASON
+                    await asyncio.sleep(
+                        self._local_execution.dispatch_poll_interval_seconds
                     )
                 except Exception as exc:
                     _LOGGER.warning(
@@ -2832,8 +2923,7 @@ class HostDispatchScheduler:
                         exc.__class__.__name__,
                         exc_info=True,
                     )
-                    if not self._closed:
-                        await asyncio.sleep(self._local_execution.dispatch_poll_interval_seconds)
+                    raise
             _LOGGER.debug(_LOG_DRAIN_LOOP_CLOSE_EXIT, self._host_handle_id)
         except asyncio.CancelledError:
             _LOGGER.debug(
@@ -2891,6 +2981,7 @@ class HostDispatchScheduler:
                         exc.__class__.__name__,
                         exc_info=True,
                     )
+                    raise
         except asyncio.CancelledError:
             _LOGGER.debug(
                 "dispatch.queue_promotion.cancelled host_handle_id=%s",
@@ -3749,37 +3840,6 @@ class HostDispatchScheduler:
                 exc.__class__.__name__,
                 original_error_type,
                 exc_info=True,
-            )
-
-    def _best_effort_closeout_pending_queue_for_shutdown(
-        self,
-        *,
-        reason: str,
-        original_error: BaseException,
-    ) -> None:
-        """关闭 scheduler 前尽力收口尚未 dispatch 的队列记录。
-
-        :param reason: 写入 terminal closeout 的结构化原因。
-        :param original_error: 触发 scheduler shutdown 的原始异常。
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        closeout_count = 0
-        while not self._queue.empty():
-            record = self._queue.get_nowait()
-            self._safe_closeout_worker_startup_timeout(
-                record,
-                reason=reason,
-                original_error=original_error,
-            )
-            closeout_count += 1
-        if closeout_count > 0:
-            _LOGGER.warning(
-                _LOG_DRAIN_LOOP_QUEUE_CLOSEOUT,
-                self._host_handle_id,
-                reason,
-                closeout_count,
             )
 
     def _safe_close_worker_lost(

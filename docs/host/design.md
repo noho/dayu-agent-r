@@ -917,6 +917,12 @@ Host 对 Service 提供两个无继承关系的 public Protocol：
 
 actor transaction 的 after-commit scheduler wake 与 active worker cancel 必须同步桥接回 opener event loop；callback、`LocalWorkerHandle.on_cancel()` 与 asyncio primitive 只能在 opener loop thread 访问，bridge exception 必须返回原 actor caller。execution close 先停止新 call 并 drain actor command / wake，在 scheduler 仍存活时完成 bridge，然后按 `scheduler -> projection flush -> actor handle/store -> actor executor -> scheduler store` 关闭；admin close 只关闭 actor chain，重复关闭幂等。
 
+execution Host 的 lifecycle 与 new-work admission 由同一个 `HostExecutionHealthGate` 拥有，状态单向为 `STARTING -> READY -> UNAVAILABLE -> CLOSING -> CLOSED`。`submit_followup`、`retry_run`、`replay_run` 取得 admission lease 后才可提交 actor；lease 覆盖 transaction、commit 后 scheduler wake 与 actor future 收口，caller cancellation 不提前释放。scheduler fatal transition 取得同一 lease，因此 admission-first 只能先完成 commit+wake，fatal-first 则在 actor submission 前返回 retryable `unavailable`。read、cancel 与 close 不因 `UNAVAILABLE` 被 admission gate 拒绝，但仍受 close gate 与各自业务状态约束。
+
+heartbeat、dispatch drain、queue promotion 与 active-cancel watchdog critical task 的非预期退出通过同一 health gate 报告稳定 `component/reason_code`，public detail 不携带原始异常文本。`HostTransactionRetryExhaustedError` 是 transient，不提交 fatal、不关闭 scheduler、不取消 active worker；dispatch pending durable row 保持真源，scheduler 按 poll interval 退避后重新 reconcile。closed 或 unavailable scheduler 的 dispatch/promotion/watchdog wake 必须返回 typed internal unavailable，不能静默丢弃。
+
+admission 幂等 replay 必须在 transaction 内从最新 Run、current Attempt 与 dispatch row 重新派生 after-commit wake：`ACCEPTED` Run 重唤醒 pre-start governance，`RUNNING + STARTING + pending dispatch` 重投递 matching dispatch identity；queued、terminal、已取消或已进入 lane/worker 的 snapshot 不误 wake。`idempotent_replay` 只描述 durable 幂等命中，不能作为跳过全部 wake 的 shortcut。
+
 Host 公共接口采用函数式风格，但不得依赖全局隐式单例。公共函数接收明确的 Host handle / context 与 request，返回稳定 snapshot 或 Host event stream。
 
 Service-facing 第一版应表现为一个简单 Host opener / handle，而不是把 scheduler、runner、tooling、memory catch-up、wakeup 或 `HostLocalRuntime` 暴露给上层。调用方形态是打开 Host、取得 / 新建 / 读取 Session、提交 prompt 或控制命令、读取 / 订阅 Session 事件、在 terminal event 中观察 final answer、关闭 Host。内部可以使用 composition root / runtime 装配 command handle、durable store、scheduler、active registry、local execution、ToolRuntime、compactor 与 projection catch-up，但这些只是 Host 内部实现边界。
@@ -1260,6 +1266,7 @@ Snapshot 最小语义：
 - `idempotency_conflict`
 - `permission_denied`
 - `unsupported_operation`
+- `unavailable`
 - `internal_error`
 
 错误分类语义：
@@ -1269,6 +1276,7 @@ Snapshot 最小语义：
 - `invalid_state`：目标对象存在，但该状态下不允许此操作。
 - `permission_denied`：上层传入的 authorization claims 不满足 Host policy。
 - `unsupported_operation`：public request / response envelope 已冻结，但完整语义由后续 phase 落地；它不表达目标对象状态错误，也不能伪装成 `invalid_state`。
+- `unavailable`：execution scheduler 已报告 fatal 或 Host 尚未完成 startup；固定为 retryable，detail 只包含稳定 component / reason code，不泄漏原始异常文本。
 
 `HostApiError` 必须是受限 typed contract：`code`、`message`、`retryable` 与 `detail?`。`detail` 只能是 Host 公共 API 中显式定义的 detail union 成员，禁止无结构 `extra` / `payload` / `metadata` god bag。第一版至少包含：
 
@@ -1278,6 +1286,10 @@ SteerConflictDetail:
   target_run_status?
   current_active_run_id?
   current_active_run_status?
+
+HostUnavailableDetail:
+  component
+  reason_code
 ```
 
 `SteerConflictDetail` 只携带足以解释 steer precondition 失败的 Run id 与状态摘要，不嵌入完整 `RunSnapshot`，不暴露 Host durable row。后续新增错误 detail 时必须新增具体 typed detail，不得把显式参数塞进无结构 payload。

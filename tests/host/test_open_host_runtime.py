@@ -7,12 +7,12 @@ import pathlib
 import sqlite3
 import sys
 import threading
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
 from types import ModuleType
-from typing import cast
+from typing import TypeVar, cast
 
 import pytest
 
@@ -62,6 +62,11 @@ from dayu.host import (
 )
 from dayu.host.api import AuthorizationClaim, HostInput, HostLocalExecutionOptions
 from dayu.host.command import HostCommandHandle, create_host_command_handle
+from dayu.host._durable_actor import DurableActor
+from dayu.host._execution_health import (
+    HostExecutionHealthGate,
+    HostExecutionHealthState,
+)
 from dayu.host.dispatch import ActiveWorkerRegistry, HostDispatchScheduler
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
 from dayu.host.durable.options import (
@@ -97,6 +102,8 @@ from dayu.host.wait_adapter import (
     WaitPollerRuntimePolicy,
     WaitPollerSupervisor,
 )
+
+T = TypeVar("T")
 from tests.host.public_smoke_support import awaiting_tooling_options
 from tests.host.test_resolve_wait_command import _seed_waiting_run
 
@@ -1043,6 +1050,238 @@ async def test_close_drains_actor_wake_before_scheduler_and_preserves_close_orde
 
 
 @pytest.mark.asyncio
+async def test_public_admission_first_commit_and_wake_precede_fatal(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """public admission 已排入 actor 后 commit+wake 必须先于 fatal transition。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    """
+
+    manager = open_host(_options(tmp_path, _FinalAnswerWorkerFactory()))
+    public_host = cast(_PublicHostHandle, await manager.__aenter__())
+    session = await public_host.ensure_session(_ensure_request())
+    actor_started = threading.Event()
+    actor_release = threading.Event()
+    admission_submitted = asyncio.Event()
+    fatal_started = asyncio.Event()
+    order: list[str] = []
+    original_submit = DurableActor.submit
+    original_wake = HostDispatchScheduler.wake_queue_promotion
+
+    def actor_barrier(_handle: HostCommandHandle) -> None:
+        """占住 actor worker，保证 public admission 尚未开始 transaction。
+
+        :param _handle: actor 私有 command handle。
+        :returns: ``None``。
+        :raises RuntimeError: barrier 未在测试预算内释放时抛出。
+        """
+
+        actor_started.set()
+        if not actor_release.wait(timeout=2):
+            raise RuntimeError("public admission actor barrier timed out")
+
+    barrier_future = original_submit(public_host._durable_actor, actor_barrier)
+    assert await asyncio.to_thread(actor_started.wait, 1)
+
+    def record_submit(
+        self: DurableActor,
+        operation: Callable[[HostCommandHandle], T],
+    ) -> asyncio.Future[T]:
+        """记录 public new-work 已持 lease 并提交到 actor。
+
+        :param self: durable actor。
+        :param operation: typed actor operation。
+        :returns: 原始 actor future。
+        :raises Exception: 原始 submit 异常时透传。
+        """
+
+        future = original_submit(self, operation)
+        if self is public_host._durable_actor:
+            admission_submitted.set()
+        return future
+
+    def record_wake(self: HostDispatchScheduler, session_id: str) -> None:
+        """记录 matching governance wake 后委托真实 scheduler。
+
+        :param self: scheduler。
+        :param session_id: wake Session id。
+        :returns: ``None``。
+        :raises Exception: 原始 wake 异常时透传。
+        """
+
+        order.append("wake")
+        original_wake(self, session_id)
+
+    async def report_fatal() -> bool:
+        """记录 fatal 开始并调用 public/scheduler 共享 health owner。
+
+        :returns: fatal 是否提交 transition。
+        :raises Exception: health owner 异常时透传。
+        """
+
+        fatal_started.set()
+        transitioned = await public_host._health_gate.report_fatal(
+            component="dispatch",
+            reason_code="injected_critical_exit",
+        )
+        order.append("fatal")
+        return transitioned
+
+    monkeypatch.setattr(DurableActor, "submit", record_submit)
+    monkeypatch.setattr(HostDispatchScheduler, "wake_queue_promotion", record_wake)
+    submit_task = asyncio.create_task(
+        public_host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "admission-first"),
+        )
+    )
+    await admission_submitted.wait()
+    fatal_task = asyncio.create_task(report_fatal())
+    await fatal_started.wait()
+    assert public_host._health_gate.state is HostExecutionHealthState.READY
+
+    actor_release.set()
+    try:
+        result = await submit_task
+        await barrier_future
+        assert await fatal_task is True
+        assert result.accepted_run_id != ""
+        assert order[:2] == ["wake", "fatal"]
+        assert public_host._health_gate.state is HostExecutionHealthState.UNAVAILABLE
+        submission_count = len(order)
+        with pytest.raises(HostApiError) as unavailable:
+            await public_host.submit_followup(
+                session.session_id,
+                _followup_request(session.session_id, "fatal-rejected"),
+            )
+        assert unavailable.value.code is HostApiErrorCode.UNAVAILABLE
+        assert len(order) == submission_count
+        assert (await public_host.get_session(session.session_id)).session_id == (
+            session.session_id
+        )
+        with pytest.raises(HostApiError) as cancel_error:
+            await public_host.cancel_run(
+                "missing-after-fatal",
+                _cancel_request("cancel-after-fatal"),
+            )
+        assert cancel_error.value.code is HostApiErrorCode.NOT_FOUND
+    finally:
+        actor_release.set()
+        await manager.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_public_admission_keeps_lease_until_actor_wake(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """public caller 取消不允许 fatal 越过已提交 actor command 的 matching wake。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    """
+
+    manager = open_host(_options(tmp_path, _FinalAnswerWorkerFactory()))
+    public_host = cast(_PublicHostHandle, await manager.__aenter__())
+    session = await public_host.ensure_session(_ensure_request())
+    actor_started = threading.Event()
+    actor_release = threading.Event()
+    admission_submitted = asyncio.Event()
+    fatal_started = asyncio.Event()
+    wake_seen = asyncio.Event()
+    original_submit = DurableActor.submit
+    original_wake = HostDispatchScheduler.wake_queue_promotion
+
+    def actor_barrier(_handle: HostCommandHandle) -> None:
+        """占住 actor worker直到 caller 取消与 fatal 均已排定。
+
+        :param _handle: actor 私有 command handle。
+        :returns: ``None``。
+        :raises RuntimeError: barrier 超时未释放时抛出。
+        """
+
+        actor_started.set()
+        if not actor_release.wait(timeout=2):
+            raise RuntimeError("cancelled admission actor barrier timed out")
+
+    barrier_future = original_submit(public_host._durable_actor, actor_barrier)
+    assert await asyncio.to_thread(actor_started.wait, 1)
+
+    def record_submit(
+        self: DurableActor,
+        operation: Callable[[HostCommandHandle], T],
+    ) -> asyncio.Future[T]:
+        """记录 actor submission 并委托真实实现。
+
+        :param self: durable actor。
+        :param operation: typed actor operation。
+        :returns: 原始 actor future。
+        :raises Exception: 原始 submit 异常时透传。
+        """
+
+        future = original_submit(self, operation)
+        if self is public_host._durable_actor:
+            admission_submitted.set()
+        return future
+
+    def record_wake(self: HostDispatchScheduler, session_id: str) -> None:
+        """记录 matching wake 并委托真实 scheduler。
+
+        :param self: scheduler。
+        :param session_id: wake Session id。
+        :returns: ``None``。
+        :raises Exception: 原始 wake 异常时透传。
+        """
+
+        wake_seen.set()
+        original_wake(self, session_id)
+
+    async def report_fatal() -> bool:
+        """注入 deterministic fatal transition。
+
+        :returns: fatal 是否提交 transition。
+        :raises Exception: health owner 异常时透传。
+        """
+
+        fatal_started.set()
+        return await public_host._health_gate.report_fatal(
+            component="dispatch",
+            reason_code="cancelled_admission_race",
+        )
+
+    monkeypatch.setattr(DurableActor, "submit", record_submit)
+    monkeypatch.setattr(HostDispatchScheduler, "wake_queue_promotion", record_wake)
+    submit_task = asyncio.create_task(
+        public_host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "cancelled-admission"),
+        )
+    )
+    await admission_submitted.wait()
+    submit_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await submit_task
+    fatal_task = asyncio.create_task(report_fatal())
+    await fatal_started.wait()
+    assert public_host._health_gate.state is HostExecutionHealthState.READY
+
+    actor_release.set()
+    try:
+        await barrier_future
+        await wake_seen.wait()
+        assert await fatal_task is True
+        assert public_host._health_gate.state is HostExecutionHealthState.UNAVAILABLE
+    finally:
+        actor_release.set()
+        await manager.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
 async def test_open_host_wait_poller_policy_without_poll_registry_fails_fast(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -1187,17 +1426,19 @@ async def test_open_host_startup_failure_closes_poller_before_scheduler(
     def raise_public_handle_init(
         self: _PublicHostHandle,
         *,
-        durable_actor: object,
+        durable_actor: DurableActor,
+        health_gate: HostExecutionHealthGate,
         host_handle_id: str,
         scheduler: HostDispatchScheduler,
         projection_catchup_port: ProjectionCatchupPort,
-        scheduler_store: object,
+        scheduler_store: HostDurableStore,
         wait_poller: WaitPollerSupervisor | None,
     ) -> None:
         """模拟 public handle 构造失败。
 
         :param self: public handle。
         :param durable_actor: durable actor。
+        :param health_gate: execution health gate。
         :param host_handle_id: Host handle id。
         :param scheduler: scheduler。
         :param projection_catchup_port: projection catch-up port。
@@ -1207,7 +1448,8 @@ async def test_open_host_startup_failure_closes_poller_before_scheduler(
         :raises RuntimeError: 始终抛出测试错误。
         """
 
-        del self, durable_actor, host_handle_id, scheduler, projection_catchup_port
+        del self, durable_actor, health_gate, host_handle_id, scheduler
+        del projection_catchup_port
         del scheduler_store
         assert wait_poller is not None
         raise RuntimeError("forced public handle init failure")
@@ -1274,6 +1516,7 @@ async def test_open_host_after_commit_does_not_inject_memory_catchup_port(
         host_handle_id: str,
         active_registry: ActiveWorkerRegistry | None = None,
         projection_catchup_port: ProjectionCatchupPort | None = None,
+        health_gate: HostExecutionHealthGate | None = None,
     ) -> HostDispatchScheduler:
         """记录 scheduler open 时的 projection port 并委托真实 open。
 
@@ -1283,6 +1526,7 @@ async def test_open_host_after_commit_does_not_inject_memory_catchup_port(
         :param host_handle_id: Host handle id。
         :param active_registry: active worker registry。
         :param projection_catchup_port: commit 后 projection catch-up port。
+        :param health_gate: shared execution health gate。
         :returns: 已打开 scheduler。
         """
 
@@ -1294,6 +1538,7 @@ async def test_open_host_after_commit_does_not_inject_memory_catchup_port(
             host_handle_id=host_handle_id,
             active_registry=active_registry,
             projection_catchup_port=projection_catchup_port,
+            health_gate=health_gate,
         )
 
     monkeypatch.setattr(

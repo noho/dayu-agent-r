@@ -19,6 +19,7 @@ from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCal
 from dayu.host.admission import (
     CloseoutAttemptTerminalInput,
     HostAdmissionService,
+    PendingDispatchRecord,
     SubmitFollowupQueueAdmissionInput,
     create_host_admission_service,
 )
@@ -26,6 +27,7 @@ from dayu.host.api import (
     AttemptStatus,
     AuthorizationClaim,
     CancelMode,
+    CancelRunRequest,
     EnsureSessionRequest,
     FollowupBehavior,
     HostApiError,
@@ -101,6 +103,56 @@ class _QueuedRunSummary:
 
     run_id: str
     accepted_event_sequence: int
+
+
+class _RecordingAdmissionWakeupPort:
+    """记录 admission commit 后 typed wake 的测试端口。"""
+
+    def __init__(self) -> None:
+        """初始化空 wake 记录。
+
+        :returns: ``None``。
+        """
+
+        self.dispatches: list[PendingDispatchRecord] = []
+        self.promotions: list[str] = []
+        self.watchdog_wake_count = 0
+
+    def wake_dispatch(self, record: PendingDispatchRecord) -> None:
+        """记录 matching dispatch wake。
+
+        :param record: durable snapshot 派生的 pending dispatch。
+        :returns: ``None``。
+        """
+
+        self.dispatches.append(record)
+
+    def wake_queue_promotion(self, session_id: str) -> None:
+        """记录 pre-start governance wake。
+
+        :param session_id: 目标 Session id。
+        :returns: ``None``。
+        """
+
+        self.promotions.append(session_id)
+
+    def wake_active_cancel_watchdog(self) -> None:
+        """记录 active cancel watchdog wake。
+
+        :returns: ``None``。
+        """
+
+        self.watchdog_wake_count += 1
+
+    def clear(self) -> None:
+        """清空全部 wake 记录。
+
+        :returns: ``None``。
+        """
+
+        self.dispatches.clear()
+        self.promotions.clear()
+        self.watchdog_wake_count = 0
 
 
 def test_multiprocess_same_slot_ensure_returns_one_bound_session(
@@ -480,6 +532,94 @@ def test_multiprocess_admission_event_sequence_is_global_unique_and_increasing(
         _assert_event_sequences_global_unique_and_increasing(store.transaction_runner)
 
 
+def test_idempotent_replay_derives_matching_wake_from_durable_snapshot(
+    tmp_path: Path,
+) -> None:
+    """幂等 replay 对 ACCEPTED/PENDING 重唤醒且不误唤醒已取消记录。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    """
+
+    db_path = tmp_path / "durable.sqlite3"
+    artifact_root = tmp_path / "artifacts"
+    with open_host_durable_store(_options(db_path, artifact_root)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        wakeup = _RecordingAdmissionWakeupPort()
+        service = create_host_admission_service(
+            store.transaction_runner,
+            ordinary_run_baseline=_ordinary_run_baseline(),
+            wakeup_port=wakeup,
+        )
+        request = _start_request(
+            session_id=session_id,
+            client_request_id="idempotent-wake",
+            display_text="idempotent wake",
+        )
+
+        accepted = service.start_run(
+            request,
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        assert accepted.run.status is RunStatus.ACCEPTED
+        assert wakeup.promotions == [session_id]
+        assert wakeup.dispatches == []
+
+        wakeup.clear()
+        accepted_replay = service.start_run(
+            request,
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        assert accepted_replay.idempotent_replay is True
+        assert wakeup.promotions == [session_id]
+        assert wakeup.dispatches == []
+
+        attempt_id = _start_governed_pending(
+            store.transaction_runner,
+            run_id=accepted.run.run_id,
+            expected_status=RunStatus.ACCEPTED,
+            id_suffix="idempotent-wake",
+        )
+        wakeup.clear()
+        pending_replay = service.start_run(
+            request,
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        assert pending_replay.idempotent_replay is True
+        assert len(wakeup.dispatches) == 1
+        pending = wakeup.dispatches[0]
+        assert pending.run_id == accepted.run.run_id
+        assert pending.attempt_id == attempt_id
+        assert pending.dispatch_record_id == (
+            pending_replay.dispatch_record.dispatch_record_id
+            if pending_replay.dispatch_record is not None
+            else ""
+        )
+        assert wakeup.promotions == []
+
+        service.cancel_run(
+            accepted.run.run_id,
+            CancelRunRequest(
+                context=_context(),
+                client_request_id="cancel-idempotent-wake",
+                reason="cancel_before_worker_accept",
+                mode=CancelMode.GRACEFUL,
+            ),
+            caller_semantic_digest=sha256_digest_json(
+                {"caller": "cancel-idempotent-wake"}
+            ),
+        )
+        wakeup.clear()
+        cancelled_replay = service.start_run(
+            request,
+            caller_semantic_digest=_CALLER_DIGEST,
+        )
+        assert cancelled_replay.run.status is RunStatus.CANCELLED
+        assert wakeup.dispatches == []
+        assert wakeup.promotions == []
+        assert wakeup.watchdog_wake_count == 0
+
+
 def _options(db_path: Path, artifact_root: Path) -> HostDurableStoreOptions:
     """构造多进程 Host durable store options。
 
@@ -800,6 +940,59 @@ def _start_governed_active(
             ),
         )
         assert accepted.status == StateMutationStatus.UPDATED
+        return result.attempt.attempt_id
+
+    return transaction_runner.run_write(operation)
+
+
+def _start_governed_pending(
+    transaction_runner: HostTransactionRunner,
+    *,
+    run_id: str,
+    expected_status: RunStatus,
+    id_suffix: str,
+) -> str:
+    """把 Run 启动到尚未消费 wake 的 PENDING dispatch snapshot。
+
+    :param transaction_runner: Host transaction runner。
+    :param run_id: 目标 Run id。
+    :param expected_status: 启动前 Run 状态。
+    :param id_suffix: 稳定测试 id 后缀。
+    :returns: 新建 current Attempt id。
+    :raises AssertionError: transition 未创建完整 pending snapshot 时抛出。
+    """
+
+    attempt_id = f"attempt-{id_suffix}"
+
+    def operation(transaction: HostTransaction) -> str:
+        """在单事务创建 PENDING dispatch snapshot。
+
+        :param transaction: 当前 Host transaction。
+        :returns: 新建 Attempt id。
+        :raises AssertionError: transition row 不完整时抛出。
+        """
+
+        result = start_governed_run_with_starting_attempt_in_transaction(
+            transaction,
+            EventLogStore(),
+            StartGovernedRunInput(
+                run_id=run_id,
+                expected_status=expected_status,
+                run_started_event_id=f"event-run-started-{id_suffix}",
+                attempt_started_event_id=f"event-attempt-started-{id_suffix}",
+                attempt_id=attempt_id,
+                execution_id=f"execution-{id_suffix}",
+                dispatch_record_id=f"dispatch-{id_suffix}",
+                occurred_at=_NOW,
+                actor="host.dispatch",
+                source="multiprocess-test",
+                start_reason=RunStartReason.INITIAL,
+                worker_kind=WorkerKind.LOCAL,
+                owner_host_instance_id=None,
+            ),
+        )
+        assert result.attempt is not None
+        assert result.dispatch_record is not None
         return result.attempt.attempt_id
 
     return transaction_runner.run_write(operation)

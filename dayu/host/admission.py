@@ -3981,16 +3981,58 @@ def _idempotent_run_result(
         )
     attempt = _read_current_attempt(transaction, run)
     dispatch_record = _read_current_dispatch_record(transaction, run)
+    pending_dispatch = _idempotent_replay_pending_dispatch(
+        run=run,
+        attempt=attempt,
+        dispatch_record=dispatch_record,
+    )
     return RunAdmissionResult(
         run=run,
         attempt=attempt,
         dispatch_record=dispatch_record,
-        pending_dispatch=None,
+        pending_dispatch=pending_dispatch,
         created=False,
         queued=run.status == RunStatus.QUEUED,
         attached_active=record.created_event_id is None,
         idempotent_replay=True,
     )
+
+
+def _idempotent_replay_pending_dispatch(
+    *,
+    run: RunRow,
+    attempt: AttemptRow | None,
+    dispatch_record: DispatchRecordRow | None,
+) -> PendingDispatchRecord | None:
+    """从 durable snapshot 派生幂等 replay 的 matching dispatch wake。
+
+    只有仍处于 ``RUNNING / STARTING / PENDING`` 的同源 current Attempt 才需要
+    重投递 dispatch。ACCEPTED Run 的 pre-start governance wake 由同一 admission
+    service 的 ``_wake_start_governance_if_needed`` 派生；terminal、queued、已
+    取消或已进入 lane/worker 流程的记录不重投递。
+
+    :param run: idempotency record 指向的最新 Run row。
+    :param attempt: Run current Attempt row；无 current Attempt 时为 ``None``。
+    :param dispatch_record: current Attempt dispatch row；无时为 ``None``。
+    :returns: 需要重投递时返回 matching pending dispatch，否则返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if (
+        run.status is not RunStatus.RUNNING
+        or attempt is None
+        or attempt.status is not AttemptStatus.STARTING
+        or dispatch_record is None
+        or dispatch_record.status is not DispatchRecordStatus.PENDING
+        or run.current_attempt_id != attempt.attempt_id
+        or dispatch_record.run_id != run.run_id
+        or dispatch_record.attempt_id != attempt.attempt_id
+        or dispatch_record.execution_id != attempt.execution_id
+        or dispatch_record.cancelled_event_id is not None
+        or dispatch_record.worker_accept_event_id is not None
+    ):
+        return None
+    return _pending_dispatch_from_row(dispatch_record)
 
 
 def _idempotent_steer_result(

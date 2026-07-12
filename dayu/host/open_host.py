@@ -28,6 +28,10 @@ from dayu.host.audit import (
 )
 from dayu.host.admission import create_host_admission_service
 from dayu.host._durable_actor import DurableActor, open_durable_actor
+from dayu.host._execution_health import (
+    HostExecutionHealthGate,
+    HostExecutionHealthState,
+)
 from dayu.host.api import (
     CancelRunRequest,
     CancelSessionRunsRequest,
@@ -607,8 +611,9 @@ class _PublicHostHandle:
     """
 
     __slots__ = (
-        "_closed",
+        "_close_lock",
         "_durable_actor",
+        "_health_gate",
         "_host_handle_id",
         "_projection_catchup_port",
         "_scheduler",
@@ -620,6 +625,7 @@ class _PublicHostHandle:
         self,
         *,
         durable_actor: DurableActor,
+        health_gate: HostExecutionHealthGate,
         host_handle_id: str,
         scheduler: HostDispatchScheduler,
         projection_catchup_port: ProjectionCatchupPort,
@@ -629,6 +635,7 @@ class _PublicHostHandle:
         """初始化 public Host handle。
 
         :param durable_actor: public durable command 单线程 actor。
+        :param health_gate: public admission 与 scheduler fatal 共享的 lifecycle gate。
         :param host_handle_id: 当前 Host handle 诊断 id。
         :param scheduler: 内部 dispatch scheduler。
         :param projection_catchup_port: close 阶段使用的 projection flush 端口。
@@ -638,12 +645,13 @@ class _PublicHostHandle:
         """
 
         self._durable_actor = durable_actor
+        self._health_gate = health_gate
         self._host_handle_id = host_handle_id
         self._scheduler = scheduler
         self._projection_catchup_port = projection_catchup_port
         self._scheduler_store = scheduler_store
         self._wait_poller = wait_poller
-        self._closed: bool = False
+        self._close_lock = asyncio.Lock()
 
     async def ensure_session(self, request: EnsureSessionRequest) -> SessionSnapshot:
         """确保 slot 绑定到 Session。
@@ -751,7 +759,7 @@ class _PublicHostHandle:
         """
 
         self._raise_if_closed()
-        return await self._durable_actor.call(
+        return await self._invoke_new_work(
             lambda handle: _submit_followup(handle, session_id, request)
         )
 
@@ -765,7 +773,7 @@ class _PublicHostHandle:
         """
 
         self._raise_if_closed()
-        return await self._durable_actor.call(
+        return await self._invoke_new_work(
             lambda handle: _retry_run(handle, run_id, request)
         )
 
@@ -779,7 +787,7 @@ class _PublicHostHandle:
         """
 
         self._raise_if_closed()
-        return await self._durable_actor.call(
+        return await self._invoke_new_work(
             lambda handle: _replay_run(handle, run_id, request)
         )
 
@@ -891,7 +899,10 @@ class _PublicHostHandle:
         """
 
         next_cursor = cursor
-        while not self._closed:
+        while self._health_gate.state not in (
+            HostExecutionHealthState.CLOSING,
+            HostExecutionHealthState.CLOSED,
+        ):
             batch = await self._durable_actor.call(
                 lambda handle: _read_session_host_events_after(
                     handle,
@@ -917,9 +928,19 @@ class _PublicHostHandle:
         :returns: ``None``。
         """
 
-        if self._closed:
-            return
-        self._closed = True
+        async with self._close_lock:
+            if self._health_gate.state is HostExecutionHealthState.CLOSED:
+                return
+            await self._close_owned_resources()
+
+    async def _close_owned_resources(self) -> None:
+        """按 owner 顺序关闭 execution Host 全部资源。
+
+        :returns: ``None``。
+        :raises Exception: cleanup 首个错误在全部 owner cleanup 尝试后传播。
+        """
+
+        await self._health_gate.begin_closing()
         _LOGGER.info(
             "host.public_handle.close_start host_handle_id=%s",
             self._host_handle_id,
@@ -1019,8 +1040,34 @@ class _PublicHostHandle:
             "host.public_handle.close_done host_handle_id=%s",
             self._host_handle_id,
         )
+        self._health_gate.mark_closed()
         if close_error is not None:
             raise close_error
+
+    async def _invoke_new_work(
+        self,
+        operation: Callable[[HostCommandHandle], T],
+    ) -> T:
+        """在 shared admission lease 下提交 new-work actor operation。
+
+        lease 绑定 actor future 而不是 caller awaiter，因此 caller cancellation
+        不会让 fatal transition 越过尚未完成的 commit/rollback 与 matching wake。
+
+        :param operation: new-work command operation。
+        :returns: actor operation 返回值。
+        :raises HostApiError: Host 尚未 READY 或已经 UNAVAILABLE 时抛出。
+        :raises HostClosedError: Host 正在关闭或已经关闭时抛出。
+        :raises Exception: actor operation 异常原样透传。
+        """
+
+        lease = await self._health_gate.acquire_admission()
+        try:
+            future = self._durable_actor.submit(operation)
+        except Exception:
+            lease.release()
+            raise
+        lease.release_when_done(future)
+        return await asyncio.shield(future)
 
     def _raise_if_closed(self) -> None:
         """校验 public handle 仍处于打开状态。
@@ -1029,8 +1076,7 @@ class _PublicHostHandle:
         :raises HostClosedError: Host handle 已关闭时抛出。
         """
 
-        if self._closed:
-            raise HostClosedError()
+        self._health_gate.raise_if_public_closed()
 
 
 def _observe_watch_cursor_future(future: asyncio.Future[int]) -> None:
@@ -1222,6 +1268,7 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
         close_projection_catchup_port: ProjectionCatchupPort | None = None
         wait_poller: WaitPollerSupervisor | None = None
         durable_actor: DurableActor | None = None
+        health_gate = HostExecutionHealthGate()
         try:
             loop = asyncio.get_running_loop()
             active_registry = ActiveWorkerRegistry()
@@ -1252,6 +1299,7 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
                 host_handle_id=host_handle_id,
                 active_registry=active_registry,
                 projection_catchup_port=None,
+                health_gate=health_gate,
             )
             scheduler.tick_active_cancel_watchdog(datetime.now(UTC))
             StartupRecoveryScanner(
@@ -1291,14 +1339,17 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
             )
             if wait_poller is not None:
                 wait_poller.open()
-            self._host = _PublicHostHandle(
+            host = _PublicHostHandle(
                 durable_actor=durable_actor,
+                health_gate=health_gate,
                 host_handle_id=host_handle_id,
                 scheduler=scheduler,
                 projection_catchup_port=close_projection_catchup_port,
                 scheduler_store=scheduler_store,
                 wait_poller=wait_poller,
             )
+            health_gate.mark_ready()
+            self._host = host
             _LOGGER.info(
                 "host.open.ready host_handle_id=%s",
                 host_handle_id,

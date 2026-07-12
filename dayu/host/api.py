@@ -1367,6 +1367,7 @@ class HostApiErrorCode(StrEnum):
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
     PERMISSION_DENIED = "permission_denied"
     UNSUPPORTED_OPERATION = "unsupported_operation"
+    UNAVAILABLE = "unavailable"
     INTERNAL_ERROR = "internal_error"
 
 
@@ -1403,7 +1404,35 @@ class SteerConflictDetail:
         )
 
 
-HostApiErrorDetail: TypeAlias = SteerConflictDetail
+@dataclass(frozen=True, slots=True)
+class HostUnavailableDetail:
+    """execution Host 暂不可用的稳定 typed detail。
+
+    :param component: 首个 fatal 的稳定组件标识。
+    :param reason_code: 不含原始异常消息的稳定原因码。
+    """
+
+    component: str
+    reason_code: str
+
+    def __post_init__(self) -> None:
+        """校验 unavailable detail 字段非空。
+
+        :returns: ``None``。
+        :raises ValueError: component 或 reason_code 为空时抛出。
+        """
+
+        _require_non_empty(
+            self.component,
+            field_name="HostUnavailableDetail.component",
+        )
+        _require_non_empty(
+            self.reason_code,
+            field_name="HostUnavailableDetail.reason_code",
+        )
+
+
+HostApiErrorDetail: TypeAlias = SteerConflictDetail | HostUnavailableDetail
 
 
 @dataclass(frozen=True, slots=True)
@@ -3817,6 +3846,7 @@ __all__ = [
     "HostStreamCursor",
     "HostTerminalStatus",
     "HostThinkingView",
+    "HostUnavailableDetail",
     "ListSessionsResult",
     "LocalEngineWorker",
     "LocalEngineWorkerFactory",

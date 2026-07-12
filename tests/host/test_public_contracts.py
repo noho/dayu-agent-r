@@ -407,6 +407,7 @@ def test_status_and_error_enum_values_are_stable() -> None:
         "IDEMPOTENCY_CONFLICT": "idempotency_conflict",
         "PERMISSION_DENIED": "permission_denied",
         "UNSUPPORTED_OPERATION": "unsupported_operation",
+        "UNAVAILABLE": "unavailable",
         "INTERNAL_ERROR": "internal_error",
     }
 

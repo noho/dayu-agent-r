@@ -47,11 +47,15 @@ from dayu.contracts.tool_schema import (
     ToolSchema,
 )
 from dayu.host.admission import PendingDispatchRecord
+from dayu.host._execution_health import HostExecutionHealthState
 from dayu.host.api import (
     AttemptDispatchSnapshot,
     AttemptStatus,
     CancelMode,
     EnsureSessionRequest,
+    HostApiError,
+    HostApiErrorCode,
+    HostUnavailableDetail,
     HostLocalExecutionOptions,
     LocalEngineWorker,
     LocalEngineWorkerFactory,
@@ -1930,17 +1934,54 @@ class _FailingDrainLoopScheduler(HostDispatchScheduler):
         raise RuntimeError("drain failure")
 
 
-class _RetryExhaustedDrainLoopScheduler(HostDispatchScheduler):
-    """测试用 drain_once 持久化重试耗尽 scheduler。"""
+class _RetryOnceDrainLoopScheduler(HostDispatchScheduler):
+    """测试用首次 retry exhausted、随后成功 reconcile 的 scheduler。"""
 
-    async def drain_once(self) -> DispatchDrainResult:
-        """模拟 drain_once 遇到持久化重试耗尽。
+    _drain_call_count: int
+    _retry_seen: asyncio.Event
+    _reconciled: asyncio.Event
+    _reconcile_hold: asyncio.Event
 
-        :returns: 不会返回。
-        :raises HostTransactionRetryExhaustedError: 始终抛出测试异常。
+    def configure_retry_probe(
+        self,
+        *,
+        retry_seen: asyncio.Event,
+        reconciled: asyncio.Event,
+    ) -> None:
+        """配置 deterministic retry 观测事件。
+
+        :param retry_seen: 首次 retry exhausted 时置位。
+        :param reconciled: 下一次 drain 成功时置位。
+        :returns: ``None``。
         """
 
-        raise HostTransactionRetryExhaustedError("drain retry exhausted", attempts=3)
+        self._drain_call_count = 0
+        self._retry_seen = retry_seen
+        self._reconciled = reconciled
+        self._reconcile_hold = asyncio.Event()
+
+    async def drain_once(self) -> DispatchDrainResult:
+        """首次抛 retry exhausted，下一轮记录 reconcile 成功。
+
+        :returns: retry 后的空 drain 结果。
+        :raises HostTransactionRetryExhaustedError: 首次调用固定抛出。
+        """
+
+        self._drain_call_count += 1
+        if self._drain_call_count == 1:
+            self._retry_seen.set()
+            raise HostTransactionRetryExhaustedError(
+                "drain retry exhausted",
+                attempts=3,
+            )
+        self._reconciled.set()
+        await self._reconcile_hold.wait()
+        return DispatchDrainResult(
+            processed=0,
+            dispatched=0,
+            skipped=0,
+            timed_out=0,
+        )
 
 
 class _TransientFailingActiveCancelWatchdogScheduler(HostDispatchScheduler):
@@ -2588,11 +2629,16 @@ async def test_persistent_memory_lag_repair_failure_closes_starting_run(
 
 
 @pytest.mark.asyncio
-async def test_drain_loop_logs_unexpected_exception(
+async def test_drain_loop_unexpected_exception_reports_fatal(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """drain loop 未预期异常后必须记录诊断并保持可关闭。"""
+    """drain loop 未预期异常退出并向 shared health 报告 fatal。
+
+    :param tmp_path: pytest 临时目录。
+    :param caplog: pytest 日志捕获 fixture。
+    :returns: ``None``。
+    """
 
     caplog.set_level(logging.WARNING, logger="dayu.host.dispatch")
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -2629,9 +2675,16 @@ async def test_drain_loop_logs_unexpected_exception(
             host_handle_id="host-drain-loop-log",
         )
         try:
-            scheduler._drain_task = asyncio.create_task(scheduler._drain_loop())
-            await asyncio.sleep(0.03)
-            assert scheduler._drain_task.done() is False
+            scheduler._drain_task = scheduler._start_critical_task(
+                scheduler._drain_loop,
+                component="dispatch",
+            )
+            await asyncio.wait_for(
+                asyncio.shield(scheduler._drain_task),
+                timeout=0.5,
+            )
+            assert scheduler._drain_task.done() is True
+            assert scheduler._health_gate.state is HostExecutionHealthState.UNAVAILABLE
         finally:
             await scheduler.close()
 
@@ -2639,13 +2692,18 @@ async def test_drain_loop_logs_unexpected_exception(
 
 
 @pytest.mark.asyncio
-async def test_drain_loop_fail_closes_on_durable_retry_exhausted(
+async def test_drain_loop_retries_durable_retry_exhausted_without_self_close(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """drain loop 持久化重试耗尽时必须 fail-close 并可继续 close 清理。"""
+    """drain retry exhausted 按 poll interval 重试且不关闭或取消 worker。
 
-    caplog.set_level(logging.ERROR, logger="dayu.host.dispatch")
+    :param tmp_path: pytest 临时目录。
+    :param caplog: pytest 日志捕获 fixture。
+    :returns: ``None``。
+    """
+
+    caplog.set_level(logging.WARNING, logger="dayu.host.dispatch")
     with open_host_durable_store(_options(tmp_path)) as store:
         lane_controller = await LaneController.open(
             [
@@ -2668,7 +2726,7 @@ async def test_drain_loop_fail_closes_on_durable_retry_exhausted(
             handle=_FakeHandle(),
             cancellation_token=active_token,
         )
-        scheduler = _RetryExhaustedDrainLoopScheduler(
+        scheduler = _RetryOnceDrainLoopScheduler(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             local_execution=HostLocalExecutionOptions(
@@ -2689,25 +2747,31 @@ async def test_drain_loop_fail_closes_on_durable_retry_exhausted(
             host_handle_id="host-drain-loop-retry-exhausted",
             active_registry=registry,
         )
-        scheduler._drain_task = asyncio.create_task(scheduler._drain_loop())
-        await asyncio.sleep(0.03)
-        assert scheduler._drain_task.done() is True
-        assert active_token.is_cancelled() is True
-        assert (
-            active_token.cancel_reason()
-            == "drain_loop_durable_retry_exhausted"
+        retry_seen = asyncio.Event()
+        reconciled = asyncio.Event()
+        scheduler.configure_retry_probe(
+            retry_seen=retry_seen,
+            reconciled=reconciled,
         )
-        with pytest.raises(RuntimeError, match="closed"):
-            scheduler.wake_dispatch(
-                PendingDispatchRecord(
-                    dispatch_record_id="dispatch-closed",
-                    run_id="run-closed",
-                    attempt_id="attempt-closed",
-                    execution_id="execution-closed",
-                    execution_target="target-dispatch",
-                    worker_kind=WorkerKind.LOCAL,
-                )
+        scheduler._drain_task = scheduler._start_critical_task(
+            scheduler._drain_loop,
+            component="dispatch",
+        )
+        await asyncio.wait_for(retry_seen.wait(), timeout=0.5)
+        await asyncio.wait_for(reconciled.wait(), timeout=0.5)
+        assert scheduler._drain_task.done() is False
+        assert scheduler._closed is False
+        assert active_token.is_cancelled() is False
+        scheduler.wake_dispatch(
+            PendingDispatchRecord(
+                dispatch_record_id="dispatch-open",
+                run_id="run-open",
+                attempt_id="attempt-open",
+                execution_id="execution-open",
+                execution_target="target-dispatch",
+                worker_kind=WorkerKind.LOCAL,
             )
+        )
         await scheduler.close()
 
     assert any("dispatch drain loop durable retry exhausted" in record.getMessage() for record in caplog.records)
@@ -2776,11 +2840,16 @@ async def test_active_cancel_watchdog_loop_continues_after_transient_tick_failur
 
 
 @pytest.mark.asyncio
-async def test_drain_loop_retry_exhausted_closes_pending_queue_records(
+async def test_drain_loop_retry_exhausted_preserves_pending_durable_truth(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """drain loop retry exhausted 关闭前尽力收口队列剩余 dispatch。"""
+    """drain retry exhausted 不把 pending durable work 改写成 terminal。
+
+    :param tmp_path: pytest 临时目录。
+    :param caplog: pytest 日志捕获 fixture。
+    :returns: ``None``。
+    """
 
     caplog.set_level(logging.WARNING, logger="dayu.host.dispatch")
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -2797,7 +2866,7 @@ async def test_drain_loop_retry_exhausted_closes_pending_queue_records(
             ],
             coordinator=SQLiteLaneCoordinatorConfig(db_path=tmp_path / "lane-drain-loop-queue-closeout.sqlite3"),
         )
-        scheduler = _RetryExhaustedDrainLoopScheduler(
+        scheduler = _RetryOnceDrainLoopScheduler(
             transaction_runner=store.transaction_runner,
             event_log_store=EventLogStore(),
             local_execution=HostLocalExecutionOptions(
@@ -2818,18 +2887,27 @@ async def test_drain_loop_retry_exhausted_closes_pending_queue_records(
             host_handle_id="host-drain-loop-queue-closeout",
         )
         scheduler._queue.put_nowait(_pending_dispatch(seeded))
-        scheduler._drain_task = asyncio.create_task(scheduler._drain_loop())
-        await asyncio.sleep(0.03)
+        retry_seen = asyncio.Event()
+        reconciled = asyncio.Event()
+        scheduler.configure_retry_probe(
+            retry_seen=retry_seen,
+            reconciled=reconciled,
+        )
+        scheduler._drain_task = scheduler._start_critical_task(
+            scheduler._drain_loop,
+            component="dispatch",
+        )
+        await asyncio.wait_for(retry_seen.wait(), timeout=0.5)
+        await asyncio.wait_for(reconciled.wait(), timeout=0.5)
         await scheduler.close()
 
         run, attempt, dispatch_record = _read_rows(store.transaction_runner, seeded)
-        assert scheduler._queue.qsize() == 0
-        assert run.status is RunStatus.FAILED
-        assert attempt.status is AttemptStatus.FAILED
-        assert dispatch_record.status is DispatchRecordStatus.CANCELLED
+        assert scheduler._queue.qsize() == 1
+        assert run.status is RunStatus.RUNNING
+        assert attempt.status is AttemptStatus.STARTING
+        assert dispatch_record.status is DispatchRecordStatus.PENDING
 
-    assert "dispatch.drain_loop.queue_closeout" in caplog.text
-    assert "closeout_count=1" in caplog.text
+    assert "dispatch.drain_loop.queue_closeout" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -3838,8 +3916,10 @@ async def test_scheduler_close_with_non_empty_dispatch_queue_does_not_drain_or_w
             store.transaction_runner,
             after_cursor=event_log_cursor,
         )
-        with pytest.raises(RuntimeError, match="HostDispatchScheduler is closed"):
+        with pytest.raises(HostApiError) as wake_error:
             scheduler.wake_dispatch(_pending_dispatch(seeded))
+        assert wake_error.value.code is HostApiErrorCode.UNAVAILABLE
+        assert wake_error.value.retryable is True
         with pytest.raises(RuntimeError, match="HostDispatchScheduler is closed"):
             await scheduler.drain_once()
 
@@ -4844,10 +4924,75 @@ async def test_scheduler_wake_methods_fail_after_close_and_close_is_idempotent(
         await scheduler.close()
         await scheduler.close()
 
-        with pytest.raises(RuntimeError, match="HostDispatchScheduler is closed"):
+        with pytest.raises(HostApiError) as dispatch_error:
             scheduler.wake_dispatch(_pending_dispatch(seeded))
-        scheduler.wake_queue_promotion(seeded.session_id)
+        assert dispatch_error.value.code is HostApiErrorCode.UNAVAILABLE
+        with pytest.raises(HostApiError) as promotion_error:
+            scheduler.wake_queue_promotion(seeded.session_id)
+        assert promotion_error.value.code is HostApiErrorCode.UNAVAILABLE
+        with pytest.raises(HostApiError) as watchdog_error:
+            scheduler.wake_active_cancel_watchdog()
+        assert watchdog_error.value.code is HostApiErrorCode.UNAVAILABLE
         assert scheduler._promotion_queue.qsize() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("component", ("heartbeat", "dispatch", "promotion"))
+async def test_critical_task_exception_reports_typed_fatal_to_shared_health(
+    tmp_path: Path,
+    component: str,
+) -> None:
+    """critical task 非预期异常只向 shared health 提交稳定 typed fatal。
+
+    :param tmp_path: pytest 临时目录。
+    :param component: 预期写入 typed detail 的 critical component。
+    :returns: ``None``。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+        )
+
+        async def fail_critical_task() -> None:
+            """抛出不会进入 public detail 的固定测试异常。
+
+            :returns: 不会返回。
+            :raises RuntimeError: 始终抛出。
+            """
+
+            raise RuntimeError("private provider diagnostic must not leak")
+
+        try:
+            await scheduler._supervise_critical_task(
+                fail_critical_task,
+                component=component,
+            )
+            assert scheduler._health_gate.state is HostExecutionHealthState.UNAVAILABLE
+            with pytest.raises(HostApiError) as exc_info:
+                scheduler.wake_dispatch(
+                    PendingDispatchRecord(
+                        dispatch_record_id="dispatch-fatal",
+                        run_id="run-fatal",
+                        attempt_id="attempt-fatal",
+                        execution_id="execution-fatal",
+                        execution_target="target-fatal",
+                        worker_kind=WorkerKind.LOCAL,
+                    )
+                )
+            assert exc_info.value.code is HostApiErrorCode.UNAVAILABLE
+            assert exc_info.value.retryable is True
+            assert isinstance(exc_info.value.detail, HostUnavailableDetail)
+            assert exc_info.value.detail.component == component
+            assert (
+                exc_info.value.detail.reason_code
+                == "critical_task_unexpected_exit"
+            )
+            assert "private provider diagnostic" not in str(exc_info.value.detail)
+        finally:
+            await scheduler.close()
 
 
 @pytest.mark.asyncio
