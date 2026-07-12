@@ -73,7 +73,11 @@ from dayu.engine.contracts.runner_events import (
     RunnerToolCallsCompletedData,
 )
 from dayu.engine.contracts.runner_identity import RunnerRequestIdentity
-from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.runner_spec import (
+    ClientCorrelationPolicy,
+    RunnerCallOptions,
+    RunnerSpec,
+)
 from dayu.contracts.tool_await import (
     ToolAwaitKind,
     ToolAwaitSnapshot,
@@ -281,7 +285,7 @@ class _StateClearingRunner:
         self.close_count += 1
 
     async def _iter_events(self) -> AsyncIterator[RunnerEvent]:
-        """产出脚本事件后清空 Agent 迭代状态。
+        """脚本自然结束时清空 Agent 迭代状态。
 
         :returns: RunnerEvent 异步流。
         :raises Exception: 不主动抛出异常。
@@ -319,10 +323,7 @@ class _RecordingToolExecutor:
 
         self.requests.append(request)
         call_ids = {call.tool_call_id for call in request.calls}
-        if (
-            self.raise_for_call_id is not None
-            and self.raise_for_call_id in call_ids
-        ):
+        if self.raise_for_call_id is not None and self.raise_for_call_id in call_ids:
             raise RuntimeError("tool exploded")
         if (
             self.raise_cancelled_for_call_id is not None
@@ -449,7 +450,9 @@ def _tool_script(
     )
 
 
-def _final_script(content: str, *, finish_reason: FinishReason = FinishReason.STOP) -> tuple[RunnerEvent, ...]:
+def _final_script(
+    content: str, *, finish_reason: FinishReason = FinishReason.STOP
+) -> tuple[RunnerEvent, ...]:
     """构造最终回答 Runner 脚本。
 
     :param content: 最终正文。
@@ -622,9 +625,8 @@ def _request(
             max_consecutive_failed_tool_batches=max_failed_batches,
         ),
         tool_schemas=(_schema(),),
-        tool_executor=executor or _RecordingToolExecutor(
-            outcomes={"tc_1": _success(5)}
-        ),
+        tool_executor=executor
+        or _RecordingToolExecutor(outcomes={"tc_1": _success(5)}),
         cancellation_token=token or ControllableCancellationToken(),
         attempt_id="attempt_phase3",
         execution_id="execution_phase3",
@@ -641,6 +643,35 @@ async def _collect(agent: _AsyncAgent) -> list[EngineEvent]:
 
     events: list[EngineEvent] = []
     async for event in agent.run_messages():
+        events.append(event)
+    return events
+
+
+async def _collect_with_cancel_after_iteration_completed(
+    *,
+    agent: _AsyncAgent,
+    token: ControllableCancellationToken,
+    completed_ordinal: int,
+) -> list[EngineEvent]:
+    """在指定 RunnerDone commit 可见后请求取消并继续消费。
+
+    :param agent: 被测私有 Agent。
+    :param token: Agent 使用的可控取消 token。
+    :param completed_ordinal: 触发取消的 ``ITERATION_COMPLETED`` 序号。
+    :returns: 完整 EngineEvent 列表。
+    :raises StopAsyncIteration: stream 未产出目标 completed event 时抛出。
+    """
+
+    stream = agent.run_messages()
+    events: list[EngineEvent] = []
+    completed_count = 0
+    while completed_count < completed_ordinal:
+        event = await anext(stream)
+        events.append(event)
+        if event.type is EngineEventType.ITERATION_COMPLETED:
+            completed_count += 1
+    token.request_cancel("post_runner_done")
+    async for event in stream:
         events.append(event)
     return events
 
@@ -780,9 +811,7 @@ def test_agent_policy_prompt_fields_are_required() -> None:
         key: value for key, value in full_kwargs.items() if key != "fallback_prompt"
     }
     without_continuation_prompt = {
-        key: value
-        for key, value in full_kwargs.items()
-        if key != "continuation_prompt"
+        key: value for key, value in full_kwargs.items() if key != "continuation_prompt"
     }
 
     with pytest.raises(TypeError, match="fallback_prompt"):
@@ -975,9 +1004,13 @@ async def test_completed_tool_call_injects_messages_and_reaches_final() -> None:
     """completed outcome 会进入下一轮 Runner 并最终收口 final_answer。"""
 
     executor = _RecordingToolExecutor(outcomes={"tc_1": _success({"sum": 5})})
-    runner = _ScriptedRunner(scripts=(_tool_script(_tool_call("tc_1")), _final_script("5")))
+    runner = _ScriptedRunner(
+        scripts=(_tool_script(_tool_call("tc_1")), _final_script("5"))
+    )
 
-    events = await _collect(_AsyncAgent(request=_request(executor=executor), runner=runner))
+    events = await _collect(
+        _AsyncAgent(request=_request(executor=executor), runner=runner)
+    )
 
     terminal = _terminal(events)
     assert terminal.type is EngineEventType.FINAL_ANSWER
@@ -990,15 +1023,23 @@ async def test_completed_tool_call_injects_messages_and_reaches_final() -> None:
     assert context.run_id == "run_phase3"
     assert context.iteration_id == "run_phase3_iteration_1"
     assert context.timeout_seconds == _TOOL_EXECUTION_TIMEOUT_SECONDS
-    assert context.correlation_id == (
-        "run_phase3:run_phase3_iteration_1:tool_batch"
-    )
+    assert context.correlation_id == ("run_phase3:run_phase3_iteration_1:tool_batch")
     assert [call.tool_call_id for call in executor.requests[0].calls] == ["tc_1"]
 
-    requested = [event for event in events if event.type is EngineEventType.TOOL_CALL_REQUESTED]
-    accepted = [event for event in events if event.type is EngineEventType.TOOL_RESULT_ACCEPTED]
-    ready = [event for event in events if event.type is EngineEventType.TOOL_CALLS_BATCH_READY]
-    done = [event for event in events if event.type is EngineEventType.TOOL_CALLS_BATCH_DONE]
+    requested = [
+        event for event in events if event.type is EngineEventType.TOOL_CALL_REQUESTED
+    ]
+    accepted = [
+        event for event in events if event.type is EngineEventType.TOOL_RESULT_ACCEPTED
+    ]
+    ready = [
+        event
+        for event in events
+        if event.type is EngineEventType.TOOL_CALLS_BATCH_READY
+    ]
+    done = [
+        event for event in events if event.type is EngineEventType.TOOL_CALLS_BATCH_DONE
+    ]
     assert len(ready) == 1
     assert len(done) == 1
     assert len(requested) == 1
@@ -1013,7 +1054,9 @@ async def test_completed_tool_call_injects_messages_and_reaches_final() -> None:
     assert done[0].data.failed_count == 0
     assert done[0].data.cancelled_count == 0
     assert events.index(done[0]) > events.index(accepted[0])
-    assert requested[0].data.provider_state == GeminiToolCallState(thought_signature="sig")
+    assert requested[0].data.provider_state == GeminiToolCallState(
+        thought_signature="sig"
+    )
     assert accepted[0].data.record.call.index_in_iteration == 0
     assert accepted[0].data.record.call.tool_call_id == "tc_1"
 
@@ -1036,9 +1079,7 @@ async def test_completed_tool_call_injects_messages_and_reaches_final() -> None:
         for identity in runner.request_identities_seen
     )
     iteration_completed = [
-        event
-        for event in events
-        if event.type is EngineEventType.ITERATION_COMPLETED
+        event for event in events if event.type is EngineEventType.ITERATION_COMPLETED
     ]
     assert len(iteration_completed) == 2
     for event, identity in zip(
@@ -1055,17 +1096,15 @@ async def test_oversized_tool_message_is_passed_to_next_runner_call() -> None:
     """工具结果注入 messages 后由 Runner/provider 边界处理容量。"""
 
     executor = _RecordingToolExecutor(
-        outcomes={
-            "tc_1": _success(
-                {"content": "x" * _OVERSIZED_INLINE_CONTENT_LENGTH}
-            )
-        }
+        outcomes={"tc_1": _success({"content": "x" * _OVERSIZED_INLINE_CONTENT_LENGTH})}
     )
     runner = _ScriptedRunner(
         scripts=(_tool_script(_tool_call("tc_1")), _final_script("unreachable"))
     )
 
-    events = await _collect(_AsyncAgent(request=_request(executor=executor), runner=runner))
+    events = await _collect(
+        _AsyncAgent(request=_request(executor=executor), runner=runner)
+    )
 
     terminal = _terminal(events)
     assert terminal.type is EngineEventType.FINAL_ANSWER
@@ -1082,11 +1121,7 @@ async def test_oversized_tool_message_is_passed_to_force_answer_runner_call() ->
     """force-answer fallback 不再执行 Engine 私有 inline byte 阈值。"""
 
     executor = _RecordingToolExecutor(
-        outcomes={
-            "tc_1": _success(
-                {"content": "x" * _OVERSIZED_INLINE_CONTENT_LENGTH}
-            )
-        }
+        outcomes={"tc_1": _success({"content": "x" * _OVERSIZED_INLINE_CONTENT_LENGTH})}
     )
     runner = _ScriptedRunner(
         scripts=(_tool_script(_tool_call("tc_1")), _final_script("unreachable"))
@@ -1131,13 +1166,13 @@ async def test_tool_call_iteration_preserves_streamed_content_delta() -> None:
                 ),
                 _event(
                     RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED,
-                    RunnerToolCallsCompletedData(
-                        tool_calls=(_tool_call("tc_1"),)
-                    ),
+                    RunnerToolCallsCompletedData(tool_calls=(_tool_call("tc_1"),)),
                 ),
                 _event(
                     RunnerEventType.RUNNER_DONE,
-                    RunnerDoneData(finish_reason=FinishReason.TOOL_CALLS, provider_request_id=None),
+                    RunnerDoneData(
+                        finish_reason=FinishReason.TOOL_CALLS, provider_request_id=None
+                    ),
                 ),
             ),
             _final_script("5"),
@@ -1152,7 +1187,9 @@ async def test_tool_call_iteration_preserves_streamed_content_delta() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tool_call_iteration_empty_tool_content_falls_back_to_completed_content() -> None:
+async def test_tool_call_iteration_empty_tool_content_falls_back_to_completed_content() -> (
+    None
+):
     """tool_calls content 为空字符串时保留已完成正文。"""
 
     executor = _RecordingToolExecutor(outcomes={"tc_1": _success({"sum": 5})})
@@ -1239,7 +1276,9 @@ async def test_failed_tool_result_enters_context_not_terminal() -> None:
         scripts=(_tool_script(_tool_call("tc_1")), _final_script("explained"))
     )
 
-    events = await _collect(_AsyncAgent(request=_request(executor=executor), runner=runner))
+    events = await _collect(
+        _AsyncAgent(request=_request(executor=executor), runner=runner)
+    )
 
     assert len(executor.requests) == 1
     assert _terminal(events).type is EngineEventType.FINAL_ANSWER
@@ -1265,7 +1304,9 @@ async def test_multiple_tool_calls_invoke_executor_exactly_once() -> None:
         )
     )
 
-    events = await _collect(_AsyncAgent(request=_request(executor=executor), runner=runner))
+    events = await _collect(
+        _AsyncAgent(request=_request(executor=executor), runner=runner)
+    )
 
     assert len(executor.requests) == 1
     # 输入按 LLM 输出顺序，不强制排序；只要求双射成立。
@@ -1323,7 +1364,9 @@ async def test_mixed_outcomes_in_single_batch_count_correctly() -> None:
         )
     )
 
-    events = await _collect(_AsyncAgent(request=_request(executor=executor), runner=runner))
+    events = await _collect(
+        _AsyncAgent(request=_request(executor=executor), runner=runner)
+    )
 
     done = [
         event for event in events if event.type is EngineEventType.TOOL_CALLS_BATCH_DONE
@@ -1408,9 +1451,7 @@ async def test_tool_calls_finish_reason_mismatch_keeps_provider_request_id() -> 
             (
                 _event(
                     RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED,
-                    RunnerToolCallsCompletedData(
-                        tool_calls=(_tool_call("tc_1"),)
-                    ),
+                    RunnerToolCallsCompletedData(tool_calls=(_tool_call("tc_1"),)),
                 ),
                 _event(
                     RunnerEventType.RUNNER_DONE,
@@ -1519,7 +1560,7 @@ async def test_runner_call_completed_missing_state_is_controlled_failure(
     :raises AssertionError: 终态或诊断日志不符合预期时抛出。
     """
 
-    runner = _StateClearingRunner(events=_final_script("done"))
+    runner = _StateClearingRunner(events=_final_script("done")[:-1])
     agent = _AsyncAgent(request=_request(), runner=runner)
     runner.agent = agent
 
@@ -1556,9 +1597,7 @@ async def test_verbose_logs_engine_main_path_without_tool_payloads(
     )
     runner = _ScriptedRunner(
         scripts=(
-            _tool_script(
-                _tool_call("tc_1", arguments={"query": secret_argument})
-            ),
+            _tool_script(_tool_call("tc_1", arguments={"query": secret_argument})),
             _final_script("done"),
         )
     )
@@ -1648,7 +1687,9 @@ async def test_tool_awaiting_suspends_run_with_accepted_and_awaiting_records() -
     assert len(suspended.accepted_records) == 1
     assert suspended.accepted_records[0].call.tool_call_id == "tc_2"
     assert len(awaiting_executor.requests) == 1
-    request_ids = sorted(call.tool_call_id for call in awaiting_executor.requests[0].calls)
+    request_ids = sorted(
+        call.tool_call_id for call in awaiting_executor.requests[0].calls
+    )
     assert request_ids == ["tc_1", "tc_2"]
     assert runner.call_count == 1
     assert runner.close_count == 1
@@ -1673,9 +1714,7 @@ async def test_awaiting_cancellation_before_and_after_outcome_boundary() -> None
 
     assert _terminal(before_events).type is EngineEventType.RUN_CANCELLED
     assert [
-        event
-        for event in before_events
-        if event.type is EngineEventType.TOOL_AWAITING
+        event for event in before_events if event.type is EngineEventType.TOOL_AWAITING
     ] == []
 
     token_after = ControllableCancellationToken()
@@ -1692,14 +1731,12 @@ async def test_awaiting_cancellation_before_and_after_outcome_boundary() -> None
 
     assert _terminal(after_events).type is EngineEventType.RUN_SUSPENDED
     assert [
-        event.type for event in after_events
-        if event.type
-        in {EngineEventType.TOOL_AWAITING, EngineEventType.RUN_SUSPENDED}
+        event.type
+        for event in after_events
+        if event.type in {EngineEventType.TOOL_AWAITING, EngineEventType.RUN_SUSPENDED}
     ] == [EngineEventType.TOOL_AWAITING, EngineEventType.RUN_SUSPENDED]
     assert [
-        event
-        for event in after_events
-        if event.type is EngineEventType.RUN_CANCELLED
+        event for event in after_events if event.type is EngineEventType.RUN_CANCELLED
     ] == []
 
 
@@ -1709,16 +1746,12 @@ async def test_duplicate_and_executor_exception_paths(
 ) -> None:
     """duplicate、executor exception 均有明确收口。"""
 
-    duplicate_executor = _RecordingToolExecutor(
-        outcomes={"tc_1": _success(1)}
-    )
+    duplicate_executor = _RecordingToolExecutor(outcomes={"tc_1": _success(1)})
     duplicate_events = await _collect(
         _AsyncAgent(
             request=_request(executor=duplicate_executor),
             runner=_ScriptedRunner(
-                scripts=(
-                    _tool_script(_tool_call("tc_1"), _tool_call("tc_1", index=1)),
-                )
+                scripts=(_tool_script(_tool_call("tc_1"), _tool_call("tc_1", index=1)),)
             ),
         )
     )
@@ -1729,9 +1762,7 @@ async def test_duplicate_and_executor_exception_paths(
         tool_call_id="tc_other",
         outcome=_success(1),
     )
-    mismatch_runner = _ScriptedRunner(
-        scripts=(_tool_script(_tool_call("tc_1")),)
-    )
+    mismatch_runner = _ScriptedRunner(scripts=(_tool_script(_tool_call("tc_1")),))
     mismatch_events = await _collect(
         _AsyncAgent(
             request=_request(
@@ -1796,10 +1827,7 @@ async def test_cancel_before_tool_batch_does_not_register_tool_call_id() -> None
     token = ControllableCancellationToken()
     executor = _RecordingToolExecutor(outcomes={"tc_1": _success(1)})
     runner = _ScriptedRunner(
-        scripts=(
-            _tool_script(_tool_call("tc_1")),
-            _final_script("unreachable"),
-        ),
+        scripts=(_tool_script(_tool_call("tc_1"))[:-1],),
         token_to_cancel=token,
         cancel_after_call_indices=frozenset({0}),
     )
@@ -1849,9 +1877,7 @@ async def test_tool_execution_timeout_fails_run_without_tool_result() -> None:
         == _FAST_TOOL_EXECUTION_TIMEOUT_SECONDS
     )
     assert runner.call_count == 1
-    assert EngineEventType.TOOL_RESULT_ACCEPTED not in {
-        event.type for event in events
-    }
+    assert EngineEventType.TOOL_RESULT_ACCEPTED not in {event.type for event in events}
 
 
 @pytest.mark.asyncio
@@ -1960,6 +1986,78 @@ async def test_max_iterations_force_answer_and_raise_error() -> None:
 
 
 @pytest.mark.asyncio
+async def test_post_done_cancel_does_not_override_force_answer_final() -> None:
+    """force-answer RunnerDone commit 后的取消不覆盖降级 final。"""
+
+    token = ControllableCancellationToken()
+    executor = _RecordingToolExecutor(outcomes={"tc_1": _success(5)})
+    runner = _ScriptedRunner(
+        scripts=(
+            _tool_script(_tool_call("tc_1")),
+            _final_script("committed force answer"),
+        )
+    )
+
+    events = await _collect_with_cancel_after_iteration_completed(
+        agent=_AsyncAgent(
+            request=_request(
+                token=token,
+                executor=executor,
+                max_iterations=1,
+            ),
+            runner=runner,
+        ),
+        token=token,
+        completed_ordinal=2,
+    )
+
+    terminal = _terminal(events)
+    assert terminal.type is EngineEventType.FINAL_ANSWER
+    assert isinstance(terminal.data, FinalAnswerData)
+    assert terminal.data.content == "committed force answer"
+    assert terminal.data.degraded is True
+    assert EngineEventType.RUN_CANCELLED not in {event.type for event in events}
+    assert len(executor.requests) == 1
+    assert runner.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_post_done_cancel_does_not_skip_tool_call_candidate() -> None:
+    """tool-call RunnerDone 后迟到取消不能跳过 batch-ready/requested 投影。"""
+
+    token = ControllableCancellationToken()
+    executor = _RecordingToolExecutor(outcomes={"tc_1": _success(5)})
+    runner = _ScriptedRunner(scripts=(_tool_script(_tool_call("tc_1")),))
+
+    events = await _collect_with_cancel_after_iteration_completed(
+        agent=_AsyncAgent(
+            request=_request(token=token, executor=executor),
+            runner=runner,
+        ),
+        token=token,
+        completed_ordinal=1,
+    )
+
+    terminal = _terminal(events)
+    ready = next(
+        event
+        for event in events
+        if event.type is EngineEventType.TOOL_CALLS_BATCH_READY
+    )
+    requested = next(
+        event for event in events if event.type is EngineEventType.TOOL_CALL_REQUESTED
+    )
+    assert terminal.type is EngineEventType.RUN_CANCELLED
+    assert events.index(ready) < events.index(requested) < events.index(terminal)
+    assert isinstance(ready.data, ToolCallsBatchReadyData)
+    assert ready.data.tool_calls[0].tool_call_id == "tc_1"
+    assert isinstance(requested.data, ToolCallRequestedData)
+    assert requested.data.tool_call_id == "tc_1"
+    assert executor.requests == []
+    assert runner.close_count == 1
+
+
+@pytest.mark.asyncio
 async def test_force_answer_empty_and_tool_call_are_fail_closed() -> None:
     """force-answer 空内容或继续 tool call 都不能伪装成 final。
 
@@ -2034,10 +2132,7 @@ async def test_force_answer_empty_and_tool_call_are_fail_closed() -> None:
     )
     failed_batch_failure = _failed_data(failed_batch_events)
     assert failed_batch_failure.error_code == "force_answer_empty"
-    assert (
-        "trigger=consecutive_failed_tool_batches"
-        in failed_batch_failure.message
-    )
+    assert "trigger=consecutive_failed_tool_batches" in failed_batch_failure.message
 
 
 @pytest.mark.asyncio
@@ -2119,9 +2214,7 @@ async def test_length_continuation_appends_prompt_and_joins_content() -> None:
     assert runner.request_identities_seen[1] is not None
     assert runner.request_identities_seen[1].iteration_id == "run_phase3_iteration_2"
     iteration_completed = [
-        event
-        for event in events
-        if event.type is EngineEventType.ITERATION_COMPLETED
+        event for event in events if event.type is EngineEventType.ITERATION_COMPLETED
     ]
     assert len(iteration_completed) == 2
     for event, identity in zip(
@@ -2250,19 +2343,19 @@ async def test_cancellation_wins_before_length_continuation() -> None:
         scripts=(
             _final_script("partial", finish_reason=FinishReason.LENGTH),
             _final_script("unused"),
-        ),
-        token_to_cancel=token,
-        cancel_after_call_indices=frozenset({0}),
+        )
     )
-    events = await _collect(
-        _AsyncAgent(
+    events = await _collect_with_cancel_after_iteration_completed(
+        agent=_AsyncAgent(
             request=_request(
                 token=token,
                 max_iterations=3,
                 continuation_max_attempts=2,
             ),
             runner=runner,
-        )
+        ),
+        token=token,
+        completed_ordinal=1,
     )
 
     assert _terminal(events).type is EngineEventType.RUN_CANCELLED
@@ -2312,9 +2405,7 @@ async def test_consecutive_failed_batches_force_answer_raise_and_reset() -> None
     )
     raise_failed = _failed_data(raise_events)
     assert raise_failed.error_code == "consecutive_failed_tool_batches"
-    assert raise_failed.message == (
-        "consecutive failed tool batches threshold reached"
-    )
+    assert raise_failed.message == ("consecutive failed tool batches threshold reached")
 
     reset_executor = _RecordingToolExecutor(
         outcomes={"tc_1": _failed(), "tc_2": _success(2), "tc_3": _failed()}
@@ -2355,13 +2446,13 @@ async def test_late_cancellation_after_tool_outcome_preserves_accepted_facts() -
                 ),
                 _event(
                     RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED,
-                    RunnerToolCallsCompletedData(
-                        tool_calls=(_tool_call("tc_1"),)
-                    ),
+                    RunnerToolCallsCompletedData(tool_calls=(_tool_call("tc_1"),)),
                 ),
                 _event(
                     RunnerEventType.RUNNER_DONE,
-                    RunnerDoneData(finish_reason=FinishReason.TOOL_CALLS, provider_request_id=None),
+                    RunnerDoneData(
+                        finish_reason=FinishReason.TOOL_CALLS, provider_request_id=None
+                    ),
                 ),
             ),
             _final_script("unused"),
@@ -2399,7 +2490,9 @@ async def test_late_cancellation_after_tool_outcome_preserves_accepted_facts() -
 
 
 @pytest.mark.asyncio
-async def test_all_cancelled_batch_does_not_trigger_failed_fallback_and_continues() -> None:
+async def test_all_cancelled_batch_does_not_trigger_failed_fallback_and_continues() -> (
+    None
+):
     """全部 cancelled 的批次不计入失败、不触发 fallback，下一轮 Runner 正常继续。
 
     覆盖 ``_all_records_failed`` 在 all-cancelled 批次上必须返回 ``False`` 的
@@ -2450,8 +2543,7 @@ async def test_all_cancelled_batch_does_not_trigger_failed_fallback_and_continue
     assert final.degraded is False
 
     done = [
-        event for event in events
-        if event.type is EngineEventType.TOOL_CALLS_BATCH_DONE
+        event for event in events if event.type is EngineEventType.TOOL_CALLS_BATCH_DONE
     ]
     assert len(done) == 1
     assert isinstance(done[0].data, ToolCallsBatchDoneData)
@@ -2493,12 +2585,10 @@ async def test_all_awaiting_batch_suspends_with_empty_accepted_records() -> None
     assert terminal.type is EngineEventType.RUN_SUSPENDED
 
     awaiting_events = [
-        event for event in events
-        if event.type is EngineEventType.TOOL_AWAITING
+        event for event in events if event.type is EngineEventType.TOOL_AWAITING
     ]
     accepted_events = [
-        event for event in events
-        if event.type is EngineEventType.TOOL_RESULT_ACCEPTED
+        event for event in events if event.type is EngineEventType.TOOL_RESULT_ACCEPTED
     ]
     assert len(awaiting_events) == 2
     assert accepted_events == []
@@ -2516,7 +2606,9 @@ async def test_all_awaiting_batch_suspends_with_empty_accepted_records() -> None
 
 
 @pytest.mark.asyncio
-async def test_late_cancel_after_accepted_before_awaiting_does_not_swallow_suspend() -> None:
+async def test_late_cancel_after_accepted_before_awaiting_does_not_swallow_suspend() -> (
+    None
+):
     """accepted 已 emit 但 TOOL_AWAITING 尚未 emit 前命中的取消不能吞掉挂起。
 
     依据 commit-edge：executor 返回的 outcome 视为已接受事实，仍必须发出
@@ -2552,10 +2644,7 @@ async def test_late_cancel_after_accepted_before_awaiting_does_not_swallow_suspe
     async for event in agent.run_messages():
         events.append(event)
         # 在 TOOL_AWAITING 之前、TOOL_RESULT_ACCEPTED 之后触发取消。
-        if (
-            not triggered
-            and event.type is EngineEventType.TOOL_RESULT_ACCEPTED
-        ):
+        if not triggered and event.type is EngineEventType.TOOL_RESULT_ACCEPTED:
             token.request_cancel("after_accepted_before_awaiting")
             triggered = True
 
@@ -2564,12 +2653,10 @@ async def test_late_cancel_after_accepted_before_awaiting_does_not_swallow_suspe
     assert terminal.type is EngineEventType.RUN_SUSPENDED
 
     awaiting_events = [
-        event for event in events
-        if event.type is EngineEventType.TOOL_AWAITING
+        event for event in events if event.type is EngineEventType.TOOL_AWAITING
     ]
     cancel_events = [
-        event for event in events
-        if event.type is EngineEventType.RUN_CANCELLED
+        event for event in events if event.type is EngineEventType.RUN_CANCELLED
     ]
     assert len(awaiting_events) == 1
     assert cancel_events == []

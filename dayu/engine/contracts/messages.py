@@ -43,6 +43,30 @@ class AgentMessageRole(StrEnum):
     TOOL = "tool"
 
 
+def _validate_message_role(
+    *,
+    role: AgentMessageRole,
+    expected_role: AgentMessageRole,
+    message_type: str,
+) -> None:
+    """校验具体消息类型的固有 role。
+
+    :param role: 调用方传入的消息 role。
+    :param expected_role: 当前消息类型唯一允许的 role。
+    :param message_type: 用于错误诊断的消息类型名。
+    :returns: ``None``。
+    :raises TypeError: ``role`` 不是 :class:`AgentMessageRole` 时抛出。
+    :raises ValueError: ``role`` 与当前消息类型固有 role 不一致时抛出。
+    """
+
+    if not isinstance(role, AgentMessageRole):
+        raise TypeError(f"{message_type}.role must be AgentMessageRole")
+    if role is not expected_role:
+        raise ValueError(
+            f"{message_type}.role must be {expected_role.value}: " f"got {role.value}"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class SystemMessage:
     """系统消息。
@@ -53,6 +77,20 @@ class SystemMessage:
 
     role: Literal[AgentMessageRole.SYSTEM]
     content: str
+
+    def __post_init__(self) -> None:
+        """校验系统消息固有 role。
+
+        :returns: ``None``。
+        :raises TypeError: ``role`` 不是 AgentMessageRole 时抛出。
+        :raises ValueError: ``role`` 不是 ``SYSTEM`` 时抛出。
+        """
+
+        _validate_message_role(
+            role=self.role,
+            expected_role=AgentMessageRole.SYSTEM,
+            message_type=type(self).__name__,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +103,20 @@ class UserMessage:
 
     role: Literal[AgentMessageRole.USER]
     content: str
+
+    def __post_init__(self) -> None:
+        """校验用户消息固有 role。
+
+        :returns: ``None``。
+        :raises TypeError: ``role`` 不是 AgentMessageRole 时抛出。
+        :raises ValueError: ``role`` 不是 ``USER`` 时抛出。
+        """
+
+        _validate_message_role(
+            role=self.role,
+            expected_role=AgentMessageRole.USER,
+            message_type=type(self).__name__,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +155,20 @@ class AssistantMessage:
     reasoning_content: str | None
     tool_calls: tuple[AssistantToolCall, ...]
 
+    def __post_init__(self) -> None:
+        """校验助手消息固有 role。
+
+        :returns: ``None``。
+        :raises TypeError: ``role`` 不是 AgentMessageRole 时抛出。
+        :raises ValueError: ``role`` 不是 ``ASSISTANT`` 时抛出。
+        """
+
+        _validate_message_role(
+            role=self.role,
+            expected_role=AgentMessageRole.ASSISTANT,
+            message_type=type(self).__name__,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class ToolMessage:
@@ -116,6 +182,20 @@ class ToolMessage:
     role: Literal[AgentMessageRole.TOOL]
     tool_call_id: str
     content: str
+
+    def __post_init__(self) -> None:
+        """校验工具消息固有 role。
+
+        :returns: ``None``。
+        :raises TypeError: ``role`` 不是 AgentMessageRole 时抛出。
+        :raises ValueError: ``role`` 不是 ``TOOL`` 时抛出。
+        """
+
+        _validate_message_role(
+            role=self.role,
+            expected_role=AgentMessageRole.TOOL,
+            message_type=type(self).__name__,
+        )
 
 
 AgentMessage: TypeAlias = SystemMessage | UserMessage | AssistantMessage | ToolMessage

@@ -15,6 +15,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from types import MappingProxyType
 from typing import TypeAlias
 
 from dayu.engine.contracts.agent_run import ContextBudgetSnapshot, RunResumeHint
@@ -281,9 +282,7 @@ class ToolCallsBatchDoneData:
             or self.failed_count < 0
             or self.cancelled_count < 0
         ):
-            raise ValueError(
-                "ToolCallsBatchDoneData counts must be non-negative"
-            )
+            raise ValueError("ToolCallsBatchDoneData counts must be non-negative")
         total = self.completed_count + self.failed_count + self.cancelled_count
         if total != len(self.tool_call_ids):
             raise ValueError(
@@ -408,9 +407,7 @@ class ProviderDiagnosticData:
     provider_request_id: str | None
     raw_payload: JsonValue | None
     partial_tool_calls: tuple[PartialToolCallSummary, ...] = ()
-    diagnostic_source: RunnerDiagnosticSource = (
-        RunnerDiagnosticSource.HTTP_ADAPTER
-    )
+    diagnostic_source: RunnerDiagnosticSource = RunnerDiagnosticSource.HTTP_ADAPTER
     client_correlation_id: str | None = None
 
 
@@ -472,9 +469,7 @@ class RunSuspendedData:
         """
 
         if not self.awaiting_records:
-            raise ValueError(
-                "RunSuspendedData.awaiting_records must be non-empty"
-            )
+            raise ValueError("RunSuspendedData.awaiting_records must be non-empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -549,6 +544,72 @@ EngineEventData: TypeAlias = (
 )
 """Engine 事件 data 封闭联合。"""
 
+ENGINE_EVENT_TYPE_TO_DATA: Mapping[EngineEventType, type[EngineEventData]] = (
+    MappingProxyType(
+        {
+            EngineEventType.ITERATION_STARTED: IterationStartedData,
+            EngineEventType.CONTENT_DELTA: ContentDeltaData,
+            EngineEventType.REASONING_DELTA: ReasoningDeltaData,
+            EngineEventType.CONTENT_COMPLETED: ContentCompleteData,
+            EngineEventType.TOOL_CALL_DELTA: ToolCallDeltaData,
+            EngineEventType.TOOL_CALLS_BATCH_READY: ToolCallsBatchReadyData,
+            EngineEventType.TOOL_CALL_REQUESTED: ToolCallRequestedData,
+            EngineEventType.TOOL_RESULT_ACCEPTED: ToolResultAcceptedData,
+            EngineEventType.TOOL_CALLS_BATCH_DONE: ToolCallsBatchDoneData,
+            EngineEventType.TOOL_AWAITING: ToolAwaitingData,
+            EngineEventType.CONTEXT_COMPACTION_REQUESTED: (
+                ContextCompactionRequestedData
+            ),
+            EngineEventType.USAGE_REPORTED: UsageReportedData,
+            EngineEventType.PROVIDER_DIAGNOSTIC: ProviderDiagnosticData,
+            EngineEventType.PROVIDER_PROTOCOL_ERROR: ProviderProtocolErrorData,
+            EngineEventType.ITERATION_COMPLETED: IterationCompletedData,
+            EngineEventType.FINAL_ANSWER: FinalAnswerData,
+            EngineEventType.RUN_SUSPENDED: RunSuspendedData,
+            EngineEventType.RUN_CANCELLED: RunCancelledData,
+            EngineEventType.RUN_FAILED: RunFailedData,
+        }
+    )
+)
+"""EngineEvent type/data 配对真源。"""
+
+
+def engine_event_type_for_data(data: EngineEventData) -> EngineEventType:
+    """根据 EngineEvent data 类型返回对应事件类型。
+
+    :param data: EngineEvent data 联合成员。
+    :returns: 与 data 类型唯一对应的 EngineEventType。
+    :raises TypeError: ``data`` 不是 EngineEventData 闭集成员时抛出。
+    """
+
+    for event_type, data_type in ENGINE_EVENT_TYPE_TO_DATA.items():
+        if isinstance(data, data_type):
+            return event_type
+    raise TypeError("EngineEvent.data has unsupported type")
+
+
+def validate_engine_event_pairing(
+    event_type: EngineEventType, data: EngineEventData
+) -> None:
+    """校验 EngineEvent type/data 判别关系。
+
+    :param event_type: EngineEventType。
+    :param data: EngineEvent data 联合成员。
+    :returns: ``None``。
+    :raises TypeError: ``event_type`` 不是 EngineEventType，或 ``data`` 不是
+        EngineEventData 闭集成员时抛出。
+    :raises ValueError: type 与 data 类型不匹配时抛出。
+    """
+
+    if not isinstance(event_type, EngineEventType):
+        raise TypeError("EngineEvent.type must be EngineEventType")
+    actual_type = engine_event_type_for_data(data)
+    if actual_type is not event_type:
+        raise ValueError(
+            "EngineEvent.type/data mismatch: "
+            f"type={event_type.value} data_type={type(data).__name__}"
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class EngineEvent:
@@ -570,6 +631,16 @@ class EngineEvent:
     type: EngineEventType
     data: EngineEventData
     metadata: Mapping[str, JsonValue] | None
+
+    def __post_init__(self) -> None:
+        """校验 EngineEvent 公共判别契约。
+
+        :returns: ``None``。
+        :raises TypeError: ``type`` 或 ``data`` 类型非法时抛出。
+        :raises ValueError: ``type`` 与 ``data`` 不匹配时抛出。
+        """
+
+        validate_engine_event_pairing(self.type, self.data)
 
 
 TERMINAL_ENGINE_EVENT_TYPES: frozenset[EngineEventType] = frozenset(
@@ -625,7 +696,10 @@ __all__ = [
     "RunCancelledData",
     "RunFailedData",
     "EngineEventData",
+    "ENGINE_EVENT_TYPE_TO_DATA",
     "EngineEvent",
+    "engine_event_type_for_data",
+    "validate_engine_event_pairing",
     "TERMINAL_ENGINE_EVENT_TYPES",
     "runner_role_sequence_digest",
 ]

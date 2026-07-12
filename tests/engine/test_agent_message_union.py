@@ -8,6 +8,9 @@
 from __future__ import annotations
 
 import dataclasses
+from typing import Literal, cast
+
+import pytest
 
 from dayu.engine.contracts.messages import (
     AgentMessageRole,
@@ -75,3 +78,59 @@ def test_assistant_tool_call_field_set() -> None:
 
     fields = {f.name for f in dataclasses.fields(AssistantToolCall)}
     assert fields == {"id", "name", "arguments", "provider_state"}
+
+
+def test_each_message_rejects_wrong_enum_role() -> None:
+    """四种消息构造边界都拒绝其它合法枚举 role。"""
+
+    with pytest.raises(ValueError, match="SystemMessage.role"):
+        SystemMessage(
+            role=cast(Literal[AgentMessageRole.SYSTEM], AgentMessageRole.USER),
+            content="x",
+        )
+    with pytest.raises(ValueError, match="UserMessage.role"):
+        UserMessage(
+            role=cast(Literal[AgentMessageRole.USER], AgentMessageRole.SYSTEM),
+            content="x",
+        )
+    with pytest.raises(ValueError, match="AssistantMessage.role"):
+        AssistantMessage(
+            role=cast(Literal[AgentMessageRole.ASSISTANT], AgentMessageRole.TOOL),
+            content="x",
+            reasoning_content=None,
+            tool_calls=(),
+        )
+    with pytest.raises(ValueError, match="ToolMessage.role"):
+        ToolMessage(
+            role=cast(Literal[AgentMessageRole.TOOL], AgentMessageRole.ASSISTANT),
+            tool_call_id="id",
+            content="x",
+        )
+
+
+def test_each_message_rejects_raw_string_role() -> None:
+    """四种消息构造边界都拒绝与枚举同值的 raw string role。"""
+
+    with pytest.raises(TypeError, match="SystemMessage.role"):
+        SystemMessage(
+            role=cast(Literal[AgentMessageRole.SYSTEM], "system"),
+            content="x",
+        )
+    with pytest.raises(TypeError, match="UserMessage.role"):
+        UserMessage(
+            role=cast(Literal[AgentMessageRole.USER], "user"),
+            content="x",
+        )
+    with pytest.raises(TypeError, match="AssistantMessage.role"):
+        AssistantMessage(
+            role=cast(Literal[AgentMessageRole.ASSISTANT], "assistant"),
+            content="x",
+            reasoning_content=None,
+            tool_calls=(),
+        )
+    with pytest.raises(TypeError, match="ToolMessage.role"):
+        ToolMessage(
+            role=cast(Literal[AgentMessageRole.TOOL], "tool"),
+            tool_call_id="id",
+            content="x",
+        )

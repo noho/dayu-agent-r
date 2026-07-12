@@ -188,19 +188,16 @@ _ERROR_CONSECUTIVE_FAILED_TOOL_BATCHES: EngineRunErrorCode = (
 _ERROR_CONTINUATION_TOOL_CALL_NOT_ALLOWED: EngineRunErrorCode = (
     EngineRunErrorCode.CONTINUATION_TOOL_CALL_NOT_ALLOWED
 )
-_RUNNER_ERROR_WITHOUT_DETAIL_MESSAGE: str = (
-    "runner finished with error without detail"
-)
+_RUNNER_ERROR_WITHOUT_DETAIL_MESSAGE: str = "runner finished with error without detail"
 _CONTEXT_COMPACTION_REQUIRED_MESSAGE: str = (
     "provider context overflow requires Host compaction"
 )
-_CONTEXT_OVERFLOW_MARKER_FALLBACK_CODE: str = (
-    "context_overflow_message_marker_fallback"
-)
+_CONTEXT_OVERFLOW_MARKER_FALLBACK_CODE: str = "context_overflow_message_marker_fallback"
 _RUNNER_ABNORMAL_STOP_MESSAGE: str = "runner stopped without done event"
-_MAX_ITERATIONS_EXCEEDED_MESSAGE: str = (
-    "agent policy max_iterations must be at least 1"
+_RUNNER_DONE_INVALID_FINISH_REASON_MESSAGE: str = (
+    "runner done has invalid or missing finish reason"
 )
+_MAX_ITERATIONS_EXCEEDED_MESSAGE: str = "agent policy max_iterations must be at least 1"
 _TOOL_CALL_NOT_ENABLED_MESSAGE: str = (
     "runner produced tool calls while tools were disabled or unavailable"
 )
@@ -209,13 +206,9 @@ _TOOL_BATCH_OUTCOME_MISMATCH_MESSAGE: str = (
     "tool executor returned records that do not match input tool_call_ids"
 )
 _MISSING_TERMINAL_MESSAGE: str = "agent event stream ended without terminal"
-_FORCE_ANSWER_EMPTY_MESSAGE: str = (
-    "force-answer runner did not produce final content"
-)
+_FORCE_ANSWER_EMPTY_MESSAGE: str = "force-answer runner did not produce final content"
 _RUNNER_EMPTY_FINAL_CONTENT_MESSAGE: str = "runner did not produce final content"
-_MAX_ITERATIONS_EXHAUSTED_MESSAGE: str = (
-    "agent policy max_iterations exhausted"
-)
+_MAX_ITERATIONS_EXHAUSTED_MESSAGE: str = "agent policy max_iterations exhausted"
 _CONSECUTIVE_FAILED_TOOL_BATCHES_MESSAGE: str = (
     "consecutive failed tool batches threshold reached"
 )
@@ -228,8 +221,15 @@ _EXCEPTION_MESSAGE_MAX_LENGTH: int = 240
 _EXCEPTION_MESSAGE_TRUNCATED_SUFFIX: str = "... [truncated]"
 
 _PlainJsonValue: TypeAlias = (
-    None | bool | int | float | str | list["_PlainJsonValue"] | dict[str, "_PlainJsonValue"]
+    None
+    | bool
+    | int
+    | float
+    | str
+    | list["_PlainJsonValue"]
+    | dict[str, "_PlainJsonValue"]
 )
+
 
 def _utc_now() -> datetime:
     """返回当前 UTC 时间。
@@ -451,9 +451,7 @@ def _project_tool_success_for_llm(
 
     value = result.value
     if isinstance(value, Mapping):
-        projected = {
-            key: _plain_json_value(item) for key, item in value.items()
-        }
+        projected = {key: _plain_json_value(item) for key, item in value.items()}
     else:
         projected = {"content": _plain_json_value(value)}
     return projected
@@ -528,10 +526,9 @@ class _IterationState:
     :param reasoning_chunks: 已收到的推理链增量片段。
     :param completed_content: content completed 事件中的完整正文。
     :param completed_reasoning_content: content completed 事件中的完整推理链。
-    :param finish_reason: Runner done 提供的权威完成原因。
+    :param runner_done: Runner done 提供的单一 typed commit fact；未接受
+        RunnerDone 时为 ``None``。
     :param failure_candidate: 当前 Runner 调用产生的失败候选。
-    :param provider_request_id: 当前 Runner 调用最终采用的 provider request id。
-    :param done_seen: 是否已看到 Runner done。
     :param tool_call_signal_seen: 是否已看到工具调用信号。
     :param tool_calls: 已完成聚合的工具调用。
     :param tool_calls_content: 工具调用完成事件携带的正文。
@@ -543,14 +540,29 @@ class _IterationState:
     reasoning_chunks: list[str]
     completed_content: str | None
     completed_reasoning_content: str | None
-    finish_reason: FinishReason | None
+    runner_done: RunnerDoneData | None
     failure_candidate: RunFailedData | None
-    provider_request_id: str | None
-    done_seen: bool
     tool_call_signal_seen: bool
     tool_calls: tuple[ToolCallRequest, ...] | None
     tool_calls_content: str | None
     tool_calls_reasoning_content: str | None
+
+
+def _set_first_failure_candidate(
+    state: _IterationState, candidate: RunFailedData
+) -> bool:
+    """只在失败候选尚未建立时接受首个候选。
+
+    :param state: 当前 Runner iteration 消费状态。
+    :param candidate: 新观察到的失败候选。
+    :returns: 接受并写入候选时返回 ``True``；已有候选时返回 ``False``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if state.failure_candidate is not None:
+        return False
+    state.failure_candidate = candidate
+    return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -636,8 +648,7 @@ def _count_completed_tool_records(records: Sequence[_ToolOutcomeRecord]) -> int:
     """
 
     return sum(
-        1 for record in records
-        if isinstance(record.outcome, ToolCompletedOutcome)
+        1 for record in records if isinstance(record.outcome, ToolCompletedOutcome)
     )
 
 
@@ -649,10 +660,7 @@ def _count_failed_tool_records(records: Sequence[_ToolOutcomeRecord]) -> int:
     :raises Exception: 不主动抛出异常。
     """
 
-    return sum(
-        1 for record in records
-        if isinstance(record.outcome, ToolFailedOutcome)
-    )
+    return sum(1 for record in records if isinstance(record.outcome, ToolFailedOutcome))
 
 
 def _count_cancelled_tool_records(records: Sequence[_ToolOutcomeRecord]) -> int:
@@ -664,8 +672,7 @@ def _count_cancelled_tool_records(records: Sequence[_ToolOutcomeRecord]) -> int:
     """
 
     return sum(
-        1 for record in records
-        if isinstance(record.outcome, ToolCancelledOutcome)
+        1 for record in records if isinstance(record.outcome, ToolCancelledOutcome)
     )
 
 
@@ -839,9 +846,7 @@ class _AsyncAgent:
 
             for iteration_index in range(ordinary_iterations):
                 iteration_id = self._iteration_id(iteration_index)
-                effective_tools = (
-                    () if continuation_active else self._effective_tools()
-                )
+                effective_tools = () if continuation_active else self._effective_tools()
                 tool_calls_enabled = len(effective_tools) > 0
                 _LOGGER.log(
                     VERBOSE_LOG_LEVEL,
@@ -890,17 +895,16 @@ class _AsyncAgent:
                     return
                 # commit boundary：Runner 未完成时取消可抢占；Runner done 后
                 # 已接受的 final/tool/failure 候选不能被迟到取消改写。
-                if self._is_cancelled() and not state.done_seen:
+                if self._is_cancelled() and state.runner_done is None:
                     yield await self._make_cancelled_terminal_with_close()
                     return
 
                 if continuation_active:
-                    continuation_failure = self._continuation_tool_call_failure(
-                        state
-                    )
+                    continuation_failure = self._continuation_tool_call_failure(state)
                     if continuation_failure is not None:
-                        yield await self._make_failed_or_cancelled_terminal_with_close(
-                            continuation_failure
+                        yield await self._make_iteration_failure_terminal(
+                            state=state,
+                            failure=continuation_failure,
                         )
                         return
 
@@ -938,9 +942,7 @@ class _AsyncAgent:
                             continuation_active or bool(continuation_content_parts),
                             continuation_decision.degraded,
                         )
-                        yield await self._make_final_after_close(
-                            continuation_decision
-                        )
+                        yield await self._make_final_after_close(continuation_decision)
                         return
                     if continuation_decision is None:
                         _LOGGER.log(
@@ -959,8 +961,9 @@ class _AsyncAgent:
                         continue
                     assert_never(continuation_decision)
                 if isinstance(decision, RunFailedData):
-                    yield await self._make_failed_or_cancelled_terminal_with_close(
-                        decision
+                    yield await self._make_iteration_failure_terminal(
+                        state=state,
+                        failure=decision,
                     )
                     return
                 if not isinstance(decision, _ToolCallsDecision):
@@ -1052,9 +1055,7 @@ class _AsyncAgent:
                     async for event in self._fallback_after_tools(
                         messages=messages,
                         next_iteration_index=iteration_index + 1,
-                        trigger=_fallback_trigger(
-                            _ERROR_MAX_ITERATIONS_EXCEEDED
-                        ),
+                        trigger=_fallback_trigger(_ERROR_MAX_ITERATIONS_EXCEEDED),
                     ):
                         yield event
                     return
@@ -1097,9 +1098,7 @@ class _AsyncAgent:
             )
         if continuation_content_parts or continuation_active:
             return _FinalDecision(
-                content="".join(
-                    [*continuation_content_parts, decision.content]
-                ),
+                content="".join([*continuation_content_parts, decision.content]),
                 filtered=decision.filtered,
                 degraded=True,
                 finish_reason=decision.finish_reason,
@@ -1183,12 +1182,19 @@ class _AsyncAgent:
         if (
             state.tool_calls is not None
             or state.tool_call_signal_seen
-            or state.finish_reason is FinishReason.TOOL_CALLS
+            or (
+                state.runner_done is not None
+                and state.runner_done.finish_reason is FinishReason.TOOL_CALLS
+            )
         ):
             return RunFailedData(
                 error_code=_ERROR_CONTINUATION_TOOL_CALL_NOT_ALLOWED,
                 message=_CONTINUATION_TOOL_CALL_NOT_ALLOWED_MESSAGE,
-                provider_request_id=state.provider_request_id,
+                provider_request_id=(
+                    state.runner_done.provider_request_id
+                    if state.runner_done is not None
+                    else None
+                ),
                 client_correlation_id=_client_correlation_id_from_state(state),
                 recoverable=False,
             )
@@ -1241,21 +1247,20 @@ class _AsyncAgent:
             iteration_id=iteration_id,
             iteration_index=iteration_index,
         )
-        self._last_iteration_state = _IterationState(
+        state = _IterationState(
             request_identity=request_identity,
             content_chunks=[],
             reasoning_chunks=[],
             completed_content=None,
             completed_reasoning_content=None,
-            finish_reason=None,
+            runner_done=None,
             failure_candidate=None,
-            provider_request_id=None,
-            done_seen=False,
             tool_call_signal_seen=False,
             tool_calls=None,
             tool_calls_content=None,
             tool_calls_reasoning_content=None,
         )
+        self._last_iteration_state = state
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
             "engine.agent.runner_call_start session_id=%s run_id=%s "
@@ -1297,12 +1302,17 @@ class _AsyncAgent:
                 tools,
                 request_identity=request_identity,
             ):
+                if self._is_cancelled():
+                    yield await self._make_cancelled_terminal_with_close()
+                    return
                 engine_events = self._consume_runner_event(
                     runner_event=runner_event,
                     iteration_id=iteration_id,
                 )
                 for engine_event in engine_events:
                     yield engine_event
+                if state.runner_done is not None:
+                    break
                 if self._is_cancelled():
                     yield await self._make_cancelled_terminal_with_close()
                     return
@@ -1346,13 +1356,27 @@ class _AsyncAgent:
                     )
                 )
                 return
-            state.failure_candidate = RunFailedData(
-                error_code=_ERROR_RUNNER_EXCEPTION,
-                message=_exception_diagnostic_message(exc),
-                provider_request_id=None,
-                client_correlation_id=_client_correlation_id_from_state(state),
-                recoverable=False,
+            candidate_accepted = _set_first_failure_candidate(
+                state,
+                RunFailedData(
+                    error_code=_ERROR_RUNNER_EXCEPTION,
+                    message=_exception_diagnostic_message(exc),
+                    provider_request_id=None,
+                    client_correlation_id=_client_correlation_id_from_state(state),
+                    recoverable=False,
+                ),
             )
+            if (
+                not candidate_accepted
+                and state.failure_candidate is not None
+            ):
+                _LOGGER.warning(
+                    "engine.agent.runner_exception_preserved_first_failure "
+                    "run_id=%s iteration_id=%s first_error_code=%s",
+                    self._request.run_id,
+                    iteration_id,
+                    state.failure_candidate.error_code,
+                )
 
     def _consume_runner_event(
         self, *, runner_event: RunnerEvent, iteration_id: str
@@ -1376,9 +1400,7 @@ class _AsyncAgent:
             return (
                 self._make_event(
                     event_type=EngineEventType.CONTENT_DELTA,
-                    data=ContentDeltaData(
-                        iteration_id=iteration_id, delta=data.delta
-                    ),
+                    data=ContentDeltaData(iteration_id=iteration_id, delta=data.delta),
                     occurred_at=runner_event.occurred_at,
                 ),
             )
@@ -1479,12 +1501,15 @@ class _AsyncAgent:
                 data.error_code,
                 data.provider_request_id,
             )
-            state.failure_candidate = RunFailedData(
-                error_code=data.error_code,
-                message=data.message,
-                provider_request_id=data.provider_request_id,
-                client_correlation_id=_client_correlation_id_from_state(state),
-                recoverable=False,
+            _set_first_failure_candidate(
+                state,
+                RunFailedData(
+                    error_code=data.error_code,
+                    message=data.message,
+                    provider_request_id=data.provider_request_id,
+                    client_correlation_id=_client_correlation_id_from_state(state),
+                    recoverable=False,
+                ),
             )
             return (
                 self._make_event(
@@ -1496,9 +1521,7 @@ class _AsyncAgent:
                         provider_request_id=data.provider_request_id,
                         raw_payload=data.raw_payload,
                         partial_tool_calls=data.partial_tool_calls,
-                        client_correlation_id=_client_correlation_id_from_state(
-                            state
-                        ),
+                        client_correlation_id=_client_correlation_id_from_state(state),
                     ),
                     occurred_at=runner_event.occurred_at,
                 ),
@@ -1529,14 +1552,15 @@ class _AsyncAgent:
                     data.error_code.value,
                     _safe_log_message(data.message),
                 )
-                state.failure_candidate = RunFailedData(
-                    error_code=_ERROR_CONTEXT_COMPACTION_REQUIRED,
-                    message=_CONTEXT_COMPACTION_REQUIRED_MESSAGE,
-                    provider_request_id=data.provider_request_id,
-                    client_correlation_id=_client_correlation_id_from_state(
-                        state
+                _set_first_failure_candidate(
+                    state,
+                    RunFailedData(
+                        error_code=_ERROR_CONTEXT_COMPACTION_REQUIRED,
+                        message=_CONTEXT_COMPACTION_REQUIRED_MESSAGE,
+                        provider_request_id=data.provider_request_id,
+                        client_correlation_id=_client_correlation_id_from_state(state),
+                        recoverable=True,
                     ),
-                    recoverable=True,
                 )
                 return self._context_overflow_engine_events(
                     data=data,
@@ -1544,18 +1568,40 @@ class _AsyncAgent:
                     occurred_at=runner_event.occurred_at,
                     state=state,
                 )
-            state.failure_candidate = RunFailedData(
-                error_code=adapter_error_code(data.error_code.value),
-                message=data.message,
-                provider_request_id=data.provider_request_id,
-                client_correlation_id=_client_correlation_id_from_state(state),
-                recoverable=False,
+            _set_first_failure_candidate(
+                state,
+                RunFailedData(
+                    error_code=adapter_error_code(data.error_code.value),
+                    message=data.message,
+                    provider_request_id=data.provider_request_id,
+                    client_correlation_id=_client_correlation_id_from_state(state),
+                    recoverable=False,
+                ),
             )
             return ()
         if isinstance(data, RunnerDoneData):
-            state.done_seen = True
-            state.finish_reason = data.finish_reason
-            state.provider_request_id = data.provider_request_id
+            if not isinstance(data.finish_reason, FinishReason):
+                _LOGGER.error(
+                    "engine.agent.runner_done_invalid_finish_reason "
+                    "session_id=%s run_id=%s iteration_id=%s "
+                    "provider_request_id=%s",
+                    self._request.session_id,
+                    self._request.run_id,
+                    iteration_id,
+                    data.provider_request_id,
+                )
+                _set_first_failure_candidate(
+                    state,
+                    RunFailedData(
+                        error_code=_ERROR_RUNNER_ABNORMAL_STOP,
+                        message=_RUNNER_DONE_INVALID_FINISH_REASON_MESSAGE,
+                        provider_request_id=data.provider_request_id,
+                        client_correlation_id=_client_correlation_id_from_state(state),
+                        recoverable=False,
+                    ),
+                )
+                return ()
+            state.runner_done = data
             _LOGGER.debug(
                 "engine.agent.runner_event_classified session_id=%s "
                 "run_id=%s iteration_id=%s event_type=%s finish_reason=%s "
@@ -1574,9 +1620,7 @@ class _AsyncAgent:
                         iteration_id=iteration_id,
                         finish_reason=data.finish_reason,
                         provider_request_id=data.provider_request_id,
-                        client_correlation_id=_client_correlation_id_from_state(
-                            state
-                        ),
+                        client_correlation_id=_client_correlation_id_from_state(state),
                     ),
                     occurred_at=runner_event.occurred_at,
                 ),
@@ -1695,8 +1739,7 @@ class _AsyncAgent:
         ):
             return (compaction_event,)
         diagnostic_code = (
-            detection.diagnostic_code
-            or _CONTEXT_OVERFLOW_MARKER_FALLBACK_CODE
+            detection.diagnostic_code or _CONTEXT_OVERFLOW_MARKER_FALLBACK_CODE
         )
         message = detection.message or (
             "provider context overflow was detected by adapter-owned "
@@ -1709,9 +1752,7 @@ class _AsyncAgent:
                 message=message,
                 provider_request_id=data.provider_request_id,
                 raw_payload=detection.raw_payload,
-                diagnostic_source=(
-                    RunnerDiagnosticSource.CONTEXT_OVERFLOW_CLASSIFIER
-                ),
+                diagnostic_source=(RunnerDiagnosticSource.CONTEXT_OVERFLOW_CLASSIFIER),
             ),
             iteration_id=iteration_id,
             occurred_at=occurred_at,
@@ -1742,7 +1783,8 @@ class _AsyncAgent:
         :raises Exception: 不主动抛出异常。
         """
 
-        if not state.done_seen:
+        runner_done = state.runner_done
+        if runner_done is None:
             if state.failure_candidate is not None:
                 return state.failure_candidate
             return RunFailedData(
@@ -1753,12 +1795,12 @@ class _AsyncAgent:
                 recoverable=False,
             )
 
-        finish_reason = state.finish_reason or FinishReason.STOP
+        finish_reason = runner_done.finish_reason
         if finish_reason is FinishReason.ERROR:
             return state.failure_candidate or RunFailedData(
                 error_code=_ERROR_RUNNER_ERROR_DONE_WITHOUT_DETAIL,
                 message=_RUNNER_ERROR_WITHOUT_DETAIL_MESSAGE,
-                provider_request_id=state.provider_request_id,
+                provider_request_id=runner_done.provider_request_id,
                 client_correlation_id=_client_correlation_id_from_state(state),
                 recoverable=False,
             )
@@ -1768,30 +1810,24 @@ class _AsyncAgent:
                 return RunFailedData(
                     error_code=_ERROR_RUNNER_TOOL_CALLS_FINISH_REASON_MISMATCH,
                     message="runner completed tool calls with non-tool finish reason",
-                    provider_request_id=state.provider_request_id,
-                    client_correlation_id=_client_correlation_id_from_state(
-                        state
-                    ),
+                    provider_request_id=runner_done.provider_request_id,
+                    client_correlation_id=_client_correlation_id_from_state(state),
                     recoverable=False,
                 )
             if not tool_calls_enabled:
                 return RunFailedData(
                     error_code=_ERROR_TOOL_CALL_NOT_ENABLED,
                     message=_TOOL_CALL_NOT_ENABLED_MESSAGE,
-                    provider_request_id=state.provider_request_id,
-                    client_correlation_id=_client_correlation_id_from_state(
-                        state
-                    ),
+                    provider_request_id=runner_done.provider_request_id,
+                    client_correlation_id=_client_correlation_id_from_state(state),
                     recoverable=False,
                 )
             if len(state.tool_calls) == 0:
                 return RunFailedData(
                     error_code=_ERROR_RUNNER_TOOL_CALLS_MISSING,
                     message="runner done with empty tool calls",
-                    provider_request_id=state.provider_request_id,
-                    client_correlation_id=_client_correlation_id_from_state(
-                        state
-                    ),
+                    provider_request_id=runner_done.provider_request_id,
+                    client_correlation_id=_client_correlation_id_from_state(state),
                     recoverable=False,
                 )
             content = (
@@ -1802,18 +1838,14 @@ class _AsyncAgent:
             reasoning = (
                 state.tool_calls_reasoning_content
                 or state.completed_reasoning_content
-                or (
-                    "".join(state.reasoning_chunks)
-                    if state.reasoning_chunks
-                    else None
-                )
+                or ("".join(state.reasoning_chunks) if state.reasoning_chunks else None)
             )
             return _ToolCallsDecision(
                 iteration_id=iteration_id,
                 iteration_index=iteration_index,
                 content=content,
                 reasoning_content=reasoning,
-                provider_request_id=state.provider_request_id,
+                provider_request_id=runner_done.provider_request_id,
                 client_correlation_id=_client_correlation_id_from_state(state),
                 tool_calls=tuple(
                     sorted(
@@ -1827,7 +1859,7 @@ class _AsyncAgent:
             return RunFailedData(
                 error_code=_ERROR_RUNNER_TOOL_CALLS_MISSING,
                 message="runner requested tool calls without completed tool call data",
-                provider_request_id=state.provider_request_id,
+                provider_request_id=runner_done.provider_request_id,
                 client_correlation_id=_client_correlation_id_from_state(state),
                 recoverable=False,
             )
@@ -1839,7 +1871,7 @@ class _AsyncAgent:
             return RunFailedData(
                 error_code=_ERROR_RUNNER_EMPTY_FINAL_CONTENT,
                 message=_RUNNER_EMPTY_FINAL_CONTENT_MESSAGE,
-                provider_request_id=state.provider_request_id,
+                provider_request_id=runner_done.provider_request_id,
                 client_correlation_id=_client_correlation_id_from_state(state),
                 recoverable=False,
             )
@@ -1882,9 +1914,6 @@ class _AsyncAgent:
                 )
                 return
             seen_in_batch.add(call.tool_call_id)
-        if self._is_cancelled():
-            yield await self._make_cancelled_terminal_with_close()
-            return
         for call in decision.tool_calls:
             self._executed_tool_call_ids.add(call.tool_call_id)
 
@@ -1930,6 +1959,10 @@ class _AsyncAgent:
                 call.tool_call_id,
                 call.index_in_iteration,
             )
+
+        if self._is_cancelled():
+            yield await self._make_cancelled_terminal_with_close()
+            return
 
         batch_request = BatchToolExecutionRequest(
             calls=decision.tool_calls,
@@ -1982,18 +2015,14 @@ class _AsyncAgent:
         for call in decision.tool_calls:
             outcome = outcome_by_id[call.tool_call_id]
             if isinstance(outcome, ToolAwaitingOutcome):
-                awaiting_records.append(
-                    _ToolAwaitingRecord(call=call, outcome=outcome)
-                )
+                awaiting_records.append(_ToolAwaitingRecord(call=call, outcome=outcome))
                 continue
             if (
                 isinstance(outcome, ToolCompletedOutcome)
                 or isinstance(outcome, ToolFailedOutcome)
                 or isinstance(outcome, ToolCancelledOutcome)
             ):
-                accepted_records.append(
-                    _ToolOutcomeRecord(call=call, outcome=outcome)
-                )
+                accepted_records.append(_ToolOutcomeRecord(call=call, outcome=outcome))
                 continue
             assert_never(outcome)
 
@@ -2134,9 +2163,7 @@ class _AsyncAgent:
 
     async def _execute_batch(
         self, request: BatchToolExecutionRequest
-    ) -> (
-        WaitCompleted[BatchToolExecutionOutcome] | WaitCancelled | WaitTimedOut
-    ):
+    ) -> WaitCompleted[BatchToolExecutionOutcome] | WaitCancelled | WaitTimedOut:
         """执行批式工具握手并处理取消、握手超时与普通异常。
 
         :param request: 批式工具执行请求。
@@ -2193,8 +2220,7 @@ class _AsyncAgent:
                 len(request.calls),
             )
             records = tuple(
-                _failed_record_from_cancelled(call=call)
-                for call in request.calls
+                _failed_record_from_cancelled(call=call) for call in request.calls
             )
             return BatchToolExecutionOutcome(records=records)
 
@@ -2343,7 +2369,7 @@ class _AsyncAgent:
             return
         # commit boundary：force-answer Runner 已 done 后，final / failure
         # 候选先提交；取消只阻止下一轮尚未开始的工作。
-        if self._is_cancelled() and not state.done_seen:
+        if self._is_cancelled() and state.runner_done is None:
             yield await self._make_cancelled_terminal_with_close()
             return
         decision = self._classify_iteration(
@@ -2355,19 +2381,22 @@ class _AsyncAgent:
             reject_empty_final_content=False,
         )
         if isinstance(decision, _ToolCallsDecision):
-            yield await self._make_failed_or_cancelled_terminal_with_close(
-                RunFailedData(
+            yield await self._make_iteration_failure_terminal(
+                state=state,
+                failure=RunFailedData(
                     error_code=_ERROR_TOOL_CALL_NOT_ENABLED,
                     message=_fallback_failure_message(
                         trigger=trigger,
                         failure_message=_TOOL_CALL_NOT_ENABLED_MESSAGE,
                     ),
-                    provider_request_id=state.provider_request_id,
-                    client_correlation_id=_client_correlation_id_from_state(
-                        state
+                    provider_request_id=(
+                        state.runner_done.provider_request_id
+                        if state.runner_done is not None
+                        else None
                     ),
+                    client_correlation_id=_client_correlation_id_from_state(state),
                     recoverable=False,
-                )
+                ),
             )
             return
         if isinstance(decision, RunFailedData):
@@ -2382,34 +2411,32 @@ class _AsyncAgent:
                     recoverable=decision.recoverable,
                     client_correlation_id=decision.client_correlation_id,
                 )
-            yield await self._make_failed_or_cancelled_terminal_with_close(
-                decision
+            yield await self._make_iteration_failure_terminal(
+                state=state,
+                failure=decision,
             )
             return
         if isinstance(decision, _FinalDecision):
             if decision.content.strip() == "":
-                yield await self._make_failed_or_cancelled_terminal_with_close(
-                    RunFailedData(
+                yield await self._make_iteration_failure_terminal(
+                    state=state,
+                    failure=RunFailedData(
                         error_code=_ERROR_FORCE_ANSWER_EMPTY,
                         message=_fallback_failure_message(
                             trigger=trigger,
                             failure_message=_FORCE_ANSWER_EMPTY_MESSAGE,
                         ),
                         provider_request_id=None,
-                        client_correlation_id=_client_correlation_id_from_state(
-                            state
-                        ),
+                        client_correlation_id=_client_correlation_id_from_state(state),
                         recoverable=False,
-                    )
+                    ),
                 )
                 return
             yield await self._make_final_after_close(decision)
             return
         assert_never(decision)
 
-    async def _make_final_after_close(
-        self, decision: _FinalDecision
-    ) -> EngineEvent:
+    async def _make_final_after_close(self, decision: _FinalDecision) -> EngineEvent:
         """构造最终回答终态。
 
         :param decision: final answer 决策。
@@ -2440,6 +2467,27 @@ class _AsyncAgent:
         if self._is_cancelled():
             return await self._make_cancelled_terminal_with_close()
         return self._make_terminal_failed(failure)
+
+    async def _make_iteration_failure_terminal(
+        self,
+        *,
+        state: _IterationState,
+        failure: RunFailedData,
+    ) -> EngineEvent:
+        """按 RunnerDone commit 边界提交 iteration 失败。
+
+        RunnerDone 已接受时，失败事实已经提交，迟到取消不得覆盖；RunnerDone
+        尚未接受时，取消仍可在 pre-done 边界抢占。
+
+        :param state: 产出失败决策的 iteration 状态。
+        :param failure: iteration 分类得到的失败事实。
+        :returns: ``RUN_FAILED`` 或 pre-done ``RUN_CANCELLED`` terminal。
+        :raises Exception: 不主动抛出异常；Runner close 异常会被吞掉并记日志。
+        """
+
+        if state.runner_done is not None:
+            return self._make_terminal_failed(failure)
+        return await self._make_failed_or_cancelled_terminal_with_close(failure)
 
     async def _make_tool_timeout_terminal_with_close(
         self, *, client_correlation_id: str | None
@@ -2523,8 +2571,7 @@ class _AsyncAgent:
         if requested_at is None:
             requested_at = accepted_at
         reason = (
-            self._request.cancellation_token.cancel_reason()
-            or _DEFAULT_CANCEL_REASON
+            self._request.cancellation_token.cancel_reason() or _DEFAULT_CANCEL_REASON
         )
         await self._close_runner_once()
         return self._make_terminal_cancelled(
@@ -2592,12 +2639,7 @@ class _AsyncAgent:
         self,
         *,
         event_type: EngineEventType,
-        data: (
-            FinalAnswerData
-            | RunFailedData
-            | RunSuspendedData
-            | RunCancelledData
-        ),
+        data: FinalAnswerData | RunFailedData | RunSuspendedData | RunCancelledData,
     ) -> EngineEvent:
         """构造 terminal EngineEvent 并锁定终态。
 
@@ -2733,9 +2775,7 @@ class _AsyncAgent:
 
         if not records:
             return False
-        return all(
-            isinstance(record.outcome, ToolFailedOutcome) for record in records
-        )
+        return all(isinstance(record.outcome, ToolFailedOutcome) for record in records)
 
     def _is_terminal(self, event: EngineEvent) -> bool:
         """判断事件是否为 terminal。
@@ -2887,21 +2927,21 @@ class _AsyncAgent:
                 recoverable=False,
             )
         finish_reason = (
-            state.finish_reason.value
-            if state.finish_reason is not None
+            state.runner_done.finish_reason.value
+            if state.runner_done is not None
             else None
         )
         _LOGGER.log(
             VERBOSE_LOG_LEVEL,
             "engine.agent.runner_call_completed session_id=%s run_id=%s "
-            "iteration_id=%s iteration_index=%s done_seen=%s "
+            "iteration_id=%s iteration_index=%s runner_done=%s "
             "finish_reason=%s tool_call_signal_seen=%s tool_call_count=%s "
             "has_failure_candidate=%s",
             self._request.session_id,
             self._request.run_id,
             iteration_id,
             iteration_index,
-            state.done_seen,
+            state.runner_done is not None,
             finish_reason,
             state.tool_call_signal_seen,
             _tool_call_count(state.tool_calls),
@@ -2976,9 +3016,7 @@ async def run_agent_and_wait(request: AgentRunRequest) -> AgentRunResult:
             degraded=data.degraded,
             finish_reason=data.finish_reason,
         )
-    if terminal.type is EngineEventType.RUN_FAILED and isinstance(
-        data, RunFailedData
-    ):
+    if terminal.type is EngineEventType.RUN_FAILED and isinstance(data, RunFailedData):
         return EngineRunOutcomeFailed(
             session_id=terminal.session_id,
             run_id=terminal.run_id,

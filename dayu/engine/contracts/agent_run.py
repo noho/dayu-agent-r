@@ -24,7 +24,13 @@ from dayu.engine.contracts.error_codes import (
     validate_engine_error_code,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
-from dayu.engine.contracts.messages import AgentMessage
+from dayu.engine.contracts.messages import (
+    AgentMessage,
+    AssistantMessage,
+    SystemMessage,
+    ToolMessage,
+    UserMessage,
+)
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
 from dayu.engine.contracts.tool_records import (
     AcceptedToolExecutionRecord,
@@ -102,12 +108,25 @@ class AgentRunRequest:
         """校验 Agent run 请求的入口不变量。
 
         :returns: ``None``。
+        :raises TypeError: ``messages`` 含 AgentMessage 封闭联合之外的实例时
+            抛出。
         :raises ValueError: ``messages`` 为空，或 ``attempt_id`` /
             ``execution_id`` 未成对出现时抛出。
         """
 
         if len(self.messages) == 0:
             raise ValueError("AgentRunRequest.messages must be non-empty")
+        message_types = (
+            SystemMessage,
+            UserMessage,
+            AssistantMessage,
+            ToolMessage,
+        )
+        if any(not isinstance(message, message_types) for message in self.messages):
+            raise TypeError(
+                "AgentRunRequest.messages must contain only AgentMessage "
+                "union members"
+            )
         if (self.attempt_id is None) != (self.execution_id is None):
             raise ValueError(
                 "AgentRunRequest.attempt_id and execution_id must both be "

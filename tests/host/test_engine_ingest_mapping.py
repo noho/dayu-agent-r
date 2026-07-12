@@ -3534,35 +3534,33 @@ def test_late_rejection_uses_status_even_when_terminal_refs_are_missing(
 
 
 def test_unsupported_engine_event_shape_is_rejected(tmp_path: Path) -> None:
-    """EngineEvent type/data 不匹配时写 rejected diagnostic。"""
+    """EngineEvent owner 在 Host ingest 前拒绝 type/data mismatch。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
-        candidate = _candidate(
-            seeded,
-            worker_event_index=16,
-            data=FinalAnswerData(
-                content="wrong shape",
-                filtered=False,
-                degraded=False,
-                finish_reason=FinishReason.STOP,
-            ),
-            event_type=EngineEventType.RUN_FAILED,
-        )
-
-        result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
-        ).ingest(candidate)
-
-        assert result.status == EngineIngestStatus.REJECTED
-        assert _payload(result.events[0])["reason"] == "unsupported_engine_event_type"
-        assert result.stop_worker_stream is True
+        with pytest.raises(ValueError, match="type/data mismatch"):
+            _candidate(
+                seeded,
+                worker_event_index=16,
+                data=FinalAnswerData(
+                    content="wrong shape",
+                    filtered=False,
+                    degraded=False,
+                    finish_reason=FinishReason.STOP,
+                ),
+                event_type=EngineEventType.RUN_FAILED,
+            )
 
 
 @pytest.mark.parametrize(
-    ("worker_event_index", "data"),
+    ("worker_event_index", "data", "expected_error", "expected_message"),
     (
-        (17, cast(EngineEventData, None)),
+        (
+            17,
+            cast(EngineEventData, None),
+            TypeError,
+            "unsupported type",
+        ),
         (
             18,
             IterationStartedData(
@@ -3574,6 +3572,8 @@ def test_unsupported_engine_event_shape_is_rejected(tmp_path: Path) -> None:
                     RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
                 ),
             ),
+            ValueError,
+            "type/data mismatch",
         ),
     ),
 )
@@ -3581,27 +3581,20 @@ def test_transient_delta_event_rejects_missing_or_wrong_data(
     tmp_path: Path,
     worker_event_index: int,
     data: EngineEventData,
+    expected_error: type[TypeError] | type[ValueError],
+    expected_message: str,
 ) -> None:
-    """transient delta event 必须同时匹配 event type 与 data 类型。"""
+    """非法 transient delta 在构造 owner 处失败，不进入 Host repair。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
-        candidate = _candidate(
-            seeded,
-            worker_event_index=worker_event_index,
-            data=data,
-            event_type=EngineEventType.CONTENT_DELTA,
-        )
-
-        result = EngineEventIngestor(
-            transaction_runner=store.transaction_runner
-        ).ingest(candidate)
-
-        assert result.status == EngineIngestStatus.REJECTED
-        assert result.events[0].event_class == EventClass.DIAGNOSTIC
-        assert _payload(result.events[0])["reason"] == "unsupported_engine_event_type"
-        assert result.stop_worker_stream is True
-        assert _event_count(store.transaction_runner, "CONTENT_DELTA") == 0
+        with pytest.raises(expected_error, match=expected_message):
+            _candidate(
+                seeded,
+                worker_event_index=worker_event_index,
+                data=data,
+                event_type=EngineEventType.CONTENT_DELTA,
+            )
 
 
 def test_transient_delta_event_accepts_matching_type_without_row(

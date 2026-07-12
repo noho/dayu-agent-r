@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import cast
 
 import pytest
 
@@ -11,8 +12,16 @@ from dayu.contracts.tool_call import BatchToolExecutionRequest
 from dayu.contracts.tool_outcome import BatchToolExecutionOutcome
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.agent_run import AgentRunRequest
-from dayu.engine.contracts.messages import AgentMessageRole, UserMessage
-from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.messages import (
+    AgentMessage,
+    AgentMessageRole,
+    UserMessage,
+)
+from dayu.engine.contracts.runner_spec import (
+    ClientCorrelationPolicy,
+    RunnerCallOptions,
+    RunnerSpec,
+)
 
 
 class _Token(CancellationToken):
@@ -76,6 +85,13 @@ def test_agent_run_request_accepts_non_empty_messages() -> None:
     assert len(request.messages) == 1
 
 
+def test_agent_run_request_rejects_message_outside_closed_union() -> None:
+    """AgentRunRequest 拒绝静态 cast 注入的非 AgentMessage 实例。"""
+
+    with pytest.raises(TypeError, match="AgentMessage"):
+        _request(messages=(cast(AgentMessage, "not-agent-message"),))
+
+
 def test_agent_run_request_requires_attempt_execution_pair() -> None:
     """AgentRunRequest 的 attempt / execution identity 必须成对出现。"""
 
@@ -109,7 +125,7 @@ def test_agent_run_request_accepts_attempt_execution_pair() -> None:
 
 def _request(
     *,
-    messages: tuple[UserMessage, ...],
+    messages: tuple[AgentMessage, ...],
     attempt_id: str | None = None,
     execution_id: str | None = None,
 ) -> AgentRunRequest:
