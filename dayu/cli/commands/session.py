@@ -298,7 +298,10 @@ async def _run_session_resume(args: ParsedCliArgs) -> int:
         command_name=COMMAND_SESSION,
         scenario=CLI_INTERACTIVE_SCENARIO,
         ticker=interactive_ticker,
-        context_slot_values=build_interactive_context_slot_values(),
+        context_slot_values=build_interactive_context_slot_values(
+            ticker=interactive_ticker,
+            fmp_api_key=os.environ.get(FMP_API_KEY_ENV),
+        ),
         usage_error_factory=CliSessionUsageError,
     )
     async with open_host(prepared_interactive.runtime.host_assembly.options) as host:

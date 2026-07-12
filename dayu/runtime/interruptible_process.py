@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 import multiprocessing
 import multiprocessing.queues
 import os
@@ -19,6 +18,7 @@ from enum import Enum
 from typing import Final, Protocol, TypeAlias, cast
 
 from dayu.contracts.json_value import JsonValue
+from dayu.runtime.numeric import is_non_negative_finite_number
 
 _DEFAULT_PROCESS_POLL_INTERVAL_SECONDS = 0.02
 _DEFAULT_CLOSE_KILL_GRACE_SECONDS: Final[float] = 0.2
@@ -289,8 +289,10 @@ class InterruptibleProcessHandle:
 
         :param timeout_seconds: 等待秒数；``None`` 表示无限等待。
         :returns: 子进程等待结果。
+        :raises ValueError: timeout 为负数、NaN 或无穷时抛出。
         """
 
+        _validate_wait_timeout_seconds(timeout_seconds)
         self._require_started()
         started_at = time.monotonic()
         while True:
@@ -775,10 +777,22 @@ def _validate_grace_seconds(grace_seconds: float) -> None:
 
     if isinstance(grace_seconds, bool) or not isinstance(grace_seconds, int | float):
         raise TypeError("grace_seconds must be a finite number")
-    if not math.isfinite(grace_seconds):
-        raise ValueError("grace_seconds must be finite")
-    if grace_seconds < 0:
+    if not is_non_negative_finite_number(grace_seconds):
         raise ValueError("grace_seconds must be non-negative")
+
+
+def _validate_wait_timeout_seconds(timeout_seconds: float | None) -> None:
+    """校验 process wait timeout 秒数。
+
+    :param timeout_seconds: timeout 秒数；``None`` 表示无限等待。
+    :returns: ``None``。
+    :raises ValueError: timeout 为负数、NaN 或正负无穷时抛出。
+    """
+
+    if timeout_seconds is None:
+        return
+    if not is_non_negative_finite_number(timeout_seconds):
+        raise ValueError("timeout_seconds must be non-negative and finite")
 
 
 __all__ = [

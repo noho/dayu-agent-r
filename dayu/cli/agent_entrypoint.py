@@ -1,9 +1,8 @@
 """CLI Agent entrypoint 共享辅助能力。
 
-本模块只服务 ``dayu-cli prompt`` 与 ``dayu-cli interactive`` 这两个
-Agent entrypoint UI adapter。这里不承载 Service 语义，不调用 Host API，
-也不访问 Fins storage；只抽取两类命令在 CLI 层内完全相同的参数校验、
-路径解析、执行 override 映射和运行阶段 SIGINT 观察基础实现。
+本模块提供 CLI entrypoint 共用的参数校验、路径解析、执行 override 映射和
+运行阶段 SIGINT 观察基础实现。这里不承载 Service 语义，不调用 Host API，
+也不访问 Fins storage。
 """
 
 from __future__ import annotations
@@ -29,11 +28,11 @@ _TaskResult = TypeVar("_TaskResult")
 
 
 class CliSigintMonitor:
-    """CLI Agent Run 阶段的 SIGINT 观察器。
+    """CLI 异步 operation 运行阶段的 SIGINT 观察器。
 
     观察器只负责在当前 asyncio 事件循环安装和移除 ``SIGINT`` handler，
     并把用户中断转换为可等待的本地计数。具体收到第一次或第二次中断后
-    如何取消 Host Run，由调用方命令状态机决定。
+    如何取消 Host Run 或 direct operation，由调用方命令状态机决定。
     """
 
     count: int
@@ -229,32 +228,6 @@ def require_cli_text(
     return stripped
 
 
-def unsupported_execution_option_names(args: ParsedCliArgs) -> tuple[str, ...]:
-    """返回用户显式使用但当前 Agent entrypoint 不支持的旧执行选项名。
-
-    :param args: prompt 或 interactive 命令参数。
-    :returns: unsupported option 名称元组。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    names: list[str] = []
-    if args.web_provider is not None:
-        names.append("--web-provider")
-    if args.enable_tool_trace:
-        names.append("--enable-tool-trace")
-    if args.tool_trace_dir is not None:
-        names.append("--tool-trace-dir")
-    if args.max_duplicate_tool_calls is not None:
-        names.append("--max-duplicate-tool-calls")
-    if args.duplicate_tool_hint_prompt is not None:
-        names.append("--duplicate-tool-hint-prompt")
-    if args.doc_limits_json is not None:
-        names.append("--doc-limits-json")
-    if args.fins_limits_json is not None:
-        names.append("--fins-limits-json")
-    return tuple(names)
-
-
 def service_run_overrides_from_args(
     args: ParsedCliArgs,
     *,
@@ -309,5 +282,4 @@ __all__: tuple[str, ...] = (
     "resolve_explicit_config_dir",
     "resolve_workspace_root",
     "service_run_overrides_from_args",
-    "unsupported_execution_option_names",
 )

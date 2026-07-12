@@ -9,17 +9,17 @@ runtime，不读取 Fins storage，也不把 direct operation 伪装成 Host Run
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import shlex
-import signal
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from types import FrameType
 from typing import Final, cast
 
 import dayu.runtime.log as runtime_log
+from dayu.cli.agent_entrypoint import CliSigintMonitor
 from dayu.cli.arg_parsing import (
     COMMAND_DOWNLOAD,
     COMMAND_PROCESS,
@@ -42,6 +42,7 @@ from dayu.cli.output import (
     render_fins_direct_event,
     render_fins_direct_local_exit_after_cancel,
 )
+from dayu.contracts import JsonValue
 from dayu.fins.direct_events import (
     FinsDirectStreamProtocolError,
     FinsDirectStreamProtocolErrorKind,
@@ -69,22 +70,16 @@ from dayu.service.fins_direct import (
 
 _BASE_OPTION: Final[str] = "--base"
 _TICKER_OPTION: Final[str] = "--ticker"
-_INFER_OPTION: Final[str] = "--infer"
-_CI_OPTION: Final[str] = "--ci"
-_UNSUPPORTED_OPTION_TEMPLATE: Final[str] = "unsupported option {option}: {reason}"
-_UNSUPPORTED_INFER_REASON: Final[str] = "当前没有 approved Fins alias inference boundary"
-_UNSUPPORTED_CI_REASON: Final[str] = "当前没有 public CI snapshot contract"
-_MULTIPLE_MATERIAL_FORMS_MESSAGE: Final[str] = (
-    "当前 Fins upload_material request 只支持单个 --forms 值"
-)
+_UPLOAD_BATCH_SCHEMA_VERSION: Final[int] = 1
+_UPLOAD_BATCH_SCHEMA_VERSION_FIELD: Final[str] = "schema_version"
+_UPLOAD_BATCH_COMMANDS_FIELD: Final[str] = "commands"
+_MULTIPLE_MATERIAL_FORMS_MESSAGE: Final[str] = "当前 Fins upload_material request 只支持单个 --forms 值"
 _EMPTY_TICKER_MESSAGE: Final[str] = "--ticker must not be empty"
 _EMPTY_DOCUMENT_ID_MESSAGE: Final[str] = "--document-id must not contain empty item"
 _EMPTY_FORM_MESSAGE: Final[str] = "--forms must not contain empty item"
 _MISSING_UPLOAD_FILE_TEMPLATE: Final[str] = "upload file does not exist: {path}"
 _UPLOAD_PATH_NOT_FILE_TEMPLATE: Final[str] = "upload path is not a file: {path}"
-_UPLOAD_SUFFIX_NOT_ALLOWED_TEMPLATE: Final[str] = (
-    "upload file suffix is not allowed: {path}"
-)
+_UPLOAD_SUFFIX_NOT_ALLOWED_TEMPLATE: Final[str] = "upload file suffix is not allowed: {path}"
 _FINS_DIAGNOSTIC_TEXT_MAX_CHARS: Final[int] = 120
 _FINS_DIAGNOSTIC_DETAIL_MAX_ITEMS: Final[int] = 4
 _FINS_DIAGNOSTIC_TRUNCATED_SUFFIX: Final[str] = "..."
@@ -179,86 +174,8 @@ class _CliFinsCancellationToken:
         return self._requested_at
 
 
-class _FinsSigintMonitor:
-    """Fins direct operation 运行阶段的 SIGINT 观察器。"""
-
-    count: int
-    _event: asyncio.Event
-    _loop: asyncio.AbstractEventLoop | None
-    _installed: bool
-
-    def __init__(self) -> None:
-        """初始化 SIGINT monitor。
-
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        self.count = 0
-        self._event = asyncio.Event()
-        self._loop = None
-        self._installed = False
-
-    def install(self) -> None:
-        """在当前事件循环安装 SIGINT handler。
-
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常；不支持 signal handler 的平台保留
-            默认 KeyboardInterrupt 行为。
-        """
-
-        loop = asyncio.get_running_loop()
-        try:
-            loop.add_signal_handler(signal.SIGINT, self.notify)
-        except (NotImplementedError, RuntimeError):
-            self._installed = False
-            self._loop = None
-            return
-        self._installed = True
-        self._loop = loop
-
-    def close(self) -> None:
-        """移除当前 monitor 安装的 SIGINT handler。
-
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        if self._installed and self._loop is not None:
-            self._loop.remove_signal_handler(signal.SIGINT)
-        self._installed = False
-        self._loop = None
-
-    def notify(self, _signal_number: int | None = None, _frame: FrameType | None = None) -> None:
-        """记录一次 SIGINT。
-
-        :param _signal_number: ``signal.signal`` 风格 handler 兼容参数。
-        :param _frame: ``signal.signal`` 风格 handler 兼容参数。
-        :returns: ``None``。
-        :raises Exception: 不主动抛出异常。
-        """
-
-        self.count += 1
-        self._event.set()
-
-    async def wait_next(self, observed_count: int) -> int:
-        """等待下一次 SIGINT。
-
-        :param observed_count: 调用方已经观察到的 SIGINT 计数。
-        :returns: 新的 SIGINT 计数。
-        :raises asyncio.CancelledError: 等待任务被取消时透传。
-        """
-
-        while self.count <= observed_count:
-            await self._event.wait()
-            self._event.clear()
-        return self.count
-
-
 FinsDirectServiceFactory = Callable[[Path], FinsDirectCommandService]
-FINS_DIRECT_SERVICE_FACTORY: FinsDirectServiceFactory = (
-    FinsDirectCommandService.from_workspace_root
-)
+FINS_DIRECT_SERVICE_FACTORY: FinsDirectServiceFactory = FinsDirectCommandService.from_workspace_root
 
 
 def run_fins_direct_command(args: ParsedCliArgs) -> int:
@@ -309,7 +226,6 @@ async def _run_fins_direct_command_async(args: ParsedCliArgs) -> int:
     )
     if args.command_name == COMMAND_UPLOAD_FILINGS_FROM:
         return _run_upload_filings_from(args)
-    _raise_for_unsupported_flags(args)
     workspace_root = _resolve_workspace_root(args.workspace_root)
     service = FINS_DIRECT_SERVICE_FACTORY(workspace_root)
     cancellation_token = _CliFinsCancellationToken()
@@ -327,7 +243,7 @@ async def _run_fins_direct_command_async(args: ParsedCliArgs) -> int:
     terminal = await _wait_for_terminal_handling_sigint(
         events=stream,
         cancellation_token=cancellation_token,
-        sigint_monitor=_FinsSigintMonitor(),
+        sigint_monitor=CliSigintMonitor(),
         command_name=args.command_name,
         operation_kind=operation_kind,
     )
@@ -366,32 +282,36 @@ def _run_upload_filings_from(args: ParsedCliArgs) -> int:
             ),
         )
     )
-    script = _render_upload_batch_script(plan.entries)
+    serialized_plan = _render_upload_batch_plan(plan.entries)
     if args.output is None:
-        print(script, end="")
+        print(serialized_plan, end="")
         return EXIT_SUCCESS
     output_path = Path(args.output).expanduser().resolve(strict=False)
-    output_path.write_text(script, encoding="utf-8")
+    output_path.write_text(serialized_plan, encoding="utf-8")
     return EXIT_SUCCESS
 
 
-def _render_upload_batch_script(entries: tuple[UploadBatchPlanEntry, ...]) -> str:
-    """把结构化上传计划渲染为 ``dayu-cli`` 命令脚本。
+def _render_upload_batch_plan(entries: tuple[UploadBatchPlanEntry, ...]) -> str:
+    """把上传计划序列化为跨平台 JSON argv 公共契约。
 
     :param entries: Fins batch helper 返回的结构化计划条目。
-    :returns: shell 可执行的命令脚本文本。
+    :returns: 含 schema version 与 argv 数组的 JSON 文本。
     :raises Exception: 不主动抛出异常。
     """
 
-    lines = tuple(_render_upload_batch_command(entry) for entry in entries)
-    return "\n".join(lines) + "\n"
+    commands: list[JsonValue] = [list(_upload_batch_command_argv(entry)) for entry in entries]
+    payload: dict[str, JsonValue] = {
+        _UPLOAD_BATCH_SCHEMA_VERSION_FIELD: _UPLOAD_BATCH_SCHEMA_VERSION,
+        _UPLOAD_BATCH_COMMANDS_FIELD: commands,
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
 
 
-def _render_upload_batch_command(entry: UploadBatchPlanEntry) -> str:
-    """渲染单条上传命令。
+def _upload_batch_command_argv(entry: UploadBatchPlanEntry) -> tuple[str, ...]:
+    """构造单条上传命令的结构化 argv。
 
     :param entry: 结构化上传计划条目。
-    :returns: shell quoted 命令行。
+    :returns: 不经过 shell quoting 的 argv 元组。
     :raises Exception: 不主动抛出异常。
     """
 
@@ -411,7 +331,7 @@ def _render_upload_batch_command(entry: UploadBatchPlanEntry) -> str:
     parts.append("--files")
     parts.extend(str(path) for path in entry.files)
     _append_optional_entry_metadata(parts, entry)
-    return shlex.join(parts)
+    return tuple(parts)
 
 
 def _append_optional_entry_metadata(
@@ -685,7 +605,7 @@ async def _wait_for_terminal_handling_sigint(
     *,
     events: AsyncIterator[FinsEvent],
     cancellation_token: _CliFinsCancellationToken,
-    sigint_monitor: _FinsSigintMonitor,
+    sigint_monitor: CliSigintMonitor,
     command_name: str,
     operation_kind: FinsOperationKind,
 ) -> FinsResultSummary | _CliDirectLocalExit:
@@ -701,9 +621,7 @@ async def _wait_for_terminal_handling_sigint(
     """
 
     sigint_monitor.install()
-    event_task = asyncio.create_task(
-        _consume_fins_direct_events(events, operation_kind=operation_kind)
-    )
+    event_task = asyncio.create_task(_consume_fins_direct_events(events, operation_kind=operation_kind))
     observed_count = sigint_monitor.count
     sigint_task = asyncio.create_task(sigint_monitor.wait_next(observed_count))
     try:
@@ -907,10 +825,7 @@ def _append_result_details_diagnostic_parts(
     for detail in details:
         if len(rendered) >= _FINS_DIAGNOSTIC_DETAIL_MAX_ITEMS:
             break
-        rendered.append(
-            f"{_bounded_diagnostic_text(detail.label)}="
-            f"{_quoted_diagnostic_text(detail.value)}"
-        )
+        rendered.append(f"{_bounded_diagnostic_text(detail.label)}=" f"{_quoted_diagnostic_text(detail.value)}")
     if rendered:
         parts.append(f"details={','.join(rendered)}")
 
@@ -936,33 +851,10 @@ def _bounded_diagnostic_text(value: str) -> str:
 
     if len(value) <= _FINS_DIAGNOSTIC_TEXT_MAX_CHARS:
         return value
-    return value[
-        : _FINS_DIAGNOSTIC_TEXT_MAX_CHARS - len(_FINS_DIAGNOSTIC_TRUNCATED_SUFFIX)
-    ] + _FINS_DIAGNOSTIC_TRUNCATED_SUFFIX
-
-
-def _raise_for_unsupported_flags(args: ParsedCliArgs) -> None:
-    """对当前无 approved boundary 的旧 flag fail fast。
-
-    :param args: argparse 已解析的 Fins direct 命令参数。
-    :returns: ``None``。
-    :raises CliFinsUsageError: 发现 unsupported flag 时抛出。
-    """
-
-    if args.infer:
-        raise CliFinsUsageError(
-            _UNSUPPORTED_OPTION_TEMPLATE.format(
-                option=_INFER_OPTION,
-                reason=_UNSUPPORTED_INFER_REASON,
-            )
-        )
-    if args.ci:
-        raise CliFinsUsageError(
-            _UNSUPPORTED_OPTION_TEMPLATE.format(
-                option=_CI_OPTION,
-                reason=_UNSUPPORTED_CI_REASON,
-            )
-        )
+    return (
+        value[: _FINS_DIAGNOSTIC_TEXT_MAX_CHARS - len(_FINS_DIAGNOSTIC_TRUNCATED_SUFFIX)]
+        + _FINS_DIAGNOSTIC_TRUNCATED_SUFFIX
+    )
 
 
 def _resolve_workspace_root(raw_value: str) -> Path:
@@ -1010,17 +902,11 @@ def _validated_upload_files(raw_files: list[str] | None) -> tuple[Path, ...]:
     for raw_file in raw_files:
         path = Path(raw_file).expanduser().resolve(strict=False)
         if not path.exists():
-            raise CliFinsUsageError(
-                _MISSING_UPLOAD_FILE_TEMPLATE.format(path=path)
-            )
+            raise CliFinsUsageError(_MISSING_UPLOAD_FILE_TEMPLATE.format(path=path))
         if not path.is_file():
-            raise CliFinsUsageError(
-                _UPLOAD_PATH_NOT_FILE_TEMPLATE.format(path=path)
-            )
+            raise CliFinsUsageError(_UPLOAD_PATH_NOT_FILE_TEMPLATE.format(path=path))
         if path.suffix.lower() not in FINS_UPLOAD_FILE_SUFFIXES:
-            raise CliFinsUsageError(
-                _UPLOAD_SUFFIX_NOT_ALLOWED_TEMPLATE.format(path=path)
-            )
+            raise CliFinsUsageError(_UPLOAD_SUFFIX_NOT_ALLOWED_TEMPLATE.format(path=path))
         paths.append(path)
     return tuple(paths)
 

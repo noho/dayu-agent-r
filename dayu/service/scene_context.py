@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Final
@@ -16,6 +15,7 @@ from zoneinfo import ZoneInfo
 from dayu.contracts import JsonValue
 from dayu.fins.resolver import FmpCompanyInfoResolutionError, FmpCompanyInfoResolver
 from dayu.fins.ticker_normalization import normalize_ticker
+from dayu.runtime.numeric import is_positive_finite_number
 
 FMP_API_KEY_ENV: Final[str] = "FMP_API_KEY"
 """FMP API key 的环境变量名称。"""
@@ -130,7 +130,7 @@ def _resolve_company_name_for_subject(request: EntrypointContextSlotRequest) -> 
     api_key = _optional_stripped_text(request.fmp_api_key)
     if api_key is None:
         return None
-    if not math.isfinite(request.fmp_timeout_seconds) or request.fmp_timeout_seconds <= 0:
+    if not is_positive_finite_number(request.fmp_timeout_seconds):
         raise ValueError("fmp_timeout_seconds must be positive finite seconds")
     try:
         return FmpCompanyInfoResolver(

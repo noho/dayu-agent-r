@@ -8,7 +8,6 @@ Engine typed object，不导入 Host / Engine / Service / UI / Fins，也不表�
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -28,6 +27,7 @@ from dayu.runtime.config_loader import (
     RunnerOptionHintConfig,
     ToolTruncationPolicyConfig,
 )
+from dayu.runtime.numeric import is_positive_finite_number
 from dayu.runtime.scene_prepare import (
     SceneAgentPolicyOverride,
     SceneModelHints,
@@ -916,10 +916,9 @@ def _optional_positive_float_field(
     value = fields[field_name]
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise RuntimeAssemblyFieldError(f"{context}.{field_name} must be a number")
-    result = float(value)
-    if not math.isfinite(result) or result <= 0:
+    if not is_positive_finite_number(value):
         raise RuntimeAssemblyFieldError(f"{context}.{field_name} must be > 0")
-    return result
+    return float(value)
 
 
 def _validate_fallback_mode(value: str, *, context: str) -> None:
@@ -943,7 +942,7 @@ def _ttl_seconds_as_int(value: float) -> int:
     :raises RuntimeAssemblyFieldError: TTL 非有限正整数秒时抛出。
     """
 
-    if not math.isfinite(value) or value <= 0 or not value.is_integer():
+    if not is_positive_finite_number(value) or not value.is_integer():
         raise RuntimeAssemblyFieldError(
             "tool_truncation_policy.default_cursor_ttl_seconds "
             "must be positive integer seconds"

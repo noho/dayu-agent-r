@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import os
 import sys
 import tempfile
 from collections.abc import Callable, Sequence
@@ -166,12 +165,12 @@ def _open_default_log_file() -> TextIO | None:
     """
 
     try:
-        file_descriptor, log_file_path = tempfile.mkstemp(
+        return tempfile.TemporaryFile(
+            mode="w+",
+            encoding="utf-8",
             prefix=AUTO_LOG_FILE_PREFIX,
             suffix=AUTO_LOG_FILE_SUFFIX,
         )
-        os.close(file_descriptor)
-        return open(log_file_path, mode="a", encoding="utf-8")
     except OSError as exc:
         print(AUTO_LOG_FILE_OPEN_FAILED_TEMPLATE.format(error=exc), file=sys.stderr)
         return None

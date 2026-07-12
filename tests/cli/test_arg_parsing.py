@@ -53,7 +53,7 @@ COMMAND_HELP_EXPECTATIONS: dict[str, tuple[str, ...]] = {
         "--model-name",
         "--temperature",
     ),
-    "download": ("--ticker", "--forms", "--start", "--end", "--overwrite", "--infer"),
+    "download": ("--ticker", "--forms", "--start", "--end", "--overwrite"),
     "upload_filing": (
         "--ticker",
         "--action",
@@ -80,15 +80,16 @@ COMMAND_HELP_EXPECTATIONS: dict[str, tuple[str, ...]] = {
         "--recursive",
         "--material-forms",
     ),
-    "process": ("--ticker", "--document-id", "--overwrite", "--ci"),
-    "process_filing": ("--ticker", "--document-id", "--overwrite", "--ci"),
-    "process_material": ("--ticker", "--document-id", "--overwrite", "--ci"),
+    "process": ("--ticker", "--document-id", "--overwrite"),
+    "process_filing": ("--ticker", "--document-id", "--overwrite"),
+    "process_material": ("--ticker", "--document-id", "--overwrite"),
     "session": ("list", "resume", "purge"),
 }
 _TEST_LOGGER_NAME: str = "dayu.cli.test_arg_parsing"
 _FIRST_LOG_FILE_DIAGNOSTIC: str = "first run diagnostic"
 _SECOND_STDERR_DIAGNOSTIC: str = "second run diagnostic"
 _RESTORE_FAILURE_MESSAGE: str = "restore stderr failed"
+_ROOT_README_PATH: Path = Path(__file__).resolve().parents[2] / "README.md"
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,6 +299,32 @@ def test_interactive_new_session_flag_exits_with_usage_error() -> None:
         parse_cli_args(("interactive", "--new-session"))
 
     assert raised.value.code == EXIT_USAGE_ERROR
+
+
+def test_root_readme_matches_current_cli_public_contract() -> None:
+    """根用户手册不得重新承诺 parser 中已删除或未实现的行为。
+
+    :returns: ``None``。
+    :raises AssertionError: README 与当前 CLI command/输出契约漂移时抛出。
+    """
+
+    readme = _ROOT_README_PATH.read_text(encoding="utf-8")
+    for removed_contract in (
+        "`write`",
+        "--infer",
+        "--ci",
+        "--web-provider",
+        "--new-session",
+        "--doc-limits-json",
+        "--fins-limits-json",
+    ):
+        assert removed_contract not in readme
+    assert "`init` 是非交互式文件初始化命令" in readme
+    assert "进程结束时自动清理" in readme
+    assert '"schema_version": 1' in readme
+    assert '"commands"' in readme
+    assert "不生成 shell" in readme
+    assert "interactive --ticker" in readme
 
 
 def test_session_action_help_contains_fixed_parser_shape(
@@ -592,26 +619,46 @@ def test_main_configures_runtime_log_file_stream(
     )
 
 
-def test_open_default_log_file_creates_persistent_temp_file() -> None:
-    """默认日志文件必须创建为可回查的持久临时文件。
+def test_open_default_log_file_uses_auto_deleted_temporary_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """默认日志必须使用随进程关闭的临时流，不遗留不可发现文件。
 
+    :param monkeypatch: pytest monkeypatch 夹具。
     :returns: ``None``。
-    :raises AssertionError: 临时日志文件不可写或关闭后不存在时抛出。
+    :raises AssertionError: 未使用 auto-delete 临时流或流不可写时抛出。
     """
 
+    calls: list[tuple[str, str, str, str]] = []
+
+    def temporary_file(
+        *,
+        mode: str,
+        encoding: str,
+        prefix: str,
+        suffix: str,
+    ) -> TextIO:
+        """记录默认临时流工厂调用。
+
+        :param mode: 文件打开模式。
+        :param encoding: 文本编码。
+        :param prefix: 临时文件名前缀。
+        :param suffix: 临时文件名后缀。
+        :returns: 测试用内存文本流。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        calls.append((mode, encoding, prefix, suffix))
+        return io.StringIO()
+
+    monkeypatch.setattr(cli_main.tempfile, "TemporaryFile", temporary_file)
     stream = cli_main._open_default_log_file()
     assert stream is not None
-    log_path = Path(stream.name)
-    try:
-        stream.write("default diagnostic\n")
-        stream.close()
-        assert log_path.exists()
-        assert log_path.read_text(encoding="utf-8") == "default diagnostic\n"
-    finally:
-        if not stream.closed:
-            stream.close()
-        if log_path.exists():
-            log_path.unlink()
+    stream.write("default diagnostic\n")
+    stream.seek(0)
+    assert stream.read() == "default diagnostic\n"
+    stream.close()
+    assert calls == [("w+", "utf-8", "dayu-cli-", ".log")]
 
 
 def test_main_uses_separate_log_files_for_explicit_and_default_calls(

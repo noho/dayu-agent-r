@@ -108,6 +108,17 @@ def test_runtime_import_boundary_scan_covers_config_loader_module() -> None:
     assert "config_loader.py" in scanned_names
 
 
+def test_runtime_import_boundary_scan_covers_numeric_module() -> None:
+    """runtime import 边界扫描必须覆盖有限数值真源 ``numeric.py``。
+
+    :returns: ``None``。
+    :raises AssertionError: 新增 runtime module 未进入扫描时抛出。
+    """
+
+    scanned_names = {file_path.name for file_path in _iter_python_files()}
+    assert "numeric.py" in scanned_names
+
+
 def test_runtime_import_boundary_scan_covers_location_module() -> None:
     """runtime import 边界扫描必须覆盖 ``location.py``。"""
 

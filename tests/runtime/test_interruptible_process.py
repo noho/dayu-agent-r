@@ -942,3 +942,23 @@ async def test_interruptible_process_rejects_invalid_grace_seconds(
             await handle.close(kill_grace_seconds=value)
     finally:
         await handle.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "timeout_seconds",
+    (-0.1, float("nan"), float("inf"), float("-inf")),
+)
+async def test_interruptible_process_wait_rejects_invalid_timeout(
+    timeout_seconds: float,
+) -> None:
+    """process wait 必须在进入轮询前拒绝负数与非有限 timeout。
+
+    :param timeout_seconds: 非法 wait timeout。
+    :returns: ``None``。
+    :raises AssertionError: 非法 timeout 未被拒绝时抛出。
+    """
+
+    handle = InterruptibleProcessHandle(_ReturnTarget({"ok": True}))
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        await handle.wait(timeout_seconds=timeout_seconds)

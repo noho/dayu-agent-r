@@ -49,6 +49,7 @@ _DEFAULT_TIME_TOOL_NAME = "get_current_time"
 _DEFAULT_DOWNLOAD_TOOL_NAME = "start_fins_download"
 _DEFAULT_PREPROCESS_TOOL_NAME = "start_fins_preprocess"
 _EXCLUDED_UPLOAD_TOOL_NAME = "start_fins_upload"
+_INTERACTIVE_SUBJECT_TEXT = "# 当前分析对象\n你正在分析的是 AAPL。"
 _INTERACTIVE_CURRENT_TIME_TEXT = (
     "# 当前时间\n"
     "现在是 2026年7月7日 17:20（Asia/Shanghai，星期二）。\n"
@@ -266,10 +267,10 @@ async def test_interactive_runtime_uses_real_manifest_required_slots(
 
 
 @pytest.mark.asyncio
-async def test_interactive_runtime_requires_current_time_context_slot(
+async def test_interactive_runtime_requires_subject_and_current_time_context_slots(
     tmp_path: Path,
 ) -> None:
-    """真实 interactive scene 只要求当前时间，不要求入口身份类 context slot。"""
+    """真实 interactive scene 要求共享研究主体与当前时间 context slots。"""
 
     runtime = await prepare_entrypoint_runtime(
         EntrypointRuntimeRequest(
@@ -277,7 +278,10 @@ async def test_interactive_runtime_requires_current_time_context_slot(
             package_config_root=_PACKAGE_CONFIG_ROOT,
             explicit_config_dir=None,
             scene_id="interactive",
-            context_slot_values={"current_time": _INTERACTIVE_CURRENT_TIME_TEXT},
+            context_slot_values={
+                "fins_default_subject": _INTERACTIVE_SUBJECT_TEXT,
+                "current_time": _INTERACTIVE_CURRENT_TIME_TEXT,
+            },
             assembly_overrides=ServiceAssemblyOverrides(
                 model_id=_MODEL_ID,
                 runner_option_hint_id=_RUNNER_HINT_ID,
@@ -341,7 +345,10 @@ async def _prepare_interactive_runtime(
             package_config_root=_PACKAGE_CONFIG_ROOT,
             explicit_config_dir=None,
             scene_id="interactive",
-            context_slot_values={"current_time": _INTERACTIVE_CURRENT_TIME_TEXT},
+            context_slot_values={
+                "fins_default_subject": _INTERACTIVE_SUBJECT_TEXT,
+                "current_time": _INTERACTIVE_CURRENT_TIME_TEXT,
+            },
             assembly_overrides=ServiceAssemblyOverrides(
                 model_id=_MODEL_ID,
                 runner_option_hint_id=_RUNNER_HINT_ID,

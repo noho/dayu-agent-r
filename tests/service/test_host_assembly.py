@@ -358,7 +358,10 @@ def test_entrypoint_wait_poller_policy_enabled_for_selected_fins_awaiting_tools(
             scene_id="interactive",
             scene_manifest_root=locations.scene_manifest_root,
             prompt_asset_root=locations.prompt_asset_root,
-            context_slot_values={"current_time": _CURRENT_TIME_TEXT},
+            context_slot_values={
+                "fins_default_subject": "",
+                "current_time": _CURRENT_TIME_TEXT,
+            },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
     )

@@ -8,7 +8,6 @@ Host public API，不读取 Fins storage，也不把 raw config fragment 传入 
 
 from __future__ import annotations
 
-import math
 import pathlib
 import re
 from collections.abc import Mapping, Sequence
@@ -92,6 +91,7 @@ from dayu.runtime.config_loader import (
     ToolDiscoveryProviderConfig,
 )
 from dayu.runtime.location import RuntimeLocations
+from dayu.runtime.numeric import is_finite_number, is_positive_finite_number
 from dayu.runtime.scene_prepare import (
     PreparedSceneInputs,
     ScenePrepareRequest,
@@ -1729,7 +1729,7 @@ def _require_optional_finite_float(value: float | None, *, field_name: str) -> N
     :raises ValueError: 值不是有限数时抛出。
     """
 
-    if value is not None and not math.isfinite(value):
+    if value is not None and not is_finite_number(value):
         raise ValueError(f"{field_name} must be finite")
 
 
@@ -1744,7 +1744,7 @@ def _require_optional_positive_float(value: float | None, *, field_name: str) ->
 
     if value is None:
         return
-    if not math.isfinite(value) or value <= 0:
+    if not is_positive_finite_number(value):
         raise ValueError(f"{field_name} must be finite and > 0")
 
 

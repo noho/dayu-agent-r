@@ -103,6 +103,186 @@ def test_init_overwrite_replaces_existing_config_file(
     assert target.read_text(encoding="utf-8") != "user content"
 
 
+def test_init_overwrite_preserves_unmanaged_config_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """验证 whole-tree staging 不会误删非 init 管理的用户配置文件。
+
+    :param tmp_path: pytest 临时目录。
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: 用户文件被覆盖或删除时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    user_file = workspace_root / "config" / "user-extension.json"
+    _write_text(user_file, '{"owner":"user"}')
+
+    exit_code = cli_main.main(
+        ("init", "--base", str(workspace_root), "--overwrite")
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_SUCCESS
+    assert "initialized workspace config" in captured.out
+    assert user_file.read_text(encoding="utf-8") == '{"owner":"user"}'
+
+
+def test_init_copy_rejects_config_directory_symlink_without_writing_outside(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """验证普通 init 不会沿 ``workspace/config`` symlink 写出工作区。
+
+    :param tmp_path: pytest 临时目录。
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: init 未拒绝 symlink 或写入外部目录时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    outside_config = tmp_path / "outside-config"
+    workspace_root.mkdir()
+    outside_config.mkdir()
+    (workspace_root / "config").symlink_to(
+        outside_config,
+        target_is_directory=True,
+    )
+
+    exit_code = cli_main.main(("init", "--base", str(workspace_root)))
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_USAGE_ERROR
+    assert "write destination path must not contain a symlink" in captured.err
+    assert tuple(outside_config.iterdir()) == ()
+    assert (workspace_root / "config").is_symlink()
+
+
+def test_init_copy_rejects_nested_symlink_without_writing_outside(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """验证普通 init 拒绝现存 config tree 内的嵌套 symlink。
+
+    :param tmp_path: pytest 临时目录。
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: init 沿嵌套 symlink 写入外部目录时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    outside_prompts = tmp_path / "outside-prompts"
+    config_dir = workspace_root / "config"
+    config_dir.mkdir(parents=True)
+    outside_prompts.mkdir()
+    (config_dir / "prompts").symlink_to(
+        outside_prompts,
+        target_is_directory=True,
+    )
+
+    exit_code = cli_main.main(
+        ("init", "--base", str(workspace_root), "--overwrite")
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_USAGE_ERROR
+    assert "write destination path must not contain a symlink" in captured.err
+    assert tuple(outside_prompts.iterdir()) == ()
+    assert (config_dir / "prompts").is_symlink()
+
+
+def test_init_staged_install_failure_restores_existing_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证 staging 安装失败会恢复安装前的完整 config tree。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: 安装失败后旧配置未恢复或新配置泄漏时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    config_dir = workspace_root / "config"
+    staging_dir = workspace_root / ".dayu-init-stage-test"
+    _write_text(config_dir / "old.json", "old")
+    _write_text(staging_dir / "new.json", "new")
+    real_replace = init_command.os.replace
+
+    def fail_staging_install(source: Path, destination: Path) -> None:
+        """只在 staging tree 安装步骤模拟 rename 失败。
+
+        :param source: rename 源路径。
+        :param destination: rename 目标路径。
+        :returns: 非 staging 安装路径正常完成 rename。
+        :raises OSError: staging tree 安装步骤始终抛出。
+        """
+
+        if source == staging_dir and destination == config_dir:
+            raise OSError("simulated staged install failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(init_command.os, "replace", fail_staging_install)
+
+    with pytest.raises(OSError, match="simulated staged install failure"):
+        init_command._install_staged_config_tree(
+            workspace_root=workspace_root,
+            workspace_config_dir=config_dir,
+            staging_dir=staging_dir,
+        )
+
+    assert (config_dir / "old.json").read_text(encoding="utf-8") == "old"
+    assert not (config_dir / "new.json").exists()
+    assert (staging_dir / "new.json").read_text(encoding="utf-8") == "new"
+    assert not tuple(workspace_root.glob(".dayu-init-backup-*"))
+
+
+def test_init_staged_install_keyboard_interrupt_restores_existing_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证 staging 安装收到 SIGINT 时恢复旧 config tree。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: 中断安装后旧配置未恢复或新配置泄漏时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    config_dir = workspace_root / "config"
+    staging_dir = workspace_root / ".dayu-init-stage-test"
+    _write_text(config_dir / "old.json", "old")
+    _write_text(staging_dir / "new.json", "new")
+    real_replace = init_command.os.replace
+
+    def interrupt_staging_install(source: Path, destination: Path) -> None:
+        """只在 staging tree 安装步骤模拟用户中断。
+
+        :param source: rename 源路径。
+        :param destination: rename 目标路径。
+        :returns: 非 staging 安装路径正常完成 rename。
+        :raises KeyboardInterrupt: staging tree 安装步骤始终抛出。
+        """
+
+        if source == staging_dir and destination == config_dir:
+            raise KeyboardInterrupt
+        real_replace(source, destination)
+
+    monkeypatch.setattr(init_command.os, "replace", interrupt_staging_install)
+
+    with pytest.raises(KeyboardInterrupt):
+        init_command._install_staged_config_tree(
+            workspace_root=workspace_root,
+            workspace_config_dir=config_dir,
+            staging_dir=staging_dir,
+        )
+
+    assert (config_dir / "old.json").read_text(encoding="utf-8") == "old"
+    assert not (config_dir / "new.json").exists()
+    assert (staging_dir / "new.json").read_text(encoding="utf-8") == "new"
+    assert not tuple(workspace_root.glob(".dayu-init-backup-*"))
+
+
 def test_init_reset_only_deletes_hardcoded_whitelist(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -213,7 +393,7 @@ def test_init_reset_parent_symlink_containment_escape_fails_fast(
     captured = capsys.readouterr()
 
     assert exit_code == EXIT_USAGE_ERROR
-    assert "escapes workspace" in captured.err
+    assert "reset whitelist path must not contain a symlink" in captured.err
     assert (workspace_root / ".dayu").is_symlink()
     assert (outside_dayu / "host" / "old.txt").read_text(
         encoding="utf-8"
@@ -368,7 +548,11 @@ def test_init_sigint_maps_to_130(
         del source, destination
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(init_command, "_copy_file_atomic", raise_keyboard_interrupt)
+    monkeypatch.setattr(
+        init_command,
+        "_copy_asset_to_staging",
+        raise_keyboard_interrupt,
+    )
 
     exit_code = cli_main.main(("init", "--base", str(tmp_path / "workspace")))
     captured = capsys.readouterr()

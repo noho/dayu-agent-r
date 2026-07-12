@@ -67,7 +67,10 @@ _CANCEL_REASON: str = "user-stop"
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("interval", (0.0, -0.1))
+@pytest.mark.parametrize(
+    "interval",
+    (0.0, -0.1, float("nan"), float("inf"), float("-inf")),
+)
 async def test_await_or_cancel_rejects_non_positive_poll_interval(
     interval: float,
 ) -> None:
@@ -89,7 +92,10 @@ async def test_await_or_cancel_rejects_non_positive_poll_interval(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("interval", (0.0, -0.1))
+@pytest.mark.parametrize(
+    "interval",
+    (0.0, -0.1, float("nan"), float("inf"), float("-inf")),
+)
 async def test_wait_for_or_cancel_rejects_non_positive_poll_interval(
     interval: float,
 ) -> None:
@@ -112,7 +118,10 @@ async def test_wait_for_or_cancel_rejects_non_positive_poll_interval(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("interval", (0.0, -0.1))
+@pytest.mark.parametrize(
+    "interval",
+    (0.0, -0.1, float("nan"), float("inf"), float("-inf")),
+)
 async def test_await_or_cancel_or_timeout_rejects_non_positive_poll_interval(
     interval: float,
 ) -> None:
@@ -131,6 +140,70 @@ async def test_await_or_cancel_or_timeout_rejects_non_positive_poll_interval(
             token=token,
             timeout_seconds=_FAST_TIMEOUT_SECONDS,
             poll_interval_seconds=interval,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "timeout_seconds",
+    (-0.1, float("nan"), float("inf"), float("-inf")),
+)
+async def test_wait_for_or_cancel_rejects_invalid_timeout(
+    timeout_seconds: float,
+) -> None:
+    """non-owned task race 必须在调用 asyncio 前拒绝非法 timeout。
+
+    :param timeout_seconds: 负数或非有限 timeout。
+    :returns: ``None``。
+    :raises AssertionError: 非法 timeout 未按公共边界拒绝时抛出。
+    """
+
+    task = asyncio.create_task(asyncio.sleep(_SLOW_OPERATION_SECONDS))
+    try:
+        with pytest.raises(ValueError, match="timeout_seconds"):
+            await wait_for_or_cancel(
+                task,
+                token=_FakeToken(),
+                timeout_seconds=timeout_seconds,
+                poll_interval_seconds=_FAST_POLL,
+            )
+        assert not task.done()
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "timeout_seconds",
+    (-0.1, float("nan"), float("inf"), float("-inf")),
+)
+async def test_await_or_cancel_or_timeout_rejects_invalid_timeout(
+    timeout_seconds: float,
+) -> None:
+    """owned coroutine race 必须拒绝非法 timeout 并关闭 coroutine。
+
+    :param timeout_seconds: 负数或非有限 timeout。
+    :returns: ``None``。
+    :raises AssertionError: 非法 timeout 未被拒绝时抛出。
+    """
+
+    async def _target() -> None:
+        """构造由 helper 拥有的测试 coroutine。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        await asyncio.sleep(_SLOW_OPERATION_SECONDS)
+
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        await await_or_cancel_or_timeout(
+            _target(),
+            token=_FakeToken(),
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=_FAST_POLL,
         )
 
 

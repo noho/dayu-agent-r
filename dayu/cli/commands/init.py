@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import tempfile
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -29,26 +30,19 @@ from dayu.runtime.workspace_paths import WorkspacePaths, workspace_paths
 _BASE_OPTION: Final[str] = "--base"
 _PACKAGE_CONFIG_ROOT: Final[Path] = Path(__file__).resolve().parents[2] / "config"
 _PROMPTS_DIR_NAME: Final[str] = "prompts"
-_LEGACY_CONFIG_FILE_NAMES: Final[frozenset[str]] = frozenset(
-    {"llm_models.json", "run.json"}
-)
-_TEMP_FILE_PREFIX: Final[str] = ".dayu-init-"
-_RESET_CONTAINMENT_ERROR_TEMPLATE: Final[str] = (
-    "dayu-cli init: reset whitelist path escapes workspace: {path}"
-)
-_RESET_SYMLINK_ERROR_TEMPLATE: Final[str] = (
-    "dayu-cli init: reset whitelist path must not be a symlink: {path}"
-)
+_LEGACY_CONFIG_FILE_NAMES: Final[frozenset[str]] = frozenset({"llm_models.json", "run.json"})
+_STAGING_DIR_PREFIX: Final[str] = ".dayu-init-stage-"
+_BACKUP_DIR_PREFIX: Final[str] = ".dayu-init-backup-"
+_WRITE_DESTINATION_ROLE: Final[str] = "write destination"
+_RESET_DESTINATION_ROLE: Final[str] = "reset whitelist"
+_CONTAINMENT_ERROR_TEMPLATE: Final[str] = "dayu-cli init: {role} path escapes workspace: {path}"
+_SYMLINK_ERROR_TEMPLATE: Final[str] = "dayu-cli init: {role} path must not contain a symlink: {path}"
 _EXISTING_FILE_ERROR_TEMPLATE: Final[str] = (
     "dayu-cli init: target config file exists; pass --overwrite to replace it: {path}"
 )
 _COPY_FAILURE_TEMPLATE: Final[str] = "dayu-cli init: failed to copy config asset: {error}"
-_WORKSPACE_PATH_ERROR_TEMPLATE: Final[str] = (
-    "dayu-cli init: workspace path is invalid: {error}"
-)
-_SUCCESS_TEMPLATE: Final[str] = (
-    "dayu-cli init: initialized workspace config at {config_dir}"
-)
+_WORKSPACE_PATH_ERROR_TEMPLATE: Final[str] = "dayu-cli init: workspace path is invalid: {error}"
+_SUCCESS_TEMPLATE: Final[str] = "dayu-cli init: initialized workspace config at {config_dir}"
 _RESET_TEMPLATE: Final[str] = "dayu-cli init: reset {count} workspace path(s)"
 
 
@@ -89,6 +83,7 @@ def run_init_command(args: ParsedCliArgs) -> int:
             print(_RESET_TEMPLATE.format(count=removed_count))
         config_dir = paths.config_dir
         _copy_current_config_assets(
+            workspace_root=workspace_root,
             workspace_config_dir=config_dir,
             package_config_root=_PACKAGE_CONFIG_ROOT,
             overwrite=args.overwrite,
@@ -140,12 +135,14 @@ def _ensure_workspace_root(workspace_root: Path) -> None:
 
 def _copy_current_config_assets(
     *,
+    workspace_root: Path,
     workspace_config_dir: Path,
     package_config_root: Path,
     overwrite: bool,
 ) -> None:
     """复制当前 schema 配置文件与 prompt assets 到 workspace。
 
+    :param workspace_root: 已解析的 workspace root。
     :param workspace_config_dir: workspace root 下的 config 目标目录。
     :param package_config_root: 包内 dayu/config 根目录。
     :param overwrite: 是否允许覆盖已有目标文件。
@@ -158,10 +155,32 @@ def _copy_current_config_assets(
         workspace_config_dir=workspace_config_dir,
         package_config_root=package_config_root,
     )
+    _validate_config_write_destination(
+        workspace_root=workspace_root,
+        workspace_config_dir=workspace_config_dir,
+    )
     _raise_for_existing_assets(assets=assets, overwrite=overwrite)
-    workspace_config_dir.mkdir(parents=True, exist_ok=True)
-    for asset in assets:
-        _copy_file_atomic(source=asset.source, destination=asset.destination)
+    staging_dir = Path(tempfile.mkdtemp(prefix=_STAGING_DIR_PREFIX, dir=workspace_root))
+    try:
+        if workspace_config_dir.exists():
+            shutil.copytree(
+                workspace_config_dir,
+                staging_dir,
+                dirs_exist_ok=True,
+            )
+        for asset in assets:
+            relative_path = asset.destination.relative_to(workspace_config_dir)
+            _copy_asset_to_staging(
+                source=asset.source,
+                destination=staging_dir / relative_path,
+            )
+        _install_staged_config_tree(
+            workspace_root=workspace_root,
+            workspace_config_dir=workspace_config_dir,
+            staging_dir=staging_dir,
+        )
+    finally:
+        _delete_path_without_following_symlink(staging_dir)
 
 
 def _collect_current_config_assets(
@@ -220,18 +239,11 @@ def _raise_if_legacy_top_level_config_asset_selected(
     """
 
     for asset in assets:
-        if (
-            asset.destination.parent == workspace_config_dir
-            and asset.destination.name in _LEGACY_CONFIG_FILE_NAMES
-        ):
-            raise CliInitOperationError(
-                f"legacy config file must not be generated: {asset.destination.name}"
-            )
+        if asset.destination.parent == workspace_config_dir and asset.destination.name in _LEGACY_CONFIG_FILE_NAMES:
+            raise CliInitOperationError(f"legacy config file must not be generated: {asset.destination.name}")
 
 
-def _raise_for_existing_assets(
-    *, assets: tuple[_CopyAsset, ...], overwrite: bool
-) -> None:
+def _raise_for_existing_assets(*, assets: tuple[_CopyAsset, ...], overwrite: bool) -> None:
     """在复制前检查目标文件冲突。
 
     :param assets: 待复制文件列表。
@@ -242,35 +254,143 @@ def _raise_for_existing_assets(
 
     for asset in assets:
         if asset.destination.is_dir():
-            raise CliInitOperationError(
-                f"target path is a directory, expected file: {asset.destination}"
-            )
+            raise CliInitOperationError(f"target path is a directory, expected file: {asset.destination}")
         if asset.destination.exists() and not overwrite:
-            raise CliInitOperationError(
-                _EXISTING_FILE_ERROR_TEMPLATE.format(path=asset.destination)
-            )
+            raise CliInitOperationError(_EXISTING_FILE_ERROR_TEMPLATE.format(path=asset.destination))
 
 
-def _copy_file_atomic(*, source: Path, destination: Path) -> None:
-    """用临时文件和原子替换复制单个文件。
+def _validate_config_write_destination(*, workspace_root: Path, workspace_config_dir: Path) -> None:
+    """校验 init config 写入树没有 symlink 或 containment 逃逸。
 
-    :param source: 源文件路径。
-    :param destination: 目标文件路径。
+    :param workspace_root: 已解析的 workspace root。
+    :param workspace_config_dir: init config 目标目录。
     :returns: ``None``。
-    :raises OSError: 创建目录、复制或替换失败时抛出。
+    :raises CliInitUsageError: 目标逃逸、包含 symlink 或不是目录时抛出。
+    :raises OSError: 遍历已有目标树失败时抛出。
+    """
+
+    _validate_workspace_path(
+        workspace_root=workspace_root,
+        path=workspace_config_dir,
+        role=_WRITE_DESTINATION_ROLE,
+    )
+    if workspace_config_dir.exists() and not workspace_config_dir.is_dir():
+        raise CliInitUsageError(f"{workspace_config_dir} is not a config directory")
+    if not workspace_config_dir.exists():
+        return
+    for current_root, directory_names, file_names in os.walk(
+        workspace_config_dir,
+        followlinks=False,
+    ):
+        current_path = Path(current_root)
+        for entry_name in (*directory_names, *file_names):
+            candidate = current_path / entry_name
+            if candidate.is_symlink():
+                raise CliInitUsageError(
+                    _SYMLINK_ERROR_TEMPLATE.format(
+                        role=_WRITE_DESTINATION_ROLE,
+                        path=candidate,
+                    )
+                )
+
+
+def _copy_asset_to_staging(*, source: Path, destination: Path) -> None:
+    """把单个包内资产复制到私有 staging tree。
+
+    :param source: 包内源文件。
+    :param destination: 私有 staging tree 内目标文件。
+    :returns: ``None``。
+    :raises OSError: 目录创建或复制失败时抛出。
     """
 
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = destination.with_name(
-        f"{_TEMP_FILE_PREFIX}{uuid.uuid4().hex}-{destination.name}"
+    shutil.copy2(source, destination)
+
+
+def _install_staged_config_tree(
+    *,
+    workspace_root: Path,
+    workspace_config_dir: Path,
+    staging_dir: Path,
+) -> None:
+    """把完整 staging tree 安装为 workspace config。
+
+    已有 config 会先移动到同一 workspace 下的私有 backup。安装失败时恢复
+    backup，避免逐文件覆盖留下半更新配置；顶层 rename 不会跟随 config
+    symlink 写入其目标。
+
+    :param workspace_root: 已解析的 workspace root。
+    :param workspace_config_dir: 最终 config 目录。
+    :param staging_dir: 已完成复制的私有 staging 目录。
+    :returns: ``None``。
+    :raises CliInitUsageError: 安装前目标重新变成不安全路径时抛出。
+    :raises OSError: rename、回滚或 backup 清理失败时抛出。
+    :raises KeyboardInterrupt: 安装阶段被用户中断时，完成回滚后重新抛出。
+    """
+
+    _validate_config_write_destination(
+        workspace_root=workspace_root,
+        workspace_config_dir=workspace_config_dir,
     )
+    backup_dir = workspace_root / (f"{_BACKUP_DIR_PREFIX}{uuid.uuid4().hex}-{workspace_config_dir.name}")
+    existing_moved = False
     try:
-        shutil.copy2(source, temp_path)
-        os.replace(temp_path, destination)
-    except BaseException:
-        if temp_path.exists():
-            temp_path.unlink()
+        if workspace_config_dir.exists():
+            os.replace(workspace_config_dir, backup_dir)
+            existing_moved = True
+        os.replace(staging_dir, workspace_config_dir)
+    except (OSError, KeyboardInterrupt):
+        if existing_moved and not workspace_config_dir.exists():
+            os.replace(backup_dir, workspace_config_dir)
         raise
+    if existing_moved:
+        _delete_path_without_following_symlink(backup_dir)
+
+
+def _validate_workspace_path(*, workspace_root: Path, path: Path, role: str) -> None:
+    """校验 workspace 内路径的 lexical/resolved containment 与祖先 symlink。
+
+    :param workspace_root: 已解析的 workspace root。
+    :param path: 待校验路径。
+    :param role: 错误信息中的路径职责名称。
+    :returns: ``None``。
+    :raises CliInitUsageError: 路径逃逸或任一现存祖先为 symlink 时抛出。
+    """
+
+    resolved_workspace = workspace_root.resolve(strict=True)
+    try:
+        relative_path = path.relative_to(workspace_root)
+    except ValueError as exc:
+        raise CliInitUsageError(_CONTAINMENT_ERROR_TEMPLATE.format(role=role, path=path)) from exc
+    current_path = workspace_root
+    for component in relative_path.parts:
+        current_path /= component
+        if current_path.is_symlink():
+            raise CliInitUsageError(_SYMLINK_ERROR_TEMPLATE.format(role=role, path=current_path))
+    resolved_path = path.resolve(strict=False)
+    try:
+        resolved_path.relative_to(resolved_workspace)
+    except ValueError as exc:
+        raise CliInitUsageError(_CONTAINMENT_ERROR_TEMPLATE.format(role=role, path=path)) from exc
+
+
+def _delete_path_without_following_symlink(path: Path) -> None:
+    """删除私有 staging/backup 路径且绝不跟随最终 symlink。
+
+    :param path: 待删除的私有路径。
+    :returns: ``None``。
+    :raises OSError: unlink 或递归删除失败时抛出。
+    """
+
+    if path.is_symlink():
+        path.unlink()
+        return
+    if not path.exists():
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+        return
+    path.unlink()
 
 
 def _reset_workspace_paths(*, paths: WorkspacePaths) -> int:
@@ -289,9 +409,9 @@ def _reset_workspace_paths(*, paths: WorkspacePaths) -> int:
     )
     removed_count = 0
     for path in reset_paths:
-        if not path.exists():
+        if not path.exists() and not path.is_symlink():
             continue
-        _delete_reset_path(path)
+        _delete_reset_path(workspace_root=paths.workspace_root, path=path)
         removed_count += 1
     return removed_count
 
@@ -312,9 +432,7 @@ def _reset_whitelist_paths(paths: WorkspacePaths) -> tuple[Path, ...]:
     )
 
 
-def _validate_reset_whitelist_paths(
-    *, workspace_root: Path, reset_paths: tuple[Path, ...]
-) -> None:
+def _validate_reset_whitelist_paths(*, workspace_root: Path, reset_paths: tuple[Path, ...]) -> None:
     """预检 reset 白名单路径的 symlink 与 containment。
 
     :param workspace_root: 已解析的 workspace root。
@@ -323,33 +441,30 @@ def _validate_reset_whitelist_paths(
     :raises CliInitUsageError: 任何白名单路径不安全时抛出。
     """
 
-    resolved_workspace = workspace_root.resolve(strict=False)
     for path in reset_paths:
-        if path.is_symlink():
-            raise CliInitUsageError(
-                _RESET_SYMLINK_ERROR_TEMPLATE.format(path=path)
-            )
-        resolved_path = path.resolve(strict=False)
-        try:
-            resolved_path.relative_to(resolved_workspace)
-        except ValueError as exc:
-            raise CliInitUsageError(
-                _RESET_CONTAINMENT_ERROR_TEMPLATE.format(path=path)
-            ) from exc
+        _validate_workspace_path(
+            workspace_root=workspace_root,
+            path=path,
+            role=_RESET_DESTINATION_ROLE,
+        )
 
 
-def _delete_reset_path(path: Path) -> None:
+def _delete_reset_path(*, workspace_root: Path, path: Path) -> None:
     """删除已通过预检的 reset 白名单路径。
 
+    :param workspace_root: 已解析的 workspace root。
     :param path: 待删除路径。
     :returns: ``None``。
+    :raises CliInitUsageError: 删除前路径重新变得不安全时抛出。
     :raises OSError: 删除失败时抛出。
     """
 
-    if path.is_dir():
-        shutil.rmtree(path)
-    else:
-        path.unlink()
+    _validate_workspace_path(
+        workspace_root=workspace_root,
+        path=path,
+        role=_RESET_DESTINATION_ROLE,
+    )
+    _delete_path_without_following_symlink(path)
 
 
 __all__: tuple[str, ...] = ("run_init_command",)

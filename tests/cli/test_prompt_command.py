@@ -20,7 +20,6 @@ import dayu.service.scene_context as scene_context
 from dayu.cli.agent_entrypoint import (
     CliSigintMonitor,
     package_config_root,
-    unsupported_execution_option_names,
 )
 from dayu.cli.arg_parsing import parse_cli_args
 from dayu.cli.exit_codes import (
@@ -1856,26 +1855,26 @@ async def test_prompt_cancel_terminal_wins_over_second_sigint(
         (("--doc-limits-json", "{}"), "--doc-limits-json"),
     ),
 )
-def test_prompt_command_rejects_unsupported_old_execution_flags(
+def test_prompt_command_rejects_removed_execution_flags_as_unknown(
     unsupported_args: tuple[str, ...],
     expected_fragment: str,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """旧执行参数缺少 typed public contract 时应 fail fast。"""
+    """没有 public contract 的旧执行参数必须从 parser surface 删除。"""
 
     exit_code = cli_main.main(("prompt", *unsupported_args, "请总结收入变化"))
     captured = capsys.readouterr()
 
     assert exit_code == EXIT_USAGE_ERROR
-    assert "unsupported option" in captured.err
+    assert "unrecognized arguments" in captured.err
     assert expected_fragment in captured.err
 
 
-def test_prompt_thinking_flags_are_display_options_not_execution_overrides() -> None:
-    """``--thinking`` / ``--no-thinking`` 不进入旧执行参数拒绝集合。
+def test_prompt_thinking_flags_are_display_options() -> None:
+    """``--thinking`` / ``--no-thinking`` 保持为明确的展示选项。
 
     :returns: ``None``。
-    :raises AssertionError: thinking 展示参数被错误列为 unsupported 时抛出。
+    :raises AssertionError: thinking 展示参数未被正确解析时抛出。
     """
 
     thinking_args = parse_cli_args(("prompt", "hello", "--thinking"))
@@ -1883,20 +1882,18 @@ def test_prompt_thinking_flags_are_display_options_not_execution_overrides() -> 
 
     assert thinking_args.thinking is True
     assert no_thinking_args.thinking is False
-    assert "--thinking/--no-thinking" not in unsupported_execution_option_names(thinking_args)
-    assert "--thinking/--no-thinking" not in unsupported_execution_option_names(no_thinking_args)
 
 
-def test_prompt_debug_stream_is_not_unsupported_execution_option() -> None:
-    """debug-stream 是全局日志开关，不是旧 Agent 执行参数。
+def test_prompt_debug_stream_is_global_log_option() -> None:
+    """``--debug-stream`` 保持为全局日志开关。
 
     :returns: ``None``。
-    :raises AssertionError: debug-stream 被错误列为 unsupported option 时抛出。
+    :raises AssertionError: debug-stream 未被正确解析时抛出。
     """
 
     args = parse_cli_args(("prompt", "--debug-stream", "请总结收入变化"))
 
-    assert "--debug-stream" not in unsupported_execution_option_names(args)
+    assert args.debug_stream is True
 
 
 @pytest.mark.parametrize("removed_args", _REMOVED_PROMPT_DEBUG_OPTIONS)
@@ -1920,10 +1917,10 @@ def test_prompt_removed_debug_options_are_argparse_unknown(
     assert removed_args[0] in captured.err
 
 
-def test_prompt_command_reports_all_unsupported_old_execution_flags(
+def test_prompt_command_rejects_all_removed_execution_flags_as_unknown(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """unsupported 旧参数应统一列入清晰错误。"""
+    """所有已删除旧参数都应由 argparse 清晰拒绝。"""
 
     exit_code = cli_main.main(
         (
@@ -1942,6 +1939,7 @@ def test_prompt_command_reports_all_unsupported_old_execution_flags(
     captured = capsys.readouterr()
 
     assert exit_code == EXIT_USAGE_ERROR
+    assert "unrecognized arguments" in captured.err
     for expected in (
         "--tool-trace-dir",
         "--max-duplicate-tool-calls",

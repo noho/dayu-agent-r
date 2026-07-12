@@ -25,6 +25,17 @@ MODULE_HELP_TARGETS: tuple[tuple[str, str], ...] = (
 )
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PYPROJECT_PATH = REPO_ROOT / "pyproject.toml"
+CONSTRAINTS_ROOT = REPO_ROOT / "constraints"
+PYTHON_311_CONSTRAINT_NAMES: tuple[str, ...] = (
+    "min-py311.txt",
+    "lock-linux-x64-py311.txt",
+    "lock-macos-arm64-py311.txt",
+    "lock-macos-x64-py311.txt",
+    "lock-windows-x64-py311.txt",
+)
+TRANSFORMERS_RUNTIME_CONSTRAINT = "transformers>=4.57.6,<5.0.0"
+TRANSFORMERS_LOCK = "transformers==4.57.6"
+HUGGINGFACE_HUB_LOCK = "huggingface_hub==0.36.2"
 EXIT_SUCCESS: int = 0
 EXIT_UNAVAILABLE: int = 1
 
@@ -49,6 +60,22 @@ def _load_project_scripts() -> dict[str, str]:
         assert isinstance(target, str)
         scripts[script_name] = target
     return scripts
+
+
+def _load_project_dependencies() -> tuple[str, ...]:
+    """读取 ``pyproject.toml`` 的运行依赖声明。
+
+    :returns: 项目运行依赖字符串元组。
+    :raises AssertionError: project dependencies 缺失或包含非字符串时抛出。
+    """
+
+    pyproject_data = tomllib.loads(PYPROJECT_PATH.read_text(encoding="utf-8"))
+    project_section = pyproject_data["project"]
+    assert isinstance(project_section, dict)
+    dependencies = project_section["dependencies"]
+    assert isinstance(dependencies, list)
+    assert all(isinstance(dependency, str) for dependency in dependencies)
+    return tuple(cast(list[str], dependencies))
 
 
 def _load_script_target(script_name: str) -> tuple[ModuleType, str, EntrypointMain]:
@@ -124,6 +151,22 @@ def test_public_entrypoint_import_does_not_load_optional_heavy_dependencies() ->
     after_import = optional_modules.intersection(sys.modules)
 
     assert after_import == before_import
+
+
+def test_docling_transformers_runtime_contract_is_consistent_for_python_311() -> None:
+    """Docling 模型栈必须在 package metadata 与所有 3.11 锁文件中同源。
+
+    :returns: ``None``。
+    :raises AssertionError: metadata 允许 transformers 5.x 或任一锁文件漂移时抛出。
+    """
+
+    assert TRANSFORMERS_RUNTIME_CONSTRAINT in _load_project_dependencies()
+    for constraint_name in PYTHON_311_CONSTRAINT_NAMES:
+        constraint_text = (CONSTRAINTS_ROOT / constraint_name).read_text(encoding="utf-8")
+        assert TRANSFORMERS_LOCK in constraint_text, constraint_name
+        assert HUGGINGFACE_HUB_LOCK in constraint_text, constraint_name
+        assert "transformers==5." not in constraint_text, constraint_name
+        assert "huggingface_hub==1." not in constraint_text, constraint_name
 
 
 def test_non_help_execution_returns_controlled_diagnostics(

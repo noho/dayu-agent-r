@@ -1,8 +1,7 @@
 """``dayu.contracts`` 包根导出白名单测试。
 
-按 ``docs/engine/phase0-plan.md`` §1.1 锁定的层间共享契约符号集合，
-断言 :data:`dayu.contracts.__all__` 严格等于该集合，并明确禁止取消
-异常名（如 ``CancelledError``）出现在导出与属性访问中。
+断言 :data:`dayu.contracts.__all__` 严格等于当前层间共享契约集合，并明确
+禁止取消异常名（如 ``CancelledError``）出现在导出与属性访问中。
 """
 
 from __future__ import annotations
@@ -12,6 +11,8 @@ import dayu.contracts as contracts
 EXPECTED_EXPORTS: frozenset[str] = frozenset(
     {
         "ALLOWED_TOOL_CANCELLED_REASONS",
+        "AGENT_FALLBACK_MODES",
+        "AgentFallbackMode",
         "AsyncDirectToolExecutionCapability",
         "BatchToolExecutionContext",
         "BatchToolExecutionOutcome",

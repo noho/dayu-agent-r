@@ -10,7 +10,6 @@ checkpoint 语义。
 from __future__ import annotations
 
 import json
-import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -25,6 +24,7 @@ from dayu.contracts import (
     ToolBundle,
 )
 from dayu.runtime._digest import canonical_json_digest, text_digest
+from dayu.runtime.numeric import is_positive_finite_number
 
 _SCHEMA_VERSION: Final[int] = 1
 _SCENE_FILE_SUFFIX: Final[str] = ".json"
@@ -1761,10 +1761,9 @@ def _optional_positive_float_field(record: JsonObject, *, field_name: str, conte
     value = record[field_name]
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ScenePrepareError(f"{context}.{field_name} must be number")
-    numeric_value = float(value)
-    if not math.isfinite(numeric_value) or numeric_value <= 0:
+    if not is_positive_finite_number(value):
         raise ScenePrepareError(f"{context}.{field_name} must be finite and > 0")
-    return numeric_value
+    return float(value)
 
 
 def _parse_text_tuple(record: JsonObject, *, field_name: str, context: str) -> tuple[str, ...]:

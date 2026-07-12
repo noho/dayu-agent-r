@@ -13,7 +13,8 @@ Dayu runtime assembly 配置分两层：
 资产复制到 `<workspace>/config/`。该命令只生成当前 schema 所需的 `models.json`、
 `execution_profiles.json`、`host_runtime.json`、`runtime_lanes.json`、`tool_discovery.json`
 和 prompts 资产；不会生成旧 `llm_models.json` / `run.json`，也不会写入明文 API key。
-目标配置文件已存在时默认失败，传 `--overwrite` 才会替换。
+目标配置文件已存在时默认失败，传 `--overwrite` 才会替换。`init` 在复制前会校验
+`<workspace>/config` 及其已有子树不包含 symlink，避免沿链接把配置写出工作区。
 
 `dayu.runtime.location.resolve_runtime_locations` 负责把 workspace root 解析为 runtime assembly 位置：`<workspace>/config` 存在时输出 `config_overlay_dir`，不存在时输出 `None`；prompt assets 与 scene manifests 优先使用 workspace 中已存在的对应目录，否则使用包内默认资产。`ConfigLoader` 只接收调用方显式传入的配置目录，不猜测 workspace 路径。
 
@@ -23,9 +24,15 @@ Dayu runtime assembly 配置分两层：
 
 - 顶层 map 按稳定 id 合并。
 - workspace 中与包内同 id 的记录会整条替换包内记录。
+- 顶层非 map 字段也由 workspace 值整体替换；即使该值是 object，也不会做字段级合并。
+  因此 workspace 必须提供该字段的完整当前 schema，缺字段会在 typed 校验阶段直接失败。
 - 不做隐式 deep merge；复用配置只能用显式 `extends`。
 - `extends` 只允许单继承；循环、自引用、多父项、父项缺失、缺字段和非法类型都会加载失败。
 - catalog record id 只来自顶层 map key；record 内不得重复写 `model_id`、`provider_id`、`runtime_id`、`host_runtime_id`、`profile_id` 或 `execution_profile_id`。
+
+所有配置文件使用严格 JSON 数值边界：`NaN`、`Infinity`、`-Infinity` 以及解析后
+溢出为无穷的数字都会在文件读取时失败；timeout、backoff、TTL、heartbeat 等数值字段
+还会按各自 schema 校验正数或非负数。不要依赖 Python `json` 的非标准常量扩展。
 
 ## 当前文件
 
@@ -159,7 +166,10 @@ dayu/config/
 | `coordinator.poll_interval_seconds` | acquire 轮询间隔 |
 | `lanes` | 按 lane 名索引的容量配置 |
 
-单个 lane 包含 `capacity`、`default_timeout_seconds`、`claim_ttl_seconds` 与 `heartbeat_interval_seconds`。`claim_ttl_seconds` 必须大于 `heartbeat_interval_seconds`。
+单个 lane 包含 `capacity`、`default_timeout_seconds`、`claim_ttl_seconds` 与
+`heartbeat_interval_seconds`。timeout 必须是有限非负数；busy timeout、poll interval、
+TTL 与 heartbeat 必须是有限正数；`claim_ttl_seconds` 还必须大于
+`heartbeat_interval_seconds`。
 
 ## tool_discovery.json
 
@@ -212,6 +222,11 @@ Scene manifest 第一版是单 Run 场景装配输入。允许的顶层字段固
 Prompt fragment 可以使用条件块 marker 控制工具说明是否进入最终 system prompt。`<when_tag TAG>...</when_tag>` 只在当前 scene 选中对应工具 tag 时保留正文；`<when_tool NAME>...</when_tool>` 只在当前 scene 选中对应工具名时保留正文。条件块 marker 是 ScenePrepare 解释的 prompt asset 控制语法，渲染后的 LLM-facing system prompt 不应包含这些 marker。
 
 默认非上传 scene 不使用 broad `"fins"` tag 选择 Fins 工具，也不在 packaged manifest 中列出具体工具名；它们通过窄标签 `"fins-read"`、`"fins-download"`、`"fins-preprocess"` 选择财报 read / download / preprocess 工具。除 `conversation_compaction` 这类压缩 scene 外，包内 scene manifest 都声明 required `current_time` context slot，并在 scene prompt 的主要执行契约正文之后渲染 `{{current_time}}`。`current_time` 是 LLM-facing 当前时间文本，表示对话开始时的当前时间；回答普通“现在 / 今天 / 当前时间”问题默认使用它，且该时间不会自动更新。它不等同于工具暴露。
+
+`prompt` 与 `interactive` manifest 还声明 required `fins_default_subject` slot，并在 scene
+执行契约与 `current_time` 之后渲染 `{{fins_default_subject}}`。CLI 的可选 `--ticker`
+通过共享 Service scene-context builder 生成该模型可读文本；未提供 ticker 时 slot 值为空，
+不会把 CLI metadata 或内部标识伪装成财报事实。
 
 `prompt` 是单轮问答 scene，不暴露 download / preprocess / upload 这类长事务工具；需要模型在对话中触发 download / preprocess 时，使用 `interactive` 或 `wechat` scene。
 

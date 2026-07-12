@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -42,6 +41,7 @@ from dayu.host.api import (
 )
 from dayu.runtime.config_loader import ConfigLoader, RuntimeConfig
 from dayu.runtime.location import RuntimeLocations, resolve_runtime_locations
+from dayu.runtime.numeric import is_positive_finite_number
 from dayu.runtime.scene_prepare import (
     PreparedSceneInputs,
     ScenePrepareRequest,
@@ -1868,5 +1868,5 @@ def _require_positive_poll_interval(value: float) -> None:
     :raises ValueError: 间隔不是正数时抛出。
     """
 
-    if not math.isfinite(value) or value <= 0:
+    if not is_positive_finite_number(value):
         raise ValueError("poll_interval_seconds must be finite and > 0")

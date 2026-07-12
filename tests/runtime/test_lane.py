@@ -257,6 +257,45 @@ async def test_config_validation_and_unknown_lane(tmp_path: Path) -> None:
         await controller.acquire(_SECOND_LANE_NAME, timeout_seconds=0)
 
 
+@pytest.mark.parametrize("value", (float("nan"), float("inf"), float("-inf")))
+def test_lane_configs_reject_non_finite_runtime_numbers(
+    tmp_path: Path,
+    value: float,
+) -> None:
+    """lane lifecycle 与 SQLite coordinator 数值配置必须全部有限。
+
+    :param tmp_path: pytest 临时目录。
+    :param value: 非有限测试数值。
+    :returns: ``None``。
+    :raises AssertionError: 任一配置边界允许非有限值时抛出。
+    """
+
+    with pytest.raises(RuntimeLaneConfigError, match="default_timeout_seconds"):
+        LaneConfig(
+            name=_LANE_NAME,
+            capacity=1,
+            default_timeout_seconds=value,
+        )
+    with pytest.raises(RuntimeLaneConfigError, match="claim_ttl_seconds"):
+        LaneConfig(name=_LANE_NAME, capacity=1, claim_ttl_seconds=value)
+    with pytest.raises(RuntimeLaneConfigError, match="heartbeat_interval_seconds"):
+        LaneConfig(
+            name=_LANE_NAME,
+            capacity=1,
+            heartbeat_interval_seconds=value,
+        )
+    with pytest.raises(RuntimeLaneConfigError, match="busy_timeout_seconds"):
+        SQLiteLaneCoordinatorConfig(
+            db_path=tmp_path / "runtime_lanes.sqlite3",
+            busy_timeout_seconds=value,
+        )
+    with pytest.raises(RuntimeLaneConfigError, match="poll_interval_seconds"):
+        SQLiteLaneCoordinatorConfig(
+            db_path=tmp_path / "runtime_lanes.sqlite3",
+            poll_interval_seconds=value,
+        )
+
+
 def test_lane_owner_rejects_empty_owner_id_and_invalid_pid() -> None:
     """LaneOwner 必须拒绝空 owner_id 与非法 pid。"""
 
@@ -267,8 +306,21 @@ def test_lane_owner_rejects_empty_owner_id_and_invalid_pid() -> None:
 
 
 @pytest.mark.asyncio
-async def test_acquire_rejects_negative_timeout(tmp_path: Path) -> None:
-    """LaneController.acquire 必须拒绝负数 timeout_seconds。"""
+@pytest.mark.parametrize(
+    "timeout_seconds",
+    (-1.0, float("nan"), float("inf"), float("-inf")),
+)
+async def test_acquire_rejects_invalid_timeout(
+    tmp_path: Path,
+    timeout_seconds: float,
+) -> None:
+    """LaneController.acquire 必须拒绝负数与非有限 timeout。
+
+    :param tmp_path: pytest 临时目录。
+    :param timeout_seconds: 非法 acquire timeout。
+    :returns: ``None``。
+    :raises AssertionError: 非法 timeout 未被拒绝时抛出。
+    """
 
     db_path = tmp_path / "runtime_lanes.sqlite3"
     controller = await LaneController.open(
@@ -277,7 +329,7 @@ async def test_acquire_rejects_negative_timeout(tmp_path: Path) -> None:
     )
 
     with pytest.raises(RuntimeLaneConfigError, match="timeout"):
-        await controller.acquire(_LANE_NAME, timeout_seconds=-1)
+        await controller.acquire(_LANE_NAME, timeout_seconds=timeout_seconds)
     await controller.close(reason="test-done")
 
 

@@ -54,10 +54,16 @@ from dayu.host.durable.schema import (
     TABLE_HOST_RUNS,
 )
 from dayu.host.durable.transaction import HostTransactionRunner
+from dayu.host.lifecycle_events import (
+    HostPreviewEventType,
+    serialize_host_event_type,
+)
 from dayu.host.projection import ProjectionRunner
 
 _EVENT_TYPE_RUN_ACCEPTED = "RUN_ACCEPTED"
-_EVENT_TYPE_PREVIEW_DELTA = "PREVIEW_DELTA"
+_EVENT_TYPE_PREVIEW_DELTA = serialize_host_event_type(
+    HostPreviewEventType.REASONING_DELTA
+)
 _FIXED_NOW = datetime(2026, 5, 29, 1, 2, 3, tzinfo=UTC)
 _DIGEST_A = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 _DIGEST_B = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"

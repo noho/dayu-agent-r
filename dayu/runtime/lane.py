@@ -22,6 +22,10 @@ from types import TracebackType
 from typing import Final, TypeAlias, TypeVar, cast
 
 from dayu.contracts.cancellation import CancellationToken
+from dayu.runtime.numeric import (
+    is_non_negative_finite_number,
+    is_positive_finite_number,
+)
 
 _DEFAULT_CLAIM_TTL_SECONDS: Final[float] = 30.0
 _DEFAULT_HEARTBEAT_INTERVAL_SECONDS: Final[float] = 10.0
@@ -150,16 +154,18 @@ class LaneConfig:
             raise RuntimeLaneConfigError("LaneConfig.capacity 必须为正整数")
         if (
             self.default_timeout_seconds is not None
-            and self.default_timeout_seconds < 0
+            and not is_non_negative_finite_number(self.default_timeout_seconds)
         ):
             raise RuntimeLaneConfigError(
-                "LaneConfig.default_timeout_seconds 不能为负数"
+                "LaneConfig.default_timeout_seconds 必须为有限非负数"
             )
-        if self.claim_ttl_seconds <= 0:
-            raise RuntimeLaneConfigError("LaneConfig.claim_ttl_seconds 必须为正数")
-        if self.heartbeat_interval_seconds <= 0:
+        if not is_positive_finite_number(self.claim_ttl_seconds):
             raise RuntimeLaneConfigError(
-                "LaneConfig.heartbeat_interval_seconds 必须为正数"
+                "LaneConfig.claim_ttl_seconds 必须为有限正数"
+            )
+        if not is_positive_finite_number(self.heartbeat_interval_seconds):
+            raise RuntimeLaneConfigError(
+                "LaneConfig.heartbeat_interval_seconds 必须为有限正数"
             )
         if self.claim_ttl_seconds <= self.heartbeat_interval_seconds:
             raise RuntimeLaneConfigError(
@@ -224,13 +230,13 @@ class SQLiteLaneCoordinatorConfig:
 
         if self.db_path.name.strip() == "":
             raise RuntimeLaneConfigError("SQLite lane db_path 必须包含文件名")
-        if self.busy_timeout_seconds <= 0:
+        if not is_positive_finite_number(self.busy_timeout_seconds):
             raise RuntimeLaneConfigError(
-                "SQLite lane busy_timeout_seconds 必须为正数"
+                "SQLite lane busy_timeout_seconds 必须为有限正数"
             )
-        if self.poll_interval_seconds <= 0:
+        if not is_positive_finite_number(self.poll_interval_seconds):
             raise RuntimeLaneConfigError(
-                "SQLite lane poll_interval_seconds 必须为正数"
+                "SQLite lane poll_interval_seconds 必须为有限正数"
             )
 
 
@@ -1380,8 +1386,8 @@ def _resolve_timeout(
         if explicit_timeout_seconds is not None
         else default_timeout_seconds
     )
-    if timeout is not None and timeout < 0:
-        raise RuntimeLaneConfigError("timeout_seconds 不能为负数")
+    if timeout is not None and not is_non_negative_finite_number(timeout):
+        raise RuntimeLaneConfigError("timeout_seconds 必须为有限非负数")
     return timeout
 
 

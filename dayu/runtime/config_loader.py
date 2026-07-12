@@ -9,14 +9,18 @@ scene manifest，不读取财报仓储，也不 import 业务层。
 from __future__ import annotations
 
 import json
-import math
 from collections.abc import Container, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Final, TypeAlias, cast
+from typing import Final, Never, TypeAlias, cast
 
 from dayu.contracts import AGENT_FALLBACK_MODES, JsonValue, ToolBundleSourceKind
+from dayu.runtime.numeric import (
+    is_finite_number,
+    is_non_negative_finite_number,
+    is_positive_finite_number,
+)
 
 _MODELS_FILE: Final[str] = "models.json"
 _EXECUTION_PROFILES_FILE: Final[str] = "execution_profiles.json"
@@ -953,10 +957,42 @@ def _read_required_json_object(path: Path) -> JsonObject:
     if not path.exists():
         raise ConfigFileNotFoundError(f"config file not found: {path}")
     try:
-        value = cast(JsonValue, json.loads(path.read_text(encoding="utf-8")))
-    except json.JSONDecodeError as exc:
+        value = cast(
+            JsonValue,
+            json.loads(
+                path.read_text(encoding="utf-8"),
+                parse_float=_parse_finite_json_float,
+                parse_constant=_reject_non_finite_json_constant,
+            ),
+        )
+    except ValueError as exc:
         raise ConfigShapeError(f"invalid JSON config file: {path}") from exc
     return _require_json_object(value, context=str(path))
+
+
+def _parse_finite_json_float(value: str) -> float:
+    """解析 JSON 浮点数字面量并拒绝溢出为无穷的值。
+
+    :param value: JSON parser 读取的数字面量。
+    :returns: 有限浮点数。
+    :raises ValueError: 数字解析后为 NaN 或正负无穷时抛出。
+    """
+
+    parsed = float(value)
+    if not is_finite_number(parsed):
+        raise ValueError("JSON number must be finite")
+    return parsed
+
+
+def _reject_non_finite_json_constant(value: str) -> Never:
+    """拒绝 Python JSON 扩展允许的 NaN / Infinity 常量。
+
+    :param value: 非标准 JSON 数值常量文本。
+    :returns: 本函数不会返回。
+    :raises ValueError: 始终抛出，阻止非有限数进入 typed config。
+    """
+
+    raise ValueError(f"JSON number must be finite: {value}")
 
 
 def _overlay_roots(
@@ -2487,12 +2523,14 @@ def _require_float_field(
     :param field_name: 字段名。
     :param context: 错误消息上下文。
     :returns: float 字段值。
-    :raises ConfigFieldError: 字段缺失、bool 或非数值时抛出。
+    :raises ConfigFieldError: 字段缺失、bool、非数值或非有限时抛出。
     """
 
     value = _require_field(record, field_name=field_name, context=context)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ConfigFieldError(f"{context}.{field_name} must be a number")
+    if not is_finite_number(value):
+        raise ConfigFieldError(f"{context}.{field_name} must be finite")
     return float(value)
 
 
@@ -2509,7 +2547,7 @@ def _require_positive_float_field(
     """
 
     value = _require_float_field(record, field_name=field_name, context=context)
-    if value <= 0:
+    if not is_positive_finite_number(value):
         raise ConfigFieldError(f"{context}.{field_name} must be > 0")
     return value
 
@@ -2527,9 +2565,7 @@ def _require_non_negative_finite_float_field(
     """
 
     value = _require_float_field(record, field_name=field_name, context=context)
-    if not math.isfinite(value):
-        raise ConfigFieldError(f"{context}.{field_name} must be finite")
-    if value < 0:
+    if not is_non_negative_finite_number(value):
         raise ConfigFieldError(f"{context}.{field_name} must be >= 0")
     return value
 

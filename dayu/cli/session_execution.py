@@ -27,7 +27,6 @@ from dayu.cli.agent_entrypoint import (
     resolve_explicit_config_dir,
     resolve_workspace_root,
     service_run_overrides_from_args,
-    unsupported_execution_option_names,
 )
 from dayu.cli.arg_parsing import ParsedCliArgs
 from dayu.cli.composer import (
@@ -87,7 +86,6 @@ from dayu.service.host_assembly import ServiceAssemblyOverrides, ServiceRunOverr
 DEFAULT_DISPLAY_USER: Final[str] = "本地 CLI 用户"
 PROMPT_TURN_INDEX: Final[int] = 1
 _MODEL_NAME_OPTION: Final[str] = "--model-name"
-_UNSUPPORTED_OPTION_PREFIX: Final[str] = "unsupported option"
 _PROMPT_OPERATION_SUBMIT_FOLLOWUP: Final[str] = "submit_followup"
 _PROMPT_OPERATION_CANCEL_RUN: Final[str] = "cancel_run"
 _INTERACTIVE_OPERATION_STARTUP_RECONNECT: Final[str] = "startup_reconnect"
@@ -242,7 +240,6 @@ async def prepare_prompt_session_execution(
     :raises Exception: runtime assembly 失败时向上抛出。
     """
 
-    _raise_for_unsupported_execution_options(args, usage_error_factory)
     workspace_root = resolve_workspace_root(
         args.workspace_root,
         error_factory=usage_error_factory,
@@ -300,7 +297,6 @@ async def prepare_interactive_session_execution(
     :raises Exception: runtime assembly 失败时向上抛出。
     """
 
-    _raise_for_unsupported_execution_options(args, usage_error_factory)
     workspace_root = resolve_workspace_root(
         args.workspace_root,
         error_factory=usage_error_factory,
@@ -1136,23 +1132,6 @@ async def _cancel_run_waiting_for_terminal_or_second_sigint(
         return None
     finally:
         await cancel_and_await_task(second_sigint_task)
-
-
-def _raise_for_unsupported_execution_options(
-    args: ParsedCliArgs,
-    error_factory: _UsageErrorFactory,
-) -> None:
-    """检查当前不支持的旧执行参数。
-
-    :param args: prompt 或 interactive 兼容命令参数。
-    :param error_factory: 用于构造当前命令用法错误的异常工厂。
-    :returns: ``None``。
-    :raises ValueError: 任一 unsupported option 被用户显式使用时抛出。
-    """
-
-    unsupported = unsupported_execution_option_names(args)
-    if unsupported:
-        raise error_factory(f"{_UNSUPPORTED_OPTION_PREFIX}: {', '.join(unsupported)}")
 
 
 def _read_user_input(prompt: str) -> str:

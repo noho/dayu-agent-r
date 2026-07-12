@@ -24,7 +24,6 @@ from dayu.cli.thinking import CliThinkingRenderer, CliThinkingRendererOptions
 from dayu.cli.agent_entrypoint import (
     CliSigintMonitor,
     package_config_root,
-    unsupported_execution_option_names,
 )
 from dayu.cli.arg_parsing import parse_cli_args
 from dayu.cli.exit_codes import (
@@ -80,6 +79,7 @@ from dayu.service.entrypoint_runtime import (
 from dayu.service.host_assembly import ServiceAssemblyOverrides, ServiceRunOverrides
 
 _MODEL_ID = "deepseek-v4-flash"
+_FINS_DEFAULT_SUBJECT_SLOT = "fins_default_subject"
 _CURRENT_TIME_SLOT = "current_time"
 _CURRENT_TIME_TEXT = (
     "# 当前时间\n"
@@ -700,6 +700,7 @@ def test_interactive_label_reuses_host_slot_and_fills_context_slots(
         return await real_prepare(request)
 
     monkeypatch.setenv("DEEPSEEK_API_KEY", _API_KEY)
+    monkeypatch.delenv("FMP_API_KEY", raising=False)
     monkeypatch.setattr(
         session_execution,
         "prepare_entrypoint_runtime",
@@ -734,7 +735,14 @@ def test_interactive_label_reuses_host_slot_and_fills_context_slots(
     assert exit_code == EXIT_SUCCESS
     assert captured.out.strip() == "answer for run-1"
     assert captured_requests[0].scene_id == "interactive"
-    assert tuple(captured_requests[0].context_slot_values) == (_CURRENT_TIME_SLOT,)
+    assert tuple(captured_requests[0].context_slot_values) == (
+        _FINS_DEFAULT_SUBJECT_SLOT,
+        _CURRENT_TIME_SLOT,
+    )
+    assert (
+        captured_requests[0].context_slot_values[_FINS_DEFAULT_SUBJECT_SLOT]
+        == "# 当前分析对象\n你正在分析的是 AAPL。"
+    )
     assert "Asia/Shanghai" in str(captured_requests[0].context_slot_values[_CURRENT_TIME_SLOT])
     assert fake_host.ensure_requests[0].scope == "cli.interactive"
     assert fake_host.ensure_requests[0].slot_key == "cli.interactive.earnings"
@@ -1989,11 +1997,11 @@ async def test_interactive_repl_returns_130_on_second_sigint(
     assert cursor_record.seen_terminal_event_ids == ()
 
 
-def test_interactive_thinking_flags_are_display_options_not_execution_overrides() -> None:
-    """``--thinking`` / ``--no-thinking`` 不进入旧执行参数拒绝集合。
+def test_interactive_thinking_flags_are_display_options() -> None:
+    """``--thinking`` / ``--no-thinking`` 保持为明确的展示选项。
 
     :returns: ``None``。
-    :raises AssertionError: thinking 展示参数被错误列为 unsupported 时抛出。
+    :raises AssertionError: thinking 展示参数未被正确解析时抛出。
     """
 
     thinking_args = parse_cli_args(("interactive", "--thinking"))
@@ -2001,22 +2009,18 @@ def test_interactive_thinking_flags_are_display_options_not_execution_overrides(
 
     assert thinking_args.thinking is True
     assert no_thinking_args.thinking is False
-    assert "--thinking/--no-thinking" not in unsupported_execution_option_names(thinking_args)
-    assert "--thinking/--no-thinking" not in unsupported_execution_option_names(
-        no_thinking_args
-    )
 
 
-def test_interactive_debug_stream_is_not_unsupported_execution_option() -> None:
-    """debug-stream 是全局日志开关，不是旧 Agent 执行参数。
+def test_interactive_debug_stream_is_global_log_option() -> None:
+    """``--debug-stream`` 保持为全局日志开关。
 
     :returns: ``None``。
-    :raises AssertionError: debug-stream 被错误列为 unsupported option 时抛出。
+    :raises AssertionError: debug-stream 未被正确解析时抛出。
     """
 
     args = parse_cli_args(("interactive", "--debug-stream"))
 
-    assert "--debug-stream" not in unsupported_execution_option_names(args)
+    assert args.debug_stream is True
 
 
 @pytest.mark.parametrize("removed_args", _REMOVED_INTERACTIVE_DEBUG_OPTIONS)
@@ -2040,10 +2044,10 @@ def test_interactive_removed_debug_options_are_argparse_unknown(
     assert removed_args[0] in captured.err
 
 
-def test_interactive_reports_all_unsupported_old_execution_flags(
+def test_interactive_rejects_all_removed_execution_flags_as_unknown(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """unsupported 旧参数应统一列入清晰错误。"""
+    """所有已删除旧参数都应由 argparse 清晰拒绝。"""
 
     exit_code = cli_main.main(
         (
@@ -2061,6 +2065,7 @@ def test_interactive_reports_all_unsupported_old_execution_flags(
     captured = capsys.readouterr()
 
     assert exit_code == EXIT_USAGE_ERROR
+    assert "unrecognized arguments" in captured.err
     for expected in (
         "--tool-trace-dir",
         "--max-duplicate-tool-calls",
@@ -2195,7 +2200,10 @@ async def _prepare_interactive_runtime(tmp_path: Path) -> EntrypointRuntimeResul
             package_config_root=package_config_root(),
             explicit_config_dir=None,
             scene_id="interactive",
-            context_slot_values={_CURRENT_TIME_SLOT: _CURRENT_TIME_TEXT},
+            context_slot_values={
+                _FINS_DEFAULT_SUBJECT_SLOT: "",
+                _CURRENT_TIME_SLOT: _CURRENT_TIME_TEXT,
+            },
             assembly_overrides=ServiceAssemblyOverrides(model_id=_MODEL_ID),
             env={"DEEPSEEK_API_KEY": _API_KEY},
         )

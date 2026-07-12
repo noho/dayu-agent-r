@@ -15,6 +15,7 @@ import pytest
 import dayu.cli.commands.fins as fins_command
 import dayu.cli.main as cli_main
 import dayu.cli.output as cli_output
+from dayu.cli.agent_entrypoint import CliSigintMonitor
 from dayu.cli.exit_codes import (
     EXIT_FAILURE,
     EXIT_KEYBOARD_INTERRUPT,
@@ -827,15 +828,25 @@ def test_process_commands_map_to_service(
         ("process", "--ticker", "AAPL", "--ci"),
     ),
 )
-def test_unsupported_flags_fail_fast(
+def test_removed_flags_are_argparse_unknown(
     argv: tuple[str, ...],
     fake_service: _FakeFinsDirectService,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """--infer 和 --ci 必须 fail fast。"""
+    """已无 public contract 的 ``--infer`` / ``--ci`` 不应出现在 parser。
+
+    :param argv: 含已删除 flag 的命令参数。
+    :param fake_service: direct service 测试替身。
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: flag 未按未知参数拒绝或启动了 direct stream 时抛出。
+    """
 
     exit_code = cli_main.main(argv)
+    captured = capsys.readouterr()
 
     assert exit_code == EXIT_USAGE_ERROR
+    assert "unrecognized arguments" in captured.err
     assert fake_service.stream_calls == []
 
 
@@ -970,7 +981,7 @@ async def test_sigint_cancels_stream_task_without_job_id(
         pause_after_first_event=True,
     )
     token = fins_command._CliFinsCancellationToken()
-    monitor = fins_command._FinsSigintMonitor()
+    monitor = CliSigintMonitor()
 
     wait_task = asyncio.create_task(
         fins_command._wait_for_terminal_handling_sigint(
@@ -1016,7 +1027,7 @@ async def test_cancel_race_does_not_override_terminal_result() -> None:
         yield _result_event(status=FinsResultStatus.SUCCESS)
 
     token = fins_command._CliFinsCancellationToken()
-    monitor = fins_command._FinsSigintMonitor()
+    monitor = CliSigintMonitor()
 
     wait_task = asyncio.create_task(
         fins_command._wait_for_terminal_handling_sigint(
@@ -1113,7 +1124,7 @@ def test_upload_filings_from_does_not_start_live_stream(
     fake_service: _FakeFinsDirectService,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """upload_filings_from 只生成脚本，不启动 Fins direct stream。"""
+    """upload_filings_from 只生成 JSON argv 计划，不启动 direct stream。"""
 
     source_dir = tmp_path / "source"
     source_dir.mkdir()
@@ -1124,7 +1135,8 @@ def test_upload_filings_from_does_not_start_live_stream(
     ) == EXIT_SUCCESS
 
     captured = capsys.readouterr()
-    assert "dayu-cli upload_filing" in captured.out
+    assert '"schema_version": 1' in captured.out
+    assert '"upload_filing"' in captured.out
     assert "Fins progress" not in captured.out
     assert fake_service.stream_calls == []
 

@@ -522,14 +522,8 @@ def test_host_runtime_process_capsule_policy_valid_block_parses(
     (
         ("terminate_grace_seconds", True),
         ("terminate_grace_seconds", -0.1),
-        ("terminate_grace_seconds", float("nan")),
-        ("terminate_grace_seconds", float("inf")),
-        ("terminate_grace_seconds", float("-inf")),
         ("kill_grace_seconds", True),
         ("kill_grace_seconds", -0.1),
-        ("kill_grace_seconds", float("nan")),
-        ("kill_grace_seconds", float("inf")),
-        ("kill_grace_seconds", float("-inf")),
     ),
 )
 def test_host_runtime_process_capsule_policy_invalid_grace_fails_fast(
@@ -537,7 +531,7 @@ def test_host_runtime_process_capsule_policy_invalid_grace_fails_fast(
     field_name: str,
     value: JsonValue,
 ) -> None:
-    """host_runtime process capsule cleanup grace 拒绝 bool、负数、NaN 与无穷。"""
+    """host_runtime process capsule cleanup grace 拒绝 bool 与负数。"""
 
     package_root = tmp_path / "package"
     _minimal_package_config(package_root)
@@ -556,6 +550,30 @@ def test_host_runtime_process_capsule_policy_invalid_grace_fails_fast(
 
     with pytest.raises(ConfigFieldError, match=field_name):
         ConfigLoader(package_config_dir=package_root).load_host_runtime()
+
+
+@pytest.mark.parametrize("numeric_literal", ("NaN", "Infinity", "-Infinity", "1e400"))
+def test_config_json_boundary_rejects_non_finite_number_literals(
+    tmp_path: Path,
+    numeric_literal: str,
+) -> None:
+    """所有配置文件必须在 JSON 读取 owner 拒绝非有限数字面量。
+
+    :param tmp_path: pytest 临时目录。
+    :param numeric_literal: Python JSON 扩展常量或溢出浮点数字面量。
+    :returns: ``None``。
+    :raises AssertionError: 非有限值进入 schema 字段校验之后才失败时抛出。
+    """
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    (package_root / "models.json").write_text(
+        f'{{"unexpected": {numeric_literal}}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigShapeError, match="invalid JSON config file"):
+        ConfigLoader(package_config_dir=package_root).load_models()
 
 
 def test_host_runtime_process_capsule_policy_rejects_unknown_fields(
