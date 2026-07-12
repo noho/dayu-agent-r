@@ -234,7 +234,11 @@ def test_succeeded_terminal_projection_rejects_non_text_finish_reason(
         ({}, None, "content is missing"),
         ({"content": "  "}, None, "content is blank"),
         ({"content": 7}, None, "content must be text"),
-        ({"content": "answer"}, "sha256:mismatch", "payload digest mismatch"),
+        (
+            {"content": "answer"},
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "descriptor digest mismatch",
+        ),
     ),
 )
 def test_succeeded_terminal_projection_fails_closed_for_descriptor_errors(

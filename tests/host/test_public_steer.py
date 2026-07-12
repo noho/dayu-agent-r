@@ -145,6 +145,9 @@ async def test_steer_replays_same_client_request_id_idempotently(
             _followup_request(session.session_id, "steer-idempotent-source"),
         )
         await _wait_for_run_status(host, first.accepted_run_id, RunStatus.RUNNING)
+        await wait_for_diagnostic_event_type_count(
+            tmp_path / "host.sqlite3", "ATTEMPT_RUNNING", 1
+        )
         request = SubmitFollowupRequest(
             context=_context("steer-idempotent"),
             session_id=session.session_id,
