@@ -14,11 +14,9 @@ import hashlib
 import html
 import json
 import re
-import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Final, Optional, TypeAlias, cast
 
 import httpx
@@ -331,19 +329,9 @@ class HkexnewsDiscoveryClient:
         if not payload.startswith(_PDF_MAGIC_BYTES):
             raise RuntimeError(f"PDF magic bytes 校验失败，url={candidate.source_url}")
         sha256 = hashlib.sha256(payload).hexdigest()
-        tmp_dir = Path(tempfile.gettempdir()) / "dayu_hk_downloads"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            prefix="hkexnews_",
-            suffix=".pdf",
-            dir=tmp_dir,
-            delete=False,
-        ) as fp:
-            fp.write(payload)
-            pdf_path = Path(fp.name)
         return DownloadedReportAsset(
             candidate=candidate,
-            pdf_path=pdf_path,
+            pdf_bytes=payload,
             sha256=sha256,
             content_length=len(payload),
             downloaded_at=_utc_now_isoformat(),

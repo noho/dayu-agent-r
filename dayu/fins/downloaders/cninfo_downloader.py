@@ -35,11 +35,9 @@ import datetime as dt
 import hashlib
 import json
 import re
-import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Final, Optional, TypeAlias, cast
 
 import httpx
@@ -305,8 +303,7 @@ class CninfoDiscoveryClient:
         实现细节：
 
         - 校验 PDF magic bytes（``%PDF-``）与最小字节数；非 PDF 抛 RuntimeError。
-        - 暂存路径为 ``tempfile.NamedTemporaryFile``，调用方取出字节后会
-          ``unlink``。
+        - 已校验 PDF 直接通过 ``DownloadedReportAsset.pdf_bytes`` 交付。
         - HTTP 失败按 ``max_retries`` 重试（指数退避）。
 
         Args:
@@ -334,19 +331,9 @@ class CninfoDiscoveryClient:
             )
         sha256 = _sha256_hex(payload)
         downloaded_at = _utc_now_isoformat()
-        tmp_dir = Path(tempfile.gettempdir()) / "dayu_cn_downloads"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            prefix="cninfo_",
-            suffix=".pdf",
-            dir=tmp_dir,
-            delete=False,
-        ) as fp:
-            fp.write(payload)
-            pdf_path = Path(fp.name)
         return DownloadedReportAsset(
             candidate=candidate,
-            pdf_path=pdf_path,
+            pdf_bytes=payload,
             sha256=sha256,
             content_length=len(payload),
             downloaded_at=downloaded_at,

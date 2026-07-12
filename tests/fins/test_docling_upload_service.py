@@ -10,6 +10,7 @@ import pytest
 
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.document_models import (
+    BatchToken,
     DocumentHandle,
     FileObjectMeta,
     ProcessedHandle,
@@ -80,6 +81,149 @@ class _FailingFinalUploadSourceRepository(_SpyUploadSourceRepository):
         del req, source_kind
         self._events.append("create_failed")
         raise RuntimeError("forced final upsert failure")
+
+    def update_source_document(
+        self,
+        req: SourceDocumentUpsertRequest,
+        source_kind: SourceKind,
+    ) -> DocumentHandle:
+        """模拟 staging 后 final source update 失败。"""
+
+        del req, source_kind
+        self._events.append("update_failed")
+        raise RuntimeError("forced final upsert failure")
+
+
+class _BatchIdentityUploadSourceRepository(_SpyUploadSourceRepository):
+    """记录 upload 各阶段所处 batch identity 的 source 仓储 spy。"""
+
+    def __init__(self, workspace_root: Path, repository_set: _FsRepositorySet, events: list[str]) -> None:
+        """初始化 batch identity spy。"""
+
+        super().__init__(workspace_root, repository_set, events)
+        self.active_token: BatchToken | None = None
+        self.phase_batch_ids: list[tuple[str, str]] = []
+        self.begin_calls = 0
+        self.commit_calls = 0
+        self.rollback_calls = 0
+
+    def begin_batch(self, ticker: str) -> BatchToken:
+        """开启 batch 并记录唯一 token。"""
+
+        token = super().begin_batch(ticker)
+        self.begin_calls += 1
+        self.active_token = token
+        self.phase_batch_ids.append(("begin", token.token_id))
+        return token
+
+    def stage_source_document(
+        self,
+        req: SourceDocumentUpsertRequest,
+        source_kind: SourceKind,
+    ) -> SourceHandle:
+        """记录 acknowledgement 使用的活动 token 后暂存 source。"""
+
+        self._record_phase("ack")
+        return super().stage_source_document(req, source_kind)
+
+    def create_source_document(
+        self,
+        req: SourceDocumentUpsertRequest,
+        source_kind: SourceKind,
+    ) -> DocumentHandle:
+        """记录 final meta 使用的活动 token 后创建完成态。"""
+
+        self._record_phase("final_meta")
+        return FsSourceDocumentRepository.create_source_document(self, req, source_kind)
+
+    def commit_batch(self, token: BatchToken) -> None:
+        """记录 caller 的唯一 commit 并转发 storage commit。"""
+
+        self._record_phase("commit")
+        self.commit_calls += 1
+        super().commit_batch(token)
+        self.active_token = None
+
+    def rollback_batch(self, token: BatchToken) -> None:
+        """记录 caller rollback 并转发 storage rollback。"""
+
+        self.rollback_calls += 1
+        super().rollback_batch(token)
+        self.active_token = None
+
+    def _record_phase(self, phase: str) -> None:
+        """把阶段与当前 batch ID 一并记录。"""
+
+        token = self.active_token
+        assert token is not None
+        self.phase_batch_ids.append((phase, token.token_id))
+
+
+class _BatchIdentityUploadBlobRepository(FsDocumentBlobRepository):
+    """记录 upload blob 写入所处 batch identity 的仓储 spy。"""
+
+    def __init__(
+        self,
+        workspace_root: Path,
+        repository_set: _FsRepositorySet,
+        source_repository: _BatchIdentityUploadSourceRepository,
+    ) -> None:
+        """初始化 blob batch identity spy。"""
+
+        super().__init__(workspace_root, repository_set=repository_set)
+        self._source_repository = source_repository
+
+    def store_file(
+        self,
+        handle: SourceHandle | ProcessedHandle,
+        filename: str,
+        data: BinaryIO,
+        *,
+        content_type: Optional[str] = None,
+        metadata: Optional[dict[str, str]] = None,
+    ) -> FileObjectMeta:
+        """记录当前 token 后转发真实 blob 写入。"""
+
+        self._source_repository._record_phase(f"blob:{filename}")
+        return super().store_file(
+            handle,
+            filename,
+            data,
+            content_type=content_type,
+            metadata=metadata,
+        )
+
+
+class _CommitFailingUploadSourceRepository(_SpyUploadSourceRepository):
+    """模拟 storage 已消费 token 后仍向 caller 抛出 commit 主异常。"""
+
+    def __init__(self, workspace_root: Path, repository_set: _FsRepositorySet, events: list[str]) -> None:
+        """初始化 commit failure spy。"""
+
+        super().__init__(workspace_root, repository_set, events)
+        self.caller_rollback_calls = 0
+
+    def commit_batch(self, token: BatchToken) -> None:
+        """由 storage owner 回滚并消费 token，再抛出 commit 主异常。"""
+
+        FsSourceDocumentRepository.rollback_batch(self, token)
+        raise OSError("forced storage commit failure")
+
+    def rollback_batch(self, token: BatchToken) -> None:
+        """记录不应发生的 caller 二次 rollback。"""
+
+        self.caller_rollback_calls += 1
+        super().rollback_batch(token)
+
+
+class _RollbackFailingUploadSourceRepository(_FailingFinalUploadSourceRepository):
+    """模拟 operation 与 caller rollback 同时失败的 source 仓储。"""
+
+    def rollback_batch(self, token: BatchToken) -> None:
+        """抛出 rollback 次异常以验证双错误传播。"""
+
+        del token
+        raise OSError("forced rollback failure")
 
 
 class _StagingAwareUploadBlobRepository(FsDocumentBlobRepository):
@@ -285,8 +429,126 @@ def test_execute_upload_stages_source_before_first_blob_write(tmp_path: Path) ->
     assert meta["ingest_complete"] is True
 
 
-def test_execute_upload_final_upsert_failure_keeps_acknowledged_staging(tmp_path: Path) -> None:
-    """final upsert 失败时允许留下 incomplete source meta，但 blob 不得 ownerless。"""
+def test_execute_upload_uses_one_caller_batch_for_ack_blobs_and_final_meta(tmp_path: Path) -> None:
+    """upload create 的 ack、blob、final meta 必须共享唯一 caller token。"""
+
+    events: list[str] = []
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source_repository = _BatchIdentityUploadSourceRepository(tmp_path, repository_set, events)
+    blob_repository = _BatchIdentityUploadBlobRepository(
+        tmp_path,
+        repository_set,
+        source_repository,
+    )
+    service = DoclingUploadService(
+        source_repository=source_repository,
+        blob_repository=blob_repository,
+        convert_with_docling=_convert_docling_stub,
+    )
+    sample_file = tmp_path / "deck.pdf"
+    sample_file.write_text("hello", encoding="utf-8")
+
+    result = service.execute_upload(
+        ticker="AAPL",
+        source_kind=SourceKind.MATERIAL,
+        action="create",
+        document_id="mat_identity",
+        internal_document_id="mat_identity",
+        form_type="MATERIAL_OTHER",
+        files=[sample_file],
+        overwrite=False,
+        meta={"material_name": "Deck", "ingest_method": "upload"},
+    )
+
+    batch_ids = {batch_id for _, batch_id in source_repository.phase_batch_ids}
+    phases = [phase for phase, _ in source_repository.phase_batch_ids]
+    assert result.status == "uploaded"
+    assert batch_ids and len(batch_ids) == 1
+    assert phases == [
+        "begin",
+        "ack",
+        "blob:deck.pdf",
+        "blob:deck_docling.json",
+        "final_meta",
+        "commit",
+    ]
+    assert source_repository.begin_calls == 1
+    assert source_repository.commit_calls == 1
+    assert source_repository.rollback_calls == 0
+
+
+def test_execute_upload_commit_failure_does_not_call_caller_rollback(tmp_path: Path) -> None:
+    """commit_batch 开始后 token 归 storage owner，失败不得触发二次 rollback。"""
+
+    events: list[str] = []
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source_repository = _CommitFailingUploadSourceRepository(tmp_path, repository_set, events)
+    blob_repository = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    service = DoclingUploadService(
+        source_repository=source_repository,
+        blob_repository=blob_repository,
+        convert_with_docling=_convert_docling_stub,
+    )
+    sample_file = tmp_path / "deck.pdf"
+    sample_file.write_text("hello", encoding="utf-8")
+
+    with pytest.raises(OSError, match="forced storage commit failure"):
+        service.execute_upload(
+            ticker="AAPL",
+            source_kind=SourceKind.MATERIAL,
+            action="create",
+            document_id="mat_commit_failed",
+            internal_document_id="mat_commit_failed",
+            form_type="MATERIAL_OTHER",
+            files=[sample_file],
+            overwrite=False,
+            meta={"material_name": "Deck", "ingest_method": "upload"},
+        )
+
+    assert source_repository.caller_rollback_calls == 0
+    with pytest.raises(FileNotFoundError):
+        source_repository.get_source_meta(
+            "AAPL",
+            "mat_commit_failed",
+            SourceKind.MATERIAL,
+        )
+
+
+def test_execute_upload_operation_and_rollback_failure_preserve_both_errors(tmp_path: Path) -> None:
+    """operation 与 rollback 双失败时 primary、note 与 cause 必须同时保留。"""
+
+    events: list[str] = []
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source_repository = _RollbackFailingUploadSourceRepository(tmp_path, repository_set, events)
+    blob_repository = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    service = DoclingUploadService(
+        source_repository=source_repository,
+        blob_repository=blob_repository,
+        convert_with_docling=_convert_docling_stub,
+    )
+    sample_file = tmp_path / "deck.pdf"
+    sample_file.write_text("hello", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="forced final upsert failure") as exc_info:
+        service.execute_upload(
+            ticker="AAPL",
+            source_kind=SourceKind.MATERIAL,
+            action="create",
+            document_id="mat_dual_failure",
+            internal_document_id="mat_dual_failure",
+            form_type="MATERIAL_OTHER",
+            files=[sample_file],
+            overwrite=False,
+            meta={"material_name": "Deck", "ingest_method": "upload"},
+        )
+
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert "forced rollback failure" in str(exc_info.value.__cause__)
+    assert any("recovery evidence retained" in note for note in exc_info.value.__notes__)
+
+
+def test_execute_upload_create_final_failure_leaves_document_absent(tmp_path: Path) -> None:
+    """create final upsert 失败时 batch 回滚应隐藏 source 与全部 blob。"""
 
     events: list[str] = []
     repository_set = build_fs_repository_set(workspace_root=tmp_path)
@@ -312,14 +574,14 @@ def test_execute_upload_final_upsert_failure_keeps_acknowledged_staging(tmp_path
             overwrite=False,
             meta={"material_name": "Deck", "ingest_method": "upload"},
         )
-    meta = source_repository.get_source_meta("AAPL", "mat_failed", SourceKind.MATERIAL)
     handle = SourceHandle(ticker="AAPL", document_id="mat_failed", source_kind=SourceKind.MATERIAL.value)
 
     assert events[0] == "stage"
     assert events[-1] == "create_failed"
     assert blob_repository.observed_ingest_complete == [False, False]
-    assert meta["ingest_complete"] is False
-    assert {entry.name for entry in blob_repository.list_entries(handle)} == {"deck.pdf", "deck_docling.json", "meta.json"}
+    with pytest.raises(FileNotFoundError):
+        source_repository.get_source_meta("AAPL", "mat_failed", SourceKind.MATERIAL)
+    assert blob_repository.list_entries(handle) == []
 
 
 def test_execute_upload_skips_when_source_fingerprint_matches(tmp_path: Path) -> None:
@@ -437,8 +699,12 @@ def test_execute_upload_overwrite_cancel_after_conversion_keeps_previous_documen
     assert {entry.name for entry in context.blob_repository.list_entries(handle)} == old_entries
 
 
-def test_execute_upload_overwrite_final_failure_keeps_previous_document(tmp_path: Path) -> None:
-    """overwrite final upsert 失败时应通过 batch rollback 保留旧 source document。"""
+@pytest.mark.parametrize("overwrite", [False, True])
+def test_execute_upload_update_failure_keeps_previous_document(
+    tmp_path: Path,
+    overwrite: bool,
+) -> None:
+    """update/overwrite final upsert 失败时 batch rollback 均保留旧文档。"""
 
     repository_set = build_fs_repository_set(workspace_root=tmp_path)
     seed_source_repository = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
@@ -483,7 +749,7 @@ def test_execute_upload_overwrite_final_failure_keeps_previous_document(tmp_path
             internal_document_id="mat_demo",
             form_type="MATERIAL_OTHER",
             files=[new_file],
-            overwrite=True,
+            overwrite=overwrite,
             meta={"material_name": "Deck", "ingest_method": "upload"},
         )
 

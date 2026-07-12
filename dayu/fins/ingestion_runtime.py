@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import sys
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field, replace
@@ -3787,7 +3788,8 @@ class FinsIngestionRuntime:
             primary_document=primary_document,
             meta=_download_document_meta(document.meta),
         )
-        token: BatchToken | None = self.source_repository.begin_batch(ticker)
+        token: BatchToken = self.source_repository.begin_batch(ticker)
+        commit_started = False
         try:
             if source_exists:
                 self.source_repository.reset_source_document(ticker, document_id, document.source_kind)
@@ -3803,13 +3805,23 @@ class FinsIngestionRuntime:
             )
             if rebuild_processed:
                 _mark_processed_reprocess_required_if_present(self.processed_repository, ticker, document_id)
-            commit_token = token
-            token = None
-            self.source_repository.commit_batch(commit_token)
-        except Exception:
-            if token is not None:
-                self.source_repository.rollback_batch(token)
-            raise
+            # commit_batch 调用开始即由 storage owner 消费 token；提交失败后
+            # caller 不得尝试二次 rollback。
+            commit_started = True
+            self.source_repository.commit_batch(token)
+        finally:
+            if not commit_started:
+                operation_error = sys.exception()
+                try:
+                    self.source_repository.rollback_batch(token)
+                except Exception as rollback_error:
+                    if operation_error is not None:
+                        operation_error.add_note(
+                            "rollback_batch failed; recovery evidence retained: "
+                            f"{rollback_error}"
+                        )
+                        raise operation_error from rollback_error
+                    raise
         return True
 
     def _store_downloaded_file(

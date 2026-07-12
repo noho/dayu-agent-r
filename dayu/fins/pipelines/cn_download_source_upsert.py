@@ -206,7 +206,12 @@ def commit_cn_filing_source_document(
     previous_completed_meta: JsonObject | None,
     source_meta_exists: bool,
 ) -> None:
-    """提交 CN/HK filing source document 完成态。
+    """在 caller-owned 活动 batch 内暂存 CN/HK filing 完成态与 marker。
+
+    本 helper 不是事务 commit owner：它不调用 ``begin_batch``、
+    ``commit_batch`` 或 ``rollback_batch``。调用方必须先持有与 ``ticker``
+    对应的 active token，并把本 helper 与相关 reset、ack、blob 写入放在同一
+    同步 batch 段内，最后由 caller 唯一一次调用 ``commit_batch``。
 
     参数:
         source_repository: source 文档仓储。
@@ -233,6 +238,7 @@ def commit_cn_filing_source_document(
     异常:
         OSError: 仓储写入失败时抛出。
         ValueError: ``primary_document`` 未指向 Docling JSON 时抛出。
+        RuntimeError: 当前执行 owner 未持有 ``ticker`` 的活动 batch 时抛出。
     """
 
     if not primary_document.endswith("_docling.json"):

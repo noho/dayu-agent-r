@@ -92,7 +92,7 @@ class _PipelineDownloadFakeDiscoveryClient:
         )
 
     def download_report_pdf(self, candidate: CnReportCandidate) -> DownloadedReportAsset:
-        """返回本地临时 PDF 资产。
+        """返回内存 PDF 资产。
 
         Args:
             candidate: 远端候选。
@@ -101,15 +101,13 @@ class _PipelineDownloadFakeDiscoveryClient:
             已下载 PDF 资产。
 
         Raises:
-            OSError: 临时文件写入失败时抛出。
+            无。
         """
 
         self.download_calls += 1
-        pdf_path = self.temp_dir / f"{candidate.source_id}_{self.download_calls}.pdf"
-        pdf_path.write_bytes(_PDF_BYTES)
         return DownloadedReportAsset(
             candidate=candidate,
-            pdf_path=pdf_path,
+            pdf_bytes=_PDF_BYTES,
             sha256=hashlib.sha256(_PDF_BYTES).hexdigest(),
             content_length=len(_PDF_BYTES),
             downloaded_at="2026-05-02T00:00:00+00:00",
@@ -180,7 +178,7 @@ class _PipelineDownloadFakeHkDiscoveryClient:
         )
 
     def download_report_pdf(self, candidate: CnReportCandidate) -> DownloadedReportAsset:
-        """返回本地临时 PDF 资产。
+        """返回内存 PDF 资产。
 
         Args:
             candidate: 远端候选。
@@ -189,15 +187,13 @@ class _PipelineDownloadFakeHkDiscoveryClient:
             已下载 PDF 资产。
 
         Raises:
-            OSError: 临时文件写入失败时抛出。
+            无。
         """
 
         self.download_calls += 1
-        pdf_path = self.temp_dir / f"{candidate.source_id}_{self.download_calls}.pdf"
-        pdf_path.write_bytes(_PDF_BYTES)
         return DownloadedReportAsset(
             candidate=candidate,
-            pdf_path=pdf_path,
+            pdf_bytes=_PDF_BYTES,
             sha256=hashlib.sha256(_PDF_BYTES).hexdigest(),
             content_length=len(_PDF_BYTES),
             downloaded_at="2026-05-02T00:00:00+00:00",

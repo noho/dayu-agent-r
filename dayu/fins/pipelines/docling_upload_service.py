@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import mimetypes
+import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from io import BytesIO
@@ -327,9 +328,8 @@ class DoclingUploadService:
         """
 
         replace_existing = overwrite and previous_meta is not None and action in {"create", "update"}
-        token: BatchToken | None = None
-        if replace_existing:
-            token = self._source_repository.begin_batch(ticker)
+        token: BatchToken = self._source_repository.begin_batch(ticker)
+        commit_started = False
         try:
             effective_previous_meta = previous_meta
             upsert_mode = _resolve_upsert_mode(
@@ -359,9 +359,6 @@ class DoclingUploadService:
             )
             for asset in pending_assets:
                 if _is_cancelled(cancellation_checker):
-                    if token is not None:
-                        self._source_repository.rollback_batch(token)
-                        token = None
                     return _build_cancelled_result(document_id=document_id, internal_document_id=internal_document_id)
                 file_meta = self._blob_repository.store_file(
                     handle=handle,
@@ -385,6 +382,8 @@ class DoclingUploadService:
             primary_document = _pick_primary_docling_file(stored_entries)
             if primary_document is None:
                 raise RuntimeError("未生成 docling 主文件，无法写入 primary_document")
+            if _is_cancelled(cancellation_checker):
+                return _build_cancelled_result(document_id=document_id, internal_document_id=internal_document_id)
             self._upsert_source_document(
                 upsert_mode=upsert_mode,
                 source_kind=source_kind,
@@ -396,10 +395,12 @@ class DoclingUploadService:
                 file_entries=stored_entries,
                 meta=meta,
             )
-            if token is not None:
-                commit_token = token
-                token = None
-                self._source_repository.commit_batch(commit_token)
+            if _is_cancelled(cancellation_checker):
+                return _build_cancelled_result(document_id=document_id, internal_document_id=internal_document_id)
+            # 从调用 commit_batch 起 token 生命周期转交 storage owner；即使提交失败，
+            # caller 也不得再次 rollback 已被消费的 token。
+            commit_started = True
+            self._source_repository.commit_batch(token)
             return UploadOperationResult(
                 status="uploaded",
                 document_id=document_id,
@@ -414,10 +415,19 @@ class DoclingUploadService:
                     "document_version": document_version,
                 },
             )
-        except Exception:
-            if token is not None:
-                self._source_repository.rollback_batch(token)
-            raise
+        finally:
+            if not commit_started:
+                operation_error = sys.exception()
+                try:
+                    self._source_repository.rollback_batch(token)
+                except Exception as rollback_error:
+                    if operation_error is not None:
+                        operation_error.add_note(
+                            "rollback_batch failed; recovery evidence retained: "
+                            f"{rollback_error}"
+                        )
+                        raise operation_error from rollback_error
+                    raise
 
     def resolve_document_id_by_internal(
         self,
@@ -522,7 +532,12 @@ class DoclingUploadService:
         previous_meta: JsonObject | None,
         meta: JsonObject,
     ) -> SourceHandle:
-        """在上传 blob 写入前确认 source repository 已承认该 source。
+        """在 caller-owned 活动 batch 内暂存 source acknowledgement。
+
+        本 helper 只复用当前 shared storage core 的活动 batch；不创建、不提交、
+        不回滚 batch。调用方必须在进入本 helper 前持有与 ``ticker`` 对应的
+        active token，并在所有 blob 与最终 meta 暂存完成后统一决定 commit 或
+        rollback。
 
         Args:
             ticker: 已规范化股票代码。
@@ -541,6 +556,7 @@ class DoclingUploadService:
             KeyError: meta 缺少必需溯源字段时抛出。
             ValueError: meta 溯源字段非法时抛出。
             OSError: 仓储写入失败时抛出。
+            RuntimeError: 当前执行 owner 未持有 ``ticker`` 的活动 batch 时抛出。
         """
 
         if previous_meta is None or not bool(previous_meta.get("ingest_complete", False)):

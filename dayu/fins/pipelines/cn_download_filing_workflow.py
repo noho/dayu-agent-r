@@ -8,12 +8,12 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections.abc import AsyncIterator, Callable
 from io import BytesIO
-from pathlib import Path
 from typing import cast
 
-from dayu.fins.domain.document_models import FileObjectMeta, SourceHandle
+from dayu.fins.domain.document_models import BatchToken, SourceHandle
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.pipelines.cn_download_pdf_gate import CnDownloadPdfGateProtocol
 from dayu.fins.pipelines.cn_download_models import (
@@ -140,7 +140,6 @@ async def run_cn_download_single_filing_stream(
         previous_meta=previous_meta,
         overwrite=overwrite,
     )
-    source_meta_exists = previous_meta is not None
     remote_fingerprint = build_remote_fingerprint(candidate)
     skip_result = _resolve_fast_skip_result(
         previous_meta=previous_meta,
@@ -156,43 +155,22 @@ async def run_cn_download_single_filing_stream(
         )
         return
 
-    if _should_reset_before_download(previous_meta=previous_meta, remote_fingerprint=remote_fingerprint, overwrite=overwrite):
-        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
-        source_repository.reset_source_document(ticker, document_id, SourceKind.FILING)
-        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
-        previous_meta = None
-        previous_completed_meta = None
-        source_meta_exists = False
-
-    if previous_meta is None:
-        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
-        update_cn_staging_source_document(
-            source_repository=source_repository,
-            ticker=ticker,
-            document_id=document_id,
-            internal_document_id=internal_document_id,
-            form_type=candidate.fiscal_period,
-            primary_document=pdf_filename,
-            file_entries=[],
-            candidate=candidate,
-            profile=profile,
-            pdf_sha256=None,
-            remote_fingerprint=remote_fingerprint,
-            previous_meta_exists=False,
-        )
-        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
-        source_meta_exists = True
-    handle = source_repository.get_source_handle(ticker, document_id, SourceKind.FILING)
-
-    reusable_pdf = _resolve_reusable_pdf(
-        blob_repository=blob_repository,
-        handle=handle,
-        pdf_filename=pdf_filename,
-        docling_filename=docling_filename,
-        previous_meta=previous_meta,
-        remote_fingerprint=remote_fingerprint,
-        overwrite=overwrite,
+    existing_handle = (
+        source_repository.get_source_handle(ticker, document_id, SourceKind.FILING)
+        if previous_meta is not None
+        else None
     )
+    reusable_pdf = None
+    if existing_handle is not None:
+        reusable_pdf = _resolve_reusable_pdf(
+            blob_repository=blob_repository,
+            handle=existing_handle,
+            pdf_filename=pdf_filename,
+            docling_filename=docling_filename,
+            previous_meta=previous_meta,
+            remote_fingerprint=remote_fingerprint,
+            overwrite=overwrite,
+        )
     if reusable_pdf is None:
         yield DownloadEvent(
             event_type=DownloadEventType.FILE_DOWNLOAD_STARTED,
@@ -243,46 +221,7 @@ async def run_cn_download_single_filing_stream(
             )
             return
         _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
-        pdf_path = asset.pdf_path
-        try:
-            _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
-            pdf_bytes = await asyncio.to_thread(pdf_path.read_bytes)
-            _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
-        except CnDownloadCancelledError:
-            _unlink_temp_pdf(pdf_path, module=module)
-            raise
-        except Exception as exc:
-            _unlink_temp_pdf(pdf_path, module=module)
-            yield DownloadEvent(
-                event_type=DownloadEventType.FILE_FAILED,
-                ticker=ticker,
-                document_id=document_id,
-                payload={
-                    "name": pdf_filename,
-                    "stage": "pdf_read_failed",
-                    "status": "failed",
-                    "reason_code": "pdf_read_failed",
-                    "reason_message": str(exc),
-                },
-            )
-            failed = _build_filing_result(
-                document_id=document_id,
-                status="failed",
-                candidate=candidate,
-                reason_code="pdf_read_failed",
-                reason_message=str(exc),
-                downloaded_files=0,
-                skipped_files=0,
-            )
-            yield DownloadEvent(
-                event_type=DownloadEventType.FILING_FAILED,
-                ticker=ticker,
-                document_id=document_id,
-                payload=_filing_event_payload(failed),
-            )
-            return
-        else:
-            _unlink_temp_pdf(pdf_path, module=module)
+        pdf_bytes = asset.pdf_bytes
         pdf_sha256 = asset.sha256
         reused_pdf = False
     else:
@@ -291,31 +230,36 @@ async def run_cn_download_single_filing_stream(
         pdf_sha256 = _read_required_text(previous_meta, "staging_pdf_sha256")
         reused_pdf = True
 
-    if _can_skip_by_pdf_sha(
+    can_skip_by_pdf_sha = existing_handle is not None and _can_skip_by_pdf_sha(
         previous_meta=previous_meta,
         overwrite=overwrite,
         pdf_sha256=pdf_sha256,
         blob_repository=blob_repository,
-        handle=handle,
+        handle=existing_handle,
         docling_filename=docling_filename,
-    ):
+    )
+    if can_skip_by_pdf_sha:
         _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
-        commit_cn_filing_source_document(
+        primary_document = _read_required_text(previous_meta, "primary_document")
+        file_entries = _read_file_entries(previous_meta)
+        source_fingerprint = _read_required_text(previous_meta, "source_fingerprint")
+        _commit_cn_filing_metadata_batch(
             source_repository=source_repository,
             processed_repository=processed_repository,
             ticker=ticker,
             document_id=document_id,
             internal_document_id=internal_document_id,
             form_type=candidate.fiscal_period,
-            primary_document=_read_required_text(previous_meta, "primary_document"),
-            file_entries=_read_file_entries(previous_meta),
+            primary_document=primary_document,
+            file_entries=file_entries,
             candidate=candidate,
             profile=profile,
             pdf_sha256=pdf_sha256,
             remote_fingerprint=remote_fingerprint,
-            source_fingerprint=_read_required_text(previous_meta, "source_fingerprint"),
+            source_fingerprint=source_fingerprint,
             previous_completed_meta=previous_completed_meta,
-            source_meta_exists=True,
+            cancel_checker=cancel_checker,
+            module=module,
         )
         skipped = _build_filing_result(
             document_id=document_id,
@@ -334,92 +278,6 @@ async def run_cn_download_single_filing_stream(
         )
         return
 
-    if previous_meta is not None and previous_meta.get("ingest_complete") is True and not overwrite:
-        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
-        source_repository.reset_source_document(ticker, document_id, SourceKind.FILING)
-        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
-        update_cn_staging_source_document(
-            source_repository=source_repository,
-            ticker=ticker,
-            document_id=document_id,
-            internal_document_id=internal_document_id,
-            form_type=candidate.fiscal_period,
-            primary_document=pdf_filename,
-            file_entries=[],
-            candidate=candidate,
-            profile=profile,
-            pdf_sha256=None,
-            remote_fingerprint=remote_fingerprint,
-            previous_meta_exists=False,
-        )
-        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
-        previous_meta = None
-        source_meta_exists = True
-        handle = source_repository.get_source_handle(ticker, document_id, SourceKind.FILING)
-
-    if reused_pdf:
-        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
-        pdf_entry_meta = _find_file_meta(blob_repository=blob_repository, handle=handle, filename=pdf_filename)
-    else:
-        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
-        pdf_entry_meta = blob_repository.store_file(
-            handle,
-            pdf_filename,
-            BytesIO(pdf_bytes),
-            content_type=_PDF_CONTENT_TYPE,
-            metadata={"source": _SOURCE_LABEL_ORIGINAL},
-        )
-        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
-    pdf_entry = build_cn_file_entry(
-        filename=pdf_filename,
-        file_meta=pdf_entry_meta,
-        source_label=_SOURCE_LABEL_ORIGINAL,
-    )
-    reusable_docling = _resolve_reusable_docling(
-        blob_repository=blob_repository,
-        handle=handle,
-        docling_filename=docling_filename,
-        previous_meta=previous_meta,
-        remote_fingerprint=remote_fingerprint,
-        pdf_sha256=pdf_sha256,
-        overwrite=overwrite,
-    )
-    staged_docling_meta: FileObjectMeta | None = None
-    staged_docling_entry: JsonObject | None = None
-    if reusable_docling is not None:
-        try:
-            staged_docling_meta = _find_file_meta(
-                blob_repository=blob_repository,
-                handle=handle,
-                filename=docling_filename,
-            )
-        except FileNotFoundError:
-            staged_docling_meta = None
-        if staged_docling_meta is not None:
-            staged_docling_entry = build_cn_file_entry(
-                filename=docling_filename,
-                file_meta=staged_docling_meta,
-                source_label=_SOURCE_LABEL_DOCLING,
-            )
-    staging_entries = [pdf_entry]
-    if staged_docling_entry is not None:
-        staging_entries.append(staged_docling_entry)
-    _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
-    update_cn_staging_source_document(
-        source_repository=source_repository,
-        ticker=ticker,
-        document_id=document_id,
-        internal_document_id=internal_document_id,
-        form_type=candidate.fiscal_period,
-        primary_document=pdf_filename,
-        file_entries=staging_entries,
-        candidate=candidate,
-        profile=profile,
-        pdf_sha256=pdf_sha256,
-        remote_fingerprint=remote_fingerprint,
-        previous_meta_exists=True,
-    )
-    _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
     yield DownloadEvent(
         event_type=DownloadEventType.FILE_DOWNLOADED,
         ticker=ticker,
@@ -434,6 +292,17 @@ async def run_cn_download_single_filing_stream(
     )
 
     _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
+    reusable_docling = None
+    if existing_handle is not None:
+        reusable_docling = _resolve_reusable_docling(
+            blob_repository=blob_repository,
+            handle=existing_handle,
+            docling_filename=docling_filename,
+            previous_meta=previous_meta,
+            remote_fingerprint=remote_fingerprint,
+            pdf_sha256=pdf_sha256,
+            overwrite=overwrite,
+        )
     if reusable_docling is None:
         _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
         yield DownloadEvent(
@@ -478,60 +347,39 @@ async def run_cn_download_single_filing_stream(
             )
             return
         _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
-        docling_meta = blob_repository.store_file(
-            handle,
-            docling_filename,
-            BytesIO(docling_json_bytes),
-            content_type=_JSON_CONTENT_TYPE,
-            metadata={"source": _SOURCE_LABEL_DOCLING, "pdf_sha256": pdf_sha256},
-        )
-        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
         reused_docling = False
         converted = True
     else:
         _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
         docling_json_bytes = reusable_docling
-        if staged_docling_meta is not None:
-            docling_meta = staged_docling_meta
-        else:
-            _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
-            docling_meta = blob_repository.store_file(
-                handle,
-                docling_filename,
-                BytesIO(docling_json_bytes),
-                content_type=_JSON_CONTENT_TYPE,
-                metadata={"source": _SOURCE_LABEL_DOCLING, "pdf_sha256": pdf_sha256},
-            )
-            _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
-        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
         reused_docling = True
         converted = False
-    docling_entry = build_cn_file_entry(
-        filename=docling_filename,
-        file_meta=docling_meta,
-        source_label=_SOURCE_LABEL_DOCLING,
-    )
     source_fingerprint = build_content_fingerprint(
         pdf_bytes=pdf_bytes,
         docling_json_bytes=docling_json_bytes,
     )
     _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
-    commit_cn_filing_source_document(
+    _commit_cn_filing_assets_batch(
         source_repository=source_repository,
+        blob_repository=blob_repository,
         processed_repository=processed_repository,
         ticker=ticker,
         document_id=document_id,
         internal_document_id=internal_document_id,
         form_type=candidate.fiscal_period,
-        primary_document=docling_filename,
-        file_entries=[pdf_entry, docling_entry],
+        pdf_filename=pdf_filename,
+        docling_filename=docling_filename,
+        pdf_bytes=pdf_bytes,
+        docling_json_bytes=docling_json_bytes,
         candidate=candidate,
         profile=profile,
         pdf_sha256=pdf_sha256,
         remote_fingerprint=remote_fingerprint,
         source_fingerprint=source_fingerprint,
         previous_completed_meta=previous_completed_meta,
-        source_meta_exists=source_meta_exists,
+        source_meta_exists=previous_meta is not None,
+        cancel_checker=cancel_checker,
+        module=module,
     )
     downloaded = _build_filing_result(
         document_id=document_id,
@@ -551,6 +399,298 @@ async def run_cn_download_single_filing_stream(
         document_id=document_id,
         payload=_filing_event_payload(downloaded),
     )
+
+
+def _commit_cn_filing_assets_batch(
+    *,
+    source_repository: SourceDocumentRepositoryProtocol,
+    blob_repository: DocumentBlobRepositoryProtocol,
+    processed_repository: ProcessedDocumentRepositoryProtocol,
+    ticker: str,
+    document_id: str,
+    internal_document_id: str,
+    form_type: str,
+    pdf_filename: str,
+    docling_filename: str,
+    pdf_bytes: bytes,
+    docling_json_bytes: bytes,
+    candidate: CnReportCandidate,
+    profile: CnCompanyProfile,
+    pdf_sha256: str,
+    remote_fingerprint: str,
+    source_fingerprint: str,
+    previous_completed_meta: JsonObject | None,
+    source_meta_exists: bool,
+    cancel_checker: Callable[[], bool] | None,
+    module: str,
+) -> None:
+    """在一个 caller-owned batch 内提交 CN/HK filing 的全部持久态。
+
+    Args:
+        source_repository: source 文档仓储及 batch owner 入口。
+        blob_repository: PDF 与 Docling blob 仓储。
+        processed_repository: processed marker 仓储。
+        ticker: 已归一化 ticker。
+        document_id: 文档 ID。
+        internal_document_id: 内部文档 ID。
+        form_type: 财期 form type。
+        pdf_filename: PDF 对象名。
+        docling_filename: Docling JSON 对象名。
+        pdf_bytes: 已在 batch 外完成下载或复用读取的 PDF 字节。
+        docling_json_bytes: 已在 batch 外完成转换或复用读取的 JSON 字节。
+        candidate: 远端候选报告。
+        profile: 公司基础元数据。
+        pdf_sha256: PDF SHA-256。
+        remote_fingerprint: 远端 fingerprint。
+        source_fingerprint: PDF 与 Docling 内容 fingerprint。
+        previous_completed_meta: batch 前的上一版完成态 meta。
+        source_meta_exists: batch 前是否存在待替换 source document。
+        cancel_checker: 可选同步取消检查器。
+        module: 日志模块名。
+
+    Returns:
+        无；返回时 storage ``COMMITTED`` 已成立。
+
+    Raises:
+        CnDownloadCancelledError: batch 内阶段边界命中取消时抛出并回滚。
+        OSError: 任一仓储写入、commit 或 rollback 失败时抛出。
+        RuntimeError: batch/token owner 契约不成立时抛出。
+    """
+
+    token = source_repository.begin_batch(ticker)
+    commit_started = False
+    try:
+        _raise_if_cancelled(
+            module=module,
+            ticker=ticker,
+            document_id=document_id,
+            cancel_checker=cancel_checker,
+        )
+        if source_meta_exists:
+            source_repository.reset_source_document(ticker, document_id, SourceKind.FILING)
+            _raise_if_cancelled(
+                module=module,
+                ticker=ticker,
+                document_id=document_id,
+                cancel_checker=cancel_checker,
+            )
+        update_cn_staging_source_document(
+            source_repository=source_repository,
+            ticker=ticker,
+            document_id=document_id,
+            internal_document_id=internal_document_id,
+            form_type=form_type,
+            primary_document=pdf_filename,
+            file_entries=[],
+            candidate=candidate,
+            profile=profile,
+            pdf_sha256=pdf_sha256,
+            remote_fingerprint=remote_fingerprint,
+            previous_meta_exists=False,
+        )
+        _raise_if_cancelled(
+            module=module,
+            ticker=ticker,
+            document_id=document_id,
+            cancel_checker=cancel_checker,
+        )
+        handle = source_repository.get_source_handle(ticker, document_id, SourceKind.FILING)
+        pdf_meta = blob_repository.store_file(
+            handle,
+            pdf_filename,
+            BytesIO(pdf_bytes),
+            content_type=_PDF_CONTENT_TYPE,
+            metadata={"source": _SOURCE_LABEL_ORIGINAL},
+        )
+        _raise_if_cancelled(
+            module=module,
+            ticker=ticker,
+            document_id=document_id,
+            cancel_checker=cancel_checker,
+        )
+        docling_meta = blob_repository.store_file(
+            handle,
+            docling_filename,
+            BytesIO(docling_json_bytes),
+            content_type=_JSON_CONTENT_TYPE,
+            metadata={"source": _SOURCE_LABEL_DOCLING, "pdf_sha256": pdf_sha256},
+        )
+        _raise_if_cancelled(
+            module=module,
+            ticker=ticker,
+            document_id=document_id,
+            cancel_checker=cancel_checker,
+        )
+        file_entries = [
+            build_cn_file_entry(
+                filename=pdf_filename,
+                file_meta=pdf_meta,
+                source_label=_SOURCE_LABEL_ORIGINAL,
+            ),
+            build_cn_file_entry(
+                filename=docling_filename,
+                file_meta=docling_meta,
+                source_label=_SOURCE_LABEL_DOCLING,
+            ),
+        ]
+        commit_cn_filing_source_document(
+            source_repository=source_repository,
+            processed_repository=processed_repository,
+            ticker=ticker,
+            document_id=document_id,
+            internal_document_id=internal_document_id,
+            form_type=form_type,
+            primary_document=docling_filename,
+            file_entries=file_entries,
+            candidate=candidate,
+            profile=profile,
+            pdf_sha256=pdf_sha256,
+            remote_fingerprint=remote_fingerprint,
+            source_fingerprint=source_fingerprint,
+            previous_completed_meta=previous_completed_meta,
+            source_meta_exists=True,
+        )
+        _raise_if_cancelled(
+            module=module,
+            ticker=ticker,
+            document_id=document_id,
+            cancel_checker=cancel_checker,
+        )
+        # commit_batch 开始后 token 由 storage owner 消费，caller 不再回滚。
+        commit_started = True
+        source_repository.commit_batch(token)
+    finally:
+        if not commit_started:
+            _rollback_cn_batch_preserving_primary(
+                source_repository=source_repository,
+                token=token,
+                operation_error=sys.exception(),
+            )
+
+
+def _commit_cn_filing_metadata_batch(
+    *,
+    source_repository: SourceDocumentRepositoryProtocol,
+    processed_repository: ProcessedDocumentRepositoryProtocol,
+    ticker: str,
+    document_id: str,
+    internal_document_id: str,
+    form_type: str,
+    primary_document: str,
+    file_entries: list[JsonObject],
+    candidate: CnReportCandidate,
+    profile: CnCompanyProfile,
+    pdf_sha256: str,
+    remote_fingerprint: str,
+    source_fingerprint: str,
+    previous_completed_meta: JsonObject | None,
+    cancel_checker: Callable[[], bool] | None,
+    module: str,
+) -> None:
+    """在 caller-owned batch 内提交 PDF-SHA skip 的最终 meta 与 marker。
+
+    Args:
+        source_repository: source 文档仓储及 batch owner 入口。
+        processed_repository: processed marker 仓储。
+        ticker: 已归一化 ticker。
+        document_id: 文档 ID。
+        internal_document_id: 内部文档 ID。
+        form_type: 财期 form type。
+        primary_document: 既有 Docling JSON 主文件名。
+        file_entries: 既有完成态文件条目。
+        candidate: 远端候选报告。
+        profile: 公司基础元数据。
+        pdf_sha256: PDF SHA-256。
+        remote_fingerprint: 当前远端 fingerprint。
+        source_fingerprint: 既有内容 fingerprint。
+        previous_completed_meta: batch 前的完成态 meta。
+        cancel_checker: 可选同步取消检查器。
+        module: 日志模块名。
+
+    Returns:
+        无；返回时 storage ``COMMITTED`` 已成立。
+
+    Raises:
+        CnDownloadCancelledError: batch 内命中取消时抛出并回滚。
+        OSError: meta、processed、commit 或 rollback 失败时抛出。
+        RuntimeError: batch/token owner 契约不成立时抛出。
+    """
+
+    token = source_repository.begin_batch(ticker)
+    commit_started = False
+    try:
+        _raise_if_cancelled(
+            module=module,
+            ticker=ticker,
+            document_id=document_id,
+            cancel_checker=cancel_checker,
+        )
+        commit_cn_filing_source_document(
+            source_repository=source_repository,
+            processed_repository=processed_repository,
+            ticker=ticker,
+            document_id=document_id,
+            internal_document_id=internal_document_id,
+            form_type=form_type,
+            primary_document=primary_document,
+            file_entries=file_entries,
+            candidate=candidate,
+            profile=profile,
+            pdf_sha256=pdf_sha256,
+            remote_fingerprint=remote_fingerprint,
+            source_fingerprint=source_fingerprint,
+            previous_completed_meta=previous_completed_meta,
+            source_meta_exists=True,
+        )
+        _raise_if_cancelled(
+            module=module,
+            ticker=ticker,
+            document_id=document_id,
+            cancel_checker=cancel_checker,
+        )
+        commit_started = True
+        source_repository.commit_batch(token)
+    finally:
+        if not commit_started:
+            _rollback_cn_batch_preserving_primary(
+                source_repository=source_repository,
+                token=token,
+                operation_error=sys.exception(),
+            )
+
+
+def _rollback_cn_batch_preserving_primary(
+    *,
+    source_repository: SourceDocumentRepositoryProtocol,
+    token: BatchToken,
+    operation_error: BaseException | None,
+) -> None:
+    """回滚未进入 commit 的 batch，并保留 operation/rollback 双错误。
+
+    Args:
+        source_repository: 持有 token 的 source 仓储。
+        token: 尚未交给 ``commit_batch`` 的 caller-owned token。
+        operation_error: 当前正在传播的业务异常或取消异常；正常 return 时为
+            ``None``。
+
+    Returns:
+        无。
+
+    Raises:
+        BaseException: operation 与 rollback 都失败时重新抛出 operation，并以
+            rollback 为 cause；仅 rollback 失败时原样抛出 rollback 异常。
+    """
+
+    try:
+        source_repository.rollback_batch(token)
+    except Exception as rollback_error:
+        if operation_error is not None:
+            operation_error.add_note(
+                "rollback_batch failed; recovery evidence retained: "
+                f"{rollback_error}"
+            )
+            raise operation_error from rollback_error
+        raise
 
 
 def _safe_get_source_meta(
@@ -621,21 +761,6 @@ def _resolve_previous_completed_meta(
     if previous_meta.get("ingest_complete") is not True:
         return None
     return previous_meta
-
-
-def _should_reset_before_download(
-    *,
-    previous_meta: JsonObject | None,
-    remote_fingerprint: str,
-    overwrite: bool,
-) -> bool:
-    """判断进入下载分支前是否应 reset 单个 source document。"""
-
-    if overwrite or previous_meta is None:
-        return False
-    if previous_meta.get("ingest_complete") is True:
-        return False
-    return previous_meta.get("staging_remote_fingerprint") != remote_fingerprint
 
 
 def _resolve_reusable_pdf(
@@ -729,20 +854,6 @@ def _can_skip_by_pdf_sha(
     if previous_meta.get("pdf_sha256") != pdf_sha256:
         return False
     return has_blob_file(blob_repository=blob_repository, handle=handle, filename=docling_filename)
-
-
-def _find_file_meta(
-    *,
-    blob_repository: DocumentBlobRepositoryProtocol,
-    handle: SourceHandle,
-    filename: str,
-) -> FileObjectMeta:
-    """从 blob 仓储中查找指定文件元数据。"""
-
-    for item in blob_repository.list_files(handle):
-        if item.uri.rsplit("/", 1)[-1] == filename:
-            return item
-    raise FileNotFoundError(f"文件不存在: {filename}")
 
 
 def _read_file_entries(meta: JsonObject | None) -> list[JsonObject]:
@@ -860,15 +971,6 @@ def _coerce_json_value(value: JsonValue) -> JsonValue:
     if isinstance(value, dict):
         return {str(key): _coerce_json_value(item) for key, item in value.items()}
     return str(value)
-
-
-def _unlink_temp_pdf(path: Path, *, module: str) -> None:
-    """删除 downloader 暂存 PDF。"""
-
-    try:
-        path.unlink(missing_ok=True)
-    except OSError as exc:
-        Log.warn(f"删除临时 PDF 失败: path={path} error={exc}", module=module)
 
 
 def _raise_if_cancelled(

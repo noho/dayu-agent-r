@@ -66,6 +66,7 @@ from dayu.host.durable.state import (
 from dayu.host.api import ResolveWaitFailedOutcome
 from dayu.host.wait_adapter import WaitPollReady
 from dayu.fins.domain.document_models import (
+    BatchToken,
     CompanyMeta,
     SourceDocumentUpsertRequest,
     now_iso8601,
@@ -101,12 +102,36 @@ from dayu.fins.storage import (
     FsBatchingRepository,
     FsCompanyMetaRepository,
     FsDocumentBlobRepository,
+    FsFilingMaintenanceRepository,
+    FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
     SourceDocumentRepositoryProtocol,
 )
-from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
+from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 from dayu.fins.ticker_normalization import NormalizedTicker
 from dayu.fins.tools.read_runtime import FinsReadRuntime
+
+
+class _CommitFailingDownloadSourceRepository(FsSourceDocumentRepository):
+    """模拟 storage 消费 token 后抛出 generic download commit 异常。"""
+
+    def __init__(self, workspace_root: Path, repository_set: _FsRepositorySet) -> None:
+        """初始化 commit failure source spy。"""
+
+        super().__init__(workspace_root, repository_set=repository_set)
+        self.caller_rollback_calls = 0
+
+    def commit_batch(self, token: BatchToken) -> None:
+        """由 storage owner 回滚并消费 token 后抛出 commit 主异常。"""
+
+        FsSourceDocumentRepository.rollback_batch(self, token)
+        raise OSError("forced generic commit failure")
+
+    def rollback_batch(self, token: BatchToken) -> None:
+        """记录不应发生的 caller 二次 rollback。"""
+
+        self.caller_rollback_calls += 1
+        super().rollback_batch(token)
 
 
 def test_direct_event_text_helper_owns_result_titles_and_failure_messages() -> None:
@@ -1241,6 +1266,86 @@ def test_store_downloaded_document_overwrite_failure_rolls_back_target_scope(tmp
 
     assert runtime.source_repository.get_source_meta("AAPL", "aapl-2024-10k", SourceKind.FILING) == old_meta
     assert runtime.source_repository.get_source_meta("AAPL", "aapl-2024-10q-00", SourceKind.FILING) == non_target_meta
+
+
+def test_store_downloaded_document_create_failure_leaves_document_absent(tmp_path: Path) -> None:
+    """generic download create 的 blob 校验失败必须回滚 source 与 blob。"""
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    runtime = _build_ingestion_runtime(workspace_root, executor=_HoldingExecutor())
+    document = FinsDownloadedSourceDocument(
+        source_kind=SourceKind.FILING,
+        document_id="aapl-new-10k",
+        internal_document_id="aapl-new-10k",
+        form_type="10-K",
+        primary_document="aapl-new-10k.md",
+        meta={"form_type": "10-K"},
+        files=(FinsDownloadedFile(filename="", content=b"broken"),),
+    )
+
+    with pytest.raises(ValueError, match="filename 不能为空"):
+        runtime._store_downloaded_document(
+            ticker="AAPL",
+            document=document,
+            overwrite_existing=False,
+            rebuild_processed=False,
+        )
+
+    with pytest.raises(FileNotFoundError):
+        runtime.source_repository.get_source_meta(
+            "AAPL",
+            "aapl-new-10k",
+            SourceKind.FILING,
+        )
+
+
+def test_store_downloaded_document_commit_failure_does_not_caller_rollback(tmp_path: Path) -> None:
+    """generic commit 失败后 caller 不得对 storage-owned token 二次 rollback。"""
+
+    workspace_root = tmp_path / "fins-workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    source_repository = _CommitFailingDownloadSourceRepository(workspace_root, repository_set)
+    default_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    runtime = ingestion_runtime.FinsIngestionRuntime.create(
+        source_repository=source_repository,
+        blob_repository=FsDocumentBlobRepository(workspace_root, repository_set=repository_set),
+        filing_maintenance_repository=FsFilingMaintenanceRepository(
+            workspace_root,
+            repository_set=repository_set,
+        ),
+        processed_repository=FsProcessedDocumentRepository(
+            workspace_root,
+            repository_set=repository_set,
+        ),
+        processor_registry=default_runtime.processor_registry,
+        job_store=default_runtime.ingestion_job_store,
+        executor=_HoldingExecutor(),
+    )
+    document = FinsDownloadedSourceDocument(
+        source_kind=SourceKind.FILING,
+        document_id="aapl-commit-failed",
+        internal_document_id="aapl-commit-failed",
+        form_type="10-K",
+        primary_document="report.md",
+        meta={"form_type": "10-K"},
+        files=(FinsDownloadedFile(filename="report.md", content=b"report"),),
+    )
+
+    with pytest.raises(OSError, match="forced generic commit failure"):
+        runtime._store_downloaded_document(
+            ticker="AAPL",
+            document=document,
+            overwrite_existing=False,
+            rebuild_processed=False,
+        )
+
+    assert source_repository.caller_rollback_calls == 0
+    with pytest.raises(FileNotFoundError):
+        source_repository.get_source_meta(
+            "AAPL",
+            "aapl-commit-failed",
+            SourceKind.FILING,
+        )
 
 
 def test_start_download_allows_sec_amended_form_type(tmp_path: Path) -> None:

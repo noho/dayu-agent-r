@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Final, Literal, Optional, TypeAlias
 
 from dayu.fins.domain.filing_semantics import FiscalPeriod
@@ -234,19 +233,19 @@ class DownloadedReportAsset:
     """downloader 完成 PDF 下载后返回的强类型资产对象。
 
     与 ``CnReportCandidate`` 相比新增"已下载内容"事实：sha256、字节数、
-    本地暂存路径、下载时间戳。``sha256`` 是 PDF 字节内容的 SHA-256，与
+    PDF 字节、下载时间戳。``sha256`` 是 PDF 字节内容的 SHA-256，与
     ``previous_meta.pdf_sha256`` 比对即可决定是否走 PDF skip。
 
     Attributes:
         candidate: 对应的远端候选元数据。
-        pdf_path: PDF 暂存的本地路径；workflow 层取出字节后会 ``unlink``。
+        pdf_bytes: 已下载并完成 PDF 校验的原始字节。
         sha256: PDF 字节内容的 SHA-256（小写 hex）。
         content_length: 实际写入的字节数。
         downloaded_at: ISO-8601 ``YYYY-MM-DDTHH:MM:SS+00:00`` UTC 时间戳。
     """
 
     candidate: CnReportCandidate
-    pdf_path: Path
+    pdf_bytes: bytes
     sha256: str
     content_length: int
     downloaded_at: str

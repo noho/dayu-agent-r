@@ -108,8 +108,8 @@ class CnReportDiscoveryClientProtocol(Protocol):
         """下载单份候选 PDF 并返回强类型资产对象。
 
         实现层负责 ``%PDF-`` magic bytes 校验、最小长度校验、Content-Type
-        校验、必要的 retry / sleep。返回值 ``pdf_path`` 指向本地暂存路径，
-        workflow 层取字节后会自行 ``unlink``。
+        校验、必要的 retry / sleep。返回值直接携带已校验的 ``pdf_bytes``，
+        downloader 不创建临时文件。
 
         Args:
             candidate: 单份候选远端元数据。

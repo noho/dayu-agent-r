@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
 from typing import TypeAlias
@@ -1071,8 +1072,8 @@ def test_download_report_pdf_returns_asset_for_valid_pdf() -> None:
 
     assert asset.candidate == candidate
     assert asset.content_length == len(pdf_payload)
-    assert asset.pdf_path.read_bytes() == pdf_payload
-    asset.pdf_path.unlink()
+    assert asset.pdf_bytes == pdf_payload
+    assert asset.sha256 == hashlib.sha256(pdf_payload).hexdigest()
 
 
 def test_download_report_pdf_does_not_sleep_before_first_request() -> None:
@@ -1108,7 +1109,7 @@ def test_download_report_pdf_does_not_sleep_before_first_request() -> None:
     asset = client.download_report_pdf(candidate)
 
     assert sleep_calls == []
-    asset.pdf_path.unlink()
+    assert asset.pdf_bytes == pdf_payload
 
 
 def test_download_report_pdf_throttles_between_successful_requests() -> None:
@@ -1145,12 +1146,12 @@ def test_download_report_pdf_throttles_between_successful_requests() -> None:
 
     assert len(sleep_calls) == 1
     assert 0 < sleep_calls[0] <= 0.3
-    first.pdf_path.unlink()
-    second.pdf_path.unlink()
+    assert first.pdf_bytes == pdf_payload
+    assert second.pdf_bytes == pdf_payload
 
 
-def test_download_report_pdf_uses_unique_temp_paths_for_same_candidate() -> None:
-    """同一披露易 candidate 重复下载也应落到不同临时文件路径。"""
+def test_download_report_pdf_repeated_calls_return_complete_bytes() -> None:
+    """同一披露易 candidate 重复下载均返回完整且自洽的内存资产。"""
 
     pdf_payload = _build_pdf_payload()
 
@@ -1176,11 +1177,10 @@ def test_download_report_pdf_uses_unique_temp_paths_for_same_candidate() -> None
     first = client.download_report_pdf(candidate)
     second = client.download_report_pdf(candidate)
 
-    assert first.pdf_path != second.pdf_path
-    assert first.pdf_path.exists()
-    assert second.pdf_path.exists()
-    first.pdf_path.unlink()
-    second.pdf_path.unlink()
+    assert first.pdf_bytes == pdf_payload
+    assert second.pdf_bytes == pdf_payload
+    assert first.sha256 == second.sha256
+    assert first.content_length == second.content_length == len(pdf_payload)
 
 
 def test_download_report_pdf_rejects_short_or_non_pdf_payload() -> None:

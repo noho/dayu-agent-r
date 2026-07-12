@@ -1109,9 +1109,8 @@ def test_download_report_pdf_returns_asset_with_sha256() -> None:
     import hashlib
 
     assert asset.sha256 == hashlib.sha256(payload).hexdigest()
-    assert asset.pdf_path.exists()
-    assert asset.pdf_path.read_bytes().startswith(b"%PDF-")
-    asset.pdf_path.unlink()
+    assert asset.pdf_bytes == payload
+    assert len(asset.pdf_bytes) == asset.content_length
 
 
 def test_download_report_pdf_does_not_sleep_before_first_request() -> None:
@@ -1132,7 +1131,7 @@ def test_download_report_pdf_does_not_sleep_before_first_request() -> None:
     asset = client.download_report_pdf(_make_candidate())
 
     assert sleep_calls == []
-    asset.pdf_path.unlink()
+    assert asset.pdf_bytes == payload
 
 
 def test_download_report_pdf_throttles_between_successful_requests() -> None:
@@ -1155,12 +1154,12 @@ def test_download_report_pdf_throttles_between_successful_requests() -> None:
 
     assert len(sleep_calls) == 1
     assert 0 < sleep_calls[0] <= 0.3
-    first.pdf_path.unlink()
-    second.pdf_path.unlink()
+    assert first.pdf_bytes == payload
+    assert second.pdf_bytes == payload
 
 
-def test_download_report_pdf_uses_unique_temp_paths_for_same_candidate() -> None:
-    """同一 candidate 并发/重复下载也应落到不同临时文件路径。"""
+def test_download_report_pdf_repeated_calls_return_complete_bytes() -> None:
+    """同一 candidate 重复下载均应返回完整且自洽的内存资产。"""
 
     payload = _build_pdf_payload()
 
@@ -1171,11 +1170,10 @@ def test_download_report_pdf_uses_unique_temp_paths_for_same_candidate() -> None
     first = client.download_report_pdf(_make_candidate())
     second = client.download_report_pdf(_make_candidate())
 
-    assert first.pdf_path != second.pdf_path
-    assert first.pdf_path.exists()
-    assert second.pdf_path.exists()
-    first.pdf_path.unlink()
-    second.pdf_path.unlink()
+    assert first.pdf_bytes == payload
+    assert second.pdf_bytes == payload
+    assert first.sha256 == second.sha256
+    assert first.content_length == second.content_length == len(payload)
 
 
 def test_download_report_pdf_rejects_short_content() -> None:
