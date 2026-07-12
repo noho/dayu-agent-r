@@ -16,6 +16,7 @@ from dayu.host._wait_observation import (
 from dayu.host.command import HostCommandHandle, create_host_command_handle
 from dayu.host.durable.state import WaitPollLastOutcome, WaitRecordRow, WaitRecordStatus
 from dayu.host.wait_adapter import (
+    WaitAdapterSnapshot,
     WaitExternalJobLifecycleApplied,
     WaitExternalJobLifecycleAction,
     WaitExternalJobLifecycleResult,
@@ -56,29 +57,29 @@ class _BlockingAdapter:
         self.poll_calls = 0
         self.abandon_calls = 0
 
-    def poll_wait(self, wait_record: WaitRecordRow) -> WaitPollResult:
+    def poll_wait(self, snapshot: WaitAdapterSnapshot) -> WaitPollResult:
         """阻塞 poll 直到测试释放。
 
-        :param wait_record: immutable wait snapshot。
+        :param snapshot: adapter snapshot。
         :returns: not-ready 结果。
         """
 
-        del wait_record
+        del snapshot
         self.poll_calls += 1
         self.poll_entered.set()
         self.poll_release.wait()
         return WaitPollNotReady()
 
     def abandon_wait(
-        self, wait_record: WaitRecordRow
+        self, snapshot: WaitAdapterSnapshot
     ) -> WaitExternalJobLifecycleResult:
         """阻塞 abandon 直到测试释放。
 
-        :param wait_record: immutable cancelled wait snapshot。
+        :param snapshot: adapter snapshot。
         :returns: applied 结果；超时后该结果必须被 dropped。
         """
 
-        del wait_record
+        del snapshot
         self.abandon_calls += 1
         self.abandon_entered.set()
         self.abandon_release.wait()

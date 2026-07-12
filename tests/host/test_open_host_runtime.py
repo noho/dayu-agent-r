@@ -79,7 +79,6 @@ from dayu.host.durable.options import (
     PayloadStoragePolicy,
 )
 from dayu.host.durable.outbox import read_outbox_terminal_items_after
-from dayu.host.durable.state import WaitRecordRow
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.context_policy import default_context_budget_policy
 from dayu.host.memory import default_memory_projection_policy
@@ -102,6 +101,7 @@ from dayu.host.recovery import (
     StartupRecoveryScanResult,
 )
 from dayu.host.wait_adapter import (
+    WaitAdapterSnapshot,
     WaitExternalJobLifecycleResult,
     WaitPollAdapterRegistration,
     WaitPollAdapterRegistry,
@@ -473,14 +473,14 @@ class _ReadyPollAdapter:
 
         self.poll_count = 0
 
-    def poll_wait(self, wait_record: WaitRecordRow) -> WaitPollResult:
+    def poll_wait(self, snapshot: WaitAdapterSnapshot) -> WaitPollResult:
         """记录 poll 并返回 completed result。
 
-        :param wait_record: wait record。
+        :param snapshot: adapter snapshot。
         :returns: ready poll result。
         """
 
-        del wait_record
+        del snapshot
         self.poll_count += 1
         return WaitPollReady(
             ResolveWaitCompletedOutcome(
@@ -494,16 +494,16 @@ class _ReadyPollAdapter:
         )
 
     def abandon_wait(
-        self, wait_record: WaitRecordRow
+        self, snapshot: WaitAdapterSnapshot
     ) -> WaitExternalJobLifecycleResult:
         """本测试不处理 cancelled wait。
 
-        :param wait_record: wait record。
+        :param snapshot: adapter snapshot。
         :returns: applied lifecycle result。
         :raises AssertionError: 被错误调用时抛出。
         """
 
-        raise AssertionError(f"unexpected abandon {wait_record.wait_id}")
+        raise AssertionError(f"unexpected abandon {snapshot.resume_token}")
 
 
 @pytest.mark.asyncio

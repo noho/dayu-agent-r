@@ -50,21 +50,10 @@ from dayu.fins.ingestion_events import (
     FinsIngestionJobEventRecord,
     FinsIngestionJobEventType,
 )
-from dayu.fins.ingestion.wait_adapter import FinsIngestionWaitPollAdapter
-from dayu.fins.ingestion.wait_adapter import FINS_INGESTION_WAIT_ADAPTER_KEY
 from dayu.fins.ingestion.observation_handle import (
     FinsObservationHandle,
     FinsObservationStatus,
 )
-from dayu.fins.tools.download_tools import DOWNLOAD_TOOL_NAME
-from dayu.host.durable.state import (
-    ExternalJobRef,
-    WaitRecordRow,
-    WaitRecordStatus,
-    WaitResumePolicy,
-)
-from dayu.host.api import ResolveWaitFailedOutcome
-from dayu.host.wait_adapter import WaitPollReady
 from dayu.fins.domain.document_models import (
     BatchToken,
     CompanyMeta,
@@ -2785,10 +2774,10 @@ def test_cancel_and_activate_share_observation_lock_without_timing_sleep(
     assert executor.operations == []
 
 
-def test_activation_submit_failure_is_observed_as_failed_by_wait_adapter(
+def test_activation_submit_failure_terminalizes_prepared_observation(
     tmp_path: Path,
 ) -> None:
-    """activation submit failure 必须转为 FAILED，且现有 wait adapter 可观察。"""
+    """activation submit failure 必须把 prepared observation 转为 FAILED。"""
 
     workspace_root = tmp_path / "fins-workspace"
     runtime = _build_ingestion_runtime(
@@ -2802,13 +2791,9 @@ def test_activation_submit_failure_is_observed_as_failed_by_wait_adapter(
 
     with pytest.raises(OSError):
         runtime.activate_observation(handle)
+    snapshot = asyncio.run(runtime.poll_observation(handle))
 
-    poll = FinsIngestionWaitPollAdapter(runtime=runtime).poll_wait(
-        _observation_wait_record(handle, DOWNLOAD_TOOL_NAME)
-    )
-
-    assert isinstance(poll, WaitPollReady)
-    assert isinstance(poll.outcome, ResolveWaitFailedOutcome)
+    assert snapshot.status is FinsObservationStatus.FAILED
 
 
 def test_unexpected_activation_exception_terminalizes_prepared_observation(
@@ -4034,56 +4019,6 @@ def _build_ingestion_runtime(
         executor=executor,
         download_adapters=download_adapters,
         upload_runner=upload_runner,
-    )
-
-
-def _observation_wait_record(
-    handle: FinsObservationHandle,
-    tool_name: str,
-) -> WaitRecordRow:
-    """构造 observation wait adapter 测试用 Host wait record。
-
-    Args:
-        handle: Fins observation handle。
-        tool_name: awaiting 工具名。
-
-    Returns:
-        Host wait record row。
-
-    Raises:
-        ValueError: 字段非法时由 Host durable 类型抛出。
-    """
-
-    return WaitRecordRow(
-        wait_id=f"wait-{handle.handle_id}",
-        session_id="session-fins",
-        run_id="run-fins",
-        attempt_id="attempt-fins",
-        execution_id="execution-fins",
-        tool_call_id=f"call-{tool_name}",
-        tool_name=tool_name,
-        adapter_key=FINS_INGESTION_WAIT_ADAPTER_KEY,
-        await_kind="external_job",
-        resume_policy=WaitResumePolicy.POLL,
-        resume_token=handle.handle_id,
-        snapshot_ref=None,
-        external_job_ref=ExternalJobRef(
-            adapter_key=FINS_INGESTION_WAIT_ADAPTER_KEY,
-            external_job_id=handle.handle_id,
-        ),
-        accept_idempotency_key=f"accept-{handle.handle_id}",
-        resolve_idempotency_key=None,
-        resolve_semantic_digest=None,
-        deadline_at=None,
-        expires_at=None,
-        status=WaitRecordStatus.WAITING,
-        created_event_id=f"event-created-{handle.handle_id}",
-        created_event_sequence=1,
-        updated_event_id=f"event-updated-{handle.handle_id}",
-        updated_event_sequence=1,
-        created_at="2026-01-01T00:00:00Z",
-        updated_at="2026-01-01T00:00:00Z",
-        terminal_at=None,
     )
 
 

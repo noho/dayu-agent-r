@@ -39,7 +39,7 @@ from dayu.fins.ingestion.observation_handle import (
     FinsObservationStatus,
     parse_observation_handle_id_token,
 )
-from dayu.fins.ingestion.wait_adapter import (
+from dayu.service.fins_wait_adapter import (
     FINS_INGESTION_WAIT_ADAPTER_KEY,
     FinsIngestionWaitActivationAdapter,
     FinsIngestionWaitPollAdapter,

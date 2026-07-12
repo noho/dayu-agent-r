@@ -10,7 +10,6 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol
 from uuid import uuid4
 
 from dayu.contracts import (
@@ -72,6 +71,7 @@ from dayu.host.memory import default_memory_projection_policy
 from dayu.host.wait_adapter import (
     WaitAdapterBinding,
     WaitAdapterRegistry,
+    WaitAdapterSnapshot,
     WaitExternalJobLifecycleResult,
     WaitExternalJobLifecycleUnsupported,
     WaitExternalJobRefSource,
@@ -400,15 +400,15 @@ class _GatedReadyPollAdapter:
 
         self._gate.set()
 
-    def poll_wait(self, wait_record: "_OpaqueWaitInput") -> WaitPollResult:
+    def poll_wait(self, snapshot: WaitAdapterSnapshot) -> WaitPollResult:
         """按测试门控返回未就绪或完成结果。
 
-        :param wait_record: Host 传入的等待快照；本 smoke 不读取其字段。
+        :param snapshot: Host 传入的等待快照；本 smoke 不读取其字段。
         :returns: poll 结果。
         :raises Exception: 不主动抛出异常。
         """
 
-        del wait_record
+        del snapshot
         if not self._gate.is_set():
             self.not_ready_count += 1
             return WaitPollNotReady()
@@ -425,21 +425,17 @@ class _GatedReadyPollAdapter:
         )
 
     def abandon_wait(
-        self, wait_record: "_OpaqueWaitInput"
+        self, snapshot: WaitAdapterSnapshot
     ) -> WaitExternalJobLifecycleResult:
         """返回当前 smoke 不支持外部放弃动作。
 
-        :param wait_record: Host 传入的等待快照；本 smoke 不读取其字段。
+        :param snapshot: Host 传入的等待快照；本 smoke 不读取其字段。
         :returns: unsupported 结果。
         :raises Exception: 不主动抛出异常。
         """
 
-        del wait_record
+        del snapshot
         return WaitExternalJobLifecycleUnsupported(reason="not-supported-in-smoke")
-
-
-class _OpaqueWaitInput(Protocol):
-    """poll adapter 不消费字段的入参协议。"""
 
 
 class _AwaitingThenAnswerWorkerFactory:

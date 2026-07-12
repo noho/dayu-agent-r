@@ -109,7 +109,7 @@ UI / Service 调用 `open_host(options)` 得到 Host handle，先 ensure / creat
 
 ### 工具与 Fins
 
-Engine 只看到调用方传入的 `tool_schemas` 与 `ToolExecutor`。Host ToolRuntime 把业务 `ToolBundle` 包装成受治理的 batch executor，负责权限、截断、等待、重复调用治理、diagnostic、payload descriptor 和 accept barrier。Fins 工具通过共享 `DefaultFinsRuntime.get_read_runtime()` 与 `DefaultFinsRuntime.get_ingestion_runtime()` 复用同一套仓储、处理器注册表和 ingestion runtime；工具触发的 download、preprocess 与 upload 长事务通过 lightweight observation handle 接入 Host wait-resume。CLI 等 direct 数据命令不创建 Host Run，也不创建 CLI-facing durable job；它们在 Service/Fins boundary 内消费普通 `AsyncIterator[FinsEvent]`，运行中输出 `PROGRESS`，终态由唯一 `RESULT` 收口，取消走当前 operation-scoped cancellation。
+Engine 只看到调用方传入的 `tool_schemas` 与 `ToolExecutor`。Host ToolRuntime 把业务 `ToolBundle` 包装成受治理的 batch executor，负责权限、截断、等待、重复调用治理、diagnostic、payload descriptor 和 accept barrier。Fins 工具通过共享 `DefaultFinsRuntime.get_read_runtime()` 与 `DefaultFinsRuntime.get_ingestion_runtime()` 复用同一套仓储、处理器注册表和 ingestion runtime；工具触发的 download、preprocess 与 upload 长事务通过 lightweight observation handle 和 Service-owned wait adapter 接入 Host wait-resume。CLI 等 direct 数据命令不创建 Host Run，也不创建 CLI-facing durable job；它们在 Service/Fins boundary 内消费普通 `AsyncIterator[FinsEvent]`，运行中输出 `PROGRESS`，终态由唯一 `RESULT` 收口，取消走当前 operation-scoped cancellation。
 
 ### Wait / resume
 

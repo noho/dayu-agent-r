@@ -20,6 +20,7 @@ from uuid import uuid4
 
 from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
 from dayu.host.api import (
+    HOST_WAIT_RESUME_TOKEN_MAX_LENGTH,
     HostCallContext,
     ResolveWaitLostOutcome,
     ResolveWaitOutcome,
@@ -229,13 +230,47 @@ WaitPollResult: TypeAlias = WaitPollNotReady | WaitPollReady | WaitPollLost
 """poll adapter 单次观察结果封闭联合。"""
 
 
+class WaitAdapterSnapshotProjectionError(ValueError):
+    """Host wait row 投影为 adapter snapshot 失败。"""
+
+
+@dataclass(frozen=True, slots=True)
+class WaitAdapterSnapshot:
+    """投影给外部 wait adapter 的最小 Host snapshot。
+
+    :param tool_name: 等待所属工具名。
+    :param resume_token: Host durable row 中保存的 opaque resume token。
+    :param created_at: Host durable row 创建时间，已解析为 UTC aware datetime。
+    """
+
+    tool_name: str
+    resume_token: str
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        """校验 adapter snapshot 基础字段。
+
+        :returns: ``None``。
+        :raises ValueError: 字段为空、类型非法或时间无时区时抛出。
+        """
+
+        if self.tool_name.strip() == "":
+            raise ValueError("tool_name must be non-empty")
+        if self.resume_token.strip() == "":
+            raise ValueError("resume_token must be non-empty")
+        if len(self.resume_token) > HOST_WAIT_RESUME_TOKEN_MAX_LENGTH:
+            raise ValueError("resume_token is too long")
+        if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
+            raise ValueError("created_at must be timezone-aware")
+
+
 class WaitPollAdapter(Protocol):
     """外部等待系统 poll adapter 端口。"""
 
-    def poll_wait(self, wait_record: WaitRecordRow) -> WaitPollResult:
+    def poll_wait(self, snapshot: WaitAdapterSnapshot) -> WaitPollResult:
         """在 Host transaction 外观察外部 job 状态。
 
-        :param wait_record: 当前 wait record 快照。
+        :param snapshot: Host 投影给 adapter 的最小快照。
         :returns: poll 结果。
         :raises Exception: adapter 可在外部系统调用失败时抛出普通异常。
         """
@@ -243,11 +278,11 @@ class WaitPollAdapter(Protocol):
         ...
 
     def abandon_wait(
-        self, wait_record: WaitRecordRow
+        self, snapshot: WaitAdapterSnapshot
     ) -> WaitExternalJobLifecycleResult:
         """在 wait 已取消时执行 best-effort 外部 job lifecycle 动作。
 
-        :param wait_record: 已取消 wait record 快照。
+        :param snapshot: Host 投影给 adapter 的最小快照。
         :returns: typed lifecycle 结果；applied、unsupported 与 no-op 都是终态诊断。
         :raises Exception: adapter 可在临时外部系统调用失败时抛出普通异常。
         """
@@ -1043,8 +1078,20 @@ class WaitPoller:
                     error_message=record.adapter_key.value,
                 )
                 continue
+            try:
+                adapter_snapshot = _adapter_snapshot_from_wait_record(record)
+            except WaitAdapterSnapshotProjectionError as exc:
+                adapter_errors += 1
+                claim_conflicts += self._release_with_backoff(
+                    record,
+                    claim_id,
+                    outcome=WaitPollLastOutcome.ADAPTER_ERROR,
+                    error_code=_POLL_ERROR_CODE_ADAPTER_EXCEPTION,
+                    error_message=exc.__class__.__name__,
+                )
+                continue
             observation = self._observation_runner.observe(
-                partial(adapter.poll_wait, record),
+                partial(adapter.poll_wait, adapter_snapshot),
                 timeout_seconds=self._policy.adapter_call_timeout_seconds,
             )
             if isinstance(observation, WaitObservationFailed):
@@ -1285,8 +1332,23 @@ class WaitPoller:
                 ),
                 0,
             )
+        try:
+            adapter_snapshot = _adapter_snapshot_from_wait_record(record)
+        except WaitAdapterSnapshotProjectionError as exc:
+            return (
+                0,
+                1,
+                self._release_with_backoff(
+                    record,
+                    claim_id,
+                    outcome=WaitPollLastOutcome.ABANDON_ERROR,
+                    error_code=_POLL_ERROR_CODE_ABANDON_EXCEPTION,
+                    error_message=exc.__class__.__name__,
+                ),
+                0,
+            )
         observation = self._observation_runner.observe(
-            partial(adapter.abandon_wait, record),
+            partial(adapter.abandon_wait, adapter_snapshot),
             timeout_seconds=self._policy.adapter_call_timeout_seconds,
         )
         if isinstance(observation, WaitObservationFailed):
@@ -2192,6 +2254,42 @@ def _new_poll_claim_id() -> str:
     return f"poll-claim-{uuid4()}"
 
 
+def _adapter_snapshot_from_wait_record(record: WaitRecordRow) -> WaitAdapterSnapshot:
+    """把 Host durable wait row 投影为 adapter-facing snapshot。
+
+    :param record: Host durable wait row。
+    :returns: adapter-facing 最小 snapshot。
+    :raises WaitAdapterSnapshotProjectionError: resume token 或创建时间非法时抛出。
+    """
+
+    try:
+        _validate_adapter_snapshot_resume_token(record.resume_token)
+        created_at = parse_utc_timestamp(record.created_at)
+        return WaitAdapterSnapshot(
+            tool_name=record.tool_name,
+            resume_token=record.resume_token,
+            created_at=created_at,
+        )
+    except (TypeError, ValueError) as exc:
+        raise WaitAdapterSnapshotProjectionError(
+            "wait record cannot be projected to adapter snapshot"
+        ) from exc
+
+
+def _validate_adapter_snapshot_resume_token(resume_token: str) -> None:
+    """校验 Host wait adapter snapshot 的 resume token 边界。
+
+    :param resume_token: durable wait row 中的 resume token。
+    :returns: ``None``。
+    :raises ValueError: token 为空或超过 Host public 上限时抛出。
+    """
+
+    if resume_token.strip() == "":
+        raise ValueError("resume_token must be non-empty")
+    if len(resume_token) > HOST_WAIT_RESUME_TOKEN_MAX_LENGTH:
+        raise ValueError("resume_token is too long")
+
+
 def _new_poller_owner_id() -> str:
     """生成 poller owner id。
 
@@ -2206,6 +2304,8 @@ __all__ = [
     "WaitActivationAdapterRegistration",
     "WaitActivationRegistry",
     "WaitActivationRequest",
+    "WaitAdapterSnapshot",
+    "WaitAdapterSnapshotProjectionError",
     "WaitAdapterBinding",
     "WaitAdapterRegistry",
     "WaitExternalJobLifecycleAction",
@@ -2230,4 +2330,5 @@ __all__ = [
     "WaitPollResult",
     "WaitPoller",
     "WaitResolvePort",
+    "WaitResumePolicy",
 ]

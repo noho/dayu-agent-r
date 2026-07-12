@@ -1,8 +1,8 @@
-"""Fins awaiting observation 到 Host wait-resume contract 的适配器。
+"""Service 层 Fins awaiting observation 到 Host wait-resume contract 的适配器。
 
-本模块只把 Fins lightweight observation handle 投影为 Host 已有等待契约，
-不改变 Host/Engine public contract，也不恢复 durable job record、event
-sidecar 或 cursor 语义。
+本模块位于 Service composition boundary，只把 Host 投影出的最小 wait
+adapter snapshot 映射到 Fins lightweight observation runtime；不读取 Host
+durable row、durable store、state mutator 或 Fins storage。
 """
 
 from __future__ import annotations
@@ -53,13 +53,13 @@ from dayu.host.api import (
     ResolveWaitLostOutcome,
     WaitAdapterKey,
 )
-from dayu.host.durable.state import WaitRecordRow, WaitResumePolicy
 from dayu.host.wait_adapter import (
     WaitActivationAdapterRegistration,
     WaitActivationRegistry,
     WaitActivationRequest,
     WaitAdapterBinding,
     WaitAdapterRegistry,
+    WaitAdapterSnapshot,
     WaitExternalJobLifecycleAction,
     WaitExternalJobLifecycleApplied,
     WaitExternalJobLifecycleNoop,
@@ -71,6 +71,7 @@ from dayu.host.wait_adapter import (
     WaitPollNotReady,
     WaitPollReady,
     WaitPollResult,
+    WaitResumePolicy,
 )
 
 FINS_INGESTION_WAIT_ADAPTER_KEY: Final[WaitAdapterKey] = WaitAdapterKey(
@@ -135,31 +136,33 @@ class FinsIngestionWaitPollAdapter:
         ).get_ingestion_runtime()
         return cls(runtime=runtime)
 
-    def poll_wait(self, wait_record: WaitRecordRow) -> WaitPollResult:
+    def poll_wait(self, snapshot: WaitAdapterSnapshot) -> WaitPollResult:
         """观察 Fins lightweight observation 并映射为 Host wait poll 结果。
 
-        :param wait_record: Host wait record 快照。
+        :param snapshot: Host 投影出的最小 wait adapter snapshot。
         :returns: 未就绪、可 resolve 或 lost 的 poll 结果。
         :raises Exception: 非 observation 缺失、损坏或 transient 类异常会按
             Host poller 约定向外抛出并计入 adapter error。
         """
 
-        handle = _handle_from_wait_record(wait_record)
+        handle = _handle_from_snapshot(snapshot)
         if handle is None:
             return WaitPollLost(_lost_outcome())
         try:
-            snapshot = _run_async_observation(self.runtime.poll_observation(handle))
+            observation_snapshot = _run_async_observation(
+                self.runtime.poll_observation(handle)
+            )
         except FinsObservationPollError as exc:
-            return _poll_error_result(wait_record, exc)
-        return _poll_snapshot_result(wait_record, snapshot)
+            return _poll_error_result(exc)
+        return _poll_snapshot_result(snapshot.tool_name, observation_snapshot)
 
     def abandon_wait(
         self,
-        wait_record: WaitRecordRow,
+        snapshot: WaitAdapterSnapshot,
     ) -> WaitExternalJobLifecycleResult:
         """Host 放弃 wait 后 best-effort 取消并释放 Fins observation。
 
-        :param wait_record: 已取消的 Host wait record 快照。
+        :param snapshot: Host 投影出的最小 wait adapter snapshot。
         :returns: Host 外部 job lifecycle typed 结果；Fins 当前只在释放本地
             observation handle 后返回 ``ABANDON`` applied，无法继续处理时返回
             no-op。
@@ -167,14 +170,16 @@ class FinsIngestionWaitPollAdapter:
             交给 Host poller 退避重试。
         """
 
-        handle = _handle_from_wait_record(wait_record)
+        handle = _handle_from_snapshot(snapshot)
         if handle is None:
             return WaitExternalJobLifecycleNoop(
                 reason=_ABANDON_REASON_INVALID_OBSERVATION_HANDLE
             )
         try:
-            snapshot = _run_async_observation(self.runtime.cancel_observation(handle))
-            if snapshot.status is FinsObservationStatus.LOST:
+            observation_snapshot = _run_async_observation(
+                self.runtime.cancel_observation(handle)
+            )
+            if observation_snapshot.status is FinsObservationStatus.LOST:
                 return WaitExternalJobLifecycleNoop(
                     reason=_ABANDON_REASON_OBSERVATION_MISSING
                 )
@@ -351,23 +356,23 @@ def _binding_for_tool_name(tool_name: str) -> WaitAdapterBinding:
     )
 
 
-def _handle_from_wait_record(wait_record: WaitRecordRow) -> FinsObservationHandle | None:
-    """从 Host wait record 恢复 typed observation handle。
+def _handle_from_snapshot(snapshot: WaitAdapterSnapshot) -> FinsObservationHandle | None:
+    """从 Host adapter snapshot 恢复 typed observation handle。
 
-    :param wait_record: Host wait record 快照。
+    :param snapshot: Host 投影出的最小 wait adapter snapshot。
     :returns: observation handle；token 损坏或工具名不支持时返回 ``None``。
     :raises Exception: 不主动抛出异常。
     """
 
     try:
-        handle_id = parse_observation_handle_id_token(wait_record.resume_token)
-        operation_kind = _operation_kind_from_tool_name(wait_record.tool_name)
+        handle_id = parse_observation_handle_id_token(snapshot.resume_token)
+        operation_kind = _operation_kind_from_tool_name(snapshot.tool_name)
     except ValueError:
         return None
     return FinsObservationHandle(
         handle_id=handle_id,
         operation_kind=operation_kind,
-        created_at=_timestamp_or_now(wait_record.created_at),
+        created_at=snapshot.created_at,
     )
 
 
@@ -389,12 +394,10 @@ def _operation_kind_from_tool_name(tool_name: str) -> FinsOperationKind:
 
 
 def _poll_error_result(
-    wait_record: WaitRecordRow,
     exc: FinsObservationPollError,
 ) -> WaitPollResult:
     """把 observation poll 错误映射为 Host poll result。
 
-    :param wait_record: Host wait record 快照。
     :param exc: observation poll 分类异常。
     :returns: poll result。
     :raises Exception: 不主动抛出异常。
@@ -417,12 +420,12 @@ def _observation_error_reason(error_kind: FinsObservationPollErrorKind) -> str:
 
 
 def _poll_snapshot_result(
-    wait_record: WaitRecordRow,
+    tool_name: str,
     snapshot: FinsObservationSnapshot,
 ) -> WaitPollResult:
     """把 observation snapshot 映射为 Host poll result。
 
-    :param wait_record: Host wait record 快照。
+    :param tool_name: 原等待工具名。
     :param snapshot: observation snapshot。
     :returns: poll result。
     :raises ValueError: terminal snapshot 缺少 result 时由 outcome 构造抛出。
@@ -431,11 +434,11 @@ def _poll_snapshot_result(
     if snapshot.status in {FinsObservationStatus.PENDING, FinsObservationStatus.RUNNING}:
         return WaitPollNotReady()
     if snapshot.status is FinsObservationStatus.SUCCEEDED:
-        return WaitPollReady(_completed_outcome(wait_record.tool_name, snapshot))
+        return WaitPollReady(_completed_outcome(tool_name, snapshot))
     if snapshot.status is FinsObservationStatus.FAILED:
-        return WaitPollReady(_failed_outcome(wait_record.tool_name, snapshot))
+        return WaitPollReady(_failed_outcome(tool_name, snapshot))
     if snapshot.status is FinsObservationStatus.CANCELLED:
-        return WaitPollReady(_cancelled_outcome(wait_record.tool_name, snapshot))
+        return WaitPollReady(_cancelled_outcome(tool_name, snapshot))
     return WaitPollLost(_lost_outcome())
 
 
@@ -583,26 +586,7 @@ def _result_meta(tool_name: str, snapshot: FinsObservationSnapshot) -> ToolResul
     )
 
 
-def _timestamp_or_now(value: str) -> datetime:
-    """把 Host UTC 字符串转成 aware datetime。
-
-    :param value: Host wait record 时间戳。
-    :returns: timezone-aware UTC datetime。
-    :raises Exception: 不主动抛出异常；非法输入回退为当前 UTC 时间。
-    """
-
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return datetime.now(timezone.utc)
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
-def _run_async_observation(
-    operation: Coroutine[object, object, _ASYNC_RESULT_T],
-) -> _ASYNC_RESULT_T:
+def _run_async_observation(operation: Coroutine[None, None, _ASYNC_RESULT_T]) -> _ASYNC_RESULT_T:
     """在 sync Host adapter 内执行 observation runtime async 方法。
 
     :param operation: observation runtime coroutine。

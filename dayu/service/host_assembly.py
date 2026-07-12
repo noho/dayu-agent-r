@@ -26,7 +26,7 @@ from dayu.engine import AgentPolicy
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.engine.provider_extensions import provider_request_extension_from_json
 from dayu.fins.ingestion.observation_handle import FinsObservationRuntime
-from dayu.fins.ingestion.wait_adapter import (
+from dayu.service.fins_wait_adapter import (
     FINS_DOWNLOAD_AWAITING_TOOL_NAME,
     FINS_PREPROCESS_AWAITING_TOOL_NAME,
     FINS_UPLOAD_AWAITING_TOOL_NAME,

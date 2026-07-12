@@ -26,6 +26,7 @@ from dayu.host.command import HostCommandHandle, create_host_command_handle, exp
 from dayu.host._wait_observation import WaitObservationRunner
 from dayu.host.durable.state import WaitPollLastOutcome, WaitRecordRow, WaitRecordStatus
 from dayu.host.wait_adapter import (
+    WaitAdapterSnapshot,
     WaitExternalJobLifecycleAction,
     WaitExternalJobLifecycleApplied,
     WaitExternalJobLifecycleResult,
@@ -252,29 +253,29 @@ class _SequenceAdapter:
         self.poll_started_at: list[float] = []
         self.abandoned: list[str] = []
 
-    def poll_wait(self, wait_record: WaitRecordRow) -> WaitPollResult:
+    def poll_wait(self, snapshot: WaitAdapterSnapshot) -> WaitPollResult:
         """返回下一项 poll 结果。
 
-        :param wait_record: wait record。
+        :param snapshot: adapter snapshot。
         :returns: poll 结果。
         """
 
-        del wait_record
+        del snapshot
         self.poll_started_at.append(time.monotonic())
         index = min(self.poll_count, len(self._results) - 1)
         self.poll_count += 1
         return self._results[index]
 
     def abandon_wait(
-        self, wait_record: WaitRecordRow
+        self, snapshot: WaitAdapterSnapshot
     ) -> WaitExternalJobLifecycleResult:
         """记录 abandon wait。
 
-        :param wait_record: wait record。
+        :param snapshot: adapter snapshot。
         :returns: applied lifecycle result。
         """
 
-        self.abandoned.append(wait_record.wait_id)
+        self.abandoned.append(snapshot.resume_token)
         return WaitExternalJobLifecycleApplied(
             action=WaitExternalJobLifecycleAction.ABANDON,
             message="test_abandoned",
@@ -294,30 +295,30 @@ class _BlockingReadyAdapter:
         self.release = threading.Event()
         self.poll_count = 0
 
-    def poll_wait(self, wait_record: WaitRecordRow) -> WaitPollResult:
+    def poll_wait(self, snapshot: WaitAdapterSnapshot) -> WaitPollResult:
         """等待测试释放后返回 ready。
 
-        :param wait_record: wait record。
+        :param snapshot: adapter snapshot。
         :returns: ready poll 结果。
         """
 
-        del wait_record
+        del snapshot
         self.poll_count += 1
         self.entered.set()
         self.release.wait()
         return _ready_result()
 
     def abandon_wait(
-        self, wait_record: WaitRecordRow
+        self, snapshot: WaitAdapterSnapshot
     ) -> WaitExternalJobLifecycleResult:
         """本测试 adapter 不处理 cancelled wait。
 
-        :param wait_record: wait record。
+        :param snapshot: adapter snapshot。
         :returns: ``None``。
         :raises AssertionError: 被错误调用时抛出。
         """
 
-        raise AssertionError(f"unexpected abandon {wait_record.wait_id}")
+        raise AssertionError(f"unexpected abandon {snapshot.resume_token}")
 
 
 class _FailingAdapterRegistry(WaitPollAdapterRegistry):

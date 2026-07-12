@@ -13,13 +13,14 @@
 - `dayu.service.entrypoint_runtime`：为 product entrypoint 提供 reusable Agent runtime helper，覆盖 runtime 准备、Session ensure/create、submit 前 live watcher attach、terminal observation outbox fallback、interactive existing-session startup reconnect、cancel request 构造与 watcher failure 诊断；该模块不解析 CLI 参数，不保存 CLI cursor，不处理 stdout/stderr，也不安装 signal handler。
 - `dayu.service.scene_context`：为 product entrypoint 生成 LLM-facing context slot 文本，覆盖财报分析对象、当前时间、显式 FMP key 下的公司名增强和 FMP 失败时的 ticker-only fallback；该模块不读取 CLI 参数，不向 LLM 投影 FMP 错误文本。
 - `dayu.service.fins_direct`：为 product entrypoint 提供 reusable Fins direct stream helper，覆盖 download / preprocess / upload 的 typed request 构造、`AsyncIterator[FinsEvent]` 透传、terminal result 收口和 operation-scoped cancellation；该模块不解析 CLI 参数，不处理 stdout/stderr，也不读取 Fins storage。
+- `dayu.service.fins_wait_adapter`：为 Host production wait poller 提供 Fins awaiting observation integration，负责把 Host `WaitAdapterSnapshot` 映射到 Fins `FinsObservationRuntime` 的 activate / poll / cancel / abandon 入口；该模块不读取 Host durable row / store / state mutator，也不读取 Fins storage。
 
 `compose_open_host_options(request)` 会把选中的 execution profile 映射为 Host typed inputs：`tool_truncation_policy` 决定 ToolRuntime 截断默认值，`tool_duplicate_governance_policy` 决定 `HostToolingOptions.duplicate_governance_policy`，`agent_policy` 决定 ordinary run baseline 的 Agent loop policy。
 Service 从模型配置构造 `RunnerSpec` 时默认启用 OpenAI-compatible client correlation policy，使 ordinary baseline 与 compactor baseline 的 Runner 调用都携带可由 Engine 映射的客户端调试关联 id；静态 `X-Client-Request-Id` header 冲突由 RunnerSpec 边界 fail fast。
 
 工具发现 provider 不读取全局 runtime config，也不自行推断 workspace。调用方负责把 raw config 与运行时参数装配为 effective spec；例如 Fins provider 的 `workspace_root` 可以来自 overlay 显式配置，也可以由调用方通过 `assemble_effective_tool_provider_configs(...)` 使用当前 `workspace_root` 注入到 provider spec。
 
-`discover_service_tools(...)` 返回的 `ServiceDiscoveredTools` 会携带本次 discovery 实际使用的 effective provider configs。`compose_open_host_options(...)` 复用这份结果绑定 Host tooling / wait adapter，避免工具闭包和等待适配器从两份 raw config 各自推断运行时参数。
+`discover_service_tools(...)` 返回的 `ServiceDiscoveredTools` 会携带本次 discovery 实际使用的 effective provider configs。`compose_open_host_options(...)` 复用这份结果绑定 Host tooling 与 Service-owned Fins wait adapter，避免工具闭包和等待适配器从两份 raw config 各自推断运行时参数。
 
 `entrypoint_runtime` 在完成工具发现与 scene prepare 后，会按本次 `PreparedSceneInputs.tool_selection.tool_names` 判断 product entrypoint 是否实际暴露 Fins download / preprocess / upload awaiting 长事务工具；命中时自动为 Host opener 补齐 production `WaitPollerRuntimePolicy`，并复用同一 discovery 结果中的 `HostToolingOptions.wait_poll_adapter_registry`。未选择这些长事务工具的 scene（例如 prompt）保持 no-poller；Host 的默认 `OpenHostOptions.wait_poller_policy=None` 契约不变。
 
@@ -37,4 +38,5 @@ Service 从模型配置构造 `RunnerSpec` 时默认启用 OpenAI-compatible cli
 
 - Service 可以依赖 Host / Engine public contracts，但不得修改 Host truth 或绕过 Host public API。
 - `dayu.runtime` 不得依赖 `dayu.service`；公共层中立能力应继续放在 `dayu.runtime`。
-- 财报文档存取仍只能通过 `dayu.fins.storage` 仓储协议完成；本包只允许在 approved Fins Service boundary 中调用 `DefaultFinsRuntime` / `FinsIngestionRuntime`，不得直接读取财报仓储。
+- 财报文档存取仍只能通过 `dayu.fins.storage` 仓储协议完成；本包只允许在 approved Fins Service boundary 中调用 `DefaultFinsRuntime` / `FinsIngestionRuntime` / `FinsObservationRuntime`，不得直接读取财报仓储。
+- Service-owned Fins wait adapter 只消费 Host `WaitAdapterSnapshot`、`WaitActivationRequest` 与 wait adapter public outcome 类型；不得导入 `dayu.host.durable` 或从 Host durable row 推断 deadline / expiry / state mutator 语义。
