@@ -18,7 +18,6 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import TracebackType
 from typing import Final, TypeAlias, TypeVar, cast
 
 from dayu.contracts.cancellation import CancellationToken
@@ -431,6 +430,9 @@ class LaneController:
         self._held_tokens: dict[tuple[str, str], LaneClaimToken] = {}
         self._waiters: set[asyncio.Event] = set()
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._heartbeat_stopped = False
+        self._close_lock = asyncio.Lock()
+        self._close_task: asyncio.Task[None] | None = None
         self._heartbeat_interval_seconds = min(
             item.heartbeat_interval_seconds for item in configs
         )
@@ -567,30 +569,82 @@ class LaneController:
         :param reason: 关闭原因，会传给 pending acquire 的 cancelled outcome。
         :returns: ``None``。
         :raises RuntimeLaneError: SQLite release 操作失败时抛出。
+        :raises asyncio.CancelledError: caller 取消等待时透传；private cleanup 继续。
         """
 
-        if self._close_completed:
-            return
         self._closed = True
-        if reason is not None:
+        if reason is not None and self._close_reason is None:
             self._close_reason = reason
         self._wake_waiters()
-        tokens = tuple(self._held_tokens.values())
-        first_release_error: RuntimeLaneError | None = None
-        for lane_token in tokens:
+        async with self._close_lock:
+            if self._close_completed:
+                return
+            close_task = self._close_task
+            if close_task is None or close_task.done():
+                close_task = asyncio.create_task(self._run_close_attempt())
+                self._close_task = close_task
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError:
+            close_task.add_done_callback(_observe_cancelled_lane_close_task)
+            raise
+
+    async def _run_close_attempt(self) -> None:
+        """执行一次 single-flight lane cleanup attempt。
+
+        heartbeat 与各 held token 是独立 checkpoint。普通异常只记录首错，
+        仍继续尝试其它 token；成功 token 由既有 release owner 从 held 集合移除，
+        failed token 留待下一次 close 补偿。
+
+        :returns: ``None``。
+        :raises Exception: heartbeat stop 或 token release 的首个普通异常。
+        """
+
+        first_error: Exception | None = None
+        if not self._heartbeat_stopped:
+            try:
+                await self._stop_heartbeat_once()
+            except Exception as exc:
+                first_error = exc
+
+        for lane_token in tuple(self._held_tokens.values()):
             try:
                 await lane_token.release()
-            except RuntimeLaneError as exc:
-                if first_release_error is None:
-                    first_release_error = exc
-        heartbeat_task = self._heartbeat_task
-        if heartbeat_task is not None and heartbeat_task is not asyncio.current_task():
-            heartbeat_task.cancel()
-            with _suppress_cancelled_error():
-                await heartbeat_task
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+
+        if first_error is not None:
+            raise first_error
+        if not self._heartbeat_stopped:
+            raise RuntimeLaneError("runtime lane heartbeat 尚未完成 close cleanup")
+        if self._held_tokens:
+            raise RuntimeLaneError("runtime lane close 后仍存在 held token")
         self._close_completed = True
-        if first_release_error is not None:
-            raise first_release_error
+
+    async def _stop_heartbeat_once(self) -> None:
+        """停止并回收 controller heartbeat task。
+
+        :returns: ``None``。
+        :raises RuntimeLaneError: heartbeat 试图关闭自身时抛出。
+        :raises Exception: heartbeat task 的非取消异常原样抛出。
+        """
+
+        heartbeat_task = self._heartbeat_task
+        if heartbeat_task is None:
+            self._heartbeat_stopped = True
+            return
+        if heartbeat_task is asyncio.current_task():
+            raise RuntimeLaneError("runtime lane heartbeat task 不能关闭自身")
+        if not heartbeat_task.done():
+            heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if heartbeat_task.done():
+                self._heartbeat_stopped = True
 
     async def _try_claim_once(self, lane_config: LaneConfig) -> _ClaimAttempt:
         """执行一次 SQLite 短事务 claim。
@@ -1042,7 +1096,8 @@ class LaneController:
         if self._heartbeat_error is None:
             self._heartbeat_error = error
         self._closed = True
-        self._close_reason = _CLOSE_REASON_HEARTBEAT_ERROR
+        if self._close_reason is None:
+            self._close_reason = _CLOSE_REASON_HEARTBEAT_ERROR
         self._wake_waiters()
 
     def _raise_heartbeat_error_if_present(self) -> None:
@@ -1091,36 +1146,24 @@ class LaneController:
         return lane_config
 
 
-class _suppress_cancelled_error:
-    """压制 ``asyncio.CancelledError`` 的局部 context manager。
+def _observe_cancelled_lane_close_task(task: asyncio.Future[None]) -> None:
+    """消费 caller cancellation 后 private lane close task 的最终异常。
 
-    该 helper 只用于 close 等 cleanup 路径，避免引入 ``contextlib.suppress``
-    对 ``BaseException`` 子类类型推断不稳定的问题。
+    :param task: caller 已停止等待的 single-flight close task。
+    :returns: ``None``。
     """
 
-    def __enter__(self) -> None:
-        """进入 context manager。
-
-        :returns: ``None``。
-        """
-
-        return None
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> bool:
-        """退出 context manager，并只压制 ``asyncio.CancelledError``。
-
-        :param exc_type: 异常类型。
-        :param exc: 异常实例。
-        :param tb: traceback。
-        :returns: 若异常是 ``asyncio.CancelledError`` 返回 ``True``。
-        """
-
-        return exc_type is asyncio.CancelledError
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except Exception as exc:
+        _LOGGER.warning(
+            "runtime_lane.close_cleanup_failed_after_caller_cancel "
+            "error_type=%s",
+            exc.__class__.__name__,
+            exc_info=exc,
+        )
 
 
 async def _await_task_after_outer_cancellation(

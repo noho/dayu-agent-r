@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import multiprocessing
 import multiprocessing.queues
 import os
@@ -23,6 +24,7 @@ from dayu.runtime.numeric import is_non_negative_finite_number
 _DEFAULT_PROCESS_POLL_INTERVAL_SECONDS = 0.02
 _DEFAULT_CLOSE_KILL_GRACE_SECONDS: Final[float] = 0.2
 _PROCESS_GROUP_CLEANUP_SUPPORTED: Final[bool] = os.name == "posix"
+_LOGGER = logging.getLogger(__name__)
 
 
 class InterruptibleProcessTarget(Protocol):
@@ -250,6 +252,37 @@ class _ProcessFailed:
 _ProcessMessage: TypeAlias = _ProcessSucceeded | _ProcessFailed
 
 
+@dataclass(slots=True)
+class _ProcessCleanupProgress:
+    """进程 handle 各资源 cleanup checkpoint。
+
+    每个字段只在对应 documented cleanup API 成功返回后置为 ``True``；失败
+    后的下一次 close 只补未完成步骤。
+    """
+
+    signal_completed: bool = False
+    process_join_completed: bool = False
+    process_close_completed: bool = False
+    queue_close_completed: bool = False
+    queue_cancel_join_completed: bool = False
+    queue_join_completed: bool = False
+
+    def is_completed(self) -> bool:
+        """返回所有 cleanup checkpoint 是否完成。
+
+        :returns: 所有步骤完成时返回 ``True``。
+        """
+
+        return (
+            self.signal_completed
+            and self.process_join_completed
+            and self.process_close_completed
+            and self.queue_close_completed
+            and self.queue_cancel_join_completed
+            and self.queue_join_completed
+        )
+
+
 class InterruptibleProcessHandle:
     """可 interrupt 的本地子进程 handle。"""
 
@@ -270,7 +303,12 @@ class InterruptibleProcessHandle:
             args=(target, self._result_queue),
         )
         self._started = False
+        self._start_completed = False
         self._closed = False
+        self._cleanup_completed = False
+        self._cleanup_progress = _ProcessCleanupProgress()
+        self._cleanup_lock = asyncio.Lock()
+        self._cleanup_task: asyncio.Task[None] | None = None
 
     def start(self) -> None:
         """启动子进程。
@@ -279,10 +317,13 @@ class InterruptibleProcessHandle:
         :raises RuntimeError: 重复启动时抛出。
         """
 
+        if self._closed:
+            raise RuntimeError("interruptible process has already been closed")
         if self._started:
             raise RuntimeError("interruptible process has already started")
         self._started = True
         self._process.start()
+        self._start_completed = True
 
     async def wait(self, timeout_seconds: float | None) -> ProcessWaitResult:
         """等待子进程完成或 timeout。
@@ -380,19 +421,141 @@ class InterruptibleProcessHandle:
         :returns: ``None``。
         :raises TypeError: ``kill_grace_seconds`` 是 bool 或非数值时抛出。
         :raises ValueError: ``kill_grace_seconds`` 为负数、NaN 或无穷时抛出。
+        :raises RuntimeError: process / queue cleanup 未完成时抛出。
+        :raises asyncio.CancelledError: caller 取消等待时透传；private cleanup 继续。
         """
 
         _validate_grace_seconds(kill_grace_seconds)
-        if self._closed:
-            return
         self._closed = True
-        if self._started and self._process.is_alive():
-            await self.kill(grace_seconds=kill_grace_seconds)
-        if self._started:
-            await asyncio.to_thread(self._process.join, 0)
-            self._process.close()
-        self._result_queue.close()
-        await asyncio.to_thread(self._result_queue.join_thread)
+        async with self._cleanup_lock:
+            if self._cleanup_completed:
+                return
+            cleanup_task = self._cleanup_task
+            if cleanup_task is None or cleanup_task.done():
+                cleanup_task = asyncio.create_task(
+                    self._run_cleanup_attempt(
+                        kill_grace_seconds=kill_grace_seconds
+                    )
+                )
+                self._cleanup_task = cleanup_task
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            cleanup_task.add_done_callback(_observe_cancelled_close_cleanup_task)
+            raise
+
+    async def _run_cleanup_attempt(self, *, kill_grace_seconds: float) -> None:
+        """执行一次可恢复的 resource cleanup attempt。
+
+        process 与 queue checkpoint 相互独立；任一步普通异常都会被记录为首错，
+        但不会阻止后续 checkpoint。本 task 不由 public caller 直接取消。
+
+        :param kill_grace_seconds: process signal / join 的有限等待预算。
+        :returns: ``None``。
+        :raises Exception: cleanup checkpoint 的首个普通异常。
+        """
+
+        first_error: Exception | None = None
+        try:
+            process_may_have_spawned = self._process_may_have_spawned()
+        except Exception as exc:
+            first_error = exc
+            # 无法读取 partial-start 状态时 fail-safe 尝试 documented process
+            # cleanup；各步骤自己的异常仍不会阻止 queue cleanup。
+            process_may_have_spawned = True
+
+        if not self._cleanup_progress.signal_completed:
+            try:
+                if process_may_have_spawned and self._process.is_alive():
+                    interrupt_result = await interrupt_multiprocessing_process(
+                        self._process,
+                        signal_kind=ProcessCleanupSignal.KILL,
+                        grace_seconds=kill_grace_seconds,
+                    )
+                    if not interrupt_result.exited:
+                        raise RuntimeError(
+                            "interruptible process did not exit after cleanup kill"
+                        )
+                self._cleanup_progress.signal_completed = True
+            except Exception as exc:
+                first_error = _first_cleanup_error(first_error, exc)
+
+        if (
+            self._cleanup_progress.signal_completed
+            and not self._cleanup_progress.process_join_completed
+        ):
+            try:
+                if process_may_have_spawned:
+                    await asyncio.to_thread(
+                        self._process.join,
+                        kill_grace_seconds,
+                    )
+                    if self._process.is_alive():
+                        raise RuntimeError(
+                            "interruptible process remained alive after cleanup join"
+                        )
+                self._cleanup_progress.process_join_completed = True
+            except Exception as exc:
+                first_error = _first_cleanup_error(first_error, exc)
+
+        if (
+            self._cleanup_progress.process_join_completed
+            and not self._cleanup_progress.process_close_completed
+        ):
+            try:
+                self._process.close()
+                self._cleanup_progress.process_close_completed = True
+            except Exception as exc:
+                first_error = _first_cleanup_error(first_error, exc)
+
+        if not self._cleanup_progress.queue_close_completed:
+            try:
+                self._result_queue.close()
+                self._cleanup_progress.queue_close_completed = True
+            except Exception as exc:
+                first_error = _first_cleanup_error(first_error, exc)
+
+        if not self._cleanup_progress.queue_cancel_join_completed:
+            try:
+                # Queue.join_thread() 没有 timeout 参数；先使用 documented
+                # cancel-join gate，避免 feeder 异常时产生无界 close 等待。
+                self._result_queue.cancel_join_thread()
+                self._cleanup_progress.queue_cancel_join_completed = True
+            except Exception as exc:
+                first_error = _first_cleanup_error(first_error, exc)
+
+        if (
+            self._cleanup_progress.queue_cancel_join_completed
+            and not self._cleanup_progress.queue_join_completed
+        ):
+            try:
+                await asyncio.to_thread(self._result_queue.join_thread)
+                self._cleanup_progress.queue_join_completed = True
+            except Exception as exc:
+                first_error = _first_cleanup_error(first_error, exc)
+
+        if first_error is not None:
+            raise first_error
+        if not self._cleanup_progress.is_completed():
+            raise RuntimeError("interruptible process cleanup remained incomplete")
+        self._cleanup_completed = True
+
+    def _process_may_have_spawned(self) -> bool:
+        """判断 process cleanup API 是否需要按已 spawn 路径执行。
+
+        本判断只选择 documented cleanup 操作，绝不恢复同一 handle 的 start
+        权限；任何 start exception 后 ``_started`` gate 都保持不变。
+
+        :returns: start 已成功，或失败后仍可观察到 child PID 时返回 ``True``。
+        :raises Exception: 非 documented process state 异常原样抛出。
+        """
+
+        if self._start_completed:
+            return True
+        try:
+            return self._process.pid is not None
+        except (AssertionError, ValueError, OSError):
+            return False
 
     def _read_message(self) -> _ProcessMessage | None:
         """读取单条 worker 消息。
@@ -412,8 +575,47 @@ class InterruptibleProcessHandle:
         :raises RuntimeError: 子进程尚未启动时抛出。
         """
 
-        if not self._started:
+        if not self._start_completed:
             raise RuntimeError("interruptible process has not started")
+
+
+def _first_cleanup_error(
+    current: Exception | None,
+    candidate: Exception,
+) -> Exception:
+    """保留 cleanup attempt 的首个普通异常。
+
+    :param current: 已记录的首错；尚无错误时为 ``None``。
+    :param candidate: 当前 checkpoint 异常。
+    :returns: ``current`` 或首次出现的 ``candidate``。
+    """
+
+    if current is not None:
+        return current
+    return candidate
+
+
+def _observe_cancelled_close_cleanup_task(task: asyncio.Future[None]) -> None:
+    """消费 caller cancellation 后 private cleanup task 的最终异常。
+
+    task 仍保存在 handle 上，后续 close 可以读取同一结果或启动补偿 attempt；
+    observer 仅避免无人再次 close 时产生未观察异常。
+
+    :param task: caller 已停止等待的 private cleanup task。
+    :returns: ``None``。
+    """
+
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except Exception as exc:
+        _LOGGER.warning(
+            "interruptible_process.close_cleanup_failed_after_caller_cancel "
+            "error_type=%s",
+            exc.__class__.__name__,
+            exc_info=exc,
+        )
 
 
 def _run_process_target(

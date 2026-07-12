@@ -1395,6 +1395,7 @@ async def test_close_best_effort_release_continues_after_one_release_failure(
     assert isinstance(first, LaneAcquired)
     assert isinstance(second, LaneAcquired)
     original_release_claim_sync = controller._release_claim_sync
+    release_attempts: dict[str, int] = {}
 
     def fail_first_release(lane_name: str, claim_id: str) -> None:
         """只让第一枚 token 的 release 失败。
@@ -1405,7 +1406,8 @@ async def test_close_best_effort_release_continues_after_one_release_failure(
         :raises RuntimeLaneError: 第一枚 token release 时抛出。
         """
 
-        if claim_id == first.token.claim_id:
+        release_attempts[claim_id] = release_attempts.get(claim_id, 0) + 1
+        if claim_id == first.token.claim_id and release_attempts[claim_id] == 1:
             raise RuntimeLaneError(_CLOSE_RELEASE_FAILED_MESSAGE)
         original_release_claim_sync(lane_name, claim_id)
 
@@ -1417,6 +1419,153 @@ async def test_close_best_effort_release_continues_after_one_release_failure(
     assert _claim_count(db_path) == 1
     assert first.token.released is False
     assert second.token.released is True
+    assert controller._close_completed is False
+    assert set(controller._held_tokens) == {
+        (first.token.name, first.token.claim_id)
+    }
+
+    await controller.close(reason="ignored-second-reason")
+
+    assert _claim_count(db_path) == 0
+    assert first.token.released is True
+    assert controller._held_tokens == {}
+    assert controller._close_completed is True
+    assert controller._close_reason == "shutdown"
+    assert release_attempts[first.token.claim_id] == 2
+    assert release_attempts[second.token.claim_id] == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_close_and_caller_cancel_share_single_cleanup_task(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """并发 close 共享 cleanup；一个 caller 取消不影响 token 最终 release。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    """
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    controller = await LaneController.open(
+        [_lane_config()], coordinator=_coordinator(db_path)
+    )
+    acquired = await controller.acquire(_LANE_NAME, timeout_seconds=0)
+    assert isinstance(acquired, LaneAcquired)
+    release_started = Event()
+    finish_release = Event()
+    release_calls = 0
+    stop_heartbeat_calls = 0
+    original_release = controller._release_claim_sync
+    original_stop_heartbeat = controller._stop_heartbeat_once
+
+    def blocked_release(lane_name: str, claim_id: str) -> None:
+        """阻塞唯一 release checkpoint。
+
+        :param lane_name: lane 名称。
+        :param claim_id: claim id。
+        :returns: ``None``。
+        """
+
+        nonlocal release_calls
+        release_calls += 1
+        release_started.set()
+        assert finish_release.wait(_THREAD_EVENT_TIMEOUT_SECONDS) is True
+        original_release(lane_name, claim_id)
+
+    async def counted_stop_heartbeat() -> None:
+        """记录 heartbeat stop attempt 并委托真实 owner。
+
+        :returns: ``None``。
+        """
+
+        nonlocal stop_heartbeat_calls
+        stop_heartbeat_calls += 1
+        await original_stop_heartbeat()
+
+    monkeypatch.setattr(controller, "_release_claim_sync", blocked_release)
+    monkeypatch.setattr(controller, "_stop_heartbeat_once", counted_stop_heartbeat)
+
+    first = asyncio.create_task(controller.close(reason="first-reason"))
+    await _wait_for_thread_event(release_started)
+    second = asyncio.create_task(controller.close(reason="second-reason"))
+    await asyncio.sleep(0)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    finish_release.set()
+    await second
+
+    assert release_calls == 1
+    assert stop_heartbeat_calls == 1
+    assert acquired.token.released is True
+    assert controller._held_tokens == {}
+    assert controller._heartbeat_stopped is True
+    assert controller._close_completed is True
+    assert controller._close_reason == "first-reason"
+    assert _claim_count(db_path) == 0
+
+
+@pytest.mark.asyncio
+async def test_concurrent_close_callers_share_failure_then_retry_remaining_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """并发 close 观察同一 failure，后续 close 只重试 failed token。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    """
+
+    db_path = tmp_path / "runtime_lanes.sqlite3"
+    controller = await LaneController.open(
+        [_lane_config()], coordinator=_coordinator(db_path)
+    )
+    acquired = await controller.acquire(_LANE_NAME, timeout_seconds=0)
+    assert isinstance(acquired, LaneAcquired)
+    release_started = Event()
+    finish_release = Event()
+    release_calls = 0
+    original_release = controller._release_claim_sync
+
+    def fail_first_release(lane_name: str, claim_id: str) -> None:
+        """首次 release 阻塞后失败，第二次成功。
+
+        :param lane_name: lane 名称。
+        :param claim_id: claim id。
+        :returns: ``None``。
+        :raises RuntimeLaneError: 首次调用抛出。
+        """
+
+        nonlocal release_calls
+        release_calls += 1
+        if release_calls == 1:
+            release_started.set()
+            assert finish_release.wait(_THREAD_EVENT_TIMEOUT_SECONDS) is True
+            raise RuntimeLaneError(_CLOSE_RELEASE_FAILED_MESSAGE)
+        original_release(lane_name, claim_id)
+
+    monkeypatch.setattr(controller, "_release_claim_sync", fail_first_release)
+    first = asyncio.create_task(controller.close(reason="shared-failure"))
+    await _wait_for_thread_event(release_started)
+    second = asyncio.create_task(controller.close(reason="ignored"))
+    await asyncio.sleep(0)
+    finish_release.set()
+    outcomes = await asyncio.gather(first, second, return_exceptions=True)
+
+    assert isinstance(outcomes[0], RuntimeLaneError)
+    assert outcomes[0] is outcomes[1]
+    assert controller._close_completed is False
+    assert acquired.token.released is False
+    assert release_calls == 1
+
+    await controller.close(reason="ignored-retry")
+
+    assert release_calls == 2
+    assert acquired.token.released is True
+    assert controller._close_completed is True
+    assert controller._close_reason == "shared-failure"
+    assert _claim_count(db_path) == 0
 
 
 @pytest.mark.asyncio

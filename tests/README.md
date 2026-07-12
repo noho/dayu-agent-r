@@ -117,11 +117,13 @@ CLI import boundary 测试通过 AST 阻止 `session` command 从 `prompt` / `in
 - numeric / cancellation：覆盖有限数值公共判断，以及取消等待 helper 的完成、取消、timeout/poll interval 非有限值拒绝与异常传播语义。
 - interruptible process：覆盖 process-backed 子进程完成、terminate / kill、cleanup grace 校验、POSIX 安全进程组
   cleanup 清理嵌套子进程，以及 unsupported、PID / pgid 不可用、pgid unsafe、group signal 失败与 direct signal 失败时的
-  direct-child fallback 诊断。
+  direct-child fallback 诊断；partial start / post-spawn failure、process / queue cleanup checkpoint 首错、caller cancellation、
+  concurrent close single-flight 与 retry-only-incomplete-step 使用 deterministic fake / barrier 覆盖，同一 failed handle 不恢复 start 权限。
 - lane：覆盖 cross-process named semaphore / capacity guard 的配置校验、独立 SQLite runtime lane DB schema、acquire /
   heartbeat / release、timeout、协作式 cancellation、`Task.cancel()` 透传、controller close、跨进程 capacity invariant、
   close/acquire 并发下 pending acquire 唤醒、新 claim 拒绝、active claim count invariant、shielded claim / refresh / release
-  遇到外层取消时的收口一致性、外层取消 cleanup 有界等待与 late result 观测、TTL 时间真源不受 monotonic elapsed 前跳影响、release 后其它进程 acquire，以及 crash 后 TTL stale cleanup eventual acquire；测试不断言
+  遇到外层取消时的收口一致性、外层取消 cleanup 有界等待与 late result 观测、partial token release 后 remaining-token retry、
+  concurrent close / caller cancellation single-flight、首次 close reason 与 heartbeat stop completion、TTL 时间真源不受 monotonic elapsed 前跳影响、release 后其它进程 acquire，以及 crash 后 TTL stale cleanup eventual acquire；测试不断言
   FIFO、公平性或 Host dispatch 集成。
 - filelock：覆盖同步 file lock wrapper 的 parent directory 创建策略、禁用创建时的结构化错误、context manager 正常与异常路径 release、release 幂等、non-blocking timeout 包装、非有限 timeout 拒绝，以及第三方 `filelock` import 只能出现在 `dayu.runtime.filelock` 的边界。
 - diagnostic text：覆盖层中立 diagnostic 文本中的 Bearer / API key / authorization / password / secret / token 敏感值检测、局部 value 脱敏、marker 字面替换、有界截断、空字符串 no-op、普通 token/header 诊断不误判，以及先脱敏再截断不泄漏原值。
