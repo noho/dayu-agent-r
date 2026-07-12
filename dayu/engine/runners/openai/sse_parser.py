@@ -60,6 +60,7 @@ from dayu.engine.runners.openai._choice_policy import (
     ChoicePolicyError,
     SSEChoiceSelection,
     validate_sse_chunk_choices,
+    validate_sse_terminal_shape,
 )
 from dayu.engine.runners.openai.diagnostic_payload import (
     invalid_utf8_diagnostic_payload,
@@ -88,8 +89,6 @@ _INVALID_UTF8_CODE: str = "invalid_utf8"
 _TRUNCATED_UTF8_TAIL_CODE: str = "truncated_utf8_tail"
 _LINE_TOO_LONG_CODE: str = "sse_line_too_long"
 _DATA_LINES_TOO_MANY_CODE: str = "sse_data_lines_too_many"
-_MISSING_TERMINAL_FINISH_REASON_CODE: str = "sse_missing_finish_reason"
-_MISSING_TERMINAL_FINISH_REASON: str = "missing_terminal_finish_reason"
 _USAGE_FIELD_MALFORMED_CODE: str = "usage_field_malformed"
 _USAGE_FIELD_MALFORMED_MESSAGE: str = (
     "provider usage fields were missing or malformed; token usage was ignored"
@@ -499,16 +498,22 @@ class SSEParser:
                 self._reasoning_buffer.append(reasoning)
                 yield _make_event(RunnerReasoningDeltaData(delta=reasoning))
             tool_calls_delta = delta.get("tool_calls")
-            if isinstance(tool_calls_delta, list):
+            if isinstance(tool_calls_delta, list) and tool_calls_delta:
                 self._tool_calls_seen = True
                 position = 0
                 for raw in tool_calls_delta:
                     if not isinstance(raw, dict):
                         continue
+                    resolved_index = self._aggregator.feed(
+                        raw,
+                        position=position,
+                    )
                     typed_delta = self._coerce_tool_call_delta(raw)
-                    resolved_index = self._aggregator.feed(typed_delta, position=position)
                     position += 1
-                    event_data = self._tool_call_delta_event(typed_delta, resolved_index=resolved_index)
+                    event_data = self._tool_call_delta_event(
+                        typed_delta,
+                        resolved_index=resolved_index,
+                    )
                     if event_data is not None:
                         yield _make_event(event_data)
         if finish_reason is not None:
@@ -566,18 +571,13 @@ class SSEParser:
         :returns: 可归属的 tool call delta；无法归属时返回 ``None``。
         """
 
-        if resolved_index is not None:
-            tool_call_index = resolved_index
-        else:
-            raw_index = delta.get("index")
-            if _is_tool_call_index(raw_index):
-                tool_call_index = raw_index
-            else:
-                _LOGGER.warning(
-                    "sse.protocol_diagnostic code=tool_call_delta_unowned " "provider_request_id=%s",
-                    self._provider_request_id,
-                )
-                return None
+        if resolved_index is None:
+            _LOGGER.warning(
+                "sse.protocol_diagnostic code=tool_call_delta_unowned "
+                "provider_request_id=%s",
+                self._provider_request_id,
+            )
+            return None
         delta_id = delta.get("id")
         tool_call_id = delta_id if isinstance(delta_id, str) else None
         function = delta.get("function")
@@ -591,7 +591,7 @@ class SSEParser:
             if isinstance(arguments, str):
                 arguments_delta = arguments
         return RunnerToolCallDeltaData(
-            tool_call_index=tool_call_index,
+            tool_call_index=resolved_index,
             tool_call_id=tool_call_id,
             name_delta=name_delta,
             arguments_delta=arguments_delta,
@@ -658,6 +658,18 @@ class SSEParser:
         if flush.inside_text:
             self._reasoning_buffer.append(flush.inside_text)
             yield _make_event(RunnerReasoningDeltaData(delta=flush.inside_text))
+        terminal_error = validate_sse_terminal_shape(
+            finish_reason=self._finish_reason,
+            has_tool_calls=self._tool_calls_seen,
+        )
+        if terminal_error is not None:
+            async for event in self._handle_choice_policy_error(
+                terminal_error,
+                parsed={},
+            ):
+                yield event
+            return
+        assert self._finish_reason is not None
         if self._tool_calls_seen:
             result = self._aggregator.finalize()
             for warning in result.warnings:
@@ -680,32 +692,7 @@ class SSEParser:
                     reasoning_content="".join(self._reasoning_buffer) or None,
                 )
             )
-            finish = FinishReason.TOOL_CALLS
         else:
-            if self._finish_reason is None:
-                yield _make_event(
-                    RunnerProtocolErrorData(
-                        error_code=runner_protocol_error_code(
-                            _MISSING_TERMINAL_FINISH_REASON_CODE
-                        ),
-                        message="SSE content response missing terminal finish_reason",
-                        provider_request_id=self._provider_request_id,
-                        raw_payload=protocol_object_diagnostic_payload(
-                            {},
-                            source=_MISSING_TERMINAL_FINISH_REASON_CODE,
-                            reason=_MISSING_TERMINAL_FINISH_REASON,
-                        ),
-                        partial_tool_calls=self._aggregator.partial_summaries(),
-                    )
-                )
-                self._terminated = True
-                yield _make_event(
-                    RunnerDoneData(
-                        finish_reason=FinishReason.ERROR,
-                        provider_request_id=self._provider_request_id,
-                    )
-                )
-                return
             content = "".join(self._content_buffer) or None
             reasoning = "".join(self._reasoning_buffer) or None
             yield _make_event(
@@ -714,11 +701,10 @@ class SSEParser:
                     reasoning_content=reasoning,
                 )
             )
-            finish = self._finish_reason
         self._terminated = True
         yield _make_event(
             RunnerDoneData(
-                finish_reason=finish,
+                finish_reason=self._finish_reason,
                 provider_request_id=self._provider_request_id,
             )
         )

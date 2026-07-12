@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TypeAlias
@@ -46,15 +46,11 @@ from dayu.engine.contracts.runner_events import (
     RunnerUsageRecordedData,
     runner_event_type_for_data,
 )
-from dayu.engine.runners.openai._types import (
-    _OpenAIToolCallDelta,
-    _OpenAIToolCallFunction,
-    _ReasoningProtocolHook,
-)
+from dayu.engine.runners.openai._types import _ReasoningProtocolHook
 from dayu.engine.runners.openai._choice_policy import (
     ChoicePolicyError,
     validate_non_stream_choice,
-    validate_non_stream_content_terminal_finish,
+    validate_non_stream_terminal_shape,
 )
 from dayu.engine.runners.openai.diagnostic_payload import (
     protocol_object_diagnostic_payload,
@@ -75,7 +71,7 @@ _PAYLOAD_NOT_OBJECT_CODE: str = "non_stream_payload_not_object"
 _PROVIDER_ERROR_CODE: str = "non_stream_provider_error"
 _TOOL_CALL_NOT_OBJECT_CODE: str = "non_stream_tool_call_not_object"
 _TOOL_CALLS_EMPTY_AFTER_FILTER_CODE: str = "non_stream_tool_calls_empty_after_filter"
-_TOOL_CALL_ARGUMENTS_NOT_OBJECT_CODE: str = "tool_call_arguments_not_object"
+_TOOL_CALL_ARGUMENTS_NOT_STRING_CODE: str = "tool_call_arguments_not_string"
 _USAGE_FIELD_MALFORMED_CODE: str = "usage_field_malformed"
 _USAGE_FIELD_MALFORMED_MESSAGE: str = (
     "provider usage fields were missing or malformed; token usage was ignored"
@@ -257,9 +253,9 @@ def _emit_from_dict(
     choice = selection.choice
     finish_reason = selection.finish_reason
     message = choice.get("message")
-    tool_calls_emitted = False
     content: str | None = None
     reasoning: str | None = None
+    raw_tool_calls: list[JsonValue] | None = None
     if isinstance(message, dict):
         raw_content = message.get("content")
         if isinstance(raw_content, str):
@@ -271,48 +267,55 @@ def _emit_from_dict(
             outside, inside = _split_thought(content, hook=hook)
             content = outside or None
             if inside:
-                # OLD `extracted_reasoning + native_reasoning` 顺序：
+                # 跨 transport 固定 `extracted_reasoning + native_reasoning`：
                 # 剥离的 ``<thought>`` 在前，provider 原生 reasoning 在后，
                 # 与 SSE 路径（先处理 content 流再处理 reasoning_content
                 # 流）保持等价。
                 reasoning = inside + (reasoning or "")
-        raw_tool_calls = message.get("tool_calls")
-        if isinstance(raw_tool_calls, list) and raw_tool_calls:
-            tool_calls_request = _build_tool_calls(
-                raw_tool_calls, provider_request_id=provider_request_id
-            )
-            for warning in tool_calls_request.warnings:
-                yield _make_event(warning)
-            if tool_calls_request.fatal_errors:
-                for fatal in tool_calls_request.fatal_errors:
-                    yield _make_event(fatal)
-                yield _make_event(
-                    RunnerDoneData(
-                        finish_reason=FinishReason.ERROR,
-                        provider_request_id=provider_request_id,
-                    )
-                )
-                return
-            yield _make_event(
-                RunnerToolCallsCompletedData(
-                    tool_calls=tool_calls_request.tool_calls,
-                    content=content,
-                    reasoning_content=reasoning,
-                )
-            )
-            tool_calls_emitted = True
-    if not tool_calls_emitted:
-        terminal_error = validate_non_stream_content_terminal_finish(
-            choice,
-            finish_reason=finish_reason,
+        raw_tool_calls_value = message.get("tool_calls")
+        if isinstance(raw_tool_calls_value, list):
+            raw_tool_calls = raw_tool_calls_value
+
+    has_tool_calls = bool(raw_tool_calls)
+    terminal_error = validate_non_stream_terminal_shape(
+        choice,
+        finish_reason=finish_reason,
+        has_tool_calls=has_tool_calls,
+    )
+    if terminal_error is not None:
+        yield from _emit_choice_policy_error(
+            terminal_error,
+            parsed=parsed,
+            provider_request_id=provider_request_id,
         )
-        if terminal_error is not None:
-            yield from _emit_choice_policy_error(
-                terminal_error,
-                parsed=parsed,
-                provider_request_id=provider_request_id,
+        return
+    assert finish_reason is not None, "terminal shape policy requires finish_reason"
+
+    if has_tool_calls:
+        assert raw_tool_calls is not None
+        tool_calls_request = _build_tool_calls(
+            raw_tool_calls, provider_request_id=provider_request_id
+        )
+        for warning in tool_calls_request.warnings:
+            yield _make_event(warning)
+        if tool_calls_request.fatal_errors:
+            for fatal in tool_calls_request.fatal_errors:
+                yield _make_event(fatal)
+            yield _make_event(
+                RunnerDoneData(
+                    finish_reason=FinishReason.ERROR,
+                    provider_request_id=provider_request_id,
+                )
             )
             return
+        yield _make_event(
+            RunnerToolCallsCompletedData(
+                tool_calls=tool_calls_request.tool_calls,
+                content=content,
+                reasoning_content=reasoning,
+            )
+        )
+    else:
         yield _make_event(
             RunnerContentCompletedData(
                 content=content,
@@ -359,14 +362,9 @@ def _emit_from_dict(
                     provider_request_id=provider_request_id,
                 )
             )
-    if tool_calls_emitted:
-        done_finish_reason = FinishReason.TOOL_CALLS
-    else:
-        assert finish_reason is not None, "content terminal finish_reason checked"
-        done_finish_reason = finish_reason
     yield _make_event(
         RunnerDoneData(
-            finish_reason=done_finish_reason,
+            finish_reason=finish_reason,
             provider_request_id=provider_request_id,
         )
     )
@@ -449,11 +447,9 @@ def _build_tool_calls(
     复用 :class:`ToolCallAggregator`：把每个 tool call 当作一次
     完整的 delta 投喂，再调用 finalize。
 
-    OLD 兼容点：non-stream ``function.arguments`` 既可能是 JSON string
-    也可能是 dict 形态。OLD 直接接受 dict；NEW 在喂入 aggregator
-    （只接受字符串 buffer）前先把 Mapping 序列化为 JSON string。
-    其它非法类型（list / number / bool）→ ``tool_call_arguments_not_object``
-    fatal 错误。
+    non-stream ``function.arguments`` 只有 JSON string 合法；dict、list、
+    number、bool、null 或缺失都在本边界产生
+    ``tool_call_arguments_not_string`` fatal。
 
     :param raw_tool_calls: provider 返回的原始 tool_calls 列表。
     :param provider_request_id: 当前 response header 提供的 request id。
@@ -517,18 +513,15 @@ def _coerce_final_tool_call(
     *,
     index: int,
     provider_request_id: str | None,
-) -> tuple[_OpenAIToolCallDelta, RunnerProtocolErrorData | None]:
+) -> tuple[dict[str, JsonValue], RunnerProtocolErrorData | None]:
     """把非流式 tool call dict 转成可被聚合器消费的 delta 形态。
 
     本函数返回 ``(delta, pre_error)``：
 
     - ``delta``：投喂 :class:`ToolCallAggregator` 的强类型形态；
-    - ``pre_error``：若发现 ``function.arguments`` 既不是字符串也不是
-      JSON object，返回 ``tool_call_arguments_not_object`` fatal 协议
-      错误；否则为 ``None``。
-
-    OLD 兼容：``function.arguments`` 为 :class:`Mapping` 时序列化为
-    JSON 字符串，避免参数被静默清空。
+    - ``pre_error``：若发现 ``function.arguments`` 不是字符串（含缺失或
+      ``null``），返回 ``tool_call_arguments_not_string`` fatal；否则为
+      ``None``。
 
     :param raw: provider 返回的单个 tool call object。
     :param index: 当前 tool call 在列表中的位置。
@@ -537,47 +530,44 @@ def _coerce_final_tool_call(
     :raises Exception: 不主动抛出异常。
     """
 
-    delta: _OpenAIToolCallDelta = {"index": index}
+    delta: dict[str, JsonValue] = {"index": index}
     delta_id = raw.get("id")
     if isinstance(delta_id, str):
         delta["id"] = delta_id
     delta_type = raw.get("type")
     if isinstance(delta_type, str):
         delta["type"] = delta_type
-    pre_error: RunnerProtocolErrorData | None = None
     function = raw.get("function")
+    func_payload: dict[str, JsonValue] = {}
+    arguments: JsonValue | None = None
     if isinstance(function, dict):
-        func_payload: _OpenAIToolCallFunction = {}
         name = function.get("name")
         if isinstance(name, str):
             func_payload["name"] = name
         arguments = function.get("arguments")
         if isinstance(arguments, str):
             func_payload["arguments"] = arguments
-        elif isinstance(arguments, Mapping):
-            # OLD 行为：dict 形态参数直接保留；序列化为 JSON 字符串
-            # 后让 aggregator 沿用统一字符串 buffer 入口。
-            func_payload["arguments"] = json.dumps(dict(arguments))
-        elif arguments is not None:
-            tool_id_for_msg = (
-                delta_id if isinstance(delta_id, str) else f"#{index}"
-            )
-            pre_error = RunnerProtocolErrorData(
-                error_code=runner_protocol_error_code(
-                    _TOOL_CALL_ARGUMENTS_NOT_OBJECT_CODE
-                ),
-                message=(
-                    f"tool call {tool_id_for_msg} arguments is neither a "
-                    "JSON string nor a JSON object"
-                ),
-                provider_request_id=provider_request_id,
-                raw_payload=None,
-            )
-        if func_payload:
-            delta["function"] = func_payload
+    if func_payload:
+        delta["function"] = func_payload
+    pre_error: RunnerProtocolErrorData | None = None
+    if not isinstance(arguments, str):
+        tool_id_for_msg = (
+            delta_id if isinstance(delta_id, str) else f"#{index}"
+        )
+        pre_error = RunnerProtocolErrorData(
+            error_code=runner_protocol_error_code(
+                _TOOL_CALL_ARGUMENTS_NOT_STRING_CODE
+            ),
+            message=(
+                f"tool call {tool_id_for_msg} function.arguments must be "
+                "a JSON string"
+            ),
+            provider_request_id=provider_request_id,
+            raw_payload=None,
+        )
     extra_content = raw.get("extra_content")
     if isinstance(extra_content, dict):
-        cleaned: dict[str, Mapping[str, JsonValue]] = {}
+        cleaned: dict[str, dict[str, JsonValue]] = {}
         for namespace, inner in extra_content.items():
             if isinstance(inner, dict):
                 cleaned[namespace] = dict(inner)

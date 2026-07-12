@@ -38,6 +38,10 @@ SSE_CHOICE_INDEX_NON_ZERO_CODE: str = "sse_choice_index_non_zero"
 SSE_MULTIPLE_VALID_CHOICES_CODE: str = "sse_multiple_valid_choices"
 SSE_INVALID_FINISH_REASON_CODE: str = "sse_invalid_finish_reason"
 SSE_CONFLICTING_FINISH_REASON_CODE: str = "sse_conflicting_finish_reason"
+SSE_MISSING_FINISH_REASON_CODE: str = "sse_missing_finish_reason"
+SSE_TOOL_CALLS_FINISH_REASON_MISMATCH_CODE: str = (
+    "sse_tool_calls_finish_reason_mismatch"
+)
 
 NON_STREAM_MISSING_CHOICES_CODE: str = "non_stream_missing_choices"
 NON_STREAM_CHOICE_NOT_OBJECT_CODE: str = "non_stream_choice_not_object"
@@ -46,6 +50,9 @@ NON_STREAM_CHOICE_INDEX_NON_ZERO_CODE: str = "non_stream_choice_index_non_zero"
 NON_STREAM_INVALID_CHOICE_SHAPE_CODE: str = "non_stream_invalid_choice_shape"
 NON_STREAM_INVALID_FINISH_REASON_CODE: str = "non_stream_invalid_finish_reason"
 NON_STREAM_MISSING_FINISH_REASON_CODE: str = "non_stream_missing_finish_reason"
+NON_STREAM_TOOL_CALLS_FINISH_REASON_MISMATCH_CODE: str = (
+    "non_stream_tool_calls_finish_reason_mismatch"
+)
 
 _REASON_CHOICES_MISSING: str = "choices_missing"
 _REASON_CHOICES_NOT_LIST: str = "choices_not_list"
@@ -65,7 +72,10 @@ _REASON_FINISH_REASON_CONFLICT: str = "finish_reason_conflict"
 _REASON_NON_STREAM_MULTIPLE_CHOICES: str = "non_stream_multiple_choices"
 _REASON_NON_STREAM_MESSAGE_MISSING: str = "message_missing"
 _REASON_NON_STREAM_MESSAGE_NOT_OBJECT: str = "message_not_object"
-_REASON_NON_STREAM_MISSING_FINISH_REASON: str = "missing_finish_reason"
+_REASON_MISSING_FINISH_REASON: str = "missing_finish_reason"
+_REASON_TOOL_CALLS_FINISH_REASON_MISMATCH: str = (
+    "tool_calls_finish_reason_mismatch"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,7 +112,7 @@ class NonStreamChoiceSelection:
 
     :param choice: 唯一合法 assistant choice。
     :param finish_reason: provider 明确给出的终态原因；``null`` 或缺失时
-        为 ``None``，由调用方根据 tool_calls 语义再决定是否 fatal。
+        为 ``None``，必须由 terminal shape policy fail closed。
     """
 
     choice: dict[str, JsonValue]
@@ -265,26 +275,25 @@ def validate_non_stream_choice(
     return NonStreamChoiceSelection(choice=raw_choice, finish_reason=finish_result)
 
 
-def validate_non_stream_content_terminal_finish(
+def validate_non_stream_terminal_shape(
     choice: dict[str, JsonValue],
     *,
     finish_reason: FinishReason | None,
+    has_tool_calls: bool,
 ) -> ChoicePolicyError | None:
-    """校验非流式 content 成功路径必须有明确 terminal finish_reason。
+    """校验非流式 assistant message 与 terminal tool-call shape。
 
-    tool_calls 路径由 adapter 根据完整工具调用事实推断为
-    :attr:`FinishReason.TOOL_CALLS`；content-only 成功路径不得把缺失或
-    ``null`` 的 ``finish_reason`` 默认成 ``STOP``。
+    非流式成功响应必须包含 assistant message，并由共用 terminal helper
+    校验显式 finish reason 与 tool-call presence 严格一致。
 
     :param choice: 已通过 response-level policy 的单个 choice。
     :param finish_reason: 已规范化的终态原因；缺失或 ``null`` 时为
         ``None``。
+    :param has_tool_calls: message 是否携带非空 tool_calls 列表。
     :returns: 需要 fatal 收口时返回 policy error，否则返回 ``None``。
     :raises Exception: 不主动抛出异常。
     """
 
-    if finish_reason is not None:
-        return None
     message = choice.get(_MESSAGE_FIELD)
     if message is None:
         return ChoicePolicyError(
@@ -298,10 +307,72 @@ def validate_non_stream_content_terminal_finish(
             message="non-stream choice message is not a JSON object",
             diagnostic_reason=_REASON_NON_STREAM_MESSAGE_NOT_OBJECT,
         )
+    return _validate_terminal_shape(
+        finish_reason=finish_reason,
+        has_tool_calls=has_tool_calls,
+        missing_code=NON_STREAM_MISSING_FINISH_REASON_CODE,
+        mismatch_code=NON_STREAM_TOOL_CALLS_FINISH_REASON_MISMATCH_CODE,
+        transport_name="non-stream",
+    )
+
+
+def validate_sse_terminal_shape(
+    *,
+    finish_reason: FinishReason | None,
+    has_tool_calls: bool,
+) -> ChoicePolicyError | None:
+    """校验 SSE 聚合终态的 finish reason 与 tool-call presence。
+
+    :param finish_reason: 跨 chunks 聚合后的显式 provider finish reason。
+    :param has_tool_calls: 本次 stream 是否观察到 tool-call 列表。
+    :returns: 需要 fatal 收口时返回 policy error，否则返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return _validate_terminal_shape(
+        finish_reason=finish_reason,
+        has_tool_calls=has_tool_calls,
+        missing_code=SSE_MISSING_FINISH_REASON_CODE,
+        mismatch_code=SSE_TOOL_CALLS_FINISH_REASON_MISMATCH_CODE,
+        transport_name="SSE",
+    )
+
+
+def _validate_terminal_shape(
+    *,
+    finish_reason: FinishReason | None,
+    has_tool_calls: bool,
+    missing_code: str,
+    mismatch_code: str,
+    transport_name: str,
+) -> ChoicePolicyError | None:
+    """校验成功终态必须显式且与 tool-call presence 双向一致。
+
+    :param finish_reason: 已规范化的显式 provider finish reason。
+    :param has_tool_calls: 当前 response 是否包含 tool calls。
+    :param missing_code: 当前 transport 的 missing error code。
+    :param mismatch_code: 当前 transport 的 mismatch error code。
+    :param transport_name: 当前 transport 诊断前缀。
+    :returns: fatal policy error；shape 一致时返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if finish_reason is None:
+        return ChoicePolicyError(
+            error_code=missing_code,
+            message=f"{transport_name} response missing terminal finish_reason",
+            diagnostic_reason=_REASON_MISSING_FINISH_REASON,
+        )
+    finish_declares_tool_calls = finish_reason is FinishReason.TOOL_CALLS
+    if has_tool_calls is finish_declares_tool_calls:
+        return None
     return ChoicePolicyError(
-        error_code=NON_STREAM_MISSING_FINISH_REASON_CODE,
-        message="non-stream content response missing terminal finish_reason",
-        diagnostic_reason=_REASON_NON_STREAM_MISSING_FINISH_REASON,
+        error_code=mismatch_code,
+        message=(
+            f"{transport_name} tool-call presence does not match "
+            "terminal finish_reason"
+        ),
+        diagnostic_reason=_REASON_TOOL_CALLS_FINISH_REASON_MISMATCH,
     )
 
 
@@ -435,15 +506,19 @@ __all__ = [
     "NON_STREAM_MISSING_CHOICES_CODE",
     "NON_STREAM_MISSING_FINISH_REASON_CODE",
     "NON_STREAM_MULTIPLE_CHOICES_CODE",
+    "NON_STREAM_TOOL_CALLS_FINISH_REASON_MISMATCH_CODE",
     "NonStreamChoiceSelection",
     "SSE_CHOICE_INDEX_NON_ZERO_CODE",
     "SSE_CONFLICTING_FINISH_REASON_CODE",
     "SSE_INVALID_CHOICE_SHAPE_CODE",
     "SSE_INVALID_FINISH_REASON_CODE",
     "SSE_MISSING_CHOICES_CODE",
+    "SSE_MISSING_FINISH_REASON_CODE",
     "SSE_MULTIPLE_VALID_CHOICES_CODE",
+    "SSE_TOOL_CALLS_FINISH_REASON_MISMATCH_CODE",
     "SSEChoiceSelection",
     "validate_non_stream_choice",
-    "validate_non_stream_content_terminal_finish",
+    "validate_non_stream_terminal_shape",
     "validate_sse_chunk_choices",
+    "validate_sse_terminal_shape",
 ]

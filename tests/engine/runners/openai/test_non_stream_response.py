@@ -355,8 +355,8 @@ def test_non_stream_tool_calls_emitted() -> None:
     assert done[0].data.finish_reason is FinishReason.TOOL_CALLS
 
 
-def test_non_stream_tool_calls_without_finish_reason_done_as_tool_calls() -> None:
-    """非流式 tool_calls 缺 finish_reason 时与 SSE 路径一致收口为 TOOL_CALLS。"""
+def test_non_stream_tool_calls_without_finish_reason_fail_closed() -> None:
+    """非流式 tool calls 缺 finish reason 时必须失败收口。"""
 
     payload = json.dumps(
         {
@@ -386,14 +386,20 @@ def test_non_stream_tool_calls_without_finish_reason_done_as_tool_calls() -> Non
         )
     )
 
-    done = [event for event in events if event.type is RunnerEventType.RUNNER_DONE]
-    assert len(done) == 1
-    assert isinstance(done[0].data, RunnerDoneData)
-    assert done[0].data.finish_reason is FinishReason.TOOL_CALLS
+    assert [event.type for event in events] == [
+        RunnerEventType.PROVIDER_PROTOCOL_ERROR,
+        RunnerEventType.RUNNER_DONE,
+    ]
+    error = events[0].data
+    assert isinstance(error, RunnerProtocolErrorData)
+    assert error.error_code == "non_stream_missing_finish_reason"
+    done = events[-1].data
+    assert isinstance(done, RunnerDoneData)
+    assert done.finish_reason is FinishReason.ERROR
 
 
-def test_non_stream_tool_calls_with_stop_finish_reason_done_as_tool_calls() -> None:
-    """provider 返回 tool_calls 但 finish_reason=stop 时 Done 仍为 TOOL_CALLS。"""
+def test_non_stream_tool_calls_with_stop_finish_reason_fail_closed() -> None:
+    """非流式 tool calls 与 stop 终态冲突时必须失败收口。"""
 
     payload = json.dumps(
         {
@@ -424,10 +430,16 @@ def test_non_stream_tool_calls_with_stop_finish_reason_done_as_tool_calls() -> N
         )
     )
 
-    done = [event for event in events if event.type is RunnerEventType.RUNNER_DONE]
-    assert len(done) == 1
-    assert isinstance(done[0].data, RunnerDoneData)
-    assert done[0].data.finish_reason is FinishReason.TOOL_CALLS
+    assert [event.type for event in events] == [
+        RunnerEventType.PROVIDER_PROTOCOL_ERROR,
+        RunnerEventType.RUNNER_DONE,
+    ]
+    error = events[0].data
+    assert isinstance(error, RunnerProtocolErrorData)
+    assert error.error_code == "non_stream_tool_calls_finish_reason_mismatch"
+    done = events[-1].data
+    assert isinstance(done, RunnerDoneData)
+    assert done.finish_reason is FinishReason.ERROR
 
 
 def test_non_stream_tool_call_index_ignores_non_dict_elements() -> None:

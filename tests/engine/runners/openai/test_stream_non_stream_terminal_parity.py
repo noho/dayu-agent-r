@@ -95,6 +95,91 @@ def _sse_chunk(payload: dict[str, JsonValue]) -> bytes:
     return f"data: {payload_json}\n\n".encode("utf-8")
 
 
+async def _stream_terminal_events(
+    *,
+    has_tool_calls: bool,
+    finish_reason_field: dict[str, JsonValue],
+) -> list[RunnerEvent]:
+    """构造指定 terminal shape 的 SSE 事件。
+
+    :param has_tool_calls: 是否发送 tool-call delta。
+    :param finish_reason_field: terminal choice 的 finish_reason 字段。
+    :returns: parser 产出的 Runner 事件列表。
+    :raises Exception: parser 异常时向上传播。
+    """
+
+    delta: dict[str, JsonValue]
+    if has_tool_calls:
+        delta = {
+            "tool_calls": [
+                {
+                    "index": 0,
+                    "id": "call-a",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }
+            ]
+        }
+    else:
+        delta = {"content": "answer"}
+    initial_choice: dict[str, JsonValue] = {"delta": delta}
+    raw_finish_reason = finish_reason_field.get("finish_reason")
+    chunks = [_sse_chunk({"choices": [initial_choice]})]
+    if isinstance(raw_finish_reason, str):
+        terminal_choice: dict[str, JsonValue] = {
+            **finish_reason_field,
+            "delta": {},
+        }
+        chunks.append(_sse_chunk({"choices": [terminal_choice]}))
+    else:
+        initial_choice.update(finish_reason_field)
+        chunks[0] = _sse_chunk({"choices": [initial_choice]})
+    chunks.append(b"data: [DONE]\n\n")
+    return await parse_sse(
+        chunks,
+        hook=make_no_thought_hook(),
+    )
+
+
+def _non_stream_terminal_events(
+    *,
+    has_tool_calls: bool,
+    finish_reason_field: dict[str, JsonValue],
+) -> list[RunnerEvent]:
+    """构造指定 terminal shape 的 non-stream 事件。
+
+    :param has_tool_calls: assistant message 是否带 tool calls。
+    :param finish_reason_field: choice 的 finish_reason 字段。
+    :returns: parser 产出的 Runner 事件列表。
+    :raises Exception: parser 异常时向上传播。
+    """
+
+    message: dict[str, JsonValue] = {
+        "role": "assistant",
+        "content": None if has_tool_calls else "answer",
+    }
+    if has_tool_calls:
+        message["tool_calls"] = [
+            {
+                "id": "call-a",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+            }
+        ]
+    choice: dict[str, JsonValue] = {
+        **finish_reason_field,
+        "message": message,
+    }
+    payload = json.dumps({"choices": [choice]}).encode("utf-8")
+    return list(
+        parse_non_stream_response(
+            payload,
+            hook=make_no_thought_hook(),
+            provider_request_id=None,
+        )
+    )
+
+
 @pytest.mark.asyncio
 async def test_stream_and_non_stream_thought_strip_terminal_parity() -> None:
     """Gemini ``<thought>...</thought>answer`` 在两条路径终态一致。"""
@@ -488,3 +573,96 @@ async def test_sse_content_without_terminal_finish_reason_fail_closed() -> None:
     assert RunnerEventType.RUNNER_CONTENT_COMPLETED not in {
         event.type for event in events
     }
+
+
+@pytest.mark.parametrize(
+    ("has_tool_calls", "finish_reason"),
+    (
+        (True, "stop"),
+        (True, "length"),
+        (True, "content_filter"),
+        (False, "tool_calls"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_stream_and_non_stream_terminal_shape_mismatch_fail_closed(
+    has_tool_calls: bool,
+    finish_reason: str,
+) -> None:
+    """tool presence 与显式 finish reason 不一致时两路都必须 fatal。
+
+    :param has_tool_calls: response 是否携带 tool calls。
+    :param finish_reason: 与 response shape 冲突的显式终态。
+    :returns: 无返回值。
+    :raises AssertionError: 任一路径先产出成功 completed 时由 pytest 抛出。
+    """
+
+    finish_reason_field: dict[str, JsonValue] = {
+        "finish_reason": finish_reason
+    }
+    stream_events = await _stream_terminal_events(
+        has_tool_calls=has_tool_calls,
+        finish_reason_field=finish_reason_field,
+    )
+    non_stream_events = _non_stream_terminal_events(
+        has_tool_calls=has_tool_calls,
+        finish_reason_field=finish_reason_field,
+    )
+
+    stream_error, stream_done = _extract_protocol_error_and_done(stream_events)
+    ns_error, ns_done = _extract_protocol_error_and_done(non_stream_events)
+    assert stream_error.error_code == "sse_tool_calls_finish_reason_mismatch"
+    assert (
+        ns_error.error_code
+        == "non_stream_tool_calls_finish_reason_mismatch"
+    )
+    assert stream_done.finish_reason is ns_done.finish_reason is FinishReason.ERROR
+    completed_types = {
+        RunnerEventType.RUNNER_CONTENT_COMPLETED,
+        RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED,
+    }
+    assert completed_types.isdisjoint(event.type for event in stream_events)
+    assert completed_types.isdisjoint(event.type for event in non_stream_events)
+
+
+@pytest.mark.parametrize("has_tool_calls", (False, True))
+@pytest.mark.parametrize(
+    "finish_reason_field",
+    (
+        {},
+        {"finish_reason": None},
+    ),
+)
+@pytest.mark.asyncio
+async def test_stream_and_non_stream_missing_terminal_reason_fail_closed(
+    has_tool_calls: bool,
+    finish_reason_field: dict[str, JsonValue],
+) -> None:
+    """missing/null finish reason 对 content/tool-call 两种 shape 均 fatal。
+
+    :param has_tool_calls: response 是否携带 tool calls。
+    :param finish_reason_field: 缺失或显式 null 的 terminal 字段。
+    :returns: 无返回值。
+    :raises AssertionError: 任一路径默认终态时由 pytest 抛出。
+    """
+
+    stream_events = await _stream_terminal_events(
+        has_tool_calls=has_tool_calls,
+        finish_reason_field=finish_reason_field,
+    )
+    non_stream_events = _non_stream_terminal_events(
+        has_tool_calls=has_tool_calls,
+        finish_reason_field=finish_reason_field,
+    )
+
+    stream_error, stream_done = _extract_protocol_error_and_done(stream_events)
+    ns_error, ns_done = _extract_protocol_error_and_done(non_stream_events)
+    assert stream_error.error_code == "sse_missing_finish_reason"
+    assert ns_error.error_code == "non_stream_missing_finish_reason"
+    assert stream_done.finish_reason is ns_done.finish_reason is FinishReason.ERROR
+    completed_types = {
+        RunnerEventType.RUNNER_CONTENT_COMPLETED,
+        RunnerEventType.RUNNER_TOOL_CALLS_COMPLETED,
+    }
+    assert completed_types.isdisjoint(event.type for event in stream_events)
+    assert completed_types.isdisjoint(event.type for event in non_stream_events)
