@@ -533,8 +533,9 @@ async def test_watch_lifecycle_errors_and_closed_session_watch(
     async with open_host(
         _options(tmp_path / "open", _Factory(_WORKER_MODE_FINAL))
     ) as host:
+        missing_watcher = host.watch_session_events("missing-session")
         with pytest.raises(HostApiError) as exc_info:
-            host.watch_session_events("missing-session")
+            await anext(missing_watcher)
         assert exc_info.value.code is HostApiErrorCode.NOT_FOUND
 
         session = await host.ensure_session(_ensure_request("watch-closed"))

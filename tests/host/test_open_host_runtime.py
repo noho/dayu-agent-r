@@ -5,9 +5,13 @@ from __future__ import annotations
 import asyncio
 import pathlib
 import sqlite3
+import sys
+import threading
 from collections.abc import AsyncGenerator, AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
+from types import ModuleType
 from typing import cast
 
 import pytest
@@ -29,6 +33,7 @@ from dayu.host import (
     CloseSessionRequest,
     CompactorRunnerBaseline,
     EnsureSessionRequest,
+    FollowupSnapshot,
     FollowupBehavior,
     Host,
     HostApiError,
@@ -41,6 +46,7 @@ from dayu.host import (
     LocalEngineWorker,
     LocalEngineWorkerFactory,
     LocalWorkerHandle,
+    OpenHostAdminOptions,
     OpenHostOptions,
     OperationContext,
     OrdinaryRunExecutionBaseline,
@@ -48,14 +54,16 @@ from dayu.host import (
     ResolveWaitCompletedOutcome,
     RunSnapshot,
     RunStatus,
+    SessionSnapshot,
     SubmitFollowupRequest,
     WaitAdapterKey,
     open_host,
+    open_host_admin,
 )
 from dayu.host.api import AuthorizationClaim, HostInput, HostLocalExecutionOptions
 from dayu.host.command import HostCommandHandle, create_host_command_handle
 from dayu.host.dispatch import ActiveWorkerRegistry, HostDispatchScheduler
-from dayu.host.durable.connection import open_host_durable_store
+from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
     HostSQLiteStoragePolicy,
@@ -69,6 +77,11 @@ from dayu.host.memory import default_memory_projection_policy
 from dayu.host.open_host import (
     _CompositeProjectionCatchupPort,
     _PublicHostHandle,
+    _ThreadsafeSchedulerWakeupPort,
+    _ensure_session as _actor_ensure_session,
+    _get_run as _actor_get_run,
+    _session_live_event_start_cursor as _actor_watch_cursor,
+    _submit_followup as _actor_submit_followup,
     _command_options_from_open_host_options,
     _local_execution_options_from_open_host_options,
 )
@@ -505,6 +518,159 @@ async def test_submit_followup_queue_auto_wakes_scheduler(
 
 
 @pytest.mark.asyncio
+async def test_public_write_busy_retry_does_not_block_opener_event_loop(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BEGIN IMMEDIATE 持锁时 actor busy retry 不阻塞 opener loop barrier。"""
+
+    options = _options(tmp_path, _FinalAnswerWorkerFactory())
+    actor_started = threading.Event()
+    original_ensure_session = _actor_ensure_session
+
+    def record_actor_start(
+        handle: HostCommandHandle,
+        request: EnsureSessionRequest,
+    ) -> SessionSnapshot:
+        """记录 public ensure 已进入 actor worker thread。
+
+        :param handle: actor 私有 command handle。
+        :param request: ensure session 请求。
+        :returns: 原始 ensure 结果。
+        :raises Exception: 原始 command 失败时透传。
+        """
+
+        actor_started.set()
+        return original_ensure_session(handle, request)
+
+    open_host_module = cast(ModuleType, sys.modules["dayu.host.open_host"])
+    monkeypatch.setattr(open_host_module, "_ensure_session", record_actor_start)
+    async with open_host(options) as host:
+        lock_connection = sqlite3.connect(
+            options.db_path,
+            isolation_level=None,
+        )
+        lock_connection.execute("BEGIN IMMEDIATE")
+        ensure_task = asyncio.create_task(host.ensure_session(_ensure_request()))
+        assert await asyncio.to_thread(actor_started.wait, 1)
+
+        probe_requested = asyncio.Event()
+        loop_advanced = asyncio.Event()
+
+        async def event_loop_probe() -> None:
+            """通过 Event barrier 证明 opener loop 仍可执行 callback。
+
+            :returns: ``None``。
+            :raises Exception: 不主动抛出异常。
+            """
+
+            await probe_requested.wait()
+            asyncio.get_running_loop().call_soon(loop_advanced.set)
+            await loop_advanced.wait()
+
+        probe_task = asyncio.create_task(event_loop_probe())
+        probe_requested.set()
+        await asyncio.wait_for(loop_advanced.wait(), timeout=1)
+        assert not ensure_task.done()
+        lock_connection.execute("ROLLBACK")
+        lock_connection.close()
+        session = await asyncio.wait_for(ensure_task, timeout=1)
+        await probe_task
+
+    assert session.session_id != ""
+
+
+@pytest.mark.asyncio
+async def test_public_ensure_submit_read_and_watch_share_actor_thread(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """public command/read/watch SQLite 入口全部提交到同一 actor thread。"""
+
+    loop_thread_id = threading.get_ident()
+    operation_threads: dict[str, int] = {}
+    module = cast(ModuleType, sys.modules["dayu.host.open_host"])
+    original_ensure = _actor_ensure_session
+    original_submit = _actor_submit_followup
+    original_get_run = _actor_get_run
+    original_watch_cursor = _actor_watch_cursor
+
+    def record_ensure(
+        handle: HostCommandHandle,
+        request: EnsureSessionRequest,
+    ) -> SessionSnapshot:
+        """记录 ensure operation thread。
+
+        :param handle: actor command handle。
+        :param request: ensure 请求。
+        :returns: Session snapshot。
+        :raises Exception: 原始 command 失败时透传。
+        """
+
+        operation_threads["ensure"] = threading.get_ident()
+        return original_ensure(handle, request)
+
+    def record_submit(
+        handle: HostCommandHandle,
+        session_id: str,
+        request: SubmitFollowupRequest,
+    ) -> FollowupSnapshot:
+        """记录 submit operation thread。
+
+        :param handle: actor command handle。
+        :param session_id: 目标 Session id。
+        :param request: follow-up 请求。
+        :returns: Followup snapshot。
+        :raises Exception: 原始 command 失败时透传。
+        """
+
+        operation_threads["submit"] = threading.get_ident()
+        return original_submit(handle, session_id, request)
+
+    def record_get_run(handle: HostCommandHandle, run_id: str) -> RunSnapshot:
+        """记录 get_run operation thread。
+
+        :param handle: actor command handle。
+        :param run_id: 目标 Run id。
+        :returns: Run snapshot。
+        :raises Exception: 原始 read 失败时透传。
+        """
+
+        operation_threads["read"] = threading.get_ident()
+        return original_get_run(handle, run_id)
+
+    def record_watch_cursor(handle: HostCommandHandle, session_id: str) -> int:
+        """记录 watch cursor attach operation thread。
+
+        :param handle: actor command handle。
+        :param session_id: 目标 Session id。
+        :returns: live cursor。
+        :raises Exception: 原始 read 失败时透传。
+        """
+
+        operation_threads["watch"] = threading.get_ident()
+        return original_watch_cursor(handle, session_id)
+
+    monkeypatch.setattr(module, "_ensure_session", record_ensure)
+    monkeypatch.setattr(module, "_submit_followup", record_submit)
+    monkeypatch.setattr(module, "_get_run", record_get_run)
+    monkeypatch.setattr(module, "_session_live_event_start_cursor", record_watch_cursor)
+    async with open_host(_options(tmp_path, _FinalAnswerWorkerFactory())) as host:
+        session = await host.ensure_session(_ensure_request())
+        followup = await host.submit_followup(
+            session.session_id,
+            _followup_request(session.session_id, "actor-thread-contract"),
+        )
+        watcher = host.watch_session_events(session.session_id)
+        await host.get_run(followup.accepted_run_id)
+        await cast(AsyncGenerator[HostEvent, None], watcher).aclose()
+
+    assert set(operation_threads) == {"ensure", "submit", "read", "watch"}
+    assert len(set(operation_threads.values())) == 1
+    assert next(iter(operation_threads.values())) != loop_thread_id
+
+
+@pytest.mark.asyncio
 async def test_open_host_close_flushes_outbox_projection(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -634,12 +800,14 @@ async def test_open_host_active_cancel_watchdog_public_watch_observes_cancelled(
             _followup_request(session.session_id, "followup-active-cancel-watchdog"),
         )
         await asyncio.wait_for(factory.accepted_event.wait(), timeout=1)
+        watcher = host.watch_session_events(session.session_id)
+        terminal_task = asyncio.create_task(_next_terminal(watcher))
+        await asyncio.sleep(0)
+        await host.get_run(followup.accepted_run_id)
         cancelling = await host.cancel_run(
             followup.accepted_run_id,
             _cancel_request("cancel-active-watchdog"),
         )
-        watcher = host.watch_session_events(session.session_id)
-        terminal_task = asyncio.create_task(_next_terminal(watcher))
         cast(_PublicHostHandle, host)._scheduler.tick_active_cancel_watchdog(
             datetime(2030, 1, 1, tzinfo=UTC)
         )
@@ -712,54 +880,166 @@ async def test_open_host_reopen_closes_accepted_cancel_with_watchdog(
 
 
 @pytest.mark.asyncio
-async def test_public_host_close_closes_command_handle_when_scheduler_close_raises() -> None:
-    """scheduler close 抛错时仍会追平 projection 并关闭 command handle。"""
+async def test_close_drains_actor_wake_before_scheduler_and_preserves_close_order(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """阻塞 actor wake 收口后才按 scheduler→projection→actor→store 关闭。"""
 
-    scheduler = _RaisingSchedulerClose()
-    command_handle = _RecordingCommandHandleClose()
-    projection_catchup_port = _RecordingProjectionCatchupPort()
-    host = _PublicHostHandle(
-        command_handle=cast(HostCommandHandle, command_handle),
-        host_handle_id="host-open-runtime-test",
-        scheduler=cast(HostDispatchScheduler, scheduler),
-        projection_catchup_port=projection_catchup_port,
-        wait_poller=None,
-    )
-
-    with pytest.raises(RuntimeError, match=_SCHEDULER_CLOSE_FAILURE_MESSAGE):
-        await host.close()
-    await host.close()
-
-    assert scheduler.close_count == 1
-    assert projection_catchup_port.catch_up_count == 1
-    assert command_handle.close_count == 1
-
-
-@pytest.mark.asyncio
-async def test_public_host_close_closes_wait_poller_before_scheduler() -> None:
-    """public Host close 先关闭 wait poller，再关闭 scheduler。"""
-
+    manager = open_host(_options(tmp_path, _FinalAnswerWorkerFactory()))
+    public_host = cast(_PublicHostHandle, await manager.__aenter__())
+    loop = asyncio.get_running_loop()
+    loop_thread_id = threading.get_ident()
+    wake_started = threading.Event()
+    wake_release = threading.Event()
+    wake_on_loop = asyncio.Event()
     order: list[str] = []
-    wait_poller = _RecordingWaitPollerClose(order)
-    scheduler = _RecordingSchedulerClose(order)
-    command_handle = _RecordingCommandHandleClose()
-    projection_catchup_port = _RecordingProjectionCatchupPort()
-    host = _PublicHostHandle(
-        command_handle=cast(HostCommandHandle, command_handle),
-        host_handle_id="host-open-runtime-poller-close-test",
-        scheduler=cast(HostDispatchScheduler, scheduler),
-        projection_catchup_port=projection_catchup_port,
-        wait_poller=cast(WaitPollerSupervisor, wait_poller),
+    original_scheduler_close = HostDispatchScheduler.close
+    original_wake_queue = HostDispatchScheduler.wake_queue_promotion
+    original_projection_catchup = _CompositeProjectionCatchupPort.catch_up_projection
+    original_handle_close = HostCommandHandle.close
+    original_executor_shutdown = ThreadPoolExecutor.shutdown
+    original_store_close = HostDurableStore.close
+
+    async def record_scheduler_close(self: HostDispatchScheduler) -> None:
+        """记录 scheduler close 并委托真实实现。
+
+        :param self: scheduler。
+        :returns: ``None``。
+        :raises Exception: 原始 close 失败时透传。
+        """
+
+        order.append("scheduler")
+        await original_scheduler_close(self)
+
+    def record_wake_queue(
+        self: HostDispatchScheduler,
+        session_id: str,
+    ) -> None:
+        """记录 scheduler wake 的 loop thread 并访问 asyncio primitive。
+
+        :param self: scheduler。
+        :param session_id: queue promotion Session id。
+        :returns: ``None``。
+        :raises Exception: 原始 wake 失败时透传。
+        """
+
+        assert threading.get_ident() == loop_thread_id
+        wake_on_loop.set()
+        original_wake_queue(self, session_id)
+
+    def record_projection_catchup(self: _CompositeProjectionCatchupPort) -> None:
+        """记录 projection close 阶段并委托真实实现。
+
+        :param self: composite projection port。
+        :returns: ``None``。
+        :raises Exception: 原始 catch-up 失败时透传。
+        """
+
+        order.append("projection")
+        original_projection_catchup(self)
+
+    def record_handle_close(self: HostCommandHandle) -> None:
+        """记录 actor handle close 并委托真实实现。
+
+        :param self: actor 私有 command handle。
+        :returns: ``None``。
+        :raises Exception: 原始 close 失败时透传。
+        """
+
+        order.append("actor_handle")
+        original_handle_close(self)
+
+    def record_executor_shutdown(
+        self: ThreadPoolExecutor,
+        wait: bool = True,
+        *,
+        cancel_futures: bool = False,
+    ) -> None:
+        """记录 actor executor shutdown 并委托真实实现。
+
+        :param self: thread pool executor。
+        :param wait: 是否等待 worker 退出。
+        :param cancel_futures: 是否取消未开始 futures。
+        :returns: ``None``。
+        :raises Exception: 原始 shutdown 失败时透传。
+        """
+
+        order.append("executor")
+        original_executor_shutdown(
+            self,
+            wait=wait,
+            cancel_futures=cancel_futures,
+        )
+
+    def record_store_close(self: HostDurableStore) -> None:
+        """区分记录 actor store 与 scheduler store close。
+
+        :param self: durable store。
+        :returns: ``None``。
+        :raises Exception: 原始 close 失败时透传。
+        """
+
+        order.append(
+            "scheduler_store"
+            if threading.get_ident() == loop_thread_id
+            else "actor_store"
+        )
+        original_store_close(self)
+
+    monkeypatch.setattr(HostDispatchScheduler, "close", record_scheduler_close)
+    monkeypatch.setattr(
+        HostDispatchScheduler,
+        "wake_queue_promotion",
+        record_wake_queue,
+    )
+    monkeypatch.setattr(
+        _CompositeProjectionCatchupPort,
+        "catch_up_projection",
+        record_projection_catchup,
+    )
+    monkeypatch.setattr(HostCommandHandle, "close", record_handle_close)
+    monkeypatch.setattr(ThreadPoolExecutor, "shutdown", record_executor_shutdown)
+    monkeypatch.setattr(HostDurableStore, "close", record_store_close)
+    wakeup_port = _ThreadsafeSchedulerWakeupPort(
+        loop=loop,
+        scheduler=public_host._scheduler,
     )
 
-    await host.close()
-    await host.close()
+    def blocked_actor_wake(_handle: HostCommandHandle) -> None:
+        """在 actor thread 等待 barrier 后同步桥接 scheduler wake。
 
-    assert order == ["poller", "scheduler"]
-    assert wait_poller.close_count == 1
-    assert scheduler.close_count == 1
-    assert projection_catchup_port.catch_up_count == 1
-    assert command_handle.close_count == 1
+        :param _handle: actor 私有 command handle。
+        :returns: ``None``。
+        :raises RuntimeError: release barrier 超时时抛出。
+        """
+
+        wake_started.set()
+        if not wake_release.wait(timeout=2):
+            raise RuntimeError("close-order wake barrier timed out")
+        wakeup_port.wake_queue_promotion("close-order-session")
+
+    command_task = asyncio.create_task(
+        public_host._durable_actor.call(blocked_actor_wake)
+    )
+    assert await asyncio.to_thread(wake_started.wait, 1)
+    close_task = asyncio.create_task(public_host.close())
+    await asyncio.sleep(0)
+    assert "scheduler" not in order
+    wake_release.set()
+    await command_task
+    await asyncio.wait_for(wake_on_loop.wait(), timeout=1)
+    await close_task
+    await manager.__aexit__(None, None, None)
+
+    assert order == [
+        "scheduler",
+        "projection",
+        "actor_handle",
+        "actor_store",
+        "executor",
+        "scheduler_store",
+    ]
 
 
 @pytest.mark.asyncio
@@ -907,25 +1187,28 @@ async def test_open_host_startup_failure_closes_poller_before_scheduler(
     def raise_public_handle_init(
         self: _PublicHostHandle,
         *,
-        command_handle: HostCommandHandle,
+        durable_actor: object,
         host_handle_id: str,
         scheduler: HostDispatchScheduler,
         projection_catchup_port: ProjectionCatchupPort,
+        scheduler_store: object,
         wait_poller: WaitPollerSupervisor | None,
     ) -> None:
         """模拟 public handle 构造失败。
 
         :param self: public handle。
-        :param command_handle: command handle。
+        :param durable_actor: durable actor。
         :param host_handle_id: Host handle id。
         :param scheduler: scheduler。
         :param projection_catchup_port: projection catch-up port。
+        :param scheduler_store: scheduler durable store。
         :param wait_poller: wait poller。
         :returns: 不会返回。
         :raises RuntimeError: 始终抛出测试错误。
         """
 
-        del self, command_handle, host_handle_id, scheduler, projection_catchup_port
+        del self, durable_actor, host_handle_id, scheduler, projection_catchup_port
+        del scheduler_store
         assert wait_poller is not None
         raise RuntimeError("forced public handle init failure")
 
@@ -1055,10 +1338,10 @@ async def test_open_host_dispatch_memory_catchup_reaches_required_cursor(
 
 
 @pytest.mark.asyncio
-async def test_open_host_purge_session_and_watch_after_purge_fail_closed(
+async def test_open_host_admin_purge_keeps_execution_capability_separate(
     tmp_path: pathlib.Path,
 ) -> None:
-    """open_host purge 接到 command facade，purge 后 watch 不重建 Session。"""
+    """HostAdmin purge 后 execution read fail closed，且 execution 无 purge。"""
 
     options = _options(tmp_path, _FinalAnswerWorkerFactory())
 
@@ -1068,22 +1351,21 @@ async def test_open_host_purge_session_and_watch_after_purge_fail_closed(
             session.session_id,
             _close_request("close-before-purge"),
         )
-        result = await host.purge_session(
+        assert not hasattr(host, "purge_session")
+
+    async with open_host_admin(_admin_options(options)) as host_admin:
+        result = await host_admin.purge_session(
             session.session_id,
             _purge_request("purge-open-host"),
         )
-
         assert result.session_id == session.session_id
         assert result.purged is True
         assert result.purge_tombstone_ref is not None
         assert result.deleted_counts_digest is not None
+    async with open_host(options) as reopened_host:
         with pytest.raises(HostApiError) as get_session_exc:
-            await host.get_session(session.session_id)
-        with pytest.raises(HostApiError) as watch_exc:
-            host.watch_session_events(session.session_id)
-
+            await reopened_host.get_session(session.session_id)
         assert get_session_exc.value.code == HostApiErrorCode.NOT_FOUND
-        assert watch_exc.value.code == HostApiErrorCode.NOT_FOUND
 
 
 def test_compactor_runner_baseline_none_maps_to_fail_closed_no_capability(
@@ -1367,6 +1649,33 @@ def _options(
         memory_projection_policy=default_memory_projection_policy(),
         memory_projection_catchup_batch_size=128,
         enable_truncation_manager=True,
+    )
+
+
+def _admin_options(options: OpenHostOptions) -> OpenHostAdminOptions:
+    """从 execution options 投影同源 admin durable policy。
+
+    :param options: execution opener options。
+    :returns: admin opener options。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return OpenHostAdminOptions(
+        db_path=options.db_path,
+        artifact_root=options.artifact_root,
+        create_parent_dirs=options.create_parent_dirs,
+        sqlite_busy_timeout_seconds=options.sqlite_busy_timeout_seconds,
+        sqlite_write_busy_retry_count=options.sqlite_write_busy_retry_count,
+        sqlite_write_retry_initial_delay_seconds=(
+            options.sqlite_write_retry_initial_delay_seconds
+        ),
+        sqlite_write_retry_backoff_multiplier=(
+            options.sqlite_write_retry_backoff_multiplier
+        ),
+        sqlite_write_retry_max_delay_seconds=(
+            options.sqlite_write_retry_max_delay_seconds
+        ),
+        payload_inline_threshold_bytes=options.payload_inline_threshold_bytes,
     )
 
 

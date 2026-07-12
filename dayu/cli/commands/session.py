@@ -66,28 +66,27 @@ from dayu.cli.session_execution import (
     prepare_prompt_session_execution,
 )
 from dayu.cli.session_identity import CliSessionLabelKind, slot_ref_for_cli_label
-from dayu.contracts import JsonValue
 from dayu.host.api import (
     Host,
+    HostAdmin,
     HostApiError,
     HostApiErrorCode,
     PurgeSessionRequest,
     SessionSlotRef,
     SessionStatus,
 )
-from dayu.host.open_host import open_host
+from dayu.host.open_host import open_host, open_host_admin
 from dayu.runtime.location import RuntimeLocationError
 from dayu.service.entrypoint_runtime import (
     EntrypointRuntimeError,
-    EntrypointRuntimeRequest,
-    EntrypointRuntimeResult,
-    prepare_entrypoint_runtime,
 )
-from dayu.service.host_assembly import ServiceAssemblyOverrides
+from dayu.service.host_admin import (
+    ServiceHostAdminRequest,
+    ServiceHostAdminResult,
+    prepare_host_admin,
+)
 from dayu.service.scene_context import (
-    EntrypointContextSlotRequest,
     FMP_API_KEY_ENV,
-    build_entrypoint_context_slot_values,
 )
 
 DEFAULT_DISPLAY_USER: Final[str] = "本地 CLI 用户"
@@ -189,8 +188,8 @@ async def _run_session_command_async(args: ParsedCliArgs) -> int:
         display_user=DEFAULT_DISPLAY_USER,
         ticker=None,
     )
-    runtime = await _prepare_session_runtime(args)
-    async with open_host(runtime.host_assembly.options) as host:
+    admin = _prepare_session_admin(args)
+    async with open_host_admin(admin.options) as host:
         if args.session_action == SESSION_ACTION_LIST:
             return await _run_session_list(host)
         if args.session_action == SESSION_ACTION_PURGE:
@@ -202,15 +201,15 @@ async def _run_session_command_async(args: ParsedCliArgs) -> int:
     raise CliSessionUsageError(f"unsupported session command: {args.session_action}")
 
 
-async def _prepare_session_runtime(
+def _prepare_session_admin(
     args: ParsedCliArgs,
-) -> EntrypointRuntimeResult:
-    """准备 session 命令打开 Host 所需的 runtime assembly。
+) -> ServiceHostAdminResult:
+    """准备 session list/purge 所需的纯 durable admin assembly。
 
     :param args: argparse 已解析的 session 命令参数。
-    :returns: entrypoint runtime 准备结果。
+    :returns: HostAdmin opener 装配结果。
     :raises CliSessionUsageError: workspace 或 config 参数非法时抛出。
-    :raises Exception: runtime assembly 失败时向上抛出。
+    :raises Exception: Host runtime 配置或路径装配失败时向上抛出。
     """
 
     workspace_root = resolve_workspace_root(
@@ -222,23 +221,19 @@ async def _prepare_session_runtime(
         workspace_root=workspace_root,
         error_factory=CliSessionUsageError,
     )
-    return await prepare_entrypoint_runtime(
-        EntrypointRuntimeRequest(
+    return prepare_host_admin(
+        ServiceHostAdminRequest(
             workspace_root=workspace_root,
             package_config_root=package_config_root(),
-            explicit_config_dir=explicit_config_dir,
-            scene_id=CLI_PROMPT_SCENARIO,
-            context_slot_values=_session_context_slot_values(),
-            assembly_overrides=ServiceAssemblyOverrides(),
-            env=os.environ,
+            config_overlay_dir=explicit_config_dir,
         )
     )
 
 
-async def _run_session_list(host: Host) -> int:
+async def _run_session_list(host: HostAdmin) -> int:
     """执行 ``session list``。
 
-    :param host: Host public handle。
+    :param host: HostAdmin public handle。
     :returns: CLI 退出码。
     :raises HostApiError: Host 读取失败时向上抛出。
     :raises OSError: 输出流写入失败时由底层 ``print`` 透传。
@@ -274,8 +269,8 @@ async def _run_session_resume(args: ParsedCliArgs) -> int:
             ),
             usage_error_factory=CliSessionUsageError,
         )
+        target = await _resolve_existing_session_target_with_admin(args)
         async with open_host(prepared.runtime.host_assembly.options) as host:
-            target = await _resolve_existing_session_target(host=host, args=args)
             try:
                 return await execute_prompt_on_session(
                     host=host,
@@ -304,8 +299,8 @@ async def _run_session_resume(args: ParsedCliArgs) -> int:
         ),
         usage_error_factory=CliSessionUsageError,
     )
+    target = await _resolve_existing_session_target_with_admin(args)
     async with open_host(prepared_interactive.runtime.host_assembly.options) as host:
-        target = await _resolve_existing_session_target(host=host, args=args)
         try:
             return await execute_interactive_on_session(
                 host=host,
@@ -327,13 +322,13 @@ async def _run_session_resume(args: ParsedCliArgs) -> int:
 
 async def _run_session_purge(
     *,
-    host: Host,
+    host: HostAdmin,
     args: ParsedCliArgs,
     invocation: CliInvocation,
 ) -> int:
     """执行 ``session purge``。
 
-    :param host: Host public handle。
+    :param host: HostAdmin public handle。
     :param args: argparse 已解析的 session 命令参数。
     :param invocation: 当前 CLI invocation 身份。
     :returns: CLI 退出码。
@@ -367,12 +362,12 @@ async def _run_session_purge(
 
 async def _resolve_existing_session_target(
     *,
-    host: Host,
+    host: HostAdmin,
     args: ParsedCliArgs,
 ) -> _ExistingSessionTarget:
     """把 resume selector 解析为当前存在且 OPEN 的 Host Session。
 
-    :param host: Host public handle。
+    :param host: HostAdmin public handle。
     :param args: argparse 已解析的 session 命令参数。
     :returns: 已解析的 existing Session 目标。
     :raises CliSessionUsageError: selector 非法、目标缺失或目标 CLOSED 时抛出。
@@ -426,14 +421,34 @@ async def _resolve_existing_session_target(
     )
 
 
+async def _resolve_existing_session_target_with_admin(
+    args: ParsedCliArgs,
+) -> _ExistingSessionTarget:
+    """通过短生命周期 HostAdmin 解析 resume 目标。
+
+    :param args: argparse 已解析的 session resume 参数。
+    :returns: 已解析且仍为 OPEN 的 Session 目标。
+    :raises CliSessionUsageError: selector 非法或目标不可 resume 时抛出。
+    :raises HostApiError: durable 列表读取失败时抛出。
+    :raises Exception: admin assembly 或 opener 失败时透传。
+    """
+
+    admin = _prepare_session_admin(args)
+    async with open_host_admin(admin.options) as host_admin:
+        return await _resolve_existing_session_target(
+            host=host_admin,
+            args=args,
+        )
+
+
 async def _resolve_purge_target(
     *,
-    host: Host,
+    host: HostAdmin,
     args: ParsedCliArgs,
 ) -> _PurgeTarget:
     """解析 purge selector 为 Host Session id。
 
-    :param host: Host public handle。
+    :param host: HostAdmin public handle。
     :param args: argparse 已解析的 session 命令参数。
     :returns: purge 目标。
     :raises CliSessionUsageError: selector 非法或 label 无匹配 Session 时抛出。
@@ -474,12 +489,12 @@ async def _resolve_purge_target(
 
 async def _resolve_session_id_for_slot(
     *,
-    host: Host,
+    host: HostAdmin,
     slot: SessionSlotRef,
 ) -> str | None:
     """通过 Host public list 解析 slot 当前绑定的 Session id。
 
-    :param host: Host public handle。
+    :param host: HostAdmin public handle。
     :param slot: 待匹配的 Host public slot ref。
     :returns: 匹配到的 Session id；未匹配时为 ``None``。
     :raises HostApiError: Host list 失败时向上抛出。
@@ -691,18 +706,5 @@ def _host_error_target(
         explicit_session_id_selector=not target.resolved_from_label,
         resolved_from_label=target.resolved_from_label,
     )
-
-
-def _session_context_slot_values() -> dict[str, JsonValue]:
-    """构造 session 命令 runtime 准备所需的上下文槽位。
-
-    :returns: ScenePrepare 可消费的上下文槽位值。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    return build_entrypoint_context_slot_values(
-        EntrypointContextSlotRequest(ticker=None)
-    )
-
 
 __all__: tuple[str, ...] = ("run_session_command",)

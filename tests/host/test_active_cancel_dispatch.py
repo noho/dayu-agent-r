@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import threading
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -50,7 +51,13 @@ from dayu.host.api import (
     StartRunRequest,
 )
 from dayu.host.command import HostCommandHandle, create_host_command_handle, start_run
-from dayu.host.dispatch import ActiveWorkerRegistry, HostDispatchScheduler
+from dayu.host.dispatch import (
+    ActiveCancelMessage,
+    ActiveWorkerRegistry,
+    HostDispatchScheduler,
+    _HostCancellationToken,
+)
+from dayu.host.open_host import _ThreadsafeActiveWorkerCancelPort
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
 from dayu.host.durable.event_log import EventClass, EventLogAppendRequest, EventLogStore
 from dayu.host.durable.options import (
@@ -85,6 +92,46 @@ class _RunRefs:
     dispatch_record_id: str
 
 
+@pytest.mark.asyncio
+async def test_active_cancel_bridge_runs_worker_hook_on_opener_loop_thread() -> None:
+    """actor thread 发起 cancel 时 token/hook/asyncio primitive 回到 opener loop。"""
+
+    opener_thread_id = threading.get_ident()
+    registry = ActiveWorkerRegistry()
+    handle = _CancelAwareHandle(
+        local_worker_id="bridge-worker",
+        terminal="hang",
+    )
+    token = _HostCancellationToken()
+    registry.register(
+        run_id="run-bridge",
+        attempt_id="attempt-bridge",
+        execution_id="execution-bridge",
+        handle=handle,
+        cancellation_token=token,
+    )
+    port = _ThreadsafeActiveWorkerCancelPort(
+        loop=asyncio.get_running_loop(),
+        active_registry=registry,
+    )
+
+    found = await asyncio.to_thread(
+        port.cancel,
+        ActiveCancelMessage(
+            run_id="run-bridge",
+            attempt_id="attempt-bridge",
+            execution_id="execution-bridge",
+            reason="bridge-test",
+        ),
+    )
+
+    assert found is True
+    assert token.cancel_reason() == "bridge-test"
+    assert handle.cancel_reasons == ["bridge-test"]
+    assert handle.cancel_thread_ids == [opener_thread_id]
+    assert handle._cancelled.is_set()
+
+
 class _CancelAwareHandle:
     """收到 cancel 后发出 run_cancelled 的 fake worker handle。"""
 
@@ -103,6 +150,7 @@ class _CancelAwareHandle:
         self._session_id: str | None = None
         self._run_id: str | None = None
         self.cancel_reasons: list[str] = []
+        self.cancel_thread_ids: list[int] = []
         self.closed = False
 
     @property
@@ -161,6 +209,7 @@ class _CancelAwareHandle:
         """
 
         self.cancel_reasons.append(reason)
+        self.cancel_thread_ids.append(threading.get_ident())
         self._cancelled.set()
 
     def bind_snapshot(self, snapshot: AttemptDispatchSnapshot) -> None:

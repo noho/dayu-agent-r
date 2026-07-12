@@ -64,14 +64,15 @@ Host 与其它层的稳定边界如下：
 
 ## 接口
 
-普通 Service-facing 入口是包根导出的 `open_host(options)`。它是异步 context manager，进入后返回异步 `Host` handle；Service 使用该 handle 发起 Session / Run / outbox / wait / cancel / purge 操作，不直接持有 durable store、scheduler、command handle、registry、wait poller 或 ToolRuntime 内部对象。`OpenHostOptions.wait_poller_policy=None` 时不启动 production wait poller；传入启用的 policy 时，`HostToolingOptions.wait_poll_adapter_registry` 必须同时提供，poller 才会由 `open_host` 装配。
+Service-facing opener 按 capability 分为两个无继承关系的异步协议：`open_host(options)` 返回 execution `Host`，`open_host_admin(options)` 返回纯 durable `HostAdmin`。execution opener 装配 scheduler、recovery、lane、worker 与可选 wait poller；admin opener 只接收 SQLite / artifact policy，不读取 scene、tool、model 或 secret，也不启动 recovery、projection catch-up、lane、worker 或 scheduler。两种 public handle 都不暴露 durable store、同步 command handle或内部 wakeup port。
+
+execution public command / read / watch 统一提交给单 worker durable actor；command handle、actor store 与 SQLite connection 从创建、使用到关闭始终归属该 actor thread。scheduler 使用另一条独立、同 policy 的 store connection。actor transaction 的 after-commit scheduler wake 与 active worker cancel 通过同步 bridge 回到 opener event loop；caller cancellation 不取消已经开始的 actor future。
 
 `Host` handle 当前提供：
 
 - `ensure_session(request)`：按 `(scope, slot_key)` 原子确保当前 Session。
 - `create_session(request)`：显式创建新 Session，可选择重绑定 slot。
 - `get_session(session_id)`：读取 Session snapshot。
-- `list_sessions()`：读取全部未 purge Session 的 durable 列表摘要。
 - `get_run(run_id)`：读取 Run snapshot。Run 是否终态以 Host public `is_terminal_run_status(status)` 为准；终态 `RunSnapshot` 必须携带同状态的 `TerminalResultSummary`，非终态不得携带 terminal summary。
 - `submit_followup(session_id, request)`：提交普通 queue 或 steer follow-up。
 - `retry_run(run_id, request)`：基于失败源 Run 创建关联的新 Run。
@@ -80,13 +81,17 @@ Host 与其它层的稳定边界如下：
 - `cancel_session_runs(session_id, request)`：取消 Session 下可治理的非终态 Run。
 - `resolve_wait(wait_id, request)`：接收外部 wait result，由 Host 恢复或收口 Run。
 - `close_session(session_id, request)`：关闭 Session 的新输入入口。
-- `purge_session(session_id, request)`：清理已关闭且所有 Run 已终态的 Session 本地可恢复事实。
-- `report_storage_usage()`：读取只读 storage usage report，包含 durable SQLite 表 row count、payload logical bytes、orphan SQLite payload 诊断计数以及 DB/WAL 文件大小。
-- `run_storage_maintenance(request)`：执行显式 maintenance，返回 orphan artifact 候选、已发布 artifact 物理字节和、usage report 与可选 WAL checkpoint 诊断；默认 dry-run 不删除文件，显式 `reclaim_orphan_artifacts=True` 时只回收删除前 recheck 仍未被引用的 orphan artifact 物理文件。
 - `read_outbox_terminal_items(session_id, request)`：读取离线 terminal notification item。
 - `drain_outbox_terminal_items(session_id, request)`：幂等标记 terminal notification item 已 drain。
 - `watch_session_events(session_id)`：创建 live HostEvent 订阅；订阅从当前 live cursor 开始，不提供离线 replay cursor。
-- `close()`：关闭当前 opener runtime，先关闭 wait poller，再关闭 scheduler，并向 active worker 传播 lifecycle cancel；该操作不写用户 cancel / failed terminal facts。
+- `close()`：关闭当前 execution runtime；停止新 public call 后先关闭 wait poller并 drain actor command / wake，再按 scheduler、projection flush、actor handle、actor executor、scheduler store 的顺序释放资源。该操作不写用户 cancel / failed terminal facts。
+
+`HostAdmin` handle 当前提供：
+
+- `get_session(session_id)` 与 `list_sessions()`：读取 durable Session truth，不触发执行。
+- `purge_session(session_id, request)`：清理已关闭且所有 Run 已终态的 Session 本地可恢复事实。
+- `report_storage_usage()` 与 `run_storage_maintenance(request)`：读取 storage usage 或执行显式 maintenance；默认 maintenance 为 dry-run。
+- `close()`：只关闭 admin actor、command handle、store 与 executor，重复关闭幂等。
 
 包根还导出函数式 command / read facade：`ensure_session`、`create_session`、`get_session`、`list_sessions`、`get_run`、`submit_followup`、`retry_run`、`replay_run`、`cancel_run`、`cancel_session_runs`、`resolve_wait`、`close_session`、`purge_session`、`report_storage_usage`、`run_storage_maintenance`。普通 Service 优先使用 `open_host` 返回的异步 handle；低层 facade 不公开 durable store 或 scheduler 作为包根公共面。
 
@@ -325,7 +330,7 @@ dayu.host
 
 ## 稳定边界
 
-Host 稳定边界是 durable command、typed request / snapshot、HostEvent view、outbox terminal item 与 `open_host(options)` construction-time typed inputs。`list_sessions` 属于 typed read view：它从 durable Session / slot / Run state truth 生成全部未 purge Session 的列表摘要，不读取 projection truth，不触发 projection catch-up，也不启动执行。
+Host 稳定边界是 durable command、typed request / snapshot、HostEvent view、outbox terminal item，以及 execution `open_host(options)` / admin `open_host_admin(options)` 的 construction-time typed inputs。`HostAdmin.list_sessions` 属于 typed read view：它从 durable Session / slot / Run state truth 生成全部未 purge Session 的列表摘要，不读取 projection truth，不触发 projection catch-up，也不启动执行。
 
 Host 不负责：
 
@@ -346,7 +351,7 @@ Stream 术语固定如下：
 
 ### Public API 与 opener
 
-`api.py` 定义 public dataclass、enum、Protocol、error 与 opener options；包根 `__all__` 收口 Service-facing 导出。`open_host(options)` 负责装配 durable store、admission service、scheduler、active worker registry、可选 wait poller supervisor、audit / tool trace / outbox projection catch-up ports、context compactor 和本地 worker typed port，并在 async context 退出时关闭当前 opener runtime。Conversation Memory 的 required repair / catch-up 由 dispatch 前 correctness path 触发，opener 的 after-commit 热路径不执行 memory projection 追平。
+`api.py` 定义 public dataclass、enum、独立 `Host` / `HostAdmin` Protocol、error 与两类 opener options；包根 `__all__` 收口 Service-facing 导出。`open_host(options)` 负责装配 scheduler store、public durable actor、admission、scheduler、active worker registry、可选 wait poller、projection catch-up ports、context compactor 和本地 worker typed port；`open_host_admin(options)` 只装配 admin durable actor chain。Conversation Memory 的 required repair / catch-up 由 dispatch 前 correctness path 触发，opener 的 after-commit 热路径不执行 memory projection 追平。
 
 ### Admission 与 command
 

@@ -124,6 +124,7 @@ from dayu.host.durable.transaction import (
 )
 from dayu.host.dispatch import (
     ActiveCancelMessage,
+    ActiveWorkerCancelPort,
     ActiveWorkerRegistry,
 )
 from dayu.host.projection import catch_up_projection_best_effort
@@ -197,7 +198,7 @@ class HostCommandHandle:
         host_handle_id: str,
         durable_store: HostDurableStore,
         admission_service: HostAdmissionService,
-        active_registry: ActiveWorkerRegistry,
+        active_registry: ActiveWorkerCancelPort,
         active_cancel_watchdog_wakeup_port: ActiveCancelWatchdogWakeupPort | None = None,
     ) -> None:
         """初始化 Host command handle。
@@ -358,7 +359,7 @@ class HostCommandHandle:
 def create_host_command_handle(
     options: HostCommandHandleOptions,
     *,
-    active_registry: ActiveWorkerRegistry | None = None,
+    active_registry: ActiveWorkerCancelPort | None = None,
 ) -> HostCommandHandle:
     """创建 Host public command handle。
 
@@ -1634,7 +1635,7 @@ def _propagate_active_cancel_targets(
 
 
 def _wake_active_cancel_watchdog(host: HostCommandHandle) -> None:
-    """best-effort 唤醒 active cancel watchdog。
+    """唤醒 active cancel watchdog 并保留 bridge failure。
 
     :param host: Host command handle。
     :returns: ``None``。
@@ -1643,13 +1644,7 @@ def _wake_active_cancel_watchdog(host: HostCommandHandle) -> None:
     wakeup_port = host._active_cancel_watchdog_wakeup_port
     if wakeup_port is None:
         return
-    try:
-        wakeup_port.wake_active_cancel_watchdog()
-    except RuntimeError:
-        _LOGGER.debug(
-            "command.active_cancel_watchdog_wakeup_closed host_handle_id=%s",
-            host.host_handle_id,
-        )
+    wakeup_port.wake_active_cancel_watchdog()
 
 
 def _is_deferred_cancel_state(host: HostCommandHandle, run_id: str) -> bool:

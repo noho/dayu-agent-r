@@ -38,6 +38,7 @@ from dayu.host.api import (
     HostApiErrorCode,
     HostApiErrorDetail,
     Host,
+    HostAdmin,
     HostActivityCounts,
     HostActivityKind,
     HostActivitySeverity,
@@ -58,6 +59,7 @@ from dayu.host.api import (
     LocalEngineWorker,
     LocalEngineWorkerFactory,
     LocalWorkerHandle,
+    OpenHostAdminOptions,
     OpenHostOptions,
     OperationContext,
     OrdinaryRunExecutionBaseline,
@@ -124,7 +126,7 @@ from dayu.host.wait_callback import (
     callback_payload_digest,
 )
 from dayu.host.read_api import get_run, get_session, list_sessions
-from dayu.host.open_host import open_host
+from dayu.host.open_host import open_host, open_host_admin
 from dayu.host.durable.maintenance import HostWalCheckpointMode, HostWalCheckpointResult
 from dayu.host.storage_maintenance import (
     DEFAULT_ORPHAN_ARTIFACT_GRACE_SECONDS,
@@ -180,6 +182,7 @@ __all__ = [
     "HostApiErrorCode",
     "HostApiErrorDetail",
     "Host",
+    "HostAdmin",
     "HostActivityCounts",
     "HostActivityKind",
     "HostActivitySeverity",
@@ -207,6 +210,7 @@ __all__ = [
     "LocalEngineWorker",
     "LocalEngineWorkerFactory",
     "LocalWorkerHandle",
+    "OpenHostAdminOptions",
     "HostToolingOptions",
     "OpenHostOptions",
     "OperationContext",
@@ -267,6 +271,7 @@ __all__ = [
     "is_terminal_run_status",
     "list_sessions",
     "open_host",
+    "open_host_admin",
     "purge_session",
     "replay_run",
     "report_storage_usage",

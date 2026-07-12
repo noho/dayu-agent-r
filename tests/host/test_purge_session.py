@@ -13,7 +13,7 @@ from typing import TypeVar, cast
 import pytest
 
 from dayu.contracts.json_value import JsonValue
-from dayu.host import open_host
+from dayu.host import OpenHostAdminOptions, OpenHostOptions, open_host, open_host_admin
 from dayu.host import command as host_command_module
 from dayu.host.audit import (
     LogAuditSinkOptions,
@@ -463,8 +463,8 @@ async def _purge_in_independent_process_async(*, root_path: Path, result_marker:
         worker_factory=None,
         allow_tool_calls=False,
     )
-    async with open_host(options) as host:
-        result = await host.purge_session(_SESSION_ID, _purge_api_request())
+    async with open_host_admin(_admin_options_from_execution(options)) as host_admin:
+        result = await host_admin.purge_session(_SESSION_ID, _purge_api_request())
     result_marker.write_text(
         json.dumps(
             {
@@ -475,6 +475,35 @@ async def _purge_in_independent_process_async(*, root_path: Path, result_marker:
             sort_keys=True,
         ),
         encoding="utf-8",
+    )
+
+
+def _admin_options_from_execution(
+    options: OpenHostOptions,
+) -> OpenHostAdminOptions:
+    """从测试 execution options 投影同源 admin durable policy。
+
+    :param options: execution opener options。
+    :returns: admin opener options。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return OpenHostAdminOptions(
+        db_path=options.db_path,
+        artifact_root=options.artifact_root,
+        create_parent_dirs=options.create_parent_dirs,
+        sqlite_busy_timeout_seconds=options.sqlite_busy_timeout_seconds,
+        sqlite_write_busy_retry_count=options.sqlite_write_busy_retry_count,
+        sqlite_write_retry_initial_delay_seconds=(
+            options.sqlite_write_retry_initial_delay_seconds
+        ),
+        sqlite_write_retry_backoff_multiplier=(
+            options.sqlite_write_retry_backoff_multiplier
+        ),
+        sqlite_write_retry_max_delay_seconds=(
+            options.sqlite_write_retry_max_delay_seconds
+        ),
+        payload_inline_threshold_bytes=options.payload_inline_threshold_bytes,
     )
 
 
@@ -527,8 +556,9 @@ async def _read_after_purge_in_independent_process_async(*, root_path: Path, res
                 _replay_api_request("replay-after-purge-process"),
             )
         )
+        watcher = host.watch_session_events(_SESSION_ID)
         try:
-            host.watch_session_events(_SESSION_ID)
+            await anext(watcher)
         except HostApiError as exc:
             observed["watch_session_events"] = exc.code.value
         else:

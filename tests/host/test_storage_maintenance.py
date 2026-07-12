@@ -26,6 +26,7 @@ from dayu.host import (
     HostCallContext,
     HostClosedError,
     HostStorageMaintenanceRequest,
+    OpenHostAdminOptions,
     OpenHostOptions,
     OperationContext,
     OrdinaryRunExecutionBaseline,
@@ -56,7 +57,7 @@ from dayu.host.durable.schema import (
 )
 from dayu.host.durable.transaction import HostTransaction
 from dayu.host.memory import default_memory_projection_policy
-from dayu.host.open_host import open_host
+from dayu.host.open_host import open_host_admin
 from dayu.host.read_api import get_run, get_session
 from dayu.host import storage_maintenance as storage_maintenance_module
 from dayu.host.storage_maintenance import report_storage_usage
@@ -230,6 +231,34 @@ def _open_host_options(tmp_path: Path) -> OpenHostOptions:
         memory_projection_policy=default_memory_projection_policy(),
         memory_projection_catchup_batch_size=128,
         enable_truncation_manager=True,
+    )
+
+
+def _open_host_admin_options(tmp_path: Path) -> OpenHostAdminOptions:
+    """从测试 execution options 投影同源 admin durable options。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: HostAdmin opener options。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    options = _open_host_options(tmp_path)
+    return OpenHostAdminOptions(
+        db_path=options.db_path,
+        artifact_root=options.artifact_root,
+        create_parent_dirs=options.create_parent_dirs,
+        sqlite_busy_timeout_seconds=options.sqlite_busy_timeout_seconds,
+        sqlite_write_busy_retry_count=options.sqlite_write_busy_retry_count,
+        sqlite_write_retry_initial_delay_seconds=(
+            options.sqlite_write_retry_initial_delay_seconds
+        ),
+        sqlite_write_retry_backoff_multiplier=(
+            options.sqlite_write_retry_backoff_multiplier
+        ),
+        sqlite_write_retry_max_delay_seconds=(
+            options.sqlite_write_retry_max_delay_seconds
+        ),
+        payload_inline_threshold_bytes=options.payload_inline_threshold_bytes,
     )
 
 
@@ -716,10 +745,10 @@ def test_storage_maintenance_result_json_value_is_stable_self_explaining_and_non
 async def test_open_host_async_handle_runs_storage_maintenance_dry_run(
     tmp_path: Path,
 ) -> None:
-    """open_host async handle 暴露 storage maintenance dry-run 入口。"""
+    """HostAdmin async handle 暴露 storage maintenance dry-run 入口。"""
 
-    async with open_host(_open_host_options(tmp_path)) as host:
-        result = await host.run_storage_maintenance(
+    async with open_host_admin(_open_host_admin_options(tmp_path)) as host_admin:
+        result = await host_admin.run_storage_maintenance(
             HostStorageMaintenanceRequest(run_wal_checkpoint=False)
         )
 
@@ -733,12 +762,12 @@ async def test_open_host_run_storage_maintenance_fails_after_close(
 ) -> None:
     """public handle 关闭后 maintenance 使用当前 closed handle 错误语义。"""
 
-    manager = open_host(_open_host_options(tmp_path))
-    host = await manager.__aenter__()
-    await host.close()
+    manager = open_host_admin(_open_host_admin_options(tmp_path))
+    host_admin = await manager.__aenter__()
+    await host_admin.close()
 
     with pytest.raises(HostClosedError):
-        await host.run_storage_maintenance(HostStorageMaintenanceRequest())
+        await host_admin.run_storage_maintenance(HostStorageMaintenanceRequest())
 
 
 def _write_referenced_artifact(host: HostCommandHandle, artifact_root: Path) -> str:

@@ -1282,6 +1282,79 @@ class OpenHostOptions:
             _validate_wait_poller_policy(self.wait_poller_policy)
 
 
+@dataclass(frozen=True, slots=True)
+class OpenHostAdminOptions:
+    """``open_host_admin`` 的纯 durable 管理构造选项。
+
+    该契约只包含打开 Host durable store 所需的存储参数，不包含 scheduler、
+    recovery、lane、worker、scene、tool、model 或 secret 输入。
+
+    :param db_path: Host durable SQLite 数据库路径。
+    :param artifact_root: Host artifact 根目录。
+    :param create_parent_dirs: 打开 store / artifact 前是否创建父目录。
+    :param sqlite_busy_timeout_seconds: durable SQLite busy timeout 秒数。
+    :param sqlite_write_busy_retry_count: 写事务 busy 重试次数。
+    :param sqlite_write_retry_initial_delay_seconds: 首次写重试等待秒数。
+    :param sqlite_write_retry_backoff_multiplier: 写重试退避倍率。
+    :param sqlite_write_retry_max_delay_seconds: 写重试最大等待秒数。
+    :param payload_inline_threshold_bytes: payload 内联存储阈值字节数。
+    """
+
+    db_path: pathlib.Path
+    artifact_root: pathlib.Path
+    create_parent_dirs: bool
+    sqlite_busy_timeout_seconds: float
+    sqlite_write_busy_retry_count: int
+    sqlite_write_retry_initial_delay_seconds: float
+    sqlite_write_retry_backoff_multiplier: float
+    sqlite_write_retry_max_delay_seconds: float
+    payload_inline_threshold_bytes: int
+
+    def __post_init__(self) -> None:
+        """校验纯 durable 管理构造选项。
+
+        :returns: ``None``。
+        :raises TypeError: 路径、布尔或数值字段类型非法时抛出。
+        :raises ValueError: timeout、重试或 payload 阈值非法时抛出。
+        """
+
+        _require_path(self.db_path, field_name="OpenHostAdminOptions.db_path")
+        _require_path(
+            self.artifact_root,
+            field_name="OpenHostAdminOptions.artifact_root",
+        )
+        _require_bool(
+            self.create_parent_dirs,
+            field_name="OpenHostAdminOptions.create_parent_dirs",
+        )
+        _require_positive_float(
+            self.sqlite_busy_timeout_seconds,
+            field_name="OpenHostAdminOptions.sqlite_busy_timeout_seconds",
+        )
+        _require_non_negative_int(
+            self.sqlite_write_busy_retry_count,
+            field_name="OpenHostAdminOptions.sqlite_write_busy_retry_count",
+        )
+        _require_positive_float(
+            self.sqlite_write_retry_initial_delay_seconds,
+            field_name=(
+                "OpenHostAdminOptions.sqlite_write_retry_initial_delay_seconds"
+            ),
+        )
+        _require_positive_float(
+            self.sqlite_write_retry_backoff_multiplier,
+            field_name="OpenHostAdminOptions.sqlite_write_retry_backoff_multiplier",
+        )
+        _require_positive_float(
+            self.sqlite_write_retry_max_delay_seconds,
+            field_name="OpenHostAdminOptions.sqlite_write_retry_max_delay_seconds",
+        )
+        _require_positive_int(
+            self.payload_inline_threshold_bytes,
+            field_name="OpenHostAdminOptions.payload_inline_threshold_bytes",
+        )
+
+
 class HostApiErrorCode(StrEnum):
     """Host API 结构化错误码。
 
@@ -3424,6 +3497,82 @@ class HostClosedError(Exception):
         super().__init__(message)
 
 
+class HostAdmin(Protocol):
+    """Service 使用的异步 Host durable 管理协议。
+
+    该协议只承诺列表、清理与存储维护能力；它不继承 execution ``Host``，
+    也不暴露 submit、cancel、watch、scheduler 或 worker 生命周期。
+    """
+
+    async def get_session(self, session_id: str) -> SessionSnapshot:
+        """读取单个 Session snapshot。
+
+        :param session_id: 目标 Session id。
+        :returns: durable truth 生成的 Session snapshot。
+        :raises HostClosedError: admin handle 已关闭时抛出。
+        :raises HostApiError: Session 不存在或 durable 读取失败时抛出。
+        """
+
+        ...
+
+    async def list_sessions(self) -> ListSessionsResult:
+        """读取全部未 purge Session 的列表摘要。
+
+        :returns: durable truth 生成的 Session 列表结果。
+        :raises HostClosedError: admin handle 已关闭时抛出。
+        :raises HostApiError: durable 读取失败时抛出。
+        """
+
+        ...
+
+    async def purge_session(
+        self, session_id: str, request: PurgeSessionRequest
+    ) -> PurgeSessionResult:
+        """清理已关闭且所有 Run 已终态的 Session 本地事实。
+
+        :param session_id: 目标 Session id。
+        :param request: purge session 请求。
+        :returns: purge tombstone ref 与删除计数摘要。
+        :raises HostClosedError: admin handle 已关闭时抛出。
+        :raises HostApiError: purge 前置条件不满足、幂等冲突或写入失败时抛出。
+        """
+
+        ...
+
+    async def report_storage_usage(self) -> HostStorageUsageReport:
+        """读取 Host durable storage usage report。
+
+        :returns: storage usage report。
+        :raises HostClosedError: admin handle 已关闭时抛出。
+        :raises HostApiError: durable 读取失败时抛出。
+        """
+
+        ...
+
+    async def run_storage_maintenance(
+        self,
+        request: HostStorageMaintenanceRequest,
+    ) -> HostStorageMaintenanceResult:
+        """执行 Host storage maintenance。
+
+        :param request: maintenance 请求。
+        :returns: maintenance 结果。
+        :raises HostClosedError: admin handle 已关闭时抛出。
+        :raises HostApiError: maintenance 执行失败时抛出。
+        """
+
+        ...
+
+    async def close(self) -> None:
+        """关闭当前 admin handle lifecycle。
+
+        :returns: ``None``。
+        :raises Exception: actor durable chain 关闭失败时透传。
+        """
+
+        ...
+
+
 class Host(Protocol):
     """普通 Service 使用的异步 Host handle 协议。
 
@@ -3460,16 +3609,6 @@ class Host(Protocol):
         :returns: Session snapshot。
         :raises HostClosedError: Host handle 已关闭时抛出。
         :raises HostApiError: Session 不存在或读取失败时抛出。
-        """
-
-        ...
-
-    async def list_sessions(self) -> ListSessionsResult:
-        """读取全部未 purge Session 的列表摘要。
-
-        :returns: durable truth 生成的 Session 列表结果。
-        :raises HostClosedError: Host handle 已关闭时抛出。
-        :raises HostApiError: durable 读取失败时抛出。
         """
 
         ...
@@ -3609,48 +3748,6 @@ class Host(Protocol):
 
         ...
 
-    async def purge_session(
-        self, session_id: str, request: PurgeSessionRequest
-    ) -> PurgeSessionResult:
-        """清理已关闭且所有 Run 已终态的 Session 本地事实。
-
-        :param session_id: 目标 Session id。
-        :param request: purge session 请求。
-        :returns: purge tombstone ref 与删除计数摘要。
-        :raises HostClosedError: Host handle 已关闭时抛出。
-        :raises HostApiError: purge 前置条件不满足、幂等冲突或写入失败时抛出。
-        """
-
-        ...
-
-    async def report_storage_usage(self) -> HostStorageUsageReport:
-        """读取 Host durable storage usage report。
-
-        :returns: storage usage report。
-        :raises HostClosedError: Host handle 已关闭时抛出。
-        :raises HostApiError: durable 读取失败时抛出。
-        """
-
-        ...
-
-    async def run_storage_maintenance(
-        self,
-        request: HostStorageMaintenanceRequest,
-    ) -> HostStorageMaintenanceResult:
-        """执行 Host storage maintenance。
-
-        :param request: maintenance 请求。
-            默认 dry-run 不删除文件；当
-            ``request.reclaim_orphan_artifacts`` 为 ``True`` 时，会执行破坏性
-            orphan artifact 回收。
-        :returns: maintenance 结果。
-        :raises HostClosedError: Host handle 已关闭时抛出。
-        :raises HostApiError: maintenance 读取、扫描、checkpoint 或 orphan artifact
-            回收失败时抛出。
-        """
-
-        ...
-
     def watch_session_events(self, session_id: str) -> AsyncIterator[HostEvent]:
         """创建 Session live HostEvent 订阅。
 
@@ -3704,6 +3801,7 @@ __all__ = [
     "HostApiErrorDetail",
     "HostCallContext",
     "Host",
+    "HostAdmin",
     "HostClosedError",
     "HostActivityCounts",
     "HostActivityKind",
@@ -3724,6 +3822,7 @@ __all__ = [
     "LocalEngineWorkerFactory",
     "LocalWorkerHandle",
     "OperationContext",
+    "OpenHostAdminOptions",
     "OpenHostOptions",
     "OrdinaryRunExecutionBaseline",
     "OutboxProjectionStatus",

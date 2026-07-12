@@ -52,6 +52,7 @@ OLD_FETCH_MORE_PROJECTION_TOKENS: tuple[str, ...] = (
 ENGINE_FORBIDDEN_PREFIXES: tuple[str, ...] = ("dayu.host",)
 HOST_ENGINE_CONTRACT_ALLOWED_MODULES: tuple[str, ...] = (
     "_execution_config_projection.py",
+    "_runner_call_manifest.py",
     "api.py",
     "compact_pipeline.py",
     "compaction_operation.py",

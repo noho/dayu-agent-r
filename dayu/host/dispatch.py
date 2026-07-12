@@ -17,6 +17,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
+from typing import Protocol
 from uuid import uuid4
 
 from dayu.contracts.cancellation import CancellationToken
@@ -487,6 +488,34 @@ class ActiveCancelMessage:
     attempt_id: str
     execution_id: str
     reason: str
+
+
+class ActiveWorkerCancelPort(Protocol):
+    """command path 传播 active worker cancel 的最小 typed port。"""
+
+    def cancel(self, message: ActiveCancelMessage) -> bool:
+        """向匹配的 active execution 传播取消。
+
+        :param message: durable commit 后的 active cancel 消息。
+        :returns: 找到匹配 active execution 时返回 ``True``。
+        :raises Exception: port 或 event-loop bridge 失败时透传。
+        """
+
+        ...
+
+
+class NoActiveWorkerCancelPort:
+    """未装配 execution worker 时使用的显式空 cancel port。"""
+
+    def cancel(self, message: ActiveCancelMessage) -> bool:
+        """确认当前没有可传播的 active worker。
+
+        :param message: durable commit 后的 active cancel 消息。
+        :returns: 固定返回 ``False``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return False
 
 
 @dataclass(frozen=True, slots=True)

@@ -904,13 +904,26 @@ admission 冻结的 effective execution snapshot 必须把 canonical execution c
 
 ## 11. Host 公共接口
 
+### 11.1 Execution / Admin capability 与 durable actor boundary
+
+Host 对 Service 提供两个无继承关系的 public Protocol：
+
+- execution `Host` 由 `open_host(OpenHostOptions)` 打开，承诺 Session / Run command、cancel、wait、outbox read/drain 与 live watch；它不承诺 Session list / purge 或 storage maintenance。
+- `HostAdmin` 由 `open_host_admin(OpenHostAdminOptions)` 打开，只承诺 `get_session`、`list_sessions`、`purge_session`、`report_storage_usage` 与 `run_storage_maintenance`；它不暴露 ensure/create/submit/retry/replay/resolve/cancel/watch 或任何 scheduler control。
+
+`OpenHostAdminOptions` 只包含 durable SQLite、artifact 与 payload policy。admin opener 不加载或接收 scene、tool、model、provider secret、lane、worker、wait poller 或 execution baseline，不执行 startup recovery、projection catch-up 或 scheduler/host-instance registration。CLI / Service 的 list 与 purge 必须走这条 admin assembly；resume 等执行入口仍走 `open_host`。
+
+所有 execution / admin public durable command 与 read 都提交到 opener 私有的 single-worker durable actor。actor 是 command handle、actor durable store 与 SQLite connection 的唯一线程 owner，负责它们的创建、使用、drain 和关闭；caller cancellation 只取消等待，不取消已经提交的底层 future。execution scheduler 使用独立 durable store / connection，两条连接共享同一个 SQLite / payload policy，但任何 live connection 都不得跨线程。
+
+actor transaction 的 after-commit scheduler wake 与 active worker cancel 必须同步桥接回 opener event loop；callback、`LocalWorkerHandle.on_cancel()` 与 asyncio primitive 只能在 opener loop thread 访问，bridge exception 必须返回原 actor caller。execution close 先停止新 call 并 drain actor command / wake，在 scheduler 仍存活时完成 bridge，然后按 `scheduler -> projection flush -> actor handle/store -> actor executor -> scheduler store` 关闭；admin close 只关闭 actor chain，重复关闭幂等。
+
 Host 公共接口采用函数式风格，但不得依赖全局隐式单例。公共函数接收明确的 Host handle / context 与 request，返回稳定 snapshot 或 Host event stream。
 
 Service-facing 第一版应表现为一个简单 Host opener / handle，而不是把 scheduler、runner、tooling、memory catch-up、wakeup 或 `HostLocalRuntime` 暴露给上层。调用方形态是打开 Host、取得 / 新建 / 读取 Session、提交 prompt 或控制命令、读取 / 订阅 Session 事件、在 terminal event 中观察 final answer、关闭 Host。内部可以使用 composition root / runtime 装配 command handle、durable store、scheduler、active registry、local execution、ToolRuntime、compactor 与 projection catch-up，但这些只是 Host 内部实现边界。
 
-P10.5 冻结 async-only Host opener / handle。Service-facing opener 名称固定为 `open_host(options)`，并且必须是 async context manager：`async with open_host(options) as host:`。handle methods 与 event stream consumption 均以 async public contract 为准。Host public contract 不提供同步 wrapper，不冻结同步 close / cancel / timeout / stream iteration 语义。CLI 或同步上层如需使用 Host，应在 Service / CLI adapter 边界用 `asyncio.run(...)` 或等价机制包装 async Host contract，不要求 Host 层维护第二套同步 API。
+Host Service-facing opener 固定为 capability-separated `open_host(options)` 与 `open_host_admin(options)`，两者都是 async context manager。handle methods 与 event stream consumption 均以 async public contract 为准。Host public contract 不提供同步 wrapper，不冻结同步 close / cancel / timeout / stream iteration 语义。CLI 或同步上层如需使用 Host，应在 Service / CLI adapter 边界用 `asyncio.run(...)` 或等价机制包装 async Host contract，不要求 Host 层维护第二套同步 API。
 
-Host opener close 是 Host handle lifecycle 语义，不是 Session / Run 治理事实。`host.close()` 与 `open_host(...).__aexit__` 必须幂等；重复 close 不报错。close 完成后，调用该 handle 上的 `ensure_session`、`create_session`、`get_session`、`close_session`、`purge_session`、`report_storage_usage`、`run_storage_maintenance`、`get_run`、`watch_session_events`、`submit_followup`、`cancel_run`、`cancel_session_runs`、`resolve_wait`、`retry_run`、`replay_run` 等 Host API，必须 fail-fast 抛出 typed `HostClosedError` 或等价 Host lifecycle exception。这个错误不写 EventLog，不返回 command-level `invalid_state`，也不与 `Session CLOSED`、not found、purged、retry precondition failed 等业务状态混淆。已经进入 admission / command transaction 的调用按正常事务语义完成；close gate 之后新进入的调用统一抛 closed-handle exception。
+Host opener close 是 handle lifecycle 语义，不是 Session / Run 治理事实。execution `Host` 与 `HostAdmin` 的 `close()` / context exit 都必须幂等；close 完成后，调用同一 handle 能力面上的任一方法必须 fail-fast 抛出 typed `HostClosedError` 或等价 lifecycle exception。这个错误不写 EventLog，不返回 command-level `invalid_state`，也不与 `Session CLOSED`、not found、purged、retry precondition failed 等业务状态混淆。已经提交给 durable actor 的调用按正常事务与 after-commit wake 语义完成；close gate 之后的新调用统一抛 closed-handle exception。
 
 Host opener close 会终止当前 handle 持有的本地运行环境，但不得伪装成用户取消。close 流程必须停止 scheduler / promotion / background supervisor，不再启动新的 Attempt；必须向 active worker registry 传播 lifecycle cancel，使 Host 注入 Engine 的 cancellation token 可见，并通知 `LocalWorkerHandle.on_cancel(reason)` 这个 best-effort hook；随后关闭或取消当前 handle 持有的 active worker task、lane wait、stream fanout task 与本地 runtime resource，避免进程内任务泄漏。若 close 过程中 active worker 已经产出可确认 terminal event，Host 按正常 ingest / terminal closeout 追加事实。若 active worker 没有可确认 terminal，Host close 不得写 `CANCEL_REQUESTED`、`RUN_CANCELLED`、`RUN_FAILED` 或其它伪装用户意图 / 确认失败的 canonical fact；未收口 active Attempt 后续必须通过 Host lifecycle / Recovery 的 positive orphan proof 路径进入 `ATTEMPT_LOST`，再按 policy 进入 `RUN_RECOVERING` 或 `RUN_LOST`。调用方若要表达用户明确停止，应在 close 前显式调用 `cancel_run(...)` 或 `cancel_session_runs(...)`。
 
@@ -1002,7 +1015,7 @@ resolve_wait(host, wait_id, request) -> RunSnapshot
 以下能力不属于普通 Service-facing public contract：
 
 - `start_run(...)` / `_start_run(...)`：`_start_run` 是 Host 内部 admission primitive，普通 Service 不可调用。
-- `create_host_command_handle(...)`：降为 Host 内部 / 低层测试 composition primitive，不作为 Service 打开 Host 的入口；Service-facing 打开入口只有 `open_host(options)`。
+- `create_host_command_handle(...)`：降为 Host 内部 / 低层测试 composition primitive，不作为 Service 打开 Host 的入口；Service-facing opener 只有 capability-separated `open_host(options)` 与 `open_host_admin(options)`。
 - `HostLocalRuntime`、`HostLocalExecutionOptions`：均为 Host 内部 contract 或 implementation type，不从普通 Service-facing public namespace 暴露。
 - scheduler / wakeup / dispatch control API：Service 不得调用 scheduler wakeup、读取 dispatch row 或控制 dispatch；这些接线由 `open_host(options)` 内部完成。
 - `stream_run_events(...)` / `HostEventView`：只作为 Host 内部 diagnostic / detail / debug / drill-down 补读契约保留，不进入普通 Service-facing public contract。若未来需要公开 run-scoped diagnostic read API，必须另行讨论并定义不同于内部 `HostEventView` 的 public typed DTO。
@@ -1217,7 +1230,8 @@ Run 读取与结果边界：
 
 接口分层：
 
-- `ensure_session`、`create_session`、`get_session`、`list_sessions`、`close_session`、`purge_session`、`get_run`、`watch_session_events`、`report_storage_usage`、`run_storage_maintenance`、`cancel_run`、`cancel_session_runs`、`submit_followup` 是普通 Service-facing 稳定公共能力。
+- execution `Host` 稳定能力包括 `ensure_session`、`create_session`、`get_session`、`close_session`、`get_run`、`watch_session_events`、outbox read/drain、`cancel_run`、`cancel_session_runs`、`submit_followup`、`retry_run`、`replay_run` 与 `resolve_wait`。
+- `HostAdmin` 稳定能力包括 `get_session`、`list_sessions`、`purge_session`、`report_storage_usage` 与 `run_storage_maintenance`；两个 Protocol 不互相继承，也不通过 wrapper/facade 重新合并能力面。
 - `stream_run_events` 不进入 P10.5 普通 Service-facing public contract；现有实现若保留，只能作为 Host 内部 diagnostic / detail read path。未来若要公开 run-scoped diagnostic read API，必须另行讨论 public contract，且不能直接暴露内部 `HostEventView`。
 - `cancel_session_runs` 是客户端退出 / supervisor shutdown 的便利公共能力；它只取消指定 Session 下未终态 Run，不表达客户端拥有的 Session 集合。
 - `ensure_session` 表示“给我这个 slot 的当前会话，必要时创建并绑定”。
