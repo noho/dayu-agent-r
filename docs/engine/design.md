@@ -99,7 +99,10 @@ Engine 当前采用 run-scoped 一次性 Agent / Runner 模型：
 
 Engine 不读取配置文件，也不从 `ToolExecutor` 查询 schema。`tool_schemas` 是本次 run 模型可见工具的唯一输入快照。是否禁用工具由 `disable_tools`、`AgentPolicy.allow_tool_calls`、Runner `supports_tool_calling` 三者共同决定。
 
-`messages` 必须非空。`attempt_id` 与 `execution_id` 必须同时为空或同时非空；Engine 只把它们用于本次逻辑 Runner 调用身份派生，不拥有 Host attempt / execution 生命周期。
+`messages` 必须非空，且每个元素必须属于 `AgentMessage` 封闭联合。
+`SystemMessage`、`UserMessage`、`AssistantMessage`、`ToolMessage` 在各自构造边界校验固有
+`AgentMessageRole`，不能用其它 enum member 或裸字符串 role 构造后交给 payload builder 修复。
+`attempt_id` 与 `execution_id` 必须同时为空或同时非空；Engine 只把它们用于本次逻辑 Runner 调用身份派生，不拥有 Host attempt / execution 生命周期。
 
 ## 5. AgentPolicy
 
@@ -198,6 +201,9 @@ OpenAI-compatible Runner 的当前传输规则：
 - `supports_stream_usage=True` 且 effective stream 为 `True` 时，请求 payload 写入 `stream_options.include_usage=True`；否则不写该字段。
 - HTTP / 网络 / timeout 的可重试错误按 `RunnerSpec.max_retries`、错误分类与 `Retry-After` 退避；若某次 attempt 已经产出过 RunnerEvent，后续可重试失败不再重试，而是产出 error 事件并收口。
 - 取消 token 在 HTTP 建连、response 获取、body 读取、SSE byte chunk 等待与 retry sleep 边界被观察；Runner 被取消时生成器自然结束，不补 `RunnerDoneData`。
+- stream / non-stream 成功终态都必须携带显式、可映射的 `finish_reason`，并满足 response 含 tool calls 当且仅当 finish reason 为 `TOOL_CALLS`；missing / null、tool calls + 非 tool reason、content + `TOOL_CALLS` 都在 completed event 前按 provider protocol error fail closed。
+- OpenAI tool-call aggregation 只接受非 bool 的非负 native index。index、provider id 与无歧义 position continuation 在同一 identity owner 内绑定；synthetic/native target、same-id/two-index 或 same-index/two-id 冲突不合并 partial，也不产出 completed tool calls。
+- non-stream `function.arguments` 只接受 JSON string；dict、list、number、boolean、null 或缺失都是 provider protocol error。string 解析后的 JSON 仍必须是 object。
 
 ## 8. RunnerSpec 与 RunnerCallOptions
 
@@ -277,6 +283,9 @@ OpenAI-compatible Runner 只有在 policy 为 `OPENAI_X_CLIENT_REQUEST_ID` 且�
 `RunnerEvent` 不含 `session_id` 或 `run_id`。这些字段在 `EngineEvent` 提升阶段补齐。调用方消费 Agent run 时只观察 `EngineEvent`；只有实现或测试 Runner 协议时才直接处理 `RunnerEvent`。
 
 `provider_diagnostic` 只表达 provider / adapter 非致命诊断，例如未知 provider tool-call 扩展字段、malformed usage、HTTP 200 缺失 `Content-Type` 或 context overflow message marker fallback provenance。它携带封闭 `severity`、`diagnostic_source`、诊断码、provider request id、有界 payload ref 所需材料和 partial tool-call 摘要，但不代表 run failure，不进入 Agent failure candidate。
+
+Agent 对 protocol、HTTP、context overflow 与 runner exception 使用 first-accepted failure candidate。
+更晚到达的通用 runner exception 不覆盖已经接受的 provider error code、provider request id 或 recoverable 语义；非致命 `provider_diagnostic` 始终不成为 failure candidate。
 
 ## 10. 工具调用协议
 
@@ -424,10 +433,10 @@ Engine 只观察 token，不持有取消治理真源。取消公共终态通过 
 - iteration 起点、Runner 调用期间、工具 handshake 前和 fallback Runner 调用前会观察取消。
 - RunnerEvent 已经被 Agent 消费后，相关 content、reasoning、usage、protocol error 或状态更新先被接受，再观察取消。
 - Runner 未完成时取消可以抢占本轮并收口为 `run_cancelled`。
+- Agent 以单一 typed `RunnerDoneData` 保存 Runner 完成 commit；finish reason 与 provider request id 只从该 fact 读取，不由分散字段或默认值反推。
 - Runner 已 `done` 后，分类得到的 final / tool / failure 候选不能被迟到取消改写。
 - ToolExecutor 返回 completed / failed / cancelled outcome 后，Agent 先产出 `tool_result_accepted` 并注入 tool message；之后若观察到取消，只阻止下一轮 Runner，不丢失已接受工具结果。
 - ToolExecutor 返回 awaiting outcome 后，Agent 先产出 `tool_awaiting`，再产出 `run_suspended`；迟到取消不能吞掉 `await_spec` 或 snapshot。
-- final decision 进入 terminal commit boundary 后，`final_answer` 是终态；迟到取消不能改写为 `run_cancelled`。
 
 取消是当前 run 的 terminal reason。取消后若调用方要继续原目标，必须构造新的 `AgentRunRequest`。
 
@@ -445,6 +454,8 @@ class EngineEvent:
     data: EngineEventData
     metadata: Mapping[str, JsonValue] | None
 ```
+
+`EngineEvent` 构造时通过唯一 `EngineEventType -> data dataclass` mapping 校验 discriminator/data 配对；非法 type 或封闭联合之外的 data 抛 `TypeError`，合法 type 与错误 data 组合抛 `ValueError`。调用方与 Host consumer 只消费已经成立的 Engine event fact，不在下游按 data class 修复 discriminator。
 
 `metadata` 只允许承载中性 observer / debug hint，不承载契约事实。当前 Agent 产出的事件 `metadata` 为 `None`。
 
@@ -527,5 +538,9 @@ Engine 只表达 provider context overflow 这一可恢复事实。
 - `ToolFunctionSchema.parameters` 是顶层 `object` 参数 schema。
 - `ToolParametersSchema.required` 是必填字段名元组。
 - `ToolParametersSchema.additional_properties` 为 `bool | None`。
+
+`ToolParametersSchema` 在构造期校验 property schema 及 array items schema 中的
+`minLength`、`maxLength`、`minItems`、`maxItems`：它们必须是非 bool 的非负整数。
+共享 runtime 参数投影保留对构造后 mutable mapping 篡改的防御，并用 JSON 类型语义校验 enum：boolean 与 number 永不相等，有限 int / float 作为 JSON number 按数学值比较，array / object 递归比较。显式参数和 schema default 进入同一字段投影路径。
 
 `ToolTruncateSpec` 与 `ToolTruncationStrategy` 存在于 `dayu.contracts` 公共契约中，不属于 Engine 包根导出的稳定调用面。工具结果截断由 Engine 外部工具执行环境解释和执行；Engine 不创建 truncation cursor，不生成或校验 `scope_token`，不执行 `fetch_more`，不保存跨 run 工具状态。

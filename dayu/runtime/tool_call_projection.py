@@ -18,7 +18,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Final, Literal, TypeAlias, cast
+from typing import Final, Literal, TypeAlias, TypeGuard, cast
 
 from dayu.contracts import (
     JsonValue,
@@ -43,6 +43,12 @@ _SUPPORTED_JSON_SCHEMA_TYPES: Final[frozenset[str]] = frozenset(
     {"string", "integer", "number", "boolean", "array", "object"}
 )
 _SUPPORTED_ARRAY_ITEM_TYPES: Final[frozenset[str]] = frozenset({"string", "integer", "number", "boolean"})
+_COUNT_BOUND_KEYS: Final[tuple[str, ...]] = (
+    "minLength",
+    "maxLength",
+    "minItems",
+    "maxItems",
+)
 _SUPPORTED_FIELD_SCHEMA_KEYS: Final[frozenset[str]] = frozenset(
     {
         "default",
@@ -374,6 +380,12 @@ def _project_field(
             message=(f"Tool schema for {field_name!r} uses unsupported keyword " f"{unsupported_key!r}."),
             hint="Fix the provider tool schema before retrying.",
         )
+    invalid_count_bound = _first_invalid_count_bound(field_schema)
+    if invalid_count_bound is not None:
+        return _schema_bound_failure(
+            field_name=field_name,
+            bound_name=invalid_count_bound,
+        )
 
     type_value = field_schema.get("type")
     if not isinstance(type_value, str) or type_value not in _SUPPORTED_JSON_SCHEMA_TYPES:
@@ -449,7 +461,7 @@ def _project_string(
         return _type_failure(field_name=field_name, expected="string")
     min_length = field_schema.get("minLength")
     if min_length is not None:
-        if isinstance(min_length, bool) or not isinstance(min_length, int):
+        if not _is_valid_count_bound(min_length):
             return _schema_bound_failure(field_name=field_name, bound_name="minLength")
         if len(value) < min_length:
             return _range_failure(
@@ -458,7 +470,7 @@ def _project_string(
             )
     max_length = field_schema.get("maxLength")
     if max_length is not None:
-        if isinstance(max_length, bool) or not isinstance(max_length, int):
+        if not _is_valid_count_bound(max_length):
             return _schema_bound_failure(field_name=field_name, bound_name="maxLength")
         if len(value) > max_length:
             return _range_failure(
@@ -565,7 +577,7 @@ def _project_array(
         return _type_failure(field_name=field_name, expected="array")
     min_items = field_schema.get("minItems")
     if min_items is not None:
-        if isinstance(min_items, bool) or not isinstance(min_items, int):
+        if not _is_valid_count_bound(min_items):
             return _schema_bound_failure(field_name=field_name, bound_name="minItems")
         if len(value) < min_items:
             return _range_failure(
@@ -574,7 +586,7 @@ def _project_array(
             )
     max_items = field_schema.get("maxItems")
     if max_items is not None:
-        if isinstance(max_items, bool) or not isinstance(max_items, int):
+        if not _is_valid_count_bound(max_items):
             return _schema_bound_failure(field_name=field_name, bound_name="maxItems")
         if len(value) > max_items:
             return _range_failure(
@@ -646,13 +658,93 @@ def _validate_enum(
             message=f"Tool schema enum for {field_name!r} must be an array.",
             hint="Fix the provider tool schema before retrying.",
         )
-    if value not in enum_value:
+    if not any(_json_values_equal(value, candidate) for candidate in enum_value):
         allowed = ", ".join(str(item) for item in enum_value)
         return _failure(
             field_name=field_name,
             message=f"Tool argument {field_name!r} must be one of: {allowed}.",
             hint=f"Set {field_name} to one of: {allowed}.",
         )
+    return None
+
+
+def _json_values_equal(left: JsonValue, right: JsonValue) -> bool:
+    """按 JSON 类型语义递归比较两个值。
+
+    JSON boolean 与 number 是不同类型；有限 int / float 都属于 JSON
+    number，并按数学值比较。array 与 object 递归应用同一规则。
+
+    :param left: 左侧 JSON 值。
+    :param right: 右侧 JSON 值。
+    :returns: 两值按 JSON 类型语义相等时返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if left is None or right is None:
+        return left is None and right is None
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left is right
+    if isinstance(left, (int, float)) or isinstance(right, (int, float)):
+        if not isinstance(left, (int, float)) or not isinstance(
+            right, (int, float)
+        ):
+            return False
+        if isinstance(left, float) and not math.isfinite(left):
+            return False
+        if isinstance(right, float) and not math.isfinite(right):
+            return False
+        return left == right
+    if isinstance(left, str) or isinstance(right, str):
+        return isinstance(left, str) and isinstance(right, str) and left == right
+    if isinstance(left, list) or isinstance(right, list):
+        if not isinstance(left, list) or not isinstance(right, list):
+            return False
+        return len(left) == len(right) and all(
+            _json_values_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right, strict=True)
+        )
+    if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+        return False
+    if set(left) != set(right):
+        return False
+    return all(_json_values_equal(left[key], right[key]) for key in left)
+
+
+def _is_valid_count_bound(value: JsonValue) -> TypeGuard[int]:
+    """判断 count bound 是否为合法非负整数。
+
+    :param value: schema 中的计数边界值。
+    :returns: 非 bool 的非负整数返回 ``True``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _first_invalid_count_bound(
+    field_schema: Mapping[str, JsonValue],
+    *,
+    path: str = "",
+) -> str | None:
+    """查找字段或 array items schema 的首个非法 count bound。
+
+    该检查是对构造后 mutable mapping 被外部篡改的防御，不替代
+    :class:`ToolParametersSchema` 的声明期校验。
+
+    :param field_schema: 当前字段或 array items schema。
+    :param path: 当前嵌套路径前缀。
+    :returns: 非法 bound 的路径；全部合法时返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    for bound_name in _COUNT_BOUND_KEYS:
+        if bound_name not in field_schema:
+            continue
+        if not _is_valid_count_bound(field_schema[bound_name]):
+            return f"{path}{bound_name}"
+    items_schema = field_schema.get("items")
+    if isinstance(items_schema, Mapping):
+        return _first_invalid_count_bound(items_schema, path=f"{path}items.")
     return None
 
 

@@ -99,7 +99,7 @@ Engine 位于链路最下游。Host 可以调用 Engine public entry；Engine �
 
 - `run_id`：调用方传入的本次 run 标识；Engine 随事件和工具执行上下文透传，不拥有 run 生命周期。
 - `session_id`：调用方传入的 session 标识；Engine 随事件和工具执行上下文透传，不拥有 session 生命周期。
-- `messages`：进入本次 run 的非空 `AgentMessage` 元组；构造期要求非空。
+- `messages`：进入本次 run 的非空 `AgentMessage` 元组；构造期要求非空且每个成员属于封闭联合。四种 message dataclass 各自在构造期校验固有 `AgentMessageRole`，payload builder 不修复非法 role。
 - `disable_tools`：本次 run 是否禁用工具。
 - `runner_spec`：Runner 规约。
 - `runner_options`：单次 Runner 调用参数。
@@ -177,9 +177,9 @@ Engine 公共契约分为 Engine 专属契约与 Dayu Agent 公共契约。
   已知失败使用 Engine-owned 枚举；provider / runner adapter 专有协议码使用
   带来源的 wrapper。Host / public 边界必须通过
   `serialize_engine_error_code(...)` 序列化为 durable 文本。
-- `AgentMessage`：Runner 输入消息封闭联合，成员包括 `SystemMessage`、`UserMessage`、`AssistantMessage`、`ToolMessage`。
+- `AgentMessage`：Runner 输入消息封闭联合，成员包括 `SystemMessage`、`UserMessage`、`AssistantMessage`、`ToolMessage`；每种成员在构造时拒绝错误 enum role 或裸字符串 role。
 - `AssistantToolCall`：assistant 消息中的工具调用记录，保留 `provider_state` 以支持 provider roundtrip。
-- `EngineEvent`：Engine 对调用方暴露的公共事件，字段包括 `occurred_at`、`session_id`、`run_id`、`type`、`data`、`metadata`。
+- `EngineEvent`：Engine 对调用方暴露的公共事件，字段包括 `occurred_at`、`session_id`、`run_id`、`type`、`data`、`metadata`；构造时按唯一 mapping 校验 `EngineEventType` 与 data dataclass 配对，调用方不修复非法组合。
 - `EngineEventData`：Engine 事件 data 封闭联合，每个 `EngineEventType` 对应明确 data dataclass。
 - `RunnerEvent`：Runner 到 Agent 的协议归一事件，不含 `session_id` / `run_id`；构造时校验 `RunnerEventType` 与 data dataclass 的唯一配对，Runner adapter 复用 Engine contract 中的配对映射与派生 helper。
 - `AsyncRunner`：Engine 调用模型 provider 的协议，定义 `call(...)`、`is_supports_tool_calling()`、`close()`。
@@ -193,7 +193,7 @@ Engine 公共契约分为 Engine 专属契约与 Dayu Agent 公共契约。
 
 这些契约定义真源在 `dayu.contracts`，由 Host / Engine / ToolRuntime 等层共同使用；Engine 只消费或透传，不拥有其治理语义。
 
-- `ToolSchema`：本次 run 暴露给模型的工具 schema 快照。
+- `ToolSchema`：本次 run 暴露给模型的工具 schema 快照。其 `ToolParametersSchema` 在构造期要求 string/array count bounds 是非 bool 的非负整数；共享 runtime 投影按 JSON 类型语义校验 enum，并让 default 与显式参数复用同一路径。
 - `ToolExecutor`：工具执行协议，形状是 `execute(BatchToolExecutionRequest) -> BatchToolExecutionOutcome`。
 - `BatchToolExecutionRequest`：批式工具执行请求，包含 `calls` 与 `context`。
 - `BatchToolExecutionContext`：批式工具执行上下文，包含 `run_id`、`session_id`、`iteration_id`、`timeout_seconds`、`cancellation_token`、`correlation_id`。
@@ -268,7 +268,8 @@ Stream 术语固定如下：
 - 当 `RunnerCallOptions.stream=True` 但 `RunnerSpec.supports_streaming=False` 时降级为非流式请求。
 - 只有在 effective stream 为 `True` 且 HTTP 200 response 的 media type 是 `text/event-stream` 时按 SSE 解析；流式请求缺失 `Content-Type` 时保留 SSE fallback 并记录诊断；其它 media type 按非流式 JSON 解析。
 - `supports_stream_usage=True` 时，流式请求写入 `stream_options.include_usage=True`；否则不写该字段。
-- SSE 与非流式响应都在 OpenAI-compatible Runner adapter 边界校验 `choices` 与 `finish_reason`：多 assistant choice、显式非零 choice index、非法 choice shape、未知或非法 `finish_reason` 都按 provider protocol error fail closed；`finish_reason` 缺失或 `null` 只表示 absent，不会默认成 `stop`。
+- SSE 与非流式响应都在 OpenAI-compatible Runner adapter 边界校验 `choices` 与 `finish_reason`：多 assistant choice、显式非零 choice index、非法 choice shape、未知或非法 `finish_reason` 都按 provider protocol error fail closed；成功终态要求显式 finish reason，且 tool calls presence 当且仅当 reason 为 `TOOL_CALLS`。missing/null、tool calls + 非 tool reason、content + `TOOL_CALLS` 均在 completed event 前失败，不默认或强制成功终态。
+- tool-call aggregator 统一绑定非 bool 非负 native index、provider id 与无歧义 position continuation；identity conflict 不拼接 name、arguments 或 provider state，也不产出 completed tool calls。non-stream `function.arguments` 仅接受 JSON string，不兼容 dict 或其它 JSON wire shape。
 - 按 `RunnerSpec.max_retries`、HTTP 分类、网络异常、timeout 和 `Retry-After` 执行重试；`max_retries` 表示首次失败后的重试次数，`0` 表示不重试；若一次 attempt 已经产出事件，后续 retriable failure 不再重试，而是以 error 收口。
 - 取消 token 命中时 Runner 生成器自然结束，不补 `RunnerDoneData`。
 - fatal provider protocol error 的 `RunnerProtocolErrorData.error_code` 是
@@ -472,7 +473,7 @@ Runner 的 `runner_done` 只表示本次 RunnerEvent stream 结束；提升到 E
 
 取消 token 的语义是阻止未来工作，不撤回已接受事实。Agent 在迭代前、Runner 事件消费后、工具执行等待边界、工具结果注入后和下一轮工作开始前观察 token。取消赢得当前边界时，Engine 以 `run_cancelled` 与 `EngineRunOutcomeCancelled` 收口。
 
-已经提升的 RunnerEvent、已经 accepted 的普通工具结果、已经返回的 awaiting outcome 和已经接受的 final decision 不会被迟到取消改写。
+Agent 使用单一 typed `RunnerDoneData` 作为 Runner iteration commit，finish reason 与 provider request id 都从该 fact 读取。已经提升的 RunnerEvent、Runner done 后分类得到的 final / tool / failure candidate、已经 accepted 的普通工具结果和已经返回的 awaiting outcome 不会被迟到取消改写。
 
 ### 工具握手 timeout
 
@@ -482,7 +483,7 @@ Runner 的 `runner_done` 只表示本次 RunnerEvent stream 结束；提升到 E
 
 ### Provider 错误
 
-Runner 解析层 fatal 错误产出 `provider_protocol_error`；非致命 provider / adapter 诊断产出 `provider_diagnostic`，例如未知 provider tool-call 扩展字段、malformed usage、HTTP 200 缺失 `Content-Type` 或 context overflow marker fallback provenance。`provider_diagnostic` 不设置 Agent 失败候选，不代表 run failure。HTTP、网络、timeout 和上下文超限产出 `runner_http_error`。`RunnerHTTPErrorCode.CONTEXT_LENGTH_EXCEEDED` 是 Dayu 的中性错误分类，不是 provider 官方错误码，也不对应固定 HTTP 状态码。OpenAI-compatible Runner 只在 HTTP 失败响应中识别到明确的上下文溢出信号时才归一为该分类：
+Runner 解析层 fatal 错误产出 `provider_protocol_error`；非致命 provider / adapter 诊断产出 `provider_diagnostic`，例如未知 provider tool-call 扩展字段、malformed usage、HTTP 200 缺失 `Content-Type` 或 context overflow marker fallback provenance。`provider_diagnostic` 不设置 Agent 失败候选，不代表 run failure。Agent 保留 first-accepted protocol / HTTP / context failure candidate；更晚的通用 runner exception 不覆盖其 code、provider request id 或 recoverable 语义。HTTP、网络、timeout 和上下文超限产出 `runner_http_error`。`RunnerHTTPErrorCode.CONTEXT_LENGTH_EXCEEDED` 是 Dayu 的中性错误分类，不是 provider 官方错误码，也不对应固定 HTTP 状态码。OpenAI-compatible Runner 只在 HTTP 失败响应中识别到明确的上下文溢出信号时才归一为该分类：
 
 - 结构化 payload 的 `error.code == "context_length_exceeded"`。
 - 错误文本命中受控 marker，例如 `maximum context length is`、`total message token length exceed model limit`、`range of input length should be`、`model's maximum context length`、`model requires more context` 或 `context length exceeded`。

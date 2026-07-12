@@ -131,7 +131,7 @@ CLI import boundary 测试通过 AST 阻止 `session` command 从 `prompt` / `in
 - logging：验证 `dayu.runtime.log` 的 logger 装配、默认 stderr 诊断流、显式 stream override、CLI 风格级别解析、层中立 verbose / stream-debug / bounded payload key helper、`VERBOSE` / `STREAM_DEBUG` / `CRITICAL` 级别契约，确认普通 `DEBUG` 抑制 stream-debug 记录而 `STREAM_DEBUG` 同时输出普通 debug 与 stream 诊断，并验证 `dayu.runtime.log_levels` 只提供公共日志级别常量、不注册 stdlib logging level。
 - config loader：覆盖 `models.json`、`execution_profiles.json`、`host_runtime.json`、`runtime_lanes.json`、`tool_discovery.json` 的 typed view 加载、workspace 同 id 整条替换、非 map 字段完整替换、严格 JSON 拒绝 NaN / Infinity / 浮点溢出、合法单继承链、missing / self / circular / multi / invalid `extends` 错误路径、catalog record 内重复 id 字段 fail fast、execution profile 上下文窗口分档校验、工具重复治理 decision allowlist、process capsule cleanup grace 有限非负数校验、旧 execution profile 字段与旧 runner hint `max_tokens` fail fast、host runtime lane 引用校验、旧配置文件不读取，以及 packaged tool discovery 中 Fins raw config 不写 `workspace_root`、显式 Doc / Fins limits、`doc-tools.enabled=false` 和旧 provider-level `allow_empty` 字段拒绝。
 - workspace paths / runtime location：覆盖 workspace root 下公共路径派生、相对配置路径 containment、`config/` 存在与不存在时的 `config_overlay_dir`，显式 config overlay 目录存在 / 缺失 / 非目录边界，workspace prompt assets 优先级，以及包内 prompt / manifest 默认资产缺失时 fail fast。
-- tool call projection：覆盖 current `ToolCallable` 共享参数投影与 outcome 构造 helper，包括 schema default、类型收窄、unknown / missing / enum / range / array item 参数失败、固定 `invalid_argument` failure、completed / failed outcome metadata，以及 Host cancellation token 对应的 `ToolCancelledOutcome(host_cancelled)`。
+- tool call projection：覆盖 current `ToolCallable` 共享参数投影与 outcome 构造 helper，包括 schema default、类型收窄、unknown / missing / range / array item 参数失败、JSON typed enum equality（boolean/number 分离、有限 number 数学等价、array/object 递归）、default/显式参数同路径、构造后 mutable schema 负 count bound 防御、固定 `invalid_argument` failure、completed / failed outcome metadata，以及 Host cancellation token 对应的 `ToolCancelledOutcome(host_cancelled)`。
 - scene prepare：覆盖单 scene 装配、system prompt 输出、fragment refs / source refs / digest、required context slot、未知 / 非字符串 placeholder、双花括号字面量保留、单继承、可选或继承的 model hints、旧 `conversation` / 泛化 `runtime` / 旧 model 字段 fail fast、typed agent policy override、fragment id / order 冲突、fragment path containment、missing required fragment fail-closed，以及 `all` / `none` / `select` 工具选择的 names、tags、并集、未知工具、空匹配和 `<when_tag>` / `<when_tool>` 条件块过滤语义；真实 prompt assets 测试确认条件块 marker 不进入最终 system prompt。
 - tools discovery：覆盖显式 import path / package entry point provider 解析、禁用 provider 跳过、provider identity / source refs / 启用 provider 空工具输出 fail-fast、重复 provider / 工具名、reserved framework tool name 防线，以及 source refs 内容摘要规范化。
 - assembly helpers：覆盖 runtime-neutral 模型 / runner option hint 选择、typed allowlist override 解析、Agent policy 字段级优先级合并、工具截断 policy 默认值补齐、Fins packaged 缺省 workspace root 到 Service effective absolute `workspace_root` 的注入、Web storage state 目录按 workspace root 解析、raw provider config 不变性，以及 helper 返回值不构造 Host / Engine typed object；弱类型守卫显式确认这些 Phase 12 runtime helper 文件被扫描；`test_smoke_host_public_multiturn_assembly.py` 覆盖 Host public multiturn smoke 通过正式 Service assembly helper、内置 `manual-smoke` provider、workspace overlay provider、默认 fresh session slot、duplicate governance diagnostics 和 compact pressure 估算的成功路径；`test_smoke_host_public_conversation_memory_scenarios_assembly.py` 覆盖 Host public conversation memory 场景 smoke 的 `memory-core` / `memory-compact` / `memory-reactive-compact` / `memory-compact-fallback` suite 解析、pressure mode 参数、reactive deterministic recovery dispatch oracle、compact failure fallback selected window oracle、compact EventLog audit 摘要验收、compact operation timeline / rejected histogram / manifest missing stage 诊断、`CONTEXT_COMPACTION_FAILED` hard fail 语义、mock finance tool 装配、tool selection、pressure 文本和 slot key 语义。
@@ -158,7 +158,7 @@ Service composition 测试，覆盖 `dayu.service` 在 Host 外部把 runtime ty
 - import boundary：阻止公共契约层反向依赖 Engine、Host、runtime implementation、Service、UI、Fins 或运行期 HTTP 客户端，
   并显式确认公共 source ref 契约模块被边界扫描覆盖。
 - weak typing guard：通过 AST 扫描阻止 `Any`、`object`、无类型签名与裸容器注解进入公共契约源码。
-- ToolExecutionOutcome / ToolResult / ToolCall 等契约测试：覆盖工具调用 provider state、工具结果信封、工具执行 outcome 封闭联合与穷尽匹配、工具等待时间字段时区边界、工具参数 schema key 边界和截断策略 limit key 映射穷尽性。
+- ToolExecutionOutcome / ToolResult / ToolCall 等契约测试：覆盖工具调用 provider state、工具结果信封、工具执行 outcome 封闭联合与穷尽匹配、工具等待时间字段时区边界、工具参数 schema key 边界、property/array-items 的 count bounds 构造期非 bool 非负整数校验和截断策略 limit key 映射穷尽性。
 - tool declaration：覆盖最小 `@tool(..., truncate=ToolTruncateSpec(...))` 声明能力，确认 `ToolDefinition` / `ToolBundle` 只投影 `ToolSchema` 给 Engine，校验展示名非空，默认拒绝调用方直接构造空 `ToolBundle`，覆盖 execution capability 默认 async direct、thread-backed guard、process-backed context / target / JSON 信封 pickle round-trip，并覆盖框架 no-tool 路径使用的类型真实空 bundle。
 
 ### `tests/documents/`
@@ -232,8 +232,8 @@ Engine 契约、包根导出、事件契约与架构边界测试，覆盖 `dayu.
 - package exports：锁定 `dayu.engine.__all__`，阻止未承诺入口、实现类或取消异常出现在包根。
 - import boundary：阻止 Engine 反向依赖 Host（含 memory）、Service、UI、Fins、工具声明 owner、工具执行实现、处理器或 trace 私有模块；OpenAI runner 子树内允许当前实现所需的 `aiohttp`。
 - weak typing guard：扫描 `dayu.engine` 源码，守住强类型签名、封闭联合与 metadata 类型边界，并阻止 Engine error-code contract 退化为裸 `str` 或关键 dataclass 构造点传入字符串字面量。
-- 事件契约与消息契约：覆盖 EngineEvent、RunnerEvent、AgentMessage、metadata、provider protocol error `partial_tool_calls` 有界摘要、usage provider request id 显式字段、content-completed 不承载 finish reason、AgentMessage 大内容透传到 Runner、终态事件集合等结构约束。
-- Agent 状态机：覆盖无工具 final / failed / cancelled、content filter 降级 final 诊断日志、普通 completed / failed tool calling、工具结果投影、max iteration force-answer、大工具消息进入 force-answer 路径、连续失败工具批次保护、awaiting 拒绝与取消优先级、close cancellation 资源释放、工具批执行前取消不登记 tool call id。
+- 事件契约与消息契约：覆盖 EngineEvent/RunnerEvent discriminator-data 构造配对、AgentMessage 固有 role 与 AgentRunRequest message union 构造校验、metadata、provider protocol error `partial_tool_calls` 有界摘要、usage provider request id 显式字段、content-completed 不承载 finish reason、AgentMessage 大内容透传到 Runner、终态事件集合等结构约束。
+- Agent 状态机：覆盖无工具 final / failed / cancelled、content filter 降级 final 诊断日志、普通 completed / failed tool calling、工具结果投影、max iteration force-answer、大工具消息进入 force-answer 路径、连续失败工具批次保护、awaiting 拒绝与取消优先级、RunnerDone typed commit 后迟到取消不覆盖 ordinary/force-answer/error/tool candidate、first failure candidate 不被 runner exception 覆盖、close cancellation 资源释放、工具批执行前取消不登记 tool call id。
 - provider smoke 轻量测试：覆盖 `utils/smoke_async_agent_providers.py` 的参数解析、缺 key 跳过、安全输出与 provider case 配置，不做真实联网。
 - provider extension config adapter：覆盖默认模型目录中的 provider extension JSON DSL 到 `ProviderRequestExtension` 封闭联合的映射，并确认未知 type、未知字段、非法枚举和非法字段组合 fail closed。
 
@@ -241,11 +241,11 @@ Engine 契约、包根导出、事件契约与架构边界测试，覆盖 `dayu.
 
 Engine contract 的细粒度测试，当前覆盖：
 
-- `messages`：AssistantMessage / AssistantToolCall 与 provider state roundtrip 契约。
+- `messages`：四种 AgentMessage 固有 role 构造校验、AssistantMessage / AssistantToolCall 与 provider state roundtrip 契约。
 - `runner_events`：RunnerEventData 联合、RunnerHTTPErrorCode、RunnerHTTPErrorData、HTTP error 与 context overflow 错误枚举、HTTP error 到 Done(ERROR) 的收口契约，以及 provider / runner-specific error-code wrapper 的 trim、空值、长度和序列化契约。
 - `runner_spec`：RunnerSpec 字段集合、`ClientCorrelationPolicy` 枚举值、provider reasoning / thinking extension、stream usage 能力字段、免鉴权 provider 的 `api_key_ref=None`、timeout / retry 校验与构造路径。
 - `runner_identity`：`RunnerRequestIdentity` 与 `build_runner_request_identity` 的稳定 lowercase SHA-256 `client_correlation_id`、ASCII 长度、iteration / call index 差异、direct Engine 无 Attempt 路径、attempt / execution 成对约束、空文本与非法序号拒绝。
-- `agent_run`：`AgentRunRequest` 的非空 messages 校验，以及 Attempt `attempt_id` / `execution_id` 成对出现或同时缺失的契约。
+- `agent_run`：`AgentRunRequest` 的非空 messages、message union membership 校验，以及 Attempt `attempt_id` / `execution_id` 成对出现或同时缺失的契约。
 - import boundary：Engine contract 子包不得越过自身契约边界引入上层依赖。
 
 ### `tests/engine/runners/openai/`
@@ -253,9 +253,9 @@ Engine contract 的细粒度测试，当前覆盖：
 OpenAI-compatible Runner 的 provider 协议测试，覆盖从 payload 构建、provider 响应解析到 RunnerEvent 事件流的行为：
 
 - payload：消息、工具 schema、reasoning content、provider 扩展、stream usage gating、禁止额外 payload 袋。
-- SSE：content delta、reasoning delta、tool call delta、tool call 聚合、usage、malformed usage 非终止诊断、`[DONE]`、多行 data、单行 / data 行数缓冲上限、跨 chunk UTF-8、非法 UTF-8、尾部无换行、空 choices + usage、单 chunk choice policy fail-closed、HTTP 200 `Content-Type` 白名单分流和缺失 `Content-Type` fallback。
+- SSE：content delta、reasoning delta、tool call delta、tool call 聚合、native index 类型/非负约束、synthetic/native/id/position identity conflict fail-closed 且不合并 partial、usage、malformed usage 非终止诊断、`[DONE]`、多行 data、单行 / data 行数缓冲上限、跨 chunk UTF-8、非法 UTF-8、尾部无换行、空 choices + usage、单 chunk choice policy fail-closed、HTTP 200 `Content-Type` 白名单分流和缺失 `Content-Type` fallback。
 - diagnostics：覆盖 Runner HTTP attempt / response 等普通 debug 诊断、stream idle heartbeat 与 SSE done-token 的 stream-debug gating，以及 stream-debug 不输出完整 prompt、headers、API key 或响应正文。
-- non-stream：非流式响应、response-level choice policy fail-closed、thought 标签处理、stream / non-stream 终态语义一致性，且 finish reason 只在 Runner done 边界断言。
+- non-stream：非流式响应、string-only `function.arguments`、response-level choice policy fail-closed、thought 标签处理、stream / non-stream strict terminal parity（显式 finish reason 且 tool calls presence 当且仅当 `TOOL_CALLS`），且 finish reason 只在 Runner done 边界断言。
 - 错误与重试：协议错误、HTTP error 分类、context overflow classifier、未知状态码、retry backoff、重试耗尽后的事件收口。
 - request identity header：覆盖 OpenAI-compatible Runner 在 `ClientCorrelationPolicy.OPENAI_X_CLIENT_REQUEST_ID` 且 `request_identity` 存在时发送 `X-Client-Request-Id`，policy disabled 或 identity 缺失时不发送，policy 开启时拒绝静态 `X-Client-Request-Id` header 冲突，并确认 transport retry 复用同一个客户端关联 header；provider request id 从 `x-request-id` 或 DeepSeek `x-ds-trace-id` 提取且优先标准 `x-request-id`，基础设施 tracing header 不映射为 provider id，既有 `runner.http.response` DEBUG 行只输出实际存在的 provider request id header，全部缺失时输出 `x-request-id=None`。
 - 取消与资源：取消边界、取消后不补 done 事件、close 释放资源、已完成 read task 异常消费。

@@ -6,6 +6,7 @@ from typing import cast
 
 import pytest
 
+from dayu.contracts.json_value import JsonValue
 from dayu.contracts import tool_schema as tool_schema_module
 from dayu.contracts.tool_schema import (
     ToolParametersSchema,
@@ -37,6 +38,152 @@ def test_tool_parameters_schema_rejects_blank_property_key() -> None:
             required=(),
             additional_properties=False,
         )
+
+
+@pytest.mark.parametrize(
+    "bound_name",
+    ("minLength", "maxLength", "minItems", "maxItems"),
+)
+@pytest.mark.parametrize("invalid_bound", (True, 1.5, "1"))
+def test_tool_parameters_schema_rejects_non_integer_count_bounds(
+    bound_name: str,
+    invalid_bound: JsonValue,
+) -> None:
+    """字段 count bound 的 bool、float 与 string 必须在构造期拒绝。
+
+    :param bound_name: 要校验的 JSON Schema count keyword。
+    :param invalid_bound: 非法的非整数边界值。
+    :returns: 无返回值。
+    :raises AssertionError: schema 未抛出 ``TypeError`` 时由 pytest 抛出。
+    """
+
+    field_type = "string" if bound_name.endswith("Length") else "array"
+    field_schema: dict[str, JsonValue] = {
+        "type": field_type,
+        bound_name: invalid_bound,
+    }
+
+    with pytest.raises(TypeError, match=bound_name):
+        ToolParametersSchema(
+            type="object",
+            properties={"value": field_schema},
+            required=(),
+            additional_properties=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "bound_name",
+    ("minLength", "maxLength", "minItems", "maxItems"),
+)
+def test_tool_parameters_schema_rejects_negative_count_bounds(
+    bound_name: str,
+) -> None:
+    """字段 count bound 为负数时必须在构造期抛 ``ValueError``。
+
+    :param bound_name: 要校验的 JSON Schema count keyword。
+    :returns: 无返回值。
+    :raises AssertionError: schema 未抛出 ``ValueError`` 时由 pytest 抛出。
+    """
+
+    field_type = "string" if bound_name.endswith("Length") else "array"
+    field_schema: dict[str, JsonValue] = {
+        "type": field_type,
+        bound_name: -1,
+    }
+
+    with pytest.raises(ValueError, match=bound_name):
+        ToolParametersSchema(
+            type="object",
+            properties={"value": field_schema},
+            required=(),
+            additional_properties=False,
+        )
+
+
+@pytest.mark.parametrize("bound_name", ("minLength", "maxLength"))
+@pytest.mark.parametrize("invalid_bound", (True, 1.5, "1"))
+def test_tool_parameters_schema_rejects_non_integer_array_item_bounds(
+    bound_name: str,
+    invalid_bound: JsonValue,
+) -> None:
+    """array items 的 string count bound 同样必须在构造期拒绝。
+
+    :param bound_name: items string schema 的长度关键字。
+    :param invalid_bound: 非法的非整数边界值。
+    :returns: 无返回值。
+    :raises AssertionError: schema 未抛出 ``TypeError`` 时由 pytest 抛出。
+    """
+
+    with pytest.raises(TypeError, match=f"items.{bound_name}"):
+        ToolParametersSchema(
+            type="object",
+            properties={
+                "values": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        bound_name: invalid_bound,
+                    },
+                }
+            },
+            required=(),
+            additional_properties=False,
+        )
+
+
+@pytest.mark.parametrize("bound_name", ("minLength", "maxLength"))
+def test_tool_parameters_schema_rejects_negative_array_item_bounds(
+    bound_name: str,
+) -> None:
+    """array items 的负 string count bound 必须在构造期拒绝。
+
+    :param bound_name: items string schema 的长度关键字。
+    :returns: 无返回值。
+    :raises AssertionError: schema 未抛出 ``ValueError`` 时由 pytest 抛出。
+    """
+
+    with pytest.raises(ValueError, match=f"items.{bound_name}"):
+        ToolParametersSchema(
+            type="object",
+            properties={
+                "values": {
+                    "type": "array",
+                    "items": {"type": "string", bound_name: -1},
+                }
+            },
+            required=(),
+            additional_properties=False,
+        )
+
+
+def test_tool_parameters_schema_accepts_zero_count_bounds() -> None:
+    """四类 count bound 与 array item string bounds 都允许零。"""
+
+    schema = ToolParametersSchema(
+        type="object",
+        properties={
+            "text": {"type": "string", "minLength": 0, "maxLength": 0},
+            "values": {
+                "type": "array",
+                "minItems": 0,
+                "maxItems": 0,
+                "items": {
+                    "type": "string",
+                    "minLength": 0,
+                    "maxLength": 0,
+                },
+            },
+        },
+        required=(),
+        additional_properties=False,
+    )
+
+    assert schema.properties["text"] == {
+        "type": "string",
+        "minLength": 0,
+        "maxLength": 0,
+    }
 
 
 def test_enabled_truncate_spec_requires_enum_strategy_and_matching_limit() -> None:

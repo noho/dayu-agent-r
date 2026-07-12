@@ -143,6 +143,206 @@ def test_validate_arguments_checks_enum_and_string_bounds() -> None:
     assert "at least 3 characters" in _assert_validation_failure(short_result).message
 
 
+@pytest.mark.parametrize(
+    ("value", "enum_candidate"),
+    (
+        (True, 1),
+        (True, 1.0),
+        (False, 0),
+        (False, 0.0),
+    ),
+)
+def test_enum_json_equality_separates_boolean_from_number(
+    value: bool,
+    enum_candidate: int | float,
+) -> None:
+    """JSON boolean 与 int/float number 必须永不相等。
+
+    :param value: 显式 boolean 参数。
+    :param enum_candidate: Python equality 会误判相等的 JSON number。
+    :returns: 无返回值。
+    :raises AssertionError: enum 校验错误接受值时由 pytest 抛出。
+    """
+
+    result = validate_and_project_arguments(
+        _call({"flag": value}),
+        _TOOL_NAME,
+        _schema(
+            properties={
+                "flag": {"type": "boolean", "enum": [enum_candidate]}
+            },
+            required=("flag",),
+        ),
+    )
+
+    assert "one of" in _assert_validation_failure(result).message
+
+
+@pytest.mark.parametrize(("value", "enum_candidate"), ((1, 1.0), (1.0, 1)))
+def test_enum_json_equality_preserves_finite_number_equivalence(
+    value: int | float,
+    enum_candidate: int | float,
+) -> None:
+    """有限 int 与 float JSON number 按数学值比较。
+
+    :param value: 显式 number 参数。
+    :param enum_candidate: 数学值相同但 Python 数值类型不同的 enum 成员。
+    :returns: 无返回值。
+    :raises AssertionError: 等价 number 被拒绝时由 pytest 抛出。
+    """
+
+    result = validate_and_project_arguments(
+        _call({"score": value}),
+        _TOOL_NAME,
+        _schema(
+            properties={
+                "score": {"type": "number", "enum": [enum_candidate]}
+            },
+            required=("score",),
+        ),
+    )
+
+    assert isinstance(result, ValidatedToolArguments)
+
+
+@pytest.mark.parametrize(
+    ("field_type", "value", "enum_candidate", "accepted"),
+    (
+        ("array", [1, {"score": 2}], [1.0, {"score": 2.0}], True),
+        ("array", [True], [1], False),
+        ("object", {"score": 1}, {"score": 1.0}, True),
+        ("object", {"flag": True}, {"flag": 1}, False),
+    ),
+)
+def test_enum_json_equality_recurses_arrays_and_objects(
+    field_type: str,
+    value: JsonValue,
+    enum_candidate: JsonValue,
+    accepted: bool,
+) -> None:
+    """array/object enum 必须递归复用 typed JSON equality。
+
+    :param field_type: 顶层字段 JSON Schema type。
+    :param value: 显式 nested JSON 参数。
+    :param enum_candidate: 要比较的 nested enum 成员。
+    :param accepted: 预期是否按 JSON 语义相等。
+    :returns: 无返回值。
+    :raises AssertionError: 递归比较结果不符时由 pytest 抛出。
+    """
+
+    result = validate_and_project_arguments(
+        _call({"value": value}),
+        _TOOL_NAME,
+        _schema(
+            properties={
+                "value": {"type": field_type, "enum": [enum_candidate]}
+            },
+            required=("value",),
+        ),
+    )
+
+    if accepted:
+        assert isinstance(result, ValidatedToolArguments)
+    else:
+        assert "one of" in _assert_validation_failure(result).message
+
+
+def test_default_and_explicit_arguments_share_json_enum_equality() -> None:
+    """default 与显式参数必须经同一个 typed enum comparison。"""
+
+    schema = _schema(
+        properties={
+            "flag": {"type": "boolean", "enum": [1], "default": True}
+        },
+        required=(),
+    )
+
+    explicit_result = validate_and_project_arguments(
+        _call({"flag": True}),
+        _TOOL_NAME,
+        schema,
+    )
+    default_result = validate_and_project_arguments(
+        _call({}),
+        _TOOL_NAME,
+        schema,
+    )
+
+    explicit_failure = _assert_validation_failure(explicit_result)
+    default_failure = _assert_validation_failure(default_result)
+    assert explicit_failure.message == default_failure.message
+
+
+@pytest.mark.parametrize(
+    ("bound_name", "field_type", "value"),
+    (
+        ("minLength", "string", "x"),
+        ("maxLength", "string", "x"),
+        ("minItems", "array", []),
+        ("maxItems", "array", []),
+    ),
+)
+def test_runtime_rejects_negative_count_bound_after_mutable_schema_tamper(
+    bound_name: str,
+    field_type: str,
+    value: JsonValue,
+) -> None:
+    """外部 mutable mapping 篡改负 count bound 时 runtime 仍 fail closed。
+
+    :param bound_name: 被篡改的 JSON Schema count keyword。
+    :param field_type: 当前字段 schema type。
+    :param value: 用于触发字段投影的合法参数值。
+    :returns: 无返回值。
+    :raises AssertionError: runtime 把非法 schema 当用户 range 时由 pytest 抛出。
+    """
+
+    mutable_field_schema: dict[str, JsonValue] = {
+        "type": field_type,
+        bound_name: 0,
+    }
+    schema = _schema(
+        properties={"value": mutable_field_schema},
+        required=("value",),
+    )
+    mutable_field_schema[bound_name] = -1
+
+    result = validate_and_project_arguments(
+        _call({"value": value}),
+        _TOOL_NAME,
+        schema,
+    )
+
+    failure = _assert_validation_failure(result)
+    assert bound_name in failure.message
+    assert "schema bound" in failure.message
+
+
+def test_runtime_rejects_negative_array_item_bound_after_schema_tamper() -> None:
+    """空 array 也不能绕过被外部篡改的 items count bound defense。"""
+
+    mutable_item_schema: dict[str, JsonValue] = {
+        "type": "string",
+        "minLength": 0,
+    }
+    schema = _schema(
+        properties={
+            "values": {"type": "array", "items": mutable_item_schema}
+        },
+        required=("values",),
+    )
+    mutable_item_schema["minLength"] = -1
+
+    result = validate_and_project_arguments(
+        _call({"values": []}),
+        _TOOL_NAME,
+        schema,
+    )
+
+    failure = _assert_validation_failure(result)
+    assert "items.minLength" in failure.message
+    assert "schema bound" in failure.message
+
+
 def test_validate_arguments_integer_rejects_bool() -> None:
     """integer 字段必须拒绝 Python bool。"""
 

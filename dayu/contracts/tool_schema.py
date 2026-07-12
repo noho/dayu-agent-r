@@ -9,8 +9,8 @@ schema 内的字段值（``type``、``function``）是 OpenAI 风格协议字面
 
 - ``ToolParametersSchema`` 仅承诺三个稳定字段：``type``、``properties``、
   ``required``，外加可选的 ``additional_properties``。本模块不实现完整
-  JSON Schema runtime validator；调用方仍必须保证 ``required`` 中的字段名
-  都来自 ``properties``，否则该 schema 不是合法的 LLM-facing 参数契约。
+  JSON Schema runtime validator；它只在声明期校验字段名、required 引用和
+  string/array count bounds。调用方仍必须保证其它参数 schema 关键字合法。
 - ``ToolSchema`` / ``ToolFunctionSchema`` 严格遵循 OpenAI Function-call
   格式以利 Runner 直接传递；其它 provider 适配由 Phase 1+ 处理。
 - ``ToolTruncateSpec`` 是 Host ToolRuntime 使用的显式截断声明，不进入
@@ -33,6 +33,44 @@ _TEXT_CHARS_LIMIT_KEY = "max_chars"
 _TEXT_LINES_LIMIT_KEY = "max_lines"
 _LIST_ITEMS_LIMIT_KEY = "max_items"
 _BINARY_BYTES_LIMIT_KEY = "max_bytes"
+_COUNT_BOUND_KEYS: tuple[str, ...] = (
+    "minLength",
+    "maxLength",
+    "minItems",
+    "maxItems",
+)
+
+
+def _validate_count_bounds(
+    field_schema: Mapping[str, JsonValue],
+    *,
+    path: str,
+) -> None:
+    """递归校验字段及 array items schema 的计数边界。
+
+    :param field_schema: 当前字段或 array items 的 JSON Schema 映射。
+    :param path: 用于异常定位的 schema 路径。
+    :returns: ``None``。
+    :raises TypeError: count bound 不是非 bool 整数时抛出。
+    :raises ValueError: count bound 为负数时抛出。
+    """
+
+    for bound_name in _COUNT_BOUND_KEYS:
+        if bound_name not in field_schema:
+            continue
+        bound = field_schema[bound_name]
+        if isinstance(bound, bool) or not isinstance(bound, int):
+            raise TypeError(
+                f"ToolParametersSchema {path}.{bound_name} must be int"
+            )
+        if bound < 0:
+            raise ValueError(
+                f"ToolParametersSchema {path}.{bound_name} must be non-negative"
+            )
+
+    items_schema = field_schema.get("items")
+    if isinstance(items_schema, Mapping):
+        _validate_count_bounds(items_schema, path=f"{path}.items")
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,9 +93,10 @@ class ToolParametersSchema:
         """校验工具参数 schema 的最小结构一致性。
 
         :returns: ``None``。
-        :raises TypeError: ``properties`` 字段名不是字符串时抛出。
+        :raises TypeError: ``properties`` 字段名不是字符串，或 property/items
+            count bound 不是非 bool 整数时抛出。
         :raises ValueError: ``properties`` 字段名为空白，或 ``required``
-            中字段不属于 ``properties`` 时抛出。
+            中字段不属于 ``properties``，或 count bound 为负数时抛出。
         """
 
         property_names = set(self.properties.keys())
@@ -67,6 +106,12 @@ class ToolParametersSchema:
             if property_name.strip() == "":
                 raise ValueError(
                     "ToolParametersSchema.properties keys must be non-empty"
+                )
+            field_schema = self.properties[property_name]
+            if isinstance(field_schema, Mapping):
+                _validate_count_bounds(
+                    field_schema,
+                    path=f"properties.{property_name}",
                 )
         for field_name in self.required:
             if field_name not in property_names:
