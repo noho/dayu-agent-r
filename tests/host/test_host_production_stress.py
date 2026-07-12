@@ -100,6 +100,7 @@ _SLICE3_SECONDARY_FIRST_TERMINAL_COUNT = 2
 _SLICE3_SECONDARY_RECONNECT_TERMINAL_COUNT = 1
 _SLICE3_DISCONNECT_GAP_RUN_COUNT = 3
 _SLICE3_WATCH_LAG_PER_SESSION_LIMIT = _SLICE3_RUNS_PER_SESSION
+_SLICE3_DR006_ACCEPTED_COUNT = 12
 _SLICE4_SCENARIO_NAME = "scheduler-liveness-long-run-mixed-flow"
 _SLICE4_SESSION_COUNT = 4
 _SLICE4_LANE_CAPACITY = 1
@@ -1953,6 +1954,7 @@ async def test_sustained_watch_slow_consumer_reconnect_stress(
                 StressWorkerBehavior.FAILED,
             )
             run_ids.append(session2_tail_failed_run_id)
+            assert len(factory.accepted_snapshots) == _SLICE3_DR006_ACCEPTED_COUNT
 
             gap_run_ids.append(
                 await _submit_scripted_followup(
@@ -1981,6 +1983,11 @@ async def test_sustained_watch_slow_consumer_reconnect_stress(
                 )
             )
             run_ids.extend(gap_run_ids)
+            # reconnect watcher 的 live cursor 必须在 gap terminal 全部 durable
+            # commit 后取得；否则测试会把尚在 ingest 的旧 terminal 错当成
+            # reconnect 之后的新事件，形成与 watch 契约无关的调度竞态。
+            for gap_run_id in gap_run_ids:
+                await _wait_run_terminal(host, gap_run_id)
             last_primary_terminal_counts = _record_all_watch_lag_samples(
                 tmp_path,
                 session_ids,

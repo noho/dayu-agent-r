@@ -103,7 +103,23 @@ def effective_execution_snapshot_from_json(
     try:
         root = required_json_mapping(value, field_name="effective_execution_config")
         policy_snapshot_ref = required_json_text(root, field_name="policy_snapshot_ref")
+        policy_snapshot_digest = required_json_text(
+            root,
+            field_name="policy_snapshot_digest",
+        )
         config = required_json_mapping(root.get("config"), field_name="config")
+        actual_config_digest = sha256_digest_json(config)
+        if policy_snapshot_digest != actual_config_digest:
+            raise HostDurableError(
+                "effective execution policy snapshot digest mismatch"
+            )
+        expected_policy_snapshot_ref = (
+            _POLICY_SNAPSHOT_REF_PREFIX + actual_config_digest
+        )
+        if policy_snapshot_ref != expected_policy_snapshot_ref:
+            raise HostDurableError(
+                "effective execution policy snapshot ref mismatch"
+            )
         return EffectiveExecutionSnapshot(
             runner_spec=runner_spec_from_json(
                 required_json_mapping(config.get("runner_spec"), field_name="runner_spec")

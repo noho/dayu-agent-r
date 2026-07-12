@@ -22,6 +22,13 @@ from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.engine.contracts.agent_run import AgentRunRequest
 from dayu.engine.contracts.engine_events import RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+from dayu.host._runner_call_manifest import (
+    RunnerCallHotAtoms,
+    RunnerCallProjectorMetadata,
+    complete_runner_call_hot_diagnostic,
+    runner_call_hot_payload,
+    runner_call_projector_metadata_descriptor,
+)
 from dayu.host.compact_material import conversation_compact_input_vnext_from_material_pack
 from dayu.host.compact_payload import accepted_compact_business_texts
 from dayu.host.compaction import (
@@ -1141,7 +1148,11 @@ def _compactor_runner_call_manifest_body(
         "message_entries": list(message_entries),
         "source_cursor_refs": list(source_cursor_refs),
         "tool_schema_snapshot_refs": [],
-        "memory_snapshot_cursor_ref": request.memory_snapshot_cursor,
+        "memory_snapshot_cursor_ref": (
+            None
+            if request.memory_snapshot_cursor is None
+            else f"memory:{request.memory_snapshot_cursor}"
+        ),
         "compact_artifact_refs": [],
         "context_fallback_decision_ref": None,
         "projector_metadata": list(projector_metadata),
@@ -1172,37 +1183,53 @@ def _compactor_runner_call_hot_payload(
     :returns: EventLog hot payload。
     """
 
-    return {
-        "session_id": _required_manifest_text(manifest, "session_id"),
-        "host_run_id": _required_manifest_text(manifest, "host_run_id"),
-        "attempt_id": _optional_manifest_text(manifest, "attempt_id"),
-        "execution_id": _optional_manifest_text(manifest, "execution_id"),
-        "runner_call_index": _required_manifest_int(
-            manifest, "runner_call_index"
+    message_count = _required_manifest_int(manifest, "message_count")
+    role_sequence_digest = _required_manifest_text(
+        manifest,
+        "role_sequence_digest",
+    )
+    return runner_call_hot_payload(
+        RunnerCallHotAtoms(
+            session_id=_required_manifest_text(manifest, "session_id"),
+            host_run_id=_required_manifest_text(manifest, "host_run_id"),
+            attempt_id=_optional_manifest_text(manifest, "attempt_id"),
+            execution_id=_optional_manifest_text(manifest, "execution_id"),
+            runner_call_index=_required_manifest_int(
+                manifest, "runner_call_index"
+            ),
+            runner_call_kind=_required_manifest_text(
+                manifest, "runner_call_kind"
+            ),
+            runner_call_trigger_reason=_required_manifest_text(
+                manifest,
+                "runner_call_trigger_reason",
+            ),
+            iteration_id=None,
+            iteration_index=None,
+            manifest_payload_ref=manifest_payload_ref,
+            manifest_digest=manifest_digest,
+            manifest_schema_version=_required_manifest_text(
+                manifest, "schema_version"
+            ),
+            validation_status=_RUNNER_CALL_VALIDATION_COMPLETE,
+            message_count=message_count,
+            role_sequence_digest=role_sequence_digest,
+            input_projection_digest=_required_manifest_text(
+                manifest,
+                "input_projection_digest",
+            ),
+            runner_call_projection_artifact_ref=None,
+            runner_call_projection_artifact_digest=None,
+            runner_call_projection_artifact_size_bytes=None,
+            diagnostic=complete_runner_call_hot_diagnostic(
+                status=_RUNNER_CALL_VALIDATION_COMPLETE,
+                message_count=message_count,
+                role_sequence_digest=role_sequence_digest,
+                consumer_boundary=_GOVERNANCE_ACTOR,
+            ),
         ),
-        "runner_call_kind": _required_manifest_text(manifest, "runner_call_kind"),
-        "runner_call_trigger_reason": _required_manifest_text(
-            manifest,
-            "runner_call_trigger_reason",
-        ),
-        "iteration_id": None,
-        "iteration_index": None,
-        "manifest_payload_ref": manifest_payload_ref,
-        "manifest_digest": manifest_digest,
-        "manifest_schema_version": RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
-        "validation_status": _RUNNER_CALL_VALIDATION_COMPLETE,
-        "message_count": _required_manifest_int(manifest, "message_count"),
-        "role_sequence_digest": _required_manifest_text(
-            manifest,
-            "role_sequence_digest",
-        ),
-        "input_projection_digest": _required_manifest_text(
-            manifest,
-            "input_projection_digest",
-        ),
-        "projector_metadata_summary": _projector_metadata_summary(manifest),
-        "diagnostic": None,
-    }
+        manifest=manifest,
+    )
 
 
 def _compactor_message_entries(
@@ -1268,27 +1295,31 @@ def _compactor_projector_metadata(
     """
 
     return (
-        {
-            "metadata_id": _compactor_projector_metadata_id(0),
-            "projector_id": _COMPACTOR_SYSTEM_PROJECTOR_ID,
-            "projector_schema_version": _COMPACTOR_PROJECTOR_SCHEMA_VERSION,
-            "purpose": _COMPACTOR_PROJECTOR_PURPOSE,
-            "source_contract_refs": [
-                f"prompt-digest:{prepared_input.system_prompt_asset_digest}"
-            ],
-            "projector_digest": prepared_input.system_prompt_asset_digest,
-        },
-        {
-            "metadata_id": _compactor_projector_metadata_id(1),
-            "projector_id": _COMPACTOR_USER_PROJECTOR_ID,
-            "projector_schema_version": _COMPACTOR_PROJECTOR_SCHEMA_VERSION,
-            "purpose": _COMPACTOR_PROJECTOR_PURPOSE,
-            "source_contract_refs": [
-                compactor_input_projection_ref,
-                *_compactor_source_cursor_refs(request),
-            ],
-            "projector_digest": prepared_input.user_prompt_digest,
-        },
+        runner_call_projector_metadata_descriptor(
+            RunnerCallProjectorMetadata(
+                projector_metadata_id=_compactor_projector_metadata_id(0),
+                projector_id=_COMPACTOR_SYSTEM_PROJECTOR_ID,
+                projector_schema_version=_COMPACTOR_PROJECTOR_SCHEMA_VERSION,
+                projector_digest=prepared_input.system_prompt_asset_digest,
+                purpose=_COMPACTOR_PROJECTOR_PURPOSE,
+                source_contract_refs=(
+                    f"prompt-digest:{prepared_input.system_prompt_asset_digest}",
+                ),
+            )
+        ),
+        runner_call_projector_metadata_descriptor(
+            RunnerCallProjectorMetadata(
+                projector_metadata_id=_compactor_projector_metadata_id(1),
+                projector_id=_COMPACTOR_USER_PROJECTOR_ID,
+                projector_schema_version=_COMPACTOR_PROJECTOR_SCHEMA_VERSION,
+                projector_digest=prepared_input.user_prompt_digest,
+                purpose=_COMPACTOR_PROJECTOR_PURPOSE,
+                source_contract_refs=(
+                    compactor_input_projection_ref,
+                    *_compactor_source_cursor_refs(request),
+                ),
+            )
+        ),
     )
 
 
@@ -1346,32 +1377,6 @@ def _compactor_source_cursor_refs(request: CompactionRequest) -> tuple[str, ...]
             )
         )
     )
-
-
-def _projector_metadata_summary(
-    manifest: Mapping[str, JsonValue]
-) -> list[JsonValue]:
-    """从 manifest projector metadata 构造 hot payload summary。
-
-    :param manifest: runner-call manifest body。
-    :returns: bounded projector metadata summary。
-    """
-
-    metadata = manifest.get("projector_metadata")
-    if not isinstance(metadata, list):
-        return []
-    summary: list[JsonValue] = []
-    for entry in metadata:
-        if isinstance(entry, Mapping):
-            summary.append(
-                {
-                    "metadata_id": entry.get("metadata_id"),
-                    "projector_id": entry.get("projector_id"),
-                    "purpose": entry.get("purpose"),
-                    "projector_digest": entry.get("projector_digest"),
-                }
-            )
-    return summary
 
 
 def _compactor_trigger_reason(compaction_attempt_number: int) -> str:

@@ -11,10 +11,10 @@ from dayu.contracts.json_value import JsonValue
 from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import EventLogRow
-from dayu.host.durable.payload import PayloadKind, read_payload_descriptor
+from dayu.host.durable.payload import read_payload_descriptor
+from dayu.host.durable.payload_resolution import resolve_json_payload
 from dayu.host.durable.schema import (
     PayloadDescriptorKind,
-    TABLE_SQLITE_PAYLOADS,
     TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
     TOOL_CALL_ARGUMENTS_STORAGE_PAYLOAD_DESCRIPTOR,
     TOOL_CALL_SEMANTIC_QUERY_STORAGE_ABSENT,
@@ -162,39 +162,27 @@ def sqlite_payload_object(
     payload_digest: str,
     payload_label: str,
 ) -> Mapping[str, JsonValue]:
-    """按 payload descriptor 读取 SQLite JSON object。
+    """按 payload descriptor 读取完整性已校验的 durable JSON object。
 
     :param transaction: 当前 Host transaction。
     :param payload_ref: payload descriptor ref。
     :param payload_digest: 调用方持有的 payload digest。
     :param payload_label: 错误消息中的 payload 名称。
     :returns: payload JSON object。
-    :raises HostDurableError: descriptor、digest 或 SQLite payload 非法时抛出。
+    :raises HostDurableError: descriptor、caller digest、row、artifact 或 canonical
+        JSON bytes 任一不一致时抛出。
     """
 
-    descriptor = read_payload_descriptor(transaction, payload_ref)
-    if descriptor is None:
-        raise HostDurableError(f"{payload_label} payload descriptor is missing")
-    if descriptor.payload_kind is not PayloadKind.SQLITE_PAYLOAD:
-        raise HostDurableError(f"{payload_label} payload must be sqlite payload")
-    if descriptor.payload_digest != payload_digest:
-        raise HostDurableError(f"{payload_label} payload digest mismatch")
-    if descriptor.sqlite_payload_id is None:
-        raise HostDurableError(f"{payload_label} sqlite payload id is missing")
-    row = transaction.fetchone(
-        f"""
-        SELECT payload_json
-        FROM {TABLE_SQLITE_PAYLOADS}
-        WHERE payload_id = ?
-        """,
-        (descriptor.sqlite_payload_id,),
-    )
-    if row is None:
-        raise HostDurableError(f"{payload_label} sqlite payload row is missing")
-    payload_json = row.get("payload_json")
-    if not isinstance(payload_json, str):
-        raise HostDurableError(f"{payload_label} sqlite payload JSON is invalid")
-    return _json_object(payload_json, payload_label=payload_label)
+    try:
+        return resolve_json_payload(
+            transaction,
+            payload_ref=payload_ref,
+            expected_digest=payload_digest,
+        ).payload
+    except HostDurableError as exc:
+        raise HostDurableError(
+            f"{payload_label} payload integrity validation failed: {exc}"
+        ) from exc
 
 
 def _json_object(payload_json: str, *, payload_label: str) -> Mapping[str, JsonValue]:

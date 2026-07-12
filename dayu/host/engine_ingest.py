@@ -54,6 +54,17 @@ from dayu.engine.contracts.engine_events import (
     UsageReportedData,
 )
 from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
+from dayu.host._runner_call_manifest import (
+    RunnerCallHotAtoms,
+    RunnerCallHotDiagnostic,
+    RunnerCallProjectorMetadata,
+    complete_runner_call_hot_diagnostic,
+    parse_runner_call_hot_payload,
+    parse_runner_call_manifest,
+    runner_call_hot_diagnostic_from_json,
+    runner_call_hot_payload,
+    runner_call_projector_metadata_descriptor,
+)
 from dayu.host.admission import (
     AdmissionWakeupPort,
     NoopAdmissionWakeupPort,
@@ -308,7 +319,7 @@ _RUNNER_CALL_KIND_TOOL_RESULT_CONTINUATION = "tool_result_continuation"
 _RUNNER_CALL_TRIGGER_INITIAL_USER_INPUT = "initial_user_input"
 _RUNNER_CALL_TRIGGER_TOOL_RESULTS_AVAILABLE = "tool_results_available"
 _RUNNER_CALL_DIAGNOSTIC_MISSING_REF_KIND_PROJECTION_ARTIFACT = (
-    "runner_call_projection_artifact"
+    "artifact_ref"
 )
 _RUNNER_CALL_PROJECTOR_PURPOSE_TOOL_CONTINUATION = "tool_continuation_input"
 _ORDINARY_RUNNER_CALL_KINDS = frozenset(
@@ -5534,12 +5545,14 @@ def _limited_runner_call_manifest_body(
             consumer_boundary=_EVENT_SOURCE,
         )
     )
+    projector_metadata_id = _limited_runner_call_projector_metadata_id(data)
     message_entries = (
         tuple(
             _observed_runner_call_message_entry(
                 context,
                 message,
                 projection_descriptor=projection_descriptor,
+                projector_metadata_id=projector_metadata_id,
             )
             for message in data.input_projection
         )
@@ -5627,12 +5640,14 @@ def _observed_runner_call_message_entry(
     message: RunnerInputMessageProjection,
     *,
     projection_descriptor: PayloadDescriptor,
+    projector_metadata_id: str,
 ) -> Mapping[str, JsonValue]:
     """构造 Engine observed manifest message entry。
 
     :param context: 已校验 candidate 上下文。
     :param message: Engine observed message projection。
     :param projection_descriptor: runner-call projection descriptor。
+    :param projector_metadata_id: 本次 Engine observed projector metadata id。
     :returns: manifest message entry JSON object。
     """
 
@@ -5644,7 +5659,7 @@ def _observed_runner_call_message_entry(
         "source_refs": list(_limited_runner_call_source_refs(context)),
         "projection_artifact_ref": projection_descriptor.payload_ref,
         "projection_artifact_digest": projection_descriptor.payload_digest,
-        "projector_metadata_id": f"projector:{message.index}:{message.role}",
+        "projector_metadata_id": projector_metadata_id,
         "provider_tool_calls_digest": (
             sha256_digest_json(
                 {
@@ -5738,21 +5753,38 @@ def _limited_runner_call_projector_metadata(
 
     projector_id = "engine_observed_runner_input_signal"
     projector_schema_version = "engine_observed_runner_input_signal.v1"
-    metadata_id = f"projector:{data.iteration_index}:engine-observed"
-    return {
-        "projector_metadata_id": metadata_id,
-        "projector_id": projector_id,
-        "projector_schema_version": projector_schema_version,
-        "projector_digest": sha256_digest_json(
-            {
-                "projector_id": projector_id,
-                "projector_schema_version": projector_schema_version,
-                "source_refs": list(_limited_runner_call_source_refs(context)),
-            }
-        ),
-        "purpose": _RUNNER_CALL_PROJECTOR_PURPOSE_TOOL_CONTINUATION,
-        "source_contract_refs": list(_limited_runner_call_source_refs(context)),
-    }
+    metadata_id = _limited_runner_call_projector_metadata_id(data)
+    source_contract_refs = _limited_runner_call_source_refs(context)
+    projector_digest = sha256_digest_json(
+        {
+            "projector_id": projector_id,
+            "projector_schema_version": projector_schema_version,
+            "source_refs": list(source_contract_refs),
+        }
+    )
+    return runner_call_projector_metadata_descriptor(
+        RunnerCallProjectorMetadata(
+            projector_metadata_id=metadata_id,
+            projector_id=projector_id,
+            projector_schema_version=projector_schema_version,
+            projector_digest=projector_digest,
+            purpose=_RUNNER_CALL_PROJECTOR_PURPOSE_TOOL_CONTINUATION,
+            source_contract_refs=source_contract_refs,
+        )
+    )
+
+
+def _limited_runner_call_projector_metadata_id(
+    data: IterationStartedData,
+) -> str:
+    """返回 Engine continuation messages 共用的 metadata id。
+
+    :param data: Engine iteration started data。
+    :returns: 可由 manifest ``projector_metadata`` 唯一解析的 id。
+    :raises: 无。
+    """
+
+    return f"projector:{data.iteration_index}:engine-observed"
 
 
 def _runner_call_kind_for_iteration(data: IterationStartedData) -> str:
@@ -5922,44 +5954,49 @@ def _runner_call_manifest_hot_payload(
     :returns: canonical event hot payload。
     """
 
-    return {
-        "session_id": _manifest_text(manifest, "session_id"),
-        "host_run_id": _manifest_text(manifest, "host_run_id"),
-        "attempt_id": _manifest_optional_text(manifest, "attempt_id"),
-        "execution_id": _manifest_optional_text(manifest, "execution_id"),
-        "runner_call_index": _manifest_int(manifest, "runner_call_index"),
-        "runner_call_kind": _manifest_text(manifest, "runner_call_kind"),
-        "runner_call_trigger_reason": _manifest_text(
-            manifest, "runner_call_trigger_reason"
+    validation_status = _manifest_validation_status(manifest)
+    return runner_call_hot_payload(
+        RunnerCallHotAtoms(
+            session_id=_manifest_text(manifest, "session_id"),
+            host_run_id=_manifest_text(manifest, "host_run_id"),
+            attempt_id=_manifest_optional_text(manifest, "attempt_id"),
+            execution_id=_manifest_optional_text(manifest, "execution_id"),
+            runner_call_index=_manifest_int(manifest, "runner_call_index"),
+            runner_call_kind=_manifest_text(manifest, "runner_call_kind"),
+            runner_call_trigger_reason=_manifest_text(
+                manifest, "runner_call_trigger_reason"
+            ),
+            iteration_id=_manifest_optional_text(manifest, "iteration_id"),
+            iteration_index=_manifest_optional_int(manifest, "iteration_index"),
+            manifest_payload_ref=manifest_payload_ref,
+            manifest_digest=manifest_digest,
+            manifest_schema_version=_manifest_text(manifest, "schema_version"),
+            validation_status=validation_status,
+            message_count=_manifest_int(manifest, "message_count"),
+            role_sequence_digest=_manifest_text(
+                manifest, "role_sequence_digest"
+            ),
+            input_projection_digest=_manifest_text(
+                manifest, "input_projection_digest"
+            ),
+            runner_call_projection_artifact_ref=_manifest_optional_text(
+                manifest, "runner_call_projection_artifact_ref"
+            ),
+            runner_call_projection_artifact_digest=_manifest_optional_text(
+                manifest, "runner_call_projection_artifact_digest"
+            ),
+            runner_call_projection_artifact_size_bytes=_manifest_optional_int(
+                manifest, "runner_call_projection_artifact_size_bytes"
+            ),
+            diagnostic=_manifest_hot_diagnostic(manifest),
         ),
-        "iteration_id": _manifest_optional_text(manifest, "iteration_id"),
-        "iteration_index": manifest.get("iteration_index"),
-        "manifest_payload_ref": manifest_payload_ref,
-        "manifest_digest": manifest_digest,
-        "manifest_schema_version": _manifest_text(manifest, "schema_version"),
-        "validation_status": _manifest_validation_status(manifest),
-        "message_count": _manifest_int(manifest, "message_count"),
-        "role_sequence_digest": _manifest_text(manifest, "role_sequence_digest"),
-        "input_projection_digest": _manifest_text(
-            manifest, "input_projection_digest"
-        ),
-        "projector_metadata_summary": list(_projector_metadata_summary(manifest)),
-        "runner_call_projection_artifact_ref": _manifest_optional_text(
-            manifest, "runner_call_projection_artifact_ref"
-        ),
-        "runner_call_projection_artifact_digest": _manifest_optional_text(
-            manifest, "runner_call_projection_artifact_digest"
-        ),
-        "runner_call_projection_artifact_size_bytes": _manifest_optional_int(
-            manifest, "runner_call_projection_artifact_size_bytes"
-        ),
-        "diagnostic": _manifest_hot_diagnostic(manifest),
-    }
+        manifest=manifest,
+    )
 
 
 def _manifest_hot_diagnostic(
     manifest: Mapping[str, JsonValue]
-) -> Mapping[str, JsonValue]:
+) -> RunnerCallHotDiagnostic:
     """构造 runner-call manifest hot payload diagnostic。
 
     :param manifest: manifest body。
@@ -5969,19 +6006,13 @@ def _manifest_hot_diagnostic(
     """
 
     if _manifest_validation_status(manifest) != _RUNNER_CALL_MANIFEST_STATUS_COMPLETE:
-        return _manifest_diagnostic(manifest)
+        return runner_call_hot_diagnostic_from_json(_manifest_diagnostic(manifest))
     message_count = _manifest_int(manifest, "message_count")
     role_sequence_digest = _manifest_text(manifest, "role_sequence_digest")
-    return _runner_call_manifest_diagnostic(
+    return complete_runner_call_hot_diagnostic(
         status=_RUNNER_CALL_MANIFEST_STATUS_COMPLETE,
-        reason=None,
-        missing_atom_kind=None,
-        missing_ref_kind=None,
-        missing_ref=None,
-        observed_count=message_count,
-        expected_count=message_count,
-        observed_digest=role_sequence_digest,
-        expected_digest=role_sequence_digest,
+        message_count=message_count,
+        role_sequence_digest=role_sequence_digest,
         consumer_boundary=_EVENT_SOURCE,
     )
 
@@ -6070,39 +6101,6 @@ def _next_runner_call_index(transaction: HostTransaction, run_id: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise HostDurableError("runner-call manifest count is invalid")
     return value
-
-
-def _projector_metadata_summary(
-    manifest: Mapping[str, JsonValue]
-) -> tuple[Mapping[str, JsonValue], ...]:
-    """从 manifest body 复制 projector metadata summary。
-
-    :param manifest: manifest body。
-    :returns: projector metadata summary。
-    :raises HostDurableError: projector metadata 字段非法时抛出。
-    """
-
-    value = manifest.get("projector_metadata")
-    if not isinstance(value, list):
-        raise HostDurableError("runner-call manifest projector_metadata is invalid")
-    summary: list[Mapping[str, JsonValue]] = []
-    for item in value:
-        if not isinstance(item, Mapping):
-            raise HostDurableError("runner-call projector metadata must be object")
-        summary.append(
-            {
-                "projector_metadata_id": _manifest_text(
-                    item, "projector_metadata_id"
-                ),
-                "projector_id": _manifest_text(item, "projector_id"),
-                "projector_schema_version": _manifest_text(
-                    item, "projector_schema_version"
-                ),
-                "projector_digest": _manifest_text(item, "projector_digest"),
-                "purpose": _manifest_text(item, "purpose"),
-            }
-        )
-    return tuple(summary)
 
 
 def _find_runner_call_iteration_link_event(
@@ -6266,26 +6264,25 @@ def _is_unlinked_prepared_ordinary_manifest(
     :raises HostDurableError: payload 字段非法时抛出。
     """
 
-    hot_payload = _payload_object(event)
-    if _optional_payload_text(hot_payload, field_name="validation_status") != (
-        _RUNNER_CALL_MANIFEST_STATUS_COMPLETE
-    ):
+    hot_payload = parse_runner_call_hot_payload(_payload_object(event))
+    if hot_payload.validation_status != _RUNNER_CALL_MANIFEST_STATUS_COMPLETE:
         return False
-    if _optional_payload_text(hot_payload, field_name="iteration_id") is not None:
+    if hot_payload.iteration_id is not None:
         return False
-    if hot_payload.get("iteration_index") is not None:
+    if hot_payload.iteration_index is not None:
         return False
-    runner_call_kind = _optional_payload_text(
-        hot_payload, field_name="runner_call_kind"
-    )
-    if runner_call_kind not in _ORDINARY_RUNNER_CALL_KINDS:
+    if hot_payload.runner_call_kind not in _ORDINARY_RUNNER_CALL_KINDS:
         return False
-    manifest = event_payload_object(
+    manifest_payload = event_payload_object(
         transaction,
         event,
         payload_label="runner-call manifest",
     )
-    if manifest.get("compactor_identity") is not None:
+    manifest = parse_runner_call_manifest(
+        manifest_payload,
+        hot_payload=hot_payload,
+    )
+    if manifest.compactor_identity is not None:
         return False
     return True
 
@@ -6373,13 +6370,11 @@ def _runner_call_iteration_link_payload(
     :raises HostDurableError: manifest hot payload 字段非法时抛出。
     """
 
-    manifest_payload = _payload_object(manifest_event)
-    expected_count = _optional_payload_int(
-        manifest_payload, field_name="message_count"
+    manifest_payload = parse_runner_call_hot_payload(
+        _payload_object(manifest_event)
     )
-    expected_digest = _optional_payload_text(
-        manifest_payload, field_name="role_sequence_digest"
-    )
+    expected_count = manifest_payload.message_count
+    expected_digest = manifest_payload.role_sequence_digest
     status = _RUNNER_CALL_MANIFEST_STATUS_COMPLETE
     reason: str | None = None
     if expected_count != data.message_count:
@@ -6403,26 +6398,18 @@ def _runner_call_iteration_link_payload(
             consumer_boundary=_EVENT_SOURCE,
         )
     return {
-        "session_id": _manifest_text(manifest_payload, "session_id"),
-        "host_run_id": _manifest_text(manifest_payload, "host_run_id"),
-        "attempt_id": _manifest_optional_text(manifest_payload, "attempt_id"),
-        "execution_id": _manifest_optional_text(manifest_payload, "execution_id"),
+        "session_id": manifest_payload.session_id,
+        "host_run_id": manifest_payload.host_run_id,
+        "attempt_id": manifest_payload.attempt_id,
+        "execution_id": manifest_payload.execution_id,
         "manifest_event_id": manifest_event.event_id,
-        "manifest_payload_ref": _manifest_text(
-            manifest_payload, "manifest_payload_ref"
-        ),
-        "manifest_digest": _manifest_text(manifest_payload, "manifest_digest"),
-        "manifest_schema_version": _manifest_text(
-            manifest_payload, "manifest_schema_version"
-        ),
-        "runner_call_index": _manifest_int(
-            manifest_payload, "runner_call_index"
-        ),
-        "runner_call_kind": _manifest_text(
-            manifest_payload, "runner_call_kind"
-        ),
-        "runner_call_trigger_reason": _manifest_text(
-            manifest_payload, "runner_call_trigger_reason"
+        "manifest_payload_ref": manifest_payload.manifest_payload_ref,
+        "manifest_digest": manifest_payload.manifest_digest,
+        "manifest_schema_version": manifest_payload.manifest_schema_version,
+        "runner_call_index": manifest_payload.runner_call_index,
+        "runner_call_kind": manifest_payload.runner_call_kind,
+        "runner_call_trigger_reason": (
+            manifest_payload.runner_call_trigger_reason
         ),
         "iteration_id": data.iteration_id,
         "iteration_index": data.iteration_index,
@@ -6511,9 +6498,9 @@ def _resolution_from_limited_manifest_event(
     :raises HostDurableError: manifest hot payload 字段非法时抛出。
     """
 
-    payload = _payload_object(event)
-    diagnostic = _runner_call_payload_diagnostic(
-        payload,
+    hot_payload = parse_runner_call_hot_payload(_payload_object(event))
+    diagnostic = _runner_call_diagnostic_projection(
+        hot_payload.diagnostic,
         consumer_boundary="engine_ingest_preview",
     )
     status = _manifest_text(diagnostic, "status")
@@ -6522,8 +6509,8 @@ def _resolution_from_limited_manifest_event(
         reason=_manifest_optional_text(diagnostic, "reason"),
         link_event_id=None,
         manifest_event_id=event.event_id,
-        manifest_payload_ref=_manifest_text(payload, "manifest_payload_ref"),
-        manifest_digest=_manifest_text(payload, "manifest_digest"),
+        manifest_payload_ref=hot_payload.manifest_payload_ref,
+        manifest_digest=hot_payload.manifest_digest,
         expected_count=_manifest_optional_int(diagnostic, "expected_count"),
         expected_digest=_manifest_optional_text(diagnostic, "expected_digest"),
         observed_count=data.message_count,
@@ -6624,44 +6611,39 @@ def _runner_call_payload_diagnostic(
     :param payload: canonical hot payload。
     :param consumer_boundary: 当前消费边界。
     :returns: diagnostic summary。
-    :raises HostDurableError: 非 complete signal 缺少 typed diagnostic 时抛出。
+    :raises HostDurableError: hot payload 或 diagnostic contract 非法时抛出。
     """
 
-    status = _optional_payload_text(payload, field_name="validation_status")
-    diagnostic = payload.get("diagnostic")
-    if status == _RUNNER_CALL_MANIFEST_STATUS_COMPLETE:
-        return _runner_call_manifest_diagnostic(
-            status=_RUNNER_CALL_MANIFEST_STATUS_COMPLETE,
-            reason=None,
-            missing_atom_kind=None,
-            missing_ref_kind=None,
-            missing_ref=None,
-            observed_count=_optional_payload_int(
-                payload, field_name="message_count"
-            ),
-            expected_count=_optional_payload_int(
-                payload, field_name="message_count"
-            ),
-            observed_digest=_optional_payload_text(
-                payload, field_name="role_sequence_digest"
-            ),
-            expected_digest=_optional_payload_text(
-                payload, field_name="role_sequence_digest"
-            ),
-            consumer_boundary=consumer_boundary,
-        )
-    if not isinstance(diagnostic, Mapping):
-        raise HostDurableError("runner-call manifest diagnostic must be object")
+    hot_payload = parse_runner_call_hot_payload(payload)
+    return _runner_call_diagnostic_projection(
+        hot_payload.diagnostic,
+        consumer_boundary=consumer_boundary,
+    )
+
+
+def _runner_call_diagnostic_projection(
+    diagnostic: RunnerCallHotDiagnostic,
+    *,
+    consumer_boundary: str,
+) -> Mapping[str, JsonValue]:
+    """把 shared owner diagnostic 投影到 Engine ingest consumer boundary。
+
+    :param diagnostic: shared hot owner 已校验的 diagnostic。
+    :param consumer_boundary: 当前 Engine ingest 消费边界。
+    :returns: 只改写 consumer boundary 的 diagnostic JSON object。
+    :raises HostDurableError: consumer boundary 非法时由 projection builder 抛出。
+    """
+
     return _runner_call_manifest_diagnostic(
-        status=_manifest_text(diagnostic, "status"),
-        reason=_manifest_optional_text(diagnostic, "reason"),
-        missing_atom_kind=_manifest_optional_text(diagnostic, "missing_atom_kind"),
-        missing_ref_kind=_manifest_optional_text(diagnostic, "missing_ref_kind"),
-        missing_ref=_manifest_optional_text(diagnostic, "missing_ref"),
-        observed_count=_manifest_optional_int(diagnostic, "observed_count"),
-        expected_count=_manifest_optional_int(diagnostic, "expected_count"),
-        observed_digest=_manifest_optional_text(diagnostic, "observed_digest"),
-        expected_digest=_manifest_optional_text(diagnostic, "expected_digest"),
+        status=diagnostic.status,
+        reason=diagnostic.reason,
+        missing_atom_kind=diagnostic.missing_atom_kind,
+        missing_ref_kind=diagnostic.missing_ref_kind,
+        missing_ref=diagnostic.missing_ref,
+        observed_count=diagnostic.observed_count,
+        expected_count=diagnostic.expected_count,
+        observed_digest=diagnostic.observed_digest,
+        expected_digest=diagnostic.expected_digest,
         consumer_boundary=consumer_boundary,
     )
 

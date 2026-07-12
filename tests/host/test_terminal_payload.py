@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.host.durable.codec import sha256_digest_bytes
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.options import (
@@ -21,7 +22,7 @@ from dayu.host.durable.payload import (
     SQLitePayloadFormat,
     SQLitePayloadWriteRequest,
 )
-from dayu.host.durable.schema import TABLE_SQLITE_PAYLOADS
+from dayu.host.durable.schema import TABLE_PAYLOAD_DESCRIPTORS, TABLE_SQLITE_PAYLOADS
 from dayu.host.durable.transaction import HostTransaction
 from dayu.host._terminal_answer import (
     assistant_final_answer_continuity_text,
@@ -76,6 +77,54 @@ def _write_terminal_payload(
             payload_json=payload_json,
         ),
     )
+
+
+def _tamper_sqlite_json_payload_with_self_consistent_metadata(
+    transaction: HostTransaction,
+    *,
+    descriptor: PayloadDescriptor,
+    payload_json: str | bytes,
+) -> str:
+    """篡改 JSON content 并同步 row/descriptor digest/size 以继续测试 parser。
+
+    :param transaction: 当前 Host write transaction。
+    :param descriptor: 目标 payload descriptor。
+    :param payload_json: 待写入 SQLite ``payload_json`` 的文本或 BLOB。
+    :returns: 篡改后 content digest。
+    :raises AssertionError: descriptor 没有 SQLite payload id 时抛出。
+    """
+
+    if descriptor.sqlite_payload_id is None:
+        raise AssertionError("sqlite payload id must exist")
+    payload_bytes = (
+        payload_json.encode("utf-8")
+        if isinstance(payload_json, str)
+        else payload_json
+    )
+    payload_digest = sha256_digest_bytes(payload_bytes)
+    payload_size_bytes = len(payload_bytes)
+    transaction.execute(
+        f"""
+        UPDATE {TABLE_SQLITE_PAYLOADS}
+        SET payload_json = ?, payload_size_bytes = ?, payload_digest = ?
+        WHERE payload_id = ?
+        """,
+        (
+            payload_json,
+            payload_size_bytes,
+            payload_digest,
+            descriptor.sqlite_payload_id,
+        ),
+    )
+    transaction.execute(
+        f"""
+        UPDATE {TABLE_PAYLOAD_DESCRIPTORS}
+        SET payload_size_bytes = ?, payload_digest = ?
+        WHERE payload_ref = ?
+        """,
+        (payload_size_bytes, payload_digest, descriptor.payload_ref),
+    )
+    return payload_digest
 
 
 def test_run_payload_final_answer_is_read() -> None:
@@ -471,13 +520,14 @@ def test_required_continuity_resolver_rejects_missing_descriptor_row(
     """
 
     with open_host_durable_store(_options(tmp_path)) as store:
+        missing_digest = sha256_digest_bytes(b"missing")
         with pytest.raises(HostDurableError, match="descriptor is missing"):
             store.transaction_runner.run_read(
                 lambda transaction: assistant_final_answer_continuity_text(
                     transaction,
                     {
                         "terminal_summary_ref": "payload-missing",
-                        "terminal_summary_digest": "sha256:missing",
+                        "terminal_summary_digest": missing_digest,
                     },
                     text_policy=PayloadTextReadPolicy.LENIENT_NON_EMPTY,
                 )
@@ -488,7 +538,7 @@ def test_required_continuity_resolver_rejects_missing_descriptor_row(
                     transaction,
                     {
                         "terminal_summary_ref": "payload-missing",
-                        "terminal_summary_digest": "sha256:missing",
+                        "terminal_summary_digest": missing_digest,
                     },
                 )
             )
@@ -513,24 +563,25 @@ def test_required_continuity_resolver_rejects_digest_mismatch(
                 payload_json={"content": "answer"},
             )
         )
-        with pytest.raises(HostDurableError, match="payload digest mismatch"):
+        wrong_digest = sha256_digest_bytes(b"not-the-descriptor-digest")
+        with pytest.raises(HostDurableError, match="descriptor digest mismatch"):
             store.transaction_runner.run_read(
                 lambda transaction: assistant_final_answer_continuity_text(
                     transaction,
                     {
                         "terminal_summary_ref": descriptor.payload_ref,
-                        "terminal_summary_digest": "sha256:not-the-descriptor-digest",
+                        "terminal_summary_digest": wrong_digest,
                     },
                     text_policy=PayloadTextReadPolicy.LENIENT_NON_EMPTY,
                 )
             )
-        with pytest.raises(HostDurableError, match="payload digest mismatch"):
+        with pytest.raises(HostDurableError, match="descriptor digest mismatch"):
             store.transaction_runner.run_read(
                 lambda transaction: required_assistant_final_answer_continuity_text(
                     transaction,
                     {
                         "terminal_summary_ref": descriptor.payload_ref,
-                        "terminal_summary_digest": "sha256:not-the-descriptor-digest",
+                        "terminal_summary_digest": wrong_digest,
                     },
                 )
             )
@@ -642,9 +693,9 @@ def test_continuity_resolver_rejects_non_text_descriptor_content_even_lenient(
 @pytest.mark.parametrize(
     ("payload_json", "expected_fragment"),
     (
-        (b"123", "JSON is invalid"),
-        ("{", "JSON is invalid"),
-        ("[]", "JSON must be object"),
+        (b"123", "payload text is invalid"),
+        ("{", "payload text is invalid"),
+        ("[]", "payload must be object"),
     ),
 )
 def test_required_continuity_resolver_rejects_invalid_sqlite_payload_json(
@@ -671,10 +722,11 @@ def test_required_continuity_resolver_rejects_invalid_sqlite_payload_json(
             )
         )
         assert descriptor.sqlite_payload_id is not None
-        store.transaction_runner.run_write(
-            lambda transaction: transaction.execute(
-                f"UPDATE {TABLE_SQLITE_PAYLOADS} SET payload_json = ? WHERE payload_id = ?",
-                (payload_json, descriptor.sqlite_payload_id),
+        tampered_digest = store.transaction_runner.run_write(
+            lambda transaction: _tamper_sqlite_json_payload_with_self_consistent_metadata(
+                transaction,
+                descriptor=descriptor,
+                payload_json=payload_json,
             )
         )
         with pytest.raises(HostDurableError, match=expected_fragment):
@@ -683,7 +735,7 @@ def test_required_continuity_resolver_rejects_invalid_sqlite_payload_json(
                     transaction,
                     {
                         "terminal_summary_ref": descriptor.payload_ref,
-                        "terminal_summary_digest": descriptor.payload_digest,
+                        "terminal_summary_digest": tampered_digest,
                     },
                     text_policy=PayloadTextReadPolicy.LENIENT_NON_EMPTY,
                 )
@@ -694,7 +746,7 @@ def test_required_continuity_resolver_rejects_invalid_sqlite_payload_json(
                     transaction,
                     {
                         "terminal_summary_ref": descriptor.payload_ref,
-                        "terminal_summary_digest": descriptor.payload_digest,
+                        "terminal_summary_digest": tampered_digest,
                     },
                 )
             )

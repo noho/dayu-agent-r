@@ -2541,10 +2541,9 @@ def _accepted_tool_evidence_delta_blocks(
 ) -> tuple[RunInputMaterialBlock, ...]:
     """把 ``TOOL_RESULT_ACCEPTED`` 映射为 evidence material blocks。
 
-    当 accepted evidence envelope 缺少 durable request atom 时，
-    ``tool_call_event_ref`` 会退化为当前 producer event ref。这个 ref 只用于
-    prompt-local provenance 追溯，不表示对应的 ``TOOL_CALL_REQUESTED`` event
-    一定存在。
+    accepted evidence envelope 声明 request provenance 时，必须由共享
+    accepted-result projection 证明该 ref 指向同 identity 的 canonical
+    ``TOOL_CALL_REQUESTED`` request atom；缺失或不一致一律 fail closed。
 
     :param transaction: 当前 Host transaction。
     :param event_log_store: EventLog store。
@@ -2554,17 +2553,31 @@ def _accepted_tool_evidence_delta_blocks(
     :raises HostDurableError: evidence envelope 或 raw tool payload 损坏时抛出。
     """
 
-    projection = project_accepted_tool_result(transaction, row)
+    resolved_payload = event_payload_object(
+        transaction,
+        row,
+        payload_label=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
+    )
+    projection = project_accepted_tool_result(
+        transaction,
+        row,
+        resolved_payload=resolved_payload,
+    )
     if not projection.envelope_available:
         return ()
+    tool_call_event_ref = projection.tool_call_requested_event_ref
+    if tool_call_event_ref is None:
+        raise HostDurableError(
+            "accepted evidence tool_call_requested_event_ref is missing"
+        )
+    if projection.request_arguments_json is None:
+        raise HostDurableError(
+            "accepted evidence tool call request provenance is invalid"
+        )
     if projection.evidence_id in represented_evidence_refs:
         return ()
     if projection.llm_material is None:
         raise HostDurableError("TOOL_RESULT_ACCEPTED raw_tool_outcome is missing")
-    tool_call_event_ref = projection.tool_call_requested_event_ref
-    if tool_call_event_ref is None:
-        # 缺少 request atom 时只保留本地 provenance 线索，不伪造 request event。
-        tool_call_event_ref = row.event_id
     payload_refs = tuple(
         dict.fromkeys((*projection.payload_refs, *_payload_refs_for_event(row)))
     )

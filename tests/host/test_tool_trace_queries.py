@@ -4,11 +4,30 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.engine.contracts.agent_policy import AgentPolicy
+from dayu.engine.contracts.engine_events import (
+    RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION,
+    runner_role_sequence_digest,
+)
+from dayu.engine.contracts.messages import AgentMessageRole, UserMessage
+from dayu.engine.contracts.runner_spec import (
+    ClientCorrelationPolicy,
+    RunnerCallOptions,
+    RunnerSpec,
+)
+from dayu.host._runner_call_manifest import (
+    RunnerCallHotAtoms,
+    complete_runner_call_hot_diagnostic,
+    parse_runner_call_hot_payload,
+    runner_call_hot_diagnostic_from_json,
+    runner_call_hot_payload,
+)
 from dayu.host.durable.artifact import LocalArtifactStore
 from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
@@ -16,6 +35,7 @@ from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
+    EventLogRow,
     append_event,
 )
 from dayu.host.durable.payload import (
@@ -41,11 +61,31 @@ from dayu.host.durable.tool_trace import (
     resolve_runner_call_projection_from_signal,
     resolve_tool_trace_hot_row_payloads,
 )
+from dayu.host.durable.state import (
+    AttemptRow,
+    DispatchRecordRow,
+    DispatchRecordStatus,
+    RunRow,
+    WorkerKind,
+)
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.api import AttemptDispatchSnapshot, AttemptStatus, RunStatus
+from dayu.host.queue_policy import RunQueuePolicy
+from dayu.host.run_input import (
+    CompactArtifactView,
+    CurrentRunFacts,
+    DurableRunnerCallManifestRecorder,
+    MemorySnapshotView,
+    PolicySnapshot,
+    RunnerCallManifestRecordInput,
+    SessionContinuityView,
+    ToolSchemaSnapshot,
+)
 from dayu.host.tool_trace import (
     ToolTraceSinkOptions,
     catch_up_tool_trace_projection,
 )
+from tests.host.fake_cancellation import ControllableCancellationToken
 
 _FIXED_NOW = datetime(2026, 5, 29, 3, 4, 5, tzinfo=UTC)
 _FIELD_CONTEXT_PRESSURE = "context_pressure"
@@ -58,6 +98,17 @@ _ALL_SIGNAL_FIELDS: tuple[str, ...] = (
     _FIELD_FAILURE_METADATA,
     _FIELD_PARTIAL_TOOL_CALL_SIGNAL,
 )
+
+
+class _ManifestTamperKind(StrEnum):
+    """Tool Trace full-manifest fail-closed 篡改分类。"""
+
+    INCOMPLETE = "incomplete"
+    DANGLING_METADATA_ID = "dangling_metadata_id"
+    UNKNOWN_PROJECTOR_ID = "unknown_projector_id"
+    UNKNOWN_PURPOSE = "unknown_purpose"
+    UNKNOWN_SCHEMA_VERSION = "unknown_schema_version"
+    HOT_IDENTITY_MISMATCH = "hot_identity_mismatch"
 
 
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
@@ -82,6 +133,8 @@ def _append_event(
     payload: JsonValue,
     run_id: str = "run-1",
     event_class: EventClass = EventClass.CANONICAL_FACT,
+    payload_ref: str | None = None,
+    payload_digest: str | None = None,
 ) -> None:
     """追加 Tool Trace query 测试 EventLog row。
 
@@ -91,6 +144,8 @@ def _append_event(
     :param payload: inline payload。
     :param run_id: Run id。
     :param event_class: EventLog class。
+    :param payload_ref: 可选 source descriptor ref。
+    :param payload_digest: 可选 source descriptor digest。
     :returns: ``None``。
     """
 
@@ -113,8 +168,8 @@ def _append_event(
                 policy_decision=None,
                 reason=None,
                 payload_json=payload,
-                payload_ref=None,
-                payload_digest=None,
+                payload_ref=payload_ref,
+                payload_digest=payload_digest,
             ),
         )
     )
@@ -226,6 +281,526 @@ def _write_artifact_json_payload(
         artifact_ref,
         "application/json",
         {},
+    )
+
+
+def _projector_metadata(
+    *,
+    metadata_id: str,
+    projector_id: str,
+    purpose: str,
+) -> Mapping[str, JsonValue]:
+    """构造 Tool Trace query 测试用六字段 projector metadata。
+
+    :param metadata_id: projector metadata id。
+    :param projector_id: projector id。
+    :param purpose: projector purpose。
+    :returns: 完整六字段 projector metadata JSON object。
+    :raises TypeError: 无主动抛出。
+    """
+
+    source_contract_refs: list[JsonValue] = ["contract:test-runner-call"]
+    schema_version = "run_input_projector.v1"
+    return {
+        "projector_metadata_id": metadata_id,
+        "projector_id": projector_id,
+        "projector_schema_version": schema_version,
+        "projector_digest": sha256_digest_json(
+            {
+                "projector_id": projector_id,
+                "projector_schema_version": schema_version,
+                "purpose": purpose,
+                "source_contract_refs": source_contract_refs,
+            }
+        ),
+        "purpose": purpose,
+        "source_contract_refs": source_contract_refs,
+    }
+
+
+def _full_runner_call_manifest(
+    *,
+    manifest_id: str,
+    runner_call_index: int,
+    runner_call_kind: str,
+    runner_call_trigger_reason: str,
+    roles: tuple[str, ...],
+    message_count: int | None = None,
+    role_sequence_digest: str | None = None,
+    iteration_id: str | None = None,
+    iteration_index: int | None = None,
+    projection_ref: str | None = None,
+    projection_digest: str | None = None,
+    projection_size_bytes: int | None = None,
+    diagnostic: Mapping[str, JsonValue] | None = None,
+) -> Mapping[str, JsonValue]:
+    """构造覆盖完整字段与 metadata graph 的 runner-call manifest。
+
+    :param manifest_id: manifest logical id。
+    :param runner_call_index: runner-call 顺序。
+    :param runner_call_kind: runner-call kind。
+    :param runner_call_trigger_reason: runner-call trigger reason。
+    :param roles: 实际 message entry roles。
+    :param message_count: manifest message_count；省略时等于 ``roles`` 数量。
+    :param role_sequence_digest: role digest；省略时从 ``roles`` 计算。
+    :param iteration_id: 可选 iteration id。
+    :param iteration_index: 可选 iteration index。
+    :param projection_ref: 可选 input projection ref。
+    :param projection_digest: 可选 input projection digest。
+    :param projection_size_bytes: 可选 input projection size。
+    :param diagnostic: 非 complete manifest diagnostic；complete 时为 ``None``。
+    :returns: full runner-call manifest JSON object。
+    :raises AssertionError: projection descriptor 只提供一部分时抛出。
+    """
+
+    projection_values = (projection_ref, projection_digest, projection_size_bytes)
+    assert all(value is None for value in projection_values) or all(
+        value is not None for value in projection_values
+    )
+    purpose = (
+        "tool_continuation_input"
+        if runner_call_kind == "tool_result_continuation"
+        else "ordinary_run_input"
+    )
+    projector_ids = {
+        "system": "run_input_system_context",
+        "user": "user_input_message",
+        "assistant": "assistant_history_message",
+        "tool": "tool_result_message",
+    }
+    metadata: list[JsonValue] = []
+    message_entries: list[JsonValue] = []
+    for index, role in enumerate(roles):
+        metadata_id = f"projector:{index}:{role}"
+        metadata.append(
+            _projector_metadata(
+                metadata_id=metadata_id,
+                projector_id=projector_ids[role],
+                purpose=purpose,
+            )
+        )
+        message_entries.append(
+            {
+                "index": index,
+                "role": role,
+                "content_digest": sha256_digest_json(
+                    {"manifest_id": manifest_id, "message_index": index}
+                ),
+                "content_size_bytes": index + 1,
+                "source_refs": [f"event:source:{manifest_id}:{index}"],
+                "projection_artifact_ref": projection_ref,
+                "projection_artifact_digest": projection_digest,
+                "projector_metadata_id": metadata_id,
+                "provider_tool_calls_digest": None,
+                "reasoning_content_digest": None,
+            }
+        )
+    actual_message_count = len(roles) if message_count is None else message_count
+    actual_role_digest = (
+        runner_role_sequence_digest(roles)
+        if role_sequence_digest is None
+        else role_sequence_digest
+    )
+    return {
+        "schema_version": "runner_call_input_manifest.v1",
+        "manifest_id": manifest_id,
+        "session_id": "session-1",
+        "host_run_id": "run-1",
+        "attempt_id": "attempt-1",
+        "execution_id": "execution-1",
+        "runner_call_index": runner_call_index,
+        "runner_call_kind": runner_call_kind,
+        "runner_call_trigger_reason": runner_call_trigger_reason,
+        "iteration_id": iteration_id,
+        "iteration_index": iteration_index,
+        "message_count": actual_message_count,
+        "role_sequence_digest": actual_role_digest,
+        "runner_input_serializer_schema_version": (
+            RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+        ),
+        "input_projection_digest": sha256_digest_json(
+            {"manifest_id": manifest_id, "message_count": actual_message_count}
+        ),
+        "runner_call_projection_artifact_ref": projection_ref,
+        "runner_call_projection_artifact_digest": projection_digest,
+        "runner_call_projection_artifact_size_bytes": projection_size_bytes,
+        "message_entries": message_entries,
+        "source_cursor_refs": [f"event:{manifest_id}"],
+        "tool_schema_snapshot_refs": [],
+        "memory_snapshot_cursor_ref": None,
+        "compact_artifact_refs": [],
+        "context_fallback_decision_ref": None,
+        "projector_metadata": metadata,
+        "compactor_identity": None,
+        "diagnostic": diagnostic,
+    }
+
+
+def _hot_payload_for_manifest(
+    manifest: Mapping[str, JsonValue],
+    *,
+    manifest_ref: str,
+) -> Mapping[str, JsonValue]:
+    """通过 shared producer owner 构造同源 hot payload。
+
+    :param manifest: full runner-call manifest。
+    :param manifest_ref: manifest descriptor ref。
+    :returns: exact fixed-shape hot payload。
+    :raises AssertionError: 测试 manifest 字段类型不符合 fixture contract 时抛出。
+    :raises HostDurableError: production owner 拒绝 manifest 时抛出。
+    """
+
+    diagnostic_value = manifest["diagnostic"]
+    message_count = manifest["message_count"]
+    role_digest = manifest["role_sequence_digest"]
+    assert isinstance(message_count, int) and not isinstance(message_count, bool)
+    assert isinstance(role_digest, str)
+    if diagnostic_value is None:
+        validation_status = "complete"
+        diagnostic = complete_runner_call_hot_diagnostic(
+            status=validation_status,
+            message_count=message_count,
+            role_sequence_digest=role_digest,
+            consumer_boundary="test.tool_trace_query",
+        )
+    else:
+        assert isinstance(diagnostic_value, Mapping)
+        diagnostic = runner_call_hot_diagnostic_from_json(diagnostic_value)
+        validation_status = diagnostic.status
+    projection_ref = manifest["runner_call_projection_artifact_ref"]
+    projection_digest = manifest["runner_call_projection_artifact_digest"]
+    projection_size = manifest["runner_call_projection_artifact_size_bytes"]
+    assert projection_ref is None or isinstance(projection_ref, str)
+    assert projection_digest is None or isinstance(projection_digest, str)
+    assert projection_size is None or (
+        isinstance(projection_size, int) and not isinstance(projection_size, bool)
+    )
+    return runner_call_hot_payload(
+        RunnerCallHotAtoms(
+            session_id="session-1",
+            host_run_id="run-1",
+            attempt_id="attempt-1",
+            execution_id="execution-1",
+            runner_call_index=_manifest_test_int(manifest, "runner_call_index"),
+            runner_call_kind=_manifest_test_text(manifest, "runner_call_kind"),
+            runner_call_trigger_reason=_manifest_test_text(
+                manifest,
+                "runner_call_trigger_reason",
+            ),
+            iteration_id=_manifest_test_optional_text(manifest, "iteration_id"),
+            iteration_index=_manifest_test_optional_int(
+                manifest,
+                "iteration_index",
+            ),
+            manifest_payload_ref=manifest_ref,
+            manifest_digest=sha256_digest_json(manifest),
+            manifest_schema_version=_manifest_test_text(
+                manifest,
+                "schema_version",
+            ),
+            validation_status=validation_status,
+            message_count=message_count,
+            role_sequence_digest=role_digest,
+            input_projection_digest=_manifest_test_text(
+                manifest,
+                "input_projection_digest",
+            ),
+            runner_call_projection_artifact_ref=projection_ref,
+            runner_call_projection_artifact_digest=projection_digest,
+            runner_call_projection_artifact_size_bytes=projection_size,
+            diagnostic=diagnostic,
+        ),
+        manifest=manifest,
+    )
+
+
+def _manifest_test_text(
+    manifest: Mapping[str, JsonValue],
+    field_name: str,
+) -> str:
+    """读取测试 manifest 的必填文本。
+
+    :param manifest: 测试 manifest。
+    :param field_name: 字段名。
+    :returns: 文本值。
+    :raises AssertionError: 字段不是文本时抛出。
+    """
+
+    value = manifest[field_name]
+    assert isinstance(value, str)
+    return value
+
+
+def _manifest_test_optional_text(
+    manifest: Mapping[str, JsonValue],
+    field_name: str,
+) -> str | None:
+    """读取测试 manifest 的可选文本。
+
+    :param manifest: 测试 manifest。
+    :param field_name: 字段名。
+    :returns: 文本或 ``None``。
+    :raises AssertionError: 非空值不是文本时抛出。
+    """
+
+    value = manifest[field_name]
+    assert value is None or isinstance(value, str)
+    return value
+
+
+def _manifest_test_int(
+    manifest: Mapping[str, JsonValue],
+    field_name: str,
+) -> int:
+    """读取测试 manifest 的必填整数。
+
+    :param manifest: 测试 manifest。
+    :param field_name: 字段名。
+    :returns: 整数值。
+    :raises AssertionError: 字段不是严格整数时抛出。
+    """
+
+    value = manifest[field_name]
+    assert isinstance(value, int) and not isinstance(value, bool)
+    return value
+
+
+def _manifest_test_optional_int(
+    manifest: Mapping[str, JsonValue],
+    field_name: str,
+) -> int | None:
+    """读取测试 manifest 的可选整数。
+
+    :param manifest: 测试 manifest。
+    :param field_name: 字段名。
+    :returns: 整数或 ``None``。
+    :raises AssertionError: 非空值不是严格整数时抛出。
+    """
+
+    value = manifest[field_name]
+    assert value is None or (
+        isinstance(value, int) and not isinstance(value, bool)
+    )
+    return value
+
+
+def _record_real_ordinary_runner_call_manifest(
+    transaction_runner: HostTransactionRunner,
+    *,
+    message_count: int,
+) -> None:
+    """通过 ordinary production recorder 写入真实 full manifest 与 hot event。
+
+    :param transaction_runner: Host durable transaction runner。
+    :param message_count: 实际交给 producer 的 message 数量。
+    :returns: ``None``。
+    :raises HostDurableError: production manifest owner 拒绝输入时抛出。
+    """
+
+    now = "2026-05-29T03:04:05.000000Z"
+    run = RunRow(
+        run_id="run-1",
+        session_id="session-1",
+        status=RunStatus.RUNNING,
+        client_request_id="request-runner-call-real",
+        input_event_id="event-input-real",
+        input_event_sequence=1,
+        accepted_event_id="event-run-accepted-real",
+        accepted_event_sequence=2,
+        queued_event_id=None,
+        queued_event_sequence=None,
+        started_event_id="event-run-started-real",
+        started_event_sequence=3,
+        terminal_event_id=None,
+        terminal_event_sequence=None,
+        cancel_request_event_id=None,
+        current_attempt_id="attempt-1",
+        source_run_id=None,
+        source_run_relation=None,
+        execution_target="local-default",
+        queue_policy=RunQueuePolicy.QUEUE,
+        created_at=now,
+        updated_at=now,
+        terminal_at=None,
+    )
+    attempt = AttemptRow(
+        attempt_id="attempt-1",
+        run_id=run.run_id,
+        execution_id="execution-1",
+        status=AttemptStatus.STARTING,
+        started_event_id="event-attempt-started-real",
+        started_event_sequence=4,
+        terminal_event_id=None,
+        terminal_event_sequence=None,
+        created_at=now,
+        updated_at=now,
+        terminal_at=None,
+    )
+    dispatch_record = DispatchRecordRow(
+        dispatch_record_id="dispatch-runner-call-real",
+        run_id=run.run_id,
+        attempt_id=attempt.attempt_id,
+        execution_id=attempt.execution_id,
+        status=DispatchRecordStatus.PENDING,
+        worker_kind=WorkerKind.LOCAL,
+        execution_target=run.execution_target,
+        owner_host_instance_id=None,
+        created_event_id="event-dispatch-created-real",
+        created_event_sequence=5,
+        waiting_for_lane_at=None,
+        lane_name=None,
+        lane_claim_id=None,
+        lane_owner_id=None,
+        lane_acquired_at=None,
+        dispatching_at=None,
+        worker_accepted_at=None,
+        worker_accept_event_id=None,
+        worker_accept_event_sequence=None,
+        cancelled_event_id=None,
+        cancelled_event_sequence=None,
+        created_at=now,
+        updated_at=now,
+        cancelled_at=None,
+    )
+    current_facts = CurrentRunFacts(
+        run=run,
+        attempt=attempt,
+        dispatch_record=dispatch_record,
+        user_input_event=_runner_call_source_event(
+            event_id=run.input_event_id,
+            event_type="USER_INPUT_ACCEPTED",
+            payload={"display_text": "real producer input"},
+        ),
+        run_accepted_event=_runner_call_source_event(
+            event_id=run.accepted_event_id,
+            event_type="RUN_ACCEPTED",
+            payload={},
+        ),
+        run_started_event=_runner_call_source_event(
+            event_id="event-run-started-real",
+            event_type="RUN_STARTED",
+            payload={"start_reason": "initial"},
+        ),
+        user_prompt="real producer input",
+        system_prompt=None,
+        operation_kind="prompt",
+    )
+    token = ControllableCancellationToken()
+    attempt_snapshot = AttemptDispatchSnapshot(
+        session_id=run.session_id,
+        run_id=run.run_id,
+        attempt_id=attempt.attempt_id,
+        execution_id=attempt.execution_id,
+        dispatch_record_id=dispatch_record.dispatch_record_id,
+        execution_target=run.execution_target,
+        policy_snapshot_ref="policy:runner-call-real",
+        cancellation_token=token,
+    )
+    policy_snapshot = PolicySnapshot(
+        runner_spec=RunnerSpec(
+            provider="test",
+            model="test-model",
+            endpoint="https://example.invalid/v1",
+            api_key_ref="test-key",
+            headers={},
+            client_correlation_policy=ClientCorrelationPolicy.DISABLED,
+            supports_tool_calling=False,
+            supports_streaming=False,
+            supports_stream_usage=False,
+            default_timeout_seconds=30.0,
+            max_retries=0,
+            provider_request=None,
+        ),
+        runner_options=RunnerCallOptions(
+            temperature=None,
+            max_tokens=None,
+            top_p=None,
+            stream=False,
+        ),
+        agent_policy=AgentPolicy(
+            max_iterations=1,
+            continuation_max_attempts=0,
+            allow_tool_calls=False,
+            tool_execution_timeout_seconds=1.0,
+            fallback_prompt="test fallback prompt",
+            continuation_prompt="test continuation prompt",
+        ),
+        policy_snapshot_ref="policy:runner-call-real",
+    )
+    messages = tuple(
+        UserMessage(
+            role=AgentMessageRole.USER,
+            content=f"real producer message {index}",
+        )
+        for index in range(message_count)
+    )
+    DurableRunnerCallManifestRecorder(transaction_runner).record_runner_call_manifest(
+        RunnerCallManifestRecordInput(
+            attempt_snapshot=attempt_snapshot,
+            current_facts=current_facts,
+            policy_snapshot=policy_snapshot,
+            memory=MemorySnapshotView(
+                messages=(),
+                memory_snapshot_cursor=None,
+                policy_digest=None,
+                diagnostics=(),
+            ),
+            compact=CompactArtifactView(
+                compaction_event_ref=None,
+                compact_artifact_ref=None,
+                compact_artifact_digest=None,
+            ),
+            continuity=SessionContinuityView(messages=()),
+            tool_snapshot=ToolSchemaSnapshot(
+                tool_schemas=(),
+                disable_tools=True,
+                tool_runtime_handle=None,
+            ),
+            messages=messages,
+            fallback=None,
+        )
+    )
+
+
+def _runner_call_source_event(
+    *,
+    event_id: str,
+    event_type: str,
+    payload: Mapping[str, JsonValue],
+) -> EventLogRow:
+    """构造 ordinary producer 只读 source fact。
+
+    :param event_id: source event id。
+    :param event_type: source event type。
+    :param payload: source event payload。
+    :returns: typed EventLog row。
+    :raises: 无。
+    """
+
+    now = "2026-05-29T03:04:05.000000Z"
+    return EventLogRow(
+        event_sequence=1,
+        event_id=event_id,
+        event_body_digest=sha256_digest_json(
+            {"event_id": event_id, "event_type": event_type}
+        ),
+        event_class=EventClass.CANONICAL_FACT,
+        session_id="session-1",
+        run_id="run-1",
+        attempt_id="attempt-1",
+        execution_id="execution-1",
+        event_type=event_type,
+        occurred_at=now,
+        actor="test",
+        source="test.tool_trace_queries",
+        client_request_id=None,
+        idempotency_key=None,
+        policy_decision_json=None,
+        reason_json=None,
+        payload_json=canonical_json_dumps(payload),
+        payload_ref=None,
+        payload_digest=None,
+        appended_at=now,
     )
 
 
@@ -585,102 +1160,124 @@ def test_runner_call_reconstruction_signal_query_classifies_statuses(
 ) -> None:
     """runner-call 查询 helper 返回 complete / limited_signal / mismatch typed signal。"""
 
-    manifest_digest = sha256_digest_json({"manifest": "runner-call"})
-    role_digest = sha256_digest_json({"roles": ["system", "user"]})
+    role_digest = runner_role_sequence_digest(("system", "user"))
     projection_digest = sha256_digest_json({"projection": "summary"})
-    observed_digest = sha256_digest_json({"roles": ["system", "user", "tool"]})
-    expected_digest = sha256_digest_json({"roles": ["system", "user"]})
+    observed_digest = runner_role_sequence_digest(("system", "user", "tool"))
+    expected_digest = role_digest
+    complete_manifest = _full_runner_call_manifest(
+        manifest_id="runner-call-manifest:complete",
+        runner_call_index=0,
+        runner_call_kind="initial_user_dispatch",
+        runner_call_trigger_reason="initial_user_input",
+        roles=("system", "user"),
+        projection_ref="payload-runner-call-projection-complete",
+        projection_digest=projection_digest,
+        projection_size_bytes=128,
+    )
+    limited_diagnostic: Mapping[str, JsonValue] = {
+        "status": "limited_signal",
+        "reason": "missing_projection_artifact",
+        "missing_atom_kind": None,
+        "missing_ref_kind": "artifact_ref",
+        "missing_ref": None,
+        "observed_count": 3,
+        "expected_count": None,
+        "observed_digest": observed_digest,
+        "expected_digest": None,
+        "consumer_boundary": "host.engine_ingest",
+    }
+    limited_manifest = _full_runner_call_manifest(
+        manifest_id="runner-call-manifest:limited",
+        runner_call_index=1,
+        runner_call_kind="tool_result_continuation",
+        runner_call_trigger_reason="tool_results_available",
+        roles=(),
+        message_count=3,
+        role_sequence_digest=observed_digest,
+        iteration_id="iteration-2",
+        iteration_index=1,
+        diagnostic=limited_diagnostic,
+    )
+    mismatch_diagnostic: Mapping[str, JsonValue] = {
+        "status": "mismatch",
+        "reason": "role_sequence_digest_mismatch",
+        "missing_atom_kind": None,
+        "missing_ref_kind": None,
+        "missing_ref": None,
+        "observed_count": 3,
+        "expected_count": 2,
+        "observed_digest": observed_digest,
+        "expected_digest": expected_digest,
+        "consumer_boundary": "host.engine_ingest",
+    }
+    mismatch_manifest = _full_runner_call_manifest(
+        manifest_id="runner-call-manifest:mismatch",
+        runner_call_index=2,
+        runner_call_kind="tool_result_continuation",
+        runner_call_trigger_reason="tool_results_available",
+        roles=("system", "user", "tool"),
+        iteration_id="iteration-3",
+        iteration_index=2,
+        diagnostic=mismatch_diagnostic,
+    )
+    complete_hot = _hot_payload_for_manifest(
+        complete_manifest,
+        manifest_ref="payload-runner-call-complete",
+    )
+    limited_hot = _hot_payload_for_manifest(
+        limited_manifest,
+        manifest_ref="payload-runner-call-limited",
+    )
+    mismatch_hot = _hot_payload_for_manifest(
+        mismatch_manifest,
+        manifest_ref="payload-runner-call-mismatch",
+    )
     with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: (
+                _write_json_payload(
+                    transaction,
+                    payload_ref="payload-runner-call-complete",
+                    payload_id="sqlite-runner-call-complete",
+                    payload=complete_manifest,
+                ),
+                _write_json_payload(
+                    transaction,
+                    payload_ref="payload-runner-call-limited",
+                    payload_id="sqlite-runner-call-limited",
+                    payload=limited_manifest,
+                ),
+                _write_json_payload(
+                    transaction,
+                    payload_ref="payload-runner-call-mismatch",
+                    payload_id="sqlite-runner-call-mismatch",
+                    payload=mismatch_manifest,
+                ),
+            )
+        )
         _append_event(
             store.transaction_runner,
             event_id="event-runner-call-complete",
             event_type="RUNNER_CALL_INPUT_ASSEMBLED",
-            payload={
-                "runner_call_index": 0,
-                "runner_call_kind": "initial_user_dispatch",
-                "runner_call_trigger_reason": "initial_user_input",
-                "iteration_id": "iteration-1",
-                "manifest_payload_ref": "payload-runner-call-complete",
-                "manifest_digest": manifest_digest,
-                "validation_status": "complete",
-                "message_count": 2,
-                "role_sequence_digest": role_digest,
-                "input_projection_digest": projection_digest,
-                "projector_metadata_summary": [
-                    {
-                        "projector_metadata_id": "projector:0",
-                        "projector_id": "run_input_system_context",
-                        "projector_schema_version": "run_input_projector.v1",
-                        "projector_digest": sha256_digest_json(
-                            {"projector": "system"}
-                        ),
-                        "purpose": "ordinary_run_input",
-                    }
-                ],
-                "diagnostic": None,
-            },
+            payload=complete_hot,
+            payload_ref="payload-runner-call-complete",
+            payload_digest=sha256_digest_json(complete_manifest),
         )
         _append_event(
             store.transaction_runner,
             event_id="event-runner-call-limited",
             event_type="RUNNER_CALL_INPUT_ASSEMBLED",
-            payload={
-                "runner_call_index": 1,
-                "runner_call_kind": "tool_result_continuation",
-                "runner_call_trigger_reason": "tool_results_available",
-                "manifest_payload_ref": "payload-runner-call-limited",
-                "manifest_digest": sha256_digest_json({"manifest": "limited"}),
-                "validation_status": "limited_signal",
-                "message_count": 3,
-                "role_sequence_digest": observed_digest,
-                "input_projection_digest": sha256_digest_json(
-                    {"projection": "limited"}
-                ),
-                "projector_metadata_summary": [],
-                "diagnostic": {
-                    "status": "limited_signal",
-                    "reason": "missing_projection_artifact",
-                    "missing_atom_kind": None,
-                    "missing_ref_kind": "runner_call_projection_artifact",
-                    "missing_ref": None,
-                    "observed_count": 3,
-                    "expected_count": None,
-                    "observed_digest": observed_digest,
-                    "expected_digest": None,
-                    "consumer_boundary": "host.engine_ingest",
-                },
-            },
+            payload=limited_hot,
+            payload_ref="payload-runner-call-limited",
+            payload_digest=sha256_digest_json(limited_manifest),
         )
         _append_event(
             store.transaction_runner,
             event_id="event-runner-call-mismatch",
             event_type="RUNNER_CALL_INPUT_ASSEMBLED",
-            payload={
-                "runner_call_index": 2,
-                "runner_call_kind": "tool_result_continuation",
-                "runner_call_trigger_reason": "tool_results_available",
-                "manifest_payload_ref": "payload-runner-call-mismatch",
-                "manifest_digest": sha256_digest_json({"manifest": "mismatch"}),
-                "validation_status": "mismatch",
-                "message_count": 3,
-                "role_sequence_digest": observed_digest,
-                "input_projection_digest": sha256_digest_json(
-                    {"projection": "mismatch"}
-                ),
-                "projector_metadata_summary": [],
-                "diagnostic": {
-                    "status": "mismatch",
-                    "reason": "role_sequence_digest_mismatch",
-                    "missing_atom_kind": None,
-                    "missing_ref_kind": None,
-                    "missing_ref": None,
-                    "observed_count": 3,
-                    "expected_count": 2,
-                    "observed_digest": observed_digest,
-                    "expected_digest": expected_digest,
-                    "consumer_boundary": "host.engine_ingest",
-                },
-            },
+            payload=mismatch_hot,
+            payload_ref="payload-runner-call-mismatch",
+            payload_digest=sha256_digest_json(mismatch_manifest),
         )
         _catch_up(store.transaction_runner, tmp_path)
 
@@ -723,6 +1320,132 @@ def test_runner_call_reconstruction_signal_query_classifies_statuses(
         )
         assert mismatch.diagnostic.observed_digest == observed_digest
         assert mismatch.diagnostic.expected_digest == expected_digest
+
+
+def test_runner_call_query_reconstructs_three_hundred_projector_summaries(
+    tmp_path: Path,
+) -> None:
+    """Tool Trace 从 verified descriptor 恢复 300 条五字段 metadata summary。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: descriptor 无法解析、summary 丢失或字段错位时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        _record_real_ordinary_runner_call_manifest(
+            store.transaction_runner,
+            message_count=300,
+        )
+        _catch_up(store.transaction_runner, tmp_path)
+
+        page = store.transaction_runner.run_read(
+            lambda transaction: read_runner_call_reconstruction_signals_by_run(
+                transaction,
+                "run-1",
+                after_event_sequence=0,
+                limit=10,
+            )
+        )
+
+        assert len(page.signals) == 1
+        summaries = page.signals[0].projector_metadata_summary
+        assert len(summaries) == 300
+        assert summaries[0].projector_metadata_id == "projector:0:user"
+        assert summaries[-1].projector_metadata_id == "projector:299:user"
+        assert all(
+            summary.projector_schema_version == "run_input_projector.v1"
+            and summary.purpose == "ordinary_run_input"
+            for summary in summaries
+        )
+        assert summaries[-1].projector_id == "user_input_message"
+
+
+@pytest.mark.parametrize("tamper_kind", tuple(_ManifestTamperKind))
+def test_runner_call_query_rejects_invalid_full_manifest_graph(
+    tmp_path: Path,
+    tamper_kind: _ManifestTamperKind,
+) -> None:
+    """Tool Trace 只从完整 typed manifest 图投影 metadata summary。
+
+    :param tmp_path: pytest 临时目录。
+    :param tamper_kind: schema、graph、enum 或 hot identity 篡改分类。
+    :returns: ``None``。
+    :raises AssertionError: 无效 manifest 被 Tool Trace 查询接受时抛出。
+    """
+
+    projection_digest = sha256_digest_json({"projection": "manifest-graph"})
+    base_manifest = _full_runner_call_manifest(
+        manifest_id="runner-call-manifest:graph-validation",
+        runner_call_index=0,
+        runner_call_kind="initial_user_dispatch",
+        runner_call_trigger_reason="initial_user_input",
+        roles=("system", "user"),
+        projection_ref="payload-projection-graph-validation",
+        projection_digest=projection_digest,
+        projection_size_bytes=128,
+    )
+    manifest: dict[str, JsonValue] = dict(base_manifest)
+    if tamper_kind is _ManifestTamperKind.INCOMPLETE:
+        del manifest["message_entries"]
+    elif tamper_kind is _ManifestTamperKind.DANGLING_METADATA_ID:
+        entries = list(_json_object_sequence(manifest["message_entries"]))
+        first_entry = dict(entries[0])
+        first_entry["projector_metadata_id"] = "projector:missing"
+        manifest["message_entries"] = [first_entry, *entries[1:]]
+    elif tamper_kind in (
+        _ManifestTamperKind.UNKNOWN_PROJECTOR_ID,
+        _ManifestTamperKind.UNKNOWN_PURPOSE,
+    ):
+        metadata = list(_json_object_sequence(manifest["projector_metadata"]))
+        first_metadata = dict(metadata[0])
+        if tamper_kind is _ManifestTamperKind.UNKNOWN_PROJECTOR_ID:
+            first_metadata["projector_id"] = "unknown_projector"
+        else:
+            first_metadata["purpose"] = "unknown_purpose"
+        manifest["projector_metadata"] = [first_metadata, *metadata[1:]]
+    elif tamper_kind is _ManifestTamperKind.UNKNOWN_SCHEMA_VERSION:
+        manifest["schema_version"] = "runner_call_input_manifest.unknown"
+    hot_payload: dict[str, JsonValue] = dict(
+        _hot_payload_for_manifest(
+            base_manifest,
+            manifest_ref="payload-manifest-graph-validation",
+        )
+    )
+    if tamper_kind is _ManifestTamperKind.HOT_IDENTITY_MISMATCH:
+        hot_payload["runner_call_index"] = 1
+    else:
+        hot_payload["manifest_digest"] = sha256_digest_json(manifest)
+    manifest_digest = sha256_digest_json(manifest)
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: _write_json_payload(
+                transaction,
+                payload_ref="payload-manifest-graph-validation",
+                payload_id="sqlite-manifest-graph-validation",
+                payload=manifest,
+            )
+        )
+        _append_event(
+            store.transaction_runner,
+            event_id=f"event-runner-call-graph-{tamper_kind.value}",
+            event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+            payload=hot_payload,
+            payload_ref="payload-manifest-graph-validation",
+            payload_digest=manifest_digest,
+        )
+        _catch_up(store.transaction_runner, tmp_path)
+
+        with pytest.raises(HostDurableError):
+            store.transaction_runner.run_read(
+                lambda transaction: read_runner_call_reconstruction_signals_by_run(
+                    transaction,
+                    "run-1",
+                    after_event_sequence=0,
+                    limit=10,
+                )
+            )
 
 
 def test_runner_call_projection_resolver_reads_manifest_projection_and_schema(
@@ -772,16 +1495,30 @@ def test_runner_call_projection_resolver_reads_manifest_projection_and_schema(
     }
     projection_digest = sha256_digest_json(projection_payload)
     schema_digest = sha256_digest_json(schema_payload)
-    manifest_payload: Mapping[str, JsonValue] = {
-        "schema_version": "runner_call_input_manifest.v1",
-        "runner_call_projection_artifact_ref": "payload-projection",
-        "runner_call_projection_artifact_digest": projection_digest,
-        "tool_schema_snapshot_refs": [
-            "tool_schema_snapshot_ref:payload-schema",
-            "tool_schema_snapshot_digest:" + schema_digest,
-        ],
-    }
+    manifest_value = dict(
+        _full_runner_call_manifest(
+            manifest_id="runner-call-manifest:resolvable",
+            runner_call_index=0,
+            runner_call_kind="initial_user_dispatch",
+            runner_call_trigger_reason="initial_user_input",
+            roles=("system", "user"),
+            projection_ref="payload-projection",
+            projection_digest=projection_digest,
+            projection_size_bytes=len(
+                canonical_json_dumps(projection_payload).encode("utf-8")
+            ),
+        )
+    )
+    manifest_value["tool_schema_snapshot_refs"] = [
+        "tool_schema_snapshot_ref:payload-schema",
+        "tool_schema_snapshot_digest:" + schema_digest,
+    ]
+    manifest_payload: Mapping[str, JsonValue] = manifest_value
     manifest_digest = sha256_digest_json(manifest_payload)
+    hot_payload = _hot_payload_for_manifest(
+        manifest_payload,
+        manifest_ref="payload-manifest",
+    )
     with open_host_durable_store(_options(tmp_path)) as store:
         store.transaction_runner.run_write(
             lambda transaction: (
@@ -809,25 +1546,9 @@ def test_runner_call_projection_resolver_reads_manifest_projection_and_schema(
             store.transaction_runner,
             event_id="event-runner-call-resolvable",
             event_type="RUNNER_CALL_INPUT_ASSEMBLED",
-            payload={
-                "runner_call_index": 0,
-                "runner_call_kind": "initial_user_dispatch",
-                "runner_call_trigger_reason": "initial_user_input",
-                "manifest_payload_ref": "payload-manifest",
-                "manifest_digest": manifest_digest,
-                "validation_status": "complete",
-                "message_count": 2,
-                "role_sequence_digest": sha256_digest_json(
-                    {"roles": ["system", "user"]}
-                ),
-                "input_projection_digest": sha256_digest_json(
-                    {"projection": "summary"}
-                ),
-                "projector_metadata_summary": [],
-                "runner_call_projection_artifact_ref": "payload-projection",
-                "runner_call_projection_artifact_digest": projection_digest,
-                "diagnostic": None,
-            },
+            payload=hot_payload,
+            payload_ref="payload-manifest",
+            payload_digest=manifest_digest,
         )
         _catch_up(store.transaction_runner, tmp_path)
 
@@ -872,13 +1593,23 @@ def test_runner_call_projection_resolver_reads_artifact_projection_payload(
         ],
     }
     projection_digest = sha256_digest_json(projection_payload)
-    manifest_payload: Mapping[str, JsonValue] = {
-        "schema_version": "runner_call_input_manifest.v1",
-        "runner_call_projection_artifact_ref": "payload-artifact-projection",
-        "runner_call_projection_artifact_digest": projection_digest,
-        "tool_schema_snapshot_refs": [],
-    }
+    manifest_payload = _full_runner_call_manifest(
+        manifest_id="runner-call-manifest:artifact-projection",
+        runner_call_index=0,
+        runner_call_kind="initial_user_dispatch",
+        runner_call_trigger_reason="initial_user_input",
+        roles=("user",),
+        projection_ref="payload-artifact-projection",
+        projection_digest=projection_digest,
+        projection_size_bytes=len(
+            canonical_json_dumps(projection_payload).encode("utf-8")
+        ),
+    )
     manifest_digest = sha256_digest_json(manifest_payload)
+    hot_payload = _hot_payload_for_manifest(
+        manifest_payload,
+        manifest_ref="payload-artifact-manifest",
+    )
     with open_host_durable_store(_options(tmp_path)) as store:
         store.transaction_runner.run_write(
             lambda transaction: (
@@ -899,25 +1630,9 @@ def test_runner_call_projection_resolver_reads_artifact_projection_payload(
             store.transaction_runner,
             event_id="event-runner-call-artifact-projection",
             event_type="RUNNER_CALL_INPUT_ASSEMBLED",
-            payload={
-                "runner_call_index": 0,
-                "runner_call_kind": "initial_user_dispatch",
-                "runner_call_trigger_reason": "initial_user_input",
-                "manifest_payload_ref": "payload-artifact-manifest",
-                "manifest_digest": manifest_digest,
-                "validation_status": "complete",
-                "message_count": 1,
-                "role_sequence_digest": sha256_digest_json({"roles": ["user"]}),
-                "input_projection_digest": sha256_digest_json(
-                    {"projection": "artifact"}
-                ),
-                "projector_metadata_summary": [],
-                "runner_call_projection_artifact_ref": (
-                    "payload-artifact-projection"
-                ),
-                "runner_call_projection_artifact_digest": projection_digest,
-                "diagnostic": {"status": "complete"},
-            },
+            payload=hot_payload,
+            payload_ref="payload-artifact-manifest",
+            payload_digest=manifest_digest,
         )
         _catch_up(store.transaction_runner, tmp_path)
 
@@ -941,44 +1656,30 @@ def test_runner_call_projection_resolver_reads_artifact_projection_payload(
         )
 
 
-def test_runner_call_projection_resolver_fails_closed_for_missing_manifest_ref(
-    tmp_path: Path,
-) -> None:
-    """runner-call signal 缺 manifest ref 时 resolver fail closed。"""
+def test_runner_call_hot_owner_fails_closed_for_missing_manifest_ref() -> None:
+    """runner-call hot payload 缺 manifest ref 时在 shared owner fail closed。
 
-    with open_host_durable_store(_options(tmp_path)) as store:
-        _append_event(
-            store.transaction_runner,
-            event_id="event-runner-call-no-manifest",
-            event_type="RUNNER_CALL_INPUT_ASSEMBLED",
-            payload={
-                "runner_call_index": 0,
-                "runner_call_kind": "initial_user_dispatch",
-                "runner_call_trigger_reason": "initial_user_input",
-                "validation_status": "complete",
-                "message_count": 1,
-                "role_sequence_digest": sha256_digest_json({"roles": ["user"]}),
-                "input_projection_digest": sha256_digest_json(
-                    {"projection": "missing-manifest"}
-                ),
-                "projector_metadata_summary": [],
-                "diagnostic": {"status": "complete"},
-            },
+    :returns: ``None``。
+    :raises AssertionError: incomplete hot payload 被接受时抛出。
+    """
+
+    manifest = _full_runner_call_manifest(
+        manifest_id="runner-call-manifest:missing-ref",
+        runner_call_index=0,
+        runner_call_kind="initial_user_dispatch",
+        runner_call_trigger_reason="initial_user_input",
+        roles=("user",),
+    )
+    payload = dict(
+        _hot_payload_for_manifest(
+            manifest,
+            manifest_ref="payload-manifest-required",
         )
-        _catch_up(store.transaction_runner, tmp_path)
+    )
+    del payload["manifest_payload_ref"]
 
-        page = store.transaction_runner.run_read(
-            lambda transaction: read_runner_call_reconstruction_signals_by_run(
-                transaction, "run-1", after_event_sequence=0, limit=10
-            )
-        )
-
-        with pytest.raises(HostDurableError, match="no manifest_ref"):
-            store.transaction_runner.run_read(
-                lambda transaction: resolve_runner_call_projection_from_signal(
-                    transaction, page.signals[0]
-                )
-            )
+    with pytest.raises(HostDurableError, match="hot payload fields mismatch"):
+        parse_runner_call_hot_payload(payload)
 
 
 def test_runner_call_projection_resolver_fails_closed_for_digest_mismatch(
@@ -988,14 +1689,24 @@ def test_runner_call_projection_resolver_fails_closed_for_digest_mismatch(
 
     projection_payload: Mapping[str, JsonValue] = {"messages": []}
     projection_digest = sha256_digest_json(projection_payload)
-    manifest_payload: Mapping[str, JsonValue] = {
-        "runner_call_projection_artifact_ref": "payload-projection-mismatch",
-        "runner_call_projection_artifact_digest": sha256_digest_json(
-            {"projection": "wrong"}
+    wrong_projection_digest = sha256_digest_json({"projection": "wrong"})
+    manifest_payload = _full_runner_call_manifest(
+        manifest_id="runner-call-manifest:projection-digest-mismatch",
+        runner_call_index=0,
+        runner_call_kind="initial_user_dispatch",
+        runner_call_trigger_reason="initial_user_input",
+        roles=(),
+        projection_ref="payload-projection-mismatch",
+        projection_digest=wrong_projection_digest,
+        projection_size_bytes=len(
+            canonical_json_dumps(projection_payload).encode("utf-8")
         ),
-        "tool_schema_snapshot_refs": [],
-    }
+    )
     manifest_digest = sha256_digest_json(manifest_payload)
+    hot_payload = _hot_payload_for_manifest(
+        manifest_payload,
+        manifest_ref="payload-manifest-mismatch",
+    )
     with open_host_durable_store(_options(tmp_path)) as store:
         store.transaction_runner.run_write(
             lambda transaction: (
@@ -1017,18 +1728,9 @@ def test_runner_call_projection_resolver_fails_closed_for_digest_mismatch(
             store.transaction_runner,
             event_id="event-runner-call-digest-mismatch",
             event_type="RUNNER_CALL_INPUT_ASSEMBLED",
-            payload={
-                "manifest_payload_ref": "payload-manifest-mismatch",
-                "manifest_digest": manifest_digest,
-                "validation_status": "complete",
-                "message_count": 0,
-                "role_sequence_digest": sha256_digest_json({"roles": []}),
-                "input_projection_digest": sha256_digest_json(
-                    {"projection": "digest-mismatch"}
-                ),
-                "projector_metadata_summary": [],
-                "diagnostic": {"status": "complete"},
-            },
+            payload=hot_payload,
+            payload_ref="payload-manifest-mismatch",
+            payload_digest=manifest_digest,
         )
         _catch_up(store.transaction_runner, tmp_path)
         page = store.transaction_runner.run_read(
@@ -1052,12 +1754,23 @@ def test_runner_call_projection_resolver_fails_closed_for_non_object_payload(
 
     projection_payload: JsonValue = ["not", "object"]
     projection_digest = sha256_digest_json(projection_payload)
-    manifest_payload: Mapping[str, JsonValue] = {
-        "runner_call_projection_artifact_ref": "payload-projection-list",
-        "runner_call_projection_artifact_digest": projection_digest,
-        "tool_schema_snapshot_refs": [],
-    }
+    manifest_payload = _full_runner_call_manifest(
+        manifest_id="runner-call-manifest:projection-non-object",
+        runner_call_index=0,
+        runner_call_kind="initial_user_dispatch",
+        runner_call_trigger_reason="initial_user_input",
+        roles=(),
+        projection_ref="payload-projection-list",
+        projection_digest=projection_digest,
+        projection_size_bytes=len(
+            canonical_json_dumps(projection_payload).encode("utf-8")
+        ),
+    )
     manifest_digest = sha256_digest_json(manifest_payload)
+    hot_payload = _hot_payload_for_manifest(
+        manifest_payload,
+        manifest_ref="payload-manifest-list",
+    )
     with open_host_durable_store(_options(tmp_path)) as store:
         store.transaction_runner.run_write(
             lambda transaction: (
@@ -1079,18 +1792,9 @@ def test_runner_call_projection_resolver_fails_closed_for_non_object_payload(
             store.transaction_runner,
             event_id="event-runner-call-non-object",
             event_type="RUNNER_CALL_INPUT_ASSEMBLED",
-            payload={
-                "manifest_payload_ref": "payload-manifest-list",
-                "manifest_digest": manifest_digest,
-                "validation_status": "complete",
-                "message_count": 0,
-                "role_sequence_digest": sha256_digest_json({"roles": []}),
-                "input_projection_digest": sha256_digest_json(
-                    {"projection": "non-object"}
-                ),
-                "projector_metadata_summary": [],
-                "diagnostic": {"status": "complete"},
-            },
+            payload=hot_payload,
+            payload_ref="payload-manifest-list",
+            payload_digest=manifest_digest,
         )
         _catch_up(store.transaction_runner, tmp_path)
         page = store.transaction_runner.run_read(

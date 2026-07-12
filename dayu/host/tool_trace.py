@@ -15,6 +15,11 @@ from pathlib import Path
 from typing import cast
 
 from dayu.contracts.json_value import JsonValue
+from dayu.host._runner_call_manifest import (
+    RunnerCallHotAtoms,
+    RunnerCallHotDiagnostic,
+    parse_runner_call_hot_payload,
+)
 from dayu.host.durable.codec import (
     canonical_json_dumps,
     format_utc_timestamp,
@@ -24,11 +29,6 @@ from dayu.host.durable.codec import (
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import EventClass, EventLogRow, read_event_by_id
 from dayu.host.durable.tool_trace import (
-    RunnerCallReconstructionConsumerBoundary,
-    RunnerCallReconstructionDiagnosticReason,
-    RunnerCallReconstructionMissingAtomKind,
-    RunnerCallReconstructionMissingRefKind,
-    RunnerCallReconstructionStatus,
     ToolTraceHotRow,
     ToolTraceHotRowWriteStatus,
     insert_tool_trace_hot_row_if_absent,
@@ -176,8 +176,6 @@ _FIELD_RUNNER_CALL_PROJECTION_DIGEST = "runner_call_projection_artifact_digest"
 _FIELD_RUNNER_CALL_PROJECTION_SIZE_BYTES = (
     "runner_call_projection_artifact_size_bytes"
 )
-_FIELD_PROJECTOR_METADATA_SUMMARY = "projector_metadata_summary"
-_FIELD_VALIDATION_STATUS = "validation_status"
 _FIELD_DIAGNOSTIC = "diagnostic"
 _FIELD_REASON = "reason"
 _FIELD_MISSING_ATOM_KIND = "missing_atom_kind"
@@ -188,20 +186,13 @@ _FIELD_EXPECTED_COUNT = "expected_count"
 _FIELD_OBSERVED_DIGEST = "observed_digest"
 _FIELD_EXPECTED_DIGEST = "expected_digest"
 _FIELD_CONSUMER_BOUNDARY = "consumer_boundary"
-_FIELD_PROJECTOR_METADATA_ID = "projector_metadata_id"
-_FIELD_PROJECTOR_ID = "projector_id"
-_FIELD_PROJECTOR_SCHEMA_VERSION = "projector_schema_version"
-_FIELD_PROJECTOR_DIGEST = "projector_digest"
-_FIELD_PURPOSE = "purpose"
 _CONTEXT_PRESSURE_STATUS_COMPACTION_FAILED = "compaction_failed"
 _CONTEXT_PRESSURE_STATUS_COMPACTION_ATTEMPT_REJECTED = (
     "compaction_attempt_rejected"
 )
 _PARTIAL_ARGUMENTS_SHA256_HEX_LENGTH = 64
 _LOWER_HEX_CHARS = frozenset("0123456789abcdef")
-_PRODUCER_MISSING_REF_KIND_RUNNER_CALL_PROJECTION_ARTIFACT = (
-    "runner_call_projection_artifact"
-)
+_RUNNER_CALL_TOOL_TRACE_CONSUMER_BOUNDARY = "tool_trace_query"
 _OPERATION_CONTEXT_REF_FIELDS: tuple[str, ...] = (
     "operation_name",
     "operation_kind",
@@ -676,13 +667,11 @@ def _extract_runner_call_trace(event: ProjectionEventView) -> _ToolTraceExtract:
     :raises HostDurableError: runner-call signal 字段类型非法时抛出。
     """
 
-    payload = event.payload
-    manifest_ref = _optional_text(payload, _FIELD_MANIFEST_PAYLOAD_REF)
-    manifest_digest = _optional_text(payload, _FIELD_MANIFEST_DIGEST)
-    diagnostic_refs = tuple(
-        ref for ref in (manifest_ref, manifest_digest) if ref is not None
-    )
-    summary = _runner_call_trace_summary(event)
+    hot_payload = parse_runner_call_hot_payload(event.payload)
+    manifest_ref = hot_payload.manifest_payload_ref
+    manifest_digest = hot_payload.manifest_digest
+    diagnostic_refs = (manifest_ref, manifest_digest)
+    summary = _runner_call_trace_summary(event, hot_payload)
     return _ToolTraceExtract(
         tool_call_id=None,
         tool_name=None,
@@ -699,236 +688,66 @@ def _extract_runner_call_trace(event: ProjectionEventView) -> _ToolTraceExtract:
     )
 
 
-def _runner_call_trace_summary(event: ProjectionEventView) -> Mapping[str, JsonValue]:
+def _runner_call_trace_summary(
+    event: ProjectionEventView,
+    hot_payload: RunnerCallHotAtoms,
+) -> Mapping[str, JsonValue]:
     """构造 Tool Trace runner-call signal summary。
 
     :param event: typed projection event view。
+    :param hot_payload: shared owner 已校验的 typed hot atoms。
     :returns: runner-call signal summary。
-    :raises HostDurableError: payload 字段类型非法时抛出。
+    :raises: 无。
     """
 
-    payload = event.payload
     return {
         "event_type": event.event_type,
-        _FIELD_RUNNER_CALL_INDEX: _optional_int(payload, _FIELD_RUNNER_CALL_INDEX),
-        _FIELD_RUNNER_CALL_KIND: _optional_text(payload, _FIELD_RUNNER_CALL_KIND),
-        _FIELD_RUNNER_CALL_TRIGGER_REASON: _optional_text(
-            payload, _FIELD_RUNNER_CALL_TRIGGER_REASON
+        _FIELD_RUNNER_CALL_INDEX: hot_payload.runner_call_index,
+        _FIELD_RUNNER_CALL_KIND: hot_payload.runner_call_kind,
+        _FIELD_RUNNER_CALL_TRIGGER_REASON: (
+            hot_payload.runner_call_trigger_reason
         ),
-        "iteration_id": _optional_text(payload, "iteration_id"),
-        "manifest_ref": _optional_text(payload, _FIELD_MANIFEST_PAYLOAD_REF),
-        _FIELD_MANIFEST_DIGEST: _optional_text(payload, _FIELD_MANIFEST_DIGEST),
-        _FIELD_MESSAGE_COUNT: _optional_int(payload, _FIELD_MESSAGE_COUNT),
-        _FIELD_ROLE_SEQUENCE_DIGEST: _optional_text(
-            payload, _FIELD_ROLE_SEQUENCE_DIGEST
+        "iteration_id": hot_payload.iteration_id,
+        "manifest_ref": hot_payload.manifest_payload_ref,
+        _FIELD_MANIFEST_DIGEST: hot_payload.manifest_digest,
+        _FIELD_MESSAGE_COUNT: hot_payload.message_count,
+        _FIELD_ROLE_SEQUENCE_DIGEST: hot_payload.role_sequence_digest,
+        _FIELD_INPUT_PROJECTION_DIGEST: hot_payload.input_projection_digest,
+        _FIELD_RUNNER_CALL_PROJECTION_REF: (
+            hot_payload.runner_call_projection_artifact_ref
         ),
-        _FIELD_INPUT_PROJECTION_DIGEST: _optional_text(
-            payload, _FIELD_INPUT_PROJECTION_DIGEST
+        _FIELD_RUNNER_CALL_PROJECTION_DIGEST: (
+            hot_payload.runner_call_projection_artifact_digest
         ),
-        _FIELD_RUNNER_CALL_PROJECTION_REF: _optional_text(
-            payload, _FIELD_RUNNER_CALL_PROJECTION_REF
+        _FIELD_RUNNER_CALL_PROJECTION_SIZE_BYTES: (
+            hot_payload.runner_call_projection_artifact_size_bytes
         ),
-        _FIELD_RUNNER_CALL_PROJECTION_DIGEST: _optional_text(
-            payload, _FIELD_RUNNER_CALL_PROJECTION_DIGEST
-        ),
-        _FIELD_RUNNER_CALL_PROJECTION_SIZE_BYTES: _optional_int(
-            payload, _FIELD_RUNNER_CALL_PROJECTION_SIZE_BYTES
-        ),
-        _FIELD_PROJECTOR_METADATA_SUMMARY: list(
-            _runner_call_projector_metadata_summary(payload)
-        ),
-        _FIELD_DIAGNOSTIC: _runner_call_diagnostic(payload),
+        _FIELD_DIAGNOSTIC: _runner_call_diagnostic(hot_payload.diagnostic),
     }
 
 
 def _runner_call_diagnostic(
-    payload: Mapping[str, JsonValue]
+    diagnostic: RunnerCallHotDiagnostic,
 ) -> Mapping[str, JsonValue]:
-    """从 runner-call canonical payload 读取 typed diagnostic。
+    """把 owner 已校验 diagnostic 投影到 Tool Trace 查询边界。
 
-    :param payload: RUNNER_CALL_INPUT_ASSEMBLED hot payload。
+    :param diagnostic: shared owner 已校验的 hot diagnostic。
     :returns: Tool Trace consumer boundary 下的 diagnostic summary。
-    :raises HostDurableError: 非 complete signal 缺少 typed diagnostic 时抛出。
+    :raises: 无。
     """
 
-    status = _runner_call_status(
-        _required_text(payload, _FIELD_VALIDATION_STATUS),
-        field_name=_FIELD_VALIDATION_STATUS,
-    )
-    diagnostic = payload.get(_FIELD_DIAGNOSTIC)
-    if status is RunnerCallReconstructionStatus.COMPLETE:
-        return {
-            "status": status.value,
-            _FIELD_REASON: None,
-            _FIELD_MISSING_ATOM_KIND: None,
-            _FIELD_MISSING_REF_KIND: None,
-            _FIELD_MISSING_REF: None,
-            _FIELD_OBSERVED_COUNT: None,
-            _FIELD_EXPECTED_COUNT: None,
-            _FIELD_OBSERVED_DIGEST: None,
-            _FIELD_EXPECTED_DIGEST: None,
-            _FIELD_CONSUMER_BOUNDARY: (
-                RunnerCallReconstructionConsumerBoundary.TOOL_TRACE_QUERY.value
-            ),
-        }
-    if not isinstance(diagnostic, Mapping):
-        raise HostDurableError("runner-call diagnostic must be object")
-    diagnostic_mapping = cast(Mapping[str, JsonValue], diagnostic)
-    diagnostic_status = _runner_call_status(
-        _required_text(diagnostic_mapping, "status"),
-        field_name="diagnostic.status",
-    )
-    if diagnostic_status is not status:
-        raise HostDurableError("runner-call diagnostic status mismatch")
-    reason = _runner_call_reason(
-        _required_text(diagnostic_mapping, _FIELD_REASON),
-        field_name="diagnostic.reason",
-    )
     return {
-        "status": diagnostic_status.value,
-        _FIELD_REASON: reason.value,
-        _FIELD_MISSING_ATOM_KIND: _optional_runner_call_missing_atom_kind(
-            diagnostic_mapping, _FIELD_MISSING_ATOM_KIND
-        ),
-        _FIELD_MISSING_REF_KIND: _optional_runner_call_missing_ref_kind(
-            diagnostic_mapping, _FIELD_MISSING_REF_KIND
-        ),
-        _FIELD_MISSING_REF: _optional_text(diagnostic_mapping, _FIELD_MISSING_REF),
-        _FIELD_OBSERVED_COUNT: _optional_int(
-            diagnostic_mapping, _FIELD_OBSERVED_COUNT
-        ),
-        _FIELD_EXPECTED_COUNT: _optional_int(
-            diagnostic_mapping, _FIELD_EXPECTED_COUNT
-        ),
-        _FIELD_OBSERVED_DIGEST: _optional_text(
-            diagnostic_mapping, _FIELD_OBSERVED_DIGEST
-        ),
-        _FIELD_EXPECTED_DIGEST: _optional_text(
-            diagnostic_mapping, _FIELD_EXPECTED_DIGEST
-        ),
-        _FIELD_CONSUMER_BOUNDARY: (
-            RunnerCallReconstructionConsumerBoundary.TOOL_TRACE_QUERY.value
-        ),
+        "status": diagnostic.status,
+        _FIELD_REASON: diagnostic.reason,
+        _FIELD_MISSING_ATOM_KIND: diagnostic.missing_atom_kind,
+        _FIELD_MISSING_REF_KIND: diagnostic.missing_ref_kind,
+        _FIELD_MISSING_REF: diagnostic.missing_ref,
+        _FIELD_OBSERVED_COUNT: diagnostic.observed_count,
+        _FIELD_EXPECTED_COUNT: diagnostic.expected_count,
+        _FIELD_OBSERVED_DIGEST: diagnostic.observed_digest,
+        _FIELD_EXPECTED_DIGEST: diagnostic.expected_digest,
+        _FIELD_CONSUMER_BOUNDARY: _RUNNER_CALL_TOOL_TRACE_CONSUMER_BOUNDARY,
     }
-
-
-def _runner_call_projector_metadata_summary(
-    payload: Mapping[str, JsonValue],
-) -> tuple[Mapping[str, JsonValue], ...]:
-    """读取并裁剪 runner-call projector metadata summary。
-
-    :param payload: RUNNER_CALL_INPUT_ASSEMBLED hot payload。
-    :returns: 只含 projector metadata 摘要字段的 JSON object 元组。
-    :raises HostDurableError: projector metadata summary 类型非法时抛出。
-    """
-
-    value = payload.get(_FIELD_PROJECTOR_METADATA_SUMMARY)
-    if value is None:
-        return ()
-    if not isinstance(value, list):
-        raise HostDurableError(
-            "runner-call projector_metadata_summary must be JSON array"
-        )
-    items: list[Mapping[str, JsonValue]] = []
-    for item in value:
-        if not isinstance(item, Mapping):
-            raise HostDurableError("runner-call projector metadata item must be object")
-        item_mapping = cast(Mapping[str, JsonValue], item)
-        items.append(
-            {
-                _FIELD_PROJECTOR_METADATA_ID: _required_text(
-                    item_mapping, _FIELD_PROJECTOR_METADATA_ID
-                ),
-                _FIELD_PROJECTOR_ID: _required_text(
-                    item_mapping, _FIELD_PROJECTOR_ID
-                ),
-                _FIELD_PROJECTOR_SCHEMA_VERSION: _required_text(
-                    item_mapping, _FIELD_PROJECTOR_SCHEMA_VERSION
-                ),
-                _FIELD_PROJECTOR_DIGEST: _required_text(
-                    item_mapping, _FIELD_PROJECTOR_DIGEST
-                ),
-                _FIELD_PURPOSE: _required_text(item_mapping, _FIELD_PURPOSE),
-            }
-        )
-    return tuple(items)
-
-
-def _runner_call_status(
-    value: str, *, field_name: str
-) -> RunnerCallReconstructionStatus:
-    """校验 runner-call reconstruction status。
-
-    :param value: status 文本。
-    :param field_name: 错误消息字段名。
-    :returns: status enum。
-    :raises HostDurableError: status 不在封闭枚举内时抛出。
-    """
-
-    try:
-        return RunnerCallReconstructionStatus(value)
-    except ValueError as exc:
-        raise HostDurableError(f"runner-call {field_name} is unsupported") from exc
-
-
-def _runner_call_reason(
-    value: str, *, field_name: str
-) -> RunnerCallReconstructionDiagnosticReason:
-    """校验 runner-call reconstruction diagnostic reason。
-
-    :param value: reason 文本。
-    :param field_name: 错误消息字段名。
-    :returns: reason enum。
-    :raises HostDurableError: reason 不在封闭枚举内时抛出。
-    """
-
-    try:
-        return RunnerCallReconstructionDiagnosticReason(value)
-    except ValueError as exc:
-        raise HostDurableError(f"runner-call {field_name} is unsupported") from exc
-
-
-def _optional_runner_call_missing_atom_kind(
-    diagnostic: Mapping[str, JsonValue], field_name: str
-) -> str | None:
-    """读取并校验 optional runner-call missing atom kind。
-
-    :param diagnostic: diagnostic JSON object。
-    :param field_name: 字段名。
-    :returns: missing atom kind 文本或 ``None``。
-    :raises HostDurableError: 字段值不在封闭枚举内时抛出。
-    """
-
-    value = _optional_text(diagnostic, field_name)
-    if value is None:
-        return None
-    try:
-        return RunnerCallReconstructionMissingAtomKind(value).value
-    except ValueError as exc:
-        raise HostDurableError(f"runner-call diagnostic.{field_name} is unsupported") from exc
-
-
-def _optional_runner_call_missing_ref_kind(
-    diagnostic: Mapping[str, JsonValue], field_name: str
-) -> str | None:
-    """读取并校验 optional runner-call missing ref kind。
-
-    :param diagnostic: diagnostic JSON object。
-    :param field_name: 字段名。
-    :returns: missing ref kind 文本或 ``None``。
-    :raises HostDurableError: 字段值不在封闭枚举内时抛出。
-    """
-
-    value = _optional_text(diagnostic, field_name)
-    if value is None:
-        return None
-    # Engine ingest 的 projection artifact producer 标签在 Tool Trace 查询边界收敛为通用 artifact ref kind。
-    if value == _PRODUCER_MISSING_REF_KIND_RUNNER_CALL_PROJECTION_ARTIFACT:
-        return RunnerCallReconstructionMissingRefKind.ARTIFACT_REF.value
-    try:
-        return RunnerCallReconstructionMissingRefKind(value).value
-    except ValueError as exc:
-        raise HostDurableError(f"runner-call diagnostic.{field_name} is unsupported") from exc
 
 
 def _extract_diagnostic_trace(event: ProjectionEventView) -> _ToolTraceExtract | None:

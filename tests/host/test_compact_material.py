@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import NamedTuple
 
@@ -64,7 +66,12 @@ from dayu.host.compaction import (
     SessionSummaryCandidateVNext,
 )
 from dayu.host.context_events import build_context_compacted_payload
-from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
+from dayu.host.durable.codec import (
+    canonical_json_dumps,
+    sha256_digest_bytes,
+    sha256_digest_json,
+)
+from dayu.host.durable.artifact import LocalArtifactStore
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import (
@@ -79,11 +86,17 @@ from dayu.host.durable.options import (
     PayloadStoragePolicy,
 )
 from dayu.host.durable.payload import (
+    BoundedJsonPayloadWriteRequest,
+    PayloadDescriptor,
+    PayloadKind,
     PayloadStore,
     SQLitePayloadFormat,
     SQLitePayloadWriteRequest,
 )
 from dayu.host.durable.schema import (
+    TABLE_EVENT_LOG,
+    TABLE_PAYLOAD_DESCRIPTORS,
+    TABLE_SQLITE_PAYLOADS,
     TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
     TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT,
 )
@@ -136,6 +149,19 @@ _CURRENT_VNEXT_MATERIAL_KEYS = (
     "instruction",
 )
 _VNEXT_TOP_LEVEL_KEYS = ("schema_version", *_CURRENT_VNEXT_MATERIAL_KEYS)
+
+
+class _CompactEvidencePayloadTamperKind(StrEnum):
+    """compact strict consumer 的 durable payload 篡改分类。"""
+
+    DESCRIPTOR_DIGEST = "descriptor_digest"
+    DESCRIPTOR_SIZE = "descriptor_size"
+    SQLITE_ROW_DIGEST = "sqlite_row_digest"
+    SQLITE_ROW_SIZE = "sqlite_row_size"
+    SQLITE_CONTENT = "sqlite_content"
+    SQLITE_NONCANONICAL = "sqlite_noncanonical"
+    ARTIFACT_CONTAINMENT = "artifact_containment"
+    ARTIFACT_BYTES = "artifact_bytes"
 
 
 class _MaterialPackShape(NamedTuple):
@@ -1752,8 +1778,19 @@ def test_pre_dispatch_evidence_reads_descriptor_raw_payload(tmp_path: Path) -> N
             """
 
             payload_ref = "payload-descriptor-evidence"
+            request = _append_tool_call_requested_event(
+                transaction,
+                event_log,
+                event_id="event-tool-call-descriptor",
+                tool_call_id="tool-call-event-tool-result-descriptor",
+                semantic_query_text="查询 descriptor evidence",
+            )
             envelope = _accepted_evidence_envelope_for_event(
                 "event-tool-result-descriptor",
+                tool_call_requested_event_ref=request.event_id,
+                normalized_arguments_digest=sha256_digest_json(
+                    {"arguments": {"ticker": "MSFT"}}
+                ),
                 payload_ref=payload_ref,
             )
             descriptor = PayloadStore().write_sqlite_payload(
@@ -1822,6 +1859,60 @@ def test_pre_dispatch_evidence_reads_descriptor_raw_payload(tmp_path: Path) -> N
             block.accepted_tool_evidence
         )
         assert view.material_blocks[0].payload_refs == ("payload-descriptor-evidence",)
+
+
+@pytest.mark.parametrize(
+    "tamper_kind",
+    tuple(_CompactEvidencePayloadTamperKind),
+)
+def test_pre_dispatch_evidence_durable_payload_tamper_fails_closed(
+    tmp_path: Path,
+    tamper_kind: _CompactEvidencePayloadTamperKind,
+) -> None:
+    """compact strict consumer 不得把 durable corruption 降级为无 evidence。
+
+    :param tmp_path: pytest 临时目录。
+    :param tamper_kind: descriptor、SQLite、artifact 或 canonical bytes 篡改。
+    :returns: ``None``。
+    :raises AssertionError: 任一损坏 accepted result 未让 material 构造失败时抛出。
+    """
+
+    uses_artifact = tamper_kind in (
+        _CompactEvidencePayloadTamperKind.ARTIFACT_CONTAINMENT,
+        _CompactEvidencePayloadTamperKind.ARTIFACT_BYTES,
+    )
+    options = _durable_options(tmp_path)
+    event_log = EventLogStore()
+    with open_host_durable_store(options) as store:
+        run, descriptor = store.transaction_runner.run_write(
+            lambda transaction: _seed_descriptor_backed_compact_evidence(
+                transaction,
+                event_log,
+                event_id=f"event-tool-result-tamper-{tamper_kind.value}",
+                use_artifact=uses_artifact,
+            )
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: _tamper_compact_evidence_payload(
+                transaction,
+                descriptor=descriptor,
+                result_event_id=(
+                    f"event-tool-result-tamper-{tamper_kind.value}"
+                ),
+                tamper_kind=tamper_kind,
+                artifact_root=options.payload_policy.artifact_root,
+            )
+        )
+
+        with pytest.raises(HostDurableError):
+            store.transaction_runner.run_read(
+                lambda transaction: build_pre_dispatch_compact_material_view(
+                    transaction,
+                    event_log,
+                    run=run,
+                    current_display_text="current user question",
+                )
+            )
 
 
 def test_pre_dispatch_evidence_uses_projection_unavailable_source(
@@ -1957,10 +2048,15 @@ def test_pre_dispatch_tool_result_without_envelope_yields_no_evidence_block(
         assert view.material_blocks == ()
 
 
-def test_pre_dispatch_evidence_missing_request_atom_emits_limited_signal(
+def test_pre_dispatch_evidence_missing_request_atom_fails_closed(
     tmp_path: Path,
 ) -> None:
-    """缺 TOOL_CALL_REQUESTED atom 时 query 文本为 limited signal 且不泄漏 id。"""
+    """accepted evidence 缺 TOOL_CALL_REQUESTED ref 时 fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 缺失 request ref 未触发 durable error 时抛出。
+    """
 
     event_log = EventLogStore()
     with open_host_durable_store(_durable_options(tmp_path)) as store:
@@ -1970,12 +2066,14 @@ def test_pre_dispatch_evidence_missing_request_atom_emits_limited_signal(
 
             :param transaction: Host transaction。
             :returns: 当前 Run row。
+            :raises HostDurableError: durable event 写入失败时抛出。
             """
 
             _append_tool_result_event(
                 transaction,
                 event_log,
                 event_id="event-tool-result-missing-request",
+                append_request_atom_when_missing=False,
             )
             current = _append_event(
                 transaction,
@@ -1987,20 +2085,135 @@ def test_pre_dispatch_evidence_missing_request_atom_emits_limited_signal(
             return _run_row(current)
 
         run = store.transaction_runner.run_write(seed)
-        view = store.transaction_runner.run_read(
-            lambda transaction: build_pre_dispatch_compact_material_view(
+        with pytest.raises(
+            HostDurableError,
+            match="tool_call_requested_event_ref is missing",
+        ):
+            store.transaction_runner.run_read(
+                lambda transaction: build_pre_dispatch_compact_material_view(
+                    transaction,
+                    event_log,
+                    run=run,
+                    current_display_text="current user question",
+                )
+            )
+
+
+def test_pre_dispatch_evidence_request_ref_to_result_event_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """accepted request ref 指向 TOOL_RESULT_ACCEPTED row 时 fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: result event 被当作 call provenance 接受时抛出。
+    """
+
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入 self-ref result provenance 与当前输入。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run row。
+            :raises HostDurableError: durable event 写入失败时抛出。
+            """
+
+            result_event_id = "event-tool-result-as-request-ref"
+            _append_tool_result_event(
                 transaction,
                 event_log,
-                run=run,
-                current_display_text="current user question",
+                event_id=result_event_id,
+                tool_call_requested_event_ref=result_event_id,
+                append_request_atom_when_missing=False,
             )
-        )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-result-as-request-ref",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current user question"},
+            )
+            return _run_row(current)
 
-        assert view.material_blocks[0].accepted_tool_evidence is not None
-        query_text = view.material_blocks[0].accepted_tool_evidence.query_text
-        assert query_text == "查询语义不可用；参数未安全展开。"
-        assert "event-tool-result-missing-request" not in query_text
-        assert "tool-call-event-tool-result-missing-request" not in query_text
+        run = store.transaction_runner.run_write(seed)
+        with pytest.raises(
+            HostDurableError,
+            match="request provenance is invalid",
+        ):
+            store.transaction_runner.run_read(
+                lambda transaction: build_pre_dispatch_compact_material_view(
+                    transaction,
+                    event_log,
+                    run=run,
+                    current_display_text="current user question",
+                )
+            )
+
+
+def test_pre_dispatch_evidence_request_identity_mismatch_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """request/result session-run-attempt-execution identity 分裂时 fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: identity mismatch evidence 被接受时抛出。
+    """
+
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入跨 Run request ref 与当前输入。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run row。
+            :raises HostDurableError: durable event 写入失败时抛出。
+            """
+
+            tool_call_id = "tool-call-identity-mismatch"
+            request = _append_tool_call_requested_event(
+                transaction,
+                event_log,
+                event_id="event-tool-call-identity-mismatch",
+                tool_call_id=tool_call_id,
+                semantic_query_text="查询 identity mismatch",
+                run_id="run-other",
+            )
+            _append_tool_result_event(
+                transaction,
+                event_log,
+                event_id="event-tool-result-identity-mismatch",
+                tool_call_requested_event_ref=request.event_id,
+                tool_call_id=tool_call_id,
+                normalized_arguments_digest=sha256_digest_json(
+                    {"arguments": {"ticker": "MSFT"}}
+                ),
+            )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-identity-mismatch",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current user question"},
+            )
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+        with pytest.raises(
+            HostDurableError,
+            match="request provenance is invalid",
+        ):
+            store.transaction_runner.run_read(
+                lambda transaction: build_pre_dispatch_compact_material_view(
+                    transaction,
+                    event_log,
+                    run=run,
+                    current_display_text="current user question",
+                )
+            )
 
 
 @pytest.mark.parametrize(
@@ -2046,9 +2259,24 @@ def test_pre_dispatch_evidence_payload_damage_fails_closed(
             :returns: 当前 Run row。
             """
 
+            tool_call_id = f"tool-call-{event_id}"
+            request = _append_tool_call_requested_event(
+                transaction,
+                event_log,
+                event_id=f"event-tool-call-for-{event_id}",
+                tool_call_id=tool_call_id,
+                semantic_query_text=f"查询 {event_id}",
+            )
             payload: dict[str, JsonValue] = {
                 "accepted_evidence_envelope": accepted_evidence_envelope_to_json_value(
-                    _accepted_evidence_envelope_for_event(event_id)
+                    _accepted_evidence_envelope_for_event(
+                        event_id,
+                        tool_call_requested_event_ref=request.event_id,
+                        tool_call_id=tool_call_id,
+                        normalized_arguments_digest=sha256_digest_json(
+                            {"arguments": {"ticker": "MSFT"}}
+                        ),
+                    )
                 )
             }
             if include_raw:
@@ -2723,16 +2951,25 @@ def _previous_compact_block(
     )
 
 
-def _durable_options(tmp_path: Path) -> HostDurableStoreOptions:
+def _durable_options(
+    tmp_path: Path,
+    *,
+    payload_inline_threshold_bytes: int = 65536,
+) -> HostDurableStoreOptions:
     """构造 compact material 测试用 durable store options。
 
     :param tmp_path: pytest 临时目录。
+    :param payload_inline_threshold_bytes: SQLite/artifact 冷热分界。
     :returns: Host durable store options。
+    :raises ValueError: 阈值非法时由 production policy 抛出。
     """
 
     return HostDurableStoreOptions(
         db_path=tmp_path / "durable.sqlite3",
-        payload_policy=PayloadStoragePolicy(artifact_root=tmp_path / "artifacts"),
+        payload_policy=PayloadStoragePolicy(
+            artifact_root=tmp_path / "artifacts",
+            payload_inline_threshold_bytes=payload_inline_threshold_bytes,
+        ),
         sqlite_policy=HostSQLiteStoragePolicy(
             busy_timeout_seconds=0.25,
             write_busy_retry_count=3,
@@ -2740,6 +2977,214 @@ def _durable_options(tmp_path: Path) -> HostDurableStoreOptions:
             write_retry_backoff_multiplier=1.2,
             write_retry_max_delay_seconds=0.01,
         ),
+    )
+
+
+def _seed_descriptor_backed_compact_evidence(
+    transaction: HostTransaction,
+    event_log: EventLogStore,
+    *,
+    event_id: str,
+    use_artifact: bool,
+) -> tuple[RunRow, PayloadDescriptor]:
+    """写入 strict compact 测试用 descriptor-backed accepted evidence。
+
+    :param transaction: Host write transaction。
+    :param event_log: EventLog store。
+    :param event_id: TOOL_RESULT_ACCEPTED event id。
+    :param use_artifact: 是否强制写入 artifact descriptor。
+    :returns: 当前 Run row 与 accepted result payload descriptor。
+    :raises HostDurableError: payload 或 EventLog 写入失败时抛出。
+    """
+
+    tool_call_id = f"tool-call-{event_id}"
+    request = _append_tool_call_requested_event(
+        transaction,
+        event_log,
+        event_id=f"event-tool-call-for-{event_id}",
+        tool_call_id=tool_call_id,
+        semantic_query_text=f"查询 {event_id}",
+    )
+    payload_ref = f"payload-{event_id}"
+    envelope = _accepted_evidence_envelope_for_event(
+        event_id,
+        tool_call_requested_event_ref=request.event_id,
+        tool_call_id=tool_call_id,
+        normalized_arguments_digest=sha256_digest_json(
+            {"arguments": {"ticker": "MSFT"}}
+        ),
+        payload_ref=payload_ref,
+    )
+    payload: Mapping[str, JsonValue] = {
+        "accepted_evidence_envelope": (
+            accepted_evidence_envelope_to_json_value(envelope)
+        ),
+        "raw_tool_outcome": {
+            "kind": "completed",
+            "result": {"content": "descriptor-backed strict evidence"},
+        },
+    }
+    if use_artifact:
+        payload_bytes = canonical_json_dumps(payload).encode("utf-8")
+        artifact_ref = LocalArtifactStore(
+            transaction.artifact_root,
+            create_artifact_root=transaction.create_artifact_root,
+        ).write_artifact_bytes(
+            payload_bytes,
+            expected_digest=sha256_digest_json(payload),
+        )
+        descriptor = PayloadStore().write_payload_descriptor_for_artifact(
+            transaction,
+            payload_ref,
+            artifact_ref,
+            "application/json",
+            {},
+        )
+    else:
+        descriptor = PayloadStore().write_bounded_json_payload(
+            transaction,
+            BoundedJsonPayloadWriteRequest(
+                payload_ref=payload_ref,
+                sqlite_payload_id=f"sqlite-{event_id}",
+                payload_json=payload,
+                media_type="application/json",
+                metadata={},
+                expected_digest=sha256_digest_json(payload),
+            ),
+        )
+    event_log.append_event(
+        transaction,
+        EventLogAppendRequest(
+            event_id=event_id,
+            event_class=EventClass.CANONICAL_FACT,
+            session_id=_SESSION_ID,
+            run_id=None,
+            attempt_id=None,
+            execution_id=None,
+            event_type="TOOL_RESULT_ACCEPTED",
+            occurred_at=datetime(2026, 5, 24, 0, 0, 0, tzinfo=UTC),
+            actor="pytest",
+            source="test_compact_material",
+            client_request_id=None,
+            idempotency_key=None,
+            policy_decision=None,
+            reason=None,
+            payload_json={},
+            payload_ref=descriptor.payload_ref,
+            payload_digest=descriptor.payload_digest,
+        ),
+    )
+    current = _append_event(
+        transaction,
+        event_log,
+        event_id=f"event-current-{event_id}",
+        event_type="USER_INPUT_ACCEPTED",
+        payload={"display_text": "current user question"},
+    )
+    return (_run_row(current), descriptor)
+
+
+def _tamper_compact_evidence_payload(
+    transaction: HostTransaction,
+    *,
+    descriptor: PayloadDescriptor,
+    result_event_id: str,
+    tamper_kind: _CompactEvidencePayloadTamperKind,
+    artifact_root: Path,
+) -> None:
+    """篡改单个 accepted result durable integrity atom。
+
+    :param transaction: Host write transaction。
+    :param descriptor: accepted result payload descriptor。
+    :param result_event_id: TOOL_RESULT_ACCEPTED event id。
+    :param tamper_kind: 单一篡改分类。
+    :param artifact_root: Host artifact root。
+    :returns: ``None``。
+    :raises AssertionError: 篡改分类与 descriptor kind 不匹配时抛出。
+    """
+
+    wrong_digest = sha256_digest_bytes(b"tampered-compact-evidence")
+    if tamper_kind is _CompactEvidencePayloadTamperKind.DESCRIPTOR_DIGEST:
+        transaction.execute(
+            f"UPDATE {TABLE_PAYLOAD_DESCRIPTORS} SET payload_digest = ? WHERE payload_ref = ?",
+            (wrong_digest, descriptor.payload_ref),
+        )
+        return
+    if tamper_kind is _CompactEvidencePayloadTamperKind.DESCRIPTOR_SIZE:
+        transaction.execute(
+            f"UPDATE {TABLE_PAYLOAD_DESCRIPTORS} SET payload_size_bytes = payload_size_bytes + 1 WHERE payload_ref = ?",
+            (descriptor.payload_ref,),
+        )
+        return
+    if tamper_kind in (
+        _CompactEvidencePayloadTamperKind.ARTIFACT_CONTAINMENT,
+        _CompactEvidencePayloadTamperKind.ARTIFACT_BYTES,
+    ):
+        if descriptor.payload_kind is not PayloadKind.ARTIFACT_REF:
+            raise AssertionError("artifact tamper requires artifact descriptor")
+        if tamper_kind is _CompactEvidencePayloadTamperKind.ARTIFACT_CONTAINMENT:
+            transaction.execute(
+                f"UPDATE {TABLE_PAYLOAD_DESCRIPTORS} SET artifact_relative_path = ? WHERE payload_ref = ?",
+                ("../outside.json", descriptor.payload_ref),
+            )
+            return
+        if descriptor.artifact_relative_path is None:
+            raise AssertionError("artifact path must exist")
+        (artifact_root / descriptor.artifact_relative_path).write_bytes(
+            b"x" * descriptor.payload_size_bytes
+        )
+        return
+    if descriptor.payload_kind is not PayloadKind.SQLITE_PAYLOAD:
+        raise AssertionError("SQLite tamper requires SQLite descriptor")
+    payload_id = descriptor.sqlite_payload_id
+    if payload_id is None:
+        raise AssertionError("SQLite descriptor must carry payload id")
+    if tamper_kind is _CompactEvidencePayloadTamperKind.SQLITE_ROW_DIGEST:
+        transaction.execute(
+            f"UPDATE {TABLE_SQLITE_PAYLOADS} SET payload_digest = ? WHERE payload_id = ?",
+            (wrong_digest, payload_id),
+        )
+        return
+    if tamper_kind is _CompactEvidencePayloadTamperKind.SQLITE_ROW_SIZE:
+        transaction.execute(
+            f"UPDATE {TABLE_SQLITE_PAYLOADS} SET payload_size_bytes = payload_size_bytes + 1 WHERE payload_id = ?",
+            (payload_id,),
+        )
+        return
+    if tamper_kind is _CompactEvidencePayloadTamperKind.SQLITE_CONTENT:
+        transaction.execute(
+            f"UPDATE {TABLE_SQLITE_PAYLOADS} SET payload_json = ? WHERE payload_id = ?",
+            (canonical_json_dumps({"tampered": True}), payload_id),
+        )
+        return
+    noncanonical_json = '{"z": 1, "a": 2}'
+    noncanonical_bytes = noncanonical_json.encode("utf-8")
+    noncanonical_digest = sha256_digest_bytes(noncanonical_bytes)
+    noncanonical_size = len(noncanonical_bytes)
+    transaction.execute(
+        f"""
+        UPDATE {TABLE_SQLITE_PAYLOADS}
+        SET payload_json = ?, payload_digest = ?, payload_size_bytes = ?
+        WHERE payload_id = ?
+        """,
+        (
+            noncanonical_json,
+            noncanonical_digest,
+            noncanonical_size,
+            payload_id,
+        ),
+    )
+    transaction.execute(
+        f"""
+        UPDATE {TABLE_PAYLOAD_DESCRIPTORS}
+        SET payload_digest = ?, payload_size_bytes = ?
+        WHERE payload_ref = ?
+        """,
+        (noncanonical_digest, noncanonical_size, descriptor.payload_ref),
+    )
+    transaction.execute(
+        f"UPDATE {TABLE_EVENT_LOG} SET payload_digest = ? WHERE event_id = ?",
+        (noncanonical_digest, result_event_id),
     )
 
 
@@ -2844,6 +3289,7 @@ def _append_tool_result_event(
     normalized_arguments_digest: str = _DIGEST,
     run_id: str | None = None,
     source_refs: tuple[OpaqueEvidenceRef, ...] | None = None,
+    append_request_atom_when_missing: bool = True,
 ) -> EventLogRow:
     """追加带 accepted evidence envelope 的 TOOL_RESULT_ACCEPTED。
 
@@ -2855,14 +3301,34 @@ def _append_tool_result_event(
     :param normalized_arguments_digest: envelope 参数 digest。
     :param run_id: 可选 Host Run id。
     :param source_refs: 可选覆盖 envelope source refs。
+    :param append_request_atom_when_missing: request ref 未显式提供时，是否先写入
+        identity 一致的 canonical request atom。
     :returns: appended EventLog row。
     """
 
+    actual_tool_call_id = (
+        f"tool-call-{event_id}" if tool_call_id is None else tool_call_id
+    )
+    actual_request_event_ref = tool_call_requested_event_ref
+    actual_arguments_digest = normalized_arguments_digest
+    if actual_request_event_ref is None and append_request_atom_when_missing:
+        request = _append_tool_call_requested_event(
+            transaction,
+            event_log,
+            event_id=f"event-tool-call-for-{event_id}",
+            tool_call_id=actual_tool_call_id,
+            semantic_query_text=f"查询 {event_id}",
+            run_id=run_id,
+        )
+        actual_request_event_ref = request.event_id
+        actual_arguments_digest = sha256_digest_json(
+            {"arguments": {"ticker": "MSFT"}}
+        )
     envelope = _accepted_evidence_envelope_for_event(
         event_id,
-        tool_call_requested_event_ref=tool_call_requested_event_ref,
-        tool_call_id=tool_call_id,
-        normalized_arguments_digest=normalized_arguments_digest,
+        tool_call_requested_event_ref=actual_request_event_ref,
+        tool_call_id=actual_tool_call_id,
+        normalized_arguments_digest=actual_arguments_digest,
         source_refs=source_refs,
     )
     return _append_event(

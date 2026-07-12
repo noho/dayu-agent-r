@@ -419,7 +419,7 @@ def test_event_payload_object_raises_when_descriptor_missing(
             )
 
         with pytest.raises(
-            HostDurableError, match="USER_INPUT_ACCEPTED payload descriptor is missing"
+            HostDurableError, match="JSON payload descriptor is missing"
         ):
             store.transaction_runner.run_read(operation)
 
@@ -474,7 +474,7 @@ def test_event_payload_object_raises_when_sqlite_payload_row_missing(
 
         with pytest.raises(
             HostDurableError,
-            match="USER_INPUT_ACCEPTED sqlite payload row is missing",
+            match="JSON sqlite payload row is missing",
         ):
             store.transaction_runner.run_read(read_missing_payload)
 

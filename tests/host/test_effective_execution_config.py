@@ -52,6 +52,7 @@ from dayu.host._execution_config_projection import (
     required_json_mapping as _required_json_mapping,
 )
 from dayu.host.durable.connection import open_host_durable_store
+from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.event_log import EventLogRow, EventLogStore
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.options import (
@@ -62,6 +63,55 @@ from dayu.host.durable.options import (
 from dayu.host.durable.transaction import HostTransaction
 from dayu.host.payload_resolution import event_payload_object
 from dayu.host.memory import default_memory_projection_policy
+
+
+def _effective_execution_envelope(
+    config: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    """为测试 config 构造 digest/ref 自洽的冻结 envelope。
+
+    :param config: 待封装 execution config。
+    :returns: policy digest/ref 与 config 同源的 JSON object。
+    :raises TypeError: config 含非 JSON 值时由 digest helper 抛出。
+    :raises ValueError: config 含非有限浮点数时由 digest helper 抛出。
+    """
+
+    digest = sha256_digest_json(config)
+    return {
+        "policy_snapshot_ref": "policy:" + digest,
+        "policy_snapshot_digest": digest,
+        "config": config,
+    }
+
+
+def _valid_effective_execution_config_json() -> Mapping[str, JsonValue]:
+    """构造 tamper matrix 使用的有效 execution config envelope。
+
+    :returns: digest/ref/config 同源的 execution config JSON object。
+    :raises TypeError: production projector 遇到未知 provider extension 时抛出。
+    """
+
+    value = effective_execution_config_json(
+        runner_spec=_runner_spec("integrity-model"),
+        runner_options=RunnerCallOptions(
+            temperature=None,
+            max_tokens=None,
+            top_p=None,
+            stream=False,
+        ),
+        agent_policy=AgentPolicy(
+            max_iterations=1,
+            continuation_max_attempts=0,
+            allow_tool_calls=False,
+            tool_execution_timeout_seconds=1.0,
+            fallback_prompt="fallback",
+            continuation_prompt="continue",
+        ),
+        runner_spec_source="test",
+        runner_options_source="test",
+        agent_policy_source="test",
+    )
+    return _required_json_mapping(value, field_name="effective_execution_config")
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,17 +301,13 @@ async def test_field_level_partial_merge_uses_baseline_for_omitted_fields(
 def test_effective_execution_snapshot_rejects_corrupted_json_with_durable_error() -> None:
     """损坏的 durable execution config JSON 统一抛 HostDurableError。"""
 
+    config: Mapping[str, JsonValue] = {
+        "runner_spec": "corrupted",
+        "runner_options": {"stream": False},
+        "agent_policy": {},
+    }
     with pytest.raises(HostDurableError, match="runner_spec"):
-        effective_execution_snapshot_from_json(
-            {
-                "policy_snapshot_ref": "policy:snapshot",
-                "config": {
-                    "runner_spec": "corrupted",
-                    "runner_options": {"stream": False},
-                    "agent_policy": {},
-                },
-            }
-        )
+        effective_execution_snapshot_from_json(_effective_execution_envelope(config))
 
 
 def test_effective_execution_config_round_trips_client_correlation_policy() -> None:
@@ -303,49 +349,108 @@ def test_effective_execution_config_round_trips_client_correlation_policy() -> N
     )
 
 
+def test_effective_execution_snapshot_rejects_tampered_config_content() -> None:
+    """config 内容变化但 digest/ref 未变化时必须在反序列化前 fail closed。
+
+    :returns: ``None``。
+    :raises AssertionError: tampered config 未触发 durable error 时抛出。
+    """
+
+    root: dict[str, JsonValue] = dict(
+        _required_json_mapping(
+            _valid_effective_execution_config_json(),
+            field_name="effective_execution_config",
+        )
+    )
+    config: dict[str, JsonValue] = dict(
+        _required_json_mapping(root["config"], field_name="config")
+    )
+    config["sources"] = {"runner_spec": "tampered"}
+    root["config"] = config
+
+    with pytest.raises(HostDurableError, match="snapshot digest mismatch"):
+        effective_execution_snapshot_from_json(root)
+
+
+def test_effective_execution_snapshot_rejects_tampered_policy_digest() -> None:
+    """policy_snapshot_digest 与 config digest 分裂时 fail closed。
+
+    :returns: ``None``。
+    :raises AssertionError: tampered digest 未触发 durable error 时抛出。
+    """
+
+    root: dict[str, JsonValue] = dict(
+        _required_json_mapping(
+            _valid_effective_execution_config_json(),
+            field_name="effective_execution_config",
+        )
+    )
+    root["policy_snapshot_digest"] = sha256_digest_json({"tampered": True})
+
+    with pytest.raises(HostDurableError, match="snapshot digest mismatch"):
+        effective_execution_snapshot_from_json(root)
+
+
+def test_effective_execution_snapshot_rejects_tampered_policy_ref() -> None:
+    """policy_snapshot_ref 不是 ``policy:<config digest>`` 时 fail closed。
+
+    :returns: ``None``。
+    :raises AssertionError: tampered ref 未触发 durable error 时抛出。
+    """
+
+    root: dict[str, JsonValue] = dict(
+        _required_json_mapping(
+            _valid_effective_execution_config_json(),
+            field_name="effective_execution_config",
+        )
+    )
+    root["policy_snapshot_ref"] = "policy:" + sha256_digest_json(
+        {"tampered": True}
+    )
+
+    with pytest.raises(HostDurableError, match="snapshot ref mismatch"):
+        effective_execution_snapshot_from_json(root)
+
+
 def test_effective_execution_snapshot_rejects_unknown_provider_request_with_durable_error() -> None:
     """冻结 execution config 中的未知 provider request kind 按 durable 损坏处理。"""
 
+    config: Mapping[str, JsonValue] = {
+        "runner_spec": {
+            "provider": "openai",
+            "model": "model",
+            "endpoint": "http://localhost",
+            "api_key_ref": None,
+            "headers": {},
+            "client_correlation_policy": "disabled",
+            "supports_tool_calling": False,
+            "supports_streaming": False,
+            "supports_stream_usage": False,
+            "default_timeout_seconds": 1.0,
+            "max_retries": 0,
+            "provider_request": {"kind": "unknown-extension"},
+            "stream_idle_timeout_seconds": None,
+            "stream_idle_heartbeat_seconds": None,
+        },
+        "runner_options": {
+            "temperature": None,
+            "max_tokens": None,
+            "top_p": None,
+            "stream": False,
+        },
+        "agent_policy": {
+            "max_iterations": 1,
+            "continuation_max_attempts": 0,
+            "allow_tool_calls": False,
+            "tool_execution_timeout_seconds": 1.0,
+            "fallback_mode": "raise_error",
+            "fallback_prompt": "fallback",
+            "continuation_prompt": "continue",
+            "max_consecutive_failed_tool_batches": 1,
+        },
+    }
     with pytest.raises(HostDurableError, match="provider_request"):
-        effective_execution_snapshot_from_json(
-            {
-                "policy_snapshot_ref": "policy:snapshot",
-                "config": {
-                    "runner_spec": {
-                        "provider": "openai",
-                        "model": "model",
-                        "endpoint": "http://localhost",
-                        "api_key_ref": None,
-                        "headers": {},
-                        "client_correlation_policy": "disabled",
-                        "supports_tool_calling": False,
-                        "supports_streaming": False,
-                        "supports_stream_usage": False,
-                        "default_timeout_seconds": 1.0,
-                        "max_retries": 0,
-                        "provider_request": {"kind": "unknown-extension"},
-                        "stream_idle_timeout_seconds": None,
-                        "stream_idle_heartbeat_seconds": None,
-                    },
-                    "runner_options": {
-                        "temperature": None,
-                        "max_tokens": None,
-                        "top_p": None,
-                        "stream": False,
-                    },
-                    "agent_policy": {
-                        "max_iterations": 1,
-                        "continuation_max_attempts": 0,
-                        "allow_tool_calls": False,
-                        "tool_execution_timeout_seconds": 1.0,
-                        "fallback_mode": "raise_error",
-                        "fallback_prompt": "fallback",
-                        "continuation_prompt": "continue",
-                        "max_consecutive_failed_tool_batches": 1,
-                    },
-                },
-            }
-        )
+        effective_execution_snapshot_from_json(_effective_execution_envelope(config))
 
 
 @pytest.mark.asyncio

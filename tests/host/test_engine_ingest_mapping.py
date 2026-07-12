@@ -7,6 +7,7 @@ import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import NoReturn, cast
 
@@ -77,6 +78,13 @@ from dayu.engine.contracts.tool_records import (
     AwaitingToolExecutionRecord,
 )
 from dayu.host.admission import PendingDispatchRecord
+from dayu.host._runner_call_manifest import (
+    RunnerCallHotAtoms,
+    RunnerCallProjectorMetadata,
+    complete_runner_call_hot_diagnostic,
+    runner_call_hot_payload,
+    runner_call_projector_metadata_descriptor,
+)
 from dayu.host.api import (
     AttemptStatus,
     CancelMode,
@@ -115,6 +123,7 @@ from dayu.host.context_policy import (
 )
 from dayu.host.durable.codec import format_utc_timestamp, sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
+from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import (
     EventClass,
     EventLogAppendRequest,
@@ -130,7 +139,12 @@ from dayu.host.durable.options import (
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
-from dayu.host.durable.payload import PayloadKind, PayloadStore
+from dayu.host.durable.payload import (
+    PayloadKind,
+    PayloadStore,
+    SQLitePayloadFormat,
+    SQLitePayloadWriteRequest,
+)
 from dayu.host.durable.run_transition import (
     AcceptWorkerRunningInput,
     ActiveCancelWatchdogCloseoutInput,
@@ -200,6 +214,18 @@ from dayu.host.engine_ingest import (
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "engine-ingest-test"})
 _REACTIVE_POLICY_REF = "test-reactive-policy"
+
+
+class _EngineHotTamperKind(StrEnum):
+    """Engine ingest shared hot parser 的篡改分类。"""
+
+    MISSING_DIAGNOSTIC = "missing_diagnostic"
+    NULL_DIAGNOSTIC = "null_diagnostic"
+    MALFORMED_DIAGNOSTIC = "malformed_diagnostic"
+    LEGACY_METADATA_ARRAY = "legacy_metadata_array"
+    STATUS_MISMATCH = "status_mismatch"
+    COUNT_MISMATCH = "count_mismatch"
+    DIGEST_MISMATCH = "digest_mismatch"
 
 
 @dataclass(frozen=True, slots=True)
@@ -4289,7 +4315,7 @@ def test_iteration_started_writes_limited_runner_call_manifest_for_continuation(
             "status": "limited_signal",
             "reason": "missing_projection_artifact",
             "missing_atom_kind": None,
-            "missing_ref_kind": "runner_call_projection_artifact",
+                "missing_ref_kind": "artifact_ref",
             "missing_ref": None,
             "observed_count": 4,
             "expected_count": None,
@@ -4407,7 +4433,31 @@ def test_iteration_started_continuation_with_projection_writes_complete_manifest
             )
         )
         message_entries = _json_object_sequence(manifest_body["message_entries"])
+        projector_metadata = _json_object_sequence(
+            manifest_body["projector_metadata"]
+        )
         assert len(message_entries) == 4
+        assert len(projector_metadata) == 1
+        projector_metadata_ids: set[str] = set()
+        for item in projector_metadata:
+            metadata_id = item["projector_metadata_id"]
+            assert isinstance(metadata_id, str)
+            projector_metadata_ids.add(metadata_id)
+        assert all(
+            entry["projector_metadata_id"] in projector_metadata_ids
+            for entry in message_entries
+        )
+        assert frozenset(projector_metadata[0]) == frozenset(
+            {
+                "projector_metadata_id",
+                "projector_id",
+                "projector_schema_version",
+                "projector_digest",
+                "purpose",
+                "source_contract_refs",
+            }
+        )
+        assert "projector_metadata_summary" not in manifest_hot
         projection_ref = manifest_hot["runner_call_projection_artifact_ref"]
         projection_digest = manifest_hot["runner_call_projection_artifact_digest"]
         assert isinstance(projection_ref, str)
@@ -4437,6 +4487,62 @@ def test_iteration_started_continuation_with_projection_writes_complete_manifest
             assert message["content_digest"] == entry["content_digest"]
             assert entry["projection_artifact_ref"] == projection_ref
             assert entry["projection_artifact_digest"] == projection_digest
+
+
+@pytest.mark.parametrize("tamper_kind", tuple(_EngineHotTamperKind))
+def test_engine_ingest_rejects_invalid_runner_call_hot_payload(
+    tmp_path: Path,
+    tamper_kind: _EngineHotTamperKind,
+) -> None:
+    """Engine ingest 不得为损坏 hot row 合成 complete diagnostic。
+
+    :param tmp_path: pytest 临时目录。
+    :param tamper_kind: diagnostic、旧数组或跨字段冲突分类。
+    :returns: ``None``。
+    :raises AssertionError: Engine consumer 接受损坏 hot payload 时抛出。
+    """
+
+    role_digest = runner_role_sequence_digest(("system", "user"))
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        event = _append_prepared_runner_call_manifest(
+            store.transaction_runner,
+            seeded,
+            event_id=f"event-engine-hot-{tamper_kind.value}",
+            runner_call_index=0,
+            runner_call_kind="initial_user_dispatch",
+            runner_call_trigger_reason="initial_user_input",
+            message_count=2,
+            role_sequence_digest=role_digest,
+        )
+        payload: dict[str, JsonValue] = dict(_payload(event))
+        diagnostic_value = payload["diagnostic"]
+        assert isinstance(diagnostic_value, Mapping)
+        diagnostic: dict[str, JsonValue] = dict(diagnostic_value)
+        if tamper_kind is _EngineHotTamperKind.MISSING_DIAGNOSTIC:
+            del payload["diagnostic"]
+        elif tamper_kind is _EngineHotTamperKind.NULL_DIAGNOSTIC:
+            payload["diagnostic"] = None
+        elif tamper_kind is _EngineHotTamperKind.MALFORMED_DIAGNOSTIC:
+            payload["diagnostic"] = []
+        elif tamper_kind is _EngineHotTamperKind.LEGACY_METADATA_ARRAY:
+            payload["projector_metadata_summary"] = []
+        elif tamper_kind is _EngineHotTamperKind.STATUS_MISMATCH:
+            payload["validation_status"] = "limited_signal"
+        elif tamper_kind is _EngineHotTamperKind.COUNT_MISMATCH:
+            diagnostic["observed_count"] = 3
+            payload["diagnostic"] = diagnostic
+        else:
+            diagnostic["expected_digest"] = sha256_digest_json(
+                {"roles": ["tampered"]}
+            )
+            payload["diagnostic"] = diagnostic
+
+        with pytest.raises(HostDurableError):
+            engine_ingest_module._runner_call_payload_diagnostic(
+                payload,
+                consumer_boundary="engine_ingest_test",
+            )
 
 
 def test_iteration_completed_preview_includes_client_correlation_id(
@@ -5282,10 +5388,103 @@ def _append_prepared_runner_call_manifest(
     :returns: 写入的 EventLog row。
     """
 
-    manifest_digest = sha256_digest_json(
-        {"event_id": event_id, "role_sequence_digest": role_sequence_digest}
-    )
-    payload: dict[str, JsonValue] = {
+    roles = ("system", "user")
+    if message_count != len(roles):
+        raise AssertionError("prepared manifest fixture message_count must be two")
+    if role_sequence_digest != runner_role_sequence_digest(roles):
+        raise AssertionError("prepared manifest fixture role digest mismatch")
+    is_compactor = compactor_identity is not None
+    projection_ref = f"payload-runner-call-projection:{event_id}"
+    projection_digest = sha256_digest_json({"projection": event_id})
+    metadata_items: list[JsonValue] = []
+    message_entries: list[JsonValue] = []
+    for index, role in enumerate(roles):
+        metadata_id = (
+            f"compactor-projector:{role}"
+            if is_compactor
+            else f"projector:{index}:{role}"
+        )
+        projector_id = (
+            f"compactor_{role}_prompt"
+            if is_compactor
+            else (
+                "run_input_system_context"
+                if role == "system"
+                else "user_input_message"
+            )
+        )
+        purpose = (
+            "compactor_proposal_input"
+            if is_compactor
+            else (
+                "post_compaction_input"
+                if runner_call_kind == "post_compaction_dispatch"
+                else "ordinary_run_input"
+            )
+        )
+        source_contract_refs = (f"event:source:{event_id}:{index}",)
+        projector_schema_version = (
+            "compactor_projector.v1"
+            if is_compactor
+            else "run_input_projector.v1"
+        )
+        projector_digest = sha256_digest_json(
+            {
+                "projector_id": projector_id,
+                "projector_schema_version": projector_schema_version,
+                "purpose": purpose,
+                "source_contract_refs": list(source_contract_refs),
+            }
+        )
+        metadata_items.append(
+            runner_call_projector_metadata_descriptor(
+                RunnerCallProjectorMetadata(
+                    projector_metadata_id=metadata_id,
+                    projector_id=projector_id,
+                    projector_schema_version=projector_schema_version,
+                    projector_digest=projector_digest,
+                    purpose=purpose,
+                    source_contract_refs=source_contract_refs,
+                )
+            )
+        )
+        message_entries.append(
+            {
+                "index": index,
+                "role": role,
+                "content_digest": sha256_digest_json(
+                    {"event_id": event_id, "message_index": index}
+                ),
+                "content_size_bytes": index + 1,
+                "source_refs": list(source_contract_refs),
+                "projection_artifact_ref": (
+                    None if is_compactor and index == 0 else projection_ref
+                ),
+                "projection_artifact_digest": (
+                    None if is_compactor and index == 0 else projection_digest
+                ),
+                "projector_metadata_id": metadata_id,
+                "provider_tool_calls_digest": None,
+                "reasoning_content_digest": None,
+            }
+        )
+    valid_compactor_identity: Mapping[str, JsonValue] | None = None
+    if is_compactor:
+        operation_id = compactor_identity.get("compaction_operation_id")
+        if not isinstance(operation_id, str):
+            raise AssertionError("compactor operation id must be text")
+        valid_compactor_identity = {
+            "parent_host_run_id": seeded.run_id,
+            "parent_session_id": seeded.session_id,
+            "compaction_operation_id": operation_id,
+            "compactor_engine_run_id": "compactor-engine-run-test",
+            "compaction_attempt_number": runner_call_index + 1,
+            "compaction_request_digest": sha256_digest_json(
+                {"compaction_operation_id": operation_id}
+            ),
+            "compactor_input_projection_ref": projection_ref,
+        }
+    manifest: dict[str, JsonValue] = {
         "schema_version": RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
         "manifest_id": f"runner-call-manifest:{event_id}",
         "session_id": seeded.session_id,
@@ -5297,21 +5496,86 @@ def _append_prepared_runner_call_manifest(
         "runner_call_trigger_reason": runner_call_trigger_reason,
         "iteration_id": None,
         "iteration_index": None,
-        "manifest_payload_ref": f"payload-runner-call-manifest:{event_id}",
-        "manifest_digest": manifest_digest,
-        "manifest_schema_version": RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
-        "validation_status": "complete",
         "message_count": message_count,
         "role_sequence_digest": role_sequence_digest,
+        "runner_input_serializer_schema_version": (
+            RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION
+        ),
         "input_projection_digest": sha256_digest_json(
             {"projection": event_id}
         ),
-        "projector_metadata_summary": [],
+        "message_entries": message_entries,
+        "source_cursor_refs": [f"event:{event_id}"],
+        "tool_schema_snapshot_refs": [],
+        "memory_snapshot_cursor_ref": None,
+        "compact_artifact_refs": [],
+        "context_fallback_decision_ref": None,
+        "projector_metadata": metadata_items,
         "diagnostic": None,
-        "compactor_identity": compactor_identity,
+        "compactor_identity": valid_compactor_identity,
     }
+    if not is_compactor:
+        manifest.update(
+            {
+                "runner_call_projection_artifact_ref": projection_ref,
+                "runner_call_projection_artifact_digest": projection_digest,
+                "runner_call_projection_artifact_size_bytes": 128,
+            }
+        )
+    manifest_digest = sha256_digest_json(manifest)
+    manifest_payload_ref = f"payload-runner-call-manifest:{event_id}"
+    hot_payload = runner_call_hot_payload(
+        RunnerCallHotAtoms(
+            session_id=seeded.session_id,
+            host_run_id=seeded.run_id,
+            attempt_id=seeded.attempt_id,
+            execution_id=seeded.execution_id,
+            runner_call_index=runner_call_index,
+            runner_call_kind=runner_call_kind,
+            runner_call_trigger_reason=runner_call_trigger_reason,
+            iteration_id=None,
+            iteration_index=None,
+            manifest_payload_ref=manifest_payload_ref,
+            manifest_digest=manifest_digest,
+            manifest_schema_version=RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION,
+            validation_status="complete",
+            message_count=message_count,
+            role_sequence_digest=role_sequence_digest,
+            input_projection_digest=sha256_digest_json(
+                {"projection": event_id}
+            ),
+            runner_call_projection_artifact_ref=(
+                None if is_compactor else projection_ref
+            ),
+            runner_call_projection_artifact_digest=(
+                None if is_compactor else projection_digest
+            ),
+            runner_call_projection_artifact_size_bytes=(
+                None if is_compactor else 128
+            ),
+            diagnostic=complete_runner_call_hot_diagnostic(
+                status="complete",
+                message_count=message_count,
+                role_sequence_digest=role_sequence_digest,
+                consumer_boundary="test.engine_ingest",
+            ),
+        ),
+        manifest=manifest,
+    )
 
     def _operation(transaction: HostTransaction) -> EventLogRow:
+        descriptor = PayloadStore().write_sqlite_payload(
+            transaction,
+            SQLitePayloadWriteRequest(
+                payload_ref=manifest_payload_ref,
+                payload_id=f"sqlite-runner-call-manifest:{event_id}",
+                payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+                payload_json=manifest,
+                media_type="application/json",
+                metadata={},
+                expected_digest=manifest_digest,
+            ),
+        )
         return EventLogStore().append_event(
             transaction,
             EventLogAppendRequest(
@@ -5329,9 +5593,9 @@ def _append_prepared_runner_call_manifest(
                 idempotency_key=None,
                 policy_decision=None,
                 reason=None,
-                payload_json=payload,
-                payload_ref=None,
-                payload_digest=None,
+                payload_json=hot_payload,
+                payload_ref=descriptor.payload_ref,
+                payload_digest=descriptor.payload_digest,
             ),
         ).row
 

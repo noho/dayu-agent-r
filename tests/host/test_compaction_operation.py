@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 
@@ -754,6 +755,27 @@ def test_compactor_proposal_manifest_uses_initial_trigger_for_first_attempt() ->
     assert retry_manifest["runner_call_trigger_reason"] == (
         "context_compaction_retry_attempt"
     )
+    for manifest in (first_manifest, retry_manifest):
+        metadata = manifest["projector_metadata"]
+        assert isinstance(metadata, list)
+        assert len(metadata) == 2
+        for item in metadata:
+            assert isinstance(item, Mapping)
+            assert frozenset(item) == frozenset(
+                {
+                    "projector_metadata_id",
+                    "projector_id",
+                    "projector_schema_version",
+                    "projector_digest",
+                    "purpose",
+                    "source_contract_refs",
+                }
+            )
+            assert "metadata_id" not in item
+            assert item["projector_schema_version"] == "compactor_projector.v1"
+            source_contract_refs = item["source_contract_refs"]
+            assert isinstance(source_contract_refs, list)
+            assert len(source_contract_refs) > 0
 
 
 @pytest.mark.asyncio

@@ -41,6 +41,13 @@ from dayu.engine.contracts.messages import (
     UserMessage,
 )
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.host._runner_call_manifest import (
+    RunnerCallHotAtoms,
+    RunnerCallProjectorMetadata,
+    complete_runner_call_hot_diagnostic,
+    runner_call_hot_payload,
+    runner_call_projector_metadata_descriptor,
+)
 from dayu.host._event_payload import (
     payload_object as _payload_object,
 )
@@ -4210,55 +4217,48 @@ def _runner_call_manifest_hot_payload(
     :raises HostDurableError: manifest identity 字段类型非法时抛出。
     """
 
-    return {
-        "session_id": _manifest_text(manifest, "session_id"),
-        "host_run_id": _manifest_text(manifest, "host_run_id"),
-        "attempt_id": _manifest_optional_text(manifest, "attempt_id"),
-        "execution_id": _manifest_optional_text(manifest, "execution_id"),
-        "runner_call_index": _manifest_int(manifest, "runner_call_index"),
-        "runner_call_kind": _manifest_text(manifest, "runner_call_kind"),
-        "runner_call_trigger_reason": _manifest_text(manifest, "runner_call_trigger_reason"),
-        "iteration_id": _manifest_optional_text(manifest, "iteration_id"),
-        "iteration_index": manifest.get("iteration_index"),
-        "manifest_payload_ref": manifest_payload_ref,
-        "manifest_digest": manifest_digest,
-        "manifest_schema_version": _manifest_text(manifest, "schema_version"),
-        "validation_status": _RUNNER_CALL_VALIDATION_COMPLETE,
-        "message_count": _manifest_int(manifest, "message_count"),
-        "role_sequence_digest": _manifest_text(manifest, "role_sequence_digest"),
-        "input_projection_digest": _manifest_text(manifest, "input_projection_digest"),
-        "runner_call_projection_artifact_ref": _manifest_text(manifest, "runner_call_projection_artifact_ref"),
-        "runner_call_projection_artifact_digest": _manifest_text(manifest, "runner_call_projection_artifact_digest"),
-        "runner_call_projection_artifact_size_bytes": _manifest_int(
-            manifest, "runner_call_projection_artifact_size_bytes"
-        ),
-        "projector_metadata_summary": list(_projector_metadata_summary(manifest)),
-        "diagnostic": _complete_runner_call_hot_diagnostic(manifest),
-    }
-
-
-def _complete_runner_call_hot_diagnostic(manifest: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
-    """构造 complete runner-call hot payload diagnostic。
-
-    :param manifest: manifest body。
-    :returns: 自描述的 complete diagnostic object。
-    :raises HostDurableError: manifest 字段类型非法时抛出。
-    """
-
     message_count = _manifest_int(manifest, "message_count")
     role_sequence_digest = _manifest_text(manifest, "role_sequence_digest")
-    return {
-        "status": _RUNNER_CALL_VALIDATION_COMPLETE,
-        "reason": None,
-        "missing_atom_kind": None,
-        "missing_ref_kind": None,
-        "missing_ref": None,
-        "observed_count": message_count,
-        "expected_count": message_count,
-        "observed_digest": role_sequence_digest,
-        "expected_digest": role_sequence_digest,
-        "consumer_boundary": _RUNNER_CALL_EVENT_SOURCE,
-    }
+    return runner_call_hot_payload(
+        RunnerCallHotAtoms(
+            session_id=_manifest_text(manifest, "session_id"),
+            host_run_id=_manifest_text(manifest, "host_run_id"),
+            attempt_id=_manifest_optional_text(manifest, "attempt_id"),
+            execution_id=_manifest_optional_text(manifest, "execution_id"),
+            runner_call_index=_manifest_int(manifest, "runner_call_index"),
+            runner_call_kind=_manifest_text(manifest, "runner_call_kind"),
+            runner_call_trigger_reason=_manifest_text(
+                manifest, "runner_call_trigger_reason"
+            ),
+            iteration_id=_manifest_optional_text(manifest, "iteration_id"),
+            iteration_index=None,
+            manifest_payload_ref=manifest_payload_ref,
+            manifest_digest=manifest_digest,
+            manifest_schema_version=_manifest_text(manifest, "schema_version"),
+            validation_status=_RUNNER_CALL_VALIDATION_COMPLETE,
+            message_count=message_count,
+            role_sequence_digest=role_sequence_digest,
+            input_projection_digest=_manifest_text(
+                manifest, "input_projection_digest"
+            ),
+            runner_call_projection_artifact_ref=_manifest_text(
+                manifest, "runner_call_projection_artifact_ref"
+            ),
+            runner_call_projection_artifact_digest=_manifest_text(
+                manifest, "runner_call_projection_artifact_digest"
+            ),
+            runner_call_projection_artifact_size_bytes=_manifest_int(
+                manifest, "runner_call_projection_artifact_size_bytes"
+            ),
+            diagnostic=complete_runner_call_hot_diagnostic(
+                status=_RUNNER_CALL_VALIDATION_COMPLETE,
+                message_count=message_count,
+                role_sequence_digest=role_sequence_digest,
+                consumer_boundary=_RUNNER_CALL_EVENT_SOURCE,
+            ),
+        ),
+        manifest=manifest,
+    )
 
 
 def _runner_call_manifest_payload_ref(event_id: str) -> str:
@@ -4411,48 +4411,24 @@ def _projector_metadata(
     :returns: projector metadata JSON object。
     """
 
-    return {
-        "projector_metadata_id": metadata_id,
-        "projector_id": projector_id,
-        "projector_schema_version": _PROJECTOR_SCHEMA_VERSION,
-        "projector_digest": sha256_digest_json(
-            {
-                "projector_id": projector_id,
-                "projector_schema_version": _PROJECTOR_SCHEMA_VERSION,
-                "purpose": purpose,
-                "source_contract_refs": list(source_contract_refs),
-            }
-        ),
-        "purpose": purpose,
-        "source_contract_refs": list(source_contract_refs),
-    }
-
-
-def _projector_metadata_summary(manifest: Mapping[str, JsonValue]) -> tuple[Mapping[str, JsonValue], ...]:
-    """从 manifest body 复制 Tool Trace 可缓存的 projector metadata summary。
-
-    :param manifest: manifest body。
-    :returns: projector metadata summary 元组。
-    :raises HostDurableError: manifest projector metadata 结构非法时抛出。
-    """
-
-    value = manifest.get("projector_metadata")
-    if not isinstance(value, list):
-        raise HostDurableError("runner-call manifest projector_metadata is invalid")
-    summaries: list[Mapping[str, JsonValue]] = []
-    for item in value:
-        if not isinstance(item, Mapping):
-            raise HostDurableError("runner-call projector metadata must be object")
-        summaries.append(
-            {
-                "projector_metadata_id": _manifest_text(item, "projector_metadata_id"),
-                "projector_id": _manifest_text(item, "projector_id"),
-                "projector_schema_version": _manifest_text(item, "projector_schema_version"),
-                "projector_digest": _manifest_text(item, "projector_digest"),
-                "purpose": _manifest_text(item, "purpose"),
-            }
+    projector_digest = sha256_digest_json(
+        {
+            "projector_id": projector_id,
+            "projector_schema_version": _PROJECTOR_SCHEMA_VERSION,
+            "purpose": purpose,
+            "source_contract_refs": list(source_contract_refs),
+        }
+    )
+    return runner_call_projector_metadata_descriptor(
+        RunnerCallProjectorMetadata(
+            projector_metadata_id=metadata_id,
+            projector_id=projector_id,
+            projector_schema_version=_PROJECTOR_SCHEMA_VERSION,
+            projector_digest=projector_digest,
+            purpose=purpose,
+            source_contract_refs=source_contract_refs,
         )
-    return tuple(summaries)
+    )
 
 
 def _projector_metadata_id_for_message(

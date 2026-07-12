@@ -1614,7 +1614,7 @@ def test_tool_trace_does_not_inline_large_tool_call_arguments(
 
 
 def test_tool_trace_projects_runner_call_manifest_signal(tmp_path: Path) -> None:
-    """Tool Trace 只复制 runner-call manifest refs/digests 与摘要 signal。"""
+    """Tool Trace hot row 只复制 shared owner 校验后的 fixed scalars。"""
 
     cold_path = tmp_path / "trace" / "runner-call.jsonl"
     manifest_digest = sha256_digest_json({"manifest": "runner-call"})
@@ -1634,6 +1634,7 @@ def test_tool_trace_projects_runner_call_manifest_signal(tmp_path: Path) -> None
                 "runner_call_kind": "initial_user_dispatch",
                 "runner_call_trigger_reason": "initial_user_input",
                 "iteration_id": "iteration-1",
+                "iteration_index": 0,
                 "manifest_payload_ref": "payload-runner-call-manifest",
                 "manifest_digest": manifest_digest,
                 "manifest_schema_version": "runner_call_input_manifest.v1",
@@ -1641,18 +1642,21 @@ def test_tool_trace_projects_runner_call_manifest_signal(tmp_path: Path) -> None
                 "message_count": 2,
                 "role_sequence_digest": role_digest,
                 "input_projection_digest": projection_digest,
-                "projector_metadata_summary": [
-                    {
-                        "projector_metadata_id": "projector:0:system",
-                        "projector_id": "run_input_system_context",
-                        "projector_schema_version": "run_input_projector.v1",
-                        "projector_digest": sha256_digest_json(
-                            {"projector": "system"}
-                        ),
-                        "purpose": "ordinary_run_input",
-                    }
-                ],
-                "diagnostic": None,
+                "runner_call_projection_artifact_ref": None,
+                "runner_call_projection_artifact_digest": None,
+                "runner_call_projection_artifact_size_bytes": None,
+                "diagnostic": {
+                    "status": "complete",
+                    "reason": None,
+                    "missing_atom_kind": None,
+                    "missing_ref_kind": None,
+                    "missing_ref": None,
+                    "observed_count": 2,
+                    "expected_count": 2,
+                    "observed_digest": role_digest,
+                    "expected_digest": role_digest,
+                    "consumer_boundary": "host.run_input.builder",
+                },
             },
         )
 
@@ -1670,16 +1674,17 @@ def test_tool_trace_projects_runner_call_manifest_signal(tmp_path: Path) -> None
         assert row.trace_summary["message_count"] == 2
         assert row.trace_summary["role_sequence_digest"] == role_digest
         assert row.trace_summary["input_projection_digest"] == projection_digest
+        assert "projector_metadata_summary" not in row.trace_summary
         assert row.trace_summary["diagnostic"] == {
             "status": "complete",
             "reason": None,
             "missing_atom_kind": None,
             "missing_ref_kind": None,
             "missing_ref": None,
-            "observed_count": None,
-            "expected_count": None,
-            "observed_digest": None,
-            "expected_digest": None,
+            "observed_count": 2,
+            "expected_count": 2,
+            "observed_digest": role_digest,
+            "expected_digest": role_digest,
             "consumer_boundary": "tool_trace_query",
         }
         assert cold_lines[0]["trace_summary"] == row.trace_summary
@@ -1698,7 +1703,7 @@ def test_tool_trace_projects_limited_runner_call_manifest_diagnostic(
         "status": "limited_signal",
         "reason": "missing_projection_artifact",
         "missing_atom_kind": None,
-        "missing_ref_kind": "runner_call_projection_artifact",
+        "missing_ref_kind": "artifact_ref",
         "missing_ref": None,
         "observed_count": 3,
         "expected_count": None,
@@ -1720,6 +1725,7 @@ def test_tool_trace_projects_limited_runner_call_manifest_diagnostic(
                 "runner_call_kind": "tool_result_continuation",
                 "runner_call_trigger_reason": "tool_results_available",
                 "iteration_id": "iteration-2",
+                "iteration_index": 1,
                 "manifest_payload_ref": "payload-runner-call-manifest-limited",
                 "manifest_digest": manifest_digest,
                 "manifest_schema_version": "runner_call_input_manifest.v1",
@@ -1727,7 +1733,9 @@ def test_tool_trace_projects_limited_runner_call_manifest_diagnostic(
                 "message_count": 3,
                 "role_sequence_digest": role_digest,
                 "input_projection_digest": projection_digest,
-                "projector_metadata_summary": [],
+                "runner_call_projection_artifact_ref": None,
+                "runner_call_projection_artifact_digest": None,
+                "runner_call_projection_artifact_size_bytes": None,
                 "diagnostic": diagnostic,
             },
         )
@@ -1776,6 +1784,8 @@ def test_tool_trace_rejects_non_complete_runner_call_without_diagnostic(
                 "runner_call_index": 2,
                 "runner_call_kind": "tool_result_continuation",
                 "runner_call_trigger_reason": "tool_results_available",
+                "iteration_id": None,
+                "iteration_index": None,
                 "manifest_payload_ref": "payload-runner-call-manifest-missing",
                 "manifest_digest": sha256_digest_json(
                     {"manifest": "runner-call-missing-diagnostic"}
@@ -1787,7 +1797,9 @@ def test_tool_trace_rejects_non_complete_runner_call_without_diagnostic(
                 "input_projection_digest": sha256_digest_json(
                     {"projection": "missing-diagnostic"}
                 ),
-                "projector_metadata_summary": [],
+                "runner_call_projection_artifact_ref": None,
+                "runner_call_projection_artifact_digest": None,
+                "runner_call_projection_artifact_size_bytes": None,
                 "diagnostic": None,
             },
         )
@@ -1795,7 +1807,7 @@ def test_tool_trace_rejects_non_complete_runner_call_without_diagnostic(
             ToolTraceSinkOptions(cold_jsonl_path=tmp_path / "trace.jsonl")
         )
 
-        with pytest.raises(HostDurableError, match="runner-call diagnostic"):
+        with pytest.raises(HostDurableError, match="hot diagnostic"):
             store.transaction_runner.run_write(
                 lambda transaction: consumer.apply_event(
                     transaction,
@@ -1826,6 +1838,7 @@ def test_tool_trace_projects_mismatch_runner_call_diagnostic(
                 "runner_call_kind": "tool_result_continuation",
                 "runner_call_trigger_reason": "tool_results_available",
                 "iteration_id": "iteration-3",
+                "iteration_index": 2,
                 "manifest_payload_ref": "payload-runner-call-manifest-mismatch",
                 "manifest_digest": sha256_digest_json(
                     {"manifest": "runner-call-mismatch"}
@@ -1837,7 +1850,9 @@ def test_tool_trace_projects_mismatch_runner_call_diagnostic(
                 "input_projection_digest": sha256_digest_json(
                     {"projection": "mismatch"}
                 ),
-                "projector_metadata_summary": [],
+                "runner_call_projection_artifact_ref": None,
+                "runner_call_projection_artifact_digest": None,
+                "runner_call_projection_artifact_size_bytes": None,
                 "diagnostic": {
                     "status": "mismatch",
                     "reason": "role_sequence_digest_mismatch",

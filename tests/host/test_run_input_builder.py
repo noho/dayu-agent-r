@@ -1010,6 +1010,9 @@ def test_runner_call_manifest_is_bounded_and_does_not_inline_messages(
         )
         messages = _json_object_sequence(projection.payload["messages"])
         manifest_entries = _json_object_sequence(manifest["message_entries"])
+        projector_metadata = _json_object_sequence(
+            manifest["projector_metadata"]
+        )
         projection_descriptor = store.transaction_runner.run_read(
             lambda transaction: PayloadStore().read_payload_descriptor(
                 transaction,
@@ -1021,8 +1024,21 @@ def test_runner_call_manifest_is_bounded_and_does_not_inline_messages(
         assert projection_descriptor.sqlite_payload_id is None
         diagnostic = _json_object(hot_payload["diagnostic"])
         assert diagnostic["status"] == "complete"
+        assert "projector_metadata_summary" not in hot_payload
         assert messages[-1]["content"] == large_prompt
         assert len(messages) == len(manifest_entries)
+        assert len(projector_metadata) > 0
+        for item in projector_metadata:
+            assert frozenset(item) == frozenset(
+                {
+                    "projector_metadata_id",
+                    "projector_id",
+                    "projector_schema_version",
+                    "projector_digest",
+                    "purpose",
+                    "source_contract_refs",
+                }
+            )
         for message, entry in zip(messages, manifest_entries, strict=True):
             assert message["index"] == entry["index"]
             assert message["role"] == entry["role"]

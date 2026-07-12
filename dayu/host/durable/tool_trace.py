@@ -14,6 +14,13 @@ from enum import StrEnum
 from typing import cast
 
 from dayu.contracts.json_value import JsonValue
+from dayu.host._runner_call_manifest import (
+    RunnerCallHotAtoms,
+    RunnerCallHotDiagnostic,
+    RunnerCallInputManifest,
+    parse_runner_call_hot_payload,
+    parse_runner_call_manifest,
+)
 from dayu.host.durable._validation import (
     optional_text as _optional_text,
     require_int as _require_int,
@@ -21,18 +28,15 @@ from dayu.host.durable._validation import (
     require_optional_non_empty_text as _require_optional_non_empty_text,
     require_text as _require_text,
 )
-from dayu.host.durable.artifact import LocalArtifactRef, read_artifact_bytes
-from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
-from dayu.host.durable.errors import HostDurableError
-from dayu.host.durable.payload import (
-    PayloadDescriptor,
-    PayloadKind,
-    read_payload_descriptor,
+from dayu.host.durable.codec import (
+    canonical_json_dumps,
+    sha256_digest_json,
 )
+from dayu.host.durable.errors import HostDurableError
+from dayu.host.durable.payload_resolution import resolve_json_payload
 from dayu.host.durable.schema import (
     TABLE_EVENT_LOG,
     TABLE_HOST_TOOL_TRACE_HOT,
-    TABLE_SQLITE_PAYLOADS,
 )
 from dayu.host.durable.transaction import HostRow, HostTransaction, SQLiteScalar
 
@@ -44,22 +48,6 @@ _MIN_EVENT_CURSOR = 0
 _JSON_FIELD_DIAGNOSTIC_REFS = "diagnostic_refs"
 _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED = "RUNNER_CALL_INPUT_ASSEMBLED"
 _RUNNER_CALL_TRACE_EVENT_TYPE = "event_type"
-_RUNNER_CALL_TRACE_RUNNER_CALL_INDEX = "runner_call_index"
-_RUNNER_CALL_TRACE_RUNNER_CALL_KIND = "runner_call_kind"
-_RUNNER_CALL_TRACE_RUNNER_CALL_TRIGGER_REASON = "runner_call_trigger_reason"
-_RUNNER_CALL_TRACE_ITERATION_ID = "iteration_id"
-_RUNNER_CALL_TRACE_MANIFEST_REF = "manifest_ref"
-_RUNNER_CALL_TRACE_MANIFEST_DIGEST = "manifest_digest"
-_RUNNER_CALL_TRACE_MESSAGE_COUNT = "message_count"
-_RUNNER_CALL_TRACE_ROLE_SEQUENCE_DIGEST = "role_sequence_digest"
-_RUNNER_CALL_TRACE_INPUT_PROJECTION_DIGEST = "input_projection_digest"
-_RUNNER_CALL_TRACE_PROJECTOR_METADATA_SUMMARY = "projector_metadata_summary"
-_RUNNER_CALL_TRACE_DIAGNOSTIC = "diagnostic"
-_RUNNER_CALL_PROJECTOR_METADATA_ID = "projector_metadata_id"
-_RUNNER_CALL_PROJECTOR_ID = "projector_id"
-_RUNNER_CALL_PROJECTOR_SCHEMA_VERSION = "projector_schema_version"
-_RUNNER_CALL_PROJECTOR_DIGEST = "projector_digest"
-_RUNNER_CALL_PROJECTOR_PURPOSE = "purpose"
 _RUNNER_CALL_PROJECTION_ARTIFACT_REF = "runner_call_projection_artifact_ref"
 _RUNNER_CALL_PROJECTION_ARTIFACT_DIGEST = "runner_call_projection_artifact_digest"
 _TOOL_SCHEMA_SNAPSHOT_REF_PREFIX = "tool_schema_snapshot_ref:"
@@ -348,6 +336,18 @@ class RunnerCallResolvedProjection:
 
 
 @dataclass(frozen=True, slots=True)
+class _ValidatedRunnerCallContract:
+    """Tool Trace 查询边界已完整校验的 runner-call contract。
+
+    :param hot_payload: source EventLog 的 typed hot atoms。
+    :param manifest: durable resolver 与 full-manifest owner 已校验的 manifest。
+    """
+
+    hot_payload: RunnerCallHotAtoms
+    manifest: RunnerCallInputManifest
+
+
+@dataclass(frozen=True, slots=True)
 class ToolTraceResolvedRowPayloads:
     """Tool Trace hot row resolver 结果。
 
@@ -378,6 +378,8 @@ def resolve_runner_call_projection_from_signal(
 
     if signal.manifest_ref is None:
         raise HostDurableError("runner-call signal has no manifest_ref")
+    if signal.manifest_digest is None:
+        raise HostDurableError("runner-call signal has no manifest_digest")
     manifest = read_tool_trace_json_payload(
         transaction,
         signal.manifest_ref,
@@ -393,6 +395,8 @@ def resolve_runner_call_projection_from_signal(
     )
     if projection_ref is None:
         raise HostDurableError("runner-call manifest has no projection artifact ref")
+    if projection_digest is None:
+        raise HostDurableError("runner-call manifest has no projection artifact digest")
     projection = read_tool_trace_json_payload(
         transaction,
         projection_ref,
@@ -431,10 +435,10 @@ def resolve_tool_trace_hot_row_payloads(
     descriptor_payload = (
         None
         if descriptor_ref is None
-        else read_tool_trace_json_payload(
+        else _read_hot_row_descriptor_payload(
             transaction,
-            descriptor_ref,
-            expected_digest=descriptor_digest,
+            descriptor_ref=descriptor_ref,
+            descriptor_digest=descriptor_digest,
         )
     )
     return ToolTraceResolvedRowPayloads(
@@ -448,95 +452,55 @@ def read_tool_trace_json_payload(
     transaction: HostTransaction,
     payload_ref: str,
     *,
-    expected_digest: str | None,
+    expected_digest: str,
 ) -> ToolTraceResolvedJsonPayload:
     """读取并校验 Tool Trace resolver 使用的 JSON payload descriptor。
 
     :param transaction: 调用方提供的 Host durable transaction。
     :param payload_ref: payload descriptor ref。
-    :param expected_digest: 调用方期望 digest；为 ``None`` 时只校验 descriptor
-        与实际 payload 自洽。
+    :param expected_digest: 调用方持有的期望 digest。
     :returns: 已校验 digest 的 JSON payload。
     :raises HostDurableError: descriptor/payload 缺失、JSON 不是 object 或
         digest 不匹配时抛出。
     """
 
-    descriptor = read_payload_descriptor(transaction, payload_ref)
-    if descriptor is None:
-        raise HostDurableError("tool trace payload descriptor is missing")
-    if expected_digest is not None and descriptor.payload_digest != expected_digest:
-        raise HostDurableError("tool trace payload descriptor digest mismatch")
-    if descriptor.payload_kind is PayloadKind.SQLITE_PAYLOAD:
-        payload_json = _read_sqlite_payload_json(transaction, descriptor)
-    elif descriptor.payload_kind is PayloadKind.ARTIFACT_REF:
-        payload_json = _read_artifact_payload_json(transaction, descriptor)
-    else:
-        raise HostDurableError("tool trace payload kind is unsupported")
-    payload = _json_object_from_text(payload_json)
-    if sha256_digest_json(payload) != descriptor.payload_digest:
-        raise HostDurableError("tool trace payload digest mismatch")
+    resolved = resolve_json_payload(
+        transaction,
+        payload_ref=payload_ref,
+        expected_digest=expected_digest,
+    )
+    descriptor = resolved.descriptor
     return ToolTraceResolvedJsonPayload(
         payload_ref=descriptor.payload_ref,
         payload_digest=descriptor.payload_digest,
         payload_size_bytes=descriptor.payload_size_bytes,
         media_type=descriptor.media_type,
-        payload=payload,
+        payload=resolved.payload,
     )
 
 
-def _read_sqlite_payload_json(
+def _read_hot_row_descriptor_payload(
     transaction: HostTransaction,
-    descriptor: PayloadDescriptor,
-) -> str:
-    """读取 SQLite JSON payload 文本。
+    *,
+    descriptor_ref: str,
+    descriptor_digest: str | None,
+) -> ToolTraceResolvedJsonPayload:
+    """读取 Tool Trace hot row 声明的 descriptor payload。
 
     :param transaction: 调用方提供的 Host durable transaction。
-    :param descriptor: payload descriptor。
-    :returns: payload_json 文本。
-    :raises HostDurableError: SQLite payload id 或 row 缺失时抛出。
+    :param descriptor_ref: hot row/source event 声明的 descriptor ref。
+    :param descriptor_digest: hot row/source event 声明的 digest。
+    :returns: 已完成共享完整性校验的 JSON payload。
+    :raises HostDurableError: digest 缺失或 descriptor payload 非法时抛出。
     """
 
-    if descriptor.sqlite_payload_id is None:
-        raise HostDurableError("tool trace sqlite payload id is missing")
-    row = transaction.fetchone(
-        f"""
-        SELECT payload_json
-        FROM {TABLE_SQLITE_PAYLOADS}
-        WHERE payload_id = ?
-        """,
-        (descriptor.sqlite_payload_id,),
+    if descriptor_digest is None:
+        raise HostDurableError("tool trace descriptor digest is missing")
+    return read_tool_trace_json_payload(
+        transaction,
+        descriptor_ref,
+        expected_digest=descriptor_digest,
     )
-    if row is None:
-        raise HostDurableError("tool trace sqlite payload row is missing")
-    return _require_text(row.get("payload_json"), field_name="payload_json")
-
-
-def _read_artifact_payload_json(
-    transaction: HostTransaction,
-    descriptor: PayloadDescriptor,
-) -> str:
-    """读取 artifact JSON payload 文本。
-
-    :param transaction: 调用方提供的 Host durable transaction。
-    :param descriptor: payload descriptor。
-    :returns: artifact UTF-8 文本。
-    :raises HostDurableError: artifact descriptor 不完整、读取失败或 UTF-8 非法时抛出。
-    """
-
-    if descriptor.artifact_relative_path is None:
-        raise HostDurableError("tool trace artifact payload path is missing")
-    content = read_artifact_bytes(
-        transaction.artifact_root,
-        LocalArtifactRef(
-            artifact_relative_path=descriptor.artifact_relative_path,
-            artifact_digest=descriptor.payload_digest,
-            artifact_size_bytes=descriptor.payload_size_bytes,
-        ),
-    )
-    try:
-        return content.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise HostDurableError("tool trace artifact payload is not UTF-8 JSON") from exc
 
 
 def _resolve_selected_tool_schema_snapshot(
@@ -565,6 +529,8 @@ def _resolve_selected_tool_schema_snapshot(
             snapshot_digest = item.removeprefix(_TOOL_SCHEMA_SNAPSHOT_DIGEST_PREFIX)
     if snapshot_ref is None:
         return None
+    if snapshot_digest is None:
+        raise HostDurableError("tool schema snapshot digest is missing")
     return read_tool_trace_json_payload(
         transaction,
         snapshot_ref,
@@ -916,7 +882,9 @@ def read_runner_call_reconstruction_signals_by_run(
         limit=limit,
     )
     return RunnerCallReconstructionSignalPage(
-        signals=tuple(_runner_call_signal_from_hot_row(row) for row in page.rows),
+        signals=tuple(
+            _runner_call_signal_from_hot_row(transaction, row) for row in page.rows
+        ),
         next_event_sequence=page.next_event_sequence,
         has_more=page.has_more,
     )
@@ -992,21 +960,23 @@ def _query_page(
 
 
 def _runner_call_signal_from_hot_row(
+    transaction: HostTransaction,
     row: ToolTraceHotRow,
 ) -> RunnerCallReconstructionSignal:
     """把 hot row 转换为 typed runner-call reconstruction signal。
 
+    :param transaction: 调用方当前 Host durable transaction。
     :param row: Tool Trace hot row。
     :returns: typed runner-call reconstruction signal。
     :raises HostDurableError: row 不是 runner-call signal 或 summary 类型非法时抛出。
     """
 
     summary = row.trace_summary
-    event_type = _summary_required_text(
-        summary, _RUNNER_CALL_TRACE_EVENT_TYPE
-    )
+    event_type = _summary_required_text(summary, _RUNNER_CALL_TRACE_EVENT_TYPE)
     if event_type != _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED:
         raise HostDurableError("tool trace row is not runner-call signal")
+    contract = _validated_runner_call_contract(transaction, row)
+    hot_payload = contract.hot_payload
     return RunnerCallReconstructionSignal(
         event_id=row.event_id,
         event_sequence=row.event_sequence,
@@ -1014,132 +984,117 @@ def _runner_call_signal_from_hot_row(
         run_id=row.run_id,
         attempt_id=row.attempt_id,
         execution_id=row.execution_id,
-        runner_call_index=_summary_optional_int(
-            summary, _RUNNER_CALL_TRACE_RUNNER_CALL_INDEX
+        runner_call_index=hot_payload.runner_call_index,
+        runner_call_kind=hot_payload.runner_call_kind,
+        runner_call_trigger_reason=hot_payload.runner_call_trigger_reason,
+        iteration_id=hot_payload.iteration_id,
+        manifest_ref=hot_payload.manifest_payload_ref,
+        manifest_digest=hot_payload.manifest_digest,
+        message_count=hot_payload.message_count,
+        role_sequence_digest=hot_payload.role_sequence_digest,
+        input_projection_digest=hot_payload.input_projection_digest,
+        projector_metadata_summary=_projector_metadata_summary_from_manifest(
+            contract.manifest,
         ),
-        runner_call_kind=_summary_optional_text(
-            summary, _RUNNER_CALL_TRACE_RUNNER_CALL_KIND
-        ),
-        runner_call_trigger_reason=_summary_optional_text(
-            summary, _RUNNER_CALL_TRACE_RUNNER_CALL_TRIGGER_REASON
-        ),
-        iteration_id=_summary_optional_text(
-            summary, _RUNNER_CALL_TRACE_ITERATION_ID
-        ),
-        manifest_ref=_summary_optional_text(
-            summary, _RUNNER_CALL_TRACE_MANIFEST_REF
-        ),
-        manifest_digest=_summary_optional_text(
-            summary, _RUNNER_CALL_TRACE_MANIFEST_DIGEST
-        ),
-        message_count=_summary_optional_int(
-            summary, _RUNNER_CALL_TRACE_MESSAGE_COUNT
-        ),
-        role_sequence_digest=_summary_optional_text(
-            summary, _RUNNER_CALL_TRACE_ROLE_SEQUENCE_DIGEST
-        ),
-        input_projection_digest=_summary_optional_text(
-            summary, _RUNNER_CALL_TRACE_INPUT_PROJECTION_DIGEST
-        ),
-        projector_metadata_summary=_projector_metadata_summary_from_trace(summary),
-        diagnostic=_runner_call_diagnostic_from_trace(summary),
+        diagnostic=_runner_call_diagnostic_from_hot(hot_payload.diagnostic),
     )
 
 
-def _projector_metadata_summary_from_trace(
-    summary: Mapping[str, JsonValue],
+def _validated_runner_call_contract(
+    transaction: HostTransaction,
+    row: ToolTraceHotRow,
+) -> _ValidatedRunnerCallContract:
+    """从 source EventLog 与 manifest descriptor 构造完整 typed contract。
+
+    :param transaction: 调用方当前 Host durable transaction。
+    :param row: runner-call Tool Trace hot row。
+    :returns: hot/manifest 均完成 owner 校验的 contract。
+    :raises HostDurableError: source hot、row identity、descriptor integrity 或
+        full manifest semantic graph 非法时抛出。
+    """
+
+    hot_payload = parse_runner_call_hot_payload(
+        _read_event_payload(transaction, row.event_id)
+    )
+    if (
+        row.session_id != hot_payload.session_id
+        or row.run_id != hot_payload.host_run_id
+        or row.attempt_id != hot_payload.attempt_id
+        or row.execution_id != hot_payload.execution_id
+        or row.payload_ref != hot_payload.manifest_payload_ref
+        or row.payload_digest != hot_payload.manifest_digest
+    ):
+        raise HostDurableError("tool trace row and runner-call hot identity mismatch")
+    resolved_manifest = read_tool_trace_json_payload(
+        transaction,
+        hot_payload.manifest_payload_ref,
+        expected_digest=hot_payload.manifest_digest,
+    )
+    return _ValidatedRunnerCallContract(
+        hot_payload=hot_payload,
+        manifest=parse_runner_call_manifest(
+            resolved_manifest.payload,
+            hot_payload=hot_payload,
+        ),
+    )
+
+
+def _projector_metadata_summary_from_manifest(
+    manifest: RunnerCallInputManifest,
 ) -> tuple[ProjectorMetadataSummary, ...]:
-    """从 trace summary 读取 projector metadata summary。
+    """从 typed validated manifest 重建 projector metadata summary。
 
-    :param summary: runner-call trace summary。
+    :param manifest: full-manifest owner 已校验的 typed manifest。
     :returns: typed projector metadata summary 元组。
-    :raises HostDurableError: projector metadata summary 类型非法时抛出。
+    :raises: 无。
     """
 
-    value = summary.get(_RUNNER_CALL_TRACE_PROJECTOR_METADATA_SUMMARY)
-    if value is None:
-        return ()
-    if not isinstance(value, list):
-        raise HostDurableError(
-            "tool trace runner-call projector_metadata_summary must be array"
+    return tuple(
+        ProjectorMetadataSummary(
+            projector_metadata_id=metadata.projector_metadata_id,
+            projector_id=metadata.projector_id,
+            projector_schema_version=metadata.projector_schema_version,
+            projector_digest=metadata.projector_digest,
+            purpose=metadata.purpose,
         )
-    items: list[ProjectorMetadataSummary] = []
-    for item in value:
-        if not isinstance(item, Mapping):
-            raise HostDurableError(
-                "tool trace runner-call projector metadata item must be object"
-            )
-        item_mapping = cast(Mapping[str, JsonValue], item)
-        items.append(
-            ProjectorMetadataSummary(
-                projector_metadata_id=_summary_required_text(
-                    item_mapping, _RUNNER_CALL_PROJECTOR_METADATA_ID
-                ),
-                projector_id=_summary_required_text(
-                    item_mapping, _RUNNER_CALL_PROJECTOR_ID
-                ),
-                projector_schema_version=_summary_required_text(
-                    item_mapping, _RUNNER_CALL_PROJECTOR_SCHEMA_VERSION
-                ),
-                projector_digest=_summary_required_text(
-                    item_mapping, _RUNNER_CALL_PROJECTOR_DIGEST
-                ),
-                purpose=_summary_required_text(
-                    item_mapping, _RUNNER_CALL_PROJECTOR_PURPOSE
-                ),
-            )
-        )
-    return tuple(items)
+        for metadata in manifest.projector_metadata
+    )
 
 
-def _runner_call_diagnostic_from_trace(
-    summary: Mapping[str, JsonValue],
+def _runner_call_diagnostic_from_hot(
+    diagnostic: RunnerCallHotDiagnostic,
 ) -> RunnerCallReconstructionDiagnostic:
-    """从 trace summary 读取 typed runner-call diagnostic。
+    """把 shared owner diagnostic 投影为 Tool Trace typed diagnostic。
 
-    :param summary: runner-call trace summary。
+    :param diagnostic: shared owner 已校验的 hot diagnostic。
     :returns: typed runner-call diagnostic。
-    :raises HostDurableError: diagnostic 缺失、类型非法或 enum 值非法时抛出。
+    :raises HostDurableError: enum 文本不能投影到 Tool Trace contract 时抛出。
     """
 
-    value = summary.get(_RUNNER_CALL_TRACE_DIAGNOSTIC)
-    if not isinstance(value, Mapping):
-        raise HostDurableError("tool trace runner-call diagnostic must be object")
-    diagnostic = cast(Mapping[str, JsonValue], value)
     status = _runner_call_status_from_text(
-        _summary_required_text(diagnostic, "status"),
+        diagnostic.status,
         field_name="diagnostic.status",
     )
-    reason_text = _summary_optional_text(diagnostic, "reason")
-    missing_atom_text = _summary_optional_text(diagnostic, "missing_atom_kind")
-    missing_ref_text = _summary_optional_text(diagnostic, "missing_ref_kind")
-    if status is RunnerCallReconstructionStatus.COMPLETE and reason_text is not None:
-        raise HostDurableError("complete runner-call diagnostic reason must be absent")
-    if status is not RunnerCallReconstructionStatus.COMPLETE and reason_text is None:
-        raise HostDurableError("non-complete runner-call diagnostic reason is required")
     return RunnerCallReconstructionDiagnostic(
         status=status,
         reason=_optional_runner_call_reason_from_text(
-            reason_text,
+            diagnostic.reason,
             field_name="diagnostic.reason",
         ),
         missing_atom_kind=_optional_runner_call_missing_atom_kind_from_text(
-            missing_atom_text,
+            diagnostic.missing_atom_kind,
             field_name="diagnostic.missing_atom_kind",
         ),
         missing_ref_kind=_optional_runner_call_missing_ref_kind_from_text(
-            missing_ref_text,
+            diagnostic.missing_ref_kind,
             field_name="diagnostic.missing_ref_kind",
         ),
-        missing_ref=_summary_optional_text(diagnostic, "missing_ref"),
-        observed_count=_summary_optional_int(diagnostic, "observed_count"),
-        expected_count=_summary_optional_int(diagnostic, "expected_count"),
-        observed_digest=_summary_optional_text(diagnostic, "observed_digest"),
-        expected_digest=_summary_optional_text(diagnostic, "expected_digest"),
-        consumer_boundary=_runner_call_consumer_boundary_from_text(
-            _summary_required_text(diagnostic, "consumer_boundary"),
-            field_name="diagnostic.consumer_boundary",
-        ),
+        missing_ref=diagnostic.missing_ref,
+        observed_count=diagnostic.observed_count,
+        expected_count=diagnostic.expected_count,
+        observed_digest=diagnostic.observed_digest,
+        expected_digest=diagnostic.expected_digest,
+        consumer_boundary=(RunnerCallReconstructionConsumerBoundary.TOOL_TRACE_QUERY),
     )
 
 
