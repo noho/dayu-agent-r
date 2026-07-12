@@ -13,10 +13,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import TYPE_CHECKING, Protocol
 
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_await import ToolAwaitSpec
 from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolFailedOutcome
+from dayu.contracts.tool_result import ToolResultFailure
 from dayu.host._event_payload import (
     attempt_suspended_payload,
     llm_safe_replay_arguments,
@@ -32,7 +34,9 @@ from dayu.host.api import (
     AttemptStatus,
     HostApiError,
     HostApiErrorCode,
+    HostCallContext,
     HostPayloadRef,
+    OperationContext,
     ResolveWaitCancelledOutcome,
     ResolveWaitCompletedOutcome,
     ResolveWaitFailedOutcome,
@@ -40,6 +44,7 @@ from dayu.host.api import (
     ResolveWaitOutcome,
     ResolveWaitRequest,
     RunStatus,
+    WaitResolutionSource,
     WaitProviderStatusRef,
 )
 from dayu.host.durable.codec import (
@@ -69,6 +74,7 @@ from dayu.host.durable.schema import (
 )
 from dayu.host.durable.run_transition import (
     ResumeRunFromWaitingInput,
+    WaitResolutionTransitionResult,
     WaitingRunTerminalInput,
     fail_run_from_waiting_in_transaction,
     mark_run_lost_from_waiting_in_transaction,
@@ -119,12 +125,14 @@ from dayu.host.projection import (
     ProjectionCatchupPort,
     catch_up_projection_best_effort,
 )
-from dayu.host.wait_adapter import WaitAdapterBinding
 from dayu.host.wait_boundary import (
     WaitBoundaryDecisionKind,
     classify_wait_time_boundary,
 )
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
+
+if TYPE_CHECKING:
+    from dayu.host.wait_adapter import WaitAdapterBinding
 
 _LOGGER = logging.getLogger(__name__)
 _TOOL_AWAITING_ACCEPT_SCOPE_KIND = IdempotencyScopeKind.TOOL_AWAITING_ACCEPT
@@ -159,6 +167,10 @@ _TOOL_FACT_ID_PREFIX = "tool-fact-wait-"
 _WAIT_RESOLUTION_SOURCE = "host.resolve_wait"
 _WAIT_TERMINAL_REASON_FAILED = "wait_result_failed"
 _WAIT_TERMINAL_REASON_LOST = "wait_result_lost"
+_WAIT_EXPIRY_REASON = "wait_deadline_expired"
+_WAIT_EXPIRY_MESSAGE = "等待任务已超过 Host 期限，结果未被接受。"
+_WAIT_EXPIRY_SOURCE = "host.wait_expiry"
+_WAIT_EXPIRY_KEY_PREFIX = "wait-expiry-"
 _EVENT_TYPE_WAIT_LATE_RESULT_REJECTED = "WAIT_LATE_RESULT_REJECTED"
 
 
@@ -361,10 +373,62 @@ class ResolveWaitResult:
     :param run: resolve 后最新 Run row。
     :param dispatch_record: 新建 resume dispatch record；无则为 ``None``。
     :param idempotent_replay: 本次是否为幂等重放。
+    :param queue_promotion_session_id: terminal wait 释放 active slot 后需唤醒
+        queue promotion 的 Session id；无需唤醒时为 ``None``。
     """
 
     run: RunRow
     dispatch_record: DispatchRecordRow | None
+    idempotent_replay: bool
+    queue_promotion_session_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ExpireWaitInput:
+    """Host-internal wait expiry transaction 输入。
+
+    :param wait_id: 目标 wait record id。
+    :param observed_at: Host 确认 deadline 的 UTC aware 时间。
+    :param actor: canonical terminal fact actor。
+    :param source: 触发 expiry 检查的 typed 来源；不参与幂等 identity。
+    """
+
+    wait_id: str
+    observed_at: datetime
+    actor: str
+    source: WaitResolutionSource
+
+    def __post_init__(self) -> None:
+        """校验 expiry 输入。
+
+        :returns: ``None``。
+        :raises ValueError: 文本为空或 observed time 非 UTC aware 时抛出。
+        :raises TypeError: source 类型非法时抛出。
+        """
+
+        if self.wait_id.strip() == "":
+            raise ValueError("wait_id must be non-empty")
+        if self.actor.strip() == "":
+            raise ValueError("actor must be non-empty")
+        if self.observed_at.tzinfo is None or self.observed_at.utcoffset() is None:
+            raise ValueError("observed_at must be timezone-aware")
+        if self.observed_at.utcoffset() != UTC.utcoffset(self.observed_at):
+            raise ValueError("observed_at must be UTC")
+        if not isinstance(self.source, WaitResolutionSource):
+            raise TypeError("source must be WaitResolutionSource")
+
+
+@dataclass(frozen=True, slots=True)
+class ExpireWaitResult:
+    """wait expiry owner 的 transaction 结果。
+
+    :param transition: waiting terminal transition 或 CAS no-op snapshot。
+    :param queue_promotion_session_id: 本次实际释放 slot 后的 Session id。
+    :param idempotent_replay: expiry terminal 已由同一稳定 identity 提交。
+    """
+
+    transition: WaitResolutionTransitionResult
+    queue_promotion_session_id: str | None
     idempotent_replay: bool
 
 
@@ -373,9 +437,26 @@ class _LateRejectResult:
     """late wait result 已完成 durable diagnostic 后的内部拒绝结果。
 
     :param message: 对外错误消息。
+    :param queue_promotion_session_id: expiry 在同一 transaction 释放 slot 后需
+        commit 后唤醒的 Session id。
     """
 
     message: str
+    queue_promotion_session_id: str | None = None
+
+
+class QueuePromotionWakeupPort(Protocol):
+    """wait terminal commit 后唤醒 Session queue promotion 的最小端口。"""
+
+    def wake_queue_promotion(self, session_id: str) -> None:
+        """唤醒指定 Session 的 pre-start governance。
+
+        :param session_id: 已释放 active slot 的 Session id。
+        :returns: ``None``。
+        :raises Exception: wake bridge 失败时由调用方传播。
+        """
+
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -622,6 +703,7 @@ class DefaultHostResolveWaitService:
         event_log_store: EventLogStore | None = None,
         idempotency_store: IdempotencyStore | None = None,
         projection_catchup_port: ProjectionCatchupPort | None = None,
+        queue_promotion_wakeup_port: QueuePromotionWakeupPort | None = None,
     ) -> None:
         """初始化默认 resolve wait service。
 
@@ -629,6 +711,8 @@ class DefaultHostResolveWaitService:
         :param event_log_store: EventLog primitive；无则创建默认实现。
         :param idempotency_store: Idempotency primitive；无则创建默认实现。
         :param projection_catchup_port: commit 后 best-effort projection catch-up 端口。
+        :param queue_promotion_wakeup_port: terminal wait 释放 active slot 后的
+            queue promotion wake 端口；纯 transaction owner 测试可不提供。
         :returns: ``None``。
         """
 
@@ -642,6 +726,7 @@ class DefaultHostResolveWaitService:
             else IdempotencyStore()
         )
         self._projection_catchup_port = projection_catchup_port
+        self._queue_promotion_wakeup_port = queue_promotion_wakeup_port
 
     def resolve_wait(self, wait_id: str, request: ResolveWaitRequest) -> ResolveWaitResult:
         """接收等待结果并推进 Run。
@@ -669,13 +754,16 @@ class DefaultHostResolveWaitService:
                     transaction, wait_id, request
                 )
             )
+            catch_up_projection_best_effort(self._projection_catchup_port)
+            self._wake_queue_promotion_after_commit(
+                result.queue_promotion_session_id
+            )
             if isinstance(result, _LateRejectResult):
                 raise HostApiError(
                     code=HostApiErrorCode.INVALID_STATE,
                     message=result.message,
                     retryable=False,
                 )
-            catch_up_projection_best_effort(self._projection_catchup_port)
             _LOGGER.log(
                 VERBOSE_LOG_LEVEL,
                 (
@@ -699,6 +787,39 @@ class DefaultHostResolveWaitService:
                 message="resolve wait idempotency conflict",
                 retryable=False,
             ) from exc
+
+    def expire_wait(self, request: ExpireWaitInput) -> ExpireWaitResult:
+        """按 durable deadline 收口 wait 并执行 commit 后 projection/promotion。
+
+        :param request: expiry owner 输入。
+        :returns: expiry transition 结果。
+        :raises HostApiError: wait 缺失、边界非法或仍未到期时抛出。
+        :raises HostDurableError: durable transaction 失败时透传。
+        """
+
+        result = self._transaction_runner.run_write(
+            lambda transaction: _expire_wait_in_transaction(
+                transaction,
+                request,
+            )
+        )
+        catch_up_projection_best_effort(self._projection_catchup_port)
+        self._wake_queue_promotion_after_commit(
+            result.queue_promotion_session_id
+        )
+        return result
+
+    def _wake_queue_promotion_after_commit(self, session_id: str | None) -> None:
+        """在 transaction commit 与 projection catch-up 后执行 promotion wake。
+
+        :param session_id: 需唤醒的 Session id；无则为 ``None``。
+        :returns: ``None``。
+        :raises Exception: wake bridge 失败时透传，避免静默丢失 committed work。
+        """
+
+        if session_id is None or self._queue_promotion_wakeup_port is None:
+            return
+        self._queue_promotion_wakeup_port.wake_queue_promotion(session_id)
 
     def _resolve_in_transaction(
         self,
@@ -747,6 +868,19 @@ class DefaultHostResolveWaitService:
                 WaitRecordStatus.RESOLVED,
                 WaitRecordStatus.FAILED,
             ):
+                if (
+                    wait_record.status is WaitRecordStatus.FAILED
+                    and wait_record.resolve_idempotency_key is not None
+                    and wait_record.resolve_idempotency_key.startswith(
+                        _WAIT_EXPIRY_KEY_PREFIX
+                    )
+                ):
+                    return self._reject_late_result(
+                        transaction=transaction,
+                        wait_record=wait_record,
+                        request=request,
+                        rejection_reason=WaitLateRejectionReason.WAIT_EXPIRED,
+                    )
                 raise HostApiError(
                     code=HostApiErrorCode.INVALID_STATE,
                     message="wait record is already resolved by another key",
@@ -782,11 +916,36 @@ class DefaultHostResolveWaitService:
                 retryable=False,
             )
         if boundary_decision.kind is WaitBoundaryDecisionKind.EXPIRED:
-            return self._reject_late_result(
+            expiry = _expire_wait_in_transaction(
+                transaction,
+                ExpireWaitInput(
+                    wait_id=wait_id,
+                    observed_at=request.observed_at,
+                    actor=request.context.actor,
+                    source=request.source,
+                ),
+            )
+            expired_wait = expiry.transition.wait_record
+            if expired_wait is None:
+                latest_wait = read_wait_record_by_id(transaction, wait_id)
+                if latest_wait is None:
+                    raise HostApiError(
+                        code=HostApiErrorCode.NOT_FOUND,
+                        message="wait record not found after expiry",
+                        retryable=False,
+                    )
+                expired_wait = latest_wait
+            late_result = self._reject_late_result(
                 transaction=transaction,
-                wait_record=wait_record,
+                wait_record=expired_wait,
                 request=request,
                 rejection_reason=WaitLateRejectionReason.WAIT_EXPIRED,
+            )
+            return _LateRejectResult(
+                message=late_result.message,
+                queue_promotion_session_id=(
+                    expiry.queue_promotion_session_id
+                ),
             )
         if owner_run.status in (
             RunStatus.SUCCEEDED,
@@ -1095,6 +1254,7 @@ class DefaultHostResolveWaitService:
             run=transition.run,
             dispatch_record=None,
             idempotent_replay=False,
+            queue_promotion_session_id=transition.run.session_id,
         )
 
     def _resolve_lost(
@@ -1163,8 +1323,233 @@ class DefaultHostResolveWaitService:
             run=transition.run,
             dispatch_record=None,
             idempotent_replay=False,
+            queue_promotion_session_id=transition.run.session_id,
         )
 
+
+def _expire_wait_in_transaction(
+    transaction: HostTransaction,
+    input: ExpireWaitInput,
+) -> ExpireWaitResult:
+    """在调用方提供的 transaction 内按 durable deadline 收口 wait。
+
+    本 helper 不打开 transaction、不调用 public resolver。expiry identity 只由
+    wait id、实际 durable boundary 与固定 reason 派生；actor/source 只进入首个
+    获胜 terminal fact 的审计字段。
+
+    :param transaction: 调用方已打开的 Host write transaction。
+    :param input: expiry owner 输入。
+    :returns: updated、idempotent replay 或 CAS no-op typed 结果。
+    :raises HostApiError: wait 缺失、边界非法或尚未到期时抛出。
+    :raises HostDurableError: terminal transition 或幂等记录失败时透传。
+    """
+
+    wait_record = read_wait_record_by_id(transaction, input.wait_id)
+    if wait_record is None:
+        raise HostApiError(
+            code=HostApiErrorCode.NOT_FOUND,
+            message="wait record not found",
+            retryable=False,
+        )
+    owner_run = read_run_by_id(transaction, wait_record.run_id)
+    if owner_run is None:
+        raise HostApiError(
+            code=HostApiErrorCode.NOT_FOUND,
+            message="wait owner run not found",
+            retryable=False,
+        )
+    if wait_record.status is not WaitRecordStatus.WAITING:
+        expiry_replay = (
+            wait_record.resolve_idempotency_key is not None
+            and wait_record.resolve_idempotency_key.startswith(
+                _WAIT_EXPIRY_KEY_PREFIX
+            )
+        )
+        return ExpireWaitResult(
+            transition=_expiry_noop_transition(
+                wait_record=wait_record,
+                run=owner_run,
+            ),
+            queue_promotion_session_id=None,
+            idempotent_replay=expiry_replay,
+        )
+    decision = classify_wait_time_boundary(wait_record, observed_at=input.observed_at)
+    if decision.kind is WaitBoundaryDecisionKind.INVALID:
+        raise HostApiError(
+            code=HostApiErrorCode.INVALID_STATE,
+            message="wait record contains invalid time boundary",
+            retryable=False,
+        )
+    if decision.kind is WaitBoundaryDecisionKind.ACTIVE:
+        raise HostApiError(
+            code=HostApiErrorCode.INVALID_STATE,
+            message="wait deadline has not expired",
+            retryable=False,
+        )
+    boundary_value = (
+        wait_record.deadline_at
+        if decision.boundary_field == "deadline_at"
+        else wait_record.expires_at
+    )
+    if boundary_value is None:
+        raise HostDurableError("expired wait boundary value is missing")
+    expiry_digest = sha256_digest_json(
+        {
+            "wait_id": wait_record.wait_id,
+            "boundary_field": decision.boundary_field,
+            "boundary_value": boundary_value,
+            "reason": _WAIT_EXPIRY_REASON,
+        }
+    )
+    suffix = expiry_digest.removeprefix("sha256:")
+    expiry_key = f"{_WAIT_EXPIRY_KEY_PREFIX}{suffix}"
+    scope = _wait_resolution_scope(wait_record.wait_id, expiry_key)
+    idempotency_store = IdempotencyStore()
+    existing = idempotency_store.read_idempotency_record(transaction, scope)
+    if existing is not None:
+        if existing.semantic_input_digest != expiry_digest:
+            raise HostIdempotencyConflictError(
+                "wait expiry stable idempotency digest conflict"
+            )
+        return ExpireWaitResult(
+            transition=_expiry_noop_transition(
+                wait_record=wait_record,
+                run=owner_run,
+            ),
+            queue_promotion_session_id=None,
+            idempotent_replay=True,
+        )
+    request = ResolveWaitRequest(
+        context=HostCallContext(
+            actor=input.actor,
+            source=_WAIT_EXPIRY_SOURCE,
+            request_id=f"wait-expiry-{suffix}",
+            authorization_claims=(),
+            operation_context=OperationContext(
+                operation_name="expire_wait",
+                operation_kind="background",
+                business_domain="host_wait",
+                business_object_type="wait",
+                business_object_id=wait_record.wait_id,
+                scenario=None,
+                correlation_id=None,
+            ),
+        ),
+        idempotency_key=expiry_key,
+        outcome=ResolveWaitFailedOutcome(
+            result=ToolResultFailure(
+                ok=False,
+                error=_WAIT_EXPIRY_REASON,
+                message=_WAIT_EXPIRY_MESSAGE,
+                hint=None,
+                meta=None,
+            ),
+            payload_ref=None,
+        ),
+        source=input.source,
+        observed_at=input.observed_at,
+    )
+    payload_plan = _wait_resolution_payload_plan(request)
+    event_plan = _resolve_wait_event_plan(expiry_digest)
+    event_log_store = EventLogStore()
+    transition = fail_run_from_waiting_in_transaction(
+        transaction,
+        event_log_store,
+        WaitingRunTerminalInput(
+            wait_id=wait_record.wait_id,
+            run_id=wait_record.run_id,
+            suspended_attempt_id=wait_record.attempt_id,
+            tool_result_event_id=event_plan.tool_result_event_id,
+            run_terminal_event_id=event_plan.run_failed_event_id,
+            run_terminal_status=RunStatus.FAILED,
+            wait_terminal_status=WaitRecordStatus.FAILED,
+            occurred_at=input.observed_at,
+            actor=input.actor,
+            source=_WAIT_EXPIRY_SOURCE,
+            reason=_WAIT_EXPIRY_REASON,
+            message=_WAIT_EXPIRY_MESSAGE,
+            resolution_idempotency_key=expiry_key,
+            resolution_digest=expiry_digest,
+            tool_result_payload=_tool_result_resolution_payload(
+                transaction=transaction,
+                event_log_store=event_log_store,
+                wait_record=wait_record,
+                request=request,
+                payload_plan=payload_plan,
+                event_plan=event_plan,
+                wait_status_after=WaitRecordStatus.FAILED,
+                resume=False,
+            ),
+            tool_result_payload_ref=None,
+            tool_result_payload_digest=None,
+        ),
+    )
+    if transition.status is not StateMutationStatus.UPDATED:
+        return ExpireWaitResult(
+            transition=transition,
+            queue_promotion_session_id=None,
+            idempotent_replay=False,
+        )
+    created_event_id, created_event_sequence = _transition_created_event_ref(
+        transition
+    )
+    idempotency_store.record_idempotent_result(
+        transaction,
+        scope,
+        expiry_digest,
+        IdempotencyResultRef(
+            result_kind=_WAIT_RESOLUTION_RESULT_KIND,
+            result_ref=wait_record.wait_id,
+            created_event_id=created_event_id,
+            created_event_sequence=created_event_sequence,
+        ),
+    )
+    return ExpireWaitResult(
+        transition=transition,
+        queue_promotion_session_id=owner_run.session_id,
+        idempotent_replay=False,
+    )
+
+
+def _expiry_noop_transition(
+    *,
+    wait_record: WaitRecordRow,
+    run: RunRow,
+) -> WaitResolutionTransitionResult:
+    """构造 first-committer loser 的 typed durable snapshot。
+
+    :param wait_record: 当前 wait truth。
+    :param run: 当前 owner Run truth。
+    :returns: 不含新 event/dispatch 的 CAS_LOST transition。
+    """
+
+    return WaitResolutionTransitionResult(
+        status=StateMutationStatus.CAS_LOST,
+        run=run,
+        attempt=None,
+        dispatch_record=None,
+        wait_record=wait_record,
+        resume_requested_event=None,
+        tool_result_event=None,
+        run_event=None,
+        attempt_started_event=None,
+    )
+
+
+def _transition_created_event_ref(
+    transition: WaitResolutionTransitionResult,
+) -> tuple[str, int]:
+    """读取 expiry transition 的稳定 created event ref。
+
+    :param transition: 已成功 terminal 的 wait transition。
+    :returns: tool result event id 与 sequence。
+    :raises HostDurableError: transition 缺失 created event 时抛出。
+    """
+
+    event = transition.tool_result_event
+    if event is None:
+        raise HostDurableError("wait expiry transition has no tool result event")
+    return event.event_id, event.event_sequence
 
 @dataclass(frozen=True, slots=True)
 class _AwaitingEventPlan:

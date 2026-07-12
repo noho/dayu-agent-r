@@ -71,12 +71,14 @@ from dayu.host.command import (
     close_session as _close_session,
     create_session as _create_session,
     ensure_session as _ensure_session,
+    expire_wait as _expire_wait,
     purge_session as _purge_session,
     resolve_wait as _resolve_wait,
     retry_run as _retry_run,
     replay_run as _replay_run,
     submit_followup as _submit_followup,
 )
+from dayu.host.waiting import ExpireWaitInput, ExpireWaitResult
 from dayu.host.command import (
     _durable_options_from_public_options as _durable_options_from_command_options,
 )
@@ -135,6 +137,7 @@ from dayu.host.wait_adapter import (
     WaitPollerRuntimePolicy,
     WaitPollerSupervisor,
 )
+from dayu.host._wait_observation import WaitObservationRunner
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
 if TYPE_CHECKING:
@@ -451,6 +454,16 @@ class _CommandHandleWaitResolver:
 
         return _resolve_wait(self._command_handle, wait_id, request)
 
+    def expire_wait(self, request: ExpireWaitInput) -> ExpireWaitResult:
+        """通过 command path 执行 common wait expiry owner。
+
+        :param request: expiry owner 输入。
+        :returns: expiry transition 结果。
+        :raises Exception: durable transition 或 wake bridge 失败时透传。
+        """
+
+        return _expire_wait(self._command_handle, request)
+
 
 class _ClosingWaitPoller(WaitPoller):
     """poll_once 后关闭当前 poll round 私有 command handle。"""
@@ -497,10 +510,15 @@ class _OpenHostWaitPollerFactory(WaitPollerFactory):
     policy: WaitPollerRuntimePolicy
     owner_id: str
 
-    def create_wait_poller(self, lifecycle_gate: WaitPollLifecycleGate) -> WaitPoller:
+    def create_wait_poller(
+        self,
+        lifecycle_gate: WaitPollLifecycleGate,
+        observation_runner: WaitObservationRunner,
+    ) -> WaitPoller:
         """在调用线程内打开独立 durable store 并创建 wait poller。
 
         :param lifecycle_gate: supervisor close gate。
+        :param observation_runner: supervisor-owned bounded observation runner。
         :returns: 单轮 poller wrapper。
         :raises Exception: durable store 或 poller 构造失败时透传。
         """
@@ -526,6 +544,7 @@ class _OpenHostWaitPollerFactory(WaitPollerFactory):
                 context=_wait_poller_call_context(self.owner_id),
                 policy=self.policy,
                 lifecycle_gate=lifecycle_gate,
+                observation_runner=observation_runner,
                 owner_id=self.owner_id,
             )
             return _ClosingWaitPoller(command_handle=command_handle, poller=poller)

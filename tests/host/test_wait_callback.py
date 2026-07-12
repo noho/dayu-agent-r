@@ -396,7 +396,7 @@ def test_expired_callback_is_rejected_by_resolve_owner(
         )
         assert result.status is WaitCallbackAdapterStatus.INVALID_WAIT_STATE
         assert wait_record is not None
-        assert wait_record.status is WaitRecordStatus.WAITING
+        assert wait_record.status is WaitRecordStatus.FAILED
         assert len(late_events) == 1
     finally:
         host.close()

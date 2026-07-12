@@ -2375,6 +2375,24 @@ wait record 状态语义：
 - `cancelled`：Host 已取消 Run 或等待，不再接受该 wait record 的结果作为 `canonical_fact` 进入 EventLog。
 - `lost`：Host 无法确认外部 job 状态，且 policy 放弃继续等待。
 
+deadline 与 observation timeout 是两个不同的 Host 事实。Host 在 durable
+`deadline_at` / `expires_at` 到期后确认 expiry 时，必须在一个 write transaction
+内追加失败型 `TOOL_RESULT_ACCEPTED` 与 `RUN_FAILED`、把 wait 收为 `failed` 并释放
+Session active slot；该失败固定使用 `wait_deadline_expired`，不能解释为 `lost`，也不能
+接受 deadline 后到达的 provider success。poll、callback 与 direct/manual result 都委托
+同一个 transaction-local expiry helper；迟到结果只在 expiry commit 后追加 diagnostic，
+projection catch-up 与 queue promotion wake 必须先于向 caller 返回 late-result error。
+
+同步 wait adapter observation 受 Host runtime policy 的 finite-positive 单次调用预算、
+finite-positive close drain 预算与 positive outstanding cap 约束。每个 invocation 使用只持
+adapter、immutable wait snapshot、发布 token 与单槽结果通道的 daemon thread；token 按
+`ACTIVE -> INVALIDATED -> FINISHED` 迁移。timeout 或 supervisor close 必须先撤销发布权，
+迟到结果只能以 `publish=false` 丢弃，不能接触 resolver 或 durable authority。poll observation
+超时表示外部状态不可确认，wait / Run 收为 `lost(wait_observation_timeout)`；cancelled wait 的
+abandon 超时只写 `wait_abandon_timeout` diagnostic/close marker，不宣称 provider 已取消成功。
+supervisor close 对 poller loop 与全部 observation thread 只使用一个 shared monotonic deadline；
+预算耗尽后可保持 `CLOSING` 有界返回，最后一个 tracked thread finally 结束后才进入 `STOPPED`。
+
 Resume 策略分层：
 
 ```text
@@ -2416,7 +2434,7 @@ resume policy 覆盖 internal / manual、poll、callback 三类入口。所有�
 - Engine 不读取 wait record，也不恢复旧 Agent / Runner。
 - Host recovery scan 遇到 `WAITING` Run 时不得创建新 Attempt；它只能恢复 wait record 的 adapter 状态。
 - wait record 的 `resume_policy` / `await_spec` / `external_job_id` 必须包含足以在 Host restart 后恢复 adapter observation 的 durable refs。adapter registry / lookup 由 Host composition root 提供 typed adapter binding；wait record 只保存 adapter key / policy ref / external job refs，不保存进程内 adapter 对象。
-- `poll` adapter 从 wait record 读取 `external_job_id` / `await_spec` 后继续轮询，并在完成时调用同一个 `resolve_wait`。生产 poller 由 `open_host` composition root 在显式配置 poll adapter registry 与 wait poller policy 后启动；默认不启动。poller 每轮通过 durable claim / expiry / next-observe / backoff 字段判断 wait record 是否可观察，防止多个 poller 同时处理同一 wait。正常 `not_ready` 表示外部 job 仍在运行，只写入短间隔 next-observe，不增加错误 backoff attempt；adapter error、missing adapter、resolve error 或 shutdown-skipped 才写入可重试 backoff。没有可 claim wait record 时，supervisor 使用 idle 间隔降低空查频率；有 active wait 但未到 next-observe / claim expiry 时，supervisor 睡眠到下一次 due 或 idle 上限，并可被本地 wakeup 打断。空轮询不逐轮输出空摘要日志。claim / backoff 只约束 poll observation 资格，不是 Attempt ownership、EventLog truth 或外部 job ownership。
+- `poll` adapter 从 wait record 读取 `external_job_id` / `await_spec` 后继续轮询，并在完成时调用同一个 `resolve_wait`；若 provider observation 前已确认 durable deadline，则调用 common expiry helper，provider call count 必须为零。生产 poller 由 `open_host` composition root 在显式配置 poll adapter registry 与 wait poller policy 后启动；默认不启动。poller 每轮通过 durable claim / expiry / next-observe / backoff 字段判断 wait record 是否可观察，防止多个 poller 同时处理同一 wait。正常 `not_ready` 表示外部 job 仍在运行，只写入短间隔 next-observe，不增加错误 backoff attempt；adapter error、missing adapter、capacity、resolve error 或 shutdown-skipped 才写入可重试 backoff。没有可 claim wait record 时，supervisor 使用 idle 间隔降低空查频率；有 active wait 但未到 next-observe / claim expiry 时，supervisor 睡眠到下一次 due 或 idle 上限，并可被本地 wakeup 打断。空轮询不逐轮输出空摘要日志。claim / backoff 只约束 poll observation 资格，不是 Attempt ownership、EventLog truth 或外部 job ownership。
 - `callback` source 在 Phase 7 只保留 adapter contract 与 common pipeline 入口；专属 HTTP callback 服务、认证入口、复杂
   重放防护和外部系统专属 callback adapter 不属于第一版实现。后续 callback 产品化入口必须验证认证、重放防护和 idempotency
   key，然后调用同一个 `resolve_wait`。

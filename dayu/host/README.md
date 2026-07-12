@@ -84,7 +84,7 @@ execution public command / read / watch 统一提交给单 worker durable actor�
 - `read_outbox_terminal_items(session_id, request)`：读取离线 terminal notification item。
 - `drain_outbox_terminal_items(session_id, request)`：幂等标记 terminal notification item 已 drain。
 - `watch_session_events(session_id)`：创建 live HostEvent 订阅；订阅从当前 live cursor 开始，不提供离线 replay cursor。
-- `close()`：关闭当前 execution runtime；停止新 public call 后先关闭 wait poller并 drain actor command / wake，再按 scheduler、projection flush、actor handle、actor executor、scheduler store 的顺序释放资源。该操作不写用户 cancel / failed terminal facts。
+- `close()`：关闭当前 execution runtime；停止新 public call 后先用 finite shared deadline 关闭 wait poller、撤销全部 adapter observation token，再 drain actor command / wake，随后按 scheduler、projection flush、actor handle、actor executor、scheduler store 的顺序释放资源。仍阻塞的 provider thread 不持 Host durable authority，supervisor 保持 `CLOSING`，最后一个 thread finally 后才变为 `STOPPED`。该操作不写用户 cancel / failed terminal facts。
 
 `HostAdmin` handle 当前提供：
 
@@ -228,6 +228,8 @@ Service / Web transport
 - 只返回 typed `WaitCallbackAdapterResult` 与 stable status / diagnostic code；不回显 outcome payload 或 credential material。
 
 状态迁移仍由 Host 既有 `resolve_wait` 管线负责。同一 `(wait_id, idempotency_key)` 与相同 outcome digest 的重复 callback 是 replay；同 key 不同 outcome 是 idempotency conflict；已 cancel、已 terminal、已 resolved、failed 或 lost 的 late result 不恢复旧 Attempt。command-layer callback port 在非 replay 且创建 resume dispatch 时唤醒 dispatch，replay 不重复唤醒。
+
+durable deadline expiry 由 wait state machine 的 common transaction-local helper 拥有。poll、callback 或 direct result 在 `observed_at` 已越过 durable boundary 时，Host 先把 Wait / Run 同事务收为 `FAILED`，写入固定 `wait_deadline_expired` failure fact，commit 后完成 projection 与 queue-promotion wake，再向迟到 caller 返回 `INVALID_STATE`；expiry 不是 `LOST`，deadline 后 provider success 不会被接受。同步 poll / abandon adapter 调用由 Host-owned bounded observation runner 执行，policy 明确限制单次调用、outstanding invocation 与 close drain；timeout/close 先把 token 从 `ACTIVE` 置为 `INVALIDATED`，迟到线程只能 dropped publish，不能写 durable state。
 
 这个边界当前不包含真实 HTTP route、secret backend、HMAC / bearer verifier、生产 poller、physical cancel、Engine contract 或 UI surface。需要暴露 Web endpoint 时，应在 Host 外部的 Service / Web composition root 中注册路由，构造 framework-neutral request，注入 callback adapter，然后让 Host 按上述 typed callback path 处理。
 

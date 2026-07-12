@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import pathlib
 import re
+import math
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -67,7 +68,9 @@ else:
         backoff_max_delay_seconds: float
         not_ready_observe_interval_seconds: float
         idle_poll_interval_seconds: float
-        close_drain_timeout_seconds: float | None
+        adapter_call_timeout_seconds: float
+        close_drain_timeout_seconds: float
+        max_outstanding_adapter_calls: int
 
 _DEFAULT_COMMAND_MINIMUM_PROTECTION_TOKENS = 256
 
@@ -346,9 +349,31 @@ def _validate_wait_poller_policy(policy: WaitPollerRuntimePolicy) -> None:
         policy.idle_poll_interval_seconds,
         field_name="OpenHostOptions.wait_poller_policy.idle_poll_interval_seconds",
     )
-    _require_optional_positive_float(
+    _require_positive_float(
+        policy.adapter_call_timeout_seconds,
+        field_name=(
+            "OpenHostOptions.wait_poller_policy.adapter_call_timeout_seconds"
+        ),
+    )
+    if not math.isfinite(float(policy.adapter_call_timeout_seconds)):
+        raise ValueError(
+            "OpenHostOptions.wait_poller_policy.adapter_call_timeout_seconds "
+            "must be finite"
+        )
+    _require_positive_float(
         policy.close_drain_timeout_seconds,
         field_name="OpenHostOptions.wait_poller_policy.close_drain_timeout_seconds",
+    )
+    if not math.isfinite(float(policy.close_drain_timeout_seconds)):
+        raise ValueError(
+            "OpenHostOptions.wait_poller_policy.close_drain_timeout_seconds "
+            "must be finite"
+        )
+    _require_positive_int(
+        policy.max_outstanding_adapter_calls,
+        field_name=(
+            "OpenHostOptions.wait_poller_policy.max_outstanding_adapter_calls"
+        ),
     )
 
 

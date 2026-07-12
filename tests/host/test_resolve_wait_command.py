@@ -39,6 +39,7 @@ from dayu.host import (
     RunStatus,
     WaitProviderStatusRef,
     WaitResolutionSource,
+    get_run,
     resolve_wait,
 )
 from dayu.host.api import EnsureSessionRequest, HostCommandHandleOptions, WaitAdapterKey
@@ -236,7 +237,7 @@ def test_resolve_wait_survives_projection_catchup_failure(
 def test_resolve_wait_rejects_expired_wait_from_common_owner(
     tmp_path: Path,
 ) -> None:
-    """过期 wait 在 common resolve owner 内拒绝，不进入 resume 或业务 LOST。"""
+    """过期 wait 由 common owner 收为 FAILED 后拒绝迟到结果。"""
 
     host = create_host_command_handle(_options(tmp_path))
     try:
@@ -255,7 +256,8 @@ def test_resolve_wait_rejects_expired_wait_from_common_owner(
             _events(host._transaction_runner()), "WAIT_LATE_RESULT_REJECTED"
         )
         assert error_info.value.code is HostApiErrorCode.INVALID_STATE
-        assert wait_record.status is WaitRecordStatus.WAITING
+        assert wait_record.status is WaitRecordStatus.FAILED
+        assert get_run(host, seeded.run_id).status is RunStatus.FAILED
         assert len(late_events) == 1
     finally:
         host.close()

@@ -22,7 +22,12 @@ from dayu.host import (
     get_run,
     resolve_wait,
 )
-from dayu.host.command import HostCommandHandle, create_host_command_handle
+from dayu.host.api import HostCommandHandleOptions
+from dayu.host.command import (
+    HostCommandHandle,
+    create_host_command_handle,
+    expire_wait,
+)
 from dayu.host.durable.codec import format_utc_timestamp, sha256_digest_json
 from dayu.host.durable.schema import TABLE_HOST_WAIT_RECORDS
 from dayu.host.durable.state import WaitPollLastOutcome, WaitRecordRow, WaitRecordStatus
@@ -48,6 +53,7 @@ from dayu.host.wait_adapter import (
     WaitPoller,
     WaitResolvePort,
 )
+from dayu.host.waiting import ExpireWaitInput, ExpireWaitResult
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 from tests.host.test_resolve_wait_command import (
     _context,
@@ -93,6 +99,15 @@ class _PublicCommandResolver:
 
         return resolve_wait(self._host, wait_id, request)
 
+    def expire_wait(self, request: ExpireWaitInput) -> ExpireWaitResult:
+        """执行 common expiry owner。
+
+        :param request: expiry 输入。
+        :returns: expiry transition。
+        """
+
+        return expire_wait(self._host, request)
+
 
 class _FailingResolveResolver:
     """测试用始终抛出 resolve_wait 异常的 resolver。"""
@@ -119,6 +134,17 @@ class _FailingResolveResolver:
         self.idempotency_keys.append(request.idempotency_key)
         raise RuntimeError("resolve wait failed")
 
+    def expire_wait(self, request: ExpireWaitInput) -> ExpireWaitResult:
+        """模拟 expiry resolver 失败。
+
+        :param request: expiry 输入。
+        :returns: 永不返回。
+        :raises RuntimeError: 始终抛出。
+        """
+
+        self.calls.append(request.wait_id)
+        raise RuntimeError("expire wait failed")
+
 
 class _NoResolveResolver:
     """测试用禁止调用 resolve_wait 的 resolver。"""
@@ -144,6 +170,17 @@ class _NoResolveResolver:
         self.calls.append(wait_id)
         raise AssertionError(f"unexpected resolve_wait for {wait_id}")
 
+    def expire_wait(self, request: ExpireWaitInput) -> ExpireWaitResult:
+        """禁止 expiry 调用。
+
+        :param request: expiry 输入。
+        :returns: 永不返回。
+        :raises AssertionError: 任何调用都表示测试路径错误。
+        """
+
+        self.calls.append(request.wait_id)
+        raise AssertionError(f"unexpected expire_wait for {request.wait_id}")
+
 
 class _RecordingPublicCommandResolver:
     """记录 idempotency key 后调用 public ``resolve_wait`` 的 resolver。"""
@@ -168,6 +205,15 @@ class _RecordingPublicCommandResolver:
 
         self.idempotency_keys.append(request.idempotency_key)
         return resolve_wait(self._host, wait_id, request)
+
+    def expire_wait(self, request: ExpireWaitInput) -> ExpireWaitResult:
+        """执行 common expiry owner。
+
+        :param request: expiry 输入。
+        :returns: expiry transition。
+        """
+
+        return expire_wait(self._host, request)
 
 
 class _SequenceAdapter:
@@ -328,17 +374,17 @@ class _AbandonClaimStealingAdapter:
 
     def __init__(
         self,
-        transaction_runner: HostTransactionRunner,
+        options: HostCommandHandleOptions,
         lifecycle_result: WaitExternalJobLifecycleResult | None = None,
     ) -> None:
         """初始化 adapter。
 
-        :param transaction_runner: Host transaction runner。
+        :param options: observation thread 内创建独立 durable handle 的选项。
         :param lifecycle_result: adapter 返回的 lifecycle result。
         :returns: ``None``。
         """
 
-        self._transaction_runner = transaction_runner
+        self._options = options
         self._lifecycle_result = (
             lifecycle_result
             if lifecycle_result is not None
@@ -395,21 +441,25 @@ class _AbandonClaimStealingAdapter:
                 ),
             )
 
-        self._transaction_runner.run_write(operation)
+        thread_host = create_host_command_handle(self._options)
+        try:
+            thread_host._transaction_runner().run_write(operation)
+        finally:
+            thread_host.close()
         return self._lifecycle_result
 
 
 class _AbandonAlreadyMarkedAdapter:
     """abandon 调用中保留当前 claim 但制造 abandoned marker CAS 冲突。"""
 
-    def __init__(self, transaction_runner: HostTransactionRunner) -> None:
+    def __init__(self, options: HostCommandHandleOptions) -> None:
         """初始化 adapter。
 
-        :param transaction_runner: Host transaction runner。
+        :param options: observation thread 内创建独立 durable handle 的选项。
         :returns: ``None``。
         """
 
-        self._transaction_runner = transaction_runner
+        self._options = options
         self.abandoned: list[str] = []
 
     def poll_wait(self, wait_record: WaitRecordRow) -> WaitPollResult:
@@ -449,7 +499,11 @@ class _AbandonAlreadyMarkedAdapter:
                 ("2026-05-16T02:00:01.000000Z", wait_record.wait_id),
             )
 
-        self._transaction_runner.run_write(operation)
+        thread_host = create_host_command_handle(self._options)
+        try:
+            thread_host._transaction_runner().run_write(operation)
+        finally:
+            thread_host.close()
         return WaitExternalJobLifecycleApplied(
             action=WaitExternalJobLifecycleAction.ABANDON,
             message="test_abandoned",
@@ -1293,10 +1347,11 @@ def test_expired_poll_wait_is_released_before_provider_observation(
         assert result.resolved == 0
         assert result.lost == 0
         assert result.not_ready == 0
-        assert wait_record.status is WaitRecordStatus.WAITING
+        assert wait_record.status is WaitRecordStatus.FAILED
         assert wait_record.poll_claim_id is None
-        assert wait_record.poll_last_outcome is WaitPollLastOutcome.BOUNDARY_REJECTED
-        assert wait_record.poll_last_error_code == "wait_expired"
+        assert wait_record.poll_last_outcome is None
+        assert wait_record.poll_last_error_code is None
+        assert get_run(host, seeded.run_id).status is RunStatus.FAILED
         if isinstance(adapter, _SequenceAdapter):
             assert adapter.poll_count == 0
         if isinstance(adapter, _FailingPollAdapter):
@@ -1359,7 +1414,7 @@ def test_abandon_cas_conflict_leaves_cancelled_wait_retryable(
                 mode=CancelMode.GRACEFUL,
             ),
         )
-        adapter = _AbandonClaimStealingAdapter(host._transaction_runner())
+        adapter = _AbandonClaimStealingAdapter(_options(tmp_path))
         poller = _poller(host, adapter, seeded.wait_id)
 
         result = poller.poll_once()
@@ -1392,7 +1447,7 @@ def test_abandon_cas_lost_releases_current_claim(
                 mode=CancelMode.GRACEFUL,
             ),
         )
-        adapter = _AbandonAlreadyMarkedAdapter(host._transaction_runner())
+        adapter = _AbandonAlreadyMarkedAdapter(_options(tmp_path))
         poller = _poller(host, adapter, seeded.wait_id)
 
         result = poller.poll_once()
@@ -1446,7 +1501,7 @@ def test_terminal_abandon_cas_conflict_leaves_cancelled_wait_retryable(
             ),
         )
         adapter = _AbandonClaimStealingAdapter(
-            host._transaction_runner(),
+            _options(tmp_path),
             lifecycle_result=lifecycle_result,
         )
         poller = _poller(host, adapter, seeded.wait_id)

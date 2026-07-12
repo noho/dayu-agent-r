@@ -201,7 +201,7 @@ def test_late_result_after_cancel_writes_bounded_diagnostic(
         assert diagnostics[0].reason_json == '{"reason_code":"wait_cancelled"}'
         assert after_replay == after_first
         assert _events(host._transaction_runner()) == after_first
-        assert projection.calls == 0
+        assert projection.calls == 2
         assert _attempt_count(host._transaction_runner()) == attempt_count_before_late
         late_event_types = [
             event.event_type for event in after_first[len(events_before_late) :]

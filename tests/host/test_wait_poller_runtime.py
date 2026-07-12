@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import logging
+import math
 import inspect
 import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, cast
 
 import pytest
 from dayu.contracts.tool_result import ToolResultSuccess
@@ -21,7 +22,8 @@ from dayu.host import (
     resolve_wait,
 )
 from dayu.host.api import HostCommandHandleOptions
-from dayu.host.command import HostCommandHandle, create_host_command_handle
+from dayu.host.command import HostCommandHandle, create_host_command_handle, expire_wait
+from dayu.host._wait_observation import WaitObservationRunner
 from dayu.host.durable.state import WaitPollLastOutcome, WaitRecordRow, WaitRecordStatus
 from dayu.host.wait_adapter import (
     WaitExternalJobLifecycleAction,
@@ -42,6 +44,7 @@ from dayu.host.wait_adapter import (
     WaitPollReady,
     WaitPollResult,
 )
+from dayu.host.waiting import ExpireWaitInput, ExpireWaitResult
 from tests.host.test_resolve_wait_command import (
     _context,
     _options,
@@ -63,7 +66,9 @@ class _PolicyKwargs(TypedDict):
     backoff_max_delay_seconds: float
     not_ready_observe_interval_seconds: float
     idle_poll_interval_seconds: float
-    close_drain_timeout_seconds: float | None
+    adapter_call_timeout_seconds: float
+    close_drain_timeout_seconds: float
+    max_outstanding_adapter_calls: int
 
 
 class _FixedClock:
@@ -141,6 +146,15 @@ class _PublicCommandResolver:
 
         return resolve_wait(self._host, wait_id, request)
 
+    def expire_wait(self, request: ExpireWaitInput) -> ExpireWaitResult:
+        """执行 common expiry owner。
+
+        :param request: expiry 输入。
+        :returns: expiry transition。
+        """
+
+        return expire_wait(self._host, request)
+
 
 class _ClosingWaitPoller(WaitPoller):
     """poll_once 后关闭私有 Host handle 的测试 poller。"""
@@ -196,10 +210,15 @@ class _HandlePollerFactory:
         self._clock = clock
         self._owner_id = owner_id
 
-    def create_wait_poller(self, lifecycle_gate: WaitPollLifecycleGate) -> WaitPoller:
+    def create_wait_poller(
+        self,
+        lifecycle_gate: WaitPollLifecycleGate,
+        observation_runner: WaitObservationRunner,
+    ) -> WaitPoller:
         """在调用线程内创建 wait poller。
 
         :param lifecycle_gate: supervisor close gate。
+        :param observation_runner: supervisor-owned observation runner。
         :returns: wait poller。
         """
 
@@ -212,6 +231,7 @@ class _HandlePollerFactory:
             policy=self._policy,
             clock=self._clock,
             lifecycle_gate=lifecycle_gate,
+            observation_runner=observation_runner,
             owner_id=self._owner_id,
         )
         return _ClosingWaitPoller(host=host, poller=poller)
@@ -379,15 +399,20 @@ class _SelfClosingPollerFactory:
 
         self._close_call = close_call
 
-    def create_wait_poller(self, lifecycle_gate: WaitPollLifecycleGate) -> WaitPoller:
+    def create_wait_poller(
+        self,
+        lifecycle_gate: WaitPollLifecycleGate,
+        observation_runner: WaitObservationRunner,
+    ) -> WaitPoller:
         """创建 self-close poller。
 
         :param lifecycle_gate: supervisor close gate，本测试不读取。
+        :param observation_runner: supervisor-owned observation runner，本测试不读取。
         :returns: self-close poller。
         :raises RuntimeError: close 调用尚未绑定时抛出。
         """
 
-        del lifecycle_gate
+        del lifecycle_gate, observation_runner
         if self._close_call is None:
             raise RuntimeError("close call is not bound")
         return _SelfClosingPoller(
@@ -443,14 +468,19 @@ class _FailingOncePollerFactory:
         self.failed_once = threading.Event()
         self.recovered = threading.Event()
 
-    def create_wait_poller(self, lifecycle_gate: WaitPollLifecycleGate) -> WaitPoller:
+    def create_wait_poller(
+        self,
+        lifecycle_gate: WaitPollLifecycleGate,
+        observation_runner: WaitObservationRunner,
+    ) -> WaitPoller:
         """创建 poller。
 
         :param lifecycle_gate: supervisor close gate，本测试不需要读取。
+        :param observation_runner: supervisor-owned observation runner，本测试不读取。
         :returns: 单次失败 poller。
         """
 
-        del lifecycle_gate
+        del lifecycle_gate, observation_runner
         return _FailingOncePoller(self)
 
 
@@ -478,6 +508,7 @@ def test_runtime_policy_rejects_non_positive_values() -> None:
         "backoff_max_delay_seconds",
         "not_ready_observe_interval_seconds",
         "idle_poll_interval_seconds",
+        "adapter_call_timeout_seconds",
         "close_drain_timeout_seconds",
     ):
         values = _policy_kwargs()
@@ -496,17 +527,39 @@ def test_runtime_policy_rejects_non_positive_values() -> None:
         assert "claim_batch_size" in str(exc)
     else:
         raise AssertionError("claim_batch_size accepted non-positive value")
+    values = _policy_kwargs()
+    values["max_outstanding_adapter_calls"] = 0
+    with pytest.raises(ValueError, match="max_outstanding_adapter_calls"):
+        WaitPollerRuntimePolicy(**values)
 
 
-def test_runtime_policy_allows_none_close_drain_timeout() -> None:
-    """close_drain_timeout_seconds 可为 None。"""
+def test_runtime_policy_rejects_none_close_drain_timeout() -> None:
+    """close_drain_timeout_seconds 不允许无界 ``None``。"""
 
     values = _policy_kwargs()
-    values["close_drain_timeout_seconds"] = None
+    values["close_drain_timeout_seconds"] = cast(float, None)
 
-    policy = WaitPollerRuntimePolicy(**values)
+    with pytest.raises((TypeError, ValueError), match="close_drain_timeout_seconds"):
+        WaitPollerRuntimePolicy(**values)
 
-    assert policy.close_drain_timeout_seconds is None
+
+@pytest.mark.parametrize("invalid", (math.inf, -math.inf, math.nan))
+def test_runtime_policy_rejects_non_finite_observation_budgets(
+    invalid: float,
+) -> None:
+    """adapter 与 close budget 均拒绝 non-finite 数值。
+
+    :param invalid: non-finite 测试值。
+    """
+
+    for field_name in (
+        "adapter_call_timeout_seconds",
+        "close_drain_timeout_seconds",
+    ):
+        values = _policy_kwargs()
+        values[field_name] = invalid
+        with pytest.raises(ValueError, match=field_name):
+            WaitPollerRuntimePolicy(**values)
 
 
 def test_drain_once_for_test_processes_ready_and_not_ready(
@@ -813,7 +866,7 @@ def test_close_before_resolve_skips_result_and_leaves_wait_retryable(
 def test_close_drain_timeout_records_and_waits_for_inflight_poll(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """close drain timeout 只记录诊断，close 仍等待 in-flight poll 停止。"""
+    """close shared budget 到期后有界返回并保持 CLOSING。"""
 
     options = _options(tmp_path)
     host = create_host_command_handle(options)
@@ -830,29 +883,36 @@ def test_close_drain_timeout_records_and_waits_for_inflight_poll(
             _wait_until(
                 lambda: supervisor.diagnostics_snapshot().close_drain_timeouts == 1
             )
-            assert close_thread.is_alive()
+            close_thread.join(1.0)
+            assert not close_thread.is_alive()
+            assert (
+                supervisor.diagnostics_snapshot().status
+                is WaitPollerLoopStatus.CLOSING
+            )
             _read_wait(host._transaction_runner(), seeded.wait_id)
             adapter.release.set()
-            close_thread.join(1.0)
+            _wait_until(
+                lambda: supervisor.diagnostics_snapshot().status
+                is WaitPollerLoopStatus.STOPPED
+            )
 
-        assert not close_thread.is_alive()
         assert "wait poller close drain timeout" in caplog.text
         assert supervisor.diagnostics_snapshot().status is WaitPollerLoopStatus.STOPPED
     finally:
         host.close()
 
 
-def test_close_with_no_drain_timeout_waits_without_timeout_diagnostic(
+def test_close_with_finite_budget_after_inflight_release_has_no_timeout_diagnostic(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """close_drain_timeout_seconds=None 时 close 直接等待且不记录 timeout。"""
+    """in-flight 已释放时 finite close budget 不产生 timeout diagnostic。"""
 
     options = _options(tmp_path)
     host = create_host_command_handle(options)
     try:
         seeded = _seed_waiting_run(host)
         adapter = _BlockingReadyAdapter()
-        policy = _runtime_policy(close_drain_timeout_seconds=None)
+        policy = _runtime_policy(close_drain_timeout_seconds=0.2)
         supervisor = _supervisor(
             host,
             adapter,
@@ -863,17 +923,11 @@ def test_close_with_no_drain_timeout_waits_without_timeout_diagnostic(
 
         supervisor.open()
         assert adapter.entered.wait(1.0)
+        adapter.release.set()
         with caplog.at_level(logging.WARNING, logger="dayu.host.wait_adapter"):
-            close_thread = threading.Thread(target=supervisor.close)
-            close_thread.start()
-            time.sleep(0.05)
-            assert close_thread.is_alive()
-            assert supervisor.diagnostics_snapshot().close_drain_timeouts == 0
-            adapter.release.set()
-            close_thread.join(1.0)
+            supervisor.close()
 
         diagnostics = supervisor.diagnostics_snapshot()
-        assert not close_thread.is_alive()
         assert diagnostics.status is WaitPollerLoopStatus.STOPPED
         assert diagnostics.close_drain_timeouts == 0
         assert "wait poller close drain timeout" not in caplog.text
@@ -1059,12 +1113,11 @@ def _handle_poller_factory(
 
 
 def _runtime_policy(
-    *, close_drain_timeout_seconds: float | None = 0.02
+    *, close_drain_timeout_seconds: float = 0.02
 ) -> WaitPollerRuntimePolicy:
     """构造测试用 runtime policy。
 
-    :param close_drain_timeout_seconds: close drain timeout 秒数；``None``
-        表示不记录首次 timeout 诊断。
+    :param close_drain_timeout_seconds: finite-positive close shared budget 秒数。
     :returns: runtime policy。
     """
 
@@ -1088,7 +1141,9 @@ def _policy_kwargs() -> _PolicyKwargs:
         "backoff_max_delay_seconds": 20.0,
         "not_ready_observe_interval_seconds": 0.01,
         "idle_poll_interval_seconds": 0.05,
+        "adapter_call_timeout_seconds": 0.05,
         "close_drain_timeout_seconds": 0.02,
+        "max_outstanding_adapter_calls": 4,
     }
 
 

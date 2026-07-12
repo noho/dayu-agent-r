@@ -130,7 +130,11 @@ from dayu.host.wait_callback import (
     WaitCallbackStoredWaitState,
     WaitCallbackStoredWaitStatus,
 )
-from dayu.host.waiting import DefaultHostResolveWaitService
+from dayu.host.waiting import (
+    DefaultHostResolveWaitService,
+    ExpireWaitInput,
+    ExpireWaitResult,
+)
 from dayu.runtime.filelock import RuntimeFileLockError
 from dayu.runtime.log_levels import VERBOSE_LOG_LEVEL
 
@@ -782,6 +786,7 @@ def resolve_wait(host: HostCommandHandle, wait_id: str, request: ResolveWaitRequ
             event_log_store=host._admission_service.event_log_store,
             idempotency_store=host._admission_service.idempotency_store,
             projection_catchup_port=(host._admission_service.projection_catchup_port),
+            queue_promotion_wakeup_port=host._admission_service.wakeup_port,
         )
         result = service.resolve_wait(wait_id, request)
     except HostDurableError as exc:
@@ -801,6 +806,30 @@ def resolve_wait(host: HostCommandHandle, wait_id: str, request: ResolveWaitRequ
         None if result.dispatch_record is None else result.dispatch_record.dispatch_record_id,
     )
     return run_snapshot_from_row(result.run)
+
+
+def expire_wait(host: HostCommandHandle, request: ExpireWaitInput) -> ExpireWaitResult:
+    """通过 command handle 执行 Host-internal wait expiry。
+
+    :param host: poll round 私有 Host command handle。
+    :param request: expiry owner 输入。
+    :returns: expiry transition 结果。
+    :raises HostApiError: handle 已关闭、wait 缺失或边界无效时抛出。
+    :raises HostDurableError: durable transition 失败时转换或透传。
+    """
+
+    host._raise_if_closed()
+    try:
+        service = DefaultHostResolveWaitService(
+            transaction_runner=host._transaction_runner(),
+            event_log_store=host._admission_service.event_log_store,
+            idempotency_store=host._admission_service.idempotency_store,
+            projection_catchup_port=host._admission_service.projection_catchup_port,
+            queue_promotion_wakeup_port=host._admission_service.wakeup_port,
+        )
+        return service.expire_wait(request)
+    except HostDurableError as exc:
+        raise _host_api_error_from_durable_error(exc) from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -865,6 +894,9 @@ class HostCommandWaitCallbackPort(CallbackWaitResolvePort, WaitCallbackStateRead
                 idempotency_store=self.host._admission_service.idempotency_store,
                 projection_catchup_port=(
                     self.host._admission_service.projection_catchup_port
+                ),
+                queue_promotion_wakeup_port=(
+                    self.host._admission_service.wakeup_port
                 ),
             )
             result = service.resolve_wait(wait_id, request)

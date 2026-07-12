@@ -49,7 +49,9 @@ class _InvalidWaitPollerPolicy:
     backoff_max_delay_seconds: float = 300.0
     not_ready_observe_interval_seconds: float = 1.0
     idle_poll_interval_seconds: float = 5.0
-    close_drain_timeout_seconds: float | None = 5.0
+    adapter_call_timeout_seconds: float = 30.0
+    close_drain_timeout_seconds: float = 5.0
+    max_outstanding_adapter_calls: int = 8
 
 
 class _FrozenSlotsDataclassClass(Protocol):
