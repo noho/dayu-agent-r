@@ -81,4 +81,3 @@ def test_prepare_host_admin_loads_only_host_runtime_without_models_or_secrets(
     assert not hasattr(result.options, "lane_name")
     assert not hasattr(result.options, "tooling_options")
     assert not hasattr(result.options, "ordinary_run_baseline")
-
