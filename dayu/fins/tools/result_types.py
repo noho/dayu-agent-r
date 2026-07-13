@@ -7,8 +7,8 @@
 - 默认 ``total=True``（所有字段 Required）；仅条件出现的键标注 ``NotRequired``。
 - 深层嵌套结构（单条 match / 单条 row / 单条 fact 等）保留 ``dict[str, Any]``，
   后续可按需进一步收窄。
-- ``get_financial_statement`` 和 ``query_xbrl_facts`` 因 processor ``**spread``
-  动态输出，保持 ``total=False`` 并通过 ``cast`` 桥接。
+- ``get_financial_statement`` 和 ``query_xbrl_facts`` 逐字段投影已校验的领域结果，
+  核心业务字段全部 required。
 - ``NotSupportedResult`` 为三个降级路径共享返回类型，因 ``payload.update()``
   动态附加字段，保持 ``total=False`` 并通过 ``cast`` 桥接。
 """
@@ -20,6 +20,14 @@ from typing import Any, NotRequired, TypedDict
 
 from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.base import SectionSummary, TableSummary
+from dayu.fins.domain.financial_result_contract import (
+    FinancialPeriod,
+    FinancialScale,
+    FinancialStatementReason,
+    StatementLocator,
+)
+from dayu.fins.domain.filing_semantics import FinancialDataQuality
+from dayu.fins.domain.xbrl_result_contract import XbrlQueryReason
 
 # ---------------------------------------------------------------------------
 # 共享子结构
@@ -235,40 +243,21 @@ class PageContentResult(TypedDict):
 # ---------------------------------------------------------------------------
 
 
-class StatementLocator(TypedDict, total=False):
-    """财务报表定位信息。"""
-
-    statement_type: str
-    period_labels: list[str]
-    row_labels: list[str]
-
-
-class _FinancialStatementBase(TypedDict):
-    """Service 层及 processor 核心字段。"""
+class FinancialStatementResult(TypedDict):
+    """``get_financial_statement`` 的完整公共投影。"""
 
     ticker: str
     document_id: str
     citation: dict[str, Any]
     statement_type: str
+    periods: list[FinancialPeriod]
+    rows: list[dict[str, JsonValue]]
     currency: str | None
     units: str | None
-    rows: list[dict[str, JsonValue]]
+    scale: FinancialScale | None
+    data_quality: FinancialDataQuality
+    reason: FinancialStatementReason | None
     statement_locator: StatementLocator
-
-
-class FinancialStatementResult(_FinancialStatementBase, total=False):
-    """``get_financial_statement`` 返回结构。
-
-    核心字段继承自 ``_FinancialStatementBase``（Required）；
-    processor 可能附带的额外字段保持 ``NotRequired``。
-    因 processor 输出为 ``dict[str, Any]``，整个结构通过 ``cast`` 桥接。
-    """
-
-    # processor 可能附带的额外字段
-    period_labels: list[str]
-    column_headers: list[str]
-    header: dict[str, JsonValue]
-    supported: bool
 
 
 # ---------------------------------------------------------------------------
@@ -293,8 +282,8 @@ class XbrlQueryParams(_XbrlQueryParamsBase, total=False):
     max_value: float | None
 
 
-class _XbrlQueryBase(TypedDict):
-    """Service + normalizer 层保证的字段。"""
+class XbrlQueryResult(TypedDict):
+    """``query_xbrl_facts`` 的完整公共投影。"""
 
     ticker: str
     document_id: str
@@ -302,15 +291,6 @@ class _XbrlQueryBase(TypedDict):
     query_params: XbrlQueryParams
     facts: list[dict[str, JsonValue]]
     total: int
-
-
-class XbrlQueryResult(_XbrlQueryBase, total=False):
-    """``query_xbrl_facts`` 返回结构。
-
-    核心字段继承自 ``_XbrlQueryBase``（Required）；
-    因底层通过 ``**normalized_payload`` spread 合入，整个结构通过 ``cast`` 桥接。
-    """
-
-    # processor 可能附带的额外字段
-    supported: bool
     deduped_fact_count: int
+    data_quality: FinancialDataQuality
+    reason: XbrlQueryReason | None

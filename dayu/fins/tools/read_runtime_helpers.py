@@ -15,7 +15,7 @@ import json
 import re
 from collections.abc import Mapping
 from html import unescape
-from typing import Any, NoReturn, Optional, Protocol, cast, runtime_checkable
+from typing import Any, NoReturn, Optional, Protocol, TypedDict, cast, runtime_checkable
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
@@ -25,7 +25,13 @@ from dayu.documents.processors.base import (
     SectionSummary,
     TableContent,
 )
-from dayu.fins.domain.xbrl_result_contract import validate_xbrl_facts_result_payload
+from dayu.fins.domain.xbrl_result_contract import (
+    XbrlFactsPayload,
+    validate_xbrl_facts_result_payload,
+)
+from dayu.fins.domain.financial_result_contract import infer_financial_scale_from_decimals
+from dayu.fins.domain.filing_semantics import FinancialDataQuality
+from dayu.fins.domain.xbrl_result_contract import XbrlQueryReason
 from .result_types import NotSupportedResult
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.domain.filing_semantics import normalize_sec_form_type_for_matching
@@ -1414,11 +1420,22 @@ def _resolve_default_xbrl_concepts(*, form_type: Optional[str], taxonomy: Option
     return list(_GLOBAL_DEFAULT_XBRL_CONCEPTS)
 
 
+class NormalizedXbrlQueryPayload(TypedDict):
+    """read-side 去重后的 XBRL 公共投影核心字段。"""
+
+    query_params: dict[str, JsonValue]
+    facts: list[dict[str, JsonValue]]
+    total: int
+    deduped_fact_count: int
+    data_quality: FinancialDataQuality
+    reason: XbrlQueryReason | None
+
+
 def _normalize_xbrl_query_payload(
     *,
-    payload: Mapping[str, JsonValue],
+    payload: XbrlFactsPayload,
     default_concepts: list[str],
-) -> dict[str, Any]:
+) -> NormalizedXbrlQueryPayload:
     """标准化 `query_xbrl_facts` 的输出载荷。
 
     Args:
@@ -1433,28 +1450,30 @@ def _normalize_xbrl_query_payload(
     """
 
     validated = validate_xbrl_facts_result_payload(payload)
-    query_params: dict[str, Any] = dict(validated.query_params)
-    query_params["concepts"] = _normalize_concepts_for_query(query_params.get("concepts"), default_concepts)
+    query_params: dict[str, JsonValue] = dict(validated.query_params)
+    normalized_concepts: list[JsonValue] = []
+    for concept in _normalize_concepts_for_query(query_params.get("concepts"), default_concepts):
+        normalized_concepts.append(concept)
+    query_params["concepts"] = normalized_concepts
 
-    normalized_pairs: list[tuple[dict[str, Any], dict[str, Any], int]] = []
+    normalized_pairs: list[
+        tuple[dict[str, JsonValue], dict[str, JsonValue], int]
+    ] = []
     for index, raw_fact in enumerate(validated.facts):
-        if not isinstance(raw_fact, Mapping):
-            continue
         normalized_fact = _normalize_single_fact(raw_fact)
         if normalized_fact is None:
             continue
         normalized_pairs.append((normalized_fact, dict(raw_fact), index))
 
     deduped_facts = _deduplicate_xbrl_facts(normalized_pairs)
-    normalized_payload: dict[str, Any] = dict(payload)
-    normalized_payload["query_params"] = query_params
-    normalized_payload["facts"] = deduped_facts
-    normalized_payload["total"] = validated.total
-    if len(deduped_facts) != validated.total:
-        normalized_payload["deduped_fact_count"] = len(deduped_facts)
-    else:
-        normalized_payload.pop("deduped_fact_count", None)
-    return normalized_payload
+    return NormalizedXbrlQueryPayload(
+        query_params=query_params,
+        facts=deduped_facts,
+        total=validated.total,
+        deduped_fact_count=len(deduped_facts),
+        data_quality=validated.data_quality,
+        reason=validated.reason,
+    )
 
 
 def _normalize_concepts_for_query(raw_concepts: Any, default_concepts: list[str]) -> list[str]:
@@ -1482,7 +1501,9 @@ def _normalize_concepts_for_query(raw_concepts: Any, default_concepts: list[str]
     return normalized or list(default_concepts)
 
 
-def _normalize_single_fact(raw_fact: Mapping[str, Any]) -> Optional[dict[str, Any]]:
+def _normalize_single_fact(
+    raw_fact: Mapping[str, JsonValue],
+) -> Optional[dict[str, JsonValue]]:
     """标准化单条 fact。
 
     Args:
@@ -1522,7 +1543,11 @@ def _normalize_single_fact(raw_fact: Mapping[str, Any]) -> Optional[dict[str, An
     # 解析 decimals 并推断 scale
     raw_decimals = raw_fact.get("decimals")
     decimals = _parse_xbrl_decimals_value(raw_decimals)
-    scale = _infer_scale_from_decimals(decimals) if numeric_value is not None else None
+    scale = (
+        infer_financial_scale_from_decimals(raw_decimals)
+        if numeric_value is not None
+        else None
+    )
 
     return {
         "concept": concept,
@@ -1580,7 +1605,11 @@ def _looks_like_html_text(text: str) -> bool:
     return bool(_HTML_TAG_PATTERN.search(text))
 
 
-def _deduplicate_xbrl_facts(normalized_pairs: list[tuple[dict[str, Any], dict[str, Any], int]]) -> list[dict[str, Any]]:
+def _deduplicate_xbrl_facts(
+    normalized_pairs: list[
+        tuple[dict[str, JsonValue], dict[str, JsonValue], int]
+    ],
+) -> list[dict[str, JsonValue]]:
     """按确定性策略去重 XBRL facts。
 
     去重键：`(canonical_concept, period_start, period_end, fiscal_year, dedup_fiscal_period, unit, segment_signature)`。
@@ -1599,7 +1628,7 @@ def _deduplicate_xbrl_facts(normalized_pairs: list[tuple[dict[str, Any], dict[st
 
     selected: dict[
         tuple[str, str, str, str, str, str, str],
-        tuple[dict[str, Any], int, tuple[int, int, int, int, int]],
+        tuple[dict[str, JsonValue], int, tuple[int, int, int, int, int]],
     ] = {}
     first_seen_index: dict[tuple[str, str, str, str, str, str, str], int] = {}
 
@@ -1745,7 +1774,7 @@ def _parse_xbrl_decimals(raw_decimals: Any) -> int:
         return -100000
 
 
-def _parse_xbrl_decimals_value(raw_decimals: Any) -> Optional[int]:
+def _parse_xbrl_decimals_value(raw_decimals: JsonValue) -> Optional[int]:
     """解析 XBRL decimals 为实际整数值。
 
     与 ``_parse_xbrl_decimals`` 不同，本函数返回原始语义值而非评分值。
@@ -1769,15 +1798,6 @@ def _parse_xbrl_decimals_value(raw_decimals: Any) -> Optional[int]:
         return int(str(raw_decimals).strip())
     except ValueError:
         return None
-
-
-# decimals → scale 映射表
-_DECIMALS_SCALE_MAP: dict[int, str] = {
-    -9: "billions",
-    -6: "millions",
-    -3: "thousands",
-    0: "units",
-}
 
 
 # ---------------------------------------------------------------------------
@@ -1900,34 +1920,3 @@ def _build_search_hint(
         f"不允许：先枚举后面的低相关扩展命中。"
         f"{next_step} 只有在你必须枚举全部出现位置时再收窄查询。"
     )
-
-
-def _infer_scale_from_decimals(decimals: Optional[int]) -> Optional[str]:
-    """根据 XBRL decimals 推断数值 scale。
-
-    映射规则：
-    - ``-9`` → ``"billions"``
-    - ``-6`` → ``"millions"``
-    - ``-3`` → ``"thousands"``
-    - ``0`` 或正数 → ``"units"``
-    - ``None`` 或其他负数 → ``None``
-
-    Args:
-        decimals: 已解析的 decimals 值。
-
-    Returns:
-        scale 描述字符串或 ``None``。
-
-    Raises:
-        RuntimeError: 推断失败时抛出。
-    """
-
-    if decimals is None:
-        return None
-    exact = _DECIMALS_SCALE_MAP.get(decimals)
-    if exact is not None:
-        return exact
-    # 正数表示小数位数，即原始单位
-    if decimals > 0:
-        return "units"
-    return None

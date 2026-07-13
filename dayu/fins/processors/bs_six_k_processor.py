@@ -23,6 +23,7 @@ SEC 相关规则依据：
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 import re
 from typing import Any, Optional
@@ -31,8 +32,13 @@ from bs4 import Tag
 from edgar.xbrl import XBRL
 
 from dayu.documents.processors.source import Source
+from dayu.contracts.json_value import JsonValue
+from dayu.fins.domain.financial_result_contract import (
+    FinancialStatementResult,
+    determine_financial_statement_quality,
+)
 
-from .financial_base import FinancialMeta, FinancialStatementResult
+from .financial_base import FinancialMeta
 from .fins_bs_processor import FinsBSProcessor
 from .sec_form_section_common import (
     _VirtualSectionProcessorMixin,
@@ -44,6 +50,8 @@ from .sec_xbrl_query import (
     _build_statement_rows,
     _extract_period_columns,
     _infer_currency_from_units,
+    _infer_period_semantics_from_xbrl_query,
+    _infer_scale_from_xbrl_query,
     _infer_units_from_xbrl_query,
     build_statement_locator,
 )
@@ -319,7 +327,7 @@ class BsSixKFormProcessor(_VirtualSectionProcessorMixin, FinsBSProcessor):
     def get_financial_statement(
         self,
         statement_type: str,
-        financials: Optional[dict[str, Any]] = None,
+        financials: Mapping[str, JsonValue] | None = None,
         *,
         meta: Optional[FinancialMeta] = None,
     ) -> FinancialStatementResult:
@@ -349,9 +357,14 @@ class BsSixKFormProcessor(_VirtualSectionProcessorMixin, FinsBSProcessor):
             "units": None,
             "scale": None,
             "data_quality": "partial",
+            "reason": "unsupported_statement_type",
+            "statement_locator": build_statement_locator(
+                statement_type=statement_type,
+                periods=[],
+                rows=[],
+            ),
         }
         if normalized_statement_type not in _SUPPORTED_STATEMENT_TYPES:
-            result["reason"] = "unsupported_statement_type"
             return result
 
         xbrl_result = self._get_financial_statement_from_xbrl(
@@ -921,17 +934,36 @@ class BsSixKFormProcessor(_VirtualSectionProcessorMixin, FinsBSProcessor):
 
         period_columns = _extract_period_columns(statement_df.columns)
         rows = _build_statement_rows(statement_df, period_columns)
-        periods = [_build_period_summary(period) for period in period_columns]
+        if not rows:
+            return None
+        period_evidence = _infer_period_semantics_from_xbrl_query(xbrl, period_columns)
+        periods = [
+            _build_period_summary(
+                period,
+                fiscal_year=(period_evidence[period][0] if period in period_evidence else None),
+                fiscal_period=(period_evidence[period][1] if period in period_evidence else None),
+            )
+            for period in period_columns
+        ]
         units = _infer_units_from_xbrl_query(xbrl)
         currency = _infer_currency_from_units(units)
+        scale_outcome = _infer_scale_from_xbrl_query(xbrl)
+        scale = None if scale_outcome.query_failed else scale_outcome.scale
+        quality = determine_financial_statement_quality(
+            rows=rows,
+            periods=periods,
+            scale=scale,
+            complete_quality="xbrl",
+        )
         return {
             "statement_type": statement_type,
             "periods": periods,
             "rows": rows,
             "currency": currency,
             "units": units,
-            "scale": None,
-            "data_quality": "xbrl" if rows else "partial",
+            "scale": scale,
+            "data_quality": quality.data_quality,
+            "reason": quality.reason,
             "statement_locator": build_statement_locator(
                 statement_type=statement_type,
                 periods=periods,

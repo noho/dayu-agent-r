@@ -850,7 +850,14 @@ def _build_get_financial_statement_definition(
 
     @tool(
         name=GET_FINANCIAL_STATEMENT_TOOL_NAME,
-        description="读取标准财务报表。",
+        description=(
+            "读取标准财务报表。返回 periods（元素含 period_end:string、"
+            "fiscal_year:int|null、fiscal_period:FY|H1|Q1|Q2|Q3|Q4|null）、"
+            "rows、currency、units、scale、data_quality 和 reason；scale 取 "
+            "units/thousands/millions/billions/null，表示数值倍率，units 表示货币或"
+            "计量单位。data_quality 取 xbrl/extracted/partial；partial 时 reason "
+            "说明缺失或降级原因。"
+        ),
         parameters=parameters,
         execution=ProcessBackedToolExecutionCapability(
             target_factory=process_target_factory,
@@ -920,7 +927,13 @@ def _build_query_xbrl_facts_definition(
 
     @tool(
         name=QUERY_XBRL_FACTS_TOOL_NAME,
-        description="查询结构化 XBRL 数值 facts。",
+        description=(
+            "查询结构化 XBRL 数值 facts。返回 query_params、facts、total、"
+            "deduped_fact_count、data_quality 和 reason；total 是去重前的原始 fact "
+            "数，deduped_fact_count 是返回 facts 的去重后数量。data_quality=xbrl "
+            "表示 XBRL 查询正常执行，total=0 表示没有匹配 fact；partial 时 reason "
+            "说明 XBRL 不可用或部分概念查询失败。"
+        ),
         parameters=parameters,
         execution=ProcessBackedToolExecutionCapability(
             target_factory=process_target_factory,

@@ -63,6 +63,7 @@ from dayu.fins.domain.document_models import (
     now_iso8601,
 )
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.domain.xbrl_result_contract import XbrlQueryExecutionError
 from dayu.fins.domain.tool_models import Citation
 from dayu.fins.storage import (
     FsBatchingRepository,
@@ -78,7 +79,7 @@ from dayu.fins.tools.fins_limits import FinsToolLimits
 from dayu.fins.tools.fins_tools import build_fins_read_tool_definitions
 from dayu.fins.tools.provider import discover_tools
 from dayu.fins.tools.read_runtime import FinsReadRuntime
-from dayu.fins.tools.read_runtime_helpers import FinsReadCancelledError
+from dayu.fins.tools.read_runtime_helpers import FinsReadBusinessError, FinsReadCancelledError
 from dayu.host.tool_runtime import (
     DefaultToolRuntimeFactory,
     EffectiveToolBundleBuildRequest,
@@ -536,7 +537,103 @@ class _XbrlFactsProcessor(_SearchCancellingProcessor):
             "query_params": {"concepts": concept_values},
             "facts": facts,
             "total": len(facts),
+            "data_quality": "xbrl",
+            "reason": None,
         }
+
+
+class _XbrlFailureReadRuntime:
+    """process-backed target 测试使用的 XBRL 失败 read runtime。"""
+
+    def query_xbrl_facts(
+        self,
+        *,
+        ticker: str,
+        document_id: str,
+        concepts: list[str] | None = None,
+        statement_type: str | None = None,
+        period_end: str | None = None,
+        fiscal_year: int | None = None,
+        fiscal_period: str | None = None,
+        min_value: float | None = None,
+        max_value: float | None = None,
+        cancellation_token: CancellationToken | None = None,
+    ) -> Mapping[str, JsonValue]:
+        """模拟 read runtime 已把 all-failed 映射为 typed business failure。
+
+        Args:
+            ticker: 股票代码。
+            document_id: 文档 ID。
+            concepts: concept 列表。
+            statement_type: 可选报表类型。
+            period_end: 可选期末日期。
+            fiscal_year: 可选财年。
+            fiscal_period: 可选财期。
+            min_value: 可选最小值。
+            max_value: 可选最大值。
+            cancellation_token: 取消观察令牌。
+
+        Returns:
+            本函数不会返回。
+
+        Raises:
+            FinsReadBusinessError: 始终以 ``xbrl_query_failed`` 抛出。
+        """
+
+        del (
+            ticker,
+            document_id,
+            statement_type,
+            period_end,
+            fiscal_year,
+            fiscal_period,
+            min_value,
+            max_value,
+            cancellation_token,
+        )
+        failed_concepts = tuple(concepts or ["Revenue"])
+        raise FinsReadBusinessError(
+            "xbrl_query_failed",
+            "XBRL 查询执行失败，当前结果不可作为零命中使用。",
+            hint="请稍后重试。",
+        ) from XbrlQueryExecutionError(failed_concepts)
+
+
+class _XbrlFailureDefaultRuntime:
+    """只返回 XBRL 失败 read runtime 的测试 DefaultFinsRuntime 替身。"""
+
+    def get_read_runtime(self, *, processor_cache_max_entries: int) -> _XbrlFailureReadRuntime:
+        """返回 XBRL 失败 read runtime。
+
+        Args:
+            processor_cache_max_entries: processor cache 容量。
+
+        Returns:
+            XBRL 失败 read runtime。
+
+        Raises:
+            无。
+        """
+
+        del processor_cache_max_entries
+        return _XbrlFailureReadRuntime()
+
+
+def _create_xbrl_failure_default_runtime(*, workspace_root: Path) -> _XbrlFailureDefaultRuntime:
+    """构造 process target 测试所需的失败 runtime。
+
+    Args:
+        workspace_root: Fins workspace root。
+
+    Returns:
+        失败 runtime 替身。
+
+    Raises:
+        无。
+    """
+
+    del workspace_root
+    return _XbrlFailureDefaultRuntime()
 
 
 class _CountingSourceRepository(FsSourceDocumentRepository):
@@ -1505,7 +1602,12 @@ def test_fins_read_financial_statement_runs_in_spawned_child(tmp_path: Path) -> 
     assert isinstance(value, Mapping)
     assert value.get("document_id") == _FINANCIAL_HTML_DOCUMENT_ID
     assert value.get("statement_type") == _INCOME_STATEMENT_TYPE
+    assert isinstance(value.get("periods"), list)
     assert isinstance(value.get("rows"), list)
+    assert "scale" in value
+    assert value.get("data_quality") == "partial"
+    assert isinstance(value.get("reason"), str)
+    assert isinstance(value.get("statement_locator"), Mapping)
     assert "supported" not in value
     assert "error" not in value
 
@@ -1531,8 +1633,98 @@ def test_fins_read_aapl_xbrl_query_runs_in_spawned_child(tmp_path: Path) -> None
     assert isinstance(value, Mapping)
     facts = value.get("facts")
     assert isinstance(facts, list)
+    assert value.get("total") is not None
+    assert value.get("deduped_fact_count") == len(facts)
+    assert value.get("data_quality") == "xbrl"
+    assert "reason" in value
+    assert value.get("reason") is None
     concept_names = {_xbrl_fact_concept_local_name(fact) for fact in facts if isinstance(fact, Mapping)}
     assert _AAPL_XBRL_VERIFIED_CONCEPT in concept_names
+
+
+def test_financial_tool_descriptions_explain_owner_fields(tmp_path: Path) -> None:
+    """两个 financial tool description 必须自足解释结果字段与降级语义。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: description 缺失 owner 字段或语义时抛出。
+    """
+
+    definitions = _definitions_by_name(_discover_definitions(_build_fins_workspace(tmp_path)))
+    financial_description = definitions["get_financial_statement"].schema.function.description
+    xbrl_description = definitions["query_xbrl_facts"].schema.function.description
+
+    for token in (
+        "period_end:string",
+        "fiscal_year:int|null",
+        "fiscal_period:FY|H1|Q1|Q2|Q3|Q4|null",
+        "scale",
+        "units/thousands/millions/billions/null",
+        "data_quality",
+        "partial",
+        "reason",
+    ):
+        assert token in financial_description
+    for token in (
+        "total",
+        "deduped_fact_count",
+        "去重前",
+        "去重后",
+        "data_quality=xbrl",
+        "total=0",
+        "没有匹配 fact",
+        "partial",
+        "reason",
+    ):
+        assert token in xbrl_description
+    forbidden_terms = ("Host", "Engine", "event_id", "digest", "cursor", "SSRF", "allowlist")
+    assert not any(term in financial_description or term in xbrl_description for term in forbidden_terms)
+
+
+def test_financial_tool_process_target_preserves_xbrl_failed_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """process-backed target 必须把 typed XBRL failure 投影为 failed 信封。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: all-failed 被投影为 completed 空值时抛出。
+    """
+
+    target = _build_process_target(
+        _build_fins_workspace(tmp_path),
+        "query_xbrl_facts",
+        {
+            "ticker": "AAPL",
+            "document_id": "aapl-2024-10k",
+            "concepts": ["Revenue"],
+        },
+    )
+    monkeypatch.setattr(
+        DefaultFinsRuntime,
+        "create",
+        staticmethod(_create_xbrl_failure_default_runtime),
+    )
+
+    envelope = target()
+
+    assert isinstance(envelope, Mapping)
+    assert envelope.get("status") == "failed"
+    assert envelope.get("error_type") == "xbrl_query_failed"
+    assert "零命中" in str(envelope.get("message"))
+    assert "value" not in envelope
 
 
 def test_fins_read_process_backed_cancel_drops_late_result(tmp_path: Path) -> None:

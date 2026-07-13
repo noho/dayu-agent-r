@@ -16,15 +16,20 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import datetime as dt
 import re
-from typing import Any, Optional
+from typing import Any, Optional, cast
 import unicodedata
 
 import pandas as pd
 
 from dayu.documents.processors.text_utils import normalize_optional_string as _normalize_optional_string
 from dayu.documents.processors.text_utils import normalize_whitespace as _normalize_whitespace
-
-from .financial_base import FinancialStatementResult
+from dayu.fins.domain.financial_result_contract import (
+    FinancialPeriod,
+    FinancialScale,
+    FinancialStatementResult,
+    determine_financial_statement_quality,
+)
+from dayu.fins.domain.filing_semantics import normalize_fiscal_period
 from .sec_xbrl_query import build_statement_locator
 
 _CURRENCY_MAP = {
@@ -129,6 +134,7 @@ class _StatementTablePeriod:
 
     column_index: int
     period_end: str
+    fiscal_year: int | None
     fiscal_period: Optional[str]
     currency_raw: Optional[str]
 
@@ -140,7 +146,7 @@ class _ParsedStatementTable:
     periods: list[_StatementTablePeriod]
     rows: list[dict[str, Any]]
     currency_raw: Optional[str]
-    scale: Optional[str]
+    scale: FinancialScale | None
 
 
 def build_html_statement_result_from_tables(
@@ -197,18 +203,29 @@ def build_html_statement_result_from_tables(
         return None
 
     period_summaries = [_build_statement_period_summary(period) for period in selected_periods]
-    first_scale = parsed_tables[0].scale if parsed_tables else None
+    selected_scale = selected_payload.get("scale")
+    scale = (
+        cast(FinancialScale, selected_scale)
+        if isinstance(selected_scale, str)
+        and selected_scale in {"units", "thousands", "millions", "billions"}
+        else None
+    )
+    quality = determine_financial_statement_quality(
+        rows=rows,
+        periods=period_summaries,
+        scale=scale,
+        complete_quality="extracted",
+    )
+    currency = _map_currency_code(primary_currency_raw)
     return {
         "statement_type": statement_type,
         "periods": period_summaries,
         "rows": rows,
-        "currency": _map_currency_code(primary_currency_raw),
-        "units": _build_units_label(
-            primary_currency_raw=primary_currency_raw,
-            scale=first_scale,
-        ),
-        "scale": first_scale,
-        "data_quality": "extracted",
+        "currency": currency,
+        "units": currency,
+        "scale": scale,
+        "data_quality": quality.data_quality,
+        "reason": quality.reason,
         "statement_locator": build_statement_locator(
             statement_type=statement_type,
             periods=period_summaries,
@@ -384,7 +401,7 @@ def _parse_statement_table_with_header_rows(
         return None
 
     periods: list[_StatementTablePeriod] = []
-    seen_period_keys: set[tuple[str, Optional[str], Optional[str]]] = set()
+    seen_period_keys: set[tuple[str, int | None, Optional[str], Optional[str]]] = set()
     for column_index in value_column_indexes:
         period = _build_period_for_column(
             matrix=matrix,
@@ -394,7 +411,12 @@ def _parse_statement_table_with_header_rows(
         )
         if period is None:
             continue
-        period_key = (period.period_end, period.fiscal_period, period.currency_raw)
+        period_key = (
+            period.period_end,
+            period.fiscal_year,
+            period.fiscal_period,
+            period.currency_raw,
+        )
         if period_key in seen_period_keys:
             continue
         seen_period_keys.add(period_key)
@@ -705,11 +727,23 @@ def _build_period_for_column(
     explicit_fiscal_period = _extract_fiscal_period_label(column_header_text)
     if explicit_fiscal_period is None:
         explicit_fiscal_period = _extract_fiscal_period_label(statement_scope_text)
+    fiscal_period = explicit_fiscal_period or _extract_fiscal_period_from_direct_text(
+        scope_text=statement_scope_text,
+    )
+    fiscal_pair = _extract_fiscal_period_year(column_header_text)
+    direct_date = _extract_first_date(column_header_text)
+    fiscal_year = (
+        fiscal_pair[1]
+        if fiscal_period is not None and fiscal_pair is not None
+        else direct_date.year
+        if fiscal_period is not None and direct_date is not None
+        else None
+    )
     return _StatementTablePeriod(
         column_index=column_index,
         period_end=period_end,
-        fiscal_period=explicit_fiscal_period
-        or _infer_fiscal_period(scope_text=statement_scope_text, period_end=period_end),
+        fiscal_year=fiscal_year,
+        fiscal_period=fiscal_period,
         currency_raw=_extract_currency_for_column(
             scope_text=statement_scope_text,
             column_header_text=column_header_text,
@@ -742,10 +776,22 @@ def _build_single_scope_period(
         return None
     fiscal_period = _extract_fiscal_period_label(statement_scope_text)
     if fiscal_period is None:
-        fiscal_period = _infer_fiscal_period(scope_text=statement_scope_text, period_end=period_end)
+        fiscal_period = _extract_fiscal_period_from_direct_text(
+            scope_text=statement_scope_text,
+        )
+    fiscal_pair = _extract_fiscal_period_year(statement_scope_text)
+    direct_date = _extract_first_date(statement_scope_text)
+    fiscal_year = (
+        fiscal_pair[1]
+        if fiscal_period is not None and fiscal_pair is not None
+        else direct_date.year
+        if fiscal_period is not None and direct_date is not None
+        else None
+    )
     return _StatementTablePeriod(
         column_index=value_column_indexes[0],
         period_end=period_end,
+        fiscal_year=fiscal_year,
         fiscal_period=fiscal_period,
         currency_raw=_extract_currency_for_column(
             scope_text=statement_scope_text,
@@ -856,8 +902,19 @@ def _group_statement_rows_by_period_signature(
             continue
         payload = grouped.setdefault(
             signature,
-            {"periods": matching_periods, "rows": [], "table_count": 0},
+            {
+                "periods": matching_periods,
+                "rows": [],
+                "table_count": 0,
+                "scale": parsed_table.scale,
+            },
         )
+        existing_scale = payload.get("scale")
+        if existing_scale is None:
+            payload["scale"] = parsed_table.scale
+        elif parsed_table.scale is not None and existing_scale != parsed_table.scale:
+            # caption 倍率证据冲突时保持未知，禁止任取其一。
+            payload["scale"] = None
         payload["rows"].extend(selected_rows)
         payload["table_count"] = int(payload["table_count"]) + 1
     return grouped
@@ -947,7 +1004,7 @@ def _select_row_values(
     return selected_rows
 
 
-def _build_statement_period_summary(period: _StatementTablePeriod) -> dict[str, Any]:
+def _build_statement_period_summary(period: _StatementTablePeriod) -> FinancialPeriod:
     """构建标准期间摘要。
 
     Args:
@@ -960,12 +1017,11 @@ def _build_statement_period_summary(period: _StatementTablePeriod) -> dict[str, 
         RuntimeError: 构建失败时抛出。
     """
 
-    fiscal_year = int(period.period_end[:4]) if re.fullmatch(r"\d{4}-\d{2}-\d{2}", period.period_end) else None
-    return {
-        "period_end": period.period_end,
-        "fiscal_year": fiscal_year,
-        "fiscal_period": period.fiscal_period,
-    }
+    return FinancialPeriod(
+        period_end=period.period_end,
+        fiscal_year=period.fiscal_year,
+        fiscal_period=normalize_fiscal_period(period.fiscal_period),
+    )
 
 
 def _collect_column_header_text(
@@ -1520,16 +1576,14 @@ def _build_safe_date(
         return None
 
 
-def _infer_fiscal_period(
+def _extract_fiscal_period_from_direct_text(
     *,
     scope_text: str,
-    period_end: str,
 ) -> Optional[str]:
-    """根据范围文本推断 fiscal_period。
+    """仅从表头明示文本提取无歧义 fiscal period。
 
     Args:
         scope_text: 范围文本。
-        period_end: 期间结束日期。
 
     Returns:
         fiscal_period；无法判断时返回 `None`。
@@ -1542,30 +1596,8 @@ def _infer_fiscal_period(
     if explicit_period is not None:
         return explicit_period
     normalized_scope = _normalize_free_text(scope_text)
-    if any(token in normalized_scope for token in ("three months ended", "quarter ended", "three-month period")):
-        return {
-            3: "Q1",
-            6: "Q2",
-            9: "Q3",
-            12: "Q4",
-        }.get(int(period_end[5:7]))
-    if "nine months ended" in normalized_scope and int(period_end[5:7]) == 9:
-        return "Q3"
-    if "six months ended" in normalized_scope:
-        return {
-            6: "H1",
-            12: "H2",
-        }.get(int(period_end[5:7]))
     if any(token in normalized_scope for token in ("twelve months ended", "year ended", "fiscal year")):
         return "FY"
-    if "as of" in normalized_scope or "as at" in normalized_scope:
-        month = int(period_end[5:7])
-        return {
-            3: "Q1",
-            6: "Q2",
-            9: "Q3",
-            12: "FY",
-        }.get(month)
     return None
 
 
@@ -1643,34 +1675,7 @@ def _map_currency_code(raw_currency: Optional[str]) -> Optional[str]:
     return _CURRENCY_MAP.get(raw_currency, raw_currency)
 
 
-def _build_units_label(
-    *,
-    primary_currency_raw: Optional[str],
-    scale: Optional[str],
-) -> Optional[str]:
-    """构建 units 文本。
-
-    Args:
-        primary_currency_raw: 主货币文本。
-        scale: 缩放口径。
-
-    Returns:
-        units 文本；不存在时返回 `None`。
-
-    Raises:
-        RuntimeError: 构建失败时抛出。
-    """
-
-    if primary_currency_raw is None and scale is None:
-        return None
-    if primary_currency_raw is None:
-        return scale
-    if scale is None:
-        return primary_currency_raw
-    return f"{primary_currency_raw} in {scale}"
-
-
-def _infer_scale_from_caption(caption: Optional[str]) -> Optional[str]:
+def _infer_scale_from_caption(caption: Optional[str]) -> FinancialScale | None:
     """从 caption 推断缩放口径。
 
     Args:
@@ -1684,10 +1689,14 @@ def _infer_scale_from_caption(caption: Optional[str]) -> Optional[str]:
     """
 
     normalized_caption = _normalize_free_text(caption or "")
+    if "in billions" in normalized_caption:
+        return "billions"
     if "in thousands" in normalized_caption:
         return "thousands"
     if "in millions" in normalized_caption:
         return "millions"
+    if "in units" in normalized_caption:
+        return "units"
     return None
 
 

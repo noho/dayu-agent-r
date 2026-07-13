@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, ClassVar, Optional, Protocol
@@ -16,6 +17,7 @@ from typing import Any, ClassVar, Optional, Protocol
 from bs4 import BeautifulSoup
 import pandas as pd
 
+from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.source import Source
 
 from dayu.documents.processors.text_utils import (
@@ -39,7 +41,8 @@ from .sec_section_build import (
     _safe_section_text,
 )
 from .sec_table_extraction import _safe_table_dataframe
-from .financial_base import FinancialMeta, FinancialStatementResult
+from dayu.fins.domain.financial_result_contract import FinancialStatementResult
+from .financial_base import FinancialMeta
 from .html_financial_statement_common import (
     build_html_statement_result_from_tables as _build_html_statement_result_from_tables,
 )
@@ -429,7 +432,7 @@ class _BaseSecReportFormProcessor(_VirtualSectionProcessorMixin, SecProcessor):
     def get_financial_statement(
         self,
         statement_type: str,
-        financials: Optional[dict[str, Any]] = None,
+        financials: Mapping[str, JsonValue] | None = None,
         *,
         meta: Optional[FinancialMeta] = None,
     ) -> FinancialStatementResult:

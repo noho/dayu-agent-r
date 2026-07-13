@@ -13,17 +13,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, ClassVar, Optional
 
 from edgar.xbrl import XBRL
 import pandas as pd
 
-from .financial_base import (
-    FinancialMeta,
+from dayu.contracts.json_value import JsonValue
+from dayu.fins.domain.financial_result_contract import (
+    FinancialStatementReason,
     FinancialStatementResult,
-    XbrlFactsResult,
+    determine_financial_statement_quality,
 )
+from dayu.fins.domain.xbrl_result_contract import XbrlFactsResult
+from .financial_base import FinancialMeta
 from dayu.documents.processors.bs_processor import BSProcessor
 from dayu.documents.processors.source import Source
 from dayu.documents.processors.table_utils import parse_html_table_dataframe
@@ -40,6 +44,8 @@ from .sec_xbrl_query import (
     _build_statement_rows,
     _extract_period_columns,
     _infer_currency_from_units,
+    _infer_period_semantics_from_xbrl_query,
+    _infer_scale_from_xbrl_query,
     _infer_units_from_xbrl_query,
     _infer_xbrl_taxonomy,
     _normalize_fact_row,
@@ -194,7 +200,7 @@ class _BaseBsReportFormProcessor(_VirtualSectionProcessorMixin, FinsBSProcessor)
     def get_financial_statement(
         self,
         statement_type: str,
-        financials: Optional[dict[str, Any]] = None,
+        financials: Mapping[str, JsonValue] | None = None,
         *,
         meta: Optional[FinancialMeta] = None,
     ) -> FinancialStatementResult:
@@ -226,9 +232,14 @@ class _BaseBsReportFormProcessor(_VirtualSectionProcessorMixin, FinsBSProcessor)
             "units": None,
             "scale": None,
             "data_quality": "partial",
+            "reason": "unsupported_statement_type",
+            "statement_locator": build_statement_locator(
+                statement_type=statement_type,
+                periods=[],
+                rows=[],
+            ),
         }
         if normalized_statement_type not in _STATEMENT_METHODS:
-            base_result["reason"] = "unsupported_statement_type"
             return base_result
 
         xbrl_result, xbrl_reason = self._get_statement_from_xbrl(
@@ -286,23 +297,23 @@ class _BaseBsReportFormProcessor(_VirtualSectionProcessorMixin, FinsBSProcessor)
 
         normalized_concepts = [str(item).strip() for item in concepts if str(item).strip()]
         normalized_statement_type = _normalize_query_statement_type(statement_type)
-        query_params = {
-            "concepts": normalized_concepts,
+        concept_values: list[JsonValue] = []
+        for concept in normalized_concepts:
+            concept_values.append(concept)
+        filters_applied: dict[str, JsonValue] = {
+            "period_end": period_end,
+            "fiscal_year": fiscal_year,
+            "fiscal_period": fiscal_period,
+            "min_value": min_value,
+            "max_value": max_value,
+        }
+        query_params: dict[str, JsonValue] = {
+            "concepts": concept_values,
             "statement_type": normalized_statement_type or statement_type,
-            "filters_applied": {
-                "period_end": period_end,
-                "fiscal_year": fiscal_year,
-                "fiscal_period": fiscal_period,
-                "min_value": min_value,
-                "max_value": max_value,
-            },
+            "filters_applied": filters_applied,
         }
         if not normalized_concepts:
-            return {
-                "query_params": query_params,
-                "facts": [],
-                "total": 0,
-            }
+            raise ValueError("XBRL concepts 不能为空")
 
         xbrl = self._get_xbrl()
         if xbrl is None:
@@ -314,7 +325,7 @@ class _BaseBsReportFormProcessor(_VirtualSectionProcessorMixin, FinsBSProcessor)
                 "reason": "xbrl_not_available",
             }
 
-        rows = _query_facts_rows(
+        summary = _query_facts_rows(
             xbrl=xbrl,
             concepts=normalized_concepts,
             statement_type=normalized_statement_type,
@@ -324,11 +335,14 @@ class _BaseBsReportFormProcessor(_VirtualSectionProcessorMixin, FinsBSProcessor)
             min_value=min_value,
             max_value=max_value,
         )
-        facts = [_normalize_fact_row(row) for row in rows]
+        facts = [_normalize_fact_row(row) for row in summary.rows]
+        is_partial = bool(summary.failed_concepts)
         return {
             "query_params": query_params,
             "facts": facts,
             "total": len(facts),
+            "data_quality": "partial" if is_partial else "xbrl",
+            "reason": "query_partially_failed" if is_partial else None,
         }
 
     def _get_statement_from_xbrl(
@@ -336,7 +350,7 @@ class _BaseBsReportFormProcessor(_VirtualSectionProcessorMixin, FinsBSProcessor)
         *,
         statement_type: str,
         normalized_statement_type: str,
-    ) -> tuple[Optional[FinancialStatementResult], Optional[str]]:
+    ) -> tuple[FinancialStatementResult | None, FinancialStatementReason | None]:
         """从 XBRL 提取财务报表并返回失败原因。
 
         Args:
@@ -373,9 +387,27 @@ class _BaseBsReportFormProcessor(_VirtualSectionProcessorMixin, FinsBSProcessor)
 
         period_columns = _extract_period_columns(statement_df.columns)
         rows = _build_statement_rows(statement_df, period_columns)
-        periods = [_build_period_summary(period) for period in period_columns]
+        if not rows:
+            return None, "statement_empty"
+        period_evidence = _infer_period_semantics_from_xbrl_query(xbrl, period_columns)
+        periods = [
+            _build_period_summary(
+                period,
+                fiscal_year=(period_evidence[period][0] if period in period_evidence else None),
+                fiscal_period=(period_evidence[period][1] if period in period_evidence else None),
+            )
+            for period in period_columns
+        ]
         units = _infer_units_from_xbrl_query(xbrl)
         currency = _infer_currency_from_units(units)
+        scale_outcome = _infer_scale_from_xbrl_query(xbrl)
+        scale = None if scale_outcome.query_failed else scale_outcome.scale
+        quality = determine_financial_statement_quality(
+            rows=rows,
+            periods=periods,
+            scale=scale,
+            complete_quality="xbrl",
+        )
         return (
             {
                 "statement_type": statement_type,
@@ -383,8 +415,9 @@ class _BaseBsReportFormProcessor(_VirtualSectionProcessorMixin, FinsBSProcessor)
                 "rows": rows,
                 "currency": currency,
                 "units": units,
-                "scale": None,
-                "data_quality": "xbrl" if rows else "partial",
+                "scale": scale,
+                "data_quality": quality.data_quality,
+                "reason": quality.reason,
                 "statement_locator": build_statement_locator(
                     statement_type=statement_type,
                     periods=periods,

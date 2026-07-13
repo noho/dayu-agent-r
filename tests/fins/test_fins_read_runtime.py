@@ -78,9 +78,11 @@ def test_xbrl_query_payload_missing_total_fails_closed() -> None:
     payload: dict[str, JsonValue] = {
         "query_params": {"concepts": ["Revenue"]},
         "facts": [{"concept": "Revenue", "value": 100}],
+        "data_quality": "xbrl",
+        "reason": None,
     }
 
-    with pytest.raises(ValueError, match="total 必须为整数"):
+    with pytest.raises(ValueError, match="缺少必填字段: total"):
         _normalize_xbrl_query_payload(payload=payload, default_concepts=["Revenue"])
 
 
@@ -101,9 +103,11 @@ def test_xbrl_query_payload_non_int_total_fails_closed() -> None:
         "query_params": {"concepts": ["Revenue"]},
         "facts": [{"concept": "Revenue", "value": 100}],
         "total": "1",
+        "data_quality": "xbrl",
+        "reason": None,
     }
 
-    with pytest.raises(ValueError, match="total 必须为整数"):
+    with pytest.raises(ValueError, match="total 必须为非负整数"):
         _normalize_xbrl_query_payload(payload=payload, default_concepts=["Revenue"])
 
 
@@ -127,6 +131,8 @@ def test_xbrl_query_payload_mismatched_raw_total_fails_closed_before_dedup() -> 
             {"concept": "Revenue", "value": 100},
         ],
         "total": 1,
+        "data_quality": "xbrl",
+        "reason": None,
     }
 
     with pytest.raises(ValueError, match="total 必须等于 raw facts 数量"):
@@ -164,6 +170,7 @@ def test_xbrl_query_payload_preserves_processor_total_after_dedup() -> None:
         ],
         "total": 2,
         "data_quality": "xbrl",
+        "reason": None,
     }
 
     normalized = _normalize_xbrl_query_payload(payload=payload, default_concepts=["Revenue"])
@@ -171,6 +178,61 @@ def test_xbrl_query_payload_preserves_processor_total_after_dedup() -> None:
     assert normalized["total"] == 2
     assert normalized["deduped_fact_count"] == 1
     assert len(normalized["facts"]) == 1
+
+
+def test_xbrl_query_payload_always_projects_dedup_count_and_owner_quality() -> None:
+    """未发生去重时也必须输出 dedup count 并保留 producer quality/reason。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: dedup count 缺失或 quality/reason 被重算时抛出。
+    """
+
+    payload: dict[str, JsonValue] = {
+        "query_params": {"concepts": ["Revenue"]},
+        "facts": [{"concept": "Revenue", "value": 100}],
+        "total": 1,
+        "data_quality": "partial",
+        "reason": "query_partially_failed",
+    }
+
+    normalized = _normalize_xbrl_query_payload(payload=payload, default_concepts=["Revenue"])
+
+    assert normalized["total"] == 1
+    assert normalized["deduped_fact_count"] == 1
+    assert normalized["data_quality"] == "partial"
+    assert normalized["reason"] == "query_partially_failed"
+
+
+def test_xbrl_query_payload_rejects_producer_dedup_count() -> None:
+    """processor 不得夹带 read-side deduped_fact_count。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: dedup owner 漂移未被拒绝时抛出。
+    """
+
+    payload: dict[str, JsonValue] = {
+        "query_params": {"concepts": ["Revenue"]},
+        "facts": [],
+        "total": 0,
+        "data_quality": "xbrl",
+        "reason": None,
+        "deduped_fact_count": 0,
+    }
+
+    with pytest.raises(ValueError, match="不得包含.*deduped_fact_count"):
+        _normalize_xbrl_query_payload(payload=payload, default_concepts=["Revenue"])
 
 
 def test_sec_fiscal_inference_rejects_invalid_xbrl_total() -> None:

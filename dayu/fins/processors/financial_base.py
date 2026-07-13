@@ -1,70 +1,45 @@
-"""金融数据处理器协议与占位类型。
+"""Fins processor 的财务能力协议。
 
-本模块定义金融业务域专有的协议和数据类型：
-- ``FinancialDataProcessor``：财务数据处理能力协议
-- ``FinancialStatementResult``：财务报表查询结果
-- ``XbrlFactsResult``：XBRL 查询结果
-- ``FinancialMeta``：财务元信息
-
-这些类型仅在 fins 层使用，engine 层保持业务中立。
+财务报表与 XBRL 结果类型由 ``dayu.fins.domain`` 拥有；本模块只声明
+processor 能力，不兼容转发领域结果类型。
 """
 
 from __future__ import annotations
 
-from typing import Any, NotRequired, Optional, Protocol, TypedDict
+from collections.abc import Mapping
+from typing import NotRequired, Protocol, TypedDict
+
+from dayu.contracts.json_value import JsonValue
+from dayu.fins.domain.financial_result_contract import FinancialStatementResult
+from dayu.fins.domain.xbrl_result_contract import XbrlFactsResult
 
 
-class FinancialStatementResult(TypedDict):
-    """财务报表结果。"""
+class FinancialMeta(TypedDict):
+    """processor 可选消费的财务文档元信息。"""
 
-    statement_type: str
-    periods: list[dict[str, Any]]
-    rows: list[dict[str, Any]]
-    currency: str | None
-    units: str | None
-    scale: str | None
-    data_quality: str
-    reason: NotRequired[str]
-    statement_locator: NotRequired[dict[str, Any]]
-
-
-class XbrlFactsResult(TypedDict):
-    """XBRL 查询结果。"""
-
-    query_params: dict[str, Any]
-    facts: list[dict[str, Any]]
-    total: int
-    data_quality: NotRequired[str]
-    reason: NotRequired[str]
-
-
-class FinancialMeta(TypedDict, total=False):
-    """财务元信息。"""
-
-    source_kind: str
-    document_id: str
-    statement_locator: dict[str, Any]
+    source_kind: NotRequired[str]
+    document_id: NotRequired[str]
 
 
 class FinancialDataProcessor(Protocol):
-    """财务数据能力协议。"""
+    """财务报表与 XBRL 查询能力协议。"""
 
     def get_financial_statement(
         self,
         statement_type: str,
-        financials: Optional[dict[str, Any]] = None,
+        financials: Mapping[str, JsonValue] | None = None,
         *,
-        meta: Optional[FinancialMeta] = None,
+        meta: FinancialMeta | None = None,
     ) -> FinancialStatementResult:
         """读取财务报表。
 
         Args:
             statement_type: 报表类型。
             financials: 可选财务缓存。
-            meta: 可选元信息。
+            meta: 可选文档元信息。
 
         Returns:
-            报表结果。
+            完整的 producer-owned 财务报表结果。
 
         Raises:
             RuntimeError: 读取失败时抛出。
@@ -75,26 +50,26 @@ class FinancialDataProcessor(Protocol):
     def query_xbrl_facts(
         self,
         concepts: list[str],
-        statement_type: Optional[str] = None,
-        period_end: Optional[str] = None,
-        fiscal_year: Optional[int] = None,
-        fiscal_period: Optional[str] = None,
-        min_value: Optional[float] = None,
-        max_value: Optional[float] = None,
+        statement_type: str | None = None,
+        period_end: str | None = None,
+        fiscal_year: int | None = None,
+        fiscal_period: str | None = None,
+        min_value: float | None = None,
+        max_value: float | None = None,
     ) -> XbrlFactsResult:
         """查询 XBRL facts。
 
         Args:
             concepts: XBRL 概念列表。
             statement_type: 可选报表类型。
-            period_end: 可选期末日期（YYYY-MM-DD）。
+            period_end: 可选期末日期。
             fiscal_year: 可选财年。
-            fiscal_period: 可选财季。
+            fiscal_period: 可选财期。
             min_value: 可选最小值筛选。
             max_value: 可选最大值筛选。
 
         Returns:
-            查询结果。
+            完整的 producer-owned XBRL facts 结果。
 
         Raises:
             RuntimeError: 查询失败时抛出。
@@ -103,9 +78,4 @@ class FinancialDataProcessor(Protocol):
         ...
 
 
-__all__ = [
-    "FinancialDataProcessor",
-    "FinancialMeta",
-    "FinancialStatementResult",
-    "XbrlFactsResult",
-]
+__all__ = ["FinancialDataProcessor", "FinancialMeta"]

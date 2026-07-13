@@ -19,6 +19,14 @@ from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.fins._log import Log
 from dayu.fins.domain.document_models import FinsSourceProvider
+from dayu.fins.domain.financial_result_contract import (
+    FinancialStatementResult as ProcessorFinancialStatementResult,
+    validate_financial_statement_result_payload,
+)
+from dayu.fins.domain.xbrl_result_contract import (
+    XbrlFactsResult as ProcessorXbrlFactsResult,
+    XbrlQueryExecutionError,
+)
 from dayu.documents.processors.base import (
     DocumentProcessor,
     SectionContent,
@@ -68,7 +76,6 @@ from .result_types import (
     NotSupportedResult,
     PageContentResult,
     SearchDocumentResult,
-    StatementLocator,
     SectionContentResult,
     TableDetailResult,
     TablesListResult,
@@ -233,22 +240,6 @@ class _ProcessorPageContentPayload(TypedDict, total=False):
     supported: bool
 
 
-class _ProcessorFinancialStatementPayload(TypedDict, total=False):
-    """processor 财务报表能力返回载荷。"""
-
-    statement_type: str
-    currency: str | None
-    units: str | None
-    rows: list[dict[str, JsonValue]]
-    statement_locator: StatementLocator
-    period_labels: list[str]
-    column_headers: list[str]
-    header: dict[str, JsonValue]
-    supported: bool
-    data_quality: str
-    reason: str
-
-
 @runtime_checkable
 class _PageContentReadProcessor(Protocol):
     """read runtime 的分页 processor 能力协议。"""
@@ -273,7 +264,7 @@ class _PageContentReadProcessor(Protocol):
 class _FinancialStatementReadProcessor(Protocol):
     """read runtime 的财务报表 processor 能力协议。"""
 
-    def get_financial_statement(self, statement_type: str) -> _ProcessorFinancialStatementPayload:
+    def get_financial_statement(self, statement_type: str) -> ProcessorFinancialStatementResult:
         """读取指定类型的财务报表。
 
         Args:
@@ -303,7 +294,7 @@ class _XbrlFactsReadProcessor(Protocol):
         fiscal_period: str | None = None,
         min_value: float | None = None,
         max_value: float | None = None,
-    ) -> Mapping[str, JsonValue]:
+    ) -> ProcessorXbrlFactsResult:
         """查询 XBRL facts。
 
         Args:
@@ -1630,48 +1621,30 @@ class FinsReadRuntime:
             )
 
         _raise_if_fins_cancelled(cancellation_token)
-        statement_payload = processor.get_financial_statement(normalized_statement_type)
+        statement_payload = validate_financial_statement_result_payload(
+            processor.get_financial_statement(normalized_statement_type)
+        )
         _raise_if_fins_cancelled(cancellation_token)
         citation = self._build_citation(
             ticker=normalized_ticker,
             document_id=normalized_document_id,
         )
-        rows = statement_payload.get("rows")
-        if not isinstance(rows, list):
-            raise ValueError("processor get_financial_statement result rows must be list")
-        for _row in rows:
+        for _row in statement_payload["rows"]:
             _raise_if_fins_cancelled(cancellation_token)
-        raw_statement_locator = statement_payload.get("statement_locator")
-        if raw_statement_locator is None:
-            statement_locator: StatementLocator = {
-                "statement_type": normalized_statement_type,
-                "period_labels": [],
-                "row_labels": [],
-            }
-        else:
-            statement_locator = raw_statement_locator
         result: FinancialStatementResult = {
             "ticker": normalized_ticker,
             "document_id": normalized_document_id,
             "citation": citation,
-            "statement_type": statement_payload.get("statement_type") or normalized_statement_type,
-            "currency": statement_payload.get("currency"),
-            "units": statement_payload.get("units"),
-            "rows": rows,
-            "statement_locator": statement_locator,
+            "statement_type": statement_payload["statement_type"],
+            "periods": statement_payload["periods"],
+            "rows": statement_payload["rows"],
+            "currency": statement_payload["currency"],
+            "units": statement_payload["units"],
+            "scale": statement_payload["scale"],
+            "data_quality": statement_payload["data_quality"],
+            "reason": statement_payload["reason"],
+            "statement_locator": statement_payload["statement_locator"],
         }
-        period_labels = statement_payload.get("period_labels")
-        if period_labels is not None:
-            result["period_labels"] = period_labels
-        column_headers = statement_payload.get("column_headers")
-        if column_headers is not None:
-            result["column_headers"] = column_headers
-        header = statement_payload.get("header")
-        if header is not None:
-            result["header"] = header
-        supported = statement_payload.get("supported")
-        if supported is not None:
-            result["supported"] = supported
         return result
 
     def query_xbrl_facts(
@@ -1757,32 +1730,35 @@ class FinsReadRuntime:
             )
 
         _raise_if_fins_cancelled(cancellation_token)
-        payload = processor.query_xbrl_facts(
-            concepts=resolved_concepts,
-            statement_type=normalize_optional_text(statement_type),
-            period_end=normalize_optional_text(period_end),
-            fiscal_year=fiscal_year,
-            fiscal_period=normalize_optional_text(fiscal_period),
-            min_value=min_value,
-            max_value=max_value,
-        )
+        try:
+            payload = processor.query_xbrl_facts(
+                concepts=resolved_concepts,
+                statement_type=normalize_optional_text(statement_type),
+                period_end=normalize_optional_text(period_end),
+                fiscal_year=fiscal_year,
+                fiscal_period=normalize_optional_text(fiscal_period),
+                min_value=min_value,
+                max_value=max_value,
+            )
+        except XbrlQueryExecutionError as exc:
+            raise FinsReadBusinessError(
+                ErrorCode.XBRL_QUERY_FAILED.value,
+                "XBRL 查询执行失败，当前结果不可作为零命中使用。",
+                hint="请稍后重试；若持续失败，可改用财务报表或原文读取工具。",
+            ) from exc
         _raise_if_fins_cancelled(cancellation_token)
-        raw_facts_for_checkpoint = payload.get("facts")
-        if isinstance(raw_facts_for_checkpoint, list):
-            for _raw_fact in raw_facts_for_checkpoint:
-                _raise_if_fins_cancelled(cancellation_token)
+        for _raw_fact in payload["facts"]:
+            _raise_if_fins_cancelled(cancellation_token)
         normalized_payload = _normalize_xbrl_query_payload(
             payload=payload,
             default_concepts=resolved_concepts,
         )
-        facts = normalized_payload.get("facts")
-        if isinstance(facts, list):
-            for _fact in facts:
-                _raise_if_fins_cancelled(cancellation_token)
+        for _fact in normalized_payload["facts"]:
+            _raise_if_fins_cancelled(cancellation_token)
         query_params: XbrlQueryParams = {
             "concepts": resolved_concepts,
         }
-        normalized_query_params = normalized_payload.get("query_params")
+        normalized_query_params = normalized_payload["query_params"]
         if isinstance(normalized_query_params, Mapping):
             statement_type_value = normalized_query_params.get("statement_type")
             period_end_value = normalized_query_params.get("period_end")
@@ -1808,29 +1784,20 @@ class FinsReadRuntime:
                 if isinstance(max_value_value, int | float) and not isinstance(max_value_value, bool)
                 else None
             )
-        normalized_facts = normalized_payload.get("facts")
-        if not isinstance(normalized_facts, list):
-            raise ValueError("normalized XBRL payload missing facts")
-        normalized_total = normalized_payload.get("total")
-        if not isinstance(normalized_total, int) or isinstance(normalized_total, bool):
-            raise ValueError("normalized XBRL payload missing total")
         result: XbrlQueryResult = {
             "ticker": normalized_ticker,
             "document_id": normalized_document_id,
             "query_params": query_params,
-            "facts": normalized_facts,
-            "total": normalized_total,
+            "facts": normalized_payload["facts"],
+            "total": normalized_payload["total"],
+            "deduped_fact_count": normalized_payload["deduped_fact_count"],
+            "data_quality": normalized_payload["data_quality"],
+            "reason": normalized_payload["reason"],
             "citation": self._build_citation(
                 ticker=normalized_ticker,
                 document_id=normalized_document_id,
             ),
         }
-        deduped_fact_count = normalized_payload.get("deduped_fact_count")
-        if isinstance(deduped_fact_count, int) and not isinstance(deduped_fact_count, bool):
-            result["deduped_fact_count"] = deduped_fact_count
-        supported = normalized_payload.get("supported")
-        if isinstance(supported, bool):
-            result["supported"] = supported
         return result
 
     def _normalize_document_identity(

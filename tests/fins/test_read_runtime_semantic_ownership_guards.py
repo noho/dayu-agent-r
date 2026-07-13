@@ -29,6 +29,10 @@ from dayu.fins.domain.document_models import (
     now_iso8601,
 )
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.domain.financial_result_contract import (
+    validate_financial_statement_result_payload,
+)
+from dayu.fins.domain.xbrl_result_contract import XbrlQueryExecutionError
 from dayu.fins.storage import (
     FsCompanyMetaRepository,
     FsProcessedDocumentRepository,
@@ -36,7 +40,7 @@ from dayu.fins.storage import (
 )
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 from dayu.fins.tools.read_runtime import FinsReadRuntime, _parse_source_document_meta
-from dayu.fins.tools.read_runtime_helpers import _resolve_processor_taxonomy
+from dayu.fins.tools.read_runtime_helpers import FinsReadBusinessError, _resolve_processor_taxonomy
 from dayu.fins.tools.result_types import FinancialStatementResult, NotSupportedResult
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -411,6 +415,42 @@ class _FinancialStatementPayloadProcessor:
         return self._payload
 
 
+class _AllFailedXbrlProcessor(_FinancialStatementPayloadProcessor):
+    """始终报告所有 XBRL concept 执行失败的测试 processor。"""
+
+    def query_xbrl_facts(
+        self,
+        *,
+        concepts: list[str],
+        statement_type: str | None = None,
+        period_end: str | None = None,
+        fiscal_year: int | None = None,
+        fiscal_period: str | None = None,
+        min_value: float | None = None,
+        max_value: float | None = None,
+    ) -> dict[str, JsonValue]:
+        """抛出 typed XBRL all-failed 异常。
+
+        Args:
+            concepts: concept 列表。
+            statement_type: 可选报表类型。
+            period_end: 可选期末日期。
+            fiscal_year: 可选财年。
+            fiscal_period: 可选财期。
+            min_value: 可选最小值。
+            max_value: 可选最大值。
+
+        Returns:
+            本函数不会返回。
+
+        Raises:
+            XbrlQueryExecutionError: 始终抛出。
+        """
+
+        del statement_type, period_end, fiscal_year, fiscal_period, min_value, max_value
+        raise XbrlQueryExecutionError(tuple(concepts)) from RuntimeError("sentinel")
+
+
 class _FixedProcessorRegistry(ProcessorRegistry):
     """返回固定 processor 的测试 registry。"""
 
@@ -670,39 +710,66 @@ def test_read_runtime_source_meta_cache_is_partitioned_by_source_kind(tmp_path: 
 
 
 @pytest.mark.parametrize(
-    "payload",
+    ("payload", "expected_message"),
     [
-        {},
-        {"rows": {"unexpected": "dict"}},
+        (
+            {
+                "statement_type": "income_statement",
+                "periods": [],
+                "currency": None,
+                "units": None,
+                "scale": None,
+                "data_quality": "partial",
+                "reason": "statement_empty",
+                "statement_locator": {
+                    "statement_type": "income_statement",
+                    "statement_title": "Income Statement",
+                    "period_labels": [],
+                    "row_labels": [],
+                },
+            },
+            "缺少必填字段: rows",
+        ),
+        (
+            {
+                "statement_type": "income_statement",
+                "periods": [],
+                "rows": {"unexpected": "dict"},
+                "currency": None,
+                "units": None,
+                "scale": None,
+                "data_quality": "partial",
+                "reason": "statement_empty",
+                "statement_locator": {
+                    "statement_type": "income_statement",
+                    "statement_title": "Income Statement",
+                    "period_labels": [],
+                    "row_labels": [],
+                },
+            },
+            "rows 必须为数组",
+        ),
     ],
 )
-def test_get_financial_statement_rejects_missing_or_non_list_rows(
-    tmp_path: Path,
+def test_financial_statement_owner_rejects_missing_or_non_list_rows(
     payload: dict[str, JsonValue],
+    expected_message: str,
 ) -> None:
-    """processor 财报 rows 缺失或非 list 时必须失败。
+    """财务领域 owner 必须直接拒绝 rows 缺失或非数组载荷。
 
     Args:
-        tmp_path: pytest 临时目录。
-        payload: 测试用 processor 返回载荷。
+        payload: 测试用 producer 载荷。
+        expected_message: owner validator 的预期失败信息。
 
     Returns:
         无。
 
     Raises:
-        AssertionError: 断言失败时抛出。
+        AssertionError: owner contract 未在边界处拒绝非法 rows 时抛出。
     """
 
-    processor = _FinancialStatementPayloadProcessor(_FakeSource())
-    processor.set_financial_statement_payload(payload)
-    runtime, _source_repository = _build_runtime_with_source_documents(
-        tmp_path,
-        source_meta_cache_max_entries=4,
-        processor_registry=_FixedProcessorRegistry(processor),
-    )
-
-    with pytest.raises(ValueError, match="processor get_financial_statement result rows must be list"):
-        runtime.get_financial_statement(ticker="AAPL", document_id="doc-1", statement_type="income_statement")
+    with pytest.raises(ValueError, match=expected_message):
+        validate_financial_statement_result_payload(payload)
 
 
 def test_get_financial_statement_accepts_list_rows(tmp_path: Path) -> None:
@@ -721,10 +788,26 @@ def test_get_financial_statement_accepts_list_rows(tmp_path: Path) -> None:
     processor = _FinancialStatementPayloadProcessor(_FakeSource())
     processor.set_financial_statement_payload(
         {
-            "statement_type": "income_statement",
-            "currency": "USD",
-            "units": "millions",
-            "rows": [],
+                "statement_type": "income_statement",
+                "periods": [
+                    {
+                        "period_end": "2025-12-31",
+                        "fiscal_year": 2025,
+                        "fiscal_period": "FY",
+                    }
+                ],
+                "currency": "USD",
+                "units": "USD",
+                "scale": "millions",
+                "rows": [{"concept": "Revenue", "label": "Revenue", "values": [100]}],
+                "data_quality": "xbrl",
+                "reason": None,
+                "statement_locator": {
+                    "statement_type": "income_statement",
+                    "statement_title": "Income Statement",
+                    "period_labels": ["FY2025"],
+                    "row_labels": ["Revenue"],
+                },
         }
     )
     runtime, _source_repository = _build_runtime_with_source_documents(
@@ -736,12 +819,50 @@ def test_get_financial_statement_accepts_list_rows(tmp_path: Path) -> None:
     result = runtime.get_financial_statement(ticker="AAPL", document_id="doc-1", statement_type="income_statement")
 
     assert _is_financial_statement_result(result)
-    assert result["rows"] == []
+    assert result["periods"][0]["fiscal_year"] == 2025
+    assert result["rows"] == [{"concept": "Revenue", "label": "Revenue", "values": [100]}]
+    assert result["units"] == "USD"
+    assert result["scale"] == "millions"
+    assert result["data_quality"] == "xbrl"
+    assert result["reason"] is None
     assert result["statement_locator"] == {
         "statement_type": "income_statement",
-        "period_labels": [],
-        "row_labels": [],
+        "statement_title": "Income Statement",
+        "period_labels": ["FY2025"],
+        "row_labels": ["Revenue"],
     }
+
+
+def test_query_xbrl_facts_maps_all_failed_to_typed_business_failure(tmp_path: Path) -> None:
+    """read runtime 必须把 all-failed 映射为 xbrl_query_failed 而非空成功。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: typed failure code、cause 或文本语义不正确时抛出。
+    """
+
+    processor = _AllFailedXbrlProcessor(_FakeSource())
+    runtime, _source_repository = _build_runtime_with_source_documents(
+        tmp_path,
+        source_meta_cache_max_entries=4,
+        processor_registry=_FixedProcessorRegistry(processor),
+    )
+
+    with pytest.raises(FinsReadBusinessError) as error_info:
+        runtime.query_xbrl_facts(
+            ticker="AAPL",
+            document_id="doc-1",
+            concepts=["Revenue"],
+        )
+
+    assert error_info.value.code == "xbrl_query_failed"
+    assert "零命中" in error_info.value.message
+    assert isinstance(error_info.value.__cause__, XbrlQueryExecutionError)
 
 
 
