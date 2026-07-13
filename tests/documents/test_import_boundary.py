@@ -101,4 +101,4 @@ def test_documents_import_boundary_scan_covers_processors() -> None:
     assert "processors/markdown_processor.py" in scanned_relpaths
     assert "processors/bs_processor.py" in scanned_relpaths
     assert "processors/docling_processor.py" in scanned_relpaths
-
+    assert "processors/bounded_source.py" in scanned_relpaths

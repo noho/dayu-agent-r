@@ -165,14 +165,14 @@ Service composition 测试，覆盖 `dayu.service` 在 Host 外部把 runtime ty
 
 共享文档基础测试，覆盖 `dayu.documents` 的层中立边界与轻量处理器 fixture：
 
-- import boundary：阻止 `dayu.documents` 反向依赖 Engine、Host、Service、UI、Fins 或具体工具实现，并确认 Docling runtime 与 processors 子包被边界扫描覆盖。
-- processors：使用确定性 fixture 覆盖 Markdown、HTML 与 Docling JSON 处理器的章节提取、表格读取与搜索片段输出。
+- import boundary：阻止 `dayu.documents` 反向依赖 Engine、Host、Service、UI、Fins 或具体工具实现，并确认 Docling runtime、processors 子包与 bounded source helper 被边界扫描覆盖。
+- processors：使用确定性 fixture 覆盖 Markdown、HTML 与 Docling JSON 处理器的章节提取、表格读取与搜索片段输出；bounded source 测试覆盖声明长度早拒绝、同一 `Source.open()` 实读 `limit + 1` 字节拒绝、exact limit、processor snapshot 接入、正常/异常/取消/resource failure cleanup、系统临时物化文件清理、单 snapshot 单物化路径复用和非法预算。
 
 ### `tests/tools/`
 
 业务工具与 provider 测试，当前覆盖原生 Doc tools provider、Web tools provider 与 combined tools acceptance：
 
-- doc tools provider：覆盖 `dayu.tools.doc_provider` 通过当前 `ToolsDiscovery` 暴露五个原生 Doc tools、启用但缺失或空 `allowed_paths` 时以 Doc-specific `ValueError` fail fast、显式 limits 到参数上限和截断声明的投影、显式路径白名单拒绝、路径参数投影为绝对路径、路径验证失败不进入业务函数体、`search_files` 对 allowed root 内 symlink 逃逸目标不读取、current success / failure / cancellation outcome 投影、Markdown / Docling JSON 章节列表 / 搜索 / 章节读取、current `ToolTruncateSpec` 暴露、五个 Doc tools 的 process-backed execution 声明、process target 可序列化与子进程内路径校验，以及 current ToolRuntime accept barrier / cancel 后 late result 不接受集成。
+- doc tools provider：覆盖 `dayu.tools.doc_provider` 通过当前 `ToolsDiscovery` 暴露五个原生 Doc tools、启用但缺失或空 `allowed_paths` 时以 Doc-specific `ValueError` fail fast、显式 limits 到参数上限和截断声明的投影、显式路径白名单拒绝、路径参数投影为绝对路径、路径验证失败不进入业务函数体、`search_files` 对 allowed root 内 symlink 逃逸目标不读取、read/list/search 的 producer budget 与 partial contract、`read_file` 单行长文本/多编码/range/source-limit/cancellation、`list_files` directory entry cap 与 result cap 的 `scan_complete` / `total` / `truncated_reason` 语义、`search_files` source/result/directory cap、oversize skip、late query chunk scan、processor snapshot 和 bounded excerpt、LLM-facing partial 字段说明、current success / failure / cancellation outcome 投影、Markdown / Docling JSON 章节列表 / 搜索 / 章节读取、current `ToolTruncateSpec` 暴露、五个 Doc tools 的 process-backed execution 声明、process target 可序列化与子进程内路径校验，以及 current ToolRuntime accept barrier / cancel 后 late result 不接受集成。
 - web tools provider：覆盖 `dayu.tools.web` 通过当前 `ToolsDiscovery` 暴露原生 `search_web` 与 `fetch_web_page`、默认拒绝 private / local URL 且显式配置后才允许、HTTP redirect / meta refresh / Playwright request 继续导航前复用 private-network safety owner、fetch body wire / decompressed 上限的结构化失败投影、Web diagnostic schema v2 对正文/HTML/stdio 只保留 length + digest、safe URL 删除 userinfo/query/fragment、响应头只保留存在性与受限语义、storage state 默认零写入及显式 opt-in 的原子发布/权限/TTL/startup reconciliation、搜索 optional 参数与 provider config 闭包投影、fetch truncate config 与 Playwright fallback channel / storage state config 投影、非法 URL 类型进入 Web 逻辑前失败、current success / failure / cancellation outcome 投影、current `ToolTruncateSpec` 暴露、provider 级串行策略，以及基于 AST import 解析确认未导入 OLD registry / truncation / `fetch_more` / UI。
 - combined tools acceptance：使用确定性 workspace config 同时启用 Doc、Fins 与 Web providers，覆盖单一 `ToolBundle` 聚合、reserved `fetch_more` 防线、current `ToolTruncateSpec` 暴露、current ToolRuntime 注入并拥有 framework `fetch_more`、Service assembly 将 effective bundle 传入 Host、三类 provider 代表工具通过 ToolRuntime accept barrier 执行、代表性失败投影为 current outcome、ScenePrepare 可按 `doc` / `fins` / `web` tags 选择工具，以及 Web provider 串行策略在并发 callable 下生效。
 

@@ -1,6 +1,6 @@
 """doc_tools 专用的处理器工厂。
 
-根据本地文件路径创建合适的 DocumentProcessor 实例。
+根据调用方提供的 Source 创建合适的 DocumentProcessor 实例。
 支持 Markdown（*.md/*.markdown）、HTML（*.html/*.htm）、
 Docling JSON（*_docling.json）三类文件。
 其他格式返回 None，交由调用方降级处理。
@@ -13,9 +13,9 @@ from pathlib import Path
 from typing import Optional
 
 from .base import DocumentProcessor
-from .local_file_source import LocalFileSource
 from .processor_registry import ProcessorRegistry
 from .registry import build_documents_processor_registry
+from .source import Source
 
 # 模块级单例：避免每次调用都重新注册处理器
 _DOCUMENTS_PROCESSOR_REGISTRY: ProcessorRegistry | None = None
@@ -49,8 +49,8 @@ def _get_documents_processor_registry() -> ProcessorRegistry:
     return _DOCUMENTS_PROCESSOR_REGISTRY
 
 
-def create_doc_file_processor(file_path: Path) -> Optional[DocumentProcessor]:
-    """根据本地文件路径创建合适的文档处理器。
+def create_doc_file_processor(source: Source) -> Optional[DocumentProcessor]:
+    """根据 Source 创建合适的文档处理器。
 
     按优先级探测三个处理器：
     1. DoclingProcessor：命中 *_docling.json 文件
@@ -60,7 +60,7 @@ def create_doc_file_processor(file_path: Path) -> Optional[DocumentProcessor]:
     其他格式返回 None，交由调用方降级处理。
 
     Args:
-        file_path: 本地文件绝对路径。
+        source: 已由调用方完成资源治理的文档来源。
 
     Returns:
         DocumentProcessor 实例，或 None（不支持的格式）。
@@ -69,20 +69,16 @@ def create_doc_file_processor(file_path: Path) -> Optional[DocumentProcessor]:
         ValueError: 处理器创建失败时可能抛出。
         OSError: 文件不可读时可能抛出。
     """
-    uri = str(file_path)
-    suffix = file_path.suffix.lower()
+    uri = source.uri
+    suffix = Path(uri.split("?", 1)[0]).suffix.lower()
 
     # 推断 media_type：优先查表，fallback 到 mimetypes
     media_type = _SUFFIX_TO_MEDIA_TYPE.get(suffix)
     if media_type is None:
         media_type, _ = mimetypes.guess_type(uri)
 
-    # 构建 Source
-    source = LocalFileSource(
-        path=file_path,
-        uri=uri,
-        media_type=media_type,
-    )
+    if source.media_type is not None:
+        media_type = source.media_type
 
     # 通过 ProcessorRegistry 选择处理器
     registry = _get_documents_processor_registry()

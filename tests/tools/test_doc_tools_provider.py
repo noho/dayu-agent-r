@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import builtins
 import inspect
-import io
 import os
 import pickle
 import shutil
@@ -15,7 +13,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, TextIO, cast
+from typing import cast
 
 import pytest
 
@@ -35,6 +33,12 @@ from dayu.contracts.tool_call import (
 from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
 from dayu.contracts.tool_outcome import ToolCancelledOutcome, ToolCompletedOutcome, ToolFailedOutcome
 from dayu.contracts.tool_schema import ToolTruncateSpec, ToolTruncationStrategy
+from dayu.documents.processors.bounded_source import (
+    BoundedSourceSnapshot,
+    SourceBudgetExceeded,
+)
+from dayu.documents.processors.base import DocumentProcessor
+from dayu.documents.processors.local_file_source import LocalFileSource
 from dayu.host.tool_runtime import (
     DefaultToolRuntimeFactory,
     EffectiveToolBundleBuildRequest,
@@ -191,6 +195,65 @@ class _ManualCancellationToken:
         return self._requested_at
 
 
+class _CancelAfterObservationToken:
+    """在固定观察次数后自动取消的测试 token。"""
+
+    def __init__(self, cancel_at: int) -> None:
+        """初始化自动取消 token。
+
+        Args:
+            cancel_at: 第几次 ``is_cancelled`` 观察起返回 ``True``。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: ``cancel_at`` 小于 1 时抛出。
+        """
+
+        if cancel_at < 1:
+            raise ValueError("cancel_at must be >= 1")
+        self._cancel_at = cancel_at
+        self._observations = 0
+
+    def is_cancelled(self) -> bool:
+        """记录观察并在阈值后返回取消。
+
+        Returns:
+            是否已达到取消阈值。
+
+        Raises:
+            无。
+        """
+
+        self._observations += 1
+        return self._observations >= self._cancel_at
+
+    def cancel_reason(self) -> str | None:
+        """返回测试取消原因。
+
+        Returns:
+            固定测试原因。
+
+        Raises:
+            无。
+        """
+
+        return "cancel after observation"
+
+    def requested_at(self) -> datetime | None:
+        """返回测试取消时间。
+
+        Returns:
+            固定时间。
+
+        Raises:
+            无。
+        """
+
+        return datetime(2026, 1, 1, 0, 0, 0)
+
+
 class _AcceptingPort(HostToolFactAcceptPort):
     """测试用 Host accept barrier。"""
 
@@ -321,6 +384,32 @@ def test_doc_process_target_factory_is_pickle_round_trippable(
     assert round_tripped_target.tool_name == tool_name
     assert "provider_lock" not in repr(round_tripped_target)
     assert "DocumentProcessor" not in repr(round_tripped_target)
+    assert round_tripped_target.resource_budget == doc_tools.DocResourceBudget()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    (
+        ("max_source_bytes", 0),
+        ("max_source_bytes", True),
+        ("max_directory_entries", 0),
+        ("max_directory_entries", False),
+    ),
+)
+def test_doc_resource_budget_rejects_non_positive_or_bool_limits(
+    field_name: str,
+    field_value: int | bool,
+) -> None:
+    """内部资源 ceiling 的两个字段都只接受非 bool 正整数。"""
+
+    values = {
+        "max_source_bytes": 1024,
+        "max_directory_entries": 10,
+    }
+    values[field_name] = field_value
+
+    with pytest.raises(ValueError, match=field_name):
+        doc_tools.DocResourceBudget(**values)
 
 
 def test_doc_process_target_fast_path_matches_callable_baseline(tmp_path: Path) -> None:
@@ -337,6 +426,29 @@ def test_doc_process_target_fast_path_matches_callable_baseline(tmp_path: Path) 
     assert isinstance(envelope, Mapping)
     assert envelope["status"] == "completed"
     assert envelope["value"] == baseline.result.value
+
+
+def test_doc_process_target_read_file_partial_matches_direct_callable(
+    tmp_path: Path,
+) -> None:
+    """read_file 字符 cap 的 partial 投影在 direct/process 路径必须同源。"""
+
+    target = tmp_path / "long.txt"
+    target.write_text("x" * 2500, encoding="utf-8")
+    definition = _definitions_by_name(_discover_definitions(tmp_path))["read_file"]
+    call = _call("read_file", {"file_path": str(target)})
+    baseline = asyncio.run(definition.callable(call, _context()))
+    assert isinstance(baseline, ToolCompletedOutcome)
+
+    envelope = _run_definition_process_target(definition, call)
+
+    assert isinstance(envelope, Mapping)
+    assert envelope["status"] == "completed"
+    assert envelope["value"] == baseline.result.value
+    value = cast(Mapping[str, JsonValue], envelope["value"])
+    assert value["content_truncated"] is True
+    assert value["scan_complete"] is False
+    assert value["total_lines"] is None
 
 
 def test_doc_process_target_processor_path_supports_docling_sections(tmp_path: Path) -> None:
@@ -551,6 +663,8 @@ def test_path_validation_failure_does_not_enter_migrated_function_body(
         file_path: str,
         start_line: int | None,
         end_line: int | None,
+        max_chars: int,
+        max_source_bytes: int,
         cancellation_token: CancellationToken,
     ) -> JsonValue:
         """记录是否进入 Doc 业务函数。
@@ -558,12 +672,13 @@ def test_path_validation_failure_does_not_enter_migrated_function_body(
         :param file_path: 文件路径。
         :param start_line: 起始行号。
         :param end_line: 结束行号。
+        :param max_chars: 最大返回字符数。
+        :param max_source_bytes: 单 Source 字节预算。
         :param cancellation_token: 取消令牌。
         :returns: 测试返回值。
         """
 
-        del start_line
-        del end_line
+        del start_line, end_line, max_chars, max_source_bytes
         del cancellation_token
         calls.append(file_path)
         return {"file_path": file_path}
@@ -700,6 +815,387 @@ def test_list_and_search_return_paths_can_chain_to_read_tools(
     assert isinstance(read_section_from_search_outcome, ToolCompletedOutcome)
 
 
+def test_list_files_directory_entry_limit_returns_self_describing_partial(
+    tmp_path: Path,
+) -> None:
+    """目录 entry cap 命中时不得伪造 total 或完整扫描。"""
+
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    for name in ("c.txt", "a.txt", "b.txt"):
+        (nested / name).write_text(name, encoding="utf-8")
+
+    value = cast(
+        Mapping[str, JsonValue],
+        doc_tools._list_files_business(
+            directory=str(tmp_path),
+            pattern=None,
+            recursive=True,
+            limit=2,
+            max_files=2,
+            max_directory_entries=2,
+            cancellation_token=_OpenCancellationToken(),
+        ),
+    )
+
+    assert value["scanned_entries"] == 2
+    assert value["scan_complete"] is False
+    assert value["total"] is None
+    assert value["truncated_reason"] == "directory_entry_limit"
+    returned = value["returned"]
+    assert isinstance(returned, int)
+    assert returned <= 2
+
+
+def test_list_files_directory_iteration_observes_cancellation(tmp_path: Path) -> None:
+    """list_files 在目录迭代窗口必须停止观察到的取消。"""
+
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (tmp_path / name).write_text(name, encoding="utf-8")
+    token = _CancelAfterObservationToken(cancel_at=3)
+
+    with pytest.raises(doc_tools._DocCancelledError):
+        doc_tools._list_files_business(
+            directory=str(tmp_path),
+            pattern=None,
+            recursive=False,
+            limit=3,
+            max_files=3,
+            max_directory_entries=10,
+            cancellation_token=token,
+        )
+
+
+def test_list_files_result_limit_keeps_exact_total_after_complete_scan(
+    tmp_path: Path,
+) -> None:
+    """仅结果数受限时仍应完成 bounded scan 并给出精确 total。"""
+
+    for name in ("c.txt", "a.txt", "b.txt"):
+        (tmp_path / name).write_text(name, encoding="utf-8")
+
+    value = cast(
+        Mapping[str, JsonValue],
+        doc_tools._list_files_business(
+            directory=str(tmp_path),
+            pattern="*.txt",
+            recursive=False,
+            limit=2,
+            max_files=2,
+            max_directory_entries=10,
+            cancellation_token=_OpenCancellationToken(),
+        ),
+    )
+    files = cast(list[Mapping[str, JsonValue]], value["files"])
+
+    assert [item["name"] for item in files] == ["a.txt", "b.txt"]
+    assert value["returned"] == 2
+    assert value["total"] == 3
+    assert value["scan_complete"] is True
+    assert value["truncated_reason"] is None
+
+
+def test_read_file_long_single_line_stops_at_character_limit(
+    tmp_path: Path,
+) -> None:
+    """无换行长行必须最多累积字符预算加一个 probe。"""
+
+    target = tmp_path / "long.txt"
+    target.write_text("x" * 200, encoding="utf-8")
+
+    value = cast(
+        Mapping[str, JsonValue],
+        doc_tools._read_file_business(
+            file_path=str(target),
+            start_line=None,
+            end_line=None,
+            max_chars=17,
+            max_source_bytes=1000,
+            cancellation_token=_OpenCancellationToken(),
+        ),
+    )
+
+    assert value["content"] == "x" * 17
+    assert value["returned_chars"] == 17
+    assert value["content_truncated"] is True
+    assert value["scan_complete"] is False
+    assert value["total_lines"] is None
+
+
+def test_read_file_multibyte_encoding_range_reports_complete_metadata(
+    tmp_path: Path,
+) -> None:
+    """多字节 fallback 编码与行范围完整扫描必须返回精确元数据。"""
+
+    target = tmp_path / "gbk.txt"
+    target.write_bytes("第一行\n第二行\n第三行".encode("gbk"))
+
+    value = cast(
+        Mapping[str, JsonValue],
+        doc_tools._read_file_business(
+            file_path=str(target),
+            start_line=2,
+            end_line=2,
+            max_chars=100,
+            max_source_bytes=1000,
+            cancellation_token=_OpenCancellationToken(),
+        ),
+    )
+
+    assert value["content"] == "第二行\n"
+    assert value["returned_chars"] == 4
+    assert value["content_truncated"] is False
+    assert value["scan_complete"] is True
+    assert value["total_lines"] == 3
+    assert value["line_range"] == [2, 2]
+
+
+def test_read_file_source_limit_plus_one_raises_typed_resource_failure(
+    tmp_path: Path,
+) -> None:
+    """raw read 在 processor/full read 前必须按同一流拒绝 ``limit+1``。"""
+
+    target = tmp_path / "oversized.txt"
+    target.write_bytes(b"123456789")
+
+    with pytest.raises(SourceBudgetExceeded) as raised:
+        doc_tools._read_file_business(
+            file_path=str(target),
+            start_line=None,
+            end_line=None,
+            max_chars=100,
+            max_source_bytes=8,
+            cancellation_token=_OpenCancellationToken(),
+        )
+
+    assert raised.value.observed_bytes == 9
+
+
+def test_read_file_section_limit_returns_explicit_partial_fields(
+    tmp_path: Path,
+) -> None:
+    """章节字符预算必须由 producer 显式投影，不依赖下游静默截断。"""
+
+    target = _copy_fixture(tmp_path, "sample.md")
+    value = cast(
+        Mapping[str, JsonValue],
+        doc_tools._read_file_section_business(
+            file_path=str(target),
+            ref="s_0001",
+            max_chars=8,
+            max_source_bytes=100_000,
+            cancellation_token=_OpenCancellationToken(),
+        ),
+    )
+
+    assert len(str(value["content"])) == 8
+    assert value["returned_chars"] == 8
+    assert value["content_truncated"] is True
+    assert value["scan_complete"] is False
+
+
+def test_search_files_raw_long_line_finds_late_query_with_bounded_excerpt(
+    tmp_path: Path,
+) -> None:
+    """raw search 不得按整行累积，仍须找到长行尾部关键词。"""
+
+    target = tmp_path / "long.txt"
+    target.write_text("x" * 700 + "Needle" + "y" * 50, encoding="utf-8")
+
+    value = cast(
+        Mapping[str, JsonValue],
+        doc_tools._search_files_business(
+            directory=str(tmp_path),
+            query="needle",
+            include_types=None,
+            limit=5,
+            max_results=5,
+            max_source_bytes=1000,
+            max_directory_entries=10,
+            allowed_roots=(tmp_path.resolve(),),
+            cancellation_token=_OpenCancellationToken(),
+        ),
+    )
+    matches = cast(list[Mapping[str, JsonValue]], value["matches"])
+
+    assert value["total_matches"] == 1
+    assert value["scan_complete"] is True
+    assert "Needle" in str(matches[0]["matched_line_content"])
+    assert len(str(matches[0]["matched_line_content"])) <= 300
+
+
+def test_search_files_source_limit_skips_oversized_processor_input_without_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """processor 支持文件超预算时必须 partial/skipped，不能降级为无命中。"""
+
+    target = tmp_path / "oversized.md"
+    target.write_text("# Title\n" + "Revenue" * 20, encoding="utf-8")
+    processor_paths: list[Path] = []
+    original_try_create = doc_tools._try_create_processor
+
+    def spy_try_create_processor(
+        source: BoundedSourceSnapshot,
+        path: Path,
+    ) -> DocumentProcessor | None:
+        """记录实际进入 processor factory 的文件。
+
+        Args:
+            source: 已治理 Source。
+            path: 原文件路径。
+
+        Returns:
+            原 helper 返回值。
+
+        Raises:
+            原 helper 异常原样透出。
+        """
+
+        processor_paths.append(path)
+        return original_try_create(source, path)
+
+    monkeypatch.setattr(doc_tools, "_try_create_processor", spy_try_create_processor)
+    value = cast(
+        Mapping[str, JsonValue],
+        doc_tools._search_files_business(
+            directory=str(tmp_path),
+            query="Revenue",
+            include_types=None,
+            limit=5,
+            max_results=5,
+            max_source_bytes=16,
+            max_directory_entries=10,
+            allowed_roots=(tmp_path.resolve(),),
+            cancellation_token=_OpenCancellationToken(),
+        ),
+    )
+
+    assert value["matches"] == []
+    assert value["skipped_oversized_files"] == 1
+    assert value["scan_complete"] is False
+    assert value["truncated_reason"] == "source_limit"
+    assert processor_paths == []
+
+
+def test_search_files_cumulative_match_limit_returns_result_partial(
+    tmp_path: Path,
+) -> None:
+    """累计 match cap 命中时必须停止并声明 result_limit。"""
+
+    (tmp_path / "a.txt").write_text("Needle\n", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("Needle\nNeedle\n", encoding="utf-8")
+
+    value = cast(
+        Mapping[str, JsonValue],
+        doc_tools._search_files_business(
+            directory=str(tmp_path),
+            query="Needle",
+            include_types=None,
+            limit=2,
+            max_results=2,
+            max_source_bytes=1000,
+            max_directory_entries=10,
+            allowed_roots=(tmp_path.resolve(),),
+            cancellation_token=_OpenCancellationToken(),
+        ),
+    )
+
+    assert value["total_matches"] == 2
+    assert value["scan_complete"] is False
+    assert value["truncated_reason"] == "result_limit"
+
+
+def test_search_files_directory_entry_limit_returns_directory_partial(
+    tmp_path: Path,
+) -> None:
+    """search 目录 cap 命中时必须优先声明 directory_entry_limit。"""
+
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (tmp_path / name).write_text("no match", encoding="utf-8")
+
+    value = cast(
+        Mapping[str, JsonValue],
+        doc_tools._search_files_business(
+            directory=str(tmp_path),
+            query="Needle",
+            include_types=None,
+            limit=5,
+            max_results=5,
+            max_source_bytes=1000,
+            max_directory_entries=1,
+            allowed_roots=(tmp_path.resolve(),),
+            cancellation_token=_OpenCancellationToken(),
+        ),
+    )
+
+    assert value["scanned_entries"] == 1
+    assert value["scan_complete"] is False
+    assert value["truncated_reason"] == "directory_entry_limit"
+
+
+def test_search_files_processor_factory_receives_bounded_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """search processor factory 不得接收原路径并自行重开未治理来源。"""
+
+    target = tmp_path / "report.md"
+    target.write_text("# Report\nRevenue", encoding="utf-8")
+    captured_sources: list[BoundedSourceSnapshot] = []
+
+    def fake_create_processor(source: BoundedSourceSnapshot) -> None:
+        """记录 factory 输入并强制 raw scan。
+
+        Args:
+            source: processor factory 输入。
+
+        Returns:
+            始终返回 ``None``。
+
+        Raises:
+            无。
+        """
+
+        captured_sources.append(source)
+        return None
+
+    monkeypatch.setattr(doc_tools, "create_doc_file_processor", fake_create_processor)
+    value = cast(
+        Mapping[str, JsonValue],
+        doc_tools._search_files_business(
+            directory=str(tmp_path),
+            query="Revenue",
+            include_types=None,
+            limit=5,
+            max_results=5,
+            max_source_bytes=1000,
+            max_directory_entries=10,
+            allowed_roots=(tmp_path.resolve(),),
+            cancellation_token=_OpenCancellationToken(),
+        ),
+    )
+
+    assert len(captured_sources) == 1
+    assert isinstance(captured_sources[0], BoundedSourceSnapshot)
+    assert value["total_matches"] == 1
+
+
+def test_doc_tool_descriptions_explain_partial_limit_fields(tmp_path: Path) -> None:
+    """LLM-facing 描述必须自足说明 partial 字段、原因与下一步。"""
+
+    definitions = _definitions_by_name(_discover_definitions(tmp_path))
+
+    for tool_name in ("list_files", "search_files", "read_file"):
+        description = definitions[tool_name].schema.function.description
+        assert "scan_complete" in description
+        assert "truncated_reason" in description or "content_truncated" in description
+    assert "directory_entry_limit" in definitions["list_files"].schema.function.description
+    search_description = definitions["search_files"].schema.function.description
+    assert "source_limit" in search_description
+    assert "skipped_oversized_files" in search_description
+
+
 def test_search_files_does_not_read_symlink_escape(
     tmp_path: Path,
 ) -> None:
@@ -750,18 +1246,22 @@ def test_search_files_cancelled_during_iteration_stops_before_later_scan(
     token = _ManualCancellationToken()
     scanned_paths: list[str] = []
 
-    def fake_try_create_processor(path: Path) -> None:
+    def fake_try_create_processor(
+        source: BoundedSourceSnapshot,
+        path: Path,
+    ) -> None:
         """强制搜索走行扫描 fallback。
 
+        :param source: 已治理的 Source。
         :param path: 候选文件路径。
         :returns: 始终返回 ``None``。
         """
 
-        del path
+        del source, path
         return None
 
     def fake_search_via_line_scan(
-        file_path: Path,
+        source: BoundedSourceSnapshot,
         relative_path: str,
         query: str,
         remaining: int,
@@ -769,7 +1269,7 @@ def test_search_files_cancelled_during_iteration_stops_before_later_scan(
     ) -> list[dict[str, JsonValue]]:
         """记录首个扫描文件并触发取消。
 
-        :param file_path: 当前扫描文件。
+        :param source: 当前 bounded Source。
         :param relative_path: 相对路径。
         :param query: 搜索词。
         :param remaining: 剩余结果数量。
@@ -777,7 +1277,7 @@ def test_search_files_cancelled_during_iteration_stops_before_later_scan(
         :returns: 空匹配，迫使外层继续迭代并命中 checkpoint。
         """
 
-        del file_path, query, remaining, cancellation_token
+        del source, query, remaining, cancellation_token
         scanned_paths.append(relative_path)
         token.cancel("cancel during iteration")
         return []
@@ -805,25 +1305,12 @@ def test_search_via_line_scan_observes_loop_cancellation(
 
     target = tmp_path / "large.txt"
     target.write_text("Revenue\nRevenue\n", encoding="utf-8")
-    token = _ManualCancellationToken()
-
-    def fake_extract_query_anchored_snippets(content: str, query: str) -> list[str]:
-        """在读取内容后、行扫描循环前请求取消。
-
-        :param content: 文件内容。
-        :param query: 搜索词。
-        :returns: 测试片段。
-        """
-
-        del content, query
-        token.cancel("run_id=run-doc correlation_id=correlation-doc digest=sha256:doc")
-        return ["Revenue"]
-
-    monkeypatch.setattr(doc_tools, "_DOC_LOOP_CANCELLATION_CHECK_INTERVAL", 1)
-    monkeypatch.setattr(doc_tools, "extract_query_anchored_snippets", fake_extract_query_anchored_snippets)
-
-    with pytest.raises(doc_tools._DocCancelledError):
-        doc_tools._search_via_line_scan(target, "large.txt", "Revenue", 10, token)
+    token = _CancelAfterObservationToken(cancel_at=2)
+    monkeypatch.setattr(doc_tools, "_DOC_STREAM_CHUNK_BYTES", 1)
+    source = LocalFileSource(path=target, uri=str(target))
+    with BoundedSourceSnapshot(source, max_bytes=100) as snapshot:
+        with pytest.raises(doc_tools._DocCancelledError):
+            doc_tools._search_via_line_scan(snapshot, "large.txt", "Revenue", 10, token)
 
 
 def test_search_files_line_scan_cancellation_returns_host_cancelled(
@@ -835,33 +1322,23 @@ def test_search_files_line_scan_cancellation_returns_host_cancelled(
     target = tmp_path / "large.txt"
     target.write_text("Revenue\nRevenue\n", encoding="utf-8")
     definitions = _definitions_by_name(_discover_definitions(tmp_path))
-    token = _ManualCancellationToken()
+    token = _CancelAfterObservationToken(cancel_at=5)
 
-    def fake_try_create_processor(path: Path) -> None:
+    def fake_try_create_processor(
+        source: BoundedSourceSnapshot,
+        path: Path,
+    ) -> None:
         """强制搜索走行扫描 fallback。
 
+        :param source: 已治理的 Source。
         :param path: 候选文件路径。
         :returns: 始终返回 ``None``。
         """
 
-        del path
+        del source, path
         return None
-
-    def fake_extract_query_anchored_snippets(content: str, query: str) -> list[str]:
-        """在 line scan 进入循环前请求取消。
-
-        :param content: 文件内容。
-        :param query: 搜索词。
-        :returns: 测试片段。
-        """
-
-        del content, query
-        token.cancel("cancel during line scan")
-        return ["Revenue"]
-
-    monkeypatch.setattr(doc_tools, "_DOC_LOOP_CANCELLATION_CHECK_INTERVAL", 1)
+    monkeypatch.setattr(doc_tools, "_DOC_STREAM_CHUNK_BYTES", 1)
     monkeypatch.setattr(doc_tools, "_try_create_processor", fake_try_create_processor)
-    monkeypatch.setattr(doc_tools, "extract_query_anchored_snippets", fake_extract_query_anchored_snippets)
 
     outcome = asyncio.run(
         definitions["search_files"].callable(
@@ -883,59 +1360,18 @@ def test_read_file_cancelled_after_first_failed_encoding_stops_fallback(
 
     target = tmp_path / "encoded.txt"
     target.write_bytes(b"\xffencoded")
-    definitions = _definitions_by_name(_discover_definitions(tmp_path))
-    token = _ManualCancellationToken()
-    attempted_encodings: list[str] = []
-    original_open = builtins.open
-
-    def fake_open(
-        file: int | str | bytes | Path,
-        mode: str = "r",
-        buffering: int = -1,
-        encoding: str | None = None,
-        errors: str | None = None,
-        newline: str | None = None,
-        closefd: bool = True,
-        opener: Callable[[str, int], int] | None = None,
-    ) -> TextIO:
-        """在 utf-8 解码失败后请求取消。
-
-        :param file: 打开的文件路径或描述符。
-        :param mode: 打开模式。
-        :param buffering: buffering 参数。
-        :param encoding: 文本编码。
-        :param errors: 解码错误策略。
-        :param newline: 换行策略。
-        :param closefd: 是否关闭 fd。
-        :param opener: 自定义 opener。
-        :returns: 文本文件对象。
-        :raises UnicodeDecodeError: 模拟 utf-8 解码失败。
-        """
-
-        if isinstance(file, (str, Path)) and Path(file).resolve() == target.resolve():
-            if encoding is not None:
-                attempted_encodings.append(encoding)
-            if encoding == "utf-8":
-                token.cancel("cancel before fallback encoding")
-                raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
-            return io.StringIO("fallback content")
-        return cast(
-            TextIO,
-            original_open(file, mode, buffering, encoding, errors, newline, closefd, opener),
-        )
-
-    monkeypatch.setattr(builtins, "open", fake_open)
-
-    outcome = asyncio.run(
-        definitions["read_file"].callable(
-            _call("read_file", {"file_path": str(target)}),
-            _context(token),
-        )
-    )
-
-    assert isinstance(outcome, ToolCancelledOutcome)
-    assert outcome.reason == TOOL_CANCELLED_REASON_HOST_CANCELLED
-    assert attempted_encodings == ["utf-8"]
+    token = _CancelAfterObservationToken(cancel_at=2)
+    source = LocalFileSource(path=target, uri=str(target))
+    with BoundedSourceSnapshot(source, max_bytes=100) as snapshot:
+        with pytest.raises(doc_tools._DocCancelledError):
+            doc_tools._read_bounded_text(
+                snapshot=snapshot,
+                encodings=("utf-8", "latin1"),
+                max_chars=100,
+                start_line=1,
+                end_line=None,
+                cancellation_token=token,
+            )
 
 
 def test_markdown_section_extraction_observes_cooperative_cancellation(
@@ -963,8 +1399,10 @@ def test_count_file_lines_observes_cooperative_cancellation(
     token.cancel("cancel line count")
     monkeypatch.setattr(doc_tools, "_DOC_LOOP_CANCELLATION_CHECK_INTERVAL", 1)
 
-    with pytest.raises(doc_tools._DocCancelledError):
-        doc_tools._count_file_lines(target, token)
+    source = LocalFileSource(path=target, uri=str(target))
+    with BoundedSourceSnapshot(source, max_bytes=100) as snapshot:
+        with pytest.raises(doc_tools._DocCancelledError):
+            doc_tools._count_source_lines(snapshot, token)
 
 
 def test_success_and_failure_responses_do_not_contain_old_envelope(
