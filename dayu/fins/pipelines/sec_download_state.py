@@ -7,6 +7,7 @@ from dayu.contracts.json_value import JsonValue
 import asyncio
 import json
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Final, Optional
 
@@ -26,6 +27,29 @@ _SEC_CACHE_DIR: Final[str] = _SEC_CACHE_RELATIVE_DIR.as_posix()
 _SEC_CACHE_TTL_HOURS: Final[int] = 24
 _SEC_CACHE_CATEGORY_SUBMISSIONS: Final[str] = "submissions"
 _SEC_CACHE_CATEGORY_BROWSE_EDGAR: Final[str] = "browse_edgar"
+
+
+def has_current_download_version(
+    meta: Mapping[str, JsonValue] | None,
+    expected_version: str,
+) -> bool:
+    """判断 source meta 是否由当前 SEC 下载契约产生。
+
+    Args:
+        meta: 既有 source meta；文档尚不存在时为 ``None``。
+        expected_version: 当前 SEC 下载链路版本号。
+
+    Returns:
+        meta 存在、版本字段为非空字符串且与当前版本完全相等时返回 ``True``。
+
+    Raises:
+        无。
+    """
+
+    if meta is None:
+        return False
+    raw_version = meta.get("download_version")
+    return isinstance(raw_version, str) and raw_version == expected_version
 
 
 def _build_sec_cache_dir(workspace_root: Path) -> Path:

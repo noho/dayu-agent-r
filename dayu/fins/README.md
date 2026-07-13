@@ -96,6 +96,8 @@ Fins 与其它层的稳定边界如下：
 
 source document meta 中的 `source_provider` 是来源提供方真源，当前支持 SEC EDGAR、巨潮资讯、港交所披露易与用户上传。`SourceDocumentRepositoryProtocol` 负责把 source meta 投影为 typed provenance；read runtime 的 citation 只消费该 provenance 来生成 LLM-facing `source_type` 与 `source_provider`。
 
+`SourceDocumentRepositoryProtocol.get_source_revision(...)` 是 read cache freshness 的仓储真源。revision 由会影响 processor 输入的 canonical source meta 与文件身份/内容字段确定性计算；read runtime 的 processor cache 和 source meta cache 都绑定该 typed revision，复用前必须重新比较。revision 不一致时两类缓存一起失效；processor 构建或独立 meta 读取期间 revision 改变时，本次读取以 `source_changed_during_read` 失败关闭，不返回混合版本结果，也不在 owner 内自动重试。
+
 source document acknowledgement 由 source repository 持有：完成态 source meta 或 `stage_source_document(...)` 写入的 `ingest_complete=false` staging meta 都表示该 source 已被仓储承认。`DocumentBlobRepositoryProtocol.store_file(SourceHandle, ...)` 只能在 source meta 已存在后写入 blob；下载与上传 pipeline 在首次 blob 写入前必须通过 source repository staging 或既有完成态 meta 获得承认。
 
 batch/staging owner 由 storage batch token 持有：同 ticker 活动 batch 会绑定创建它的 owner token 与本地执行 scope，只有持有该 token 的 owner 可以读写 staging、提交或回滚。其它 task / thread / repository facade 不得加入同一 staging；需要让 source 与 blob 在同一替换事务中协作时，调用方必须使用共享 repository set 或显式注入共享 core 的仓储实例。
@@ -106,7 +108,9 @@ download / upload overwrite 是单目标替换语义，不是 ticker 级清空�
 
 文件系统仓储统一持有 document id 的路径组件边界：source、processed、blob handle、rejected filing artifact、download rejection registry 和 manifest 写入 / 删除入口都必须把 `document_id` 校验为单个路径组件。调用方不得用下游路径拼接、展示层过滤或测试夹具来补偿非法 document id。
 
-XBRL facts processor result contract 由 `dayu.fins.domain.xbrl_result_contract` 持有：`query_xbrl_facts` 的 raw payload 必须包含 `query_params`、raw `facts`、整数 `total`，且 `total` 必须等于 raw facts 数量。read runtime 与 fiscal inference 在任何去重、清洗或投影前先校验该契约；read runtime 不覆盖 processor-owned `total`，去重后的展示数量使用独立派生字段 `deduped_fact_count`。
+financial statement result contract 由 `dayu.fins.domain.financial_result_contract` 持有。processor 必须显式产生 `periods`、`rows`、`currency`、`units`、`scale`、`data_quality`、`reason` 与 `statement_locator`；`units` 只表达货币或计量单位，`scale` 独立表达 `units/thousands/millions/billions` 数值倍率。`partial` 必须有稳定 reason，`xbrl/extracted` 必须没有 reason；存在 rows 但缺少直接 scale 或 fiscal 证据时保持已有数据并降级为 `partial`，不得由 read runtime 补默认值。
+
+XBRL facts processor result contract 由 `dayu.fins.domain.xbrl_result_contract` 持有：`query_xbrl_facts` 的 raw payload 必须包含 `query_params`、raw `facts`、整数 `total`、`data_quality` 与 `reason`，且 `total` 必须等于 raw facts 数量。正常执行但零命中是 `xbrl` 结果；部分 concept 失败是带 reason 的 `partial`；全部 concept 失败抛 typed execution error。read runtime 在任何去重、清洗或投影前先校验该契约，不覆盖 processor-owned `total`，去重后的展示数量使用独立派生字段 `deduped_fact_count`。
 
 上传链路的 company meta freshness 由 `dayu.fins.pipelines.upload_company_meta` 持有：只有既有 meta 的 `resolver_version` 等于当前 upload resolver 版本时才可保留；版本不一致时必须用本次上传字段重新校验并写入。`updated_at` 仅是审计时间，不是 freshness TTL。SEC/CN/HK 下载链路仍由各自 producer 写入公司元数据，不经上传 freshness 逻辑；read runtime 只读取仓储中的 company meta，不刷新或推断 freshness。
 
@@ -136,7 +140,9 @@ resolver 只提供业务解析能力；调用方负责读取环境变量、配�
 - `get_financial_statement`
 - `query_xbrl_facts`
 
-read runtime 持有 `document_id -> source_kind -> source -> processor` 路由和 read tool 输出投影。processor 的可选能力边界使用 typed protocol 显式判断：分页、财务报表、XBRL facts 与 XBRL taxonomy 能力都由 protocol 方法承诺，不通过字符串属性名探测。source meta 在 read runtime 内先从仓储 raw JSON 收窄为本地 typed projection，再进入 citation、source document 列表、文档别名解析和 fiscal 推断；实例级 source meta cache 使用有界 LRU，容量由 `source_meta_cache_max_entries` 控制。
+read runtime 持有 `document_id -> source_kind -> source -> processor` 路由和 read tool 输出投影。processor 的可选能力边界使用 typed protocol 显式判断：分页、财务报表、XBRL facts 与 XBRL taxonomy 能力都由 protocol 方法承诺，不通过字符串属性名探测。source meta 在 read runtime 内先从仓储 raw JSON 收窄为本地 typed projection；fiscal year 只接受 producer 持久化的正整数，fiscal period 只接受 domain canonical 值，缺失值保持 `None`，不从 form、report date 或 filing date 补偿。实例级 source meta cache 使用有界 LRU，容量由 `source_meta_cache_max_entries` 控制，并与 storage source revision 一起决定能否复用。
+
+read path 对 source decode、search index 构建、XBRL 查询全失败和读取期间 source 变化使用 typed failure code。非法 UTF-8 不以忽略字符或空文本继续；section/enrichment/BM25F 任一构建失败不返回空搜索成功；这些失败在工具边界投影为稳定业务错误，原始异常只作为内部 cause 保留。协作式取消仍优先传播，不被 degradation mapping 改写。
 
 `dayu.fins.tools.provider.discover_tools(spec)` 是 read tools 的 ToolsDiscovery provider 入口，provider id 为 `financial-read-tools`。启用时必须通过 effective spec 提供绝对 `workspace_root`，并返回九个 read tools；read provider 是否参与发现只由 provider-level `enabled` 控制。
 
@@ -441,7 +447,7 @@ Fins workspace 规则固定如下：
 - 包内默认 `financial-read-tools`、`financial-download-tools`、`financial-preprocess-tools`、`financial-upload-tools` 均为 enabled 且 raw config 不写 `workspace_root`；Service assembly 会用当前运行时 workspace root 注入绝对 `workspace_root`。upload provider 默认注册 `start_fins_upload`，默认非上传 scene 通过窄标签 `fins-read`、`fins-download`、`fins-preprocess` 选择 read/download/preprocess 工具，避免 broad `fins` tag 误选 upload。
 - Service assembly 为 Fins awaiting providers 构造 Service-owned wait adapter registry 时，要求同一 Host assembly 内启用的 Fins download / preprocess / upload provider 使用同一个绝对 `workspace_root`。
 - legacy ingestion job store 当前路径为 `<workspace_root>/.dayu/fins_ingestion/jobs`，保存 legacy job governance records 与每个 job 的 event sidecar，不保存财报正文、processed payload、raw download payload 或 upload 本地文件路径。Direct stream 和 lightweight observation handle 不以该目录作为公共观察真源。
-- upload provider 不拥有本地源文件 allowlist 或授权配置；它只注册工具并做普通文件、存在性与非空校验。仓储写入边界仍属于 `dayu.fins.storage`，工具 caller 不能指定 source/blob/processed 的仓储写入目录。
+- upload provider 只注册工具并校验输入是存在、非空的普通文件；仓储写入边界仍属于 `dayu.fins.storage`，工具 caller 不能指定 source/blob/processed 的仓储写入目录。
 
 ## 主要组件
 
@@ -466,9 +472,11 @@ Processors 在 `dayu.documents.processors` 通用能力上增加财报语义：
 - SEC 表单专项处理器通过虚拟章节 mixin 处理 `10-K`、`10-Q`、`20-F`、`8-K`、`DEF 14A`、`SC 13D/G`、`6-K` 等表单的章节切分、搜索和财务表回退。
 - `build_fins_processor_registry()` 在 documents 默认处理器注册表基础上覆盖注册 Fins 增强处理器，并按优先级注册 SEC 表单专项主路径、回退路径和通用 SEC 兜底。
 
+`dayu.fins.domain.filing_semantics` 是 fiscal year、fiscal period 与财期 recency rank 的 domain 真源；processor 和 pipeline 负责产生直接 fiscal 事实，read runtime 只校验、排序和投影。`dayu.fins.processors.value_normalization.normalize_optional_dataframe_string(...)` 是 dataframe 可选字符串真源：`None`、空白、NaN、`pd.NA` 与 `pd.NaT` 表示缺失，数字 `0` 与 bool `False` 保留为文本。SEC section、table 与 XBRL processor 直接消费该 helper，不维护本地 wrapper。
+
 ### FinsReadRuntime
 
-`FinsReadRuntime` 是 read path runtime，负责 ticker 标准化、文档选择、document_id 到 source / processor 的路由、processor LRU 缓存、not-supported 降级、列表 / 章节 / 表格 / 页面 / 财务报表 / XBRL 查询结果构造。它不依赖 Host EventLog，也不把 processed 产物作为 read path 的唯一事实来源。
+`FinsReadRuntime` 是 read path runtime，负责 ticker 标准化、文档选择、document_id 到 source / processor 的路由、revision-aware processor/meta LRU 缓存、not-supported 降级、typed read failure 投影，以及列表 / 章节 / 表格 / 页面 / 财务报表 / XBRL 查询结果构造。它不依赖 Host EventLog，也不把 processed 产物作为 read path 的唯一事实来源。
 
 ### Tools providers
 
@@ -477,7 +485,7 @@ Read、download、preprocess、upload 是四个独立 provider：
 - read provider 只暴露 9 个 read tools。
 - download provider 只暴露 `start_fins_download`。
 - preprocess provider 只暴露 `start_fins_preprocess`。
-- upload provider 只暴露 `start_fins_upload`，并在工具边界校验本地路径存在、指向普通文件且文件非空；本地源文件授权不是 provider-owned config。
+- upload provider 只暴露 `start_fins_upload`，并在工具边界校验本地路径存在、指向普通文件且文件非空。
 
 四者都要求 effective spec 提供绝对 `workspace_root`，并通过 `DefaultFinsRuntime.create(workspace_root=...)` 获取共享 Fins 底座。
 
@@ -714,7 +722,7 @@ SecProcessor
 
 ### Workspace root 与 provider fail fast
 
-四个 Fins provider 都要求 effective spec 中存在绝对 `workspace_root`。read provider 启用时始终解析 workspace 并注册九个 read tools；upload provider 启用时始终注册 `start_fins_upload`，本地文件只在工具调用时校验存在、普通文件与非空，本地源文件授权由调用方在 provider 外部承担。其它启用路径缺少、空字符串或相对路径都会 fail fast。Service assembly 对 Fins awaiting providers 还会校验 download / preprocess / upload 使用同一个绝对 workspace root，避免一个 Host assembly 把 wait adapter 绑定到不同 Fins workspace。
+四个 Fins provider 都要求 effective spec 中存在绝对 `workspace_root`。read provider 启用时始终解析 workspace 并注册九个 read tools；upload provider 启用时始终注册 `start_fins_upload`，本地文件在工具调用时校验存在、普通文件与非空。其它启用路径缺少、空字符串或相对路径都会 fail fast。Service assembly 对 Fins awaiting providers 还会校验 download / preprocess / upload 使用同一个绝对 workspace root，避免一个 Host assembly 把 wait adapter 绑定到不同 Fins workspace。
 
 ### Storage repository boundary
 
@@ -722,7 +730,7 @@ SecProcessor
 
 ### Processor registry 与 processor cache
 
-`build_fins_processor_registry()` 在 documents 默认处理器注册表基础上注册 Fins 业务增强处理器。`FinsReadRuntime` 按 ticker / document_id / source kind 路由到 source repository 和 processor registry，并缓存 processor 实例；缓存只保存 processor，不把 Host tool result、EventLog fact 或 LLM-facing material 缓存在 Fins 内部。
+`build_fins_processor_registry()` 在 documents 默认处理器注册表基础上注册 Fins 业务增强处理器。`FinsReadRuntime` 按 ticker / document_id / source kind 路由到 source repository 和 processor registry，并缓存绑定 source revision 的 processor 实例与 typed source meta；缓存只在当前 storage revision 相等时复用，不把 Host tool result、EventLog fact 或 LLM-facing material 缓存在 Fins 内部。
 
 ### Read tool 结果与截断
 
@@ -750,7 +758,7 @@ Fins awaiting tools 不直接恢复 Host Run。Service assembly 根据启用的 
 
 ### Ticker normalization
 
-Fins read 与 ingestion 都通过 `ticker_normalization.normalize_ticker(...)` 收口 ticker 输入，生成 canonical ticker、market 和 exchange。工具 schema 允许模型传自然 ticker 写法；业务路由以 canonical ticker 为准。
+Fins read 与 ingestion 都通过 `ticker_normalization.normalize_ticker(...)` 收口 ticker 输入，生成 canonical ticker、market 和 exchange。工具 schema 允许模型传自然 ticker 写法；业务路由以 canonical ticker 为准。upload company meta 的每个非空 `ticker_aliases` 输入都通过 `try_normalize_ticker(...)` 生成 canonical alias，主 ticker 始终位于首项且相同 canonical 只保存一次；无法识别的 alias 在仓储写入前失败关闭。
 
 ## 扩展点
 

@@ -2,9 +2,7 @@
 
 该模块包含 FinsReadRuntime 所用的非搜索辅助逻辑：
 - 文本标准化（必填/可选/form_type）
-- 推荐文档构建
 - 章节标准化（children / page_range）
-- 财务日期推断（fiscal_year / fiscal_period）
 - 表格数据载荷标准化（records / markdown / raw_text）
 - XBRL 查询与 fact 标准化（concept 归一化 / 去重 / scale 推断）
 """
@@ -92,22 +90,6 @@ _DEFAULT_XBRL_CONCEPTS_BY_TAXONOMY: dict[str, tuple[str, ...]] = {
 }
 
 # ---------------------------------------------------------------------------
-# 推荐文档槽位常量
-# ---------------------------------------------------------------------------
-_RECOMMENDED_DOCUMENT_KEYS: tuple[str, ...] = (
-    "latest_document_id",
-    "recommended_for_company_overview_document_id",
-    "latest_annual_report_document_id",
-    "latest_quarterly_report_document_id",
-    "latest_current_report_document_id",
-    "latest_proxy_document_id",
-    "latest_ownership_document_id",
-    "latest_earnings_call_document_id",
-    "latest_earnings_presentation_document_id",
-    "latest_material_document_id",
-)
-
-# ---------------------------------------------------------------------------
 # form_type → document_type 映射
 #
 # document_type 是面向 LLM 的语义字段，屏蔽底层 SEC 表单细节。
@@ -142,17 +124,6 @@ _CN_FORM_TYPE_TO_DOCUMENT_TYPE: dict[str, str] = {
     "Q2": "quarterly_report",
     "Q3": "quarterly_report",
     "Q4": "quarterly_report",
-}
-
-# 缺失 report_date / filing_date 时，按 fiscal_period 做时间顺序回退。
-# 数字越大表示同一年内越“新”。
-_FISCAL_PERIOD_SORT_ORDER: dict[str, int] = {
-    "Q1": 1,
-    "Q2": 2,
-    "H1": 3,
-    "Q3": 4,
-    "Q4": 5,
-    "FY": 6,
 }
 
 # LLM 可传入的合法 document_type 值集合（含预留值）
@@ -376,48 +347,6 @@ def _resolve_document_type(form_type: Optional[str], source_kind: str) -> str:
     return _FORM_TYPE_TO_DOCUMENT_TYPE.get(form_type, "other")
 
 
-def build_document_recency_sort_key(item: Mapping[str, JsonValue]) -> tuple[int, str, str, int, int, str]:
-    """构建文档摘要的统一排序键。
-
-    排序目标：
-    1. 优先按显式日期排序（`report_date` > `filing_date`）。
-    2. 日期缺失时，回退到 `fiscal_year + fiscal_period`。
-    3. 若两者都缺失，再回退到 `document_id`，仅用于稳定排序。
-
-    Args:
-        item: 文档摘要字典。
-
-    Returns:
-        可直接用于 ``list.sort(..., reverse=True)`` 的排序键。
-
-    Raises:
-        无。
-    """
-
-    report_date = _normalize_json_scalar_text(item.get("report_date")) or ""
-    filing_date = _normalize_json_scalar_text(item.get("filing_date")) or ""
-    has_explicit_date = bool(report_date or filing_date)
-
-    fiscal_year = item.get("fiscal_year")
-    normalized_fiscal_year = fiscal_year if isinstance(fiscal_year, int) else -1
-    normalized_fiscal_period = _normalize_json_scalar_text(item.get("fiscal_period"))
-    fiscal_period_rank = _FISCAL_PERIOD_SORT_ORDER.get(normalized_fiscal_period or "", 0)
-    has_fiscal_recency = normalized_fiscal_year > 0 or fiscal_period_rank > 0
-    temporal_rank = 2 if has_explicit_date else 1 if has_fiscal_recency else 0
-
-    primary_date = report_date or filing_date
-    secondary_date = filing_date or report_date
-    document_id = _normalize_json_scalar_text(item.get("document_id")) or ""
-    return (
-        temporal_rank,
-        primary_date,
-        secondary_date,
-        normalized_fiscal_year,
-        fiscal_period_rank,
-        document_id,
-    )
-
-
 def resolve_document_type_for_source(*, form_type: JsonValue | None, source_kind: JsonValue | None) -> str:
     """根据原始源文档元数据推导稳定 document_type。
 
@@ -576,64 +505,6 @@ def _normalize_document_types(document_types: Optional[list[str]]) -> Optional[l
             seen.add(normalized)
             result.append(normalized)
     return result or None
-
-
-def _build_recommended_documents(documents: list[Mapping[str, JsonValue]]) -> dict[str, Optional[str]]:
-    """构建 `list_documents.recommended_documents` 固定槽位。
-
-    Args:
-        documents: 已按时间倒序的全量文档列表（附带 `document_type`）。
-
-    Returns:
-        推荐文档槽位字典。
-
-    Raises:
-        RuntimeError: 构建失败时抛出。
-    """
-
-    recommendations: dict[str, Optional[str]] = {key: None for key in _RECOMMENDED_DOCUMENT_KEYS}
-    if not documents:
-        return recommendations
-
-    for item in documents:
-        document_id = _normalize_json_scalar_text(item.get("document_id"))
-        if document_id is None:
-            continue
-        # document_type 由调用方在过滤循环中已附加
-        raw_doc_type = item.get("document_type")
-        doc_type = raw_doc_type if isinstance(raw_doc_type, str) else ""
-
-        if recommendations["latest_document_id"] is None:
-            recommendations["latest_document_id"] = document_id
-        if recommendations["latest_annual_report_document_id"] is None and doc_type == "annual_report":
-            recommendations["latest_annual_report_document_id"] = document_id
-        if recommendations["latest_quarterly_report_document_id"] is None and doc_type in {
-            "quarterly_report",
-            "semi_annual_report",
-        }:
-            recommendations["latest_quarterly_report_document_id"] = document_id
-        if recommendations["latest_current_report_document_id"] is None and doc_type == "current_report":
-            recommendations["latest_current_report_document_id"] = document_id
-        if recommendations["latest_proxy_document_id"] is None and doc_type == "proxy":
-            recommendations["latest_proxy_document_id"] = document_id
-        if recommendations["latest_ownership_document_id"] is None and doc_type == "ownership":
-            recommendations["latest_ownership_document_id"] = document_id
-        if recommendations["latest_earnings_call_document_id"] is None and doc_type == "earnings_call":
-            recommendations["latest_earnings_call_document_id"] = document_id
-        if recommendations["latest_earnings_presentation_document_id"] is None and doc_type == "earnings_presentation":
-            recommendations["latest_earnings_presentation_document_id"] = document_id
-        if recommendations["latest_material_document_id"] is None and doc_type == "material":
-            recommendations["latest_material_document_id"] = document_id
-
-    recommendations["recommended_for_company_overview_document_id"] = (
-        recommendations["latest_annual_report_document_id"]
-        or recommendations["latest_quarterly_report_document_id"]
-        or recommendations["latest_proxy_document_id"]
-        or recommendations["latest_current_report_document_id"]
-        or recommendations["latest_ownership_document_id"]
-        or recommendations["latest_document_id"]
-    )
-    return recommendations
 
 
 def resolve_has_financial_data(
@@ -941,131 +812,6 @@ def _extract_page_range(section: SectionSummary | SectionContent | Mapping[str, 
     if isinstance(start, int) and isinstance(end, int) and start > 0 and end > 0:
         return [start, end]
     return None
-
-
-# =====================================================================
-# 财务日期推断
-# =====================================================================
-
-
-def _infer_fiscal_period(meta: Mapping[str, JsonValue]) -> Optional[str]:
-    """推断财期。
-
-    Args:
-        meta: 文档元数据。
-
-    Returns:
-        财期字符串或 `None`。
-
-    Raises:
-        RuntimeError: 推断失败时抛出。
-    """
-
-    raw_period = _normalize_json_scalar_text(meta.get("fiscal_period"))
-    if raw_period is not None:
-        return raw_period
-
-    form_type = _normalize_json_scalar_text(meta.get("form_type"))
-    if form_type in {"10-K", "20-F"}:
-        return "FY"
-    return None
-
-
-def _resolve_fiscal_year_with_fallback(raw_value: Any, inferred_year: Optional[int]) -> Optional[int]:
-    """解析 fiscal_year，空值时回退到推断值。
-
-    Args:
-        raw_value: 源 meta 中的 fiscal_year 原始值。
-        inferred_year: 由 `report_date` 等信息推断出的 fiscal_year。
-
-    Returns:
-        可用 fiscal_year；当原始值为空或非法时返回 `inferred_year`。
-
-    Raises:
-        RuntimeError: 解析失败时抛出。
-    """
-
-    if isinstance(raw_value, bool):
-        return inferred_year
-    if isinstance(raw_value, int):
-        return raw_value if raw_value > 0 else inferred_year
-    text = normalize_optional_text(raw_value)
-    if text is None:
-        return inferred_year
-    try:
-        parsed = int(text)
-    except ValueError:
-        return inferred_year
-    if parsed <= 0:
-        return inferred_year
-    return parsed
-
-
-def _resolve_fiscal_period_with_fallback(raw_value: Any, inferred_period: Optional[str]) -> Optional[str]:
-    """解析 fiscal_period，空值时回退到推断值。
-
-    Args:
-        raw_value: 源 meta 中的 fiscal_period 原始值。
-        inferred_period: 推断出的 fiscal_period。
-
-    Returns:
-        可用 fiscal_period；原始值为空时返回 `inferred_period`。
-
-    Raises:
-        RuntimeError: 解析失败时抛出。
-    """
-
-    normalized = normalize_optional_text(raw_value)
-    if normalized is not None:
-        return normalized
-    return inferred_period
-
-
-def _infer_fiscal_year(meta: Mapping[str, JsonValue], fiscal_period: Optional[str]) -> Optional[int]:
-    """推断财年。
-
-    Args:
-        meta: 文档元数据。
-        fiscal_period: 已推断财期。
-
-    Returns:
-        财年或 `None`。
-
-    Raises:
-        RuntimeError: 推断失败时抛出。
-    """
-
-    raw_year = meta.get("fiscal_year")
-    if isinstance(raw_year, int):
-        return raw_year
-
-    del fiscal_period
-    return None
-
-
-def _extract_year(iso_date: str) -> Optional[int]:
-    """从 ISO 日期提取年份。
-
-    Args:
-        iso_date: ISO 日期字符串。
-
-    Returns:
-        年份整数；无法提取时返回 `None`。
-
-    Raises:
-        RuntimeError: 提取失败时抛出。
-    """
-
-    parts = iso_date.split("-")
-    if len(parts) < 2:
-        return None
-    try:
-        year = int(parts[0])
-    except ValueError:
-        return None
-    if year <= 0:
-        return None
-    return year
 
 
 def _to_optional_float(value: Any) -> Optional[float]:

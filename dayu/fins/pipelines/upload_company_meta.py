@@ -11,7 +11,7 @@ from typing import Final
 from dayu.fins._log import Log
 from dayu.fins.domain.document_models import CompanyMeta, now_iso8601
 from dayu.fins.storage import CompanyMetaRepositoryProtocol
-from dayu.fins.ticker_normalization import normalize_ticker, ticker_to_company_id
+from dayu.fins.ticker_normalization import normalize_ticker, ticker_to_company_id, try_normalize_ticker
 
 UPLOAD_ACTIONS_REQUIRING_COMPANY_META: Final[frozenset[str]] = frozenset({"create", "update"})
 RESOLVER_VERSION: Final[str] = "market_resolver_v1.0.0"
@@ -157,18 +157,25 @@ def _normalize_ticker_aliases(
         ticker_aliases: 原始 alias 列表。
 
     Returns:
-        去重后的大写 ticker 列表，且首项始终为规范 ticker。
+        去重后的 canonical ticker 列表，且首项始终为规范 ticker。
 
     Raises:
-        无。
+        ValueError: canonical ticker 或任一非空 alias 无法识别时抛出。
     """
 
-    normalized_canonical = str(canonical_ticker).strip().upper()
+    canonical_profile = try_normalize_ticker(canonical_ticker)
+    if canonical_profile is None:
+        raise ValueError(f"无法识别 canonical ticker: {canonical_ticker!r}")
+    normalized_canonical = canonical_profile.canonical
     normalized_aliases: list[str] = []
     for raw_alias in [normalized_canonical, *(ticker_aliases or [])]:
-        normalized_alias = str(raw_alias).strip().upper()
-        if not normalized_alias:
+        alias_text = raw_alias.strip()
+        if not alias_text:
             continue
+        alias_profile = try_normalize_ticker(alias_text)
+        if alias_profile is None:
+            raise ValueError(f"无法识别 ticker alias: {raw_alias!r}")
+        normalized_alias = alias_profile.canonical
         if normalized_alias in normalized_aliases:
             continue
         normalized_aliases.append(normalized_alias)

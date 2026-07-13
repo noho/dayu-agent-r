@@ -79,6 +79,7 @@ from dayu.fins.pipelines.sec_download_state import (
     _remote_files_equivalent_to_previous_meta,
     _save_rejection_registry as _save_rejection_registry_impl,
     _write_sec_cache_async,
+    has_current_download_version,
 )
 from dayu.fins.pipelines.sec_download_workflow import (
     SecDownloadWorkflowHost as _SecDownloadWorkflowHost,
@@ -1384,7 +1385,7 @@ class SecPipeline:
             return None
         if not bool(previous_meta.get("ingest_complete", False)):
             return None
-        if str(previous_meta.get("download_version", "")) != SEC_PIPELINE_DOWNLOAD_VERSION:
+        if not has_current_download_version(previous_meta, SEC_PIPELINE_DOWNLOAD_VERSION):
             return None
         previous_fingerprint = str(previous_meta.get("source_fingerprint", "")).strip()
         return "already_downloaded_complete" if previous_fingerprint else None
@@ -1415,7 +1416,7 @@ class SecPipeline:
             return None
         if not bool(previous_meta.get("ingest_complete", False)):
             return None
-        if str(previous_meta.get("download_version", "")) != SEC_PIPELINE_DOWNLOAD_VERSION:
+        if not has_current_download_version(previous_meta, SEC_PIPELINE_DOWNLOAD_VERSION):
             return None
         previous_fingerprint = str(previous_meta.get("source_fingerprint", "")).strip()
         if previous_fingerprint and previous_fingerprint == source_fingerprint:

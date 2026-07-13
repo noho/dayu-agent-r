@@ -467,7 +467,7 @@ async def test_upload_filing_stream_uploads_files_with_docling(tmp_path: Path) -
             filing_date="2025-04-01",
             report_date="2024-12-31",
             company_name="贵州茅台",
-            ticker_aliases=["600519", "贵州茅台"],
+            ticker_aliases=["600519", "600519.SH"],
             overwrite=False,
         )
     ]
@@ -532,7 +532,7 @@ async def test_upload_filing_stream_refreshes_stale_company_meta(tmp_path: Path)
             filing_date="2025-04-01",
             report_date="2024-12-31",
             company_name="贵州茅台",
-            ticker_aliases=["600519", "贵州茅台"],
+            ticker_aliases=["600519", "600519.SH"],
             overwrite=False,
         )
     ]
@@ -542,7 +542,7 @@ async def test_upload_filing_stream_refreshes_stale_company_meta(tmp_path: Path)
     assert company_meta.company_id == "600519_SSE"
     assert company_meta.company_name == "贵州茅台"
     assert company_meta.resolver_version == RESOLVER_VERSION
-    assert company_meta.ticker_aliases == ["600519", "贵州茅台"]
+    assert company_meta.ticker_aliases == ["600519"]
 
 
 @pytest.mark.asyncio

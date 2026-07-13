@@ -7,12 +7,96 @@ from pathlib import Path
 import pytest
 
 from dayu.contracts.json_value import JsonValue
-from dayu.fins.domain.document_models import CompanyMeta, now_iso8601
+from dayu.fins.domain.document_models import CompanyMeta, CompanyMetaInventoryEntry, now_iso8601
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.pipelines.sec_pipeline import SecPipeline
 from dayu.fins.pipelines.upload_filing_events import UploadFilingEventType
-from dayu.fins.pipelines.upload_company_meta import RESOLVER_VERSION
+from dayu.fins.pipelines.upload_company_meta import (
+    RESOLVER_VERSION,
+    _normalize_ticker_aliases,
+    upsert_company_meta_for_upload,
+)
 from dayu.fins.processors.registry import build_fins_processor_registry
+
+
+class _SpyCompanyMetaRepository:
+    """记录 company meta 写入次数的测试仓储。"""
+
+    def __init__(self) -> None:
+        """初始化空仓储。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.writes: list[CompanyMeta] = []
+
+    def scan_company_meta_inventory(self) -> list[CompanyMetaInventoryEntry]:
+        """返回空盘点结果。
+
+        Args:
+            无。
+
+        Returns:
+            空列表。
+
+        Raises:
+            无。
+        """
+
+        return []
+
+    def get_company_meta(self, ticker: str) -> CompanyMeta:
+        """模拟 company meta 不存在。
+
+        Args:
+            ticker: 查询 ticker。
+
+        Returns:
+            不返回。
+
+        Raises:
+            FileNotFoundError: 始终抛出以模拟空仓储。
+        """
+
+        raise FileNotFoundError(ticker)
+
+    def upsert_company_meta(self, meta: CompanyMeta) -> None:
+        """记录一次 company meta 写入。
+
+        Args:
+            meta: 待写入公司元数据。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.writes.append(meta)
+
+    def resolve_existing_ticker(self, ticker_candidates: list[str]) -> str | None:
+        """模拟无候选 ticker 已存在。
+
+        Args:
+            ticker_candidates: ticker 候选列表。
+
+        Returns:
+            始终返回 ``None``。
+
+        Raises:
+            无。
+        """
+
+        del ticker_candidates
+        return None
 
 
 def _convert_docling_stub(raw_data: bytes, stream_name: str) -> dict[str, JsonValue]:
@@ -66,6 +150,67 @@ def _seed_sec_upload_company_meta(
             ticker_aliases=ticker_aliases,
         )
     )
+
+
+@pytest.mark.parametrize(
+    ("canonical_ticker", "raw_aliases", "expected"),
+    [
+        ("0700", ["700.HK", "HK.0700", "0700.hk"], ["0700"]),
+        ("BRK-B", ["BRK.B", "brk-b.us"], ["BRK-B"]),
+        ("AAPL", ["aapl", "AAPL.US", "us.aapl"], ["AAPL"]),
+    ],
+)
+def test_upload_company_meta_ticker_aliases_use_canonical_owner(
+    canonical_ticker: str,
+    raw_aliases: list[str],
+    expected: list[str],
+) -> None:
+    """upload ticker aliases 应 canonical 化、稳定去重并保持主 ticker 首项。
+
+    Args:
+        canonical_ticker: 主 ticker。
+        raw_aliases: 含大小写、市场后缀或类股分隔符变体的 aliases。
+        expected: 期望 canonical alias 列表。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: alias owner 未被消费或去重顺序漂移时抛出。
+    """
+
+    assert _normalize_ticker_aliases(
+        canonical_ticker=canonical_ticker,
+        ticker_aliases=raw_aliases,
+    ) == expected
+
+
+def test_upload_company_meta_invalid_ticker_alias_fails_before_repository_write() -> None:
+    """非 ticker alias 必须在 company meta 仓储写入前失败关闭。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法 alias 被写入或未抛 ``ValueError`` 时抛出。
+    """
+
+    repository = _SpyCompanyMetaRepository()
+
+    with pytest.raises(ValueError, match="无法识别 ticker alias"):
+        upsert_company_meta_for_upload(
+            repository=repository,
+            ticker="AAPL",
+            action="create",
+            company_id=None,
+            company_name="Apple Inc.",
+            ticker_aliases=["AAPL", "Apple Inc."],
+        )
+
+    assert repository.writes == []
 
 
 @pytest.mark.asyncio

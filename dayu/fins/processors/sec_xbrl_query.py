@@ -14,10 +14,7 @@ from typing import Any, Callable, Optional
 import pandas as pd
 from edgar.xbrl import XBRL
 
-from dayu.documents.processors.text_utils import (
-    normalize_optional_string as _normalize_optional_string_base,
-    normalize_whitespace as _normalize_whitespace,
-)
+from dayu.documents.processors.text_utils import normalize_whitespace as _normalize_whitespace
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.financial_result_contract import (
     FinancialPeriod,
@@ -30,6 +27,7 @@ from dayu.fins.domain.xbrl_result_contract import (
     XbrlConceptQuerySummary,
     XbrlQueryExecutionError,
 )
+from dayu.fins.processors.value_normalization import normalize_optional_dataframe_string
 
 _STATEMENT_METHODS = {
     "income": "income_statement",
@@ -81,24 +79,6 @@ _KNOWN_CURRENCY_CODES: frozenset[str] = frozenset(
         "CAD", "AUD", "CHF", "BRL", "MXN", "SGD", "ZAR",
     }
 )
-
-
-def _normalize_optional_string(value: Any) -> Optional[str]:
-    """将任意值转为可选字符串，额外处理 pandas NaN/NaT。
-
-    对 ``None``、空字符串、``float('nan')``、``pd.NaT`` 等无意义值统一返回 ``None``。
-
-    Args:
-        value: 任意输入值。
-
-    Returns:
-        标准化字符串；空值返回 ``None``。
-    """
-    if value is None:
-        return None
-    if isinstance(value, float) and pd.isna(value):
-        return None
-    return _normalize_optional_string_base(value)
 
 
 def _infer_xbrl_taxonomy(xbrl: XBRL) -> Optional[str]:
@@ -194,8 +174,8 @@ def _build_statement_rows(
 
     rows: list[dict[str, JsonValue]] = []
     for _, row in statement_df.iterrows():
-        concept = _normalize_optional_string(row.get("concept")) or ""
-        label = _normalize_optional_string(row.get("label")) or concept
+        concept = normalize_optional_dataframe_string(row.get("concept")) or ""
+        label = normalize_optional_dataframe_string(row.get("label")) or concept
         values: list[JsonValue] = []
         for period in period_columns:
             values.append(_to_optional_float(row.get(period)))
@@ -255,8 +235,8 @@ def _format_statement_period_label(period_summary: FinancialPeriod) -> str:
     """
 
     fiscal_year = period_summary.get("fiscal_year")
-    fiscal_period = _normalize_optional_string(period_summary.get("fiscal_period"))
-    period_end = _normalize_optional_string(period_summary.get("period_end"))
+    fiscal_period = normalize_optional_dataframe_string(period_summary.get("fiscal_period"))
+    period_end = normalize_optional_dataframe_string(period_summary.get("period_end"))
     if isinstance(fiscal_year, int) and fiscal_period:
         return f"{fiscal_period}{fiscal_year}"
     return period_end or ""
@@ -278,7 +258,7 @@ def _extract_statement_row_labels(rows: list[dict[str, JsonValue]]) -> list[str]
     labels: list[str] = []
     seen: set[str] = set()
     for row in rows:
-        label = _normalize_optional_string(row.get("label")) or _normalize_optional_string(row.get("concept")) or ""
+        label = normalize_optional_dataframe_string(row.get("label")) or normalize_optional_dataframe_string(row.get("concept")) or ""
         if not label or label in seen:
             continue
         seen.add(label)
@@ -334,7 +314,7 @@ def _to_optional_float(value: Any) -> Optional[float]:
         浮点数或 `None`。
 
     Raises:
-        ValueError: 转换失败时抛出。
+        无。
     """
 
     if value is None:
@@ -343,7 +323,7 @@ def _to_optional_float(value: Any) -> Optional[float]:
         return None
     try:
         numeric = float(value)
-    except Exception:
+    except (TypeError, ValueError):
         return None
     if pd.isna(numeric):
         return None
@@ -485,8 +465,8 @@ def _query_facts_rows(
     successful_concepts: list[str] = []
     failed_concepts: list[str] = []
     last_failure: Exception | None = None
-    normalized_period_end = _normalize_optional_string(period_end)
-    normalized_fiscal_period = _normalize_optional_string(fiscal_period)
+    normalized_period_end = normalize_optional_dataframe_string(period_end)
+    normalized_fiscal_period = normalize_optional_dataframe_string(fiscal_period)
     for concept in concepts:
         target_local_name = _extract_concept_local_name(concept)
         if not target_local_name:

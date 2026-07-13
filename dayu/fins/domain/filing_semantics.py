@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 from typing import Final, Literal, Optional, TypeAlias, cast
 
+from dayu.contracts.json_value import JsonValue
+
 
 SecFormType: TypeAlias = Literal[
     "10-K",
@@ -78,6 +80,9 @@ FISCAL_PERIODS: Final[frozenset[FiscalPeriod]] = frozenset(
     cast(tuple[FiscalPeriod, ...], ("FY", "H1", "Q1", "Q2", "Q3", "Q4"))
 )
 """Fins 通用财期集合。"""
+
+_FISCAL_PERIOD_RECENCY_ORDER: Final[tuple[str, ...]] = ("", "Q1", "Q2", "H1", "Q3", "Q4", "FY")
+"""财期在同一财年内的固定业务顺序；空字符串占据未知值的 rank 0。"""
 
 DOCUMENT_QUALITIES: Final[frozenset[DocumentQuality]] = frozenset(
     cast(tuple[DocumentQuality, ...], ("full", "partial", "fallback"))
@@ -262,6 +267,48 @@ def normalize_fiscal_period(value: Optional[str], *, field_name: str = "fiscal_p
     if normalized not in FISCAL_PERIODS:
         raise ValueError(f"{field_name} 非法: {value}")
     return cast(FiscalPeriod, normalized)
+
+
+def normalize_fiscal_year(value: JsonValue | None, *, field_name: str = "fiscal_year") -> int | None:
+    """解析可选财年字段。
+
+    财年只能来自 producer 或仓储中的直接正整数事实。本函数不会从报告日期、
+    申报日期或财期推断年份，也不会接受 bool、数字文本或浮点数。
+
+    Args:
+        value: 原始财年 JSON 值；字段缺失或显式为空时传入 ``None``。
+        field_name: 报错使用的字段名。
+
+    Returns:
+        正整数财年；输入缺失时返回 ``None``。
+
+    Raises:
+        ValueError: 非空输入不是正整数，或输入为 bool 时抛出。
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{field_name} 必须为正整数")
+    return value
+
+
+def fiscal_period_recency_rank(period: str | None) -> int:
+    """返回财期在同一财年内的固定排序权重。
+
+    Args:
+        period: canonical 财期；``None`` 或未知文本表示没有可用财期事实。
+
+    Returns:
+        ``None``/未知值为 0，其余依次为 Q1=1、Q2=2、H1=3、Q3=4、Q4=5、FY=6。
+
+    Raises:
+        无。
+    """
+
+    if period is None or period not in _FISCAL_PERIOD_RECENCY_ORDER:
+        return 0
+    return _FISCAL_PERIOD_RECENCY_ORDER.index(period)
 
 
 def sanitize_fiscal_period_by_sec_form(

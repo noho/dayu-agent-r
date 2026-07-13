@@ -1158,8 +1158,34 @@ def test_sec_pipeline_skip_with_etag_gzip_variant_without_re_download(tmp_path: 
     assert result["filings"][0]["reason_code"] == "already_downloaded_complete"
 
 
-def test_sec_pipeline_marks_filing_skipped_when_all_files_not_modified(tmp_path: Path) -> None:
-    """验证文件级全 skipped 时 filing 级状态为 skipped 且不改写 meta。"""
+@pytest.mark.parametrize(
+    ("existing_download_version", "expected_status", "expected_skip_reason"),
+    [
+        (SEC_PIPELINE_DOWNLOAD_VERSION, "skipped", "not_modified"),
+        ("legacy-download-version", "downloaded", None),
+        (None, "downloaded", None),
+    ],
+)
+def test_sec_pipeline_all_files_not_modified_respects_download_version(
+    tmp_path: Path,
+    existing_download_version: str | None,
+    expected_status: str,
+    expected_skip_reason: str | None,
+) -> None:
+    """全文件未修改只能在 current download version 下形成 terminal skip。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        existing_download_version: 既有 meta 的下载版本；``None`` 表示缺失。
+        expected_status: 期望 filing 状态。
+        expected_skip_reason: 期望 skip reason；继续 commit 时为 ``None``。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: version owner 未控制 not-modified skip 时抛出。
+    """
 
     remote_files = [_make_descriptor("etag-same")]
     document_dir = tmp_path / "portfolio" / "AAPL" / "filings" / "fil_0000000000-25-000001"
@@ -1167,8 +1193,7 @@ def test_sec_pipeline_marks_filing_skipped_when_all_files_not_modified(tmp_path:
     meta_path = document_dir / "meta.json"
     original_meta = {
         "document_version": "v1",
-        "source_fingerprint": "legacy-fp",
-        "download_version": "legacy-download-version",
+        "source_fingerprint": "",
         "ingest_complete": True,
         "updated_at": "2026-03-03T00:00:00+00:00",
         "files": [
@@ -1178,11 +1203,13 @@ def test_sec_pipeline_marks_filing_skipped_when_all_files_not_modified(tmp_path:
                 "etag": "blob-etag",
                 "last_modified": "2026-03-03T00:00:00+00:00",
                 "size": 100,
-                "http_etag": "etag-same",
+                "http_etag": "etag-before",
                 "http_last_modified": "Mon, 01 Jan 2025 00:00:00 GMT",
             }
         ],
     }
+    if existing_download_version is not None:
+        original_meta["download_version"] = existing_download_version
     meta_path.write_text(
         json.dumps(original_meta, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -1210,13 +1237,22 @@ def test_sec_pipeline_marks_filing_skipped_when_all_files_not_modified(tmp_path:
     result = pipeline.download(ticker="AAPL", overwrite=False)
     after_text = meta_path.read_text(encoding="utf-8")
 
-    assert result["summary"]["skipped"] == 1
-    assert result["summary"]["downloaded"] == 0
-    assert before_text == after_text
     assert downloader.download_files_called is True
-    assert result["filings"][0]["skip_reason"] == "not_modified"
-    assert result["filings"][0]["reason_code"] == "not_modified"
-    assert "未修改" in str(result["filings"][0]["reason_message"])
+    assert result["filings"][0]["status"] == expected_status
+    assert result["filings"][0].get("skip_reason") == expected_skip_reason
+    if expected_skip_reason == "not_modified":
+        assert result["summary"]["skipped"] == 1
+        assert result["summary"]["downloaded"] == 0
+        assert before_text == after_text
+        assert result["filings"][0]["reason_code"] == "not_modified"
+        assert "未修改" in str(result["filings"][0]["reason_message"])
+        return
+
+    assert result["summary"]["skipped"] == 0
+    assert result["summary"]["downloaded"] == 1
+    assert before_text != after_text
+    committed_meta = json.loads(after_text)
+    assert committed_meta["download_version"] == SEC_PIPELINE_DOWNLOAD_VERSION
 
 
 def test_sec_pipeline_failed_filing_does_not_write_meta(tmp_path: Path) -> None:

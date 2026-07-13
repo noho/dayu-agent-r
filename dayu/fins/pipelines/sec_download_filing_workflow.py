@@ -25,6 +25,7 @@ from dayu.fins.pipelines.sec_download_source_upsert import (
     stage_downloaded_filing_source_document,
     upsert_downloaded_filing_source_document,
 )
+from dayu.fins.pipelines.sec_download_state import has_current_download_version
 from dayu.fins.pipelines.sec_filing_collection import FilingRecord
 from dayu.fins.storage import SourceDocumentRepositoryProtocol
 from dayu.fins._log import Log
@@ -529,6 +530,7 @@ async def run_download_single_filing_stream(
         if (
             previous_meta is not None
             and not overwrite
+            and has_current_download_version(previous_meta, download_version)
             and downloaded_files == 0
             and skipped_files == len(file_results)
             and has_same_file_name_set(remote_files, existing_files)

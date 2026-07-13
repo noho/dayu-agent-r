@@ -23,6 +23,12 @@ from dayu.fins.domain.financial_result_contract import (
     FinancialStatementResult as ProcessorFinancialStatementResult,
     validate_financial_statement_result_payload,
 )
+from dayu.fins.domain.filing_semantics import (
+    FiscalPeriod,
+    fiscal_period_recency_rank,
+    normalize_fiscal_period,
+    normalize_fiscal_year,
+)
 from dayu.fins.domain.xbrl_result_contract import (
     XbrlFactsResult as ProcessorXbrlFactsResult,
     XbrlQueryExecutionError,
@@ -96,10 +102,6 @@ from .read_runtime_helpers import (
     _normalize_periods,
     _build_not_supported_result,
     _extract_page_range,
-    _infer_fiscal_period,
-    _infer_fiscal_year,
-    _resolve_fiscal_year_with_fallback,
-    _resolve_fiscal_period_with_fallback,
     _build_table_data_payload,
     _normalize_table_type,
     _normalize_json_scalar_text,
@@ -165,17 +167,6 @@ _RECOMMENDED_DOCUMENT_KEYS: Final[tuple[str, ...]] = (
 )
 """list_documents 推荐槽位键集合。"""
 
-_FISCAL_PERIOD_SORT_ORDER: Final[dict[str, int]] = {
-    "FY": 5,
-    "H1": 4,
-    "Q4": 4,
-    "Q3": 3,
-    "Q2": 2,
-    "Q1": 1,
-}
-"""source document 财期排序权重。"""
-
-
 class _SourceDocumentMeta(TypedDict):
     """read runtime 使用的 source meta 投影。
 
@@ -186,7 +177,7 @@ class _SourceDocumentMeta(TypedDict):
     form_type: str | None
     material_name: JsonValue | None
     fiscal_year: int | None
-    fiscal_period: str | None
+    fiscal_period: FiscalPeriod | None
     report_date: str | None
     filing_date: str | None
     amended: bool
@@ -236,7 +227,7 @@ class _SourceDocumentSummary(TypedDict):
     form_type: str | None
     material_name: JsonValue | None
     fiscal_year: int | None
-    fiscal_period: str | None
+    fiscal_period: FiscalPeriod | None
     report_date: str | None
     filing_date: str | None
     amended: bool
@@ -366,15 +357,15 @@ def _parse_source_document_meta(raw_meta: Mapping[str, JsonValue]) -> _SourceDoc
         RuntimeError: 其它字段收窄失败时抛出。
     """
 
-    fiscal_year_value = raw_meta.get("fiscal_year")
-    fiscal_year = (
-        fiscal_year_value if isinstance(fiscal_year_value, int) and not isinstance(fiscal_year_value, bool) else None
-    )
+    fiscal_year = normalize_fiscal_year(raw_meta.get("fiscal_year"))
+    raw_fiscal_period = raw_meta.get("fiscal_period")
+    if raw_fiscal_period is not None and not isinstance(raw_fiscal_period, str):
+        raise ValueError("fiscal_period 必须为字符串")
     return {
         "form_type": _normalize_json_scalar_text(raw_meta.get("form_type")),
         "material_name": raw_meta.get("material_name"),
         "fiscal_year": fiscal_year,
-        "fiscal_period": _normalize_json_scalar_text(raw_meta.get("fiscal_period")),
+        "fiscal_period": normalize_fiscal_period(raw_fiscal_period),
         "report_date": _normalize_json_scalar_text(raw_meta.get("report_date")),
         "filing_date": _normalize_json_scalar_text(raw_meta.get("filing_date")),
         "amended": _read_bool_meta_field(raw_meta, field_name="amended", default=False),
@@ -459,7 +450,7 @@ def _source_document_recency_sort_key(
     filing_date = item["filing_date"] or ""
     has_explicit_date = bool(report_date or filing_date)
     fiscal_year = item["fiscal_year"] if item["fiscal_year"] is not None else -1
-    fiscal_period_rank = _FISCAL_PERIOD_SORT_ORDER.get(item["fiscal_period"] or "", 0)
+    fiscal_period_rank = fiscal_period_recency_rank(item["fiscal_period"])
     has_fiscal_recency = fiscal_year > 0 or fiscal_period_rank > 0
     temporal_rank = 2 if has_explicit_date else 1 if has_fiscal_recency else 0
     primary_date = report_date or filing_date
@@ -500,7 +491,7 @@ def _collect_available_document_types_for_source_documents(
     return sorted(doc_types)
 
 
-def _build_recommended_documents_for_list_result(
+def _collect_list_document_recommendations(
     documents: list[_ListedDocumentSummary],
 ) -> dict[str, str | None]:
     """构建 list_documents 推荐文档槽位。
@@ -691,7 +682,7 @@ class FinsReadRuntime:
                     "document_type": item["document_type"],
                 }
             )
-        recommended_documents = _build_recommended_documents_for_list_result(documents_with_type)
+        recommended_documents = _collect_list_document_recommendations(documents_with_type)
 
         # 判定匹配状态并构建 suggestion
         if normalized_document_types is not None and len(filtered_documents) == 0:
@@ -2099,17 +2090,6 @@ class FinsReadRuntime:
                 continue
             if not meta.get("ingest_complete", True):
                 continue
-            meta_payload = _source_document_meta_to_storage_payload(meta)
-            inferred_period = _infer_fiscal_period(meta_payload)
-            inferred_year = _infer_fiscal_year(meta_payload, inferred_period)
-            resolved_fiscal_year = _resolve_fiscal_year_with_fallback(
-                raw_value=meta["fiscal_year"],
-                inferred_year=inferred_year,
-            )
-            resolved_fiscal_period = _resolve_fiscal_period_with_fallback(
-                raw_value=meta["fiscal_period"],
-                inferred_period=inferred_period,
-            )
             # 从 processed meta 读取能力标志（轻量 JSON），处理缺失的情况
             has_financial_data = self._read_capability_flags(
                 ticker,
@@ -2122,8 +2102,8 @@ class FinsReadRuntime:
                     "source_kind": source_kind.value,
                     "form_type": _normalize_form_type_for_matching(meta["form_type"]),
                     "material_name": meta["material_name"],
-                    "fiscal_year": resolved_fiscal_year,
-                    "fiscal_period": resolved_fiscal_period,
+                    "fiscal_year": meta["fiscal_year"],
+                    "fiscal_period": meta["fiscal_period"],
                     "report_date": meta["report_date"],
                     "filing_date": meta["filing_date"],
                     "amended": meta["amended"],
