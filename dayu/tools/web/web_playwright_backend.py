@@ -37,6 +37,11 @@ from .web_fetch_orchestrator import _FetchUrlSafetyError
 from .web_challenge_detection import BotChallengeDecision
 from .web_egress_policy import WebEgressPolicy, WebEgressPolicyError
 from .web_resource_budget import WebResourceBudget
+from .web_diagnostics import (
+    WebDiagnosticBackend,
+    failed_projection,
+    project_safe_url_or_empty,
+)
 
 MODULE = "ENGINE.WEB_PLAYWRIGHT"
 _LOGGER = logging.getLogger(__name__)
@@ -515,6 +520,8 @@ def _playwright_process_entry(
     """
 
     enter_new_process_session_if_supported()
+    diagnostic_url = worker_kwargs["url"]
+    max_error_chars = worker_kwargs["resource_budget"].diagnostic_error_chars
     try:
         result_queue.put({
             "kind": "result",
@@ -525,9 +532,17 @@ def _playwright_process_entry(
             {
                 "kind": "error",
                 "error_type": type(exc).__name__,
-                "message": str(exc),
+                "message": failed_projection(
+                    stage="playwright_worker",
+                    url=diagnostic_url,
+                    elapsed_seconds=0.0,
+                    error_code="permission_denied",
+                    error_message=str(exc),
+                    max_error_chars=max_error_chars,
+                    backend=WebDiagnosticBackend.PLAYWRIGHT,
+                ).error_message,
                 "blocked_by_safety_policy": True,
-                "blocked_url": exc.url,
+                "blocked_url": project_safe_url_or_empty(exc.url),
                 "blocked_stage": exc.reason,
             }
         )
@@ -536,7 +551,15 @@ def _playwright_process_entry(
             {
                 "kind": "error",
                 "error_type": type(exc).__name__,
-                "message": str(exc),
+                "message": failed_projection(
+                    stage="playwright_worker",
+                    url=diagnostic_url,
+                    elapsed_seconds=0.0,
+                    error_code="playwright_error",
+                    error_message=str(exc),
+                    max_error_chars=max_error_chars,
+                    backend=WebDiagnosticBackend.PLAYWRIGHT,
+                ).error_message,
             }
         )
 
@@ -1330,7 +1353,6 @@ def _playwright_sync_worker(
     build_domain_home_url: Callable[[str], str],
     normalize_url_for_http: Callable[[str], str],
     sanitize_response_headers: Callable[[Mapping[str, str]], dict[str, str]],
-    build_text_excerpt: Callable[[str], str],
     convert_html_to_markdown: _HtmlConverterProtocol,
     egress_policy: WebEgressPolicy,
     resource_budget: WebResourceBudget,
@@ -1348,7 +1370,6 @@ def _playwright_sync_worker(
         build_domain_home_url: 同域首页构造函数。
         normalize_url_for_http: URL 规范化函数。
         sanitize_response_headers: 响应头裁剪函数。
-        build_text_excerpt: 文本摘录构造函数。
         convert_html_to_markdown: HTML 四段式转换函数。
         egress_policy: 当前 Web 调用唯一的出站策略。
         resource_budget: HTTP、browser 与诊断共享的完整资源预算。
@@ -1504,7 +1525,6 @@ def _playwright_sync_worker(
         "content_stats": dict(pipeline_result.content_stats),
         "http_status": response.status,
         "response_headers": sanitize_response_headers(response.headers),
-        "response_excerpt": build_text_excerpt(page_text),
     }
 
 
@@ -1607,7 +1627,19 @@ def _fetch_and_convert_with_playwright(
                 "reason": "playwright_worker_not_picklable",
             }
     except TimeoutError:
-        Log.debug(f"Playwright 浏览器回退在 {total_timeout}s 内未返回结果: {url}", module=MODULE)
+        timeout_projection = failed_projection(
+            stage="playwright_fallback",
+            url=url,
+            elapsed_seconds=total_timeout,
+            error_code="playwright_timeout",
+            error_message="Playwright 浏览器回退在预算内未返回结果。",
+            max_error_chars=resource_budget.diagnostic_error_chars,
+            backend=WebDiagnosticBackend.PLAYWRIGHT,
+        )
+        Log.debug(
+            f"Playwright 浏览器回退失败: {timeout_projection.to_json()}",
+            module=MODULE,
+        )
         return {
             "ok": False,
             "availability": "timeout",
@@ -1618,7 +1650,19 @@ def _fetch_and_convert_with_playwright(
     except _FetchUrlSafetyError:
         raise
     except Exception as exc:
-        Log.debug(f"Playwright 浏览器回退失败: {exc}", module=MODULE)
+        error_projection = failed_projection(
+            stage="playwright_fallback",
+            url=url,
+            elapsed_seconds=0.0,
+            error_code="playwright_error",
+            error_message=str(exc),
+            max_error_chars=resource_budget.diagnostic_error_chars,
+            backend=WebDiagnosticBackend.PLAYWRIGHT,
+        )
+        Log.debug(
+            f"Playwright 浏览器回退失败: {error_projection.to_json()}",
+            module=MODULE,
+        )
         return {
             "ok": False,
             "availability": "unprocessable",
@@ -1631,10 +1675,7 @@ def _fetch_and_convert_with_playwright(
         result_status = result.get("http_status")
         http_status = result_status if isinstance(result_status, int) and not isinstance(result_status, bool) else None
         content_value = result.get("content")
-        excerpt_value = result.get("response_excerpt")
         content_text = content_value if isinstance(content_value, str) else ""
-        if not content_text and isinstance(excerpt_value, str):
-            content_text = excerpt_value
         challenge = detect_bot_challenge(
             response=None,
             response_headers=response_headers,
@@ -1648,7 +1689,6 @@ def _fetch_and_convert_with_playwright(
                 "reason": "bot_challenge",
                 "http_status": result.get("http_status"),
                 "response_headers": result.get("response_headers", {}),
-                "response_excerpt": result.get("response_excerpt", ""),
                 "challenge_signals": list(challenge.challenge_signals),
             }
     return result

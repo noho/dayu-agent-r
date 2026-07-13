@@ -62,7 +62,6 @@ from dayu.runtime.tool_call_projection import (
 from . import web_fetch_orchestrator as _web_fetch_orchestrator
 from . import web_playwright_backend as _web_playwright_backend
 from .web_challenge_detection import (
-    BotChallengeDetectionResult,
     BotChallengeDecision,
     ChallengeFallbackAction,
     challenge_fallback_action,
@@ -87,6 +86,13 @@ from .web_http_session import (
     _prepare_call_session,
     _resolve_timeout_budget,
     _safe_timeout,
+)
+from .web_diagnostics import (
+    WebDiagnosticBackend,
+    WebDiagnosticProjection,
+    completed_text_projection,
+    failed_projection,
+    project_safe_url_or_empty,
 )
 from .web_recovery import (
     NEXT_ACTION_CHANGE_SOURCE,
@@ -142,7 +148,6 @@ _DEFAULT_SEC_CH_UA = '"Chromium";v="131", "Google Chrome";v="131", "Not_A Brand"
 _DEFAULT_SEC_CH_UA_MOBILE = "?0"
 _DEFAULT_SEC_CH_UA_PLATFORM = '"macOS"'
 
-_RESPONSE_SNIPPET_MAX_CHARS = 500
 _EMPTY_CONTENT_MIN_CHARS = 5
 _SEARCH_WEB_TOOL_NAME: Final[str] = "search_web"
 _FETCH_WEB_PAGE_TOOL_NAME: Final[str] = "fetch_web_page"
@@ -162,6 +167,9 @@ _FETCH_WEB_PAGE_PARAMETERS: Final[ToolParametersSchema] = ToolParametersSchema(
 _SEARCH_PROVIDER_UNAVAILABLE_ERROR: Final[str] = "search_provider_unavailable"
 _SEARCH_PROVIDER_RESPONSE_INVALID_ERROR: Final[str] = "search_provider_response_invalid"
 _RESPONSE_BODY_TOO_LARGE_ERROR: Final[str] = "response_body_too_large"
+_DEFAULT_WEB_DIAGNOSTIC_ERROR_CHARS: Final[int] = (
+    WebResourceBudget().diagnostic_error_chars
+)
 WebPayload: TypeAlias = dict[str, JsonValue]
 WebMapping: TypeAlias = Mapping[str, JsonValue]
 StagePayload: TypeAlias = dict[str, str | bool | int | float | None]
@@ -209,7 +217,8 @@ class _FetchContentResult(TypedDict, total=False):
     final_url: str
     redirect_hops: int
     response_headers: Mapping[str, str]
-    response_excerpt: str
+    response_content_length: int
+    response_content_digest: str
 
 
 class _PlaywrightFallbackKwargs(TypedDict, total=False):
@@ -820,7 +829,6 @@ def _is_ssl_like_request_exception(error: BaseException) -> bool:
 
 
 _build_fetch_content_runtime_context = _web_fetch_orchestrator._build_fetch_content_runtime_context
-_extract_response_snippet = _web_fetch_orchestrator._extract_response_snippet
 _sanitize_response_headers = _web_fetch_orchestrator._sanitize_response_headers
 _should_escalate_conversion_failure_to_browser = _web_fetch_orchestrator._should_escalate_conversion_failure_to_browser
 _should_escalate_http_status_to_browser = _web_fetch_orchestrator._should_escalate_http_status_to_browser
@@ -844,33 +852,50 @@ def _sanitize_plain_response_headers(headers: Mapping[str, str] | None) -> dict[
     return _sanitize_response_headers(dict(headers or {}))
 
 
-def _build_playwright_success_payload(url: str, pw_result: WebMapping) -> WebPayload:
-    """将 Playwright 回退成功结果规整为 fetch_web_page 输出。"""
-
-    return {
-        "url": url,
-        "final_url": pw_result.get("final_url", url),
-        "title": pw_result.get("title", ""),
-        "content": pw_result.get("content", ""),
-        "fetch_backend": "playwright",
-    }
-
-
-def _build_text_excerpt(text: str) -> str:
-    """规整任意文本并截取诊断前缀。
+def _response_text_for_challenge(response: requests.Response | None) -> str:
+    """为 challenge owner 提供瞬时响应正文，不把正文写入诊断投影。
 
     Args:
-        text: 原始文本。
+        response: 可能携带已物化有界 body 的 HTTP 响应。
 
     Returns:
-        规整后的限长文本前缀。
+        可用于 challenge 判定的文本；解码失败时为空字符串。
 
     Raises:
         无。
     """
 
-    normalized = _normalize_whitespace(text or "")
-    return normalized[:_RESPONSE_SNIPPET_MAX_CHARS]
+    if response is None:
+        return ""
+    try:
+        return _web_fetch_orchestrator._decode_response_text(response)
+    except Exception:
+        return ""
+
+
+def _build_playwright_success_payload(url: str, pw_result: WebMapping) -> WebPayload:
+    """将 Playwright 回退成功结果规整为安全的 fetch_web_page 输出。
+
+    Args:
+        url: 原始请求 URL。
+        pw_result: Playwright backend 返回的内部结果。
+
+    Returns:
+        ``final_url`` 已删除 userinfo/query/fragment 的工具成功 payload。
+
+    Raises:
+        无。
+    """
+
+    raw_final_url = str(pw_result.get("final_url", url) or url)
+
+    return {
+        "url": url,
+        "final_url": project_safe_url_or_empty(raw_final_url),
+        "title": pw_result.get("title", ""),
+        "content": pw_result.get("content", ""),
+        "fetch_backend": "playwright",
+    }
 
 
 def _raise_if_host_cancelled(cancellation_token: CancellationToken | None) -> None:
@@ -950,7 +975,6 @@ def _try_playwright_fallback(
                 message="This page requires a browser path that is unavailable under the current network policy.",
                 hint=build_hint(REASON_BLOCKED_BY_SITE_POLICY),
                 next_action=NEXT_ACTION_CHANGE_SOURCE,
-                internal_diagnostics={"fetch_backend": "playwright", "public_browser_direct": False},
             )
         browser_budget_reason = pw_result.get("reason")
         if isinstance(browser_budget_reason, str) and browser_budget_reason in (
@@ -963,10 +987,6 @@ def _try_playwright_fallback(
                 message="Browser-rendered page exceeded the configured resource budget.",
                 hint=build_hint(REASON_CONTENT_CONVERSION_FAILED),
                 next_action=NEXT_ACTION_CHANGE_SOURCE,
-                internal_diagnostics={
-                    "fetch_backend": "playwright",
-                    "budget_failure": browser_budget_reason,
-                },
             )
         Log.debug(
             "Playwright 浏览器回退未成功: "
@@ -1164,7 +1184,6 @@ def _raise_fetch_failure(
     hint: str,
     next_action: str,
     http_status: int | None = None,
-    internal_diagnostics: WebMapping | None = None,
 ) -> None:
     """记录诊断日志并抛出 ToolBusinessError。
 
@@ -1178,7 +1197,6 @@ def _raise_fetch_failure(
         hint: LLM 可执行提示（来自 web_recovery.build_hint）。
         next_action: 下一步动作（retry/change_source/continue_without_web）。
         http_status: HTTP 状态码（可选）。
-        internal_diagnostics: 内部诊断信息（可选，仅写日志）。
 
     Returns:
         无（始终抛出异常）。
@@ -1187,28 +1205,26 @@ def _raise_fetch_failure(
         ToolBusinessError: 始终抛出。
     """
     normalized_action = normalize_next_action(next_action)
-    # 构建诊断日志
-    diagnostics: WebPayload = {
-        "url": url,
-        "error_code": error_code,
-        "message": message,
-        "next_action": normalized_action,
-    }
-    if http_status is not None:
-        diagnostics["http_status"] = http_status
-    if internal_diagnostics:
-        diagnostics["internal_diagnostics"] = internal_diagnostics
-    _log_fetch_diagnostics(diagnostics)
+    projection = failed_projection(
+        stage="fetch_web_page",
+        url=url,
+        elapsed_seconds=0.0,
+        error_code=error_code,
+        error_message=message,
+        max_error_chars=_DEFAULT_WEB_DIAGNOSTIC_ERROR_CHARS,
+        http_status=http_status,
+    )
+    _log_fetch_diagnostics(projection)
     # hint 中嵌入 next_action 标签，供 LLM 解析
     hint_text = f"[{normalized_action}] {hint}"
     raise ToolBusinessError(
         code=error_code,
-        message=message,
+        message=projection.error_message,
         hint=hint_text,
-        url=url,
+        url=projection.safe_url,
         next_action=normalized_action,
         http_status=http_status,
-        internal_diagnostics=internal_diagnostics or {},
+        internal_diagnostics=projection.to_json(),
     )
 
 
@@ -1239,11 +1255,11 @@ def _parse_retry_after_seconds(response_headers: Optional[dict[str, str]]) -> Op
     return value
 
 
-def _log_fetch_diagnostics(payload: WebMapping) -> None:
+def _log_fetch_diagnostics(projection: WebDiagnosticProjection) -> None:
     """输出网页抓取诊断日志。
 
     Args:
-        payload: 诊断信息。
+        projection: 已由 Web diagnostic owner 生成的安全投影。
 
     Returns:
         无。
@@ -1252,7 +1268,10 @@ def _log_fetch_diagnostics(payload: WebMapping) -> None:
         无。
     """
 
-    Log.debug(f"fetch_web_page diagnostics={payload}", module=MODULE)
+    Log.debug(
+        f"fetch_web_page diagnostics={projection.to_json()}",
+        module=MODULE,
+    )
 
 
 def build_web_tool_definitions(config: WebToolsConfig) -> tuple[ToolDefinition, ...]:
@@ -1921,10 +1940,6 @@ def _fetch_web_page_business(
             message=f"URL is blocked by fetch safety policy: {url}",
             hint=build_hint(REASON_BLOCKED_BY_SITE_POLICY),
             next_action=NEXT_ACTION_CHANGE_SOURCE,
-            internal_diagnostics={
-                "blocked_by_safety_policy": True,
-                "input_url": url,
-            },
         )
         raise AssertionError("unreachable fetch failure path")
     deadline_monotonic = _compute_deadline_monotonic(timeout_budget)
@@ -1937,7 +1952,7 @@ def _fetch_web_page_business(
         base_session,
         timeout_budget=timeout_budget,
     )
-    applied_storage_state_cookie_count = _apply_storage_state_cookies_to_session(
+    _apply_storage_state_cookies_to_session(
         session,
         storage_state_path=playwright_storage_state_path,
     )
@@ -2025,11 +2040,6 @@ def _fetch_web_page_business(
             http_status=response.status_code if response is not None else None,
             hint=build_hint(REASON_REDIRECT_CHAIN_TOO_LONG),
             next_action=NEXT_ACTION_CHANGE_SOURCE,
-            internal_diagnostics={
-                "final_url": response.url if response is not None else url,
-                "response_headers": _sanitize_response_headers(response.headers if response is not None else {}),
-                "response_excerpt": _extract_response_snippet(response),
-            },
         )
     except requests.Timeout as exc:
         browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
@@ -2041,12 +2051,6 @@ def _fetch_web_page_business(
             message=f"Request timed out: {exc}",
             hint=build_hint(REASON_REQUEST_TIMEOUT),
             next_action=NEXT_ACTION_RETRY,
-            internal_diagnostics={
-                "final_url": url,
-                "warmup": warmup,
-                "content_type_probe": content_type_probe,
-                "applied_storage_state_cookie_count": applied_storage_state_cookie_count,
-            },
         )
     except requests.RequestException as exc:
         response = getattr(exc, "response", None)
@@ -2068,14 +2072,6 @@ def _fetch_web_page_business(
                 message=str(exc),
                 hint=build_hint(REASON_REQUEST_TIMEOUT),
                 next_action=NEXT_ACTION_RETRY,
-                internal_diagnostics={
-                    "final_url": response.url if response is not None else url,
-                    "warmup": warmup,
-                    "content_type_probe": content_type_probe,
-                    "applied_storage_state_cookie_count": applied_storage_state_cookie_count,
-                    "response_headers": _sanitize_response_headers(response.headers if response is not None else {}),
-                    "response_excerpt": _extract_response_snippet(response),
-                },
             )
         if _is_ssl_like_request_exception(exc):
             browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
@@ -2087,19 +2083,10 @@ def _fetch_web_page_business(
                 message=f"SSL/TLS 握手失败: {exc}",
                 hint=build_hint(REASON_HTTP_ERROR),
                 next_action=NEXT_ACTION_CHANGE_SOURCE,
-                internal_diagnostics={
-                    "final_url": response.url if response is not None else url,
-                    "warmup": warmup,
-                    "content_type_probe": content_type_probe,
-                    "applied_storage_state_cookie_count": applied_storage_state_cookie_count,
-                    "response_headers": _sanitize_response_headers(response.headers if response is not None else {}),
-                    "response_excerpt": _extract_response_snippet(response),
-                    "exception_types": [type(item).__name__ for item in _iter_exception_chain(exc)],
-                },
             )
         challenge = _detect_bot_challenge(
             response=response,
-            content_text=_extract_response_snippet(response),
+            content_text=_response_text_for_challenge(response),
         )
         challenge_action = challenge_fallback_action(
             decision=challenge.decision,
@@ -2122,15 +2109,6 @@ def _fetch_web_page_business(
                 http_status=http_status,
                 hint=build_hint(REASON_BLOCKED_BY_SITE_POLICY),
                 next_action=NEXT_ACTION_CHANGE_SOURCE,
-                internal_diagnostics={
-                    "final_url": response.url if response is not None else url,
-                    "warmup": warmup,
-                    "content_type_probe": content_type_probe,
-                    "applied_storage_state_cookie_count": applied_storage_state_cookie_count,
-                    "challenge_signals": list(challenge.challenge_signals),
-                    "response_headers": _sanitize_response_headers(response.headers if response is not None else {}),
-                    "response_excerpt": _extract_response_snippet(response),
-                },
             )
         if _should_escalate_http_status_to_browser(http_status):
             browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
@@ -2150,14 +2128,6 @@ def _fetch_web_page_business(
             http_status=http_status,
             hint=challenge_hint or build_hint(REASON_HTTP_ERROR),
             next_action=next_action,
-            internal_diagnostics={
-                "final_url": response.url if response is not None else url,
-                "warmup": warmup,
-                "content_type_probe": content_type_probe,
-                "applied_storage_state_cookie_count": applied_storage_state_cookie_count,
-                "response_headers": _sanitize_response_headers(response.headers if response is not None else {}),
-                "response_excerpt": _extract_response_snippet(response),
-            },
         )
     except _FetchUrlSafetyError as exc:
         _raise_fetch_failure(
@@ -2166,12 +2136,6 @@ def _fetch_web_page_business(
             message=f"URL is blocked by fetch safety policy: {exc.url}",
             hint=build_hint(REASON_BLOCKED_BY_SITE_POLICY),
             next_action=NEXT_ACTION_CHANGE_SOURCE,
-            internal_diagnostics={
-                "blocked_by_safety_policy": True,
-                "blocked_url": exc.url,
-                "blocked_stage": exc.reason,
-                "input_url": url,
-            },
         )
     except _FetchBodyLimitExceeded as exc:
         _raise_fetch_failure(
@@ -2181,21 +2145,12 @@ def _fetch_web_page_business(
             http_status=exc.response_context.http_status,
             hint=build_hint(REASON_CONTENT_CONVERSION_FAILED),
             next_action=NEXT_ACTION_CHANGE_SOURCE,
-            internal_diagnostics={
-                "final_url": exc.final_url or exc.response_context.final_url or url,
-                "limit_kind": exc.limit_kind,
-                "limit_bytes": exc.limit_bytes,
-                "observed_bytes": exc.observed_bytes,
-                "response_headers": _sanitize_plain_response_headers(exc.response_context.response_headers),
-                "response_excerpt": exc.response_context.response_excerpt,
-            },
         )
     except RuntimeError as exc:
         if cancellation_token.is_cancelled():
             _raise_fetch_cancelled()
-        internal_diagnostics: WebPayload | None = None
         challenge_context: _FetchContentRuntimeContext | None = None
-        challenge: BotChallengeDetectionResult | None = None
+        challenge_decision = BotChallengeDecision.NONE
         pipeline_error: HtmlPipelineStageError | None = None
         conversion_failure_reason = ""
         if isinstance(exc, _FetchContentConversionError):
@@ -2211,14 +2166,6 @@ def _fetch_web_page_business(
                     http_status=challenge_context.http_status,
                     hint=build_hint(REASON_BLOCKED_BY_SITE_POLICY),
                     next_action=NEXT_ACTION_CHANGE_SOURCE,
-                    internal_diagnostics={
-                        "blocked_by_safety_policy": True,
-                        "blocked_url": exc.original_error.url,
-                        "blocked_stage": exc.original_error.reason,
-                        "final_url": challenge_context.final_url or url,
-                        "response_headers": _sanitize_plain_response_headers(challenge_context.response_headers),
-                        "response_excerpt": challenge_context.response_excerpt,
-                    },
                 )
         elif isinstance(exc, HtmlPipelineStageError):
             pipeline_error = exc
@@ -2229,14 +2176,9 @@ def _fetch_web_page_business(
                 return browser_result
 
         if challenge_context is not None:
-            challenge = _detect_bot_challenge(
-                response=None,
-                response_headers=challenge_context.response_headers,
-                http_status=challenge_context.http_status,
-                content_text=challenge_context.raw_content_text or challenge_context.response_excerpt,
-            )
+            challenge_decision = challenge_context.challenge_decision
             challenge_action = challenge_fallback_action(
-                decision=challenge.decision,
+                decision=challenge_decision,
                 browser_available=True,
             )
             if challenge_action is ChallengeFallbackAction.TRY_BROWSER:
@@ -2260,49 +2202,21 @@ def _fetch_web_page_business(
             if browser_result is not None:
                 return browser_result
 
-        if pipeline_error is not None or challenge_context is not None:
-            internal_diagnostics = {}
-            if pipeline_error is not None:
-                internal_diagnostics.update(
-                    {
-                        "pipeline_stage": pipeline_error.stage,
-                        "extractor_source": pipeline_error.extractor_source,
-                        "quality_flags": list(pipeline_error.quality_flags),
-                        "content_stats": pipeline_error.content_stats,
-                    }
-                )
-            if challenge_context is not None:
-                internal_diagnostics.update(
-                    {
-                        "final_url": challenge_context.final_url or url,
-                        "http_status": challenge_context.http_status,
-                        "applied_storage_state_cookie_count": applied_storage_state_cookie_count,
-                        "response_headers": _sanitize_plain_response_headers(challenge_context.response_headers),
-                        "response_excerpt": challenge_context.response_excerpt,
-                    }
-                )
-            if conversion_failure_reason:
-                internal_diagnostics["conversion_failure_reason"] = conversion_failure_reason
-            if challenge is not None and challenge.challenge_signals:
-                internal_diagnostics["challenge_signals"] = list(challenge.challenge_signals)
         _raise_fetch_failure(
             url=url,
             error_code=(
                 "blocked"
-                if challenge is not None
-                and challenge.decision is BotChallengeDecision.CONFIRMED
+                if challenge_decision is BotChallengeDecision.CONFIRMED
                 else "content_conversion_failed"
             ),
             message=str(exc),
             hint=(
                 build_hint(REASON_BLOCKED_BY_SITE_POLICY)
-                if challenge is not None
-                and challenge.decision is BotChallengeDecision.CONFIRMED
+                if challenge_decision is BotChallengeDecision.CONFIRMED
                 else build_hint(REASON_CONTENT_CONVERSION_FAILED)
             ),
             next_action=NEXT_ACTION_CHANGE_SOURCE,
             http_status=challenge_context.http_status if challenge_context is not None else None,
-            internal_diagnostics=internal_diagnostics,
         )
     finally:
         if should_close_session:
@@ -2338,13 +2252,6 @@ def _fetch_web_page_business(
             http_status=fetch_result.get("http_status"),
             hint=build_hint(REASON_BLOCKED_BY_SITE_POLICY),
             next_action=NEXT_ACTION_CHANGE_SOURCE,
-            internal_diagnostics={
-                "final_url": fetch_result.get("final_url", url),
-                "redirect_hops": fetch_result.get("redirect_hops"),
-                "challenge_signals": list(challenge.challenge_signals),
-                "response_headers": _sanitize_plain_response_headers(fetch_result.get("response_headers")),
-                "response_excerpt": fetch_result.get("response_excerpt", ""),
-            },
         )
 
     content = fetch_result.get("content", "")
@@ -2356,43 +2263,31 @@ def _fetch_web_page_business(
             http_status=fetch_result.get("http_status"),
             hint=build_hint(REASON_EMPTY_CONTENT),
             next_action=NEXT_ACTION_CONTINUE_WITHOUT_WEB,
-            internal_diagnostics={
-                "final_url": fetch_result.get("final_url", url),
-                "redirect_hops": fetch_result.get("redirect_hops"),
-                "response_headers": _sanitize_plain_response_headers(fetch_result.get("response_headers")),
-                "response_excerpt": fetch_result.get("response_excerpt", ""),
-            },
         )
 
     success: WebPayload = {
         "url": url,
-        "final_url": fetch_result.get("final_url", url),
+        "final_url": project_safe_url_or_empty(
+            str(fetch_result.get("final_url", url) or url)
+        ),
         "title": fetch_result.get("title", ""),
         "content": content,
         "fetch_backend": "requests",
+        "response_content_length": fetch_result.get("response_content_length"),
+        "response_content_digest": fetch_result.get("response_content_digest"),
     }
     _log_fetch_diagnostics(
-        cast(WebMapping, {
-            **success,
-            "extraction_source": fetch_result.get("extraction_source", ""),
-            "renderer_source": fetch_result.get("renderer_source", ""),
-            "normalization_applied": fetch_result.get("normalization_applied", False),
-            "internal_diagnostics": {
-                "final_url": fetch_result.get("final_url", url),
-                "http_status": fetch_result.get("http_status"),
-                "redirect_hops": fetch_result.get("redirect_hops"),
-                "fetch_backend": "requests",
-                "extraction_source": fetch_result.get("extraction_source", ""),
-                "renderer_source": fetch_result.get("renderer_source", ""),
-                "normalization_applied": fetch_result.get("normalization_applied", False),
-                "quality_flags": fetch_result.get("quality_flags", []),
-                "content_stats": fetch_result.get("content_stats", {}),
-                "content_type_probe": content_type_probe,
-                "warmup": warmup,
-                "response_headers": _sanitize_plain_response_headers(fetch_result.get("response_headers")),
-                "response_excerpt": fetch_result.get("response_excerpt", ""),
-            },
-        })
+        completed_text_projection(
+            stage="fetch_web_page",
+            url=str(fetch_result.get("final_url", url) or url),
+            elapsed_seconds=0.0,
+            backend=WebDiagnosticBackend.REQUESTS,
+            content=content,
+            http_status=fetch_result.get("http_status"),
+            response_headers=_sanitize_plain_response_headers(
+                fetch_result.get("response_headers")
+            ),
+        )
     )
     return success
 
@@ -2762,7 +2657,6 @@ def _playwright_sync_worker(
         build_domain_home_url=_build_domain_home_url,
         normalize_url_for_http=_normalize_url_for_http,
         sanitize_response_headers=_sanitize_plain_response_headers,
-        build_text_excerpt=_build_text_excerpt,
         convert_html_to_markdown=cast(
             _web_playwright_backend._HtmlConverterProtocol,
             convert_html_to_llm_markdown,

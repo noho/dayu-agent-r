@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import gzip
+import inspect
 import json as json_module
 import logging
 import multiprocessing
@@ -76,6 +77,7 @@ from dayu.tools.web import discover_tools
 from dayu.tools.web import web_playwright_backend
 from dayu.tools.web import web_challenge_detection
 from dayu.tools.web import web_fetch_orchestrator
+from dayu.tools.web import web_diagnostics
 from dayu.tools.web import web_tool_projection_text
 from dayu.tools.web import web_search_providers
 from dayu.tools.web import web_tools
@@ -98,6 +100,112 @@ _FORBIDDEN_CANCEL_MESSAGE_PARTS = (
     "Host cancelled",
     "continue_without_web",
 )
+
+
+def test_web_diagnostic_projection_removes_secret_content_url_headers_exception_and_network() -> None:
+    """所有 Web diagnostic producer 只能保留 length/digest 与 safe URL。"""
+
+    sentinel = "9f" * 32
+    secret_url = (
+        f"https://{sentinel}:{sentinel}@example.com/report"
+        f"?token={sentinel}#{sentinel}"
+    )
+    projections: list[JsonValue] = [
+        web_diagnostics.completed_text_projection(
+            stage="success",
+            url=secret_url,
+            elapsed_seconds=0.1,
+            backend=web_diagnostics.WebDiagnosticBackend.REQUESTS,
+            content=f"raw html <body>{sentinel}</body>",
+            http_status=200,
+            response_headers={
+                "Authorization": sentinel,
+                "Cache-Control": sentinel,
+                "X-Network-Secret": sentinel,
+            },
+        ).to_json(),
+        web_diagnostics.failed_projection(
+            stage="failure",
+            url=secret_url,
+            elapsed_seconds=0.1,
+            error_code="synthetic",
+            error_message=f"exception={sentinel} url={secret_url}",
+            max_error_chars=512,
+        ).to_json(),
+        web_diagnostics.project_network_event(
+            event="request",
+            url=secret_url,
+            method="GET",
+            resource_type="document",
+            status_code=None,
+        ),
+    ]
+
+    serialized = json_module.dumps(projections, ensure_ascii=False)
+    assert sentinel not in serialized
+    assert sentinel[:16] not in serialized
+    assert "raw html" not in serialized
+    assert "@example.com" not in serialized
+    assert "?token=" not in serialized
+    assert "#" not in serialized
+    assert "content_length" in serialized
+    assert "content_digest" in serialized
+
+
+def test_docling_stream_name_never_includes_url_query_sentinel() -> None:
+    """Docling stream name 必须只从 URL path 推断，不能携带 query sentinel。"""
+
+    sentinel = "7d" * 32
+    stream_name = web_fetch_orchestrator._infer_docling_stream_name(
+        url=f"https://example.com/report.pdf?token={sentinel}",
+        content_type="text/plain",
+    )
+
+    assert stream_name == "page.pdf"
+    assert sentinel not in stream_name
+
+
+def test_playwright_success_final_url_uses_safe_projection() -> None:
+    """Playwright 工具成功 payload 的 final_url 不得暴露 userinfo/query/fragment。"""
+
+    sentinel = "6c" * 32
+    payload = web_tools._build_playwright_success_payload(
+        "https://example.com/request",
+        {
+            "final_url": (
+                f"https://{sentinel}:{sentinel}@example.com/report"
+                f"?token={sentinel}#{sentinel}"
+            ),
+            "title": "Example",
+            "content": "safe projected content",
+        },
+    )
+
+    assert payload["final_url"] == "https://example.com/report"
+    assert sentinel not in str(payload["final_url"])
+
+
+def test_raise_fetch_failure_accepts_only_owner_projection_inputs() -> None:
+    """failure owner 不得接受会被静默丢弃的任意 downstream diagnostics。"""
+
+    assert "internal_diagnostics" not in inspect.signature(
+        web_tools._raise_fetch_failure
+    ).parameters
+    with pytest.raises(web_tools.ToolBusinessError) as exc_info:
+        web_tools._raise_fetch_failure(
+            url="https://user:secret@example.com/report?token=secret#fragment",
+            error_code="synthetic_failure",
+            message="synthetic failure",
+            hint="change source",
+            next_action="change_source",
+        )
+
+    diagnostics = exc_info.value.internal_diagnostics
+    assert diagnostics["safe_url"] == "https://example.com/report"
+    assert diagnostics["error_code"] == "synthetic_failure"
+    assert "token=" not in json_module.dumps(diagnostics)
+
+
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 _LIVE_BROWSER_CLEANUP_SMOKE_ENV = "DAYU_RUN_LIVE_BROWSER_CLEANUP_SMOKE"
@@ -2308,6 +2416,11 @@ def test_fetch_private_url_can_be_allowed_with_explicit_config(
 ) -> None:
     """显式允许 private URL 后，抓取路径才可继续执行。"""
 
+    sentinel = "5a" * 32
+    raw_final_url = (
+        f"https://{sentinel}:{sentinel}@example.com/report"
+        f"?token={sentinel}#{sentinel}"
+    )
     monkeypatch.setattr(web_tools, "_warmup_domain", lambda *args, **kwargs: {"attempted": True, "ok": True})
     monkeypatch.setattr(web_tools, "_probe_content_type", lambda *args, **kwargs: {"attempted": True, "ok": True})
     monkeypatch.setattr(web_tools, "_try_playwright_fallback", lambda *args, **kwargs: None)
@@ -2321,13 +2434,12 @@ def test_fetch_private_url_can_be_allowed_with_explicit_config(
         """
 
         return {
-            "final_url": url,
+            "final_url": raw_final_url,
             "title": "Internal",
             "content": "local test content",
             "http_status": 200,
             "redirect_hops": 0,
             "response_headers": {},
-            "response_excerpt": "local test content",
             "extraction_source": "mock",
             "renderer_source": "mock",
             "normalization_applied": False,
@@ -2351,6 +2463,8 @@ def test_fetch_private_url_can_be_allowed_with_explicit_config(
     value = _mapping_value(outcome.result.value)
     assert value["fetch_backend"] == "requests"
     assert value["content"] == "local test content"
+    assert value["final_url"] == "https://example.com/report"
+    assert sentinel not in str(value["final_url"])
     assert "ok" not in value
 
 
@@ -3983,8 +4097,8 @@ def test_playwright_public_direct_reports_typed_egress_policy_unavailable() -> N
         resource_budget=_DEFAULT_RESOURCE_BUDGET,
         resolve_timeout_budget=lambda timeout_seconds, **kwargs: timeout_seconds,
         playwright_sync_worker=unexpected_worker,
-        detect_bot_challenge=lambda **kwargs: web_tools.BotChallengeDetectionResult(
-            decision=web_tools.BotChallengeDecision.NONE,
+        detect_bot_challenge=lambda **kwargs: web_challenge_detection.BotChallengeDetectionResult(
+            decision=web_challenge_detection.BotChallengeDecision.NONE,
             challenge_signals=(),
             evidence_classes=(),
         ),
@@ -4372,8 +4486,8 @@ def test_playwright_unpicklable_worker_fails_closed(
         cancellation_token=_OpenCancellationToken(),
         resolve_timeout_budget=lambda timeout_seconds, **kwargs: timeout_seconds,
         playwright_sync_worker=fake_worker,
-        detect_bot_challenge=lambda **kwargs: web_tools.BotChallengeDetectionResult(
-            decision=web_tools.BotChallengeDecision.NONE,
+        detect_bot_challenge=lambda **kwargs: web_challenge_detection.BotChallengeDetectionResult(
+            decision=web_challenge_detection.BotChallengeDecision.NONE,
             challenge_signals=(),
             evidence_classes=(),
         ),
@@ -4635,7 +4749,6 @@ def test_fetch_playwright_fallback_receives_channel_and_storage_state_path(
             "http_status": 200,
             "redirect_hops": 0,
             "response_headers": {},
-            "response_excerpt": "browser rendered content",
             "extraction_source": "playwright",
             "renderer_source": "playwright",
             "normalization_applied": False,
@@ -4735,7 +4848,6 @@ def test_fetch_playwright_fallback_uses_empty_storage_state_when_dir_empty(
             "http_status": 200,
             "redirect_hops": 0,
             "response_headers": {},
-            "response_excerpt": "browser rendered content",
             "extraction_source": "playwright",
             "renderer_source": "playwright",
             "normalization_applied": False,
@@ -4927,7 +5039,6 @@ def test_web_provider_serializes_search_and_fetch_business(
             "http_status": 200,
             "redirect_hops": 0,
             "response_headers": {},
-            "response_excerpt": "serialized fetch content",
             "extraction_source": "mock",
             "renderer_source": "mock",
             "normalization_applied": False,

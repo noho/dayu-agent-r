@@ -31,6 +31,13 @@ from dayu.documents.processors.html_pipeline import HtmlPipelineResult, HtmlPipe
 from dayu.documents.processors.text_utils import infer_suffix_from_uri
 
 from .web_challenge_detection import BotChallengeDecision, detect_bot_challenge
+from .web_diagnostics import (
+    WebContentDiagnostic,
+    WebResponseHeaderProjection,
+    content_diagnostic_from_bytes,
+    project_response_headers,
+    project_safe_url_or_empty,
+)
 from .web_http_encoding import (
     _decode_response_text,
     _extract_content_encoding_tokens,
@@ -45,7 +52,6 @@ from .web_http_session import AuthorizedResponseLease, _send_authorized_request
 from .web_resource_budget import WebResourceBudget
 
 _WARMUP_TIMEOUT_SECONDS = 6.0
-_RESPONSE_SNIPPET_MAX_CHARS = 500
 _EMPTY_CONTENT_MIN_CHARS = 5
 _MAX_META_REFRESH_HOPS = 3
 _META_REFRESH_IMMEDIATE_MAX_SECONDS = 1.0
@@ -132,13 +138,15 @@ def _import_optional_module(module_name: str) -> ModuleType:
 
 @dataclass(frozen=True)
 class _FetchContentRuntimeContext:
-    """抓取转换失败时保留的原始响应上下文。"""
+    """抓取转换失败时保留的不可逆响应证据。"""
 
     http_status: int | None
-    final_url: str
-    response_headers: dict[str, str]
-    response_excerpt: str
-    raw_content_text: str
+    safe_final_url: str
+    response_headers: WebResponseHeaderProjection
+    content: WebContentDiagnostic
+    challenge_decision: BotChallengeDecision
+    challenge_signals: tuple[str, ...]
+    has_client_rendering_markers: bool
 
 
 @dataclass(frozen=True)
@@ -284,39 +292,16 @@ def _raise_if_cancelled(cancellation_token: CancellationToken | None) -> None:
             raise RuntimeError(cancellation_token.cancel_reason() or "工具调用已取消")
 
 
-def _extract_response_snippet(response: requests.Response | None) -> str:
-    """提取响应文本前缀用于诊断。
-
-    Args:
-        response: HTTP 响应对象。
-
-    Returns:
-        限长后的文本前缀。
-
-    Raises:
-        无。
-    """
-
-    if response is None:
-        return ""
-    try:
-        text = _decode_response_text(response).strip()
-    except Exception:
-        return ""
-    if not text:
-        return ""
-    compact = re.sub(r"\s+", " ", text)
-    return compact[:_RESPONSE_SNIPPET_MAX_CHARS]
-
-
-def _sanitize_response_headers(headers: CaseInsensitiveDict[str] | dict[str, str] | None) -> dict[str, str]:
-    """筛选可用于分析的关键响应头。
+def _sanitize_response_headers(
+    headers: CaseInsensitiveDict[str] | dict[str, str] | None,
+) -> dict[str, str]:
+    """筛选仅供抓取状态机内部判断的关键响应头。
 
     Args:
         headers: 原始响应头映射。
 
     Returns:
-        过滤后的响应头字典。
+        内部有界响应头字典；进入日志/artifact 前仍必须经过 diagnostic projection。
 
     Raises:
         无。
@@ -343,7 +328,11 @@ def _sanitize_response_headers(headers: CaseInsensitiveDict[str] | dict[str, str
             continue
         text = str(value)
         if key == "set-cookie":
-            cookie_names = [chunk.split("=", 1)[0].strip() for chunk in text.split(";") if "=" in chunk]
+            cookie_names = [
+                chunk.split("=", 1)[0].strip()
+                for chunk in text.split(";")
+                if "=" in chunk
+            ]
             text = ",".join(sorted(set(filter(None, cookie_names))))
         normalized[key] = text[:200]
     return normalized
@@ -896,7 +885,7 @@ def _request_with_safe_redirects(
 
 
 def _build_fetch_content_runtime_context(response: requests.Response) -> _FetchContentRuntimeContext:
-    """从响应对象构造抓取转换失败上下文。
+    """从响应对象构造不可逆抓取转换失败上下文。
 
     Args:
         response: 原始 HTTP 响应。
@@ -908,39 +897,21 @@ def _build_fetch_content_runtime_context(response: requests.Response) -> _FetchC
         无。
     """
 
+    response_bytes = bytes(response.content)
     try:
-        raw_content_text = _decode_response_text(response)
+        response_text = _decode_response_text(response)
     except Exception:
-        raw_content_text = ""
+        response_text = ""
+    challenge = detect_bot_challenge(response=response, content_text=response_text)
     return _FetchContentRuntimeContext(
-        http_status=getattr(response, "status_code", None),
-        final_url=str(getattr(response, "url", "") or ""),
-        response_headers={str(key): str(value) for key, value in dict(getattr(response, "headers", {}) or {}).items()},
-        response_excerpt=_extract_response_snippet(response),
-        raw_content_text=raw_content_text,
+        http_status=response.status_code,
+        safe_final_url=project_safe_url_or_empty(str(response.url or "")),
+        response_headers=project_response_headers(response.headers),
+        content=content_diagnostic_from_bytes(response_bytes),
+        challenge_decision=challenge.decision,
+        challenge_signals=challenge.challenge_signals,
+        has_client_rendering_markers=_html_text_has_client_rendering_markers(response_text),
     )
-
-
-def _decode_bounded_body_excerpt(body_excerpt: bytes) -> str:
-    """把已受限的 body 前缀解码为诊断文本。
-
-    Args:
-        body_excerpt: 已由调用方裁剪过的 body 前缀。
-
-    Returns:
-        限长后的单行诊断文本；没有内容时返回空字符串。
-
-    Raises:
-        无。
-    """
-
-    if not body_excerpt:
-        return ""
-    decoded = body_excerpt[:_FETCH_LIMIT_CONTEXT_EXCERPT_BYTES].decode("utf-8", errors="replace").strip()
-    if not decoded:
-        return ""
-    compact = re.sub(r"\s+", " ", decoded)
-    return compact[:_RESPONSE_SNIPPET_MAX_CHARS]
 
 
 def _build_fetch_body_limit_runtime_context(
@@ -961,13 +932,15 @@ def _build_fetch_body_limit_runtime_context(
         无。
     """
 
-    response_excerpt = _decode_bounded_body_excerpt(body_excerpt)
+    bounded_excerpt = body_excerpt[:_FETCH_LIMIT_CONTEXT_EXCERPT_BYTES]
     return _FetchContentRuntimeContext(
-        http_status=getattr(response, "status_code", None),
-        final_url=str(getattr(response, "url", "") or ""),
-        response_headers={str(key): str(value) for key, value in dict(getattr(response, "headers", {}) or {}).items()},
-        response_excerpt=response_excerpt,
-        raw_content_text=response_excerpt,
+        http_status=response.status_code,
+        safe_final_url=project_safe_url_or_empty(str(response.url or "")),
+        response_headers=project_response_headers(response.headers),
+        content=content_diagnostic_from_bytes(bounded_excerpt),
+        challenge_decision=BotChallengeDecision.NONE,
+        challenge_signals=(),
+        has_client_rendering_markers=False,
     )
 
 
@@ -1185,8 +1158,7 @@ def _should_escalate_conversion_failure_to_browser(
     ):
         return False
 
-    raw_text = str(response_context.raw_content_text or response_context.response_excerpt or "")
-    return _html_text_has_client_rendering_markers(raw_text)
+    return response_context.has_client_rendering_markers
 
 
 def _should_escalate_stage_result_to_browser(stage_result: dict[str, str | bool | int | float | None] | None) -> bool:
@@ -1226,12 +1198,11 @@ def _should_escalate_pipeline_failure_to_browser(
         paragraph_count = 0
 
     quality_flags = {str(flag).strip().lower() for flag in pipeline_error.quality_flags}
-    raw_text = str(response_context.raw_content_text or response_context.response_excerpt or "").lower()
-
     extractor_found_no_body = text_length <= _EMPTY_CONTENT_MIN_CHARS or paragraph_count <= 0
     quality_indicates_empty_shell = bool({"too_short", "too_few_blocks"} & quality_flags)
-    has_client_rendering_markers = _html_text_has_client_rendering_markers(raw_text)
-    return (extractor_found_no_body or quality_indicates_empty_shell) and has_client_rendering_markers
+    return (
+        extractor_found_no_body or quality_indicates_empty_shell
+    ) and response_context.has_client_rendering_markers
 
 
 def _get_session_warmed_hosts(session: requests.Session) -> set[str]:
@@ -1460,7 +1431,7 @@ def _should_route_response_to_html_pipeline(
     if "html" in normalized_content_type:
         return True
 
-    uri_suffix = infer_suffix_from_uri(url)
+    uri_suffix = infer_suffix_from_uri(urlparse(url).path)
     if uri_suffix in {".html", ".htm", ".xhtml"}:
         return True
 
@@ -1476,7 +1447,7 @@ def _infer_docling_stream_name(*, url: str, content_type: str) -> str:
     """为 Docling 推断更稳定的输入流名称。"""
 
     normalized_content_type = str(content_type or "").lower()
-    uri_suffix = infer_suffix_from_uri(url)
+    uri_suffix = infer_suffix_from_uri(urlparse(url).path)
 
     if "pdf" in normalized_content_type or uri_suffix == ".pdf":
         return "page.pdf"
@@ -1641,6 +1612,7 @@ def _fetch_and_convert_content(
             )
             content_type = str(probe.get("content_type", "") or response.headers.get("Content-Type", "")).lower()
             response_text = _decode_response_text(response)
+            response_content = content_diagnostic_from_bytes(bytes(response.content))
             response_url = str(response.url or current_url)
             if _should_route_response_to_html_pipeline(
                 url=response_url,
@@ -1715,6 +1687,7 @@ def _fetch_and_convert_content(
                 "http_status": response.status_code,
                 "final_url": response_url,
                 "redirect_hops": http_redirect_hops + meta_refresh_hops,
-                "response_headers": dict(response.headers),
-                "response_excerpt": _extract_response_snippet(response),
+                "response_headers": _sanitize_response_headers(response.headers),
+                "response_content_length": response_content.length,
+                "response_content_digest": response_content.digest,
             }

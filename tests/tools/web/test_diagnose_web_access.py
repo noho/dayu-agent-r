@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
+from types import TracebackType
 from typing import cast
 
 import pytest
@@ -24,6 +26,7 @@ from dayu.documents.docling_runtime import DoclingRuntimeInitializationError
 from dayu.tools.web import web_http_session
 from dayu.tools.web import web_tools as web_tools_module
 from dayu.tools.web.web_egress_policy import WebEgressPolicy
+from dayu.tools.web.web_resource_budget import WebResourceBudget
 JsonObject = dict[str, JsonValue]
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -80,6 +83,38 @@ class _SessionCloseSpy(diag.requests.Session):
 
         self.close_count += 1
         super().close()
+
+
+class _StorageStateContext:
+    """storage-state atomic lifecycle 测试用最小 context。"""
+
+    def __init__(self, payload: JsonValue) -> None:
+        """保存待序列化 payload。"""
+
+        self.payload = payload
+        self.call_count = 0
+
+    def storage_state(self, *, path: str | None = None) -> JsonValue:
+        """返回内存 payload，并拒绝 Playwright 直接写路径。"""
+
+        assert path is None
+        self.call_count += 1
+        return self.payload
+
+
+class _BodyResponse:
+    """bounded Playwright response-body helper 测试替身。"""
+
+    def __init__(self, *, body: bytes, headers: Mapping[str, str]) -> None:
+        """保存 response bytes 与 headers。"""
+
+        self._body = body
+        self.headers = headers
+
+    def body(self) -> bytes:
+        """返回确定性 response bytes。"""
+
+        return self._body
 
 
 def _raise_diagnostic_request_exception(
@@ -172,12 +207,12 @@ def test_invalid_jsonl_reports_line_number(tmp_path: Path) -> None:
         diag._read_url_entries(path)
 
 
-def test_storage_state_dir_resolves_existing_host_input_and_default_output(tmp_path: Path) -> None:
-    """storage-state 目录应按 URL host 解析输入和输出路径。"""
+def test_storage_state_dir_resolves_existing_host_input_without_default_output(tmp_path: Path) -> None:
+    """storage-state 目录只允许解析 owner 输入，默认必须零写入。"""
 
     storage_dir = tmp_path / "state"
     storage_dir.mkdir()
-    host_state = storage_dir / "example.com.json"
+    host_state = storage_dir / "dayu-web-diagnostic-storage-state-example.com.json"
     host_state.write_text('{"cookies":[]}', encoding="utf-8")
     options = _options(storage_state_dir=str(storage_dir))
 
@@ -187,7 +222,317 @@ def test_storage_state_dir_resolves_existing_host_input_and_default_output(tmp_p
     )
 
     assert storage_state_in == str(host_state)
-    assert storage_state_out == str(host_state)
+    assert storage_state_out == ""
+
+
+def test_storage_state_default_publish_is_zero_write(tmp_path: Path) -> None:
+    """未显式 opt-in 时不得创建目录、temp 或 final。"""
+
+    context = _StorageStateContext({"cookies": [{"value": "secret"}]})
+    lifecycle = diag._prepare_storage_state_lifecycle(
+        _options(storage_state_dir=str(tmp_path / "missing")),
+        "https://example.com/report",
+    )
+
+    lifecycle.publish(cast(diag._BrowserContextProtocol, context))
+
+    assert lifecycle.output_enabled is False
+    assert context.call_count == 0
+    assert not (tmp_path / "missing").exists()
+
+
+def test_ensure_private_storage_directory_creates_private_leaf(tmp_path: Path) -> None:
+    """新 storage owner 目录必须创建为 0700。"""
+
+    storage_directory = tmp_path / "private-state"
+
+    diag._ensure_private_storage_directory(storage_directory)
+
+    assert storage_directory.is_dir()
+    assert storage_directory.stat().st_mode & 0o777 == 0o700
+
+
+def test_ensure_private_storage_directory_accepts_existing_private_leaf(
+    tmp_path: Path,
+) -> None:
+    """已存在且为 0700 的 owner 目录必须原样接受。"""
+
+    storage_directory = tmp_path / "private-state"
+    storage_directory.mkdir(mode=0o700)
+
+    diag._ensure_private_storage_directory(storage_directory)
+
+    assert storage_directory.stat().st_mode & 0o777 == 0o700
+
+
+def test_ensure_private_storage_directory_rejects_non_private_leaf(
+    tmp_path: Path,
+) -> None:
+    """已存在但权限不是 0700 的 owner 目录必须 fail closed。"""
+
+    storage_directory = tmp_path / "shared-state"
+    storage_directory.mkdir(mode=0o755)
+    os.chmod(storage_directory, 0o755)
+
+    with pytest.raises(ValueError, match="必须预先设置为 0700"):
+        diag._ensure_private_storage_directory(storage_directory)
+
+
+def test_ensure_private_storage_directory_rejects_non_directory_path(
+    tmp_path: Path,
+) -> None:
+    """owner 路径已被普通文件占用时必须拒绝。"""
+
+    storage_directory = tmp_path / "state-file"
+    storage_directory.write_text("not a directory", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="不是目录"):
+        diag._ensure_private_storage_directory(storage_directory)
+
+
+def test_ensure_private_storage_directory_does_not_harden_intermediate_parents(
+    tmp_path: Path,
+) -> None:
+    """嵌套路径只收紧最终 storage dir，不把中间父目录强制改成 0700。"""
+
+    storage_directory = tmp_path / "shared" / "nested" / "private-state"
+    previous_umask = os.umask(0o022)
+    try:
+        diag._ensure_private_storage_directory(storage_directory)
+    finally:
+        os.umask(previous_umask)
+
+    assert (tmp_path / "shared").stat().st_mode & 0o777 == 0o755
+    assert (tmp_path / "shared" / "nested").stat().st_mode & 0o777 == 0o755
+    assert storage_directory.stat().st_mode & 0o777 == 0o700
+
+
+def test_storage_state_atomic_publish_permissions_and_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """显式 opt-in 必须执行 0700/0600、flush/fsync、replace 与 failure cleanup。"""
+
+    parent = tmp_path / "private-state"
+    final_path = parent / "dayu-web-diagnostic-storage-state-example.com.json"
+    options = _options(
+        storage_state_out=str(final_path),
+        storage_state_ttl_seconds=60,
+    )
+    lifecycle = diag._prepare_storage_state_lifecycle(
+        options,
+        "https://example.com/report",
+    )
+    context = _StorageStateContext({"cookies": [{"name": "sid", "value": "secret"}]})
+    fsync_calls: list[int] = []
+    replace_calls: list[tuple[Path, Path]] = []
+    original_fsync = os.fsync
+    original_replace = os.replace
+
+    def fsync_spy(descriptor: int) -> None:
+        """记录并执行真实 fsync。"""
+
+        fsync_calls.append(descriptor)
+        original_fsync(descriptor)
+
+    def replace_spy(source: Path, destination: Path) -> None:
+        """记录并执行真实 atomic replace。"""
+
+        replace_calls.append((source, destination))
+        original_replace(source, destination)
+
+    monkeypatch.setattr(diag.os, "fsync", fsync_spy)
+    monkeypatch.setattr(diag.os, "replace", replace_spy)
+
+    lifecycle.publish(cast(diag._BrowserContextProtocol, context))
+
+    assert parent.stat().st_mode & 0o777 == 0o700
+    assert final_path.stat().st_mode & 0o777 == 0o600
+    assert fsync_calls
+    assert len(replace_calls) == 1
+    assert replace_calls[0][1] == final_path
+    assert not tuple(parent.glob(".dayu-web-diagnostic-storage-state-*.tmp"))
+    assert lifecycle.artifact_projection() == {
+        "input_used": False,
+        "output_enabled": True,
+        "output_label": final_path.name,
+        "ttl_seconds": 60,
+        "published": True,
+    }
+
+    lifecycle.cleanup_failure()
+    assert not final_path.exists()
+    assert lifecycle.published is False
+
+
+def test_storage_state_replace_failure_removes_run_temp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """普通 publish failure 必须删除本 run temp，且不得留下 final。"""
+
+    parent = tmp_path / "state"
+    final_path = parent / "dayu-web-diagnostic-storage-state-example.com.json"
+    lifecycle = diag._prepare_storage_state_lifecycle(
+        _options(
+            storage_state_out=str(final_path),
+            storage_state_ttl_seconds=30,
+        ),
+        "https://example.com/report",
+    )
+
+    def fail_replace(source: Path, destination: Path) -> None:
+        """模拟 ordinary replace failure。"""
+
+        del source, destination
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(diag.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="replace failed"):
+        lifecycle.publish(
+            cast(diag._BrowserContextProtocol, _StorageStateContext({"cookies": []}))
+        )
+
+    assert not final_path.exists()
+    assert not tuple(parent.glob(".dayu-web-diagnostic-storage-state-*.tmp"))
+
+
+def test_storage_state_post_replace_failure_marks_and_cleans_published_final(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """replace 后 chmod 失败时必须保留 published 事实供 cleanup 删除 final。"""
+
+    parent = tmp_path / "state"
+    final_path = parent / "dayu-web-diagnostic-storage-state-example.com.json"
+    lifecycle = diag._prepare_storage_state_lifecycle(
+        _options(
+            storage_state_out=str(final_path),
+            storage_state_ttl_seconds=30,
+        ),
+        "https://example.com/report",
+    )
+    original_chmod = os.chmod
+
+    def fail_final_chmod(path: Path, mode: int) -> None:
+        """只在 final 已由 replace 发布后模拟 chmod failure。"""
+
+        if Path(path) == final_path:
+            raise OSError("final chmod failed")
+        original_chmod(path, mode)
+
+    monkeypatch.setattr(diag.os, "chmod", fail_final_chmod)
+
+    with pytest.raises(OSError, match="final chmod failed"):
+        lifecycle.publish(
+            cast(diag._BrowserContextProtocol, _StorageStateContext({"cookies": []}))
+        )
+
+    assert final_path.exists()
+    assert lifecycle.published is True
+    lifecycle.cleanup_failure()
+    assert not final_path.exists()
+    assert lifecycle.published is False
+
+
+def test_storage_state_cancel_path_cleans_temp_and_published_final(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BaseException/cancel 路径必须调用同一 lifecycle cleanup，不承诺 SIGKILL。"""
+
+    import playwright.sync_api as playwright_sync_api
+
+    parent = tmp_path / "state"
+    parent.mkdir(mode=0o700)
+    final_path = parent / "dayu-web-diagnostic-storage-state-127.0.0.1.json"
+    temp_path = parent / ".dayu-web-diagnostic-storage-state-cancel.tmp"
+    final_path.write_text("{}", encoding="utf-8")
+    temp_path.write_text("{}", encoding="utf-8")
+    lifecycle = diag._StorageStateLifecycle(
+        input_path=None,
+        final_path=final_path,
+        ttl_seconds=60,
+        temp_path=temp_path,
+        published=True,
+    )
+
+    class _CancelledManager:
+        """在 browser manager enter 阶段模拟协作取消。"""
+
+        def __enter__(self) -> diag._PlaywrightProtocol:
+            """模拟取消异常。"""
+
+            raise KeyboardInterrupt("cancelled")
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_value: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> None:
+            """保持 context manager 协议。"""
+
+            del exc_type, exc_value, traceback
+
+    def fake_prepare(
+        options: diag.CliOptions,
+        url: str,
+    ) -> diag._StorageStateLifecycle:
+        """返回预置 cancellation lifecycle。"""
+
+        del options, url
+        return lifecycle
+
+    def fake_sync_playwright() -> _CancelledManager:
+        """返回会在 enter 抛取消的 manager。"""
+
+        return _CancelledManager()
+
+    monkeypatch.setattr(diag, "_prepare_storage_state_lifecycle", fake_prepare)
+    monkeypatch.setattr(playwright_sync_api, "sync_playwright", fake_sync_playwright)
+
+    with pytest.raises(KeyboardInterrupt, match="cancelled"):
+        diag._build_playwright_profile(
+            "http://127.0.0.1/report",
+            _options(
+                url="http://127.0.0.1/report",
+                allow_private_network_url=True,
+            ),
+            egress_policy=WebEgressPolicy(allow_private_network=True),
+        )
+
+    assert not temp_path.exists()
+    assert not final_path.exists()
+    assert lifecycle.published is False
+
+
+def test_storage_state_startup_reconciliation_is_owner_scoped_and_ttl_bounded(
+    tmp_path: Path,
+) -> None:
+    """startup 只删除 owner orphan temp 与过期 final，保留 fresh/unrelated 文件。"""
+
+    directory = tmp_path / "state"
+    directory.mkdir(mode=0o700)
+    orphan = directory / ".dayu-web-diagnostic-storage-state-orphan.tmp"
+    expired = directory / "dayu-web-diagnostic-storage-state-expired.example.json"
+    fresh = directory / "dayu-web-diagnostic-storage-state-fresh.example.json"
+    unrelated = directory / "customer-storage.json"
+    for path in (orphan, expired, fresh, unrelated):
+        path.write_text("{}", encoding="utf-8")
+    os.utime(expired, (100.0, 100.0))
+    os.utime(fresh, (180.0, 180.0))
+
+    diag._reconcile_storage_state_directory(
+        directory,
+        ttl_seconds=60,
+        now_epoch_seconds=200.0,
+    )
+
+    assert not orphan.exists()
+    assert not expired.exists()
+    assert fresh.exists()
+    assert unrelated.exists()
 
 
 def test_url_normalization_requires_http_url() -> None:
@@ -257,8 +602,8 @@ def test_url_safety_rejects_private_and_local_hosts_by_default() -> None:
     assert target.normalized_url == "https://example.com/report"
 
 
-def test_header_redaction_masks_sensitive_header_values() -> None:
-    """header 脱敏应按 header 名称隐藏凭据，同时保留非敏感 header。"""
+def test_header_projection_never_persists_raw_values() -> None:
+    """header 投影只能保留存在性与受限 media-type 语义。"""
 
     redacted = diag._redact_headers(
         {
@@ -272,13 +617,16 @@ def test_header_redaction_masks_sensitive_header_values() -> None:
         }
     )
 
-    assert redacted["Authorization"] == "<redacted>"
-    assert redacted["Cookie"] == "<redacted>"
-    assert redacted["X-Api-Key"] == "<redacted>"
-    assert redacted["X-Access-Token"] == "<redacted>"
-    assert redacted["Client-Secret"] == "<redacted>"
-    assert redacted["User-Agent"] == "diagnostic-agent"
-    assert redacted["Cache-Control"] == "no-cache"
+    assert redacted["sensitive_names"] == [
+        "authorization",
+        "client-secret",
+        "cookie",
+        "x-access-token",
+        "x-api-key",
+    ]
+    assert redacted["present_names"] == ["cache-control"]
+    assert "secret-token" not in json.dumps(redacted)
+    assert "diagnostic-agent" not in json.dumps(redacted)
 
 
 def test_requests_profile_records_raw_response_byte_length(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -309,7 +657,7 @@ def test_requests_profile_records_raw_response_byte_length(monkeypatch: pytest.M
         assert method == "GET"
         assert url == "http://127.0.0.1:43117/fixture.pdf"
         assert timeout == 1.0
-        assert stream is False
+        assert stream is True
         return (
             web_http_session.AuthorizedResponseLease(
                 response=response,
@@ -324,17 +672,22 @@ def test_requests_profile_records_raw_response_byte_length(monkeypatch: pytest.M
         "_request_with_safe_redirects",
         fake_request_with_safe_redirects,
     )
+    monkeypatch.setattr(
+        diag._web_fetch_orchestrator,
+        "_materialize_response_body",
+        lambda response_value, *, resource_budget: None,
+    )
 
     profile = diag._build_requests_profile(
         "http://127.0.0.1:43117/fixture.pdf",
         timeout_seconds=1.0,
         egress_policy=WebEgressPolicy(allow_private_network=True),
     )
-    result = _object_value(profile["result"])
-
-    assert result["content_type"] == "application/pdf"
-    assert result["content_length"] == len(b"%PDF fixture bytes")
-    assert result["text_length"] == len("%PDF fixture bytes")
+    response_headers = _object_value(profile["response_headers"])
+    assert profile["outcome"] == "completed"
+    assert response_headers["content_type"] == "application/pdf"
+    assert profile["content_length"] == len(b"%PDF fixture bytes")
+    assert str(profile["content_digest"]).startswith("sha256:")
 
 
 def test_requests_profile_closes_session_on_request_exception(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -354,7 +707,8 @@ def test_requests_profile_closes_session_on_request_exception(monkeypatch: pytes
         egress_policy=WebEgressPolicy(resolver=_resolve_example_public_address),
     )
 
-    assert profile["status"] == "request_exception"
+    assert profile["outcome"] == "failed"
+    assert profile["error_code"] == "request_exception"
     assert len(_SessionCloseSpy.instances) == 1
     assert _SessionCloseSpy.instances[0].close_count == 1
 
@@ -369,7 +723,8 @@ def test_diagnostic_requests_egress_rejection_uses_shared_policy() -> None:
     )
 
     assert profile["sampled"] is False
-    assert profile["status"] == "blocked_by_web_egress_policy"
+    assert profile["outcome"] == "failed"
+    assert profile["error_code"] == "blocked_by_web_egress_policy"
 
 
 def test_diagnostic_playwright_public_egress_is_typed_unavailable() -> None:
@@ -382,8 +737,41 @@ def test_diagnostic_playwright_public_egress_is_typed_unavailable() -> None:
     )
 
     assert profile["sampled"] is False
-    assert profile["status"] == "browser_egress_policy_unavailable"
-    assert profile["reason"] == "browser_egress_policy_unavailable"
+    assert profile["outcome"] == "skipped"
+    assert profile["error_code"] == "browser_egress_policy_unavailable"
+
+
+def test_playwright_response_body_projection_uses_exact_bytes_and_budget() -> None:
+    """browser origin-content oracle 必须使用 exact bytes，并拒绝 declared/actual 超限。"""
+
+    budget = WebResourceBudget(decoded_body_bytes=4)
+    exact_response = _BodyResponse(
+        body=b"pdf!",
+        headers={"Content-Length": "4"},
+    )
+    declared_too_large = _BodyResponse(
+        body=b"ok",
+        headers={"Content-Length": "5"},
+    )
+    actual_too_large = _BodyResponse(
+        body=b"large",
+        headers={},
+    )
+
+    assert diag._read_bounded_playwright_response_body(
+        cast(diag._ResponseProtocol, exact_response),
+        resource_budget=budget,
+    ) == b"pdf!"
+    with pytest.raises(diag._DiagnosticBrowserBodyLimitExceeded):
+        diag._read_bounded_playwright_response_body(
+            cast(diag._ResponseProtocol, declared_too_large),
+            resource_budget=budget,
+        )
+    with pytest.raises(diag._DiagnosticBrowserBodyLimitExceeded):
+        diag._read_bounded_playwright_response_body(
+            cast(diag._ResponseProtocol, actual_too_large),
+            resource_budget=budget,
+        )
 
 
 def test_comparison_bucket_matrix() -> None:
@@ -425,7 +813,7 @@ def test_comparison_bucket_matrix() -> None:
                 playwright_ok=True,
                 challenge_detected=True,
             ),
-            "all_success",
+            "playwright_challenge_detected",
         ),
         (
             "playwright_challenge_detected",
@@ -563,8 +951,10 @@ def test_batch_rows_and_summary_counts(tmp_path: Path) -> None:
         "status": "child_process_error",
         "comparison_bucket": "child_process_error",
         "returncode": 7,
-        "stdout_prefix": "out",
-        "stderr_prefix": "err",
+        "stdout_length": 3,
+        "stdout_digest": "sha256:" + "0" * 64,
+        "stderr_length": 3,
+        "stderr_digest": "sha256:" + "1" * 64,
     }
     rows = [
         diag._build_batch_result_row(
@@ -592,25 +982,25 @@ def test_batch_rows_and_summary_counts(tmp_path: Path) -> None:
     assert summary["fetch_sampled_count"] == 1
     assert summary["fetch_ok_count"] == 1
     assert summary["challenge_detected_count"] == 1
-    assert summary["comparison_buckets"] == {"all_success": 1, "child_process_error": 1}
-    assert summary["observed_buckets"] == {"all_success": 1, "child_process_error": 1}
+    assert summary["comparison_buckets"] == {"playwright_challenge_detected": 1, "child_process_error": 1}
+    assert summary["observed_buckets"] == {"playwright_challenge_detected": 1, "child_process_error": 1}
     assert summary["child_returncodes"] == {"7": 1}
-    assert rows[0]["observed_bucket"] == "all_success"
+    assert rows[0]["observed_bucket"] == "playwright_challenge_detected"
     assert rows[0]["evidence_path"] == str(tmp_path / "a.json")
-    assert rows[0]["failure_url"] == ""
-    assert rows[0]["diagnostic_schema_version"] == "web-diagnostics-v1"
+    assert rows[0]["failure_safe_url"] == "https://example.com/a"
+    assert rows[0]["diagnostic_schema_version"] == "web-diagnostics-v2"
     assert rows[1]["observed_bucket"] == "child_process_error"
     assert rows[1]["observed_failing_path"] == "diagnostic_child_process"
     assert rows[1]["evidence_path"] is None
-    assert rows[1]["failure_url"] == "https://example.com/b"
+    assert rows[1]["failure_safe_url"] == "https://example.com/b"
     assert "重新运行单 URL 诊断子进程" in str(rows[1]["diagnostic_action_hint"])
-    assert summary["diagnostic_schema_version"] == "web-diagnostics-v1"
+    assert summary["diagnostic_schema_version"] == "web-diagnostics-v2"
     observed_items = summary["observed_items"]
     assert isinstance(observed_items, list)
     assert len(observed_items) == 2
     action_hints = summary["diagnostic_action_hints"]
     assert isinstance(action_hints, list)
-    assert len(action_hints) == 1
+    assert len(action_hints) == 2
 
 
 def test_current_fetch_adapter_completed_outcome_generates_ok_profile(
@@ -634,6 +1024,8 @@ def test_current_fetch_adapter_completed_outcome_generates_ok_profile(
                     "final_url": "https://example.com/final",
                     "fetch_backend": "requests",
                     "content": "abcdef",
+                    "response_content_length": 6,
+                    "response_content_digest": "sha256:" + "b" * 64,
                 },
                 meta=None,
             )
@@ -651,12 +1043,13 @@ def test_current_fetch_adapter_completed_outcome_generates_ok_profile(
 
     assert profile["sampled"] is True
     assert profile["ok"] is True
-    assert profile["status"] == "completed"
-    assert profile["title"] == "Report"
-    assert profile["final_url"] == "https://example.com/final"
-    assert profile["fetch_backend"] == "requests"
-    assert profile["content_prefix"] == "abcdef"
+    assert profile["outcome"] == "completed"
+    assert profile["safe_url"] == "https://example.com/final"
+    assert profile["backend"] == "requests"
     assert profile["content_length"] == 6
+    assert profile["content_digest"] == "sha256:" + "b" * 64
+    assert profile["projected_content_length"] == 6
+    assert "abcdef" not in json.dumps(profile)
 
 
 def test_docling_wrapper_records_invoked_true_and_restores_callable(
@@ -717,7 +1110,7 @@ def test_docling_wrapper_records_invoked_true_and_restores_callable(
     assert evidence["original_completed"] is True
     assert evidence["original_exception_type"] == ""
     assert evidence["docling_runtime_initialization_error"] is False
-    assert evidence["diagnostic_url"] == "https://example.com/report.pdf"
+    assert evidence["safe_url"] == "https://example.com/report.pdf"
     assert web_tools_module._docling_convert_to_markdown is fake_docling
 
 
@@ -812,7 +1205,7 @@ def test_pdf_fetch_success_without_docling_invocation_keeps_failure_evidence_for
     assert profile["ok"] is True
     assert profile["content_length"] == len("pdf markdown")
     assert evidence["invoked"] is False
-    assert evidence["diagnostic_url"] == "https://example.com/report.pdf"
+    assert evidence["safe_url"] == "https://example.com/report.pdf"
 
 
 def test_docling_runtime_initialization_exception_becomes_skip_observed_item(
@@ -871,7 +1264,8 @@ def test_docling_runtime_initialization_exception_becomes_skip_observed_item(
     )
     summary = diag._build_batch_summary(run_label="run", input_path=tmp_path / "urls.jsonl", rows=[row])
 
-    assert profile["status"] == "callable_exception"
+    assert profile["outcome"] == "failed"
+    assert profile["error_code"] == "callable_exception"
     assert evidence["invoked"] is True
     assert evidence["original_completed"] is False
     assert evidence["original_exception_type"] == "DoclingRuntimeInitializationError"
@@ -986,12 +1380,10 @@ def test_current_fetch_adapter_failed_outcome_generates_business_readable_profil
 
     assert profile["sampled"] is True
     assert profile["ok"] is False
-    assert profile["status"] == "failed"
+    assert profile["outcome"] == "failed"
     assert profile["error_code"] == "blocked_by_site_policy"
-    assert profile["message"] == "Target site blocked automated access."
-    assert profile["hint"] == "[change_source] Use another source."
+    assert profile["error_message"] == "Target site blocked automated access."
     assert profile["next_action"] == "change_source"
-    assert profile["http_status"] is None
     diagnostics = _object_field(profile, "diagnostics")
     assert diagnostics["diagnostic_source"] == "current_tool_failed_outcome"
     assert diagnostics["error_code"] == "blocked_by_site_policy"
@@ -1020,14 +1412,14 @@ def test_cli_single_mode_writes_deterministic_json(
 
     payload = _load_json_object(output_path)
     assert exit_code == 0
-    assert payload["schema_version"] == "web-diagnostics-v1"
-    assert payload["diagnostic_schema_version"] == "web-diagnostics-v1"
-    assert payload["diagnostic_schema_revision"] == 1
+    assert payload["schema_version"] == "web-diagnostics-v2"
+    assert payload["diagnostic_schema_version"] == "web-diagnostics-v2"
+    assert payload["diagnostic_schema_revision"] == 2
     assert payload["generated_at"] == "2026-06-09T00:00:00+00:00"
     assert payload["comparison_bucket"] == "all_success"
     evidence = _object_field(payload, "docling_conversion_invocation_evidence")
     assert evidence["invoked"] is False
-    assert evidence["diagnostic_url"] == "https://example.com"
+    assert evidence["safe_url"] == "https://example.com/"
 
 
 def test_cli_requires_exactly_one_url_mode(
@@ -1161,7 +1553,9 @@ def _options(
     storage_state_in: str = "",
     storage_state_out: str = "",
     storage_state_dir: str = "",
+    storage_state_ttl_seconds: int = 0,
     skip_playwright: bool = False,
+    skip_requests: bool = False,
     skip_tool_fetch: bool = False,
     max_network: int = 3,
     fetch_truncate_chars: int = 1000,
@@ -1185,7 +1579,9 @@ def _options(
         storage_state_in=storage_state_in,
         storage_state_out=storage_state_out,
         storage_state_dir=storage_state_dir,
+        storage_state_ttl_seconds=storage_state_ttl_seconds,
         skip_playwright=skip_playwright,
+        skip_requests=skip_requests,
         skip_tool_fetch=skip_tool_fetch,
         max_network=max_network,
         fetch_truncate_chars=fetch_truncate_chars,
@@ -1205,34 +1601,64 @@ def _payload(
 ) -> JsonObject:
     """构造 synthetic 单 URL 诊断 payload。"""
 
+    def profile(
+        *,
+        sampled: bool,
+        completed: bool,
+        backend: str,
+        safe_url: str,
+    ) -> JsonObject:
+        """构造 schema v2 path profile。"""
+
+        outcome = "completed" if completed else "failed" if sampled else "skipped"
+        result: JsonObject = {
+            "stage": backend,
+            "sampled": sampled,
+            "outcome": outcome,
+            "ok": completed,
+            "safe_url": safe_url,
+            "elapsed_seconds": 0.1,
+            "backend": backend,
+        }
+        if completed:
+            result.update(
+                {
+                    "content_length": 8,
+                    "content_digest": "sha256:" + "a" * 64,
+                    "http_status": 200,
+                }
+            )
+        elif sampled:
+            result["error_code"] = f"{backend}_failed"
+        return result
+
     payload: JsonObject = {
-        "requests_profile": {
-            "sampled": requests_sampled,
-            "result": {
-                "ok": requests_ok,
-                "status": "completed" if requests_ok else "request_exception",
-                "status_code": 200 if requests_ok else None,
-            },
-        },
-        "fetch_web_page_profile": {
-            "sampled": fetch_sampled,
-            "ok": fetch_ok,
-            "status": "completed" if fetch_ok else "failed",
-            "error_code": "" if fetch_ok else "fetch_failed",
-            "final_url": "https://example.com/fetch",
-        },
-        "playwright_profile": {
-            "sampled": playwright_sampled,
-            "ok": playwright_ok,
-            "status": "completed" if playwright_ok else "skipped",
-            "challenge_detected": challenge_detected,
-            "challenge_signals": ["challenge"] if challenge_detected else [],
-            "navigation": {
-                "response_status": 200 if playwright_ok else None,
-                "final_url": "https://example.com/browser",
-            },
-        },
+        "schema_version": "web-diagnostics-v2",
+        "diagnostic_schema_version": "web-diagnostics-v2",
+        "diagnostic_schema_revision": 2,
+        "safe_url": "https://example.com/",
+        "requests_profile": profile(
+            sampled=requests_sampled,
+            completed=requests_ok,
+            backend="requests",
+            safe_url="https://example.com/requests",
+        ),
+        "fetch_web_page_profile": profile(
+            sampled=fetch_sampled,
+            completed=fetch_ok,
+            backend="tool",
+            safe_url="https://example.com/fetch",
+        ),
+        "playwright_profile": profile(
+            sampled=playwright_sampled,
+            completed=playwright_ok,
+            backend="playwright",
+            safe_url="https://example.com/browser",
+        ),
     }
+    playwright_profile = cast(JsonObject, payload["playwright_profile"])
+    playwright_profile["challenge_decision"] = "confirmed" if challenge_detected else "none"
+    playwright_profile["challenge_signals"] = ["challenge"] if challenge_detected else []
     payload["comparison_bucket"] = diag._classify_diagnostic_bucket(payload)
     return payload
 
