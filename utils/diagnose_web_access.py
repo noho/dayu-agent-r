@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import ipaddress
 import json
 import re
 import subprocess
@@ -20,6 +19,7 @@ import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from types import TracebackType
 from typing import Final, Protocol, TypeAlias, cast, runtime_checkable
@@ -42,8 +42,10 @@ from dayu.runtime.tools_discovery import (
     ToolsDiscoveryProviderSpec,
 )
 from dayu.tools.web import web_tools as _web_tools_module
+from dayu.tools.web import web_fetch_orchestrator as _web_fetch_orchestrator
 from dayu.tools.web.provider import discover_tools
 from dayu.tools.web.web_challenge_detection import detect_bot_challenge
+from dayu.tools.web.web_egress_policy import WebEgressPolicy, WebEgressPolicyError
 
 JsonObject: TypeAlias = dict[str, JsonValue]
 _DoclingConvertCallable: TypeAlias = Callable[[bytes, str], tuple[str, str, str]]
@@ -619,6 +621,76 @@ class _BrowserContextProtocol(Protocol):
         ...
 
 
+class _RouteRequestProtocol(Protocol):
+    """Playwright route request 的最小协议。"""
+
+    @property
+    def url(self) -> str:
+        """返回 request URL。
+
+        Args:
+            无。
+
+        Returns:
+            request URL。
+
+        Raises:
+            无。
+        """
+
+        ...
+
+
+class _RouteProtocol(Protocol):
+    """Playwright route 的最小协议。"""
+
+    @property
+    def request(self) -> _RouteRequestProtocol:
+        """返回当前 request。
+
+        Args:
+            无。
+
+        Returns:
+            当前 request。
+
+        Raises:
+            无。
+        """
+
+        ...
+
+    def abort(self) -> None:
+        """中止 request。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            Exception: 浏览器拒绝中止时抛出。
+        """
+
+        ...
+
+    def continue_(self) -> None:
+        """继续 request。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            Exception: 浏览器拒绝继续时抛出。
+        """
+
+        ...
+
+
 class _PageProtocol(Protocol):
     """Playwright page 的最小协议。
 
@@ -644,6 +716,22 @@ class _PageProtocol(Protocol):
 
         Raises:
             Exception: Playwright 内部注册失败时抛出。
+        """
+
+        ...
+
+    def route(self, pattern: str, handler: Callable[[_RouteProtocol], None]) -> None:
+        """注册浏览器 request 路由。
+
+        Args:
+            pattern: Playwright URL pattern。
+            handler: request route handler。
+
+        Returns:
+            无。
+
+        Raises:
+            Exception: 路由注册失败时抛出。
         """
 
         ...
@@ -1097,61 +1185,6 @@ def _normalize_url_for_http(url: str) -> str:
     return raw
 
 
-def _is_private_or_local_host(host: str) -> bool:
-    """判断 host 是否指向内网或本地目标。
-
-    Args:
-        host: URL host。
-
-    Returns:
-        是内网或本地目标时返回 ``True``。
-
-    Raises:
-        无。
-    """
-
-    normalized = host.strip().lower().strip("[]")
-    if not normalized:
-        return True
-    if normalized in {"localhost", "0.0.0.0"} or normalized.endswith(".localhost") or normalized.endswith(".local"):
-        return True
-    try:
-        ip_address = ipaddress.ip_address(normalized)
-    except ValueError:
-        return False
-    return (
-        ip_address.is_private
-        or ip_address.is_loopback
-        or ip_address.is_link_local
-        or ip_address.is_reserved
-        or ip_address.is_multicast
-        or ip_address.is_unspecified
-    )
-
-
-def _validate_url_safety(url: str, *, allow_private_network_url: bool) -> str:
-    """校验诊断 URL 的基础网络安全边界。
-
-    Args:
-        url: 用户输入 URL。
-        allow_private_network_url: 是否允许内网或本地 URL。
-
-    Returns:
-        规范化 URL。
-
-    Raises:
-        ValueError: URL 非 http/https，或默认策略下指向内网/本地目标时抛出。
-    """
-
-    normalized_url = _normalize_url_for_http(url)
-    host = urlparse(normalized_url).hostname or ""
-    if not allow_private_network_url and _is_private_or_local_host(host):
-        raise ValueError(
-            "URL 被诊断脚本安全策略阻止；如需诊断内网或本地 URL，请显式传入 --allow-private-network-url。"
-        )
-    return normalized_url
-
-
 def _build_diagnostic_headers(url: str) -> Mapping[str, str]:
     """构造 raw requests 诊断路径使用的本地 headers。
 
@@ -1239,14 +1272,14 @@ def _build_requests_profile(
     url: str,
     *,
     timeout_seconds: float,
-    allow_private_network_url: bool,
+    egress_policy: WebEgressPolicy,
 ) -> JsonObject:
     """采集 raw requests 诊断路径证据。
 
     Args:
         url: 待诊断 URL。
         timeout_seconds: requests 超时秒数。
-        allow_private_network_url: 是否允许内网或本地 URL。
+        egress_policy: 当前 diagnostic 调用共享的 Web 出站策略。
 
     Returns:
         raw requests profile JSON 对象。
@@ -1257,12 +1290,12 @@ def _build_requests_profile(
 
     started_at = time.perf_counter()
     try:
-        normalized_url = _validate_url_safety(url, allow_private_network_url=allow_private_network_url)
+        normalized_url = _normalize_url_for_http(url)
     except ValueError as exc:
         return {
             "sampled": False,
             "ok": False,
-            "status": "blocked_by_diagnostic_url_policy",
+            "status": "blocked_by_web_egress_policy",
             "error": str(exc),
             "raw_requests_header_source": "diagnostic_local",
         }
@@ -1284,8 +1317,31 @@ def _build_requests_profile(
         "timeout_seconds": timeout_seconds,
     }
     try:
-        response = session.send(prepared, timeout=timeout_seconds, allow_redirects=True)
-    except requests.RequestException as exc:
+        lease, redirect_hops, _visited_urls = _web_fetch_orchestrator._request_with_safe_redirects(
+            session,
+            method="GET",
+            url=normalized_url,
+            timeout=timeout_seconds,
+            headers=dict(headers),
+            normalize_url_for_http=_normalize_url_for_http,
+            egress_policy=egress_policy,
+            stream=False,
+            cancellation_token=None,
+        )
+    except _web_fetch_orchestrator._FetchUrlSafetyError as exc:
+        profile["sampled"] = False
+        profile["status"] = "blocked_by_web_egress_policy"
+        profile["error"] = str(exc)
+        profile["result"] = {
+            "ok": False,
+            "status": "blocked_by_web_egress_policy",
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+            "elapsed_seconds": _round_elapsed(started_at),
+        }
+        session.close()
+        return profile
+    except (requests.RequestException, RuntimeError) as exc:
         profile["status"] = "request_exception"
         profile["error"] = str(exc)
         profile["result"] = {
@@ -1295,30 +1351,35 @@ def _build_requests_profile(
             "error_message": str(exc),
             "elapsed_seconds": _round_elapsed(started_at),
         }
+        session.close()
         return profile
+
+    try:
+        with lease:
+            response = lease.response
+            response_text = response.text
+            response_bytes = response.content
+            challenge = detect_bot_challenge(response=response, content_text=response_text)
+            profile["ok"] = True
+            profile["status"] = "completed"
+            profile["result"] = {
+                "ok": True,
+                "status": "completed",
+                "status_code": response.status_code,
+                "final_url": response.url,
+                "redirect_hops": redirect_hops,
+                "elapsed_seconds": _round_elapsed(started_at),
+                "response_headers": _redact_headers(cast(Mapping[str, str], response.headers)),
+                "content_type": response.headers.get("Content-Type", ""),
+                "content_length": len(response_bytes),
+                "text_prefix": _prefix_text(response_text, _TEXT_PREFIX_CHARS),
+                "text_length": len(response_text),
+                "challenge_detected": challenge.challenge_detected,
+                "challenge_signals": list(challenge.challenge_signals),
+            }
+            return profile
     finally:
         session.close()
-
-    response_text = response.text
-    response_bytes = response.content
-    challenge = detect_bot_challenge(response=response, content_text=response_text)
-    profile["ok"] = True
-    profile["status"] = "completed"
-    profile["result"] = {
-        "ok": True,
-        "status": "completed",
-        "status_code": response.status_code,
-        "final_url": response.url,
-        "elapsed_seconds": _round_elapsed(started_at),
-        "response_headers": _redact_headers(cast(Mapping[str, str], response.headers)),
-        "content_type": response.headers.get("Content-Type", ""),
-        "content_length": len(response_bytes),
-        "text_prefix": _prefix_text(response_text, _TEXT_PREFIX_CHARS),
-        "text_length": len(response_text),
-        "challenge_detected": challenge.challenge_detected,
-        "challenge_signals": list(challenge.challenge_signals),
-    }
-    return profile
 
 
 def _provider_config(options: CliOptions) -> JsonObject:
@@ -1857,12 +1918,42 @@ def _wait_for_manual_confirmation(prompt_text: str) -> None:
         print("[诊断] stdin 不可交互，跳过人工确认等待。")
 
 
-def _build_playwright_profile(url: str, options: CliOptions) -> JsonObject:
+def _route_diagnostic_browser_request(
+    route: _RouteProtocol,
+    *,
+    egress_policy: WebEgressPolicy,
+) -> None:
+    """按 local/dev policy 裁决 diagnostic browser subrequest。
+
+    Args:
+        route: 当前 Playwright route。
+        egress_policy: 当前 diagnostic 调用共享的 Web 出站策略。
+
+    Returns:
+        无。
+
+    Raises:
+        无。被拒绝 request 会直接 abort。
+    """
+
+    if egress_policy.is_url_allowed(route.request.url):
+        route.continue_()
+    else:
+        route.abort()
+
+
+def _build_playwright_profile(
+    url: str,
+    options: CliOptions,
+    *,
+    egress_policy: WebEgressPolicy,
+) -> JsonObject:
     """采集 Playwright 浏览器路径证据。
 
     Args:
         url: 待诊断 URL。
         options: CLI 选项。
+        egress_policy: 当前 diagnostic 调用共享的 Web 出站策略。
 
     Returns:
         Playwright profile JSON 对象。
@@ -1873,14 +1964,28 @@ def _build_playwright_profile(url: str, options: CliOptions) -> JsonObject:
 
     storage_state_in, storage_state_out = _resolve_storage_state_paths(options, url)
     started_at = time.perf_counter()
-    try:
-        normalized_url = _validate_url_safety(url, allow_private_network_url=options.allow_private_network_url)
-    except ValueError as exc:
+    if not egress_policy.allows_private_network:
         return {
             "sampled": False,
             "ok": False,
             "skipped": True,
-            "status": "blocked_by_diagnostic_url_policy",
+            "status": "browser_egress_policy_unavailable",
+            "reason": "browser_egress_policy_unavailable",
+            "storage_state_in": storage_state_in,
+            "storage_state_out": storage_state_out,
+        }
+    try:
+        target = egress_policy.authorize_http_target(
+            _normalize_url_for_http(url),
+            stage="diagnostic_playwright_input",
+        )
+        normalized_url = target.normalized_url
+    except (ValueError, WebEgressPolicyError) as exc:
+        return {
+            "sampled": False,
+            "ok": False,
+            "skipped": True,
+            "status": "blocked_by_web_egress_policy",
             "error": str(exc),
             "storage_state_in": storage_state_in,
             "storage_state_out": storage_state_out,
@@ -1920,6 +2025,10 @@ def _build_playwright_profile(url: str, options: CliOptions) -> JsonObject:
             browser = playwright.chromium.launch(**launch_options)
             context = browser.new_context(**context_options)
             page = context.new_page()
+            page.route(
+                "**/*",
+                partial(_route_diagnostic_browser_request, egress_policy=egress_policy),
+            )
             page.on(
                 "request",
                 lambda event: _append_bounded_network_event(network_events, event, max_network=options.max_network),
@@ -2168,6 +2277,9 @@ def _build_single_diagnostic_payload(options: CliOptions) -> JsonObject:
     if not options.url:
         raise ValueError("单 URL 模式必须提供 --url。")
 
+    egress_policy = WebEgressPolicy(
+        allow_private_network=options.allow_private_network_url,
+    )
     payload: JsonObject = {
         "schema_version": _SCHEMA_VERSION,
         "diagnostic_schema_version": _SCHEMA_VERSION,
@@ -2178,7 +2290,7 @@ def _build_single_diagnostic_payload(options: CliOptions) -> JsonObject:
     payload["requests_profile"] = _build_requests_profile(
         options.url,
         timeout_seconds=options.request_timeout,
-        allow_private_network_url=options.allow_private_network_url,
+        egress_policy=egress_policy,
     )
     payload["fetch_web_page_profile"] = (
         _skipped_profile("用户显式传入 --skip-tool-fetch。")
@@ -2192,7 +2304,11 @@ def _build_single_diagnostic_payload(options: CliOptions) -> JsonObject:
     payload["playwright_profile"] = (
         _skipped_profile("用户显式传入 --skip-playwright。")
         if options.skip_playwright
-        else _build_playwright_profile(options.url, options)
+        else _build_playwright_profile(
+            options.url,
+            options,
+            egress_policy=egress_policy,
+        )
     )
     payload["comparison_bucket"] = _classify_diagnostic_bucket(payload)
     return payload

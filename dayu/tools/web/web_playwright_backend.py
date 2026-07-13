@@ -19,7 +19,7 @@ from functools import partial
 from multiprocessing.process import BaseProcess
 from queue import Empty, Queue
 from threading import Lock, Thread
-from typing import NotRequired, Protocol, TypeAlias, TypedDict, cast
+from typing import Protocol, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse
 
 import requests
@@ -33,6 +33,7 @@ from dayu.runtime.interruptible_process import (
 )
 
 from .web_fetch_orchestrator import _FetchUrlSafetyError
+from .web_egress_policy import WebEgressPolicy, WebEgressPolicyError
 
 MODULE = "ENGINE.WEB_PLAYWRIGHT"
 _LOGGER = logging.getLogger(__name__)
@@ -184,7 +185,7 @@ class _WorkerKwargs(TypedDict):
     headers: Mapping[str, str] | None
     playwright_channel: str | None
     playwright_storage_state_path: str
-    is_url_allowed: NotRequired[Callable[[str], bool] | None]
+    egress_policy: WebEgressPolicy
 
 
 class _PlaywrightWorkerProtocol(Protocol):
@@ -198,7 +199,7 @@ class _PlaywrightWorkerProtocol(Protocol):
         headers: Mapping[str, str] | None = None,
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
-        is_url_allowed: Callable[[str], bool] | None = None,
+        egress_policy: WebEgressPolicy,
     ) -> WebPayload:
         """执行一次 Playwright 抓取。"""
         ...
@@ -885,13 +886,13 @@ def _get_playwright_browser(
 
 
 def _raise_if_playwright_url_blocked(
-    *, url: str, is_url_allowed: Callable[[str], bool] | None, reason: str
+    *, url: str, egress_policy: WebEgressPolicy, reason: str
 ) -> None:
     """在 Playwright 导航/request 边界复用 Web URL 安全谓词。
 
     Args:
         url: 待校验 URL。
-        is_url_allowed: Web fetch owner 提供的安全谓词。
+        egress_policy: 当前 Web 调用唯一的出站策略。
         reason: 诊断用阶段标识。
 
     Returns:
@@ -901,22 +902,22 @@ def _raise_if_playwright_url_blocked(
         _FetchUrlSafetyError: URL 被安全策略拒绝时抛出。
     """
 
-    if is_url_allowed is None:
-        return
-    if not is_url_allowed(url):
-        raise _FetchUrlSafetyError(url=url, reason=reason)
+    try:
+        egress_policy.authorize_http_target(url, stage=reason)
+    except WebEgressPolicyError as exc:
+        raise _FetchUrlSafetyError(url=exc.url, reason=reason) from exc
 
 
 def _route_handler_abort_resources(
     route: _RouteProtocol,
     *,
-    is_url_allowed: Callable[[str], bool] | None = None,
+    egress_policy: WebEgressPolicy,
 ) -> None:
     """中止图片、字体、媒体请求，并拒绝不安全的浏览器 request。
 
     Args:
         route: Playwright Route 对象。
-        is_url_allowed: URL 安全谓词。
+        egress_policy: 当前 local/dev 浏览器 profile 的统一出站策略。
 
     Returns:
         无。
@@ -928,7 +929,7 @@ def _route_handler_abort_resources(
     abort_resource_types = {"image", "font", "media"}
     if route.request.resource_type in abort_resource_types:
         route.abort()
-    elif is_url_allowed is not None and not is_url_allowed(route.request.url):
+    elif not egress_policy.is_url_allowed(route.request.url):
         route.abort()
     else:
         route.continue_()
@@ -990,7 +991,7 @@ def _maybe_warmup_playwright_page(
     deadline_monotonic: float,
     build_domain_home_url: Callable[[str], str],
     normalize_url_for_http: Callable[[str], str],
-    is_url_allowed: Callable[[str], bool] | None = None,
+    egress_policy: WebEgressPolicy,
     time_monotonic: Callable[[], float] = time.monotonic,
 ) -> None:
     """在浏览器回退前先做一次同域首页预热。
@@ -1001,7 +1002,7 @@ def _maybe_warmup_playwright_page(
         deadline_monotonic: 本次浏览器抓取总预算 deadline。
         build_domain_home_url: 同域首页构造函数。
         normalize_url_for_http: URL 规范化函数。
-        is_url_allowed: URL 安全谓词。
+        egress_policy: 当前 Web 调用唯一的出站策略。
         time_monotonic: 可注入的单调时钟函数。
 
     Returns:
@@ -1022,7 +1023,7 @@ def _maybe_warmup_playwright_page(
     try:
         _raise_if_playwright_url_blocked(
             url=home_url,
-            is_url_allowed=is_url_allowed,
+            egress_policy=egress_policy,
             reason="playwright_warmup",
         )
     except RuntimeError:
@@ -1040,7 +1041,7 @@ def _maybe_warmup_playwright_page(
         page.goto(home_url, wait_until="domcontentloaded", timeout=warmup_timeout_ms)
         _raise_if_playwright_url_blocked(
             url=page.url,
-            is_url_allowed=is_url_allowed,
+            egress_policy=egress_policy,
             reason="playwright_warmup_response",
         )
     except Exception:
@@ -1106,7 +1107,7 @@ def _playwright_sync_worker(
     sanitize_response_headers: Callable[[Mapping[str, str]], dict[str, str]],
     build_text_excerpt: Callable[[str], str],
     convert_html_to_markdown: _HtmlConverterProtocol,
-    is_url_allowed: Callable[[str], bool] | None = None,
+    egress_policy: WebEgressPolicy,
     time_monotonic: Callable[[], float] = time.monotonic,
 ) -> WebPayload:
     """在独立线程中执行完整的 Playwright 同步抓取流程。
@@ -1123,7 +1124,7 @@ def _playwright_sync_worker(
         sanitize_response_headers: 响应头裁剪函数。
         build_text_excerpt: 文本摘录构造函数。
         convert_html_to_markdown: HTML 四段式转换函数。
-        is_url_allowed: URL 安全谓词。
+        egress_policy: 当前 Web 调用唯一的出站策略。
         time_monotonic: 可注入的单调时钟函数。
 
     Returns:
@@ -1134,6 +1135,12 @@ def _playwright_sync_worker(
     """
 
     _ = headers
+    if not egress_policy.allows_private_network:
+        return {
+            "ok": False,
+            "availability": "unprocessable",
+            "reason": "browser_egress_policy_unavailable",
+        }
     try:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
     except ImportError as exc:
@@ -1178,13 +1185,13 @@ def _playwright_sync_worker(
             stealth_class().apply_stealth_sync(page)
         page.route(
             "**/*",
-            partial(_route_handler_abort_resources, is_url_allowed=is_url_allowed),
+            partial(_route_handler_abort_resources, egress_policy=egress_policy),
         )
 
         deadline_monotonic = time_monotonic() + max(float(timeout_seconds), 0.0)
         _raise_if_playwright_url_blocked(
             url=url,
-            is_url_allowed=is_url_allowed,
+            egress_policy=egress_policy,
             reason="playwright_goto",
         )
         _maybe_warmup_playwright_page(
@@ -1193,7 +1200,7 @@ def _playwright_sync_worker(
             deadline_monotonic=deadline_monotonic,
             build_domain_home_url=build_domain_home_url,
             normalize_url_for_http=normalize_url_for_http,
-            is_url_allowed=is_url_allowed,
+            egress_policy=egress_policy,
             time_monotonic=time_monotonic,
         )
         try:
@@ -1212,7 +1219,7 @@ def _playwright_sync_worker(
             raise RuntimeError("Playwright page.goto 未返回 response 对象。")
         _raise_if_playwright_url_blocked(
             url=page.url,
-            is_url_allowed=is_url_allowed,
+            egress_policy=egress_policy,
             reason="playwright_response",
         )
 
@@ -1235,7 +1242,7 @@ def _playwright_sync_worker(
         )
         _raise_if_playwright_url_blocked(
             url=page.url,
-            is_url_allowed=is_url_allowed,
+            egress_policy=egress_policy,
             reason="playwright_settled_page",
         )
         html = page.content()
@@ -1276,7 +1283,7 @@ def _fetch_and_convert_with_playwright(
     deadline_monotonic: float | None = None,
     playwright_channel: str | None = None,
     playwright_storage_state_path: str = "",
-    is_url_allowed: Callable[[str], bool] | None = None,
+    egress_policy: WebEgressPolicy,
     cancellation_token: CancellationToken | None = None,
     resolve_timeout_budget: _ResolveTimeoutBudgetProtocol,
     playwright_sync_worker: _PlaywrightWorkerProtocol,
@@ -1292,7 +1299,7 @@ def _fetch_and_convert_with_playwright(
         deadline_monotonic: 当前工具调用的单调时钟 deadline。
         playwright_channel: 浏览器回退使用的 Chromium channel。
         playwright_storage_state_path: 浏览器回退可选 storage state 文件路径。
-        is_url_allowed: URL 安全谓词。
+        egress_policy: 当前 Web 调用唯一的出站策略。
         resolve_timeout_budget: timeout 预算解析函数。
         playwright_sync_worker: 同步 worker 函数。
         detect_bot_challenge: challenge 检测函数。
@@ -1303,6 +1310,13 @@ def _fetch_and_convert_with_playwright(
     Raises:
         _FetchUrlSafetyError: Playwright 导航或最终页面 URL 被安全策略拒绝时抛出。
     """
+
+    if not egress_policy.allows_private_network:
+        return {
+            "ok": False,
+            "availability": "unprocessable",
+            "reason": "browser_egress_policy_unavailable",
+        }
 
     try:
         import playwright  # noqa: F401
@@ -1341,7 +1355,7 @@ def _fetch_and_convert_with_playwright(
                     "headers": headers,
                     "playwright_channel": playwright_channel,
                     "playwright_storage_state_path": playwright_storage_state_path,
-                    "is_url_allowed": is_url_allowed,
+                    "egress_policy": egress_policy,
                 },
                 total_timeout=total_timeout,
                 cancellation_token=cancellation_token,

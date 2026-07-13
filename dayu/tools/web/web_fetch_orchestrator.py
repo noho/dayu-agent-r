@@ -36,6 +36,12 @@ from .web_http_encoding import (
     _extract_content_encoding_tokens,
     _find_unsupported_content_encodings,
 )
+from .web_egress_policy import (
+    AuthorizedHttpTarget,
+    WebEgressPolicy,
+    WebEgressPolicyError,
+)
+from .web_http_session import AuthorizedResponseLease, _send_authorized_request
 
 _WARMUP_TIMEOUT_SECONDS = 6.0
 _RESPONSE_SNIPPET_MAX_CHARS = 500
@@ -253,27 +259,6 @@ def _raise_if_cancelled(cancellation_token: CancellationToken | None) -> None:
             raise RuntimeError(cancellation_token.cancel_reason() or "工具调用已取消")
 
 
-def _close_response_safely(response: requests.Response) -> None:
-    """尽力关闭响应对象，兼容测试桩。
-
-    Args:
-        response: 任意响应对象。
-
-    Returns:
-        无。
-
-    Raises:
-        无。
-    """
-
-    close = getattr(response, "close", None)
-    if callable(close):
-        try:
-            close()
-        except Exception:
-            return
-
-
 def _extract_response_snippet(response: requests.Response | None) -> str:
     """提取响应文本前缀用于诊断。
 
@@ -384,30 +369,58 @@ def _resolve_redirect_target(
         raise RuntimeError(f"HTTP redirect Location 无法解析: {location}") from exc
 
 
-def _raise_if_url_blocked(
+def _authorize_http_target(
+    egress_policy: WebEgressPolicy,
     *,
     url: str,
-    is_url_allowed: Callable[[str], bool] | None,
     reason: str,
-) -> None:
-    """在网络跳转边界复用 Web URL 安全谓词。
+) -> AuthorizedHttpTarget:
+    """把 policy 拒绝投影为 fetch 编排层的稳定异常。
 
     Args:
-        url: 待校验 URL。
-        is_url_allowed: Web fetch owner 提供的安全谓词；为空时表示调用方未启用该校验。
-        reason: 诊断用阶段标识。
+        egress_policy: 当前 Web 调用唯一的出站策略。
+        url: 待授权 URL。
+        reason: 当前网络阶段。
 
     Returns:
-        无。
+        当前 hop 的不可变授权目标。
 
     Raises:
-        RuntimeError: URL 被安全策略拒绝时抛出。
+        _FetchUrlSafetyError: policy 拒绝 URL 时抛出。
     """
 
-    if is_url_allowed is None:
-        return
-    if not is_url_allowed(url):
-        raise _FetchUrlSafetyError(url=url, reason=reason)
+    try:
+        return egress_policy.authorize_http_target(url, stage=reason)
+    except WebEgressPolicyError as exc:
+        raise _FetchUrlSafetyError(url=exc.url, reason=reason) from exc
+
+
+def _validate_response_target(
+    egress_policy: WebEgressPolicy,
+    *,
+    url: str,
+    target: AuthorizedHttpTarget,
+    reason: str,
+) -> str:
+    """验证 response URL 未离开已授权 origin。
+
+    Args:
+        egress_policy: 当前 Web 调用唯一的出站策略。
+        url: response 报告的 URL。
+        target: 发送该请求的已授权目标。
+        reason: 当前响应阶段。
+
+    Returns:
+        规范化后的 response URL。
+
+    Raises:
+        _FetchUrlSafetyError: response origin 被偷换时抛出。
+    """
+
+    try:
+        return egress_policy.validate_response_url(url, target=target, stage=reason)
+    except WebEgressPolicyError as exc:
+        raise _FetchUrlSafetyError(url=exc.url, reason=reason) from exc
 
 
 def _append_limited_body_chunk(
@@ -661,10 +674,10 @@ def _request_with_safe_redirects(
     timeout: float,
     headers: dict[str, str],
     normalize_url_for_http: Callable[[str], str],
-    is_url_allowed: Callable[[str], bool] | None,
+    egress_policy: WebEgressPolicy,
     stream: bool,
     cancellation_token: CancellationToken | None,
-) -> tuple[requests.Response, int, tuple[str, ...]]:
+) -> tuple[AuthorizedResponseLease, int, tuple[str, ...]]:
     """执行带逐跳安全校验的 HTTP 请求。
 
     Args:
@@ -674,53 +687,71 @@ def _request_with_safe_redirects(
         timeout: 请求超时。
         headers: 请求头。
         normalize_url_for_http: URL 规范化函数。
-        is_url_allowed: URL 安全谓词。
+        egress_policy: 当前 Web 调用唯一的出站策略。
         stream: 是否以 stream 模式读取响应。
         cancellation_token: 取消令牌。
 
     Returns:
-        ``(最终响应, HTTP redirect 跳数, 已访问 URL 记录)``。
+        ``(最终 response lease, HTTP redirect 跳数, 已访问 URL 记录)``。
 
     Raises:
         requests.TooManyRedirects: redirect 超过上限时抛出。
         RuntimeError: redirect 目标被安全策略拒绝时抛出。
     """
 
-    current_url = url
+    current_target = _authorize_http_target(egress_policy, url=url, reason="http_request")
+    current_url = current_target.normalized_url
     current_headers = dict(headers)
     redirect_hops = 0
-    visited_urls = [url]
+    visited_urls = [current_url]
     while True:
-        _raise_if_url_blocked(url=current_url, is_url_allowed=is_url_allowed, reason="http_request")
         _raise_if_cancelled(cancellation_token)
-        response = session.request(
-            method,
-            current_url,
+        lease = _send_authorized_request(
+            session,
+            target=current_target,
+            method=method,
             timeout=timeout,
             headers=current_headers,
-            allow_redirects=False,
             stream=stream,
         )
-        _raise_if_cancelled(cancellation_token)
-        response_url = str(getattr(response, "url", "") or current_url)
-        visited_urls.append(response_url)
-        _raise_if_url_blocked(url=response_url, is_url_allowed=is_url_allowed, reason="http_response")
-        if not _is_redirect_response(response):
-            return response, redirect_hops, tuple(dict.fromkeys(visited_urls))
-        if redirect_hops >= _MAX_HTTP_REDIRECT_HOPS:
-            raise requests.TooManyRedirects("HTTP redirect chain exceeded fetch limit", response=response)
-        next_url = _resolve_redirect_target(
-            response=response,
-            current_url=current_url,
-            normalize_url_for_http=normalize_url_for_http,
-        )
-        _raise_if_url_blocked(url=next_url, is_url_allowed=is_url_allowed, reason="http_redirect")
-        visited_urls.append(next_url)
-        current_headers = dict(headers)
-        current_headers["Referer"] = response_url
-        current_url = next_url
-        redirect_hops += 1
-        _close_response_safely(response)
+        transferred = False
+        try:
+            response = lease.response
+            _raise_if_cancelled(cancellation_token)
+            response_url = _validate_response_target(
+                egress_policy,
+                url=str(response.url or current_url),
+                target=current_target,
+                reason="http_response",
+            )
+            visited_urls.append(response_url)
+            if not _is_redirect_response(response):
+                transferred = True
+                return lease, redirect_hops, tuple(dict.fromkeys(visited_urls))
+            if redirect_hops >= _MAX_HTTP_REDIRECT_HOPS:
+                raise requests.TooManyRedirects(
+                    "HTTP redirect chain exceeded fetch limit",
+                    response=response,
+                )
+            next_url = _resolve_redirect_target(
+                response=response,
+                current_url=current_url,
+                normalize_url_for_http=normalize_url_for_http,
+            )
+            next_target = _authorize_http_target(
+                egress_policy,
+                url=next_url,
+                reason="http_redirect",
+            )
+            visited_urls.append(next_target.normalized_url)
+            current_headers = dict(headers)
+            current_headers["Referer"] = response_url
+            current_target = next_target
+            current_url = next_target.normalized_url
+            redirect_hops += 1
+        finally:
+            if not transferred:
+                lease.close()
 
 
 def _build_fetch_content_runtime_context(response: requests.Response) -> _FetchContentRuntimeContext:
@@ -895,7 +926,6 @@ def _resolve_meta_refresh_follow_target(
     visited_urls: Collection[str],
     meta_refresh_hops: int,
     normalize_url_for_http: Callable[[str], str],
-    is_url_allowed: Callable[[str], bool] | None,
 ) -> str | None:
     """判断当前 HTML 是否需要按 meta refresh 继续抓取。
 
@@ -905,7 +935,6 @@ def _resolve_meta_refresh_follow_target(
         visited_urls: 已访问 URL 集合，用于防环。
         meta_refresh_hops: 已发生的 meta refresh 跳数。
         normalize_url_for_http: URL 规范化函数。
-        is_url_allowed: URL 安全谓词。
 
     Returns:
         若需要继续抓取则返回下一跳 URL；否则返回 `None`。
@@ -945,19 +974,6 @@ def _resolve_meta_refresh_follow_target(
             original_error=RuntimeError("meta_refresh_requires_browser"),
             failure_reason="meta_refresh_requires_browser",
         )
-    try:
-        _raise_if_url_blocked(
-            url=directive.target_url,
-            is_url_allowed=is_url_allowed,
-            reason="meta_refresh",
-        )
-    except RuntimeError as exc:
-        raise _FetchContentConversionError(
-            "HTML 页面 meta refresh 跳转目标被 fetch safety policy 拒绝。",
-            response_context=_build_fetch_content_runtime_context(response),
-            original_error=exc,
-            failure_reason="blocked_by_safety_policy",
-        ) from exc
     return directive.target_url
 
 
@@ -1098,7 +1114,7 @@ def _warmup_domain(
     build_domain_home_url: Callable[[str], str],
     normalize_url_for_http: Callable[[str], str],
     is_timeout_like_exception: Callable[[BaseException], bool],
-    is_url_allowed: Callable[[str], bool] | None = None,
+    egress_policy: WebEgressPolicy,
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
     cancellation_token: CancellationToken | None = None,
@@ -1126,27 +1142,30 @@ def _warmup_domain(
     )
     try:
         _raise_if_cancelled(cancellation_token)
-        response, redirect_hops, _redirect_visited_urls = _request_with_safe_redirects(
+        lease, redirect_hops, _redirect_visited_urls = _request_with_safe_redirects(
             session,
             method="GET",
             url=warmup_url,
             timeout=warmup_timeout,
             headers=headers,
             normalize_url_for_http=normalize_url_for_http,
-            is_url_allowed=is_url_allowed,
+            egress_policy=egress_policy,
             stream=False,
             cancellation_token=cancellation_token,
         )
-        _raise_if_cancelled(cancellation_token)
+        with lease:
+            response = lease.response
+            _raise_if_cancelled(cancellation_token)
+            result: dict[str, str | bool | int | float | None] = {
+                "attempted": True,
+                "success": True,
+                "http_status": response.status_code,
+                "final_url": response.url,
+                "redirect_hops": redirect_hops,
+            }
         with _WARMED_HOSTS_LOCK:
             _get_session_warmed_hosts(session).add(host)
-        return {
-            "attempted": True,
-            "success": True,
-            "http_status": response.status_code,
-            "final_url": response.url,
-            "redirect_hops": redirect_hops,
-        }
+        return result
     except Exception as exc:
         _raise_if_cancelled(cancellation_token)
         return {
@@ -1167,7 +1186,7 @@ def _probe_content_type(
     resolve_timeout_budget: Callable[..., float],
     normalize_url_for_http: Callable[[str], str],
     is_timeout_like_exception: Callable[[BaseException], bool],
-    is_url_allowed: Callable[[str], bool] | None = None,
+    egress_policy: WebEgressPolicy,
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
     cancellation_token: CancellationToken | None = None,
@@ -1184,53 +1203,56 @@ def _probe_content_type(
     )
     try:
         _raise_if_cancelled(cancellation_token)
-        response, redirect_hops, _redirect_visited_urls = _request_with_safe_redirects(
+        lease, redirect_hops, _redirect_visited_urls = _request_with_safe_redirects(
             session,
             method="HEAD",
             url=url,
             timeout=timeout,
             headers=headers,
             normalize_url_for_http=normalize_url_for_http,
-            is_url_allowed=is_url_allowed,
+            egress_policy=egress_policy,
             stream=False,
             cancellation_token=cancellation_token,
         )
-        _raise_if_cancelled(cancellation_token)
-        content_type = str(response.headers.get("Content-Type", "")).lower()
-        return {
-            "method": "HEAD",
-            "content_type": content_type,
-            "http_status": response.status_code,
-            "final_url": response.url,
-            "redirect_hops": redirect_hops,
-            "ok": True,
-        }
+        with lease:
+            response = lease.response
+            _raise_if_cancelled(cancellation_token)
+            content_type = str(response.headers.get("Content-Type", "")).lower()
+            return {
+                "method": "HEAD",
+                "content_type": content_type,
+                "http_status": response.status_code,
+                "final_url": response.url,
+                "redirect_hops": redirect_hops,
+                "ok": True,
+            }
     except Exception as head_exc:
         try:
             _raise_if_cancelled(cancellation_token)
-            response, redirect_hops, _redirect_visited_urls = _request_with_safe_redirects(
+            lease, redirect_hops, _redirect_visited_urls = _request_with_safe_redirects(
                 session,
                 method="GET",
                 url=url,
                 timeout=timeout,
                 headers=headers,
                 normalize_url_for_http=normalize_url_for_http,
-                is_url_allowed=is_url_allowed,
+                egress_policy=egress_policy,
                 stream=True,
                 cancellation_token=cancellation_token,
             )
-            _raise_if_cancelled(cancellation_token)
-            content_type = str(response.headers.get("Content-Type", "")).lower()
-            response.close()
-            return {
-                "method": "GET",
-                "content_type": content_type,
-                "http_status": response.status_code,
-                "final_url": response.url,
-                "redirect_hops": redirect_hops,
-                "ok": True,
-                "head_error": type(head_exc).__name__,
-            }
+            with lease:
+                response = lease.response
+                _raise_if_cancelled(cancellation_token)
+                content_type = str(response.headers.get("Content-Type", "")).lower()
+                return {
+                    "method": "GET",
+                    "content_type": content_type,
+                    "http_status": response.status_code,
+                    "final_url": response.url,
+                    "redirect_hops": redirect_hops,
+                    "ok": True,
+                    "head_error": type(head_exc).__name__,
+                }
         except Exception as get_exc:
             _raise_if_cancelled(cancellation_token)
             return {
@@ -1341,12 +1363,12 @@ def _fetch_and_convert_content(
     get_web_session: Callable[[], requests.Session] | None = None,
     headers: dict[str, str] | None = None,
     build_fetch_headers: Callable[[str], dict[str, str]] | None = None,
-    is_url_allowed: Callable[[str], bool] | None = None,
+    egress_policy: WebEgressPolicy,
     content_type_probe: dict[str, str | bool | int | None] | None = None,
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
     cancellation_token: CancellationToken | None = None,
-) -> dict[str, str | int | bool | list[str] | dict[str, int] | requests.Response | dict[str, str]]:
+) -> dict[str, str | int | bool | list[str] | dict[str, int] | dict[str, str]]:
     """先下载页面内容，再按内容类型转换为低噪音 Markdown。
 
     Args:
@@ -1361,7 +1383,7 @@ def _fetch_and_convert_content(
         get_web_session: 默认 Session 提供器。
         headers: 可选请求头。
         build_fetch_headers: 默认请求头构造器。
-        is_url_allowed: URL 安全谓词。
+        egress_policy: 当前 Web 调用唯一的出站策略。
         content_type_probe: 可选内容类型探测结果。
         timeout_budget: Runner 注入的单次 tool call 总预算。
         deadline_monotonic: 当前工具调用的单调时钟 deadline。
@@ -1400,113 +1422,107 @@ def _fetch_and_convert_content(
             deadline_monotonic=deadline_monotonic,
         )
         _raise_if_cancelled(cancellation_token)
-        response, current_redirect_hops, redirect_visited_urls = _request_with_safe_redirects(
+        lease, current_redirect_hops, redirect_visited_urls = _request_with_safe_redirects(
             resolved_session,
             method="GET",
             url=current_url,
             timeout=timeout,
             headers=current_headers,
             normalize_url_for_http=normalize_url_for_http,
-            is_url_allowed=is_url_allowed,
+            egress_policy=egress_policy,
             stream=True,
             cancellation_token=cancellation_token,
         )
-        http_redirect_hops += current_redirect_hops
-        visited_urls.update(redirect_visited_urls)
-        response.raise_for_status()
-        _raise_if_cancelled(cancellation_token)
-        _materialize_response_body(response)
-        _raise_if_cancelled(cancellation_token)
-
-        probe = (
-            content_type_probe or {"ok": False, "content_type": ""}
-            if meta_refresh_hops == 0
-            else {"ok": False, "content_type": ""}
-        )
-        content_type = str(probe.get("content_type", "") or response.headers.get("Content-Type", "")).lower()
-        response_text = _decode_response_text(response)
-        if _should_route_response_to_html_pipeline(
-            url=getattr(response, "url", current_url),
-            content_type=content_type,
-            response_text=response_text,
-            response_content=response.content,
-        ):
-            html_text = _extract_html_response_text(response)
-            next_meta_refresh_url = _resolve_meta_refresh_follow_target(
-                response=response,
-                html_text=html_text,
-                visited_urls=visited_urls,
-                meta_refresh_hops=meta_refresh_hops,
-                normalize_url_for_http=normalize_url_for_http,
-                is_url_allowed=is_url_allowed,
-            )
-            if next_meta_refresh_url is not None:
-                _raise_if_cancelled(cancellation_token)
-                current_headers = dict(resolved_headers)
-                current_headers["Referer"] = build_referer(str(getattr(response, "url", current_url) or current_url))
-                current_url = next_meta_refresh_url
-                visited_urls.add(next_meta_refresh_url)
-                meta_refresh_hops += 1
-                _close_response_safely(response)
-                continue
-
-            raw_challenge = detect_bot_challenge(
-                response=response,
-                content_text=html_text,
-            )
-            if raw_challenge.challenge_detected:
-                raise _FetchContentConversionError(
-                    "HTML 原始响应疑似反爬挑战页或访问门禁。",
-                    response_context=_build_fetch_content_runtime_context(response),
-                    original_error=RuntimeError("raw_html_bot_challenge"),
-                )
-            try:
-                _raise_if_cancelled(cancellation_token)
-                pipeline_result = convert_html(
-                    html_text,
-                    url=getattr(response, "url", current_url),
-                )
-            except RuntimeError as exc:
-                raise _FetchContentConversionError(
-                    str(exc),
-                    response_context=_build_fetch_content_runtime_context(response),
-                    original_error=exc,
-                ) from exc
-            title = pipeline_result.title
-            markdown = pipeline_result.markdown
-            extraction_source = pipeline_result.extractor_source
-            renderer_source = pipeline_result.renderer_source
-            normalization_applied = pipeline_result.normalization_applied
-            quality_flags = list(pipeline_result.quality_flags)
-            content_stats = dict(pipeline_result.content_stats)
-        else:
+        with lease:
+            response = lease.response
+            http_redirect_hops += current_redirect_hops
+            visited_urls.update(redirect_visited_urls)
+            response.raise_for_status()
             _raise_if_cancelled(cancellation_token)
-            title, markdown, extraction_source = convert_non_html(
-                response.content,
-                _infer_docling_stream_name(
-                    url=getattr(response, "url", current_url),
-                    content_type=content_type,
-                ),
+            _materialize_response_body(response)
+            _raise_if_cancelled(cancellation_token)
+
+            probe = (
+                content_type_probe or {"ok": False, "content_type": ""}
+                if meta_refresh_hops == 0
+                else {"ok": False, "content_type": ""}
             )
-            renderer_source = "docling"
-            normalization_applied = False
-            quality_flags = []
-            content_stats = {
-                "text_length": len(markdown),
-                "markdown_length": len(markdown),
+            content_type = str(probe.get("content_type", "") or response.headers.get("Content-Type", "")).lower()
+            response_text = _decode_response_text(response)
+            response_url = str(response.url or current_url)
+            if _should_route_response_to_html_pipeline(
+                url=response_url,
+                content_type=content_type,
+                response_text=response_text,
+                response_content=response.content,
+            ):
+                html_text = _extract_html_response_text(response)
+                next_meta_refresh_url = _resolve_meta_refresh_follow_target(
+                    response=response,
+                    html_text=html_text,
+                    visited_urls=visited_urls,
+                    meta_refresh_hops=meta_refresh_hops,
+                    normalize_url_for_http=normalize_url_for_http,
+                )
+                if next_meta_refresh_url is not None:
+                    _raise_if_cancelled(cancellation_token)
+                    current_headers = dict(resolved_headers)
+                    current_headers["Referer"] = build_referer(response_url)
+                    current_url = next_meta_refresh_url
+                    visited_urls.add(next_meta_refresh_url)
+                    meta_refresh_hops += 1
+                    continue
+
+                raw_challenge = detect_bot_challenge(
+                    response=response,
+                    content_text=html_text,
+                )
+                if raw_challenge.challenge_detected:
+                    raise _FetchContentConversionError(
+                        "HTML 原始响应疑似反爬挑战页或访问门禁。",
+                        response_context=_build_fetch_content_runtime_context(response),
+                        original_error=RuntimeError("raw_html_bot_challenge"),
+                    )
+                try:
+                    _raise_if_cancelled(cancellation_token)
+                    pipeline_result = convert_html(html_text, url=response_url)
+                except RuntimeError as exc:
+                    raise _FetchContentConversionError(
+                        str(exc),
+                        response_context=_build_fetch_content_runtime_context(response),
+                        original_error=exc,
+                    ) from exc
+                title = pipeline_result.title
+                markdown = pipeline_result.markdown
+                extraction_source = pipeline_result.extractor_source
+                renderer_source = pipeline_result.renderer_source
+                normalization_applied = pipeline_result.normalization_applied
+                quality_flags = list(pipeline_result.quality_flags)
+                content_stats = dict(pipeline_result.content_stats)
+            else:
+                _raise_if_cancelled(cancellation_token)
+                title, markdown, extraction_source = convert_non_html(
+                    response.content,
+                    _infer_docling_stream_name(url=response_url, content_type=content_type),
+                )
+                renderer_source = "docling"
+                normalization_applied = False
+                quality_flags = []
+                content_stats = {
+                    "text_length": len(markdown),
+                    "markdown_length": len(markdown),
+                }
+            return {
+                "title": title,
+                "content": markdown,
+                "extraction_source": extraction_source,
+                "renderer_source": renderer_source,
+                "normalization_applied": normalization_applied,
+                "quality_flags": quality_flags,
+                "content_stats": content_stats,
+                "http_status": response.status_code,
+                "final_url": response_url,
+                "redirect_hops": http_redirect_hops + meta_refresh_hops,
+                "response_headers": dict(response.headers),
+                "response_excerpt": _extract_response_snippet(response),
             }
-        return {
-            "title": title,
-            "content": markdown,
-            "extraction_source": extraction_source,
-            "renderer_source": renderer_source,
-            "normalization_applied": normalization_applied,
-            "quality_flags": quality_flags,
-            "content_stats": content_stats,
-            "http_status": response.status_code,
-            "final_url": response.url,
-            "redirect_hops": http_redirect_hops + meta_refresh_hops,
-            "response": response,
-            "response_headers": dict(response.headers),
-            "response_excerpt": _extract_response_snippet(response),
-        }

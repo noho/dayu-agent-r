@@ -22,18 +22,15 @@ from __future__ import annotations
 
 import asyncio
 import json
-import ipaddress
 import logging
 import os
 import re
-import socket
 import ssl
 import time
 from collections.abc import Callable
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from functools import partial
 from typing import Final, NoReturn, Optional, TypeAlias, TypedDict, cast
 from urllib.parse import quote, urlparse
 
@@ -80,6 +77,7 @@ from .web_http_encoding import (
     _resolve_response_text_encoding,
     _resolve_supported_accept_encodings,
 )
+from .web_egress_policy import WebEgressPolicy
 from .web_http_session import (
     _compute_deadline_monotonic,
     _create_no_retry_session,
@@ -124,15 +122,6 @@ _LOGGER = logging.getLogger(__name__)
 SEC_USER_AGENT_ENV = "SEC_USER_AGENT"
 
 _ALLOWED_SCHEMES = {"http", "https"}
-_PRIVATE_HOST_PATTERNS = (
-    "localhost",
-    "127.",
-    "0.0.0.0",
-    "::1",
-)
-_FAKE_IP_NETWORKS = (
-    ipaddress.ip_network("198.18.0.0/15"),
-)
 
 _DEFAULT_BROWSER_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -210,7 +199,6 @@ class _FetchContentResult(TypedDict, total=False):
     http_status: int
     final_url: str
     redirect_hops: int
-    response: requests.Response
     response_headers: Mapping[str, str]
     response_excerpt: str
 
@@ -224,7 +212,7 @@ class _PlaywrightFallbackKwargs(TypedDict, total=False):
     deadline_monotonic: float | None
     playwright_channel: str | None
     playwright_storage_state_path: str
-    is_url_allowed: Callable[[str], bool]
+    egress_policy: WebEgressPolicy
     cancellation_token: CancellationToken
 
 
@@ -236,7 +224,7 @@ class _StageFetchKwargs(TypedDict, total=False):
     headers: dict[str, str]
     timeout_budget: float | None
     deadline_monotonic: float | None
-    is_url_allowed: Callable[[str], bool]
+    egress_policy: WebEgressPolicy
     cancellation_token: CancellationToken
 
 
@@ -249,7 +237,7 @@ class _FetchConvertKwargs(TypedDict, total=False):
     content_type_probe: ContentProbePayload
     timeout_budget: float | None
     deadline_monotonic: float | None
-    is_url_allowed: Callable[[str], bool]
+    egress_policy: WebEgressPolicy
     cancellation_token: CancellationToken
 
 
@@ -732,22 +720,25 @@ def _is_timeout_like_exception(error: BaseException) -> bool:
     return _is_timeout_like_request_exception(error)
 
 
-def _build_fetch_url_safety_predicate(
-    *, allow_private_network_url: bool
-) -> Callable[[str], bool]:
-    """构造 fetch 全网络阶段复用的 URL 安全谓词。
+def _is_search_result_url_allowed(
+    url: str,
+    *,
+    allow_private_network_url: bool = False,
+) -> bool:
+    """把 search result filtering 投影到统一 Web egress owner。
 
     Args:
-        allow_private_network_url: 是否允许访问私网 URL。
+        url: provider 返回的候选结果 URL。
+        allow_private_network_url: 是否使用显式 local/dev profile。
 
     Returns:
-        接收 URL 并返回是否允许访问的谓词。
+        统一 policy 可授权该 URL 时返回 ``True``。
 
     Raises:
         无。
     """
 
-    return partial(_is_safe_public_url, allow_private_network_url=allow_private_network_url)
+    return WebEgressPolicy(allow_private_network=allow_private_network_url).is_url_allowed(url)
 
 
 def _raise_fetch_cancelled() -> NoReturn:
@@ -885,7 +876,7 @@ def _try_playwright_fallback(
     deadline_monotonic: float | None,
     playwright_channel: str | None = None,
     playwright_storage_state_path: str = "",
-    is_url_allowed: Callable[[str], bool] | None = None,
+    egress_policy: WebEgressPolicy,
     cancellation_token: CancellationToken | None = None,
 ) -> WebPayload | None:
     """尝试使用 Playwright 浏览器回退抓取页面。
@@ -898,7 +889,7 @@ def _try_playwright_fallback(
         deadline_monotonic: 当前工具调用 deadline。
         playwright_channel: 浏览器回退使用的 Chromium channel。
         playwright_storage_state_path: 浏览器回退可选 storage state 文件路径。
-        is_url_allowed: URL 安全谓词。
+        egress_policy: 当前 Web 调用唯一的出站策略。
         cancellation_token: 当前工具调用取消令牌。
 
     Returns:
@@ -919,12 +910,21 @@ def _try_playwright_fallback(
             deadline_monotonic=deadline_monotonic,
             playwright_channel=playwright_channel,
             playwright_storage_state_path=playwright_storage_state_path,
-            is_url_allowed=is_url_allowed,
+            egress_policy=egress_policy,
             cancellation_token=cancellation_token,
         )
     except _web_playwright_backend.CancelledError:
         _raise_fetch_cancelled()
     if not pw_result.get("ok"):
+        if pw_result.get("reason") == "browser_egress_policy_unavailable":
+            _raise_fetch_failure(
+                url=url,
+                error_code="browser_egress_policy_unavailable",
+                message="This page requires a browser path that is unavailable under the current network policy.",
+                hint=build_hint(REASON_BLOCKED_BY_SITE_POLICY),
+                next_action=NEXT_ACTION_CHANGE_SOURCE,
+                internal_diagnostics={"fetch_backend": "playwright", "public_browser_direct": False},
+            )
         Log.debug(
             "Playwright 浏览器回退未成功: "
             f"availability={pw_result.get('availability')} "
@@ -1013,10 +1013,11 @@ def _normalize_url_for_http(url: str) -> str:
         auth_parts.append(quote(password, safe=""))
 
     host_ascii = hostname.encode("idna").decode("ascii")
+    host_for_netloc = f"[{host_ascii}]" if ":" in host_ascii else host_ascii
     auth_prefix = ""
     if auth_parts:
         auth_prefix = ":".join(auth_parts) + "@"
-    netloc = f"{auth_prefix}{host_ascii}"
+    netloc = f"{auth_prefix}{host_for_netloc}"
     if parsed.port is not None:
         netloc = f"{netloc}:{parsed.port}"
 
@@ -1059,7 +1060,7 @@ def _warmup_domain(
     headers: dict[str, str],
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
-    is_url_allowed: Callable[[str], bool] | None = None,
+    egress_policy: WebEgressPolicy,
     cancellation_token: CancellationToken | None = None,
 ) -> StagePayload:
     """对目标域做一次预热请求以建立 Cookie。"""
@@ -1073,7 +1074,7 @@ def _warmup_domain(
         build_domain_home_url=_build_domain_home_url,
         normalize_url_for_http=_normalize_url_for_http,
         is_timeout_like_exception=_is_timeout_like_exception,
-        is_url_allowed=is_url_allowed,
+        egress_policy=egress_policy,
         timeout_budget=timeout_budget,
         deadline_monotonic=deadline_monotonic,
         cancellation_token=cancellation_token,
@@ -1088,7 +1089,7 @@ def _probe_content_type(
     headers: dict[str, str],
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
-    is_url_allowed: Callable[[str], bool] | None = None,
+    egress_policy: WebEgressPolicy,
     cancellation_token: CancellationToken | None = None,
 ) -> ContentProbePayload:
     """探测目标资源类型（HEAD 优先，失败降级到 GET）。"""
@@ -1101,7 +1102,7 @@ def _probe_content_type(
         resolve_timeout_budget=_resolve_timeout_budget,
         normalize_url_for_http=_normalize_url_for_http,
         is_timeout_like_exception=_is_timeout_like_exception,
-        is_url_allowed=is_url_allowed,
+        egress_policy=egress_policy,
         timeout_budget=timeout_budget,
         deadline_monotonic=deadline_monotonic,
         cancellation_token=cancellation_token,
@@ -1559,7 +1560,7 @@ def _search_web_business(
         timeout_budget=timeout_budget,
         deadline_monotonic=_compute_deadline_monotonic(timeout_budget),
         allow_private_network_url=config.allow_private_network_url,
-        is_safe_public_url=_is_safe_public_url,
+        is_safe_public_url=_is_search_result_url_allowed,
         normalize_whitespace=_normalize_whitespace,
         resolve_timeout_budget=_resolve_timeout_budget,
         cancellation_token=cancellation_token,
@@ -1843,7 +1844,10 @@ def _fetch_web_page_business(
     playwright_storage_state_dir = config.playwright_storage_state_dir
     _raise_if_host_cancelled(cancellation_token)
 
-    if not _is_safe_public_url(url, allow_private_network_url=allow_private_network_url):
+    egress_policy = WebEgressPolicy(allow_private_network=allow_private_network_url)
+    try:
+        normalized_url = _normalize_url_for_http(url)
+    except ValueError:
         _raise_fetch_failure(
             url=url,
             error_code="permission_denied",
@@ -1855,11 +1859,7 @@ def _fetch_web_page_business(
                 "input_url": url,
             },
         )
-
-    normalized_url = _normalize_url_for_http(url)
-    is_url_allowed = _build_fetch_url_safety_predicate(
-        allow_private_network_url=allow_private_network_url,
-    )
+        raise AssertionError("unreachable fetch failure path")
     deadline_monotonic = _compute_deadline_monotonic(timeout_budget)
     playwright_storage_state_path = _resolve_playwright_storage_state_path(
         url=normalized_url,
@@ -1886,7 +1886,7 @@ def _fetch_web_page_business(
         "deadline_monotonic": deadline_monotonic,
         "playwright_channel": playwright_channel,
         "playwright_storage_state_path": playwright_storage_state_path,
-        "is_url_allowed": is_url_allowed,
+        "egress_policy": egress_policy,
     }
     if cancellation_token is not None:
         playwright_fallback_kwargs["cancellation_token"] = cancellation_token
@@ -1898,7 +1898,7 @@ def _fetch_web_page_business(
             "headers": headers,
             "timeout_budget": timeout_budget,
             "deadline_monotonic": deadline_monotonic,
-            "is_url_allowed": is_url_allowed,
+            "egress_policy": egress_policy,
         }
         if cancellation_token is not None:
             warmup_kwargs["cancellation_token"] = cancellation_token
@@ -1917,7 +1917,7 @@ def _fetch_web_page_business(
             "headers": headers,
             "timeout_budget": timeout_budget,
             "deadline_monotonic": deadline_monotonic,
-            "is_url_allowed": is_url_allowed,
+            "egress_policy": egress_policy,
         }
         if cancellation_token is not None:
             probe_kwargs["cancellation_token"] = cancellation_token
@@ -1937,7 +1937,7 @@ def _fetch_web_page_business(
             "content_type_probe": content_type_probe,
             "timeout_budget": timeout_budget,
             "deadline_monotonic": deadline_monotonic,
-            "is_url_allowed": is_url_allowed,
+            "egress_policy": egress_policy,
         }
         if cancellation_token is not None:
             fetch_kwargs["cancellation_token"] = cancellation_token
@@ -2221,7 +2221,9 @@ def _fetch_web_page_business(
         raise RuntimeError("网页抓取流程异常结束，未获得抓取结果")
 
     challenge = _detect_bot_challenge(
-        response=fetch_result.get("response"),
+        response=None,
+        response_headers=fetch_result.get("response_headers"),
+        http_status=fetch_result.get("http_status"),
         content_text=fetch_result.get("content", ""),
     )
     if challenge.challenge_detected:
@@ -2354,7 +2356,7 @@ def _fetch_and_convert_content(
     session: Optional[requests.Session] = None,
     headers: Mapping[str, str] | None = None,
     content_type_probe: ContentProbePayload | None = None,
-    is_url_allowed: Callable[[str], bool] | None = None,
+    egress_policy: WebEgressPolicy,
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
     cancellation_token: CancellationToken | None = None,
@@ -2375,7 +2377,7 @@ def _fetch_and_convert_content(
             get_web_session=_get_web_session,
             headers=dict(headers) if headers is not None else None,
             build_fetch_headers=_build_fetch_headers,
-            is_url_allowed=is_url_allowed,
+            egress_policy=egress_policy,
             content_type_probe=content_type_probe,
             timeout_budget=timeout_budget,
             deadline_monotonic=deadline_monotonic,
@@ -2482,13 +2484,18 @@ def _get_playwright_browser(
     )
 
 
-def _route_handler_abort_resources(route: _web_playwright_backend._RouteProtocol) -> None:
+def _route_handler_abort_resources(
+    route: _web_playwright_backend._RouteProtocol,
+    *,
+    egress_policy: WebEgressPolicy,
+) -> None:
     """Playwright 路由拦截器：中止图片/字体/媒体请求，放行其余资源。
 
     降低页面渲染流量，加快加载速度。
 
     Args:
         route: playwright.sync_api.Route 对象。
+        egress_policy: 当前 Web 调用唯一的出站策略。
 
     Returns:
         无。
@@ -2497,7 +2504,10 @@ def _route_handler_abort_resources(route: _web_playwright_backend._RouteProtocol
         无。
     """
 
-    _web_playwright_backend._route_handler_abort_resources(route)
+    _web_playwright_backend._route_handler_abort_resources(
+        route,
+        egress_policy=egress_policy,
+    )
 
 
 def _maybe_warmup_playwright_page(
@@ -2505,6 +2515,7 @@ def _maybe_warmup_playwright_page(
     page: _web_playwright_backend._PageProtocol,
     url: str,
     deadline_monotonic: float,
+    egress_policy: WebEgressPolicy,
 ) -> None:
     """在浏览器回退前先做一次同域首页预热。
 
@@ -2516,6 +2527,7 @@ def _maybe_warmup_playwright_page(
         page: Playwright Page。
         url: 目标 URL。
         deadline_monotonic: 本次浏览器抓取总预算 deadline。
+        egress_policy: 当前 Web 调用唯一的出站策略。
 
     Returns:
         无。
@@ -2530,6 +2542,7 @@ def _maybe_warmup_playwright_page(
         deadline_monotonic=deadline_monotonic,
         build_domain_home_url=_build_domain_home_url,
         normalize_url_for_http=_normalize_url_for_http,
+        egress_policy=egress_policy,
         time_monotonic=time.monotonic,
     )
 
@@ -2607,7 +2620,7 @@ def _playwright_sync_worker(
     headers: Mapping[str, str] | None = None,
     playwright_channel: str | None = None,
     playwright_storage_state_path: str = "",
-    is_url_allowed: Callable[[str], bool] | None = None,
+    egress_policy: WebEgressPolicy,
 ) -> WebPayload:
     """在独立线程中执行完整的 Playwright 同步抓取流程。
 
@@ -2622,7 +2635,7 @@ def _playwright_sync_worker(
         headers: 可选额外请求头（当前仍以浏览器默认导航画像为准，不直接覆写 Context headers）。
         playwright_channel: 浏览器回退使用的 Chromium channel。
         playwright_storage_state_path: 浏览器回退可选 storage state 文件路径。
-        is_url_allowed: URL 安全谓词。
+        egress_policy: 当前 Web 调用唯一的出站策略。
 
     Returns:
         成功时返回含 ``ok=True`` 的结果字典；失败时抛出异常由调用方处理。
@@ -2638,7 +2651,7 @@ def _playwright_sync_worker(
         playwright_channel=playwright_channel,
         playwright_storage_state_path=playwright_storage_state_path,
         get_playwright_browser=_get_playwright_browser,
-        is_url_allowed=is_url_allowed,
+        egress_policy=egress_policy,
         build_domain_home_url=_build_domain_home_url,
         normalize_url_for_http=_normalize_url_for_http,
         sanitize_response_headers=_sanitize_plain_response_headers,
@@ -2660,7 +2673,7 @@ def _fetch_and_convert_with_playwright(
     deadline_monotonic: float | None = None,
     playwright_channel: str | None = None,
     playwright_storage_state_path: str = "",
-    is_url_allowed: Callable[[str], bool] | None = None,
+    egress_policy: WebEgressPolicy,
     cancellation_token: CancellationToken | None = None,
 ) -> WebPayload:
     """使用 Playwright 执行浏览器抓取并转换为 Markdown。
@@ -2676,7 +2689,7 @@ def _fetch_and_convert_with_playwright(
         deadline_monotonic: 当前工具调用的单调时钟 deadline。
         playwright_channel: 浏览器回退使用的 Chromium channel。
         playwright_storage_state_path: 浏览器回退可选 storage state 文件路径。
-        is_url_allowed: URL 安全谓词。
+        egress_policy: 当前 Web 调用唯一的出站策略。
         cancellation_token: 当前工具调用的取消令牌。
 
     Returns:
@@ -2695,7 +2708,7 @@ def _fetch_and_convert_with_playwright(
         deadline_monotonic=deadline_monotonic,
         playwright_channel=playwright_channel,
         playwright_storage_state_path=playwright_storage_state_path,
-        is_url_allowed=is_url_allowed,
+        egress_policy=egress_policy,
         cancellation_token=cancellation_token,
         resolve_timeout_budget=_resolve_timeout_budget,
         playwright_sync_worker=_playwright_sync_worker,
@@ -2795,152 +2808,3 @@ def _normalize_whitespace(text: str) -> str:
 
     lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
     return "\n".join([line for line in lines if line])
-
-
-def _is_public_ip(ip_text: str) -> bool:
-    """判断 IP 是否属于可访问公网地址。
-
-    Args:
-        ip_text: 待判断 IP 字符串。
-
-    Returns:
-        公网地址返回 ``True``，内网/保留地址返回 ``False``。
-
-    Raises:
-        ValueError: 当 IP 文本非法时抛出。
-    """
-
-    ip_value = ipaddress.ip_address(ip_text)
-    return not (
-        ip_value.is_private
-        or ip_value.is_loopback
-        or ip_value.is_link_local
-        or ip_value.is_reserved
-        or ip_value.is_multicast
-        or ip_value.is_unspecified
-    )
-
-
-def _is_fake_ip(ip_text: str) -> bool:
-    """判断 IP 是否落在常见 fake-ip 保留网段。
-
-    Args:
-        ip_text: 待判断 IP 字符串。
-
-    Returns:
-        命中 fake-ip 网段返回 ``True``，否则返回 ``False``。
-
-    Raises:
-        ValueError: 当 IP 文本非法时抛出。
-    """
-
-    ip_value = ipaddress.ip_address(ip_text)
-    return any(ip_value in network for network in _FAKE_IP_NETWORKS)
-
-
-def _looks_like_public_hostname(hostname: str) -> bool:
-    """判断主机名是否形似公开互联网域名。
-
-    设计意图：
-    - fake-ip 场景下，公开域名会被本地 DNS 虚拟化到保留地址；
-    - 这里仅在主机名本身明显不是本地域名时，才允许用 fake-ip 结果放行；
-    - 避免把 ``localhost``、单标签主机名、``*.local`` 一类本地地址误判成公网地址。
-
-    Args:
-        hostname: 已归一化的小写主机名。
-
-    Returns:
-        形似公开域名返回 ``True``，否则返回 ``False``。
-
-    Raises:
-        无。
-    """
-
-    if not hostname or "." not in hostname:
-        return False
-    if hostname.endswith(".local") or hostname.endswith(".localhost") or hostname.endswith(".localdomain"):
-        return False
-    for pattern in _PRIVATE_HOST_PATTERNS:
-        if hostname == pattern or hostname.startswith(pattern):
-            return False
-    return True
-
-
-def _resolve_hostname_ips(hostname: str) -> set[str]:
-    """解析域名并返回去重后的 IP 集合。
-
-    Args:
-        hostname: 域名（不含 scheme/path）。
-
-    Returns:
-        解析到的 IP 字符串集合；解析失败返回空集合。
-
-    Raises:
-        无。
-    """
-
-    try:
-        infos = socket.getaddrinfo(
-            hostname,
-            None,
-            family=socket.AF_UNSPEC,
-            type=socket.SOCK_STREAM,
-            proto=socket.IPPROTO_TCP,
-        )
-    except OSError:
-        return set()
-
-    resolved: set[str] = set()
-    for item in infos:
-        sockaddr = item[4]
-        if not sockaddr:
-            continue
-        ip_text = str(sockaddr[0]).strip()
-        if ip_text:
-            resolved.add(ip_text)
-    return resolved
-
-
-def _is_safe_public_url(url: str, *, allow_private_network_url: bool = False) -> bool:
-    """校验 URL 是否为可访问目标地址。
-
-    Args:
-        url: 待校验链接。
-        allow_private_network_url: 是否允许访问内网/本地网络 URL。
-
-    Returns:
-        安全可访问返回 ``True``，否则返回 ``False``。
-
-    Raises:
-        无。
-    """
-
-    parsed = urlparse(url.strip())
-    if parsed.scheme.lower() not in _ALLOWED_SCHEMES:
-        return False
-    hostname = (parsed.hostname or "").strip().lower()
-    if not hostname:
-        return False
-
-    if allow_private_network_url:
-        return True
-
-    for pattern in _PRIVATE_HOST_PATTERNS:
-        if hostname == pattern or hostname.startswith(pattern):
-            return False
-
-    try:
-        return _is_public_ip(hostname)
-    except ValueError:
-        if hostname.endswith(".local") or hostname.endswith(".localhost") or hostname.endswith(".localdomain"):
-            return False
-        resolved_ips = _resolve_hostname_ips(hostname)
-        if not resolved_ips:
-            return False
-        if all(_is_public_ip(ip_text) for ip_text in resolved_ips):
-            return True
-        # fake-ip（例如 OpenClash）会把公开域名虚拟解析到 198.18.0.0/15。
-        # 这里仅对“看起来像公开域名”的主机名放行，字面量 IP 与本地域名仍严格拒绝。
-        if _looks_like_public_hostname(hostname) and all(_is_fake_ip(ip_text) for ip_text in resolved_ips):
-            return True
-        return False

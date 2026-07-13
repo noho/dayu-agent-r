@@ -6,13 +6,14 @@ import ast
 import json
 import subprocess
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import cast
 
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.tool_call import BatchToolExecutionContext, ToolCallRequest
 from dayu.contracts.tool_declaration import ToolCallable, ToolDefinition
 from dayu.contracts.tool_execution import AsyncDirectToolExecutionCapability
@@ -20,7 +21,9 @@ from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolFailedOutcome
 from dayu.contracts.tool_result import ToolResultFailure, ToolResultSuccess
 from dayu.contracts.tool_schema import ToolFunctionSchema, ToolParametersSchema, ToolSchema
 from dayu.documents.docling_runtime import DoclingRuntimeInitializationError
+from dayu.tools.web import web_http_session
 from dayu.tools.web import web_tools as web_tools_module
+from dayu.tools.web.web_egress_policy import WebEgressPolicy
 JsonObject = dict[str, JsonValue]
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -38,6 +41,81 @@ _FORBIDDEN_IMPORTS = (
     "dayu.web",
     "dayu.ui",
 )
+
+
+class _SessionCloseSpy(diag.requests.Session):
+    """记录 diagnostic requests profile 是否关闭局部 Session。"""
+
+    instances: list["_SessionCloseSpy"] = []
+
+    def __init__(self) -> None:
+        """初始化 close 计数。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        super().__init__()
+        self.close_count = 0
+        _SessionCloseSpy.instances.append(self)
+
+    def close(self) -> None:
+        """记录 close 调用并执行父类关闭。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            Exception: 父类关闭失败时透出。
+        """
+
+        self.close_count += 1
+        super().close()
+
+
+def _raise_diagnostic_request_exception(
+    session: diag.requests.Session,
+    *,
+    method: str,
+    url: str,
+    timeout: float,
+    headers: dict[str, str],
+    normalize_url_for_http: Callable[[str], str],
+    egress_policy: WebEgressPolicy,
+    stream: bool,
+    cancellation_token: CancellationToken | None,
+) -> tuple[web_http_session.AuthorizedResponseLease, int, tuple[str, ...]]:
+    """模拟 diagnostic requests 路径的请求异常。
+
+    Args:
+        session: 当前 diagnostic 局部 Session。
+        method: HTTP 方法。
+        url: 请求 URL。
+        timeout: 超时秒数。
+        headers: 请求头。
+        normalize_url_for_http: URL 规范化函数。
+        egress_policy: 当前 Web 出站策略。
+        stream: 是否流式读取。
+        cancellation_token: 取消令牌。
+
+    Returns:
+        不返回；始终抛出请求异常。
+
+    Raises:
+        requests.Timeout: 始终抛出，用于验证异常路径 cleanup。
+    """
+
+    del session, method, url, timeout, headers, normalize_url_for_http, egress_policy, stream, cancellation_token
+    raise diag.requests.Timeout("synthetic diagnostic timeout")
 
 
 def test_jsonl_and_txt_corpus_parsing_retains_metadata_and_deduplicates(tmp_path: Path) -> None:
@@ -126,6 +204,24 @@ def test_url_normalization_requires_http_url() -> None:
         diag._normalize_url_for_http("https:///missing-host")
 
 
+def _resolve_example_public_address(hostname: str, port: int) -> tuple[str, ...]:
+    """把测试域名固定解析到公开示例地址。
+
+    Args:
+        hostname: 待解析 hostname。
+        port: 目标端口。
+
+    Returns:
+        单一公开 IPv4 地址。
+
+    Raises:
+        无。
+    """
+
+    del hostname, port
+    return ("93.184.216.34",)
+
+
 def test_url_safety_rejects_private_and_local_hosts_by_default() -> None:
     """默认 URL 安全策略应阻止内网、本地与 IPv4-mapped IPv6 目标。"""
 
@@ -143,18 +239,22 @@ def test_url_safety_rejects_private_and_local_hosts_by_default() -> None:
         "http://[::ffff:10.0.0.1]/report",
     )
 
+    public_policy = WebEgressPolicy(resolver=_resolve_example_public_address)
     for url in blocked_urls:
-        with pytest.raises(ValueError, match="安全策略阻止"):
-            diag._validate_url_safety(url, allow_private_network_url=False)
+        with pytest.raises(ValueError, match="Web egress policy rejected"):
+            public_policy.authorize_http_target(url, stage="diagnostic_test")
 
-    assert diag._is_private_or_local_host("::ffff:10.0.0.1") is True
-    assert diag._validate_url_safety(
-        "http://[::ffff:10.0.0.1]/report",
-        allow_private_network_url=True,
-    ) == "http://[::ffff:10.0.0.1]/report"
-    assert diag._validate_url_safety("example.com/report", allow_private_network_url=False) == (
-        "https://example.com/report"
+    local_policy = WebEgressPolicy(allow_private_network=True)
+    with pytest.raises(ValueError, match="IPv4-mapped"):
+        local_policy.authorize_http_target(
+            "http://[::ffff:10.0.0.1]/report",
+            stage="diagnostic_test",
+        )
+    target = public_policy.authorize_http_target(
+        diag._normalize_url_for_http("example.com/report"),
+        stage="diagnostic_test",
     )
+    assert target.normalized_url == "https://example.com/report"
 
 
 def test_header_redaction_masks_sensitive_header_values() -> None:
@@ -184,57 +284,106 @@ def test_header_redaction_masks_sensitive_header_values() -> None:
 def test_requests_profile_records_raw_response_byte_length(monkeypatch: pytest.MonkeyPatch) -> None:
     """requests profile 应记录 response.content 的原始字节长度。"""
 
-    class FakeResponse:
-        """测试用 HTTP 响应。"""
+    response = diag.requests.Response()
+    response.status_code = 200
+    response.url = "http://127.0.0.1:43117/fixture.pdf"
+    response.headers.update({"Content-Type": "application/pdf"})
+    response._content = b"%PDF fixture bytes"
+    response.encoding = "utf-8"
 
-        def __init__(self) -> None:
-            """初始化测试响应。"""
+    def fake_request_with_safe_redirects(
+        session: diag.requests.Session,
+        *,
+        method: str,
+        url: str,
+        timeout: float,
+        headers: dict[str, str],
+        normalize_url_for_http: Callable[[str], str],
+        egress_policy: WebEgressPolicy,
+        stream: bool,
+        cancellation_token: CancellationToken | None,
+    ) -> tuple[web_http_session.AuthorizedResponseLease, int, tuple[str, ...]]:
+        """返回确定性 diagnostic response lease。"""
 
-            self.text = "decoded"
-            self.content = b"%PDF fixture bytes"
-            self.headers: Mapping[str, str] = {"Content-Type": "application/pdf"}
-            self.status_code = 200
-            self.url = "http://127.0.0.1:43117/fixture.pdf"
+        del session, headers, normalize_url_for_http, egress_policy, cancellation_token
+        assert method == "GET"
+        assert url == "http://127.0.0.1:43117/fixture.pdf"
+        assert timeout == 1.0
+        assert stream is False
+        return (
+            web_http_session.AuthorizedResponseLease(
+                response=response,
+                session=diag.requests.Session(),
+            ),
+            0,
+            (url,),
+        )
 
-    class FakeSession:
-        """测试用 requests session。"""
-
-        def prepare_request(self, request: diag.requests.Request) -> diag.requests.PreparedRequest:
-            """复用 requests 真实 prepare 逻辑。"""
-
-            return diag.requests.sessions.Session().prepare_request(request)
-
-        def send(
-            self,
-            prepared: diag.requests.PreparedRequest,
-            *,
-            timeout: float,
-            allow_redirects: bool,
-        ) -> FakeResponse:
-            """返回固定响应。"""
-
-            assert prepared.url == "http://127.0.0.1:43117/fixture.pdf"
-            assert timeout == 1.0
-            assert allow_redirects is True
-            return FakeResponse()
-
-        def close(self) -> None:
-            """关闭测试 session。"""
-
-            return
-
-    monkeypatch.setattr(diag.requests, "Session", FakeSession)
+    monkeypatch.setattr(
+        diag._web_fetch_orchestrator,
+        "_request_with_safe_redirects",
+        fake_request_with_safe_redirects,
+    )
 
     profile = diag._build_requests_profile(
         "http://127.0.0.1:43117/fixture.pdf",
         timeout_seconds=1.0,
-        allow_private_network_url=True,
+        egress_policy=WebEgressPolicy(allow_private_network=True),
     )
     result = _object_value(profile["result"])
 
     assert result["content_type"] == "application/pdf"
     assert result["content_length"] == len(b"%PDF fixture bytes")
-    assert result["text_length"] == len("decoded")
+    assert result["text_length"] == len("%PDF fixture bytes")
+
+
+def test_requests_profile_closes_session_on_request_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    """requests profile 请求异常路径必须关闭局部 Session。"""
+
+    _SessionCloseSpy.instances = []
+    monkeypatch.setattr(diag.requests, "Session", _SessionCloseSpy)
+    monkeypatch.setattr(
+        diag._web_fetch_orchestrator,
+        "_request_with_safe_redirects",
+        _raise_diagnostic_request_exception,
+    )
+
+    profile = diag._build_requests_profile(
+        "https://example.com/report",
+        timeout_seconds=1.0,
+        egress_policy=WebEgressPolicy(resolver=_resolve_example_public_address),
+    )
+
+    assert profile["status"] == "request_exception"
+    assert len(_SessionCloseSpy.instances) == 1
+    assert _SessionCloseSpy.instances[0].close_count == 1
+
+
+def test_diagnostic_requests_egress_rejection_uses_shared_policy() -> None:
+    """raw requests 诊断路径必须由共享 egress owner 在发送前拒绝私网。"""
+
+    profile = diag._build_requests_profile(
+        "http://127.0.0.1/internal",
+        timeout_seconds=1.0,
+        egress_policy=WebEgressPolicy(),
+    )
+
+    assert profile["sampled"] is False
+    assert profile["status"] == "blocked_by_web_egress_policy"
+
+
+def test_diagnostic_playwright_public_egress_is_typed_unavailable() -> None:
+    """diagnostic 公网 browser direct 不得绕过 production safe-profile gate。"""
+
+    profile = diag._build_playwright_profile(
+        "https://example.com/report",
+        _options(),
+        egress_policy=WebEgressPolicy(resolver=_resolve_example_public_address),
+    )
+
+    assert profile["sampled"] is False
+    assert profile["status"] == "browser_egress_policy_unavailable"
+    assert profile["reason"] == "browser_egress_policy_unavailable"
 
 
 def test_comparison_bucket_matrix() -> None:
@@ -1125,13 +1274,13 @@ def _fake_requests_profile(
     url: str,
     *,
     timeout_seconds: float,
-    allow_private_network_url: bool,
+    egress_policy: WebEgressPolicy,
 ) -> JsonObject:
     """返回确定性 requests profile。"""
 
     assert url == "https://example.com"
     assert timeout_seconds > 0
-    assert allow_private_network_url is False
+    assert egress_policy.allows_private_network is False
     return cast(JsonObject, _payload(
         requests_sampled=True,
         requests_ok=True,
@@ -1164,11 +1313,17 @@ def _object_value(value: JsonValue) -> JsonObject:
     return {str(key): item for key, item in value.items()}
 
 
-def _fake_playwright_profile(url: str, options: diag.CliOptions) -> JsonObject:
+def _fake_playwright_profile(
+    url: str,
+    options: diag.CliOptions,
+    *,
+    egress_policy: WebEgressPolicy,
+) -> JsonObject:
     """返回确定性 Playwright profile。"""
 
     assert url == "https://example.com"
     assert options.url == "https://example.com"
+    assert egress_policy.allows_private_network is False
     return cast(JsonObject, _payload(
         requests_sampled=False,
         requests_ok=False,

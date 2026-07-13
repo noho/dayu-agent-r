@@ -10,11 +10,13 @@ import os
 import pickle
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import threading
 import time
 from io import BytesIO
+from importlib.metadata import version as package_version
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -73,6 +75,8 @@ from dayu.tools.web import web_fetch_orchestrator
 from dayu.tools.web import web_tool_projection_text
 from dayu.tools.web import web_search_providers
 from dayu.tools.web import web_tools
+from dayu.tools.web import web_http_session
+from dayu.tools.web.web_egress_policy import AuthorizedHttpTarget, WebEgressPolicy
 
 _WEB_TOOL_NAMES = ("search_web", "fetch_web_page")
 _WEB_PACKAGE_ROOT = Path(__file__).resolve().parents[3] / "dayu" / "tools" / "web"
@@ -92,6 +96,55 @@ _P = ParamSpec("_P")
 _R = TypeVar("_R")
 _LIVE_BROWSER_CLEANUP_SMOKE_ENV = "DAYU_RUN_LIVE_BROWSER_CLEANUP_SMOKE"
 _PROCESS_DESCENDANT_WAIT_SECONDS = 3.0
+_PINNED_TEST_CERTIFICATE = """-----BEGIN CERTIFICATE-----
+MIIDJTCCAg2gAwIBAgIUGUkR/EMkG5dZOX3VCiJfSvuYJ6MwDQYJKoZIhvcNAQEL
+BQAwFjEUMBIGA1UEAwwLcGlubmVkLnRlc3QwHhcNMjYwNzEzMDQ0NzE0WhcNMzYw
+NzEwMDQ0NzE0WjAWMRQwEgYDVQQDDAtwaW5uZWQudGVzdDCCASIwDQYJKoZIhvcN
+AQEBBQADggEPADCCAQoCggEBANP1p1qJx6lJJjUicPqvPcfI0+Otn3/7ybGUjBwH
+YB7xU2SYNqD9Q+mu3KUjPJ4xBpyp32yBD5DCYPUjdvvOZlRi2s2sScAr2KmD3byD
+EKaBIKddK9xHtIws3fgXOe/9BT1GtyGe9/o8U3ESgs/KyFfhLCrvAudf7NZoENyi
+3rEmJfDyICdE+L9+RRUkKhYIyoSpRZV+oiFCQdOkAEjbp60avQ7euaL3VwHdWVYj
+3YB1ZaXobbUf4mjJ77AeHFRaV2/V4loIZA/SYSyonr3NxBdpSH2PunCJO71G87P2
+sfJokGMFwMFGtPj4kXC1GAajstpHNSuVdQ9OgeEUWTkMNvkCAwEAAaNrMGkwHQYD
+VR0OBBYEFDazPkZEMXXbPu3xuLjEOZhZiV26MB8GA1UdIwQYMBaAFDazPkZEMXXb
+Pu3xuLjEOZhZiV26MA8GA1UdEwEB/wQFMAMBAf8wFgYDVR0RBA8wDYILcGlubmVk
+LnRlc3QwDQYJKoZIhvcNAQELBQADggEBAEOi/Q5iVZJ123T1YwGU+CXqxeUJzk0f
+k7guyDSpkIHEmI/dHDhR22jp3e346THGvwttqBj48bpeCGKJJePRIWPu/FU+Cs4P
+FO7qZmQfVxhR1bza586fii6lIGRa29UZ5L1HbgA4p0DpLYew52sU9349gDm15rHj
+/2EWIcCrYCu7vZQB6v0E+a3NkcQ0XPAQKTypK6jrA42ltm2Z8bMKZxEEye1svybk
+RBYlLkSmWQEsiMBEvVOTfozMNj1VKmg7KoMLJfk7oGMnuQ7huL8ABetWeUwBh9hu
+tN9QmnqppWuQn5x1xotnUD1/1eZ+TSqcW9HVwVmBiy/4Duw3c6oXQqo=
+-----END CERTIFICATE-----
+"""
+_PINNED_TEST_PRIVATE_KEY = """-----BEGIN PRIVATE KEY-----
+MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDT9adaicepSSY1
+InD6rz3HyNPjrZ9/+8mxlIwcB2Ae8VNkmDag/UPprtylIzyeMQacqd9sgQ+QwmD1
+I3b7zmZUYtrNrEnAK9ipg928gxCmgSCnXSvcR7SMLN34Fznv/QU9Rrchnvf6PFNx
+EoLPyshX4Swq7wLnX+zWaBDcot6xJiXw8iAnRPi/fkUVJCoWCMqEqUWVfqIhQkHT
+pABI26etGr0O3rmi91cB3VlWI92AdWWl6G21H+Joye+wHhxUWldv1eJaCGQP0mEs
+qJ69zcQXaUh9j7pwiTu9RvOz9rHyaJBjBcDBRrT4+JFwtRgGo7LaRzUrlXUPToHh
+FFk5DDb5AgMBAAECggEAHEm0OJqbyYWIMl4y2toJckDkuoWg/FkzvV34ZwM6+lY1
+zX6dB9ZVOnpKW0W9INWlLsJjHZ2J4MV4YC8IAao1sPxyfDGKtDmF1HXTYYXSco5Y
+N83w/RiayXxxcVtUManAicGGzldjfAOSFUylparIGyZjmSVF63A7cQ/5dCDOfLC+
++NI4T4cHceq23Rg0CmBEKYejamI7/xkuLtMjEM/GACQtEzH1JjaJO8brRKH1ctUQ
+Y3TdeLH5LKTyzQt80gPWKWY6VowSYqLqhZPbJ3hCnz0W4wM29lq6mK4x63O3CAtA
+Dd0d0FJ0+6KkF6BLK1YuDxtmnxDtrvOpVpGHqv/kyQKBgQDwn5cC/eo+GxMSEerH
+9pzSaE+QdcmJsxVo9LVLw6gSRTiSwXw1iU0WEOaUNmuwmXr9Ja87DkSSBkxaHIYw
+peGWUe9R/5hED8MGFZ+Jh03af9mcbDHP7d6d+j2GOD9z5YHiUbsXZZfUFW3f4eDl
+SMfJ4tdBJH1zrJfnY1hKrk1jHQKBgQDhgSV10wQYFat+ph40BaB9syJ+UTnVSuLr
+ocuKthXO3PBl8PtryZg9gfUV8sU91ySx+s7/eTLrY50jQKqVXhwGhV6HqsEdJ7Ih
+QUJmLPXkfBJTGii/+xKrIDDojfJDdSJEucIWgOP6Vdy9/Uc7FFaX7WY286/jiO2m
+UtwOLN0gjQKBgQCpG8/65074JPkLKxJxRI3EhlDcuxtQLk8uu0SrIa/+Xy26XkcY
+LQ3DI0+Z/IFE1SkNvq1feNCSO+DvN7rLd9mKVr02SMbPlrA+l3XPJwt9M3tRpux/
+MLLTHiqdKOzXXAYjc8NkVx8Ui5bz0IDJQ5Q9+7HCc43DfRopIbXMjqGOtQKBgQDT
+yufT8Yw20qNvH7XeRiql5EjROpiGqv7VL/BrJvj0gK2IEP0SDxTdL+Fv68M0gYwF
+XPptFver/LLpGSMdhnXr6fcOlGErcMzsTs5+CFwpbB4JztfW94hhEKrev/J5SNoW
+kiCn4gY8Z8ga6HauFjv+FQmbMuRPX5tUSx5CcgB9QQKBgQCi/FBJqj99EMG09FrQ
+StLJFBZcadxx55QhafoeUmOt7AhqF55Xb73Y/Yj458ppYHiwZvxnhsMaXasxEsxm
+7wbb4JBEQ/t8lCvhPDSXPvfC691SkdkpTQd4+Zfd9gjYIJuWEr4nbsbl1fZRLAt6
+LOVZQZayV5kp1t5dtIfJp9oVHw==
+-----END PRIVATE KEY-----
+"""
 _FORBIDDEN_IMPORTS = (
     "dayu.engine.tool_registry",
     "dayu.engine.truncation_manager",
@@ -118,6 +171,59 @@ def _raw_response(
     """
 
     response = requests.Response()
+    response.status_code = status_code
+    response.url = url
+    response.headers.update(dict(headers or {}))
+    response.raw = HTTPResponse(
+        body=BytesIO(body),
+        headers=dict(headers or {}),
+        preload_content=False,
+    )
+    return response
+
+
+class _CloseCountingResponse(requests.Response):
+    """记录 response.close 调用次数的 owner 测试替身。"""
+
+    def __init__(self) -> None:
+        """初始化关闭计数。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__()
+        self.close_count = 0
+
+    def close(self) -> None:
+        """记录并执行真实 response close。
+
+        :returns: ``None``。
+        :raises Exception: 底层 close 失败时透出。
+        """
+
+        self.close_count += 1
+        super().close()
+
+
+def _counting_response(
+    *,
+    url: str,
+    status_code: int,
+    body: bytes,
+    headers: Mapping[str, str] | None = None,
+) -> _CloseCountingResponse:
+    """构造带 raw body 与 close count 的 response。
+
+    :param url: 响应 URL。
+    :param status_code: HTTP 状态码。
+    :param body: wire body。
+    :param headers: 可选响应头。
+    :returns: 关闭计数 response。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    response = _CloseCountingResponse()
     response.status_code = status_code
     response.url = url
     response.headers.update(dict(headers or {}))
@@ -166,15 +272,73 @@ class _QueuedSession:
             raise AssertionError(f"unexpected request: {method} {url}")
         return self._responses.pop(0)
 
+    def close(self) -> None:
+        """关闭测试 Session。
 
-def _safe_public_test_url(url: str) -> bool:
-    """使用生产谓词校验测试 URL。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
 
-    :param url: 待校验 URL。
-    :returns: 允许访问返回 ``True``。
+        return
+
+
+def _resolve_public_test_address(hostname: str, port: int) -> tuple[str, ...]:
+    """把测试 hostname 固定解析到公开地址。
+
+    :param hostname: 待解析 hostname。
+    :param port: 目标端口。
+    :returns: 单一公开测试地址。
+    :raises Exception: 不主动抛出异常。
     """
 
-    return web_tools._is_safe_public_url(url, allow_private_network_url=False)
+    del hostname, port
+    return ("93.184.216.34",)
+
+
+def _public_test_policy() -> WebEgressPolicy:
+    """构造不会访问真实 DNS 的公网 egress policy。
+
+    :returns: 将测试 hostname 固定解析到公开地址的 policy。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return WebEgressPolicy(resolver=_resolve_public_test_address)
+
+
+def _queued_send_authorized_request(
+    source_session: requests.Session,
+    *,
+    target: AuthorizedHttpTarget,
+    method: str,
+    timeout: float,
+    headers: Mapping[str, str],
+    stream: bool,
+) -> web_http_session.AuthorizedResponseLease:
+    """让编排测试替身显式消费 AuthorizedHttpTarget。
+
+    :param source_session: 按顺序返回 response 的测试 Session。
+    :param target: 当前 hop 的授权目标。
+    :param method: HTTP 方法。
+    :param timeout: 请求超时。
+    :param headers: 请求头。
+    :param stream: 是否流式读取。
+    :returns: response lease。
+    :raises AssertionError: Session 不是预期替身时抛出。
+    """
+
+    assert isinstance(source_session, _QueuedSession)
+    response = source_session.request(
+        method,
+        target.normalized_url,
+        timeout=timeout,
+        headers=headers,
+        stream=stream,
+        allow_redirects=False,
+    )
+    return web_http_session.AuthorizedResponseLease(
+        response=response,
+        session=cast(requests.Session, source_session),
+    )
 
 
 class _OpenCancellationToken:
@@ -327,6 +491,8 @@ class _SocketWebServer:
     _socket: socket.socket
     _thread: threading.Thread
     _stop_requested: threading.Event
+    _ssl_context: ssl.SSLContext | None
+    _received_requests: list[bytes]
 
     @classmethod
     def start(
@@ -335,12 +501,14 @@ class _SocketWebServer:
         response_body: bytes,
         delay_seconds: float = 0.0,
         max_connections: int = 8,
+        ssl_context: ssl.SSLContext | None = None,
     ) -> "_SocketWebServer":
         """启动本地 HTTP server。
 
         :param response_body: 响应正文。
         :param delay_seconds: 每个连接发送响应前等待的秒数。
         :param max_connections: 最多处理的连接数。
+        :param ssl_context: 可选 server-side TLS context。
         :returns: 已启动的 server。
         :raises OSError: socket 监听失败时抛出。
         """
@@ -358,6 +526,8 @@ class _SocketWebServer:
             _socket=server_socket,
             _thread=threading.Thread(),
             _stop_requested=stop_requested,
+            _ssl_context=ssl_context,
+            _received_requests=[],
         )
         server._thread = threading.Thread(
             target=server._serve,
@@ -377,6 +547,26 @@ class _SocketWebServer:
 
         host, port = self._socket.getsockname()
         return f"http://{host}:{port}/page"
+
+    @property
+    def port(self) -> int:
+        """返回本地 server 监听端口。
+
+        :returns: TCP 监听端口。
+        :raises OSError: socket 地址读取失败时抛出。
+        """
+
+        return int(self._socket.getsockname()[1])
+
+    @property
+    def received_requests(self) -> tuple[bytes, ...]:
+        """返回已收到的 HTTP request bytes 快照。
+
+        :returns: 按连接顺序记录的 request bytes。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return tuple(self._received_requests)
 
     def close(self) -> None:
         """停止 server 并释放 socket。
@@ -405,8 +595,17 @@ class _SocketWebServer:
             except OSError:
                 return
             handled += 1
-            with connection:
-                self._handle_connection(connection)
+            try:
+                accepted_connection = (
+                    self._ssl_context.wrap_socket(connection, server_side=True)
+                    if self._ssl_context is not None
+                    else connection
+                )
+            except ssl.SSLError:
+                connection.close()
+                continue
+            with accepted_connection:
+                self._handle_connection(accepted_connection)
 
     def _handle_connection(self, connection: socket.socket) -> None:
         """处理单个 HTTP 连接。
@@ -418,6 +617,7 @@ class _SocketWebServer:
 
         try:
             request = connection.recv(4096)
+            self._received_requests.append(request)
             if self.delay_seconds > 0:
                 time.sleep(self.delay_seconds)
             body = b"" if request.startswith(b"HEAD ") else self.response_body
@@ -444,7 +644,7 @@ class _SyntheticNestedPlaywrightWorker:
         headers: Mapping[str, str] | None = None,
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
-        is_url_allowed: Callable[[str], bool] | None = None,
+        egress_policy: WebEgressPolicy,
     ) -> web_playwright_backend.WebPayload:
         """启动长生命周期 nested child 后保持 worker 存活。
 
@@ -457,7 +657,7 @@ class _SyntheticNestedPlaywrightWorker:
         :raises RuntimeError: PID 文件路径为空时抛出。
         """
 
-        del url, timeout_seconds, headers, playwright_channel, is_url_allowed
+        del url, timeout_seconds, headers, playwright_channel, egress_policy
         if not playwright_storage_state_path:
             raise RuntimeError("synthetic nested child pid path is required")
         child = subprocess.Popen(
@@ -488,7 +688,7 @@ class _LiveBrowserLongRunningWorker:
         headers: Mapping[str, str] | None = None,
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
-        is_url_allowed: Callable[[str], bool] | None = None,
+        egress_policy: WebEgressPolicy,
     ) -> web_playwright_backend.WebPayload:
         """启动真实浏览器并保持 worker 存活。
 
@@ -501,7 +701,7 @@ class _LiveBrowserLongRunningWorker:
         :raises RuntimeError: ready marker 路径为空时抛出。
         """
 
-        del timeout_seconds, headers, playwright_channel, is_url_allowed
+        del timeout_seconds, headers, playwright_channel, egress_policy
         if not playwright_storage_state_path:
             raise RuntimeError("live browser ready marker path is required")
         from playwright.sync_api import sync_playwright
@@ -534,7 +734,7 @@ class _BlockedPlaywrightWorker:
         headers: Mapping[str, str] | None = None,
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
-        is_url_allowed: Callable[[str], bool] | None = None,
+        egress_policy: WebEgressPolicy,
     ) -> web_playwright_backend.WebPayload:
         """抛出 Web fetch owner 的 URL safety 异常。
 
@@ -543,12 +743,12 @@ class _BlockedPlaywrightWorker:
         :param headers: 可选请求头。
         :param playwright_channel: 可选浏览器 channel。
         :param playwright_storage_state_path: storage state 路径。
-        :param is_url_allowed: URL 安全谓词。
+        :param egress_policy: Web 出站策略。
         :returns: 不返回。
         :raises web_fetch_orchestrator._FetchUrlSafetyError: 始终抛出。
         """
 
-        del url, timeout_seconds, headers, playwright_channel, playwright_storage_state_path, is_url_allowed
+        del url, timeout_seconds, headers, playwright_channel, playwright_storage_state_path, egress_policy
         raise web_fetch_orchestrator._FetchUrlSafetyError(
             url=self.blocked_url,
             reason=self.blocked_stage,
@@ -565,6 +765,315 @@ def test_web_provider_discovers_search_and_fetch() -> None:
 
     assert tuple(definition.name for definition in result.tool_bundle.definitions) == _WEB_TOOL_NAMES
     assert result.provider_reports[0].tool_names == _WEB_TOOL_NAMES
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        "http://user@example.com/report",
+        "http://example.com:8080/report",
+        "http://127.0.0.1/report",
+        "http://169.254.169.254/latest/meta-data",
+        "http://198.18.0.1/report",
+        "http://[fe80::1]/report",
+        "http://[::ffff:10.0.0.1]/report",
+    ),
+)
+def test_egress_policy_rejects_unsafe_target_matrix(url: str) -> None:
+    """公网 profile 必须 fail closed 拒绝高风险 URL/地址矩阵。"""
+
+    with pytest.raises(ValueError, match="Web egress policy rejected"):
+        _public_test_policy().authorize_http_target(url, stage="test_matrix")
+
+
+def test_egress_policy_rejects_mixed_public_private_dns_answer() -> None:
+    """DNS 同时返回公网与私网地址时不得挑选性放行。"""
+
+    policy = WebEgressPolicy(
+        resolver=lambda hostname, port: ("93.184.216.34", "10.0.0.7"),
+    )
+
+    with pytest.raises(ValueError, match="resolved address is not allowed"):
+        policy.authorize_http_target("https://mixed.example/report", stage="test_mixed_dns")
+
+
+def test_egress_transport_dependency_versions_are_locked() -> None:
+    """target-bound 扩展点必须在 plan 锁定的 requests/urllib3 版本上运行。"""
+
+    assert package_version("requests") == "2.33.1"
+    assert package_version("urllib3") == "2.6.3"
+
+
+def test_egress_target_bound_http_preserves_host_and_numeric_destination() -> None:
+    """真实 adapter/pool/connection 必须只连接授权 IP 并保留 HTTP Host。"""
+
+    server = _SocketWebServer.start(response_body=b"pinned http", max_connections=2)
+    resolver_calls: list[tuple[str, int]] = []
+
+    def resolver(hostname: str, port: int) -> tuple[str, ...]:
+        """记录 owner DNS 调用并固定到 loopback fixture。"""
+
+        resolver_calls.append((hostname, port))
+        return ("127.0.0.1",)
+
+    policy = WebEgressPolicy(allow_private_network=True, resolver=resolver)
+    server_port = server.port
+    target = policy.authorize_http_target(
+        f"http://pinned.test:{server_port}/page",
+        stage="test_http",
+    )
+    source_session = web_http_session._create_no_retry_session()
+    try:
+        lease = web_http_session._send_authorized_request(
+            source_session,
+            target=target,
+            method="GET",
+            timeout=2.0,
+            headers={},
+            stream=False,
+        )
+        with lease:
+            assert lease.response.content == b"pinned http"
+    finally:
+        source_session.close()
+        server.close()
+
+    assert resolver_calls == [("pinned.test", server_port)]
+    assert len(server.received_requests) == 1
+    assert f"Host: pinned.test:{server_port}\r\n".encode("ascii") in server.received_requests[0]
+
+
+def test_egress_target_bound_https_preserves_sni_certificate_and_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HTTPS numeric connect 不得改变 TLS SNI、证书 hostname 或 HTTP Host。"""
+
+    certificate_path = tmp_path / "pinned-test-cert.pem"
+    private_key_path = tmp_path / "pinned-test-key.pem"
+    certificate_path.write_text(_PINNED_TEST_CERTIFICATE, encoding="ascii")
+    private_key_path.write_text(_PINNED_TEST_PRIVATE_KEY, encoding="ascii")
+    observed_server_names: list[str | None] = []
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(certfile=certificate_path, keyfile=private_key_path)
+
+    def record_server_name(
+        tls_socket: ssl.SSLSocket | ssl.SSLObject,
+        server_name: str | None,
+        context: ssl.SSLSocket,
+    ) -> None:
+        """记录 TLS client 发送的 SNI hostname。"""
+
+        del tls_socket, context
+        observed_server_names.append(server_name)
+
+    server_context.set_servername_callback(record_server_name)
+    server = _SocketWebServer.start(
+        response_body=b"pinned https",
+        max_connections=2,
+        ssl_context=server_context,
+    )
+    policy = WebEgressPolicy(
+        allow_private_network=True,
+        resolver=lambda hostname, port: ("127.0.0.1",),
+    )
+    server_port = server.port
+    target = policy.authorize_http_target(
+        f"https://pinned.test:{server_port}/page",
+        stage="test_https",
+    )
+    original_create_connection = web_http_session.urllib3_connection.create_connection
+    attempted_addresses: list[str] = []
+
+    def retrying_tls_create_connection(
+        address: tuple[str, int],
+        timeout: float | None = None,
+        source_address: tuple[str, int] | None = None,
+        socket_options: list[tuple[int, int, int | bytes]] | None = None,
+    ) -> socket.socket:
+        """第一次模拟 TLS 前 connect 失败，第二次执行真实 numeric connect。"""
+
+        attempted_addresses.append(address[0])
+        if len(attempted_addresses) == 1:
+            raise ConnectionResetError("synthetic HTTPS first connect reset")
+        return original_create_connection(
+            address,
+            timeout,
+            source_address=source_address,
+            socket_options=socket_options,
+        )
+
+    monkeypatch.setattr(
+        web_http_session.urllib3_connection,
+        "create_connection",
+        retrying_tls_create_connection,
+    )
+    source_session = web_http_session._create_retry_session()
+    source_session.verify = str(certificate_path)
+    try:
+        lease = web_http_session._send_authorized_request(
+            source_session,
+            target=target,
+            method="GET",
+            timeout=2.0,
+            headers={},
+            stream=False,
+        )
+        with lease:
+            assert lease.response.content == b"pinned https"
+    finally:
+        source_session.close()
+        server.close()
+
+    assert observed_server_names == ["pinned.test"]
+    assert attempted_addresses == ["127.0.0.1", "127.0.0.1"]
+    assert len(server.received_requests) == 1
+    assert f"Host: pinned.test:{server_port}\r\n".encode("ascii") in server.received_requests[0]
+
+
+def test_egress_pinned_retry_uses_same_approved_addresses(monkeypatch: pytest.MonkeyPatch) -> None:
+    """connect retry 只能重建到同一 immutable approved address set。"""
+
+    server = _SocketWebServer.start(response_body=b"retry ok", max_connections=2)
+    policy = WebEgressPolicy(
+        allow_private_network=True,
+        resolver=lambda hostname, port: ("127.0.0.1",),
+    )
+    target = policy.authorize_http_target(
+        f"http://pinned.test:{server.port}/retry",
+        stage="test_retry",
+    )
+    original_create_connection = web_http_session.urllib3_connection.create_connection
+    attempted_addresses: list[str] = []
+
+    def flaky_create_connection(
+        address: tuple[str, int],
+        timeout: float | None = None,
+        source_address: tuple[str, int] | None = None,
+        socket_options: list[tuple[int, int, int | bytes]] | None = None,
+    ) -> socket.socket:
+        """第一次模拟 RST，后续使用真实 numeric connect。"""
+
+        attempted_addresses.append(address[0])
+        if len(attempted_addresses) == 1:
+            raise ConnectionResetError("synthetic first connect reset")
+        return original_create_connection(
+            address,
+            timeout,
+            source_address=source_address,
+            socket_options=socket_options,
+        )
+
+    monkeypatch.setattr(
+        web_http_session.urllib3_connection,
+        "create_connection",
+        flaky_create_connection,
+    )
+    source_session = web_http_session._create_retry_session()
+    try:
+        lease = web_http_session._send_authorized_request(
+            source_session,
+            target=target,
+            method="GET",
+            timeout=2.0,
+            headers={},
+            stream=False,
+        )
+        with lease:
+            assert lease.response.content == b"retry ok"
+    finally:
+        source_session.close()
+        server.close()
+
+    assert attempted_addresses == ["127.0.0.1", "127.0.0.1"]
+
+
+def test_egress_pinned_retry_exhaustion_has_no_fallback_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """approved address 全失败时 retry 耗尽，不得重新解析或连接 hostname。"""
+
+    resolver_calls: list[tuple[str, int]] = []
+
+    def resolver(hostname: str, port: int) -> tuple[str, ...]:
+        """记录唯一一次 owner DNS 解析。"""
+
+        resolver_calls.append((hostname, port))
+        return ("127.0.0.1",)
+
+    target = WebEgressPolicy(allow_private_network=True, resolver=resolver).authorize_http_target(
+        "http://pinned.test:43119/fail",
+        stage="test_retry_exhaustion",
+    )
+    attempted_addresses: list[str] = []
+
+    def failed_create_connection(
+        address: tuple[str, int],
+        timeout: float | None = None,
+        source_address: tuple[str, int] | None = None,
+        socket_options: list[tuple[int, int, int | bytes]] | None = None,
+    ) -> socket.socket:
+        """记录目标并始终模拟 connection refused。"""
+
+        del timeout, source_address, socket_options
+        attempted_addresses.append(address[0])
+        raise ConnectionRefusedError("synthetic approved address failure")
+
+    monkeypatch.setattr(
+        web_http_session.urllib3_connection,
+        "create_connection",
+        failed_create_connection,
+    )
+    source_session = web_http_session._create_retry_session()
+    try:
+        with pytest.raises(requests.ConnectionError):
+            web_http_session._send_authorized_request(
+                source_session,
+                target=target,
+                method="GET",
+                timeout=1.0,
+                headers={},
+                stream=False,
+            )
+    finally:
+        source_session.close()
+
+    assert resolver_calls == [("pinned.test", 43119)]
+    assert attempted_addresses == ["127.0.0.1"] * 4
+
+
+def test_egress_peer_mismatch_closes_socket_before_http_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """peer 不属于 approved set 时 socket 必须在交给 HTTP 层前关闭。"""
+
+    class FakeSocket:
+        """只暴露 peer 与 close 的 socket 替身。"""
+
+        def __init__(self) -> None:
+            """初始化未关闭状态。"""
+
+            self.closed = False
+
+        def getpeername(self) -> tuple[str, int]:
+            """返回未授权 peer。"""
+
+            return ("127.0.0.2", 80)
+
+        def close(self) -> None:
+            """记录 socket 已关闭。"""
+
+            self.closed = True
+
+    fake_socket = FakeSocket()
+    monkeypatch.setattr(
+        web_http_session.urllib3_connection,
+        "create_connection",
+        lambda address, timeout, source_address, socket_options: cast(socket.socket, fake_socket),
+    )
+    connection = web_http_session._PinnedHTTPConnection("pinned.test", 80)
+    connection.bind_approved_addresses(("127.0.0.1",))
+
+    with pytest.raises(Exception, match="peer mismatch"):
+        connection._new_conn()
+
+    assert fake_socket.closed is True
 
 
 def test_web_tool_display_and_description_stay_at_declaration_boundary() -> None:
@@ -1584,20 +2093,20 @@ def test_fetch_private_url_can_be_allowed_with_explicit_config(
     assert "ok" not in value
 
 
-def test_fetch_redirect_to_private_url_fails_closed() -> None:
+def test_fetch_redirect_to_private_url_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     """HTTP redirect 每一跳都必须复用 private-network safety owner。"""
 
+    response = _counting_response(
+        url="https://example.com/report",
+        status_code=302,
+        body=b"",
+        headers={"Location": "http://127.0.0.1/internal"},
+    )
     session = _QueuedSession(
-        [
-            _raw_response(
-                url="https://example.com/report",
-                status_code=302,
-                body=b"",
-                headers={"Location": "http://127.0.0.1/internal"},
-            )
-        ]
+        [response]
     )
 
+    monkeypatch.setattr(web_fetch_orchestrator, "_send_authorized_request", _queued_send_authorized_request)
     with pytest.raises(web_fetch_orchestrator._FetchUrlSafetyError) as exc_info:
         web_fetch_orchestrator._fetch_and_convert_content(
             "https://example.com/report",
@@ -1609,14 +2118,197 @@ def test_fetch_redirect_to_private_url_fails_closed() -> None:
             convert_non_html=lambda raw_bytes, stream_name: ("", "", ""),
             session=cast(requests.Session, session),
             headers={},
-            is_url_allowed=_safe_public_test_url,
+            egress_policy=_public_test_policy(),
         )
 
     assert exc_info.value.url == "http://127.0.0.1/internal"
     assert session.calls == [("GET", "https://example.com/report", True)]
+    assert response.close_count == 1
 
 
-def test_fetch_meta_refresh_to_private_url_fails_closed() -> None:
+def test_response_lease_transfers_final_response_and_closes_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """最终 response 在 transfer 前保持打开，由 caller 幂等关闭一次。"""
+
+    response = _counting_response(
+        url="https://example.com/report",
+        status_code=200,
+        body=b"ok",
+    )
+    session = _QueuedSession([response])
+    monkeypatch.setattr(web_fetch_orchestrator, "_send_authorized_request", _queued_send_authorized_request)
+
+    lease, redirect_hops, _visited_urls = web_fetch_orchestrator._request_with_safe_redirects(
+        cast(requests.Session, session),
+        method="GET",
+        url="https://example.com/report",
+        timeout=1.0,
+        headers={},
+        normalize_url_for_http=web_tools._normalize_url_for_http,
+        egress_policy=_public_test_policy(),
+        stream=True,
+        cancellation_token=None,
+    )
+
+    assert redirect_hops == 0
+    assert response.close_count == 0
+    lease.close()
+    lease.close()
+    assert response.close_count == 1
+
+
+def test_response_lease_closes_when_cancelled_after_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """request 返回后观察到取消时 callee 必须关闭 response 与 pool。"""
+
+    class CancelAfterRequestToken:
+        """第一次检查放行、第二次检查报告取消的 token。"""
+
+        def __init__(self) -> None:
+            """初始化检查计数。"""
+
+            self.check_count = 0
+
+        def is_cancelled(self) -> bool:
+            """第二次及后续检查返回 ``True``。"""
+
+            self.check_count += 1
+            return self.check_count >= 2
+
+        def cancel_reason(self) -> str | None:
+            """返回固定取消原因。"""
+
+            return "cancelled after request"
+
+        def requested_at(self) -> datetime | None:
+            """返回空请求时间。"""
+
+            return None
+
+    response = _counting_response(
+        url="https://example.com/report",
+        status_code=200,
+        body=b"ok",
+    )
+    session = _QueuedSession([response])
+    monkeypatch.setattr(web_fetch_orchestrator, "_send_authorized_request", _queued_send_authorized_request)
+
+    with pytest.raises(RuntimeError, match="cancelled after request"):
+        web_fetch_orchestrator._request_with_safe_redirects(
+            cast(requests.Session, session),
+            method="GET",
+            url="https://example.com/report",
+            timeout=1.0,
+            headers={},
+            normalize_url_for_http=web_tools._normalize_url_for_http,
+            egress_policy=_public_test_policy(),
+            stream=True,
+            cancellation_token=cast(CancellationToken, CancelAfterRequestToken()),
+        )
+
+    assert response.close_count == 1
+
+
+@pytest.mark.parametrize(
+    ("response_url", "status_code", "headers", "expected_error"),
+    (
+        ("http://127.0.0.1/internal", 200, {}, web_fetch_orchestrator._FetchUrlSafetyError),
+        ("https://example.com/report", 302, {}, RuntimeError),
+    ),
+)
+def test_response_lease_closes_on_response_or_location_reject(
+    monkeypatch: pytest.MonkeyPatch,
+    response_url: str,
+    status_code: int,
+    headers: Mapping[str, str],
+    expected_error: type[Exception],
+) -> None:
+    """response URL 与 Location 拒绝均必须关闭当前 lease。"""
+
+    response = _counting_response(
+        url=response_url,
+        status_code=status_code,
+        body=b"",
+        headers=headers,
+    )
+    session = _QueuedSession([response])
+    monkeypatch.setattr(web_fetch_orchestrator, "_send_authorized_request", _queued_send_authorized_request)
+
+    with pytest.raises(expected_error):
+        web_fetch_orchestrator._request_with_safe_redirects(
+            cast(requests.Session, session),
+            method="GET",
+            url="https://example.com/report",
+            timeout=1.0,
+            headers={},
+            normalize_url_for_http=web_tools._normalize_url_for_http,
+            egress_policy=_public_test_policy(),
+            stream=True,
+            cancellation_token=None,
+        )
+
+    assert response.close_count == 1
+
+
+def test_response_lease_closes_on_too_many_redirects(monkeypatch: pytest.MonkeyPatch) -> None:
+    """redirect 上限拒绝不得把当前 response 留给异常路径。"""
+
+    response = _counting_response(
+        url="https://example.com/report",
+        status_code=302,
+        body=b"",
+        headers={"Location": "https://example.com/next"},
+    )
+    session = _QueuedSession([response])
+    monkeypatch.setattr(web_fetch_orchestrator, "_send_authorized_request", _queued_send_authorized_request)
+    monkeypatch.setattr(web_fetch_orchestrator, "_MAX_HTTP_REDIRECT_HOPS", 0)
+
+    with pytest.raises(requests.TooManyRedirects):
+        web_fetch_orchestrator._request_with_safe_redirects(
+            cast(requests.Session, session),
+            method="GET",
+            url="https://example.com/report",
+            timeout=1.0,
+            headers={},
+            normalize_url_for_http=web_tools._normalize_url_for_http,
+            egress_policy=_public_test_policy(),
+            stream=True,
+            cancellation_token=None,
+        )
+
+    assert response.close_count == 1
+
+
+def test_response_lease_closes_head_probe_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HEAD probe 成功复制 facts 后必须立即关闭 response lease。"""
+
+    response = _counting_response(
+        url="https://example.com/report",
+        status_code=200,
+        body=b"",
+        headers={"Content-Type": "text/html"},
+    )
+    session = _QueuedSession([response])
+    monkeypatch.setattr(web_fetch_orchestrator, "_send_authorized_request", _queued_send_authorized_request)
+
+    result = web_fetch_orchestrator._probe_content_type(
+        cast(requests.Session, session),
+        url="https://example.com/report",
+        timeout_seconds=1.0,
+        headers={},
+        resolve_timeout_budget=lambda timeout_seconds, **kwargs: timeout_seconds,
+        normalize_url_for_http=web_tools._normalize_url_for_http,
+        is_timeout_like_exception=lambda error: False,
+        egress_policy=_public_test_policy(),
+    )
+
+    assert result["ok"] is True
+    assert response.close_count == 1
+
+
+def test_fetch_meta_refresh_to_private_url_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     """HTML meta refresh 目标必须在继续抓取前复用同一 URL safety owner。"""
 
     html = (
@@ -1634,7 +2326,8 @@ def test_fetch_meta_refresh_to_private_url_fails_closed() -> None:
         ]
     )
 
-    with pytest.raises(web_fetch_orchestrator._FetchContentConversionError) as exc_info:
+    monkeypatch.setattr(web_fetch_orchestrator, "_send_authorized_request", _queued_send_authorized_request)
+    with pytest.raises(web_fetch_orchestrator._FetchUrlSafetyError) as exc_info:
         web_fetch_orchestrator._fetch_and_convert_content(
             "https://example.com/report",
             timeout_seconds=1.0,
@@ -1645,14 +2338,14 @@ def test_fetch_meta_refresh_to_private_url_fails_closed() -> None:
             convert_non_html=lambda raw_bytes, stream_name: ("", "", ""),
             session=cast(requests.Session, session),
             headers={},
-            is_url_allowed=_safe_public_test_url,
+            egress_policy=_public_test_policy(),
         )
 
-    assert isinstance(exc_info.value.original_error, web_fetch_orchestrator._FetchUrlSafetyError)
+    assert exc_info.value.url == "http://127.0.0.1/internal"
     assert session.calls == [("GET", "https://example.com/report", True)]
 
 
-def test_fetch_meta_refresh_treats_redirect_hop_as_visited() -> None:
+def test_fetch_meta_refresh_treats_redirect_hop_as_visited(monkeypatch: pytest.MonkeyPatch) -> None:
     """meta refresh 防环必须消费 HTTP redirect 已访问 URL 记录。"""
 
     html = (
@@ -1676,6 +2369,7 @@ def test_fetch_meta_refresh_treats_redirect_hop_as_visited() -> None:
         ]
     )
 
+    monkeypatch.setattr(web_fetch_orchestrator, "_send_authorized_request", _queued_send_authorized_request)
     with pytest.raises(web_fetch_orchestrator._FetchContentConversionError) as exc_info:
         web_fetch_orchestrator._fetch_and_convert_content(
             "https://example.com/report",
@@ -1687,7 +2381,7 @@ def test_fetch_meta_refresh_treats_redirect_hop_as_visited() -> None:
             convert_non_html=lambda raw_bytes, stream_name: ("", "", ""),
             session=cast(requests.Session, session),
             headers={},
-            is_url_allowed=_safe_public_test_url,
+            egress_policy=_public_test_policy(),
         )
 
     assert exc_info.value.failure_reason == "meta_refresh_requires_browser"
@@ -1705,19 +2399,19 @@ def test_fetch_body_limit_maps_to_structured_tool_failure(
     session = _QueuedSession(
         [
             _raw_response(
-                url="https://example.com/",
+                url="http://127.0.0.1/",
                 status_code=200,
                 body=b"home",
                 headers={"Content-Type": "text/html"},
             ),
             _raw_response(
-                url="https://example.com/report",
+                url="http://127.0.0.1/report",
                 status_code=200,
                 body=b"head",
                 headers={"Content-Type": "text/html"},
             ),
             _raw_response(
-                url="https://example.com/report",
+                url="http://127.0.0.1/report",
                 status_code=200,
                 body=b"0123456789",
                 headers={"Content-Type": "text/html"},
@@ -1725,13 +2419,16 @@ def test_fetch_body_limit_maps_to_structured_tool_failure(
         ]
     )
     monkeypatch.setattr(web_tools, "_get_web_session", lambda: cast(requests.Session, session))
+    monkeypatch.setattr(web_fetch_orchestrator, "_send_authorized_request", _queued_send_authorized_request)
     monkeypatch.setattr(web_fetch_orchestrator, "_FETCH_MAX_WIRE_BODY_BYTES", 4)
     monkeypatch.setattr(web_fetch_orchestrator, "_FETCH_MAX_DECOMPRESSED_BODY_BYTES", 4)
-    definition = _definitions_by_name(_discover_definitions({}))["fetch_web_page"]
+    definition = _definitions_by_name(
+        _discover_definitions({"allow_private_network_url": True})
+    )["fetch_web_page"]
 
     outcome = asyncio.run(
         definition.callable(
-            _call("fetch_web_page", {"url": "https://example.com/report"}),
+            _call("fetch_web_page", {"url": "http://127.0.0.1/report"}),
             _context(timeout_seconds=None),
         )
     )
@@ -1804,11 +2501,51 @@ def test_playwright_route_blocks_private_request_before_continue() -> None:
 
     web_playwright_backend._route_handler_abort_resources(
         route,
-        is_url_allowed=_safe_public_test_url,
+        egress_policy=_public_test_policy(),
     )
 
     assert route.aborted is True
     assert route.continued is False
+
+
+def test_playwright_public_direct_reports_typed_egress_policy_unavailable() -> None:
+    """公网 browser direct 无 peer 证明时必须在 worker 启动前 typed fail closed。"""
+
+    worker_calls: list[str] = []
+
+    def unexpected_worker(
+        *,
+        url: str,
+        timeout_seconds: float,
+        headers: Mapping[str, str] | None = None,
+        playwright_channel: str | None = None,
+        playwright_storage_state_path: str = "",
+        egress_policy: WebEgressPolicy,
+    ) -> dict[str, JsonValue]:
+        """记录不应发生的公网 browser worker 调用。"""
+
+        del timeout_seconds, headers, playwright_channel, playwright_storage_state_path, egress_policy
+        worker_calls.append(url)
+        return {"ok": True}
+
+    result = web_playwright_backend._fetch_and_convert_with_playwright(
+        url="https://example.com/report",
+        timeout_seconds=1.0,
+        egress_policy=_public_test_policy(),
+        resolve_timeout_budget=lambda timeout_seconds, **kwargs: timeout_seconds,
+        playwright_sync_worker=unexpected_worker,
+        detect_bot_challenge=lambda **kwargs: web_tools.BotChallengeDetectionResult(
+            challenge_detected=False,
+            challenge_signals=(),
+        ),
+    )
+
+    assert result == {
+        "ok": False,
+        "availability": "unprocessable",
+        "reason": "browser_egress_policy_unavailable",
+    }
+    assert worker_calls == []
 
 
 def test_playwright_url_safety_error_survives_worker_process() -> None:
@@ -1820,6 +2557,7 @@ def test_playwright_url_safety_error_survives_worker_process() -> None:
         "headers": None,
         "playwright_channel": None,
         "playwright_storage_state_path": "",
+        "egress_policy": _public_test_policy(),
     }
 
     with pytest.raises(web_fetch_orchestrator._FetchUrlSafetyError) as exc_info:
@@ -1858,7 +2596,7 @@ def test_fetch_playwright_url_safety_projects_permission_denied(
         deadline_monotonic: float | None = None,
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
-        is_url_allowed: Callable[[str], bool] | None = None,
+        egress_policy: WebEgressPolicy,
         cancellation_token: CancellationToken | None = None,
     ) -> web_playwright_backend.WebPayload:
         """模拟 Playwright 导航阶段 URL safety 拒绝。
@@ -1870,7 +2608,7 @@ def test_fetch_playwright_url_safety_projects_permission_denied(
         :param deadline_monotonic: 工具调用 deadline。
         :param playwright_channel: 浏览器 channel。
         :param playwright_storage_state_path: storage state 路径。
-        :param is_url_allowed: URL 安全谓词。
+        :param egress_policy: Web 出站策略。
         :param cancellation_token: 取消令牌。
         :returns: 不返回。
         :raises web_fetch_orchestrator._FetchUrlSafetyError: 始终抛出。
@@ -1884,7 +2622,7 @@ def test_fetch_playwright_url_safety_projects_permission_denied(
             deadline_monotonic,
             playwright_channel,
             playwright_storage_state_path,
-            is_url_allowed,
+            egress_policy,
             cancellation_token,
         )
         raise web_fetch_orchestrator._FetchUrlSafetyError(
@@ -1930,7 +2668,7 @@ def test_fetch_playwright_cancel_projects_to_host_cancelled(
         deadline_monotonic: float | None = None,
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
-        is_url_allowed: Callable[[str], bool] | None = None,
+        egress_policy: WebEgressPolicy,
         cancellation_token: CancellationToken | None = None,
     ) -> dict[str, JsonValue]:
         """模拟 Playwright worker 在 fallback 内部收到取消。
@@ -1942,7 +2680,7 @@ def test_fetch_playwright_cancel_projects_to_host_cancelled(
         :param deadline_monotonic: 工具调用 deadline。
         :param playwright_channel: 浏览器 channel。
         :param playwright_storage_state_path: storage state 路径。
-        :param is_url_allowed: URL 安全谓词。
+        :param egress_policy: Web 出站策略。
         :param cancellation_token: 取消令牌。
         :returns: 不返回。
         :raises web_playwright_backend.CancelledError: 始终抛出。
@@ -1957,7 +2695,7 @@ def test_fetch_playwright_cancel_projects_to_host_cancelled(
             deadline_monotonic,
             playwright_channel,
             playwright_storage_state_path,
-            is_url_allowed,
+            egress_policy,
         )
         raise web_playwright_backend.CancelledError("cancelled by host")
 
@@ -2076,7 +2814,7 @@ def test_try_playwright_fallback_pre_cancel_does_not_start_playwright(
         deadline_monotonic: float | None = None,
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
-        is_url_allowed: Callable[[str], bool] | None = None,
+        egress_policy: WebEgressPolicy,
         cancellation_token: CancellationToken | None = None,
     ) -> dict[str, JsonValue]:
         """记录非预期 Playwright worker 调用。
@@ -2088,7 +2826,7 @@ def test_try_playwright_fallback_pre_cancel_does_not_start_playwright(
         :param deadline_monotonic: 工具调用 deadline。
         :param playwright_channel: 浏览器 channel。
         :param playwright_storage_state_path: storage state 路径。
-        :param is_url_allowed: URL 安全谓词。
+        :param egress_policy: Web 出站策略。
         :param cancellation_token: 取消令牌。
         :returns: 成功结果。
         :raises Exception: 不主动抛出异常。
@@ -2101,7 +2839,7 @@ def test_try_playwright_fallback_pre_cancel_does_not_start_playwright(
             deadline_monotonic,
             playwright_channel,
             playwright_storage_state_path,
-            is_url_allowed,
+            egress_policy,
             cancellation_token,
         )
         playwright_calls.append(url)
@@ -2120,6 +2858,7 @@ def test_try_playwright_fallback_pre_cancel_does_not_start_playwright(
             headers={},
             timeout_budget=None,
             deadline_monotonic=None,
+            egress_policy=_public_test_policy(),
             cancellation_token=token,
         )
 
@@ -2146,11 +2885,11 @@ def test_playwright_unpicklable_worker_fails_closed(
         headers: Mapping[str, str] | None = None,
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
-        is_url_allowed: Callable[[str], bool] | None = None,
+        egress_policy: WebEgressPolicy,
     ) -> dict[str, JsonValue]:
         """记录不应发生的同进程 Playwright 调用。"""
 
-        del timeout_seconds, headers, playwright_channel, playwright_storage_state_path, is_url_allowed
+        del timeout_seconds, headers, playwright_channel, playwright_storage_state_path, egress_policy
         worker_calls.append(url)
         return {"ok": True, "content": "unexpected"}
 
@@ -2162,6 +2901,7 @@ def test_playwright_unpicklable_worker_fails_closed(
         deadline_monotonic=None,
         playwright_channel=None,
         playwright_storage_state_path="",
+        egress_policy=WebEgressPolicy(allow_private_network=True),
         cancellation_token=_OpenCancellationToken(),
         resolve_timeout_budget=lambda timeout_seconds, **kwargs: timeout_seconds,
         playwright_sync_worker=fake_worker,
@@ -2192,6 +2932,7 @@ def test_playwright_worker_process_cleanup_kills_synthetic_nested_child_on_posix
         "headers": None,
         "playwright_channel": None,
         "playwright_storage_state_path": str(pid_path),
+        "egress_policy": WebEgressPolicy(allow_private_network=True),
     }
     process, result_queue = _start_playwright_worker_process(
         worker_callable=_SyntheticNestedPlaywrightWorker(),
@@ -2259,6 +3000,7 @@ def test_playwright_worker_process_cleanup_supports_running_event_loop(
         "headers": None,
         "playwright_channel": None,
         "playwright_storage_state_path": str(pid_path),
+        "egress_policy": WebEgressPolicy(allow_private_network=True),
     }
     process, result_queue = _start_playwright_worker_process(
         worker_callable=_SyntheticNestedPlaywrightWorker(),
@@ -2316,6 +3058,7 @@ def test_playwright_live_browser_cleanup_smoke_is_manual_and_best_effort(
         "headers": None,
         "playwright_channel": None,
         "playwright_storage_state_path": str(marker_path),
+        "egress_policy": WebEgressPolicy(allow_private_network=True),
     }
     process, result_queue = _start_playwright_worker_process(
         worker_callable=_LiveBrowserLongRunningWorker(),
@@ -2379,7 +3122,7 @@ def test_fetch_playwright_fallback_receives_channel_and_storage_state_path(
         deadline_monotonic: float | None = None,
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
-        is_url_allowed: Callable[[str], bool] | None = None,
+        egress_policy: WebEgressPolicy,
         cancellation_token: CancellationToken | None = None,
     ) -> Mapping[str, JsonValue]:
         """记录 browser fallback 参数并返回确定性内容。
@@ -2391,12 +3134,12 @@ def test_fetch_playwright_fallback_receives_channel_and_storage_state_path(
         :param deadline_monotonic: 工具 deadline。
         :param playwright_channel: 浏览器 channel。
         :param playwright_storage_state_path: storage state 文件路径。
-        :param is_url_allowed: URL 安全谓词。
+        :param egress_policy: Web 出站策略。
         :param cancellation_token: 取消令牌。
         :returns: 确定性抓取内容。
         """
 
-        del headers, timeout_budget, deadline_monotonic, is_url_allowed, cancellation_token
+        del headers, timeout_budget, deadline_monotonic, egress_policy, cancellation_token
         calls.append(
             {
                 "url": url,
@@ -2471,7 +3214,7 @@ def test_fetch_playwright_fallback_uses_empty_storage_state_when_dir_empty(
         deadline_monotonic: float | None = None,
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
-        is_url_allowed: Callable[[str], bool] | None = None,
+        egress_policy: WebEgressPolicy,
         cancellation_token: CancellationToken | None = None,
     ) -> Mapping[str, JsonValue]:
         """记录空 storage state dir 的 browser fallback 参数。
@@ -2483,12 +3226,12 @@ def test_fetch_playwright_fallback_uses_empty_storage_state_when_dir_empty(
         :param deadline_monotonic: 工具 deadline。
         :param playwright_channel: 浏览器 channel。
         :param playwright_storage_state_path: storage state 文件路径。
-        :param is_url_allowed: URL 安全谓词。
+        :param egress_policy: Web 出站策略。
         :param cancellation_token: 取消令牌。
         :returns: 确定性抓取内容。
         """
 
-        del headers, timeout_budget, deadline_monotonic, is_url_allowed, cancellation_token
+        del headers, timeout_budget, deadline_monotonic, egress_policy, cancellation_token
         calls.append(
             {
                 "url": url,
