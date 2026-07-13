@@ -201,7 +201,29 @@ provider 字段：
 
 包内默认 `doc-tools` provider 指向 `dayu.tools.doc_provider:discover_tools`，默认 `enabled=false` 且 `allowed_paths=[]`。只有在 workspace overlay 启用并在 `config.allowed_paths` 中显式配置可访问文件或目录根时才注册可执行文档工具。白名单为空时 provider 会 fail fast。Doc provider 的 packaged `config.limits` 显式写入默认值：`list_files_max=200`、`get_sections_max=200`、`search_files_max_results=50`、`read_file_max_chars=80000` 与 `read_file_section_max_chars=50000`；workspace overlay 可用同名正整数字段覆盖这些 Doc limits。
 
-包内默认 `web-tools` provider 指向 `dayu.tools.web:discover_tools`，默认 `enabled=true`，并默认拒绝 private / local network URL。Provider 只暴露 `search_web` 与 `fetch_web_page`；`config` 可设置 `provider`（`auto` / `tavily` / `serper` / `duckduckgo`）、`request_timeout_seconds`、`max_search_results`、`fetch_truncate_chars`、`allow_private_network_url`、`playwright_channel` 与 `playwright_storage_state_dir`。默认 `playwright_storage_state_dir` 在配置中是 `.dayu/web_tools_storage_states`，Service discovery 会按当前 workspace root 解析为 `<workspace>/.dayu/web_tools_storage_states`；只有该目录下存在目标 host 对应的 storage state 文件时，Playwright fallback 才会注入登录态。只有显式设置 `allow_private_network_url=true` 时，fetch/search URL safety 才允许内网或本地 URL。
+包内默认 `web-tools` provider 指向 `dayu.tools.web:discover_tools`，默认 `enabled=true`，并默认拒绝 private / local network URL。Provider 只暴露 `search_web` 与 `fetch_web_page`；`config` 可设置 `provider`（`auto` / `tavily` / `serper` / `duckduckgo`）、`request_timeout_seconds`、`max_search_results`、`fetch_truncate_chars`、`allow_private_network_url`、`playwright_channel`、`playwright_storage_state_dir` 与完整 `resource_budget`。默认 `playwright_storage_state_dir` 在配置中是 `.dayu/web_tools_storage_states`，Service discovery 会按当前 workspace root 解析为 `<workspace>/.dayu/web_tools_storage_states`；只有该目录下存在目标 host 对应的 storage state 文件时，Playwright fallback 才会注入登录态。只有显式设置 `allow_private_network_url=true` 时，fetch/search URL safety 才允许内网或本地 URL。
+
+Web 资源预算的唯一配置路径是 `providers["web-tools"].config.resource_budget`。整个 `resource_budget` 缺失时使用完整默认预算；一旦提供，就必须一次写全以下七个正整数字段。缺字段、未知字段、布尔值、零或负数都会在 provider discovery 时 fail fast，不会按字段回退默认值。最小完整示例：
+
+```json
+{
+  "providers": {
+    "web-tools": {
+      "config": {
+        "resource_budget": {
+          "wire_body_bytes": 26214400,
+          "decoded_body_bytes": 52428800,
+          "warmup_body_bytes": 65536,
+          "browser_dom_chars": 5000000,
+          "browser_text_chars": 1000000,
+          "diagnostic_error_chars": 1024,
+          "diagnostic_events": 80
+        }
+      }
+    }
+  }
+}
+```
 
 包内默认 `utils-tools` provider 指向 `dayu.tools.utils:discover_tools`，默认 `enabled=true`。Provider 当前只暴露 `get_current_time`，用于需要实时时钟的场景；工具只支持 `timezone="Asia/Shanghai"` 或省略该参数，并返回 `time`、`timezone`、`weekday` 与 `iso` 字段。该工具不提供财报、网页或文件事实。
 

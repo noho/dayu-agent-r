@@ -15,11 +15,12 @@ import os
 import pickle
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from functools import partial
 from multiprocessing.process import BaseProcess
 from queue import Empty, Queue
 from threading import Lock, Thread
-from typing import Protocol, TypeAlias, TypedDict, cast
+from typing import Final, Protocol, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse
 
 import requests
@@ -33,7 +34,9 @@ from dayu.runtime.interruptible_process import (
 )
 
 from .web_fetch_orchestrator import _FetchUrlSafetyError
+from .web_challenge_detection import BotChallengeDecision
 from .web_egress_policy import WebEgressPolicy, WebEgressPolicyError
+from .web_resource_budget import WebResourceBudget
 
 MODULE = "ENGINE.WEB_PLAYWRIGHT"
 _LOGGER = logging.getLogger(__name__)
@@ -122,8 +125,12 @@ class _PageProtocol(Protocol):
         """读取页面 HTML。"""
         ...
 
-    def evaluate(self, expression: str) -> str:
-        """执行页面脚本并返回字符串结果。"""
+    def evaluate(
+        self,
+        expression: str,
+        arg: Mapping[str, int] | None = None,
+    ) -> JsonValue:
+        """执行页面脚本并返回 JSON 值。"""
         ...
 
     def wait_for_load_state(self, state: str, *, timeout: int) -> None:
@@ -186,6 +193,56 @@ class _WorkerKwargs(TypedDict):
     playwright_channel: str | None
     playwright_storage_state_path: str
     egress_policy: WebEgressPolicy
+    resource_budget: WebResourceBudget
+
+
+class _BudgetedDomMetrics(TypedDict):
+    """浏览器 bounded TreeWalker 预检结果。"""
+
+    dom_chars: int
+    text_chars: int
+    dom_exceeded: bool
+    text_exceeded: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _BrowserPageProjection:
+    """预算预检通过后的完整浏览器页面投影。"""
+
+    html: str
+    page_text: str
+
+
+_BROWSER_DOM_TOO_LARGE_REASON: Final[str] = "browser_dom_too_large"
+_BROWSER_TEXT_TOO_LARGE_REASON: Final[str] = "browser_text_too_large"
+_BROWSER_RESOURCE_BUDGET_FAILURE_REASONS: Final[frozenset[str]] = frozenset(
+    {
+        _BROWSER_DOM_TOO_LARGE_REASON,
+        _BROWSER_TEXT_TOO_LARGE_REASON,
+    }
+)
+
+
+class _BrowserResourceBudgetExceeded(RuntimeError):
+    """浏览器页面在完整投影前后超过资源预算。"""
+
+    def __init__(self, reason: str) -> None:
+        """初始化浏览器资源超限异常。
+
+        Args:
+            reason: 封闭的 browser DOM/text 超限码。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: reason 不是封闭超限码时抛出。
+        """
+
+        if reason not in _BROWSER_RESOURCE_BUDGET_FAILURE_REASONS:
+            raise ValueError(f"unsupported browser budget failure: {reason}")
+        super().__init__(reason)
+        self.reason = reason
 
 
 class _PlaywrightWorkerProtocol(Protocol):
@@ -200,6 +257,7 @@ class _PlaywrightWorkerProtocol(Protocol):
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
         egress_policy: WebEgressPolicy,
+        resource_budget: WebResourceBudget,
     ) -> WebPayload:
         """执行一次 Playwright 抓取。"""
         ...
@@ -284,8 +342,8 @@ class _ChallengeResultProtocol(Protocol):
     """Challenge 检测结果的最小协议。"""
 
     @property
-    def challenge_detected(self) -> bool:
-        """是否检测到挑战页。"""
+    def decision(self) -> BotChallengeDecision:
+        """返回挑战页证据强度判定。"""
         ...
 
     @property
@@ -322,6 +380,50 @@ _PW_NETWORK_IDLE_TIMEOUT_MS = 1500
 _PW_RESULT_POLL_INTERVAL_SECONDS = 0.05
 _PW_RESULT_DRAIN_GRACE_SECONDS = 0.5
 _PW_PROCESS_TERMINATE_GRACE_SECONDS = 1.0
+_BUDGETED_DOM_METRICS_SCRIPT = """
+({domLimit, textLimit}) => {
+  let domChars = 0;
+  let textChars = 0;
+  let domExceeded = false;
+  let textExceeded = false;
+  const addDom = (value) => {
+    domChars = Math.min(domLimit + 1, domChars + value);
+    domExceeded = domChars > domLimit;
+  };
+  const addText = (value) => {
+    textChars = Math.min(textLimit + 1, textChars + value);
+    textExceeded = textChars > textLimit;
+  };
+  const walker = document.createTreeWalker(document, NodeFilter.SHOW_ALL);
+  while (walker.nextNode()) {
+    const node = walker.currentNode;
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      const localName = node.localName || '';
+      addDom(2 * localName.length + 5);
+      for (const attribute of node.attributes) {
+        addDom(attribute.name.length + 6 * attribute.value.length + 4);
+        if (domExceeded) break;
+      }
+    } else if (node.nodeType === Node.TEXT_NODE) {
+      const length = (node.nodeValue || '').length;
+      addDom(5 * length);
+      addText(length);
+    } else if (node.nodeType === Node.COMMENT_NODE) {
+      addDom((node.nodeValue || '').length + 7);
+    } else if (node.nodeType === Node.DOCUMENT_TYPE_NODE) {
+      addDom(
+        (node.name || '').length +
+        (node.publicId || '').length +
+        (node.systemId || '').length +
+        32
+      );
+    }
+    if (domExceeded || textExceeded) break;
+  }
+  return {domChars, textChars, domExceeded, textExceeded};
+}
+""".strip()
+_FULL_PAGE_TEXT_SCRIPT = "() => document.body ? document.body.innerText : ''"
 
 
 class _PlaywrightProcessCleanup(TypedDict):
@@ -1094,6 +1196,129 @@ def _settle_playwright_page(
     page.wait_for_timeout(step_timeout_ms)
 
 
+def _read_budgeted_dom_metrics(
+    page: _PageProtocol,
+    *,
+    resource_budget: WebResourceBudget,
+) -> _BudgetedDomMetrics:
+    """执行不生成完整 DOM/text 的 bounded TreeWalker 预检。
+
+    Args:
+        page: 当前 Playwright Page。
+        resource_budget: Web 资源预算唯一真源。
+
+    Returns:
+        有界 DOM/text counters 与超限标记。
+
+    Raises:
+        RuntimeError: 浏览器返回的 metrics shape 或字段类型非法时抛出。
+    """
+
+    raw_metrics = page.evaluate(
+        _BUDGETED_DOM_METRICS_SCRIPT,
+        {
+            "domLimit": resource_budget.browser_dom_chars,
+            "textLimit": resource_budget.browser_text_chars,
+        },
+    )
+    if not isinstance(raw_metrics, Mapping):
+        raise RuntimeError("Playwright DOM budget preflight returned invalid shape")
+    dom_chars = raw_metrics.get("domChars")
+    text_chars = raw_metrics.get("textChars")
+    dom_exceeded = raw_metrics.get("domExceeded")
+    text_exceeded = raw_metrics.get("textExceeded")
+    if (
+        isinstance(dom_chars, bool)
+        or not isinstance(dom_chars, int)
+        or dom_chars < 0
+        or isinstance(text_chars, bool)
+        or not isinstance(text_chars, int)
+        or text_chars < 0
+        or not isinstance(dom_exceeded, bool)
+        or not isinstance(text_exceeded, bool)
+    ):
+        raise RuntimeError("Playwright DOM budget preflight returned invalid fields")
+    return {
+        "dom_chars": dom_chars,
+        "text_chars": text_chars,
+        "dom_exceeded": dom_exceeded,
+        "text_exceeded": text_exceeded,
+    }
+
+
+def _materialize_bounded_page_projection(
+    page: _PageProtocol,
+    *,
+    resource_budget: WebResourceBudget,
+) -> _BrowserPageProjection:
+    """先 bounded preflight，再生成并复核完整 HTML/text 投影。
+
+    Args:
+        page: 当前 Playwright Page。
+        resource_budget: Web 资源预算唯一真源。
+
+    Returns:
+        实际长度复核通过的完整 HTML 与页面文本。
+
+    Raises:
+        _BrowserResourceBudgetExceeded: DOM/text 预检或实际投影超限时抛出。
+        RuntimeError: 浏览器返回的 metrics shape 非法时抛出。
+    """
+
+    metrics = _read_budgeted_dom_metrics(
+        page,
+        resource_budget=resource_budget,
+    )
+    if (
+        metrics["dom_exceeded"]
+        or metrics["dom_chars"] > resource_budget.browser_dom_chars
+    ):
+        raise _BrowserResourceBudgetExceeded(_BROWSER_DOM_TOO_LARGE_REASON)
+    if (
+        metrics["text_exceeded"]
+        or metrics["text_chars"] > resource_budget.browser_text_chars
+    ):
+        raise _BrowserResourceBudgetExceeded(_BROWSER_TEXT_TOO_LARGE_REASON)
+
+    html = page.content()
+    if len(html) > resource_budget.browser_dom_chars:
+        raise _BrowserResourceBudgetExceeded(_BROWSER_DOM_TOO_LARGE_REASON)
+    try:
+        raw_page_text = page.evaluate(_FULL_PAGE_TEXT_SCRIPT)
+        page_text = raw_page_text if isinstance(raw_page_text, str) else html
+    except Exception:
+        Log.debug(
+            "Playwright 页面全文本提取失败，回退到 HTML。",
+            module=MODULE,
+        )
+        page_text = html
+    if len(page_text) > resource_budget.browser_text_chars:
+        raise _BrowserResourceBudgetExceeded(_BROWSER_TEXT_TOO_LARGE_REASON)
+    return _BrowserPageProjection(html=html, page_text=page_text)
+
+
+def _browser_budget_failure(reason: str) -> WebPayload:
+    """构造浏览器资源超限的稳定失败事实。
+
+    Args:
+        reason: 封闭的 browser DOM/text 超限码。
+
+    Returns:
+        可跨进程投影的失败 payload。
+
+    Raises:
+        ValueError: reason 不是封闭资源失败码时抛出。
+    """
+
+    if reason not in _BROWSER_RESOURCE_BUDGET_FAILURE_REASONS:
+        raise ValueError(f"unsupported browser budget failure: {reason}")
+    return {
+        "ok": False,
+        "availability": "unprocessable",
+        "reason": reason,
+    }
+
+
 def _playwright_sync_worker(
     *,
     url: str,
@@ -1108,6 +1333,7 @@ def _playwright_sync_worker(
     build_text_excerpt: Callable[[str], str],
     convert_html_to_markdown: _HtmlConverterProtocol,
     egress_policy: WebEgressPolicy,
+    resource_budget: WebResourceBudget,
     time_monotonic: Callable[[], float] = time.monotonic,
 ) -> WebPayload:
     """在独立线程中执行完整的 Playwright 同步抓取流程。
@@ -1125,6 +1351,7 @@ def _playwright_sync_worker(
         build_text_excerpt: 文本摘录构造函数。
         convert_html_to_markdown: HTML 四段式转换函数。
         egress_policy: 当前 Web 调用唯一的出站策略。
+        resource_budget: HTTP、browser 与诊断共享的完整资源预算。
         time_monotonic: 可注入的单调时钟函数。
 
     Returns:
@@ -1245,12 +1472,17 @@ def _playwright_sync_worker(
             egress_policy=egress_policy,
             reason="playwright_settled_page",
         )
-        html = page.content()
-        final_url = page.url
         try:
-            page_text = page.evaluate("() => document.body ? document.body.innerText : ''")
-        except Exception:
-            page_text = html
+            page_projection = _materialize_bounded_page_projection(
+                page,
+                resource_budget=resource_budget,
+            )
+        except _BrowserResourceBudgetExceeded as exc:
+            context.close()
+            return _browser_budget_failure(exc.reason)
+        html = page_projection.html
+        final_url = page.url
+        page_text = page_projection.page_text
     except Exception:
         context.close()
         raise
@@ -1258,6 +1490,8 @@ def _playwright_sync_worker(
         context.close()
 
     pipeline_result = convert_html_to_markdown(html, url=final_url)
+    if len(pipeline_result.markdown) > resource_budget.browser_text_chars:
+        return _browser_budget_failure(_BROWSER_TEXT_TOO_LARGE_REASON)
     return {
         "ok": True,
         "title": pipeline_result.title,
@@ -1284,6 +1518,7 @@ def _fetch_and_convert_with_playwright(
     playwright_channel: str | None = None,
     playwright_storage_state_path: str = "",
     egress_policy: WebEgressPolicy,
+    resource_budget: WebResourceBudget,
     cancellation_token: CancellationToken | None = None,
     resolve_timeout_budget: _ResolveTimeoutBudgetProtocol,
     playwright_sync_worker: _PlaywrightWorkerProtocol,
@@ -1300,6 +1535,7 @@ def _fetch_and_convert_with_playwright(
         playwright_channel: 浏览器回退使用的 Chromium channel。
         playwright_storage_state_path: 浏览器回退可选 storage state 文件路径。
         egress_policy: 当前 Web 调用唯一的出站策略。
+        resource_budget: HTTP、browser 与诊断共享的完整资源预算。
         resolve_timeout_budget: timeout 预算解析函数。
         playwright_sync_worker: 同步 worker 函数。
         detect_bot_challenge: challenge 检测函数。
@@ -1356,6 +1592,7 @@ def _fetch_and_convert_with_playwright(
                     "playwright_channel": playwright_channel,
                     "playwright_storage_state_path": playwright_storage_state_path,
                     "egress_policy": egress_policy,
+                    "resource_budget": resource_budget,
                 },
                 total_timeout=total_timeout,
                 cancellation_token=cancellation_token,
@@ -1404,7 +1641,7 @@ def _fetch_and_convert_with_playwright(
             http_status=http_status,
             content_text=content_text,
         )
-        if challenge.challenge_detected:
+        if challenge.decision is BotChallengeDecision.CONFIRMED:
             return {
                 "ok": False,
                 "availability": "blocked",

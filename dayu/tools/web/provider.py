@@ -19,6 +19,7 @@ from dayu.runtime.tools_discovery import (
     ToolsDiscoveryProviderSpec,
 )
 
+from .web_resource_budget import WebResourceBudget, web_resource_budget_from_json
 from .web_tools import WebToolsConfig, build_web_tool_definitions
 
 _PROVIDER_ID: Final[str] = "web-tools"
@@ -31,6 +32,7 @@ _CONFIG_FETCH_TRUNCATE_CHARS_FIELD: Final[str] = "fetch_truncate_chars"
 _CONFIG_ALLOW_PRIVATE_NETWORK_URL_FIELD: Final[str] = "allow_private_network_url"
 _CONFIG_PLAYWRIGHT_CHANNEL_FIELD: Final[str] = "playwright_channel"
 _CONFIG_PLAYWRIGHT_STORAGE_STATE_DIR_FIELD: Final[str] = "playwright_storage_state_dir"
+_CONFIG_RESOURCE_BUDGET_FIELD: Final[str] = "resource_budget"
 _WEB_TOOL_NAMES: Final[tuple[str, ...]] = ("search_web", "fetch_web_page")
 
 
@@ -105,7 +107,33 @@ def _parse_config(config: Mapping[str, JsonValue]) -> WebToolsConfig:
             _CONFIG_PLAYWRIGHT_STORAGE_STATE_DIR_FIELD,
             defaults.playwright_storage_state_dir,
         ),
+        resource_budget=_resource_budget_default(
+            config,
+            defaults.resource_budget,
+        ),
     )
+
+
+def _resource_budget_default(
+    config: Mapping[str, JsonValue],
+    default: WebResourceBudget,
+) -> WebResourceBudget:
+    """读取完整 Web 资源预算。
+
+    Args:
+        config: provider 自有 JSON 配置。
+        default: 整个 ``resource_budget`` 缺失时使用的完整默认值。
+
+    Returns:
+        完整、已校验的资源预算。
+
+    Raises:
+        ValueError: ``resource_budget`` 存在但不是完整合法 object 时抛出。
+    """
+
+    if _CONFIG_RESOURCE_BUDGET_FIELD not in config:
+        return default
+    return web_resource_budget_from_json(config[_CONFIG_RESOURCE_BUDGET_FIELD])
 
 
 def _parse_provider(config: Mapping[str, JsonValue], default: str) -> str:

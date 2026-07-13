@@ -7,12 +7,12 @@ HTML/Docling 路由与浏览器升级判定，避免这些编排细节继续膨�
 
 from __future__ import annotations
 
-import re
-import gzip
 import importlib
+import re
 import zlib
 from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
+from io import BytesIO
 from types import ModuleType
 from typing import Protocol, cast
 from threading import Lock
@@ -30,7 +30,7 @@ from bs4 import BeautifulSoup
 from dayu.documents.processors.html_pipeline import HtmlPipelineResult, HtmlPipelineStageError
 from dayu.documents.processors.text_utils import infer_suffix_from_uri
 
-from .web_challenge_detection import detect_bot_challenge
+from .web_challenge_detection import BotChallengeDecision, detect_bot_challenge
 from .web_http_encoding import (
     _decode_response_text,
     _extract_content_encoding_tokens,
@@ -42,16 +42,14 @@ from .web_egress_policy import (
     WebEgressPolicyError,
 )
 from .web_http_session import AuthorizedResponseLease, _send_authorized_request
+from .web_resource_budget import WebResourceBudget
 
 _WARMUP_TIMEOUT_SECONDS = 6.0
 _RESPONSE_SNIPPET_MAX_CHARS = 500
 _EMPTY_CONTENT_MIN_CHARS = 5
 _MAX_META_REFRESH_HOPS = 3
 _META_REFRESH_IMMEDIATE_MAX_SECONDS = 1.0
-_MEBIBYTE_BYTES = 1024 * 1024
 _FETCH_BODY_CHUNK_BYTES = 64 * 1024
-_FETCH_MAX_WIRE_BODY_BYTES = 25 * _MEBIBYTE_BYTES
-_FETCH_MAX_DECOMPRESSED_BODY_BYTES = 50 * _MEBIBYTE_BYTES
 _FETCH_LIMIT_CONTEXT_EXCERPT_BYTES = 4096
 _MAX_HTTP_REDIRECT_HOPS = 30
 _HTTP_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
@@ -88,19 +86,23 @@ _PLAYWRIGHT_HTTP_ESCALATION_STATUSES = frozenset(
 _WARMED_HOSTS_LOCK = Lock()
 
 
-class _BytesDecompressorModule(Protocol):
-    """提供 ``decompress(bytes)`` 的可选解码模块协议。"""
+class _BoundedBinaryReader(Protocol):
+    """支持有界 ``read(size)`` 的二进制 reader。"""
 
-    def decompress(self, data: bytes) -> bytes:
-        """解压字节。"""
+    def read(self, size: int = -1) -> bytes:
+        """读取不超过 ``size`` 的解码字节。"""
+        ...
+
+    def close(self) -> None:
+        """关闭 reader。"""
         ...
 
 
 class _ZstandardDecompressor(Protocol):
-    """zstandard 解压器协议。"""
+    """zstandard 增量解压器协议。"""
 
-    def decompress(self, data: bytes) -> bytes:
-        """解压字节。"""
+    def stream_reader(self, source: BytesIO) -> _BoundedBinaryReader:
+        """创建支持有界读取的增量解码 reader。"""
         ...
 
 
@@ -179,6 +181,29 @@ class _FetchContentConversionError(RuntimeError):
         self.response_context = response_context
         self.original_error = original_error
         self.failure_reason = str(failure_reason or "").strip()
+
+
+class _UnsupportedBoundedContentEncoding(RuntimeError):
+    """当前 encoding 缺少可在输出物化前执行 cap 的 streaming API。"""
+
+    def __init__(self, encoding: str) -> None:
+        """初始化 unsupported encoding 错误。
+
+        Args:
+            encoding: 无法有界增量解码的 Content-Encoding token。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        normalized_encoding = encoding.strip().lower()
+        super().__init__(
+            f"当前运行时不支持有界 {normalized_encoding} 增量解码。"
+        )
+        self.encoding = normalized_encoding
 
 
 class _FetchBodyLimitExceeded(RuntimeError):
@@ -481,73 +506,176 @@ def _iter_raw_response_chunks(response: requests.Response) -> Iterable[bytes]:
     return response.raw.stream(_FETCH_BODY_CHUNK_BYTES, decode_content=False)
 
 
-def _decode_brotli_body(data: bytes) -> bytes:
-    """解码 brotli body。
-
-    Args:
-        data: brotli 压缩字节。
-
-    Returns:
-        解压后的字节。
-
-    Raises:
-        RuntimeError: 当前运行时缺少 brotli 解码器时抛出。
-    """
-
-    try:
-        brotli = cast(_BytesDecompressorModule, _import_optional_module("brotli"))
-    except ImportError:
-        try:
-            brotli = cast(_BytesDecompressorModule, _import_optional_module("brotlicffi"))
-        except ImportError as exc:
-            raise RuntimeError("当前运行时缺少 brotli 解码器。") from exc
-    return brotli.decompress(data)
-
-
-def _decode_zstd_body(data: bytes) -> bytes:
-    """解码 zstd body。
-
-    Args:
-        data: zstd 压缩字节。
-
-    Returns:
-        解压后的字节。
-
-    Raises:
-        RuntimeError: 当前运行时缺少 zstd 解码器时抛出。
-    """
-
-    try:
-        zstandard = cast(_ZstandardModule, _import_optional_module("zstandard"))
-        return zstandard.ZstdDecompressor().decompress(data)
-    except ImportError:
-        try:
-            zstd = cast(_BytesDecompressorModule, _import_optional_module("zstd"))
-        except ImportError as exc:
-            raise RuntimeError("当前运行时缺少 zstd 解码器。") from exc
-        return zstd.decompress(data)
-
-
-def _decode_deflate_body(data: bytes) -> bytes:
-    """解码 deflate body，兼容 zlib wrapper 与 raw deflate。
+def _zlib_wrapped_deflate(data: bytes) -> bool:
+    """判断 deflate body 是否带 RFC 1950 zlib wrapper。
 
     Args:
         data: deflate 压缩字节。
 
     Returns:
-        解压后的字节。
+        header 满足 zlib wrapper 约束时返回 ``True``。
 
     Raises:
-        zlib.error: 解压失败时抛出。
+        无。
+    """
+
+    if len(data) < 2:
+        return False
+    compression_method_and_flags = data[0]
+    additional_flags = data[1]
+    return (
+        compression_method_and_flags & 0x0F == 8
+        and (compression_method_and_flags << 8 | additional_flags) % 31 == 0
+    )
+
+
+def _decode_zlib_layer(
+    response: requests.Response,
+    encoded: bytes,
+    *,
+    window_bits: int,
+    limit_bytes: int,
+) -> bytes:
+    """用 ``decompressobj`` 增量解码单个 zlib/gzip 层。
+
+    每次 decoder 调用的最大输出固定为当前剩余预算加一字节，使超限在
+    完整输出物化前可判定。
+
+    Args:
+        response: 当前 HTTP 响应，用于构造 typed limit context。
+        encoded: 当前编码层输入。
+        window_bits: zlib window bits；可表达 gzip、zlib 或 raw deflate。
+        limit_bytes: 当前解码层输出上限。
+
+    Returns:
+        解码后的有界字节。
+
+    Raises:
+        _FetchBodyLimitExceeded: 当前层输出超过上限时抛出。
+        RuntimeError: 压缩流不完整或 decoder 无法前进时抛出。
+        zlib.error: 压缩流非法时抛出。
+    """
+
+    decoder = zlib.decompressobj(window_bits)
+    decoded_chunks: list[bytes] = []
+    observed_bytes = 0
+    for offset in range(0, len(encoded), _FETCH_BODY_CHUNK_BYTES):
+        pending = encoded[offset : offset + _FETCH_BODY_CHUNK_BYTES]
+        while pending:
+            remaining_bytes = limit_bytes - observed_bytes
+            decoded_chunk = decoder.decompress(pending, remaining_bytes + 1)
+            observed_bytes = _append_limited_body_chunk(
+                chunks=decoded_chunks,
+                chunk=decoded_chunk,
+                observed_bytes=observed_bytes,
+                limit_bytes=limit_bytes,
+                limit_kind="decompressed",
+                response=response,
+            )
+            next_pending = decoder.unconsumed_tail
+            if not next_pending:
+                break
+            if next_pending == pending and not decoded_chunk:
+                raise RuntimeError("HTTP content decoder made no progress")
+            pending = next_pending
+    if not decoder.eof:
+        raise RuntimeError("HTTP compressed response ended before decoder reached EOF")
+    if decoder.unused_data:
+        raise RuntimeError("HTTP compressed response contains trailing encoded data")
+    return b"".join(decoded_chunks)
+
+
+def _decode_zstd_layer(
+    response: requests.Response,
+    encoded: bytes,
+    *,
+    limit_bytes: int,
+) -> bytes:
+    """用 zstandard ``stream_reader`` 有界解码单层 zstd。
+
+    Args:
+        response: 当前 HTTP 响应，用于构造 typed limit context。
+        encoded: 当前编码层输入。
+        limit_bytes: 当前解码层输出上限。
+
+    Returns:
+        解码后的有界字节。
+
+    Raises:
+        _FetchBodyLimitExceeded: 当前层输出超过上限时抛出。
+        RuntimeError: 缺少带有界 streaming API 的 zstandard 依赖时抛出。
     """
 
     try:
-        return zlib.decompress(data)
-    except zlib.error:
-        return zlib.decompress(data, -zlib.MAX_WBITS)
+        zstandard = cast(_ZstandardModule, _import_optional_module("zstandard"))
+    except ImportError as exc:
+        raise _UnsupportedBoundedContentEncoding("zstd") from exc
+
+    reader = zstandard.ZstdDecompressor().stream_reader(BytesIO(encoded))
+    decoded_chunks: list[bytes] = []
+    observed_bytes = 0
+    try:
+        while True:
+            remaining_bytes = limit_bytes - observed_bytes
+            decoded_chunk = reader.read(
+                min(_FETCH_BODY_CHUNK_BYTES, remaining_bytes + 1)
+            )
+            if not decoded_chunk:
+                break
+            observed_bytes = _append_limited_body_chunk(
+                chunks=decoded_chunks,
+                chunk=decoded_chunk,
+                observed_bytes=observed_bytes,
+                limit_bytes=limit_bytes,
+                limit_kind="decompressed",
+                response=response,
+            )
+    finally:
+        reader.close()
+    return b"".join(decoded_chunks)
 
 
-def _decompress_limited_response_body(response: requests.Response, wire_body: bytes) -> bytes:
+def _bounded_identity_layer(
+    response: requests.Response,
+    body: bytes,
+    *,
+    limit_bytes: int,
+) -> bytes:
+    """校验未编码 body 也受 decoded cap 约束。
+
+    Args:
+        response: 当前 HTTP 响应。
+        body: 未编码 body。
+        limit_bytes: decoded body 上限。
+
+    Returns:
+        未超限的原 body。
+
+    Raises:
+        _FetchBodyLimitExceeded: body 超过 decoded cap 时抛出。
+    """
+
+    if len(body) <= limit_bytes:
+        return body
+    raise _FetchBodyLimitExceeded(
+        "HTTP response decompressed body exceeded fetch limit.",
+        final_url=str(response.url or ""),
+        limit_kind="decompressed",
+        limit_bytes=limit_bytes,
+        observed_bytes=limit_bytes + 1,
+        response_context=_build_fetch_body_limit_runtime_context(
+            response,
+            body_excerpt=body[:_FETCH_LIMIT_CONTEXT_EXCERPT_BYTES],
+        ),
+    )
+
+
+def _decompress_limited_response_body(
+    response: requests.Response,
+    wire_body: bytes,
+    *,
+    resource_budget: WebResourceBudget,
+) -> bytes:
     """按 ``Content-Encoding`` 解压并限制 decompressed body 大小。
 
     Args:
@@ -559,7 +687,7 @@ def _decompress_limited_response_body(response: requests.Response, wire_body: by
 
     Raises:
         _FetchBodyLimitExceeded: 解压后字节数超过上限时抛出。
-        RuntimeError: 内容编码声明存在但当前运行时无法解码时抛出。
+        RuntimeError: 内容编码声明存在但当前运行时无法有界解码时抛出。
     """
 
     decoded = wire_body
@@ -567,43 +695,45 @@ def _decompress_limited_response_body(response: requests.Response, wire_body: by
         if encoding == "identity":
             continue
         if encoding == "gzip":
-            decoded = gzip.decompress(decoded)
-        elif encoding == "deflate":
-            decoded = _decode_deflate_body(decoded)
-        elif encoding == "br":
-            decoded = _decode_brotli_body(decoded)
-        elif encoding == "zstd":
-            decoded = _decode_zstd_body(decoded)
-        else:
-            raise RuntimeError(f"不支持的 HTTP 内容编码: {encoding}")
-        if len(decoded) > _FETCH_MAX_DECOMPRESSED_BODY_BYTES:
-            raise _FetchBodyLimitExceeded(
-                "HTTP response decompressed body exceeded fetch limit.",
-                final_url=str(getattr(response, "url", "") or ""),
-                limit_kind="decompressed",
-                limit_bytes=_FETCH_MAX_DECOMPRESSED_BODY_BYTES,
-                observed_bytes=len(decoded),
-                response_context=_build_fetch_body_limit_runtime_context(
-                    response,
-                    body_excerpt=decoded[:_FETCH_LIMIT_CONTEXT_EXCERPT_BYTES],
-                ),
-            )
-    if len(decoded) > _FETCH_MAX_DECOMPRESSED_BODY_BYTES:
-        raise _FetchBodyLimitExceeded(
-            "HTTP response decompressed body exceeded fetch limit.",
-            final_url=str(getattr(response, "url", "") or ""),
-            limit_kind="decompressed",
-            limit_bytes=_FETCH_MAX_DECOMPRESSED_BODY_BYTES,
-            observed_bytes=len(decoded),
-            response_context=_build_fetch_body_limit_runtime_context(
+            decoded = _decode_zlib_layer(
                 response,
-                body_excerpt=decoded[:_FETCH_LIMIT_CONTEXT_EXCERPT_BYTES],
-            ),
-        )
-    return decoded
+                decoded,
+                window_bits=zlib.MAX_WBITS | 16,
+                limit_bytes=resource_budget.decoded_body_bytes,
+            )
+        elif encoding == "deflate":
+            decoded = _decode_zlib_layer(
+                response,
+                decoded,
+                window_bits=(
+                    zlib.MAX_WBITS
+                    if _zlib_wrapped_deflate(decoded)
+                    else -zlib.MAX_WBITS
+                ),
+                limit_bytes=resource_budget.decoded_body_bytes,
+            )
+        elif encoding == "br":
+            raise _UnsupportedBoundedContentEncoding("brotli")
+        elif encoding == "zstd":
+            decoded = _decode_zstd_layer(
+                response,
+                decoded,
+                limit_bytes=resource_budget.decoded_body_bytes,
+            )
+        else:
+            raise _UnsupportedBoundedContentEncoding(encoding)
+    return _bounded_identity_layer(
+        response,
+        decoded,
+        limit_bytes=resource_budget.decoded_body_bytes,
+    )
 
 
-def _read_limited_response_body(response: requests.Response) -> bytes:
+def _read_limited_response_body(
+    response: requests.Response,
+    *,
+    resource_budget: WebResourceBudget,
+) -> bytes:
     """读取响应 body，并同时执行 wire/decompressed 上限。
 
     Args:
@@ -623,12 +753,12 @@ def _read_limited_response_body(response: requests.Response) -> bytes:
             declared_length = int(content_length)
         except ValueError:
             declared_length = 0
-        if declared_length > _FETCH_MAX_WIRE_BODY_BYTES:
+        if declared_length > resource_budget.wire_body_bytes:
             raise _FetchBodyLimitExceeded(
                 "HTTP response declared body exceeded fetch wire limit.",
                 final_url=str(getattr(response, "url", "") or ""),
                 limit_kind="wire",
-                limit_bytes=_FETCH_MAX_WIRE_BODY_BYTES,
+                limit_bytes=resource_budget.wire_body_bytes,
                 observed_bytes=declared_length,
                 response_context=_build_fetch_body_limit_runtime_context(response),
             )
@@ -640,14 +770,22 @@ def _read_limited_response_body(response: requests.Response) -> bytes:
             chunks=chunks,
             chunk=chunk,
             observed_bytes=observed_bytes,
-            limit_bytes=_FETCH_MAX_WIRE_BODY_BYTES,
+            limit_bytes=resource_budget.wire_body_bytes,
             limit_kind="wire",
             response=response,
         )
-    return _decompress_limited_response_body(response, b"".join(chunks))
+    return _decompress_limited_response_body(
+        response,
+        b"".join(chunks),
+        resource_budget=resource_budget,
+    )
 
 
-def _materialize_response_body(response: requests.Response) -> None:
+def _materialize_response_body(
+    response: requests.Response,
+    *,
+    resource_budget: WebResourceBudget,
+) -> None:
     """把有界读取后的响应 body 写回 ``requests.Response``。
 
     Args:
@@ -661,7 +799,10 @@ def _materialize_response_body(response: requests.Response) -> None:
         RuntimeError: body 解码失败时抛出。
     """
 
-    decoded_body = _read_limited_response_body(response)
+    decoded_body = _read_limited_response_body(
+        response,
+        resource_budget=resource_budget,
+    )
     setattr(response, "_content", decoded_body)
     response.raw.decode_content = False
 
@@ -1104,6 +1245,34 @@ def _get_session_warmed_hosts(session: requests.Session) -> set[str]:
     return warmed_hosts
 
 
+def _consume_warmup_response_body(
+    response: requests.Response,
+    *,
+    max_bytes: int,
+) -> int:
+    """最多消费 warmup 预算允许的 wire body。
+
+    Args:
+        response: 使用 ``stream=True`` 创建的 warmup 响应。
+        max_bytes: 本次 warmup 最多消费的 wire bytes。
+
+    Returns:
+        实际消费的 wire bytes。
+
+    Raises:
+        requests.RequestException: 底层 response stream 读取失败时透出。
+    """
+
+    consumed_bytes = 0
+    while consumed_bytes < max_bytes:
+        remaining_bytes = max_bytes - consumed_bytes
+        chunk = response.raw.read(min(_FETCH_BODY_CHUNK_BYTES, remaining_bytes))
+        if not chunk:
+            break
+        consumed_bytes += len(chunk)
+    return consumed_bytes
+
+
 def _warmup_domain(
     session: requests.Session,
     *,
@@ -1115,6 +1284,7 @@ def _warmup_domain(
     normalize_url_for_http: Callable[[str], str],
     is_timeout_like_exception: Callable[[BaseException], bool],
     egress_policy: WebEgressPolicy,
+    resource_budget: WebResourceBudget,
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
     cancellation_token: CancellationToken | None = None,
@@ -1150,18 +1320,23 @@ def _warmup_domain(
             headers=headers,
             normalize_url_for_http=normalize_url_for_http,
             egress_policy=egress_policy,
-            stream=False,
+            stream=True,
             cancellation_token=cancellation_token,
         )
         with lease:
             response = lease.response
             _raise_if_cancelled(cancellation_token)
+            consumed_body_bytes = _consume_warmup_response_body(
+                response,
+                max_bytes=resource_budget.warmup_body_bytes,
+            )
             result: dict[str, str | bool | int | float | None] = {
                 "attempted": True,
                 "success": True,
                 "http_status": response.status_code,
                 "final_url": response.url,
                 "redirect_hops": redirect_hops,
+                "consumed_body_bytes": consumed_body_bytes,
             }
         with _WARMED_HOSTS_LOCK:
             _get_session_warmed_hosts(session).add(host)
@@ -1187,11 +1362,16 @@ def _probe_content_type(
     normalize_url_for_http: Callable[[str], str],
     is_timeout_like_exception: Callable[[BaseException], bool],
     egress_policy: WebEgressPolicy,
+    resource_budget: WebResourceBudget,
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
     cancellation_token: CancellationToken | None = None,
 ) -> dict[str, str | bool | int | None]:
-    """探测目标资源类型（HEAD 优先，失败降级到 GET）。"""
+    """探测目标资源类型（HEAD 优先，失败降级到零 body GET）。
+
+    ``resource_budget`` 由与 main/warmup 相同的 owner 显式传入；probe 只读
+    response headers 并立即关闭 lease，因此不消费其 body budget。
+    """
 
     timeout = min(
         resolve_timeout_budget(
@@ -1364,6 +1544,7 @@ def _fetch_and_convert_content(
     headers: dict[str, str] | None = None,
     build_fetch_headers: Callable[[str], dict[str, str]] | None = None,
     egress_policy: WebEgressPolicy,
+    resource_budget: WebResourceBudget,
     content_type_probe: dict[str, str | bool | int | None] | None = None,
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
@@ -1437,10 +1618,21 @@ def _fetch_and_convert_content(
             response = lease.response
             http_redirect_hops += current_redirect_hops
             visited_urls.update(redirect_visited_urls)
+            _raise_if_cancelled(cancellation_token)
+            try:
+                _materialize_response_body(
+                    response,
+                    resource_budget=resource_budget,
+                )
+            except _UnsupportedBoundedContentEncoding as exc:
+                raise _FetchContentConversionError(
+                    str(exc),
+                    response_context=_build_fetch_body_limit_runtime_context(response),
+                    original_error=exc,
+                    failure_reason="unsupported_content_encoding",
+                ) from exc
+            _raise_if_cancelled(cancellation_token)
             response.raise_for_status()
-            _raise_if_cancelled(cancellation_token)
-            _materialize_response_body(response)
-            _raise_if_cancelled(cancellation_token)
 
             probe = (
                 content_type_probe or {"ok": False, "content_type": ""}
@@ -1477,7 +1669,7 @@ def _fetch_and_convert_content(
                     response=response,
                     content_text=html_text,
                 )
-                if raw_challenge.challenge_detected:
+                if raw_challenge.decision is BotChallengeDecision.CONFIRMED:
                     raise _FetchContentConversionError(
                         "HTML 原始响应疑似反爬挑战页或访问门禁。",
                         response_context=_build_fetch_content_runtime_context(response),

@@ -44,7 +44,10 @@ from dayu.runtime.tools_discovery import (
 from dayu.tools.web import web_tools as _web_tools_module
 from dayu.tools.web import web_fetch_orchestrator as _web_fetch_orchestrator
 from dayu.tools.web.provider import discover_tools
-from dayu.tools.web.web_challenge_detection import detect_bot_challenge
+from dayu.tools.web.web_challenge_detection import (
+    BotChallengeDecision,
+    detect_bot_challenge,
+)
 from dayu.tools.web.web_egress_policy import WebEgressPolicy, WebEgressPolicyError
 
 JsonObject: TypeAlias = dict[str, JsonValue]
@@ -1374,7 +1377,9 @@ def _build_requests_profile(
                 "content_length": len(response_bytes),
                 "text_prefix": _prefix_text(response_text, _TEXT_PREFIX_CHARS),
                 "text_length": len(response_text),
-                "challenge_detected": challenge.challenge_detected,
+                "challenge_detected": (
+                    challenge.decision is BotChallengeDecision.CONFIRMED
+                ),
                 "challenge_signals": list(challenge.challenge_signals),
             }
             return profile
@@ -2091,7 +2096,9 @@ def _build_playwright_profile(
                 "page_text_length": len(page_text),
                 "html_prefix": _prefix_text(html, _HTML_PREFIX_CHARS),
                 "html_length": len(html),
-                "challenge_detected": challenge.challenge_detected,
+                "challenge_detected": (
+                    challenge.decision is BotChallengeDecision.CONFIRMED
+                ),
                 "challenge_signals": list(challenge.challenge_signals),
                 "network_events": network_events,
                 "network_event_count": len(network_events),

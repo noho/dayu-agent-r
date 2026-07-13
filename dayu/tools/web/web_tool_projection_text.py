@@ -24,6 +24,18 @@ WEB_SEARCH_PROVIDER_UNAVAILABLE_HINT: Final[str] = (
 )
 """search_web provider 不可用时投影给 LLM 的恢复提示。"""
 
+WEB_SEARCH_PROVIDER_RESPONSE_INVALID_HINT: Final[str] = (
+    "[change_source] The search provider returned an unrecognized response shape; "
+    "use another provider or continue with a known source URL."
+)
+"""search_web provider response 漂移时投影给 LLM 的换源提示。"""
+
+WEB_SEARCH_RESPONSE_BODY_TOO_LARGE_HINT: Final[str] = (
+    "[change_source] The search provider response exceeded the safe processing limit; "
+    "use another provider or continue with a known source URL."
+)
+"""search_web provider response 超限时投影给 LLM 的换源提示。"""
+
 SEARCH_WEB_NEXT_ACTION_FETCH_PAGE: Final[str] = "fetch_web_page"
 """search_web 找到首选结果时投影给 LLM 的下一步工具名。"""
 
