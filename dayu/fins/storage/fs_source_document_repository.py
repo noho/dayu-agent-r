@@ -20,6 +20,7 @@ from dayu.fins.domain.document_models import (
     MaterialRestoreRequest,
     MaterialUpdateRequest,
     SourceDocumentProvenance,
+    SourceDocumentRevision,
     SourceDocumentStateChangeRequest,
     SourceDocumentUpsertRequest,
     SourceHandle,
@@ -434,6 +435,31 @@ class FsSourceDocumentRepository(SourceDocumentRepositoryProtocol):
         """读取源文档 meta。"""
 
         return self._repository_set.core.get_source_meta(ticker, document_id, source_kind)
+
+    def get_source_revision(
+        self,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+    ) -> SourceDocumentRevision:
+        """读取影响 processor 输入的源文档版本。
+
+        Args:
+            ticker: 股票代码。
+            document_id: 文档 ID。
+            source_kind: 来源类型。
+
+        Returns:
+            storage owner 计算的强类型 source revision。
+
+        Raises:
+            FileNotFoundError: source meta 不存在时抛出。
+            KeyError: source meta 缺少必需版本字段时抛出。
+            ValueError: source meta 版本字段类型或内容非法时抛出。
+            OSError: 底层文件系统读取失败时抛出。
+        """
+
+        return self._repository_set.core.get_source_revision(ticker, document_id, source_kind)
 
     def get_source_document_provenance(
         self,

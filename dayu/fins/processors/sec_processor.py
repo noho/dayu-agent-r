@@ -82,6 +82,7 @@ from dayu.fins.processors.sec_table_extraction import (
     _safe_statement_dataframe,
     _should_prioritize_records_output,
 )
+from dayu.fins.processors.source_text import read_source_path_text
 
 
 # --- 本模块独用常量 ---
@@ -883,7 +884,7 @@ def _load_text(source_path: Path) -> str:
         文本内容。
 
     Raises:
-        OSError: 读取失败时抛出。
+        FinsSourceDecodeError: 读取失败或内容不是合法 UTF-8 时抛出。
     """
 
-    return source_path.read_text(encoding="utf-8", errors="ignore")
+    return read_source_path_text(source_path)

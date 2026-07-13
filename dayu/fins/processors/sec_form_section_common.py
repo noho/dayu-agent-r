@@ -405,10 +405,96 @@ class _VirtualSectionProcessorMixin:
         if not built_sections:
             return
         self._virtual_sections = self._expand_virtual_sections_by_structure(built_sections)
-        self._virtual_section_by_ref = {section.ref: section for section in self._virtual_sections}
-        # 将底层表格分配到虚拟章节（需在虚拟章节构建完成后执行）
-        self._assign_tables_to_virtual_sections()
+        self._refresh_virtual_section_state()
         self._postprocess_virtual_sections(full_text)
+
+    def _virtual_section_identity_multiset(self) -> tuple[tuple[int, str], ...]:
+        """返回当前虚拟章节 object/ref 多重集。
+
+        Args:
+            无。
+
+        Returns:
+            按 object identity 与 ref 排序的不可变多重集。
+
+        Raises:
+            RuntimeError: identity 投影失败时抛出。
+        """
+
+        return tuple(sorted((id(section), section.ref) for section in self._virtual_sections))
+
+    def _refresh_virtual_section_state(
+        self,
+        *,
+        expected_identity_multiset: tuple[tuple[int, str], ...] | None = None,
+    ) -> None:
+        """从最终虚拟章节原子刷新索引与 table 双向映射。
+
+        Args:
+            expected_identity_multiset: 可选的刷新前 section object/ref 多重集；
+                10-Q expansion 使用它证明只修改既有 boundary/order。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: expansion 创建/删除 section、ref 重复、父子 ref 悬挂、
+                table ref 重复或 table 双向映射不一致时抛出。
+            RuntimeError: 底层 table 列表读取失败时抛出。
+        """
+
+        current_identity_multiset = self._virtual_section_identity_multiset()
+        if expected_identity_multiset is not None and current_identity_multiset != expected_identity_multiset:
+            raise ValueError("虚拟章节 expansion 不得创建、删除或替换 section/ref")
+
+        section_by_ref: dict[str, _VirtualSection] = {}
+        for section in self._virtual_sections:
+            if section.ref in section_by_ref:
+                raise ValueError(f"虚拟章节 ref 重复: {section.ref}")
+            section_by_ref[section.ref] = section
+        for section in self._virtual_sections:
+            if section.parent_ref is not None and section.parent_ref not in section_by_ref:
+                raise ValueError(f"虚拟章节 parent_ref 悬挂: {section.parent_ref}")
+            for child_ref in section.child_refs:
+                child = section_by_ref.get(child_ref)
+                if child is None or child.parent_ref != section.ref:
+                    raise ValueError(f"虚拟章节 child_ref 悬挂或反向关系不一致: {child_ref}")
+
+        # 先清空全部派生状态，再以最终 section boundary/order 唯一重建。
+        self._virtual_section_by_ref = section_by_ref
+        self._table_ref_to_virtual_ref.clear()
+        for section in self._virtual_sections:
+            section.table_refs.clear()
+        self._assign_tables_to_virtual_sections()
+
+        base_table_refs: set[str] = set()
+        for table in self._get_base_processor().list_tables():
+            table_ref = _normalize_optional_string(table.get("table_ref"))
+            if table_ref is None:
+                continue
+            if table_ref in base_table_refs:
+                raise ValueError(f"底层 table_ref 重复: {table_ref}")
+            base_table_refs.add(table_ref)
+
+        section_table_refs: set[str] = set()
+        for section in self._virtual_sections:
+            for table_ref in section.table_refs:
+                if table_ref in section_table_refs:
+                    raise ValueError(f"虚拟章节 table_ref 重复分配: {table_ref}")
+                section_table_refs.add(table_ref)
+                if table_ref not in base_table_refs:
+                    raise ValueError(f"虚拟章节 table_ref 悬挂: {table_ref}")
+                if self._table_ref_to_virtual_ref.get(table_ref) != section.ref:
+                    raise ValueError(f"table 双向映射不一致: {table_ref}")
+
+        if set(self._table_ref_to_virtual_ref) != section_table_refs:
+            raise ValueError("table 反向映射包含未投影到 section 的引用")
+        for table_ref, section_ref in self._table_ref_to_virtual_ref.items():
+            if section_ref not in section_by_ref:
+                raise ValueError(f"table section_ref 悬挂: {section_ref}")
+        if base_table_refs != section_table_refs:
+            missing_refs = sorted(base_table_refs - section_table_refs)
+            raise ValueError(f"存在无法分配到最终虚拟章节的 table_ref: {missing_refs}")
 
     def _postprocess_virtual_sections(self, full_text: str) -> None:
         """对子类已构建的虚拟章节做可选后处理。

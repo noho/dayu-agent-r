@@ -287,6 +287,39 @@ DownloadRejectionRegistry: TypeAlias = dict[str, DownloadRejectionEntry]
 
 
 @dataclass(frozen=True)
+class SourceDocumentRevision:
+    """源文档处理输入的仓储版本投影。
+
+    Attributes:
+        digest: storage owner 根据规范化 source meta 计算的 SHA-256 摘要。
+    """
+
+    digest: str
+
+    def __post_init__(self) -> None:
+        """校验 revision 摘要格式。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: 摘要不是 ``sha256:<64位十六进制>`` 时抛出。
+        """
+
+        prefix = "sha256:"
+        hexadecimal = self.digest.removeprefix(prefix)
+        if (
+            not self.digest.startswith(prefix)
+            or len(hexadecimal) != 64
+            or any(character not in "0123456789abcdef" for character in hexadecimal)
+        ):
+            raise ValueError("source revision digest 必须为 sha256 摘要")
+
+
+@dataclass(frozen=True)
 class FileObjectMeta:
     """文件对象元数据。"""
 

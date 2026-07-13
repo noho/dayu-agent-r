@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import shutil
+from collections.abc import Mapping
 from typing import Any, Final, Optional
 
+from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.source import Source
 from dayu.fins.domain.document_models import (
     DocumentHandle,
@@ -24,6 +28,7 @@ from dayu.fins.domain.document_models import (
     MaterialRestoreRequest,
     MaterialUpdateRequest,
     SourceDocumentProvenance,
+    SourceDocumentRevision,
     SourceDocumentUpsertRequest,
     SourceHandle,
     now_iso8601,
@@ -62,6 +67,161 @@ _STAGING_STABLE_META_FIELDS: Final[tuple[str, ...]] = (
     "provider_company_id",
 )
 """staging source document 重入时必须保持不变的 meta 字段。"""
+
+_SOURCE_REVISION_REQUIRED_TEXT_FIELDS: Final[tuple[str, ...]] = (
+    "document_version",
+    "source_fingerprint",
+)
+"""source revision 必须消费且不得为 null 的字符串字段。"""
+
+_SOURCE_REVISION_OPTIONAL_TEXT_FIELDS: Final[tuple[str, ...]] = (
+    "form_type",
+    "primary_document",
+)
+"""source revision 中允许缺省为空的字符串字段。"""
+
+_SOURCE_REVISION_FILE_OPTIONAL_TEXT_FIELDS: Final[tuple[str, ...]] = (
+    "etag",
+    "last_modified",
+    "sha256",
+    "content_type",
+)
+"""文件 revision 投影中允许缺省为空的字符串字段。"""
+
+
+def _read_revision_text_field(
+    meta: Mapping[str, JsonValue],
+    field_name: str,
+    *,
+    allow_missing: bool,
+    allow_none: bool,
+) -> str | None:
+    """读取 source revision 使用的可选文本字段。
+
+    Args:
+        meta: source meta 或文件条目。
+        field_name: 字段名。
+        allow_missing: 是否允许字段缺省并规范为 ``None``。
+        allow_none: 是否允许显式 JSON null。
+
+    Returns:
+        规范化字符串或 ``None``。
+
+    Raises:
+        KeyError: 必需字段缺失时抛出。
+        ValueError: 字段不是字符串或 ``None`` 时抛出。
+    """
+
+    if field_name not in meta:
+        if allow_missing:
+            return None
+        raise KeyError(f"source meta 缺少 revision 字段: {field_name}")
+    value = meta[field_name]
+    if value is None:
+        if allow_none:
+            return None
+        raise ValueError(f"source revision 字段 {field_name} 不得为 null")
+    if not isinstance(value, str):
+        raise ValueError(f"source revision 字段 {field_name} 必须为字符串或 null")
+    return value
+
+
+def _build_source_revision_file_payload(raw_file: JsonValue) -> dict[str, str | int | None]:
+    """把单个 source file 条目收窄为稳定 revision 载荷。
+
+    Args:
+        raw_file: source meta ``files`` 中的原始条目。
+
+    Returns:
+        只含文件身份与内容字段的规范化载荷。
+
+    Raises:
+        ValueError: 文件条目或字段类型非法时抛出。
+        KeyError: 文件条目缺少 ``name`` 或 ``uri`` 时抛出。
+    """
+
+    if not isinstance(raw_file, Mapping):
+        raise ValueError("source revision files 条目必须为 object")
+    name = _read_revision_text_field(raw_file, "name", allow_missing=False, allow_none=False)
+    uri = _read_revision_text_field(raw_file, "uri", allow_missing=False, allow_none=False)
+    if name is None or not name.strip():
+        raise ValueError("source revision file.name 不能为空")
+    if uri is None or not uri.strip():
+        raise ValueError("source revision file.uri 不能为空")
+    size = raw_file.get("size")
+    if size is not None and (not isinstance(size, int) or isinstance(size, bool) or size < 0):
+        raise ValueError("source revision file.size 必须为非负整数或 null")
+    payload: dict[str, str | int | None] = {
+        "name": name,
+        "uri": uri,
+        "size": size,
+    }
+    for field_name in _SOURCE_REVISION_FILE_OPTIONAL_TEXT_FIELDS:
+        payload[field_name] = _read_revision_text_field(
+            raw_file,
+            field_name,
+            allow_missing=True,
+            allow_none=True,
+        )
+    return payload
+
+
+def _build_source_revision(meta: Mapping[str, JsonValue]) -> SourceDocumentRevision:
+    """从 source meta 计算 processor 输入版本。
+
+    Args:
+        meta: storage owner 读取到的 source meta。
+
+    Returns:
+        基于 canonical JSON 与 SHA-256 的强类型版本投影。
+
+    Raises:
+        KeyError: 必需字段缺失时抛出。
+        ValueError: 字段类型或内容非法时抛出。
+        TypeError: canonical 载荷无法序列化时抛出。
+    """
+
+    revision_payload: dict[str, str | bool | list[dict[str, str | int | None]] | None] = {}
+    for field_name in _SOURCE_REVISION_REQUIRED_TEXT_FIELDS:
+        revision_payload[field_name] = _read_revision_text_field(
+            meta,
+            field_name,
+            allow_missing=False,
+            allow_none=False,
+        )
+    document_version = revision_payload["document_version"]
+    if not isinstance(document_version, str) or not document_version.strip():
+        raise ValueError("source revision 字段 document_version 不能为空")
+    for field_name in _SOURCE_REVISION_OPTIONAL_TEXT_FIELDS:
+        revision_payload[field_name] = _read_revision_text_field(
+            meta,
+            field_name,
+            allow_missing=True,
+            allow_none=True,
+        )
+    for field_name in ("ingest_complete", "is_deleted"):
+        if field_name not in meta:
+            raise KeyError(f"source meta 缺少 revision 字段: {field_name}")
+        value = meta[field_name]
+        if not isinstance(value, bool):
+            raise ValueError(f"source revision 字段 {field_name} 必须为布尔值")
+        revision_payload[field_name] = value
+    raw_files = meta.get("files", [])
+    if not isinstance(raw_files, list):
+        raise ValueError("source revision 字段 files 必须为数组")
+    file_payloads = [_build_source_revision_file_payload(raw_file) for raw_file in raw_files]
+    file_payloads.sort(
+        key=lambda payload: json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    )
+    revision_payload["files"] = file_payloads
+    canonical_json = json.dumps(
+        revision_payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+    return SourceDocumentRevision(digest=f"sha256:{digest}")
 
 
 class _FsSourceDocumentMixin(_FsStorageInfra):
@@ -335,6 +495,33 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
                 f"document_id={document_id} 的 {normalized_source_kind.value} meta.json 不存在"
             )
         return _read_json_object(meta_path)
+
+    def get_source_revision(
+        self,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+    ) -> SourceDocumentRevision:
+        """读取影响 processor 输入的源文档版本。
+
+        Args:
+            ticker: 股票代码。
+            document_id: 文档 ID。
+            source_kind: 来源类型。
+
+        Returns:
+            由 canonical source meta 计算的强类型版本投影。
+
+        Raises:
+            FileNotFoundError: source meta 不存在时抛出。
+            KeyError: source meta 缺少必需版本字段时抛出。
+            ValueError: source meta 版本字段类型或内容非法时抛出。
+            OSError: 底层文件系统读取失败时抛出。
+        """
+
+        normalized_source_kind = _normalize_source_kind(source_kind)
+        meta = self.get_source_meta(ticker, document_id, normalized_source_kind)
+        return _build_source_revision(meta)
 
     def get_source_document_provenance(
         self,

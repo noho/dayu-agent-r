@@ -1045,7 +1045,7 @@ async def _invoke_fins_read_business(
         except FinsReadBusinessError as exc:
             return failed_outcome(
                 tool_name=tool_name,
-                error=exc.code,
+                error=exc.code.value,
                 message=exc.message,
                 hint=exc.hint,
                 started_at=started_at,
@@ -1140,7 +1140,7 @@ def _execute_fins_read_business_value(
             _INVALID_ARGUMENT_HINT,
         ) from exc
     except FinsReadBusinessError as exc:
-        raise _FinsReadBusinessFailure(exc.code, exc.message, exc.hint) from exc
+        raise _FinsReadBusinessFailure(exc.code.value, exc.message, exc.hint) from exc
     except FileNotFoundError as exc:
         raise _FinsReadBusinessFailure(
             "file_not_found",

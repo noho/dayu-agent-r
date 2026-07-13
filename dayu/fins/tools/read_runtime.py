@@ -4,7 +4,7 @@
 - 参数校验与标准化。
 - `document_id -> source_kind -> source -> processor` 路由。
 - 统一能力降级（`not_supported`）。
-- 仅做进程内 LRU 缓存：Processor 按 `ticker + document_id`，source meta 按来源维度隔离。
+- 仅做进程内 LRU 缓存：Processor 按 `ticker + document_id`，source meta 按来源维度隔离；两者复用前校验 storage revision。
 """
 
 from __future__ import annotations
@@ -13,12 +13,12 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from threading import Lock, RLock
-from typing import Any, Final, Literal, Optional, Protocol, TypedDict, runtime_checkable
+from typing import Any, Final, Literal, NoReturn, Optional, Protocol, TypedDict, runtime_checkable
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.fins._log import Log
-from dayu.fins.domain.document_models import FinsSourceProvider
+from dayu.fins.domain.document_models import FinsSourceProvider, SourceDocumentRevision
 from dayu.fins.domain.financial_result_contract import (
     FinancialStatementResult as ProcessorFinancialStatementResult,
     validate_financial_statement_result_payload,
@@ -35,6 +35,7 @@ from dayu.documents.processors.base import (
     TableSummary,
 )
 from dayu.documents.processors.processor_registry import ProcessorRegistry
+from dayu.fins.processors.source_text import FinsSourceDecodeError, validate_source_utf8_text
 from .error_contract import ErrorCode
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.domain.tool_models import Citation, SourceType
@@ -202,10 +203,29 @@ class _CachedSourceDocumentMeta:
     """source meta 缓存值。
 
     Attributes:
-        meta: 已收窄的 source meta；文档不存在时为 ``None``。
+        meta: 已收窄的 source meta。
+        source_kind: meta 对应的 source kind。
+        revision: meta 构建时对应的 storage source revision。
     """
 
-    meta: _SourceDocumentMeta | None
+    meta: _SourceDocumentMeta
+    source_kind: SourceKind
+    revision: SourceDocumentRevision
+
+
+@dataclass(frozen=True)
+class _CachedProcessor:
+    """processor 缓存值。
+
+    Attributes:
+        processor: 已构建的文档处理器。
+        source_kind: processor 输入对应的 source kind。
+        revision: processor 构建时对应的 storage source revision。
+    """
+
+    processor: DocumentProcessor
+    source_kind: SourceKind
+    revision: SourceDocumentRevision
 
 
 class _SourceDocumentSummary(TypedDict):
@@ -537,7 +557,7 @@ class FinsReadRuntime:
     设计约束：
     - 不依赖 `processed/*.json` 产物。
     - 所有读取均通过实时 Processor 能力完成。
-    - 缓存仅保留 Processor 实例。
+    - processor/meta 缓存条目绑定 storage-owned source revision，revision 不一致时同步失效。
     """
 
     MODULE = "FINS.READ_RUNTIME"
@@ -577,7 +597,7 @@ class FinsReadRuntime:
         self._source_repository = source_repository
         self._processed_repository = processed_repository
         self._processor_registry = processor_registry
-        self._processor_cache: ProcessorLRUCache[DocumentProcessor] = ProcessorLRUCache(
+        self._processor_cache: ProcessorLRUCache[_CachedProcessor] = ProcessorLRUCache(
             max_entries=processor_cache_max_entries,
         )
         self._meta_cache: ProcessorLRUCache[_CachedSourceDocumentMeta] = ProcessorLRUCache(
@@ -983,16 +1003,6 @@ class FinsReadRuntime:
             ticker=normalized_ticker,
             document_id=normalized_document_id,
         )
-        ref_to_topic: dict[str, Optional[str]] = {}
-        semantic_profiles: dict[str, SectionSemanticProfile] = {}
-        query_term_df: dict[str, int] = {}
-        bm25f_index = BM25FSectionIndex(
-            profiles={},
-            document_frequency={},
-            avg_field_lengths={},
-            avg_content_length=0.0,
-            document_count=0,
-        )
         try:
             _raise_if_fins_cancelled(cancellation_token)
             all_secs = processor.list_sections()
@@ -1006,6 +1016,7 @@ class FinsReadRuntime:
             bm25f_index = build_section_bm25f_index(enriched_for_search)
             _raise_if_fins_cancelled(cancellation_token)
             semantic_profiles, query_term_df = _build_section_semantic_profiles(enriched_for_search)
+            ref_to_topic: dict[str, Optional[str]] = {}
             for sec in enriched_for_search:
                 _raise_if_fins_cancelled(cancellation_token)
                 ref = sec.get("ref")
@@ -1013,8 +1024,15 @@ class FinsReadRuntime:
                     ref_to_topic[ref] = sec.get("topic")
         except FinsReadCancelledError:
             raise
-        except Exception:
-            pass
+        except Exception as exc:
+            # 异常与取消同时发生时，Host 取消仍是优先终态；只有未取消的
+            # index readiness 失败才投影为搜索业务失败。
+            _raise_if_fins_cancelled(cancellation_token)
+            raise FinsReadBusinessError(
+                ErrorCode.SEARCH_INDEX_FAILED,
+                "文档搜索索引构建失败，当前搜索结果不可用。",
+                hint="请稍后重新发起搜索；也可先读取章节列表定位内容。",
+            ) from exc
 
         is_multi = len(resolved_queries) > 1
 
@@ -1742,7 +1760,7 @@ class FinsReadRuntime:
             )
         except XbrlQueryExecutionError as exc:
             raise FinsReadBusinessError(
-                ErrorCode.XBRL_QUERY_FAILED.value,
+                ErrorCode.XBRL_QUERY_FAILED,
                 "XBRL 查询执行失败，当前结果不可作为零命中使用。",
                 hint="请稍后重试；若持续失败，可改用财务报表或原文读取工具。",
             ) from exc
@@ -1900,7 +1918,7 @@ class FinsReadRuntime:
         _raise_if_fins_cancelled(cancellation_token)
         if resolved_ticker is None:
             raise FinsReadBusinessError(
-                code=ErrorCode.NOT_FOUND.value,
+                code=ErrorCode.NOT_FOUND,
                 message=f"Financial Document Tools do not have this company: ticker='{normalized_ticker}'.",
                 hint=_MISSING_TICKER_HINT,
             )
@@ -2189,16 +2207,70 @@ class FinsReadRuntime:
 
         Raises:
             FileNotFoundError: source meta 不存在时抛出。
+            FinsReadBusinessError: meta 读取期间 source revision 变化时抛出。
         """
 
         cache_key = ProcessorCacheKey(ticker=ticker, document_id=document_id, source_kind=source_kind.value)
-        cached = self._meta_cache.get(cache_key)
-        if cached is not None and cached.meta is not None:
-            return cached.meta
-        raw_meta = self._source_repository.get_source_meta(ticker, document_id, source_kind)
-        meta = _parse_source_document_meta(raw_meta)
-        self._meta_cache.put(cache_key, _CachedSourceDocumentMeta(meta=meta))
-        return meta
+        creation_key = ProcessorCacheKey(ticker=ticker, document_id=document_id)
+        lock = self._get_creation_lock(creation_key)
+        with lock:
+            try:
+                revision_before = self._source_repository.get_source_revision(ticker, document_id, source_kind)
+            except Exception:
+                self._evict_source_kind_caches(
+                    ticker=ticker,
+                    document_id=document_id,
+                    source_kind=source_kind,
+                )
+                raise
+
+            cached = self._meta_cache.get(cache_key)
+            cached_processor = self._processor_cache.peek(creation_key)
+            processor_is_stale = (
+                cached_processor is not None
+                and cached_processor.source_kind is source_kind
+                and cached_processor.revision != revision_before
+            )
+            if processor_is_stale or (
+                cached is not None
+                and (cached.source_kind is not source_kind or cached.revision != revision_before)
+            ):
+                self._evict_source_kind_caches(
+                    ticker=ticker,
+                    document_id=document_id,
+                    source_kind=source_kind,
+                )
+                cached = None
+            if cached is not None:
+                return cached.meta
+
+            raw_meta = self._source_repository.get_source_meta(ticker, document_id, source_kind)
+            meta = _parse_source_document_meta(raw_meta)
+            try:
+                revision_after = self._source_repository.get_source_revision(ticker, document_id, source_kind)
+            except Exception as exc:
+                self._evict_source_kind_caches(
+                    ticker=ticker,
+                    document_id=document_id,
+                    source_kind=source_kind,
+                )
+                self._raise_source_changed_during_read(cause=exc)
+            if revision_before != revision_after:
+                self._evict_source_kind_caches(
+                    ticker=ticker,
+                    document_id=document_id,
+                    source_kind=source_kind,
+                )
+                self._raise_source_changed_during_read()
+            self._meta_cache.put(
+                cache_key,
+                _CachedSourceDocumentMeta(
+                    meta=meta,
+                    source_kind=source_kind,
+                    revision=revision_after,
+                ),
+            )
+            return meta
 
     def _get_document_meta_cached(self, ticker: str, document_id: str) -> _SourceDocumentMeta | None:
         """读取文档元数据（带实例级缓存）。
@@ -2213,18 +2285,11 @@ class FinsReadRuntime:
         Returns:
             meta 字典；文档不存在时返回 None。
         """
-        cache_key = ProcessorCacheKey(ticker=ticker, document_id=document_id)
-        cached = self._meta_cache.get(cache_key)
-        if cached is not None:
-            return cached.meta
         try:
             source_kind = self._resolve_source_kind(ticker=ticker, document_id=document_id)
-            raw_meta = self._source_repository.get_source_meta(ticker, document_id, source_kind)
-            meta = _parse_source_document_meta(raw_meta)
         except FileNotFoundError:
-            meta = None
-        self._meta_cache.put(cache_key, _CachedSourceDocumentMeta(meta=meta))
-        return meta
+            return None
+        return self._get_source_meta_cached_by_kind(ticker, document_id, source_kind)
 
     def _enrich_sections_with_semantic(
         self,
@@ -2410,7 +2475,7 @@ class FinsReadRuntime:
                 continue
             if cache_key.document_id == current_document_id:
                 continue
-            cached_processor = self._processor_cache.peek(cache_key)
+            cached_processor = self._get_fresh_cached_processor_for_diagnosis(cache_key)
             if cached_processor is None:
                 continue
             try:
@@ -2432,6 +2497,50 @@ class FinsReadRuntime:
             return cache_key.document_id
         return None
 
+    def _get_fresh_cached_processor_for_diagnosis(
+        self,
+        cache_key: ProcessorCacheKey,
+    ) -> DocumentProcessor | None:
+        """读取仍与 storage revision 一致的诊断候选 processor。
+
+        Args:
+            cache_key: 无 source-kind 维度的 processor cache key。
+
+        Returns:
+            revision 一致的 processor；未命中、source 失效或 revision
+            mismatch 时返回 ``None``。
+
+        Raises:
+            RuntimeError: document lock 或缓存内部操作失败时抛出。
+        """
+
+        lock = self._get_creation_lock(cache_key)
+        with lock:
+            cached = self._processor_cache.peek(cache_key)
+            if cached is None:
+                return None
+            try:
+                revision = self._source_repository.get_source_revision(
+                    cache_key.ticker,
+                    cache_key.document_id,
+                    cached.source_kind,
+                )
+            except Exception:
+                self._evict_processor_path_caches(
+                    ticker=cache_key.ticker,
+                    document_id=cache_key.document_id,
+                    source_kind=cached.source_kind,
+                )
+                return None
+            if cached.revision != revision:
+                self._evict_processor_path_caches(
+                    ticker=cache_key.ticker,
+                    document_id=cache_key.document_id,
+                    source_kind=cached.source_kind,
+                )
+                return None
+            return cached.processor
+
     def _get_or_create_processor(
         self,
         *,
@@ -2452,28 +2561,79 @@ class FinsReadRuntime:
         Raises:
             FileNotFoundError: 文档不存在时抛出。
             ValueError: 未匹配处理器时抛出。
+            FinsReadBusinessError: source 解码失败或构建期间 revision 变化时抛出。
         """
 
         _raise_if_fins_cancelled(cancellation_token)
         cache_key = ProcessorCacheKey(ticker=ticker, document_id=document_id)
-        cached = self._processor_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
+        source_kind = self._resolve_source_kind(
+            ticker=ticker,
+            document_id=document_id,
+            cancellation_token=cancellation_token,
+        )
         lock = self._get_creation_lock(cache_key)
         with lock:
-            # 复杂逻辑说明：并发线程在锁内二次检查，避免重复构建 Processor。
             _raise_if_fins_cancelled(cancellation_token)
+            try:
+                revision_before = self._source_repository.get_source_revision(ticker, document_id, source_kind)
+            except Exception:
+                self._evict_processor_path_caches(
+                    ticker=ticker,
+                    document_id=document_id,
+                    source_kind=source_kind,
+                )
+                raise
             cached = self._processor_cache.get(cache_key)
-            if cached is not None:
-                return cached
+            cached_meta = self._meta_cache.peek(
+                ProcessorCacheKey(ticker=ticker, document_id=document_id, source_kind=source_kind.value)
+            )
+            processor_is_current = (
+                cached is not None
+                and cached.source_kind is source_kind
+                and cached.revision == revision_before
+            )
+            meta_is_current = cached_meta is None or (
+                cached_meta.source_kind is source_kind and cached_meta.revision == revision_before
+            )
+            if processor_is_current and meta_is_current and cached is not None:
+                return cached.processor
+            if cached is not None or not meta_is_current:
+                self._evict_processor_path_caches(
+                    ticker=ticker,
+                    document_id=document_id,
+                    source_kind=source_kind,
+                )
+
             processor = self._create_processor(
                 ticker=ticker,
                 document_id=document_id,
                 cancellation_token=cancellation_token,
             )
             _raise_if_fins_cancelled(cancellation_token)
-            self._processor_cache.put(cache_key, processor)
+            try:
+                revision_after = self._source_repository.get_source_revision(ticker, document_id, source_kind)
+            except Exception as exc:
+                self._evict_processor_path_caches(
+                    ticker=ticker,
+                    document_id=document_id,
+                    source_kind=source_kind,
+                )
+                self._raise_source_changed_during_read(cause=exc)
+            if revision_before != revision_after:
+                self._evict_processor_path_caches(
+                    ticker=ticker,
+                    document_id=document_id,
+                    source_kind=source_kind,
+                )
+                self._raise_source_changed_during_read()
+            self._processor_cache.put(
+                cache_key,
+                _CachedProcessor(
+                    processor=processor,
+                    source_kind=source_kind,
+                    revision=revision_after,
+                ),
+            )
             Log.debug(
                 f"processor 已创建并缓存: ticker={ticker} document_id={document_id} type={type(processor).__name__}",
                 module=self.MODULE,
@@ -2501,6 +2661,7 @@ class FinsReadRuntime:
             FileNotFoundError: 文档不存在时抛出。
             ValueError: 未匹配处理器时抛出。
             RuntimeError: 候选处理器全部创建失败时抛出。
+            FinsReadBusinessError: 文本 source 无法可靠解码时抛出。
         """
 
         _raise_if_fins_cancelled(cancellation_token)
@@ -2517,13 +2678,26 @@ class FinsReadRuntime:
         )
         _raise_if_fins_cancelled(cancellation_token)
         source_meta = self._source_repository.get_source_meta(ticker, document_id, source_kind)
+        parsed_source_meta = _parse_source_document_meta(source_meta)
+        if parsed_source_meta["is_deleted"] or not parsed_source_meta["ingest_complete"]:
+            raise FileNotFoundError(
+                f"source document 当前不可读取: ticker={ticker}, document_id={document_id}"
+            )
         form_type = normalize_optional_text(source_meta.get("form_type"))
         _raise_if_fins_cancelled(cancellation_token)
-        return self._processor_registry.create_with_fallback(
-            source=source,
-            form_type=form_type,
-            media_type=getattr(source, "media_type", None),
-        )
+        try:
+            validate_source_utf8_text(source)
+            return self._processor_registry.create_with_fallback(
+                source=source,
+                form_type=form_type,
+                media_type=source.media_type,
+            )
+        except FinsSourceDecodeError as exc:
+            raise FinsReadBusinessError(
+                ErrorCode.SOURCE_DECODE_FAILED,
+                "源文档无法被可靠解码，当前读取结果不可用。",
+                hint="请重新获取有效的 UTF-8 源文档后再试。",
+            ) from exc
 
     def _resolve_source_kind(
         self,
@@ -2582,3 +2756,94 @@ class FinsReadRuntime:
             created = Lock()
             self._creation_locks[cache_key] = created
             return created
+
+    def _evict_source_kind_caches(
+        self,
+        *,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+    ) -> None:
+        """清理指定 source kind 的 processor/meta 缓存。
+
+        Args:
+            ticker: 标准化股票代码。
+            document_id: 标准化文档 ID。
+            source_kind: 发生 revision mismatch 的 source kind。
+
+        Returns:
+            无。
+
+        Raises:
+            RuntimeError: 缓存内部操作失败时抛出。
+        """
+
+        processor_key = ProcessorCacheKey(ticker=ticker, document_id=document_id)
+        cached_processor = self._processor_cache.peek(processor_key)
+        if cached_processor is not None and cached_processor.source_kind is source_kind:
+            self._processor_cache.evict(processor_key)
+        self._meta_cache.evict(
+            ProcessorCacheKey(ticker=ticker, document_id=document_id, source_kind=source_kind.value)
+        )
+        # no-kind positive cache 已删除；保留清理动作避免旧运行时条目残留。
+        self._meta_cache.evict(processor_key)
+
+    def _evict_processor_path_caches(
+        self,
+        *,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+    ) -> None:
+        """清理 processor 路由及其关联 source meta 缓存。
+
+        Args:
+            ticker: 标准化股票代码。
+            document_id: 标准化文档 ID。
+            source_kind: 当前 storage 路由解析出的 source kind。
+
+        Returns:
+            无。
+
+        Raises:
+            RuntimeError: 缓存内部操作失败时抛出。
+        """
+
+        processor_key = ProcessorCacheKey(ticker=ticker, document_id=document_id)
+        cached_processor = self._processor_cache.peek(processor_key)
+        self._processor_cache.evict(processor_key)
+        kinds_to_evict = {source_kind}
+        if cached_processor is not None:
+            kinds_to_evict.add(cached_processor.source_kind)
+        for cached_source_kind in kinds_to_evict:
+            self._meta_cache.evict(
+                ProcessorCacheKey(
+                    ticker=ticker,
+                    document_id=document_id,
+                    source_kind=cached_source_kind.value,
+                )
+            )
+        self._meta_cache.evict(processor_key)
+
+    @staticmethod
+    def _raise_source_changed_during_read(*, cause: Exception | None = None) -> NoReturn:
+        """抛出读取期间 source revision 变化的 typed failure。
+
+        Args:
+            cause: 可选的第二次 revision 读取异常。
+
+        Returns:
+            不返回。
+
+        Raises:
+            FinsReadBusinessError: 始终以 ``source_changed_during_read`` 抛出。
+        """
+
+        failure = FinsReadBusinessError(
+            ErrorCode.SOURCE_CHANGED_DURING_READ,
+            "读取期间源文档发生变化，当前结果已丢弃。",
+            hint="请重新发起一次读取，以使用最新源文档。",
+        )
+        if cause is None:
+            raise failure
+        raise failure from cause

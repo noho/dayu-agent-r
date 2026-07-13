@@ -27,6 +27,8 @@ from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.pipelines import sec_download_filing_workflow as _sec_download_filing_workflow
 from dayu.fins.pipelines import sec_6k_primary_document_repair as _sec_6k_primary_repair
 from dayu.fins.pipelines import sec_pipeline
+from dayu.fins.pipelines.sec_6k_rules import _extract_head_text
+from dayu.fins.processors.source_text import FinsSourceDecodeError
 from dayu.fins.domain.filing_semantics import (
     expand_sec_form_aliases,
     normalize_document_quality,
@@ -55,6 +57,26 @@ class _NeverCancelled:
         """始终返回未取消。"""
 
         return False
+
+
+def test_sec_6k_preview_rejects_invalid_utf8() -> None:
+    """6-K preview 遇到非法 UTF-8 时应 typed fail，不得返回删字文本。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法 bytes 未触发 typed decode failure 时抛出。
+    """
+
+    with pytest.raises(FinsSourceDecodeError) as error_info:
+        _extract_head_text(b"valid\xffinvalid", max_lines=10)
+
+    assert "\\xff" not in str(error_info.value)
+    assert isinstance(error_info.value.__cause__, UnicodeDecodeError)
 
 
 class _RecordingSecPipelineForAdapter:

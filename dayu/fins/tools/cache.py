@@ -1,6 +1,6 @@
-"""财报工具缓存组件。
+"""财报工具进程内 LRU 缓存组件。
 
-本模块仅提供 Processor 实例缓存能力：
+本模块提供 processor 与同源 typed runtime projection 的缓存容器：
 - 只做进程内缓存。
 - 只做 LRU 淘汰（无 TTL）。
 - 线程安全，适配多线程工具并发调用。
@@ -35,7 +35,7 @@ class ProcessorCacheKey:
 
 
 class ProcessorLRUCache(Generic[ProcessorT]):
-    """线程安全的 Processor LRU 缓存。
+    """线程安全的 Fins runtime LRU 缓存。
 
     设计说明：
     - 本缓存只按访问顺序做 LRU 淘汰，不做时间失效。

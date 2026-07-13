@@ -51,6 +51,7 @@ from .report_form_financial_statement_common import (
     select_report_statement_tables as _select_report_statement_tables,
     should_apply_report_statement_html_fallback as _should_apply_report_statement_html_fallback,
 )
+from .source_text import materialize_source_text
 
 _TABLE_OF_CONTENTS_TOKEN = "table of contents"
 _TABLE_OF_CONTENTS_CUTOFF_BUFFER_CHARS = 1500
@@ -601,21 +602,13 @@ def _extract_source_text_preserving_lines(source: Source) -> str:
         source: 文档来源抽象。
 
     Returns:
-        使用 DOM 顺序和换行分隔提取的文本；失败时返回空字符串。
+        使用 DOM 顺序和换行分隔提取的文本。
 
     Raises:
-        RuntimeError: 读取失败时抛出。
+        FinsSourceDecodeError: 物化、读取或 UTF-8 解码失败时抛出。
     """
 
-    try:
-        source_path = source.materialize(suffix=".html")
-    except Exception:
-        return ""
-    path = Path(source_path)
-    try:
-        raw_html = path.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        return ""
+    raw_html = materialize_source_text(source, suffix=".html")
     if not raw_html.strip():
         return ""
     parser = _LinePreservingHtmlTextExtractor()

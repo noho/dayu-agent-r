@@ -35,6 +35,7 @@ from dayu.fins.domain.xbrl_result_contract import XbrlQueryReason
 from .result_types import NotSupportedResult
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.domain.filing_semantics import normalize_sec_form_type_for_matching
+from .error_contract import ErrorCode
 
 # ---------------------------------------------------------------------------
 # 预编译正则
@@ -254,7 +255,7 @@ class FinsReadBusinessError(Exception):
         无。
     """
 
-    def __init__(self, code: str, message: str, *, hint: str = "") -> None:
+    def __init__(self, code: ErrorCode, message: str, *, hint: str = "") -> None:
         """初始化 Fins 业务失败。
 
         Args:

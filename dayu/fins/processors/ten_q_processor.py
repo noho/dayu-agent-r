@@ -86,8 +86,10 @@ class TenQFormProcessor(_BaseSecReportFormProcessor):
             RuntimeError: 修复失败时抛出。
         """
 
+        identity_multiset = self._virtual_section_identity_multiset()
         expand_ten_q_virtual_sections_content(
             full_text=full_text,
             virtual_sections=self._virtual_sections,
         )
+        self._refresh_virtual_section_state(expected_identity_multiset=identity_multiset)
 __all__ = ["TenQFormProcessor"]

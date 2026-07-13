@@ -84,10 +84,7 @@ class TenKFormProcessor(_BaseSecReportFormProcessor):
             full_text=full_text,
             virtual_sections=self._virtual_sections,
         )
-        self._virtual_section_by_ref = {
-            section.ref: section for section in self._virtual_sections
-        }
-        self._assign_tables_to_virtual_sections()
+        self._refresh_virtual_section_state()
 
 
 __all__ = ["TenKFormProcessor"]

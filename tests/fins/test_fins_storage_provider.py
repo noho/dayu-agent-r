@@ -76,6 +76,7 @@ from dayu.fins.storage import (
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.tools.fins_limits import FinsToolLimits
+from dayu.fins.tools.error_contract import ErrorCode
 from dayu.fins.tools.fins_tools import build_fins_read_tool_definitions
 from dayu.fins.tools.provider import discover_tools
 from dayu.fins.tools.read_runtime import FinsReadRuntime
@@ -298,7 +299,6 @@ class _SearchCancellingProcessor:
                 preview="Annual recurring revenue",
             )
         ]
-
     def list_tables(self) -> list[TableSummary]:
         """返回测试表格列表。
 
@@ -391,6 +391,25 @@ class _SearchCancellingProcessor:
         """
 
         return "Annual recurring revenue"
+
+
+class _SearchIndexFailingProcessor(_SearchCancellingProcessor):
+    """测试用 search index list stage 失败 processor。"""
+
+    def list_sections(self) -> list[SectionSummary]:
+        """在 index readiness 阶段抛出 sentinel。
+
+        Args:
+            无。
+
+        Returns:
+            不返回。
+
+        Raises:
+            RuntimeError: 始终抛出测试 sentinel。
+        """
+
+        raise RuntimeError("search index list sentinel")
 
 
 class _ReadCancellingProcessor(_SearchCancellingProcessor):
@@ -593,7 +612,7 @@ class _XbrlFailureReadRuntime:
         )
         failed_concepts = tuple(concepts or ["Revenue"])
         raise FinsReadBusinessError(
-            "xbrl_query_failed",
+            ErrorCode.XBRL_QUERY_FAILED,
             "XBRL 查询执行失败，当前结果不可作为零命中使用。",
             hint="请稍后重试。",
         ) from XbrlQueryExecutionError(failed_concepts)
@@ -833,6 +852,116 @@ def test_storage_repositories_list_and_read_fixture_documents(tmp_path: Path) ->
     assert document_ids == ["aapl-2024-10k"]
     assert "Annual recurring revenue increased" in content
     assert source.media_type == "text/markdown"
+
+
+@pytest.mark.parametrize(
+    "changed_field",
+    [
+        "document_version",
+        "source_fingerprint",
+        "form_type",
+        "primary_document",
+        "ingest_complete",
+        "is_deleted",
+        "files.name",
+        "files.uri",
+        "files.etag",
+        "files.last_modified",
+        "files.size",
+        "files.sha256",
+        "files.content_type",
+    ],
+)
+def test_source_revision_changes_for_every_processor_input_field(
+    tmp_path: Path,
+    changed_field: str,
+) -> None:
+    """任一 processor 输入 meta/file 字段变化都应改变 source revision。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        changed_field: 待修改的 canonical revision 字段。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: revision 未随 owner 字段变化时抛出。
+    """
+
+    workspace_root = tmp_path / f"revision-{changed_field.replace('.', '-')}"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    _create_source_revision_document(repository)
+    before = repository.get_source_revision("AAPL", "revision-doc", SourceKind.FILING)
+    meta = repository.get_source_meta("AAPL", "revision-doc", SourceKind.FILING)
+    _mutate_source_revision_meta(meta, changed_field)
+    repository.replace_source_meta("AAPL", "revision-doc", SourceKind.FILING, meta)
+
+    assert repository.get_source_revision("AAPL", "revision-doc", SourceKind.FILING) != before
+
+
+def test_source_revision_is_stable_for_json_key_and_file_order(tmp_path: Path) -> None:
+    """JSON key 顺序与 files 顺序变化不得改变 source revision。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: canonical revision 对顺序不稳定时抛出。
+    """
+
+    workspace_root = tmp_path / "revision-order"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    _create_source_revision_document(repository)
+    before = repository.get_source_revision("AAPL", "revision-doc", SourceKind.FILING)
+    meta = repository.get_source_meta("AAPL", "revision-doc", SourceKind.FILING)
+    files = meta["files"]
+    assert isinstance(files, list)
+    meta["files"] = list(reversed(files))
+    reordered = dict(reversed(list(meta.items())))
+    repository.replace_source_meta("AAPL", "revision-doc", SourceKind.FILING, reordered)
+
+    assert repository.get_source_revision("AAPL", "revision-doc", SourceKind.FILING) == before
+
+
+def test_source_revision_fails_closed_for_missing_or_invalid_fields(tmp_path: Path) -> None:
+    """revision owner 遇到必需字段缺失或非法 file shape 应 fail closed。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法 meta 未被拒绝时抛出。
+    """
+
+    workspace_root = tmp_path / "revision-invalid"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    _create_source_revision_document(repository)
+    meta = repository.get_source_meta("AAPL", "revision-doc", SourceKind.FILING)
+    meta.pop("document_version")
+    repository.replace_source_meta("AAPL", "revision-doc", SourceKind.FILING, meta)
+    with pytest.raises(KeyError, match="document_version"):
+        repository.get_source_revision("AAPL", "revision-doc", SourceKind.FILING)
+
+    _create_source_revision_document(repository, replace_existing=True)
+    invalid_file_meta = repository.get_source_meta("AAPL", "revision-doc", SourceKind.FILING)
+    files = invalid_file_meta["files"]
+    assert isinstance(files, list)
+    first_file = files[0]
+    assert isinstance(first_file, dict)
+    first_file["size"] = True
+    repository.replace_source_meta("AAPL", "revision-doc", SourceKind.FILING, invalid_file_meta)
+    with pytest.raises(ValueError, match="file.size"):
+        repository.get_source_revision("AAPL", "revision-doc", SourceKind.FILING)
 
 
 def test_document_summary_decode_rejects_invalid_fiscal_period_and_quality() -> None:
@@ -1920,6 +2049,47 @@ def test_search_document_semantic_enrichment_cancelled_error_is_not_swallowed(
     assert processor.search_calls == []
 
 
+def test_search_document_index_failure_returns_typed_failed_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """search index readiness 异常应投影为 search_index_failed outcome。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: outcome 不是 typed failed 时抛出。
+    """
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    read_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_read_runtime()
+    processor = _SearchIndexFailingProcessor(_ManualCancellationToken())
+    _install_processor(read_runtime, cast(DocumentProcessor, processor), monkeypatch)
+    definition = _definitions_by_name(_definitions_for_read_runtime(read_runtime, workspace_root))["search_document"]
+
+    outcome = asyncio.run(
+        definition.callable(
+            _call(
+                "search_document",
+                {
+                    "ticker": "AAPL",
+                    "document_id": "aapl-2024-10k",
+                    "query": "annual recurring revenue",
+                },
+            ),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == ErrorCode.SEARCH_INDEX_FAILED.value
+
+
 def test_read_section_cancelled_before_processor_read_returns_cancelled_outcome(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2392,6 +2562,109 @@ def _build_fins_workspace(tmp_path: Path) -> Path:
         batching_repository.rollback_batch(token)
         raise
     return workspace_root
+
+
+def _create_source_revision_document(
+    repository: FsSourceDocumentRepository,
+    *,
+    replace_existing: bool = False,
+) -> None:
+    """创建 canonical source revision 测试文档。
+
+    Args:
+        repository: source repository。
+        replace_existing: 是否先重置同 ID 文档。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: source meta 写入失败时抛出。
+    """
+
+    if replace_existing:
+        repository.reset_source_document("AAPL", "revision-doc", SourceKind.FILING)
+    repository.create_source_document(
+        SourceDocumentUpsertRequest(
+            ticker="AAPL",
+            document_id="revision-doc",
+            internal_document_id="revision-doc",
+            form_type="10-K",
+            primary_document="primary.html",
+            meta={
+                "ingest_method": "download",
+                "source_provider": FinsSourceProvider.SEC_EDGAR.to_storage_value(),
+                "ingest_complete": True,
+                "is_deleted": False,
+                "document_version": "v1",
+                "source_fingerprint": "fingerprint-v1",
+            },
+            file_entries=[
+                {
+                    "name": "primary.html",
+                    "uri": "local://AAPL/filings/revision-doc/primary.html",
+                    "etag": "etag-primary",
+                    "last_modified": "2025-01-01T00:00:00Z",
+                    "size": 100,
+                    "sha256": "a" * 64,
+                    "content_type": "text/html",
+                },
+                {
+                    "name": "exhibit.html",
+                    "uri": "local://AAPL/filings/revision-doc/exhibit.html",
+                    "etag": None,
+                    "last_modified": None,
+                    "size": 50,
+                    "sha256": "b" * 64,
+                    "content_type": "text/html",
+                },
+            ],
+        ),
+        SourceKind.FILING,
+    )
+
+
+def _mutate_source_revision_meta(meta: DocumentMeta, changed_field: str) -> None:
+    """修改一个 canonical revision 字段。
+
+    Args:
+        meta: 待修改 source meta。
+        changed_field: 顶层字段或 ``files.<field>``。
+
+    Returns:
+        无。
+
+    Raises:
+        ValueError: changed_field 不在测试矩阵时抛出。
+    """
+
+    top_level_values: dict[str, JsonValue] = {
+        "document_version": "v2",
+        "source_fingerprint": "fingerprint-v2",
+        "form_type": "10-Q",
+        "primary_document": "exhibit.html",
+        "ingest_complete": False,
+        "is_deleted": True,
+    }
+    if changed_field in top_level_values:
+        meta[changed_field] = top_level_values[changed_field]
+        return
+    file_values: dict[str, JsonValue] = {
+        "name": "renamed.html",
+        "uri": "local://AAPL/filings/revision-doc/renamed.html",
+        "etag": "etag-v2",
+        "last_modified": "2025-01-02T00:00:00Z",
+        "size": 101,
+        "sha256": "c" * 64,
+        "content_type": "application/xhtml+xml",
+    }
+    field_name = changed_field.removeprefix("files.")
+    if field_name not in file_values:
+        raise ValueError(f"未知 revision 测试字段: {changed_field}")
+    files = meta["files"]
+    if not isinstance(files, list) or not files or not isinstance(files[0], dict):
+        raise ValueError("revision 测试 fixture files 非法")
+    files[0][field_name] = file_values[field_name]
 
 
 def _create_source_document_for_provenance(
