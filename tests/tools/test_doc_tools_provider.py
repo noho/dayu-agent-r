@@ -10,7 +10,7 @@ import pickle
 import shutil
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from datetime import datetime
 from pathlib import Path
 from typing import cast
@@ -33,12 +33,9 @@ from dayu.contracts.tool_call import (
 from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
 from dayu.contracts.tool_outcome import ToolCancelledOutcome, ToolCompletedOutcome, ToolFailedOutcome
 from dayu.contracts.tool_schema import ToolTruncateSpec, ToolTruncationStrategy
-from dayu.documents.processors.bounded_source import (
-    BoundedSourceSnapshot,
-    SourceBudgetExceeded,
-)
 from dayu.documents.processors.base import DocumentProcessor
 from dayu.documents.processors.local_file_source import LocalFileSource
+from dayu.documents.processors.source_snapshot import SourceSnapshot
 from dayu.host.tool_runtime import (
     DefaultToolRuntimeFactory,
     EffectiveToolBundleBuildRequest,
@@ -356,7 +353,18 @@ def test_doc_process_target_factory_is_pickle_round_trippable(
     tmp_path: Path,
     tool_name: str,
 ) -> None:
-    """Doc process target factory 和 target 必须可 pickle round-trip。"""
+    """验证 Doc process target factory/target 可序列化且不捕获 live object。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        tool_name: 当前验证的 Doc 工具名。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: round-trip 结果或目标字段边界不符合约定时抛出。
+    """
 
     target = _copy_fixture(tmp_path, "sample.md")
     definition = _definitions_by_name(_discover_definitions(tmp_path))[tool_name]
@@ -382,34 +390,17 @@ def test_doc_process_target_factory_is_pickle_round_trippable(
     )
 
     assert round_tripped_target.tool_name == tool_name
-    assert "provider_lock" not in repr(round_tripped_target)
-    assert "DocumentProcessor" not in repr(round_tripped_target)
-    assert round_tripped_target.resource_budget == doc_tools.DocResourceBudget()
-
-
-@pytest.mark.parametrize(
-    ("field_name", "field_value"),
-    (
-        ("max_source_bytes", 0),
-        ("max_source_bytes", True),
-        ("max_directory_entries", 0),
-        ("max_directory_entries", False),
-    ),
-)
-def test_doc_resource_budget_rejects_non_positive_or_bool_limits(
-    field_name: str,
-    field_value: int | bool,
-) -> None:
-    """内部资源 ceiling 的两个字段都只接受非 bool 正整数。"""
-
-    values = {
-        "max_source_bytes": 1024,
-        "max_directory_entries": 10,
-    }
-    values[field_name] = field_value
-
-    with pytest.raises(ValueError, match=field_name):
-        doc_tools.DocResourceBudget(**values)
+    target_repr = repr(round_tripped_target)
+    assert tuple(field.name for field in fields(round_tripped_target)) == (
+        "tool_name",
+        "arguments",
+        "allowed_root_locators",
+        "limits",
+        "timeout_seconds",
+    )
+    assert "provider_lock" not in target_repr
+    assert "DocumentProcessor" not in target_repr
+    assert "CancellationToken" not in target_repr
 
 
 def test_doc_process_target_fast_path_matches_callable_baseline(tmp_path: Path) -> None:
@@ -664,7 +655,6 @@ def test_path_validation_failure_does_not_enter_migrated_function_body(
         start_line: int | None,
         end_line: int | None,
         max_chars: int,
-        max_source_bytes: int,
         cancellation_token: CancellationToken,
     ) -> JsonValue:
         """记录是否进入 Doc 业务函数。
@@ -673,12 +663,12 @@ def test_path_validation_failure_does_not_enter_migrated_function_body(
         :param start_line: 起始行号。
         :param end_line: 结束行号。
         :param max_chars: 最大返回字符数。
-        :param max_source_bytes: 单 Source 字节预算。
         :param cancellation_token: 取消令牌。
         :returns: 测试返回值。
+        :raises AssertionError: 业务函数在路径拒绝前被调用时由测试断言抛出。
         """
 
-        del start_line, end_line, max_chars, max_source_bytes
+        del start_line, end_line, max_chars
         del cancellation_token
         calls.append(file_path)
         return {"file_path": file_path}
@@ -910,7 +900,6 @@ def test_read_file_long_single_line_stops_at_character_limit(
             start_line=None,
             end_line=None,
             max_chars=17,
-            max_source_bytes=1000,
             cancellation_token=_OpenCancellationToken(),
         ),
     )
@@ -937,7 +926,6 @@ def test_read_file_multibyte_encoding_range_reports_complete_metadata(
             start_line=2,
             end_line=2,
             max_chars=100,
-            max_source_bytes=1000,
             cancellation_token=_OpenCancellationToken(),
         ),
     )
@@ -950,25 +938,39 @@ def test_read_file_multibyte_encoding_range_reports_complete_metadata(
     assert value["line_range"] == [2, 2]
 
 
-def test_read_file_source_limit_plus_one_raises_typed_resource_failure(
+def test_read_file_reads_complete_source_without_source_byte_limit(
     tmp_path: Path,
 ) -> None:
-    """raw read 在 processor/full read 前必须按同一流拒绝 ``limit+1``。"""
+    """raw read 必须消费完整实际来源，不再产生 source byte limit 失败。
 
-    target = tmp_path / "oversized.txt"
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 返回文本或完整扫描事实不符合预期时抛出。
+    """
+
+    target = tmp_path / "complete-source.txt"
     target.write_bytes(b"123456789")
 
-    with pytest.raises(SourceBudgetExceeded) as raised:
+    value = cast(
+        Mapping[str, JsonValue],
         doc_tools._read_file_business(
             file_path=str(target),
             start_line=None,
             end_line=None,
             max_chars=100,
-            max_source_bytes=8,
             cancellation_token=_OpenCancellationToken(),
-        )
+        ),
+    )
 
-    assert raised.value.observed_bytes == 9
+    assert value["content"] == "123456789"
+    assert value["returned_chars"] == 9
+    assert value["content_truncated"] is False
+    assert value["scan_complete"] is True
 
 
 def test_read_file_section_limit_returns_explicit_partial_fields(
@@ -983,7 +985,6 @@ def test_read_file_section_limit_returns_explicit_partial_fields(
             file_path=str(target),
             ref="s_0001",
             max_chars=8,
-            max_source_bytes=100_000,
             cancellation_token=_OpenCancellationToken(),
         ),
     )
@@ -1010,7 +1011,6 @@ def test_search_files_raw_long_line_finds_late_query_with_bounded_excerpt(
             include_types=None,
             limit=5,
             max_results=5,
-            max_source_bytes=1000,
             max_directory_entries=10,
             allowed_roots=(tmp_path.resolve(),),
             cancellation_token=_OpenCancellationToken(),
@@ -1024,19 +1024,30 @@ def test_search_files_raw_long_line_finds_late_query_with_bounded_excerpt(
     assert len(str(matches[0]["matched_line_content"])) <= 300
 
 
-def test_search_files_source_limit_skips_oversized_processor_input_without_fallback(
+def test_search_files_complete_source_enters_processor_and_returns_match(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """processor 支持文件超预算时必须 partial/skipped，不能降级为无命中。"""
+    """search 必须把完整来源交给处理器并返回命中，不得按字节跳过。
 
-    target = tmp_path / "oversized.md"
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 处理器调用、命中或返回字段不符合预期时抛出。
+    """
+
+    target = tmp_path / "complete-source.md"
     target.write_text("# Title\n" + "Revenue" * 20, encoding="utf-8")
     processor_paths: list[Path] = []
     original_try_create = doc_tools._try_create_processor
 
     def spy_try_create_processor(
-        source: BoundedSourceSnapshot,
+        source: SourceSnapshot,
         path: Path,
     ) -> DocumentProcessor | None:
         """记录实际进入 processor factory 的文件。
@@ -1064,18 +1075,27 @@ def test_search_files_source_limit_skips_oversized_processor_input_without_fallb
             include_types=None,
             limit=5,
             max_results=5,
-            max_source_bytes=16,
             max_directory_entries=10,
             allowed_roots=(tmp_path.resolve(),),
             cancellation_token=_OpenCancellationToken(),
         ),
     )
 
-    assert value["matches"] == []
-    assert value["skipped_oversized_files"] == 1
-    assert value["scan_complete"] is False
-    assert value["truncated_reason"] == "source_limit"
-    assert processor_paths == []
+    matches = cast(list[Mapping[str, JsonValue]], value["matches"])
+    assert len(matches) == 1
+    assert matches[0]["file"] == target.name
+    assert value["scan_complete"] is True
+    assert value["truncated_reason"] is None
+    assert set(value) == {
+        "query",
+        "directory",
+        "matches",
+        "total_matches",
+        "scanned_entries",
+        "scan_complete",
+        "truncated_reason",
+    }
+    assert processor_paths == [target.resolve()]
 
 
 def test_search_files_cumulative_match_limit_returns_result_partial(
@@ -1094,7 +1114,6 @@ def test_search_files_cumulative_match_limit_returns_result_partial(
             include_types=None,
             limit=2,
             max_results=2,
-            max_source_bytes=1000,
             max_directory_entries=10,
             allowed_roots=(tmp_path.resolve(),),
             cancellation_token=_OpenCancellationToken(),
@@ -1122,7 +1141,6 @@ def test_search_files_directory_entry_limit_returns_directory_partial(
             include_types=None,
             limit=5,
             max_results=5,
-            max_source_bytes=1000,
             max_directory_entries=1,
             allowed_roots=(tmp_path.resolve(),),
             cancellation_token=_OpenCancellationToken(),
@@ -1134,17 +1152,28 @@ def test_search_files_directory_entry_limit_returns_directory_partial(
     assert value["truncated_reason"] == "directory_entry_limit"
 
 
-def test_search_files_processor_factory_receives_bounded_snapshot(
+def test_search_files_processor_factory_receives_complete_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """search processor factory 不得接收原路径并自行重开未治理来源。"""
+    """验证 search processor factory 接收完整快照而非自行重开原路径。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: factory 输入类型、调用次数或搜索结果不符合约定时抛出。
+    """
 
     target = tmp_path / "report.md"
     target.write_text("# Report\nRevenue", encoding="utf-8")
-    captured_sources: list[BoundedSourceSnapshot] = []
+    captured_sources: list[SourceSnapshot] = []
 
-    def fake_create_processor(source: BoundedSourceSnapshot) -> None:
+    def fake_create_processor(source: SourceSnapshot) -> None:
         """记录 factory 输入并强制 raw scan。
 
         Args:
@@ -1169,7 +1198,6 @@ def test_search_files_processor_factory_receives_bounded_snapshot(
             include_types=None,
             limit=5,
             max_results=5,
-            max_source_bytes=1000,
             max_directory_entries=10,
             allowed_roots=(tmp_path.resolve(),),
             cancellation_token=_OpenCancellationToken(),
@@ -1177,12 +1205,24 @@ def test_search_files_processor_factory_receives_bounded_snapshot(
     )
 
     assert len(captured_sources) == 1
-    assert isinstance(captured_sources[0], BoundedSourceSnapshot)
+    assert isinstance(captured_sources[0], SourceSnapshot)
     assert value["total_matches"] == 1
 
 
-def test_doc_tool_descriptions_explain_partial_limit_fields(tmp_path: Path) -> None:
-    """LLM-facing 描述必须自足说明 partial 字段、原因与下一步。"""
+def test_doc_tool_descriptions_explain_retained_partial_fields(
+    tmp_path: Path,
+) -> None:
+    """LLM-facing 描述应只解释仍存在的输出与目录 partial 事实。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 描述缺少保留语义或仍暴露已删除语义时抛出。
+    """
 
     definitions = _definitions_by_name(_discover_definitions(tmp_path))
 
@@ -1192,8 +1232,14 @@ def test_doc_tool_descriptions_explain_partial_limit_fields(tmp_path: Path) -> N
         assert "truncated_reason" in description or "content_truncated" in description
     assert "directory_entry_limit" in definitions["list_files"].schema.function.description
     search_description = definitions["search_files"].schema.function.description
-    assert "source_limit" in search_description
-    assert "skipped_oversized_files" in search_description
+    assert "result_limit" in search_description
+    assert "directory_entry_limit" in search_description
+    assert search_description == (
+        "在配置允许访问目录中按关键词查找。matches 是本次命中，total_matches 等于返回命中数，"
+        "scanned_entries 是已检查目录项数。scan_complete=false 表示结果不完整；"
+        "truncated_reason 会是 result_limit 或 directory_entry_limit，应分别收紧关键词或目录后重试。"
+        "若命中带 ref，把 matches[].file 和 ref 交给 read_file_section；ref 为 null 时用 read_file。"
+    )
 
 
 def test_search_files_does_not_read_symlink_escape(
@@ -1247,7 +1293,7 @@ def test_search_files_cancelled_during_iteration_stops_before_later_scan(
     scanned_paths: list[str] = []
 
     def fake_try_create_processor(
-        source: BoundedSourceSnapshot,
+        source: SourceSnapshot,
         path: Path,
     ) -> None:
         """强制搜索走行扫描 fallback。
@@ -1261,7 +1307,7 @@ def test_search_files_cancelled_during_iteration_stops_before_later_scan(
         return None
 
     def fake_search_via_line_scan(
-        source: BoundedSourceSnapshot,
+        source: SourceSnapshot,
         relative_path: str,
         query: str,
         remaining: int,
@@ -1269,7 +1315,7 @@ def test_search_files_cancelled_during_iteration_stops_before_later_scan(
     ) -> list[dict[str, JsonValue]]:
         """记录首个扫描文件并触发取消。
 
-        :param source: 当前 bounded Source。
+        :param source: 当前完整 Source 快照。
         :param relative_path: 相对路径。
         :param query: 搜索词。
         :param remaining: 剩余结果数量。
@@ -1308,7 +1354,7 @@ def test_search_via_line_scan_observes_loop_cancellation(
     token = _CancelAfterObservationToken(cancel_at=2)
     monkeypatch.setattr(doc_tools, "_DOC_STREAM_CHUNK_BYTES", 1)
     source = LocalFileSource(path=target, uri=str(target))
-    with BoundedSourceSnapshot(source, max_bytes=100) as snapshot:
+    with SourceSnapshot(source) as snapshot:
         with pytest.raises(doc_tools._DocCancelledError):
             doc_tools._search_via_line_scan(snapshot, "large.txt", "Revenue", 10, token)
 
@@ -1325,7 +1371,7 @@ def test_search_files_line_scan_cancellation_returns_host_cancelled(
     token = _CancelAfterObservationToken(cancel_at=5)
 
     def fake_try_create_processor(
-        source: BoundedSourceSnapshot,
+        source: SourceSnapshot,
         path: Path,
     ) -> None:
         """强制搜索走行扫描 fallback。
@@ -1362,7 +1408,7 @@ def test_read_file_cancelled_after_first_failed_encoding_stops_fallback(
     target.write_bytes(b"\xffencoded")
     token = _CancelAfterObservationToken(cancel_at=2)
     source = LocalFileSource(path=target, uri=str(target))
-    with BoundedSourceSnapshot(source, max_bytes=100) as snapshot:
+    with SourceSnapshot(source) as snapshot:
         with pytest.raises(doc_tools._DocCancelledError):
             doc_tools._read_bounded_text(
                 snapshot=snapshot,
@@ -1400,7 +1446,7 @@ def test_count_file_lines_observes_cooperative_cancellation(
     monkeypatch.setattr(doc_tools, "_DOC_LOOP_CANCELLATION_CHECK_INTERVAL", 1)
 
     source = LocalFileSource(path=target, uri=str(target))
-    with BoundedSourceSnapshot(source, max_bytes=100) as snapshot:
+    with SourceSnapshot(source) as snapshot:
         with pytest.raises(doc_tools._DocCancelledError):
             doc_tools._count_source_lines(snapshot, token)
 

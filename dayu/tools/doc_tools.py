@@ -41,12 +41,9 @@ from dayu.contracts import (
 from dayu.contracts.tool_schema import ToolTruncateSpec, ToolTruncationStrategy
 from dayu.documents.processors._doc_processor_factory import create_doc_file_processor
 from dayu.documents.processors.base import DocumentProcessor
-from dayu.documents.processors.bounded_source import (
-    BoundedSourceSnapshot,
-    SourceBudgetExceeded,
-)
 from dayu.documents.processors.local_file_source import LocalFileSource
 from dayu.documents.processors.source import Source
+from dayu.documents.processors.source_snapshot import SourceSnapshot
 from dayu.runtime.tool_call_projection import (
     ToolArgumentValidationFailure,
     ToolBusinessCancelled,
@@ -84,7 +81,6 @@ _READ_FILE_ENCODINGS: Final[tuple[str, ...]] = ("utf-8", "gbk", "latin1", "cp125
 _READ_LINES_ENCODINGS: Final[tuple[str, ...]] = ("utf-8", "gbk")
 _MARKDOWN_SUFFIXES: Final[frozenset[str]] = frozenset({".md", ".markdown"})
 _DOC_LOOP_CANCELLATION_CHECK_INTERVAL: Final[int] = 1_000
-_DOC_SOURCE_MAX_BYTES: Final[int] = 32 * 1024 * 1024
 _DOC_DIRECTORY_MAX_ENTRIES: Final[int] = 10_000
 _DOC_STREAM_CHUNK_BYTES: Final[int] = 64 * 1024
 _DOC_SEARCH_EXCERPT_CHARS: Final[int] = 300
@@ -113,41 +109,6 @@ class DocToolLimits:
     search_files_max_results: int = 50
     read_file_max_chars: int = 80_000
     read_file_section_max_chars: int = 50_000
-
-
-@dataclass(frozen=True, slots=True)
-class DocResourceBudget:
-    """Doc 工具内部资源预算。
-
-    本配置由工具实现构造，不属于 provider 或 LLM 可配置参数。
-
-    Args:
-        max_source_bytes: 单个 Source 允许实读的最大字节数。
-        max_directory_entries: 单次目录遍历允许观察的最大 entry 数。
-
-    Raises:
-        ValueError: 任一预算不是正整数时抛出。
-    """
-
-    max_source_bytes: int = _DOC_SOURCE_MAX_BYTES
-    max_directory_entries: int = _DOC_DIRECTORY_MAX_ENTRIES
-
-    def __post_init__(self) -> None:
-        """校验内部资源预算。
-
-        Returns:
-            无。
-
-        Raises:
-            ValueError: 任一预算不是正整数时抛出。
-        """
-
-        for name, value in (
-            ("max_source_bytes", self.max_source_bytes),
-            ("max_directory_entries", self.max_directory_entries),
-        ):
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError(f"{name} must be a positive integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -429,7 +390,6 @@ class _DocProcessTarget:
         arguments: 工具调用参数的 JSON 副本。
         allowed_root_locators: 允许访问根路径的可序列化字符串 locator。
         limits: Doc 工具 limit 配置。
-        resource_budget: Doc 工具内部资源预算。
         timeout_seconds: 父进程投影的批级 timeout 标量；仅作为可序列化上下文
             留痕，真实 timeout 仍由父进程 Host capsule 独占治理。
 
@@ -444,7 +404,6 @@ class _DocProcessTarget:
     arguments: dict[str, JsonValue]
     allowed_root_locators: tuple[str, ...]
     limits: DocToolLimits
-    resource_budget: DocResourceBudget
     timeout_seconds: float | None
 
     def __call__(self) -> JsonValue:
@@ -475,7 +434,6 @@ class _DocProcessTarget:
                 parameters=_parameters_for_tool(self.tool_name, self.limits),
                 allowed_roots=_resolve_allowed_root_locators(self.allowed_root_locators),
                 limits=self.limits,
-                resource_budget=self.resource_budget,
                 cancellation_token=_DocProcessCancellationToken(),
             )
         except _DocBusinessFailure as failure:
@@ -499,7 +457,6 @@ class _DocProcessTargetFactory:
     Args:
         allowed_root_locators: 允许访问根路径的可序列化字符串 locator。
         limits: Doc 工具 limit 配置。
-        resource_budget: Doc 工具内部资源预算。
 
     Returns:
         dataclass 实例。
@@ -510,7 +467,6 @@ class _DocProcessTargetFactory:
 
     allowed_root_locators: tuple[str, ...]
     limits: DocToolLimits
-    resource_budget: DocResourceBudget
 
     def build_process_target(
         self,
@@ -535,7 +491,6 @@ class _DocProcessTargetFactory:
             arguments=dict(call.arguments),
             allowed_root_locators=self.allowed_root_locators,
             limits=self.limits,
-            resource_budget=self.resource_budget,
             timeout_seconds=context.timeout_seconds,
         )
 
@@ -603,28 +558,25 @@ def build_doc_tool_definitions(
         return ()
     normalized_roots = tuple(root.expanduser().resolve(strict=False) for root in allowed_roots)
     provider_lock = asyncio.Lock()
-    resource_budget = DocResourceBudget()
     process_target_factory = _DocProcessTargetFactory(
         allowed_root_locators=tuple(str(root) for root in normalized_roots),
         limits=limits,
-        resource_budget=resource_budget,
     )
     definitions = (
         _build_list_files_definition(
-            limits, resource_budget, normalized_roots, provider_lock, process_target_factory
+            limits, normalized_roots, provider_lock, process_target_factory
         ),
         _build_get_file_sections_definition(
-            limits, resource_budget, normalized_roots, provider_lock, process_target_factory
+            limits, normalized_roots, provider_lock, process_target_factory
         ),
         _build_search_files_definition(
-            limits, resource_budget, normalized_roots, provider_lock, process_target_factory
+            limits, normalized_roots, provider_lock, process_target_factory
         ),
         _build_read_file_definition(
-            limits, resource_budget, normalized_roots, provider_lock, process_target_factory
+            limits, normalized_roots, provider_lock, process_target_factory
         ),
         _build_read_file_section_definition(
             limits,
-            resource_budget,
             normalized_roots,
             provider_lock,
             process_target_factory,
@@ -638,7 +590,6 @@ def build_doc_tool_definitions(
 
 def _build_list_files_definition(
     limits: DocToolLimits,
-    resource_budget: DocResourceBudget,
     allowed_roots: tuple[Path, ...],
     provider_lock: asyncio.Lock,
     process_target_factory: _DocProcessTargetFactory,
@@ -647,7 +598,6 @@ def _build_list_files_definition(
 
     Args:
         limits: Doc 工具限制配置。
-        resource_budget: Doc 工具内部资源预算。
         allowed_roots: 允许访问根路径。
         provider_lock: provider 级共享执行锁。
         process_target_factory: process-backed 目标工厂。
@@ -690,7 +640,6 @@ def _build_list_files_definition(
                 parameters=parameters,
                 allowed_roots=allowed_roots,
                 limits=limits,
-                resource_budget=resource_budget,
                 cancellation_token=token,
             ),
         )
@@ -714,7 +663,6 @@ def _build_list_files_definition(
 
 def _build_get_file_sections_definition(
     limits: DocToolLimits,
-    resource_budget: DocResourceBudget,
     allowed_roots: tuple[Path, ...],
     provider_lock: asyncio.Lock,
     process_target_factory: _DocProcessTargetFactory,
@@ -723,7 +671,6 @@ def _build_get_file_sections_definition(
 
     Args:
         limits: Doc 工具限制配置。
-        resource_budget: Doc 工具内部资源预算。
         allowed_roots: 允许访问根路径。
         provider_lock: provider 级共享执行锁。
         process_target_factory: process-backed 目标工厂。
@@ -766,7 +713,6 @@ def _build_get_file_sections_definition(
                 parameters=parameters,
                 allowed_roots=allowed_roots,
                 limits=limits,
-                resource_budget=resource_budget,
                 cancellation_token=token,
             ),
         )
@@ -786,7 +732,6 @@ def _build_get_file_sections_definition(
 
 def _build_search_files_definition(
     limits: DocToolLimits,
-    resource_budget: DocResourceBudget,
     allowed_roots: tuple[Path, ...],
     provider_lock: asyncio.Lock,
     process_target_factory: _DocProcessTargetFactory,
@@ -795,7 +740,6 @@ def _build_search_files_definition(
 
     Args:
         limits: Doc 工具限制配置。
-        resource_budget: Doc 工具内部资源预算。
         allowed_roots: 允许访问根路径。
         provider_lock: provider 级共享执行锁。
         process_target_factory: process-backed 目标工厂。
@@ -838,7 +782,6 @@ def _build_search_files_definition(
                 parameters=parameters,
                 allowed_roots=allowed_roots,
                 limits=limits,
-                resource_budget=resource_budget,
                 cancellation_token=token,
             ),
         )
@@ -847,9 +790,8 @@ def _build_search_files_definition(
         name=SEARCH_FILES_TOOL_NAME,
         description=(
             "在配置允许访问目录中按关键词查找。matches 是本次命中，total_matches 等于返回命中数，"
-            "scanned_entries 是已检查目录项数，skipped_oversized_files 是因单文件字节预算跳过的文件数。"
-            "scan_complete=false 表示结果不完整；truncated_reason 会是 result_limit、"
-            "directory_entry_limit 或 source_limit，应分别收紧关键词/目录或改用较小文件后重试。"
+            "scanned_entries 是已检查目录项数。scan_complete=false 表示结果不完整；"
+            "truncated_reason 会是 result_limit 或 directory_entry_limit，应分别收紧关键词或目录后重试。"
             "若命中带 ref，把 matches[].file 和 ref 交给 read_file_section；ref 为 null 时用 read_file。"
         ),
         parameters=parameters,
@@ -862,7 +804,6 @@ def _build_search_files_definition(
 
 def _build_read_file_definition(
     limits: DocToolLimits,
-    resource_budget: DocResourceBudget,
     allowed_roots: tuple[Path, ...],
     provider_lock: asyncio.Lock,
     process_target_factory: _DocProcessTargetFactory,
@@ -871,7 +812,6 @@ def _build_read_file_definition(
 
     Args:
         limits: Doc 工具限制配置。
-        resource_budget: Doc 工具内部资源预算。
         allowed_roots: 允许访问根路径。
         provider_lock: provider 级共享执行锁。
         process_target_factory: process-backed 目标工厂。
@@ -914,7 +854,6 @@ def _build_read_file_definition(
                 parameters=parameters,
                 allowed_roots=allowed_roots,
                 limits=limits,
-                resource_budget=resource_budget,
                 cancellation_token=token,
             ),
         )
@@ -937,7 +876,6 @@ def _build_read_file_definition(
 
 def _build_read_file_section_definition(
     limits: DocToolLimits,
-    resource_budget: DocResourceBudget,
     allowed_roots: tuple[Path, ...],
     provider_lock: asyncio.Lock,
     process_target_factory: _DocProcessTargetFactory,
@@ -946,7 +884,6 @@ def _build_read_file_section_definition(
 
     Args:
         limits: Doc 工具限制配置。
-        resource_budget: Doc 工具内部资源预算。
         allowed_roots: 允许访问根路径。
         provider_lock: provider 级共享执行锁。
         process_target_factory: process-backed 目标工厂。
@@ -989,7 +926,6 @@ def _build_read_file_section_definition(
                 parameters=parameters,
                 allowed_roots=allowed_roots,
                 limits=limits,
-                resource_budget=resource_budget,
                 cancellation_token=token,
             ),
         )
@@ -1118,7 +1054,6 @@ def _execute_doc_business_value(
     parameters: ToolParametersSchema,
     allowed_roots: tuple[Path, ...],
     limits: DocToolLimits,
-    resource_budget: DocResourceBudget,
     cancellation_token: CancellationToken,
 ) -> JsonValue:
     """执行 Doc 工具同步业务并返回成功 JSON 值。
@@ -1134,7 +1069,6 @@ def _execute_doc_business_value(
         parameters: 当前工具的参数 schema。
         allowed_roots: 已重新解析的允许访问根路径。
         limits: Doc 工具限制配置。
-        resource_budget: Doc 工具内部资源预算。
         cancellation_token: 当前执行边界使用的取消观察 token。
 
     Returns:
@@ -1166,7 +1100,6 @@ def _execute_doc_business_value(
             arguments=path_projection,
             allowed_roots=allowed_roots,
             limits=limits,
-            resource_budget=resource_budget,
             cancellation_token=cancellation_token,
         )
     except _DocCancelledError:
@@ -1197,15 +1130,6 @@ def _execute_doc_business_value(
             str(error),
             "Use a path allowed by the provider configuration.",
         ) from error
-    except SourceBudgetExceeded as error:
-        raise _DocBusinessFailure(
-            "source_budget_exceeded",
-            (
-                "文件内容超过单文件读取预算，未交给处理器或完整读取。"
-                f"预算为 {error.limit_bytes} 字节。"
-            ),
-            "缩小文件范围、拆分文件，或改用较小的来源后重试。",
-        ) from error
     except Exception as error:
         raise _DocBusinessFailure(
             "execution_error",
@@ -1221,7 +1145,6 @@ def _route_doc_business(
     arguments: Mapping[str, JsonValue],
     allowed_roots: tuple[Path, ...],
     limits: DocToolLimits,
-    resource_budget: DocResourceBudget,
     cancellation_token: CancellationToken,
 ) -> JsonValue:
     """按工具名路由到对应 Doc 同步业务 helper。
@@ -1231,7 +1154,6 @@ def _route_doc_business(
         arguments: 已通过 schema 与路径白名单校验的参数。
         allowed_roots: 已重新解析的允许访问根路径。
         limits: Doc 工具限制配置。
-        resource_budget: Doc 工具内部资源预算。
         cancellation_token: 当前执行边界使用的取消观察 token。
 
     Returns:
@@ -1251,7 +1173,7 @@ def _route_doc_business(
             recursive=_required_bool(arguments, "recursive"),
             limit=_required_int(arguments, "limit"),
             max_files=limits.list_files_max,
-            max_directory_entries=resource_budget.max_directory_entries,
+            max_directory_entries=_DOC_DIRECTORY_MAX_ENTRIES,
             cancellation_token=cancellation_token,
         )
     if tool_name == GET_FILE_SECTIONS_TOOL_NAME:
@@ -1259,7 +1181,6 @@ def _route_doc_business(
             file_path=_required_string(arguments, "file_path"),
             limit=_required_int(arguments, "limit"),
             max_sections=limits.get_sections_max,
-            max_source_bytes=resource_budget.max_source_bytes,
             cancellation_token=cancellation_token,
         )
     if tool_name == SEARCH_FILES_TOOL_NAME:
@@ -1269,8 +1190,7 @@ def _route_doc_business(
             include_types=_optional_string_list(arguments, "include_types"),
             limit=_required_int(arguments, "limit"),
             max_results=limits.search_files_max_results,
-            max_source_bytes=resource_budget.max_source_bytes,
-            max_directory_entries=resource_budget.max_directory_entries,
+            max_directory_entries=_DOC_DIRECTORY_MAX_ENTRIES,
             allowed_roots=allowed_roots,
             cancellation_token=cancellation_token,
         )
@@ -1280,7 +1200,6 @@ def _route_doc_business(
             start_line=_optional_int(arguments, "start_line"),
             end_line=_optional_int(arguments, "end_line"),
             max_chars=limits.read_file_max_chars,
-            max_source_bytes=resource_budget.max_source_bytes,
             cancellation_token=cancellation_token,
         )
     if tool_name == READ_FILE_SECTION_TOOL_NAME:
@@ -1288,7 +1207,6 @@ def _route_doc_business(
             file_path=_required_string(arguments, "file_path"),
             ref=_required_string(arguments, "ref"),
             max_chars=limits.read_file_section_max_chars,
-            max_source_bytes=resource_budget.max_source_bytes,
             cancellation_token=cancellation_token,
         )
     raise ValueError(f"unsupported doc tool: {tool_name}")
@@ -1591,7 +1509,6 @@ def _get_file_sections_business(
     file_path: str,
     limit: int,
     max_sections: int,
-    max_source_bytes: int,
     cancellation_token: CancellationToken,
 ) -> JsonValue:
     """列出文件章节结构。
@@ -1600,7 +1517,6 @@ def _get_file_sections_business(
         file_path: 已校验并归一化的文件路径。
         limit: 最大返回 section 数。
         max_sections: 配置硬上限。
-        max_source_bytes: 单个 Source 最大实读字节数。
         cancellation_token: Host 注入的取消观察令牌。
 
     Returns:
@@ -1613,7 +1529,7 @@ def _get_file_sections_business(
     actual_limit = min(limit, max_sections)
     path = Path(file_path)
     _raise_if_doc_cancelled(cancellation_token)
-    with _bounded_local_source(path, max_source_bytes, cancellation_token) as snapshot:
+    with _source_snapshot(path, cancellation_token) as snapshot:
         processor = _try_create_processor(snapshot, path)
         if processor is not None:
             return _sections_via_processor(
@@ -1650,7 +1566,6 @@ def _search_files_business(
     include_types: list[str] | None,
     limit: int,
     max_results: int,
-    max_source_bytes: int,
     max_directory_entries: int,
     allowed_roots: tuple[Path, ...],
     cancellation_token: CancellationToken,
@@ -1663,7 +1578,6 @@ def _search_files_business(
         include_types: 可选文件扩展名过滤。
         limit: 最大返回数量。
         max_results: 配置硬上限。
-        max_source_bytes: 单个 Source 最大实读字节数。
         max_directory_entries: 允许观察的最大目录 entry 数。
         allowed_roots: 已重新解析的允许访问根路径。
         cancellation_token: Host 注入的取消观察令牌。
@@ -1683,7 +1597,6 @@ def _search_files_business(
 
     matches: list[JsonValue] = []
     scanned_entries = 0
-    skipped_oversized_files = 0
     scan_complete = True
     truncated_reason: str | None = None
     _raise_if_doc_cancelled(cancellation_token)
@@ -1706,38 +1619,29 @@ def _search_files_business(
             continue
 
         relative_path = str(file_path.relative_to(dir_path))
-        try:
-            with _bounded_local_source(
-                resolved_file, max_source_bytes, cancellation_token
-            ) as snapshot:
-                processor = _try_create_processor(snapshot, resolved_file)
-                processor_matches = None
-                if processor is not None:
-                    processor_matches = _search_via_processor(
-                        processor,
+        with _source_snapshot(resolved_file, cancellation_token) as snapshot:
+            processor = _try_create_processor(snapshot, resolved_file)
+            processor_matches = None
+            if processor is not None:
+                processor_matches = _search_via_processor(
+                    processor,
+                    relative_path,
+                    query,
+                    actual_limit - len(matches),
+                    cancellation_token,
+                )
+            if processor_matches is not None:
+                matches.extend(processor_matches)
+            else:
+                matches.extend(
+                    _search_via_line_scan(
+                        snapshot,
                         relative_path,
                         query,
                         actual_limit - len(matches),
                         cancellation_token,
                     )
-                if processor_matches is not None:
-                    matches.extend(processor_matches)
-                else:
-                    matches.extend(
-                        _search_via_line_scan(
-                            snapshot,
-                            relative_path,
-                            query,
-                            actual_limit - len(matches),
-                            cancellation_token,
-                        )
-                    )
-        except SourceBudgetExceeded:
-            skipped_oversized_files += 1
-            scan_complete = False
-            if truncated_reason is None:
-                truncated_reason = "source_limit"
-            continue
+                )
         if len(matches) >= actual_limit:
             scan_complete = False
             truncated_reason = "result_limit"
@@ -1751,7 +1655,6 @@ def _search_files_business(
         "matches": matches,
         "total_matches": len(matches),
         "scanned_entries": scanned_entries,
-        "skipped_oversized_files": skipped_oversized_files,
         "scan_complete": scan_complete,
         "truncated_reason": truncated_reason,
     }
@@ -1790,7 +1693,6 @@ def _read_file_business(
     start_line: int | None,
     end_line: int | None,
     max_chars: int,
-    max_source_bytes: int,
     cancellation_token: CancellationToken,
 ) -> JsonValue:
     """读取文件内容。
@@ -1800,7 +1702,6 @@ def _read_file_business(
         start_line: 起始行号。
         end_line: 结束行号。
         max_chars: 最大返回字符数。
-        max_source_bytes: 单个 Source 最大实读字节数。
         cancellation_token: Host 注入的取消观察令牌。
 
     Returns:
@@ -1824,9 +1725,9 @@ def _read_file_business(
         )
 
     path = Path(file_path)
-    with _bounded_local_source(path, max_source_bytes, cancellation_token) as snapshot:
+    with _source_snapshot(path, cancellation_token) as snapshot:
         scanned = _read_bounded_text(
-            snapshot= snapshot,
+            snapshot=snapshot,
             encodings=_READ_FILE_ENCODINGS,
             max_chars=max_chars,
             start_line=actual_start_line,
@@ -1852,7 +1753,6 @@ def _read_file_section_business(
     file_path: str,
     ref: str,
     max_chars: int,
-    max_source_bytes: int,
     cancellation_token: CancellationToken,
 ) -> JsonValue:
     """按 section ref 读取文件章节内容。
@@ -1861,7 +1761,6 @@ def _read_file_section_business(
         file_path: 已校验并归一化的文件路径。
         ref: 章节 ref。
         max_chars: 最大返回字符数。
-        max_source_bytes: 单个 Source 最大实读字节数。
         cancellation_token: Host 注入的取消观察令牌。
 
     Returns:
@@ -1874,7 +1773,7 @@ def _read_file_section_business(
 
     path = Path(file_path)
     _raise_if_doc_cancelled(cancellation_token)
-    with _bounded_local_source(path, max_source_bytes, cancellation_token) as snapshot:
+    with _source_snapshot(path, cancellation_token) as snapshot:
         processor = _try_create_processor(snapshot, path)
         if processor is None:
             raise _DocToolArgumentError(
@@ -1916,29 +1815,26 @@ def _read_file_section_business(
     return section_payload
 
 
-def _bounded_local_source(
+def _source_snapshot(
     path: Path,
-    max_source_bytes: int,
     cancellation_token: CancellationToken,
-) -> BoundedSourceSnapshot:
-    """构造由当前 Doc 调用拥有的有界本地 Source 快照。
+) -> SourceSnapshot:
+    """构造由当前 Doc 调用拥有的完整本地 Source 快照。
 
     Args:
         path: 已通过路径 authority 校验的文件路径。
-        max_source_bytes: 单个 Source 最大实读字节数。
         cancellation_token: Host 注入的取消观察令牌。
 
     Returns:
-        尚未进入上下文的有界 Source 快照。
+        尚未进入上下文的完整 Source 快照。
 
     Raises:
-        ValueError: 资源预算非法时抛出。
+        无。
     """
 
     source = LocalFileSource(path=path, uri=str(path))
-    return BoundedSourceSnapshot(
+    return SourceSnapshot(
         source,
-        max_source_bytes,
         _DocSourceCancellationCheck(cancellation_token),
     )
 
@@ -1947,7 +1843,7 @@ def _try_create_processor(source: Source, path: Path) -> DocumentProcessor | Non
     """安全地尝试创建处理器。
 
     Args:
-        source: 已完成资源预算治理的 Source。
+        source: 已完成 EOF 快照的 Source。
         path: 仅用于诊断的原文件路径。
 
     Returns:
@@ -1975,7 +1871,7 @@ def _sections_via_processor(
 
     Args:
         processor: 文档处理器。
-        source: 已完成资源预算治理的 Source。
+        source: 已完成 EOF 快照的 Source。
         path: 文件路径。
         limit: 最大返回数。
         cancellation_token: Host 注入的取消观察令牌。
@@ -2027,10 +1923,10 @@ def _sections_via_processor(
 
 
 def _count_source_lines(source: Source, cancellation_token: CancellationToken) -> int:
-    """增量计算有界 Source 的总行数。
+    """增量计算完整快照 Source 的总行数。
 
     Args:
-        source: 已完成资源预算治理的 Source。
+        source: 已完成 EOF 快照的 Source。
         cancellation_token: Host 注入的取消观察令牌。
 
     Returns:
@@ -2053,10 +1949,10 @@ def _read_source_lines(
     source: Source,
     cancellation_token: CancellationToken,
 ) -> list[str] | None:
-    """读取已经过字节预算治理的 Source 行，尝试多编码。
+    """读取完整快照 Source 的全部行，尝试多编码。
 
     Args:
-        source: 已完成资源预算治理的 Source。
+        source: 已完成 EOF 快照的 Source。
         cancellation_token: Host 注入的取消观察令牌。
 
     Returns:
@@ -2188,7 +2084,7 @@ def _search_via_processor(
         cancellation_token: Host 注入的取消观察令牌。
 
     Returns:
-        标准化匹配列表；处理器搜索失败时返回 ``None``，由同一 bounded
+        标准化匹配列表；处理器搜索失败时返回 ``None``，由同一完整快照
         Source 上的 raw scanner 接管。
 
     Raises:
@@ -2231,7 +2127,7 @@ def _search_via_line_scan(
     """通过行扫描搜索文件内容。
 
     Args:
-        source: 已完成资源预算治理的 Source。
+        source: 已完成 EOF 快照的 Source。
         relative_path: 文件相对路径。
         query: 搜索关键词。
         remaining: 剩余可返回匹配数。
@@ -2271,10 +2167,10 @@ def _read_bounded_text(
     end_line: int | None,
     cancellation_token: CancellationToken,
 ) -> _BoundedTextRead:
-    """用增量 decoder 与行扫描器读取有界 Source。
+    """用增量 decoder 与行扫描器读取完整快照 Source。
 
     Args:
-        snapshot: 已完成字节预算治理的 Source。
+        snapshot: 已完成 EOF 快照的 Source。
         encodings: 按顺序尝试的文本编码。
         max_chars: 允许返回的最大字符数。
         start_line: 从 1 开始的起始行。
@@ -2321,7 +2217,7 @@ def _read_source_with_encoding(
     """使用单一编码增量扫描 Source 并执行字符预算。
 
     Args:
-        source: 已完成字节预算治理的 Source。
+        source: 已完成 EOF 快照的 Source。
         encoding: 当前文本编码。
         max_chars: 允许返回的最大字符数。
         start_line: 从 1 开始的起始行。
@@ -2400,10 +2296,10 @@ def _decode_snapshot_text(
     encodings: tuple[str, ...],
     cancellation_token: CancellationToken,
 ) -> str | None:
-    """完整解码已经过字节预算治理的 Source。
+    """完整解码已复制到 EOF 的 Source 快照。
 
     Args:
-        source: 已完成字节预算治理的 Source。
+        source: 已完成 EOF 快照的 Source。
         encodings: 按顺序尝试的文本编码。
         cancellation_token: Host 注入的取消观察令牌。
 
@@ -2433,7 +2329,7 @@ def _iter_decoded_chunks(
     """从 Source 产出增量解码文本块。
 
     Args:
-        source: 已完成字节预算治理的 Source。
+        source: 已完成 EOF 快照的 Source。
         encoding: 文本编码。
         cancellation_token: Host 注入的取消观察令牌。
 
@@ -2472,10 +2368,10 @@ def _search_source_with_encoding(
     encoding: str,
     cancellation_token: CancellationToken,
 ) -> list[dict[str, JsonValue]]:
-    """使用单一编码增量搜索有界 Source。
+    """使用单一编码增量搜索完整快照 Source。
 
     Args:
-        source: 已完成字节预算治理的 Source。
+        source: 已完成 EOF 快照的 Source。
         relative_path: 文件相对路径。
         query: 搜索关键词。
         remaining: 剩余可返回匹配数。
