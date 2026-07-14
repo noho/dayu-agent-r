@@ -114,16 +114,25 @@ _FORBIDDEN_CANCEL_MESSAGE_PARTS = (
     "Host cancelled",
     "continue_without_web",
 )
+_PROXY_ALLOWED_TRANSPORT_POLICY = web_http_session.WebHttpTransportPolicy(
+    dns_peer_proof_enabled=False,
+    allow_environment_proxy=True,
+)
+_PROXY_DENIED_TRANSPORT_POLICY = web_http_session.WebHttpTransportPolicy(
+    dns_peer_proof_enabled=False,
+    allow_environment_proxy=False,
+)
+_PEER_PROOF_TRANSPORT_POLICY = web_http_session.WebHttpTransportPolicy(
+    dns_peer_proof_enabled=True,
+    allow_environment_proxy=False,
+)
 
 
 def test_web_diagnostic_projection_removes_secret_content_url_headers_exception_and_network() -> None:
     """所有 Web diagnostic producer 只能保留 length/digest 与 safe URL。"""
 
     sentinel = "9f" * 32
-    secret_url = (
-        f"https://{sentinel}:{sentinel}@example.com/report"
-        f"?token={sentinel}#{sentinel}"
-    )
+    secret_url = f"https://{sentinel}:{sentinel}@example.com/report" f"?token={sentinel}#{sentinel}"
     projections: list[JsonValue] = [
         web_diagnostics.completed_text_projection(
             stage="success",
@@ -186,10 +195,7 @@ def test_playwright_success_final_url_uses_safe_projection() -> None:
     payload = web_tools._build_playwright_success_payload(
         "https://example.com/request",
         {
-            "final_url": (
-                f"https://{sentinel}:{sentinel}@example.com/report"
-                f"?token={sentinel}#{sentinel}"
-            ),
+            "final_url": (f"https://{sentinel}:{sentinel}@example.com/report" f"?token={sentinel}#{sentinel}"),
             "title": "Example",
             "content": "safe projected content",
         },
@@ -202,12 +208,11 @@ def test_playwright_success_final_url_uses_safe_projection() -> None:
 def test_raise_fetch_failure_accepts_only_owner_projection_inputs() -> None:
     """failure owner 不得接受会被静默丢弃的任意 downstream diagnostics。"""
 
-    assert "internal_diagnostics" not in inspect.signature(
-        web_tools._raise_fetch_failure
-    ).parameters
-    assert inspect.signature(web_tools._raise_fetch_failure).parameters[
-        "diagnostic_error_chars"
-    ].default is inspect.Signature.empty
+    assert "internal_diagnostics" not in inspect.signature(web_tools._raise_fetch_failure).parameters
+    assert (
+        inspect.signature(web_tools._raise_fetch_failure).parameters["diagnostic_error_chars"].default
+        is inspect.Signature.empty
+    )
     with pytest.raises(web_tools.ToolBusinessError) as exc_info:
         web_tools._raise_fetch_failure(
             url="https://user:secret@example.com/report?token=secret#fragment",
@@ -239,12 +244,8 @@ def test_project_error_message_marks_small_cap_truncation_without_false_positive
     """
 
     assert web_diagnostics.project_error_message("xx", max_chars=1) == "…"
-    assert web_diagnostics.project_error_message("x" * 15, max_chars=14) == (
-        "x" * 13 + "…"
-    )
-    assert web_diagnostics.project_error_message("x" * 16, max_chars=15) == (
-        "x...<truncated>"
-    )
+    assert web_diagnostics.project_error_message("x" * 15, max_chars=14) == ("x" * 13 + "…")
+    assert web_diagnostics.project_error_message("x" * 16, max_chars=15) == ("x...<truncated>")
     assert web_diagnostics.project_error_message("short", max_chars=14) == "short"
 
 
@@ -307,6 +308,7 @@ def test_ordinary_fetch_failure_matrix_keeps_config_diagnostic_owner(
     queued_results: list[web_tools._FetchContentResult | BaseException] = [
         requests.TooManyRedirects("synthetic redirect chain exceeded"),
         requests.Timeout("synthetic request timeout"),
+        web_http_session.ProxyPeerProofIncompatibleError(),
         requests.ConnectionError("synthetic connection reset"),
         requests.exceptions.SSLError("synthetic TLS handshake failure"),
         RuntimeError("synthetic conversion failure"),
@@ -344,6 +346,7 @@ def test_ordinary_fetch_failure_matrix_keeps_config_diagnostic_owner(
         headers: Mapping[str, str] | None = None,
         content_type_probe: web_tools.ContentProbePayload | None = None,
         egress_policy: WebEgressPolicy,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
         http_resource_budget: HttpResourceBudget,
         timeout_budget: float | None = None,
         deadline_monotonic: float | None = None,
@@ -358,6 +361,7 @@ def test_ordinary_fetch_failure_matrix_keeps_config_diagnostic_owner(
             headers: 可选请求头。
             content_type_probe: 可选 content probe 事实。
             egress_policy: 当前 Web 出站策略。
+            transport_policy: 当前 attempt 的 transport policy。
             http_resource_budget: HTTP child 资源预算。
             timeout_budget: 可选总超时预算。
             deadline_monotonic: 可选绝对 deadline。
@@ -378,6 +382,7 @@ def test_ordinary_fetch_failure_matrix_keeps_config_diagnostic_owner(
             headers,
             content_type_probe,
             egress_policy,
+            transport_policy,
             http_resource_budget,
             timeout_budget,
             deadline_monotonic,
@@ -399,6 +404,8 @@ def test_ordinary_fetch_failure_matrix_keeps_config_diagnostic_owner(
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
         egress_policy: WebEgressPolicy,
+        browser_enabled: bool,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
         browser_resource_budget: BrowserResourceBudget,
         diagnostic_resource_budget: DiagnosticResourceBudget,
         cancellation_token: CancellationToken | None = None,
@@ -414,6 +421,8 @@ def test_ordinary_fetch_failure_matrix_keeps_config_diagnostic_owner(
             playwright_channel: 可选浏览器 channel。
             playwright_storage_state_path: storage state 路径。
             egress_policy: 当前 Web 出站策略。
+            browser_enabled: 当前配置是否允许 browser fallback。
+            transport_policy: 当前 attempt 的 transport policy。
             browser_resource_budget: Browser child 资源预算。
             diagnostic_resource_budget: Diagnostic child 资源预算。
             cancellation_token: 可选取消令牌。
@@ -434,6 +443,8 @@ def test_ordinary_fetch_failure_matrix_keeps_config_diagnostic_owner(
             playwright_channel,
             playwright_storage_state_path,
             egress_policy,
+            browser_enabled,
+            transport_policy,
             browser_resource_budget,
             diagnostic_resource_budget,
             cancellation_token,
@@ -452,12 +463,10 @@ def test_ordinary_fetch_failure_matrix_keeps_config_diagnostic_owner(
     monkeypatch.setattr(web_tools, "_probe_content_type", _stable_owner_probe)
     monkeypatch.setattr(web_tools, "_fetch_and_convert_content", fail_fetch)
     monkeypatch.setattr(web_tools, "_try_playwright_fallback", controlled_browser_fallback)
-    config = web_provider._parse_config(
-        {"resource_budget": {"diagnostics": {"error_chars": 5}}}
-    )
+    config = web_provider._parse_config({"resource_budget": {"diagnostics": {"error_chars": 5}}})
 
     observed_codes: list[str] = []
-    for _expected_error in range(7):
+    for _expected_error in range(8):
         with pytest.raises(web_tools.ToolBusinessError) as exc_info:
             web_tools._fetch_web_page_business(
                 url="https://example.com/report",
@@ -471,6 +480,7 @@ def test_ordinary_fetch_failure_matrix_keeps_config_diagnostic_owner(
     assert observed_codes == [
         "too_many_redirects",
         "request_timeout",
+        "proxy_peer_proof_incompatible",
         "http_error",
         "ssl_error",
         "content_conversion_failed",
@@ -616,6 +626,8 @@ class _IdentityZstdModule(ModuleType):
         """
 
         return _IdentityZstdDecompressor()
+
+
 _PINNED_TEST_CERTIFICATE = """-----BEGIN CERTIFICATE-----
 MIIDJTCCAg2gAwIBAgIUGUkR/EMkG5dZOX3VCiJfSvuYJ6MwDQYJKoZIhvcNAQEL
 BQAwFjEUMBIGA1UEAwwLcGlubmVkLnRlc3QwHhcNMjYwNzEzMDQ0NzE0WhcNMzYw
@@ -1421,20 +1433,28 @@ def _queued_send_authorized_request(
     timeout: float,
     headers: Mapping[str, str],
     stream: bool,
+    transport_policy: web_http_session.WebHttpTransportPolicy,
 ) -> web_http_session.AuthorizedResponseLease:
     """让编排测试替身显式消费 AuthorizedHttpTarget。
 
-    :param source_session: 按顺序返回 response 的测试 Session。
-    :param target: 当前 hop 的授权目标。
-    :param method: HTTP 方法。
-    :param timeout: 请求超时。
-    :param headers: 请求头。
-    :param stream: 是否流式读取。
-    :returns: response lease。
-    :raises AssertionError: Session 不是预期替身时抛出。
+    Args:
+        source_session: 按顺序返回 response 的测试 Session。
+        target: 当前 hop 的授权目标。
+        method: HTTP 方法。
+        timeout: 请求超时。
+        headers: 请求头。
+        stream: 是否流式读取。
+        transport_policy: 当前 attempt 的 transport policy。
+
+    Returns:
+        response lease。
+
+    Raises:
+        AssertionError: Session 不是预期替身时抛出。
     """
 
     assert isinstance(source_session, _QueuedSession)
+    assert isinstance(transport_policy, web_http_session.WebHttpTransportPolicy)
     response = source_session.request(
         method,
         target.normalized_url,
@@ -1446,6 +1466,27 @@ def _queued_send_authorized_request(
     return web_http_session.AuthorizedResponseLease(
         response=response,
         session=cast(requests.Session, source_session),
+    )
+
+
+def _plain_response_lease(
+    response: requests.Response,
+) -> web_http_session.AuthorizedResponseLease:
+    """为 search provider 测试 response 构造独占关闭 lease。
+
+    Args:
+        response: 待交给 provider 消费的确定性 response。
+
+    Returns:
+        持有 response 与私有 Session 的 lease。
+
+    Raises:
+        无。
+    """
+
+    return web_http_session.AuthorizedResponseLease(
+        response=response,
+        session=requests.Session(),
     )
 
 
@@ -1782,8 +1823,7 @@ class _SyntheticNestedPlaywrightWorker:
             [
                 sys.executable,
                 "-c",
-                "import time\n"
-                "time.sleep(60)\n",
+                "import time\n" "time.sleep(60)\n",
             ],
         )
         Path(playwright_storage_state_path).write_text(
@@ -1950,6 +1990,7 @@ def _stable_owner_warmup(
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
     egress_policy: WebEgressPolicy,
+    transport_policy: web_http_session.WebHttpTransportPolicy,
     browser_resource_budget: BrowserResourceBudget,
     cancellation_token: CancellationToken | None = None,
 ) -> web_tools.StagePayload:
@@ -1963,6 +2004,7 @@ def _stable_owner_warmup(
         timeout_budget: 可选总超时预算。
         deadline_monotonic: 可选绝对 deadline。
         egress_policy: 当前 Web 出站策略。
+        transport_policy: 当前 attempt 的 transport policy。
         browser_resource_budget: Browser child 资源预算。
         cancellation_token: 可选取消令牌。
 
@@ -1981,6 +2023,7 @@ def _stable_owner_warmup(
         timeout_budget,
         deadline_monotonic,
         egress_policy,
+        transport_policy,
         browser_resource_budget,
         cancellation_token,
     )
@@ -1996,6 +2039,7 @@ def _stable_owner_probe(
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
     egress_policy: WebEgressPolicy,
+    transport_policy: web_http_session.WebHttpTransportPolicy,
     cancellation_token: CancellationToken | None = None,
 ) -> web_tools.ContentProbePayload:
     """返回不升级 browser 的精确 probe facts。
@@ -2008,6 +2052,7 @@ def _stable_owner_probe(
         timeout_budget: 可选总超时预算。
         deadline_monotonic: 可选绝对 deadline。
         egress_policy: 当前 Web 出站策略。
+        transport_policy: 当前 attempt 的 transport policy。
         cancellation_token: 可选取消令牌。
 
     Returns:
@@ -2025,6 +2070,7 @@ def _stable_owner_probe(
         timeout_budget,
         deadline_monotonic,
         egress_policy,
+        transport_policy,
         cancellation_token,
     )
     return {"attempted": True, "ok": True}
@@ -2409,6 +2455,59 @@ def _process_entry_success_worker(
     return {"ok": True, "content": "success"}
 
 
+def _process_entry_proxy_environment_worker(
+    *,
+    url: str,
+    timeout_seconds: float,
+    headers: Mapping[str, str] | None = None,
+    playwright_channel: str | None = None,
+    playwright_storage_state_path: str = "",
+    egress_policy: WebEgressPolicy,
+    browser_resource_budget: BrowserResourceBudget,
+) -> web_playwright_backend.WebPayload:
+    """返回 worker 入口可见的标准 proxy 环境变量名。
+
+    Args:
+        url: 目标 URL。
+        timeout_seconds: browser timeout。
+        headers: 请求头。
+        playwright_channel: browser channel。
+        playwright_storage_state_path: storage state 路径。
+        egress_policy: 出站策略。
+        browser_resource_budget: browser budget。
+
+    Returns:
+        只含环境变量名、不含 proxy 值的确定性 payload。
+
+    Raises:
+        无。
+    """
+
+    del (
+        url,
+        timeout_seconds,
+        headers,
+        playwright_channel,
+        playwright_storage_state_path,
+        egress_policy,
+        browser_resource_budget,
+    )
+    proxy_names = (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    )
+    return {
+        "ok": True,
+        "visible_proxy_environment": [name for name in proxy_names if name in os.environ],
+    }
+
+
 def _process_entry_blocked_worker(
     *,
     url: str,
@@ -2645,6 +2744,426 @@ def test_egress_transport_dependency_versions_are_locked() -> None:
     assert package_version("urllib3") == "2.6.3"
 
 
+def test_http_transport_proxy_allow_prepares_once_and_reuses_merged_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """proxy allow 必须使用标准 Session 并原样复用一次 merge 的 settings。
+
+    Args:
+        monkeypatch: pytest 属性替换夹具。
+        caplog: pytest 日志捕获夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: prepare/merge/select/send 未消费同一 settings 时抛出。
+    """
+
+    source_session = web_http_session._create_no_retry_session()
+    target = AuthorizedHttpTarget(
+        normalized_url="https://example.com/report?secret=hidden",
+        scheme="https",
+        hostname="example.com",
+        port=443,
+        approved_addresses=("93.184.216.34",),
+    )
+    prepared_count = 0
+    merged_count = 0
+    selected_proxy_ids: list[int] = []
+    sent_proxy_ids: list[int] = []
+    proxy_settings = {"https": "http://user:credential@proxy.invalid:8080"}
+    settings: web_http_session._MergedEnvironmentSettings = {
+        "proxies": proxy_settings,
+        "stream": True,
+        "verify": True,
+        "cert": None,
+    }
+    original_prepare = requests.Session.prepare_request
+
+    def record_prepare(
+        session: requests.Session,
+        request: requests.Request,
+    ) -> requests.PreparedRequest:
+        """记录唯一 prepare 调用并执行 requests 标准实现。
+
+        Args:
+            session: 当前 attempt-local Session。
+            request: 待 prepare 的请求。
+
+        Returns:
+            标准 requests prepared request。
+
+        Raises:
+            requests.RequestException: 标准 prepare 失败时原样抛出。
+        """
+
+        nonlocal prepared_count
+        prepared_count += 1
+        assert session.trust_env is True
+        return original_prepare(session, request)
+
+    def record_merge(
+        session: requests.Session,
+        url: str,
+        proxies: Mapping[str, str],
+        stream: bool,
+        verify: bool | str,
+        cert: str | tuple[str, str] | None,
+    ) -> web_http_session._MergedEnvironmentSettings:
+        """返回唯一 merged settings 对象并记录空 per-call proxy 输入。
+
+        Args:
+            session: 当前 attempt-local Session。
+            url: 当前 prepared URL。
+            proxies: per-call proxy 输入。
+            stream: stream 开关。
+            verify: TLS verify 设置。
+            cert: client certificate 设置。
+
+        Returns:
+            供 select 与 send 共同消费的同一个 settings。
+
+        Raises:
+            AssertionError: trust_env 或调用参数漂移时抛出。
+        """
+
+        nonlocal merged_count
+        merged_count += 1
+        assert session.trust_env is True
+        assert url == target.normalized_url
+        assert dict(proxies) == {}
+        assert stream is True
+        assert verify is True
+        assert cert is None
+        return settings
+
+    def record_select_proxy(
+        url: str,
+        proxies: Mapping[str, str] | None,
+    ) -> str | None:
+        """记录 select_proxy 收到的 merged proxy 对象。
+
+        Args:
+            url: 当前 prepared URL。
+            proxies: merged proxy 映射。
+
+        Returns:
+            确定性 active proxy。
+
+        Raises:
+            AssertionError: URL 或 proxy 对象发生复制时抛出。
+        """
+
+        assert url == target.normalized_url
+        assert proxies is proxy_settings
+        selected_proxy_ids.append(id(proxies))
+        return proxy_settings["https"]
+
+    def record_send(
+        session: requests.Session,
+        request: requests.PreparedRequest,
+        *,
+        timeout: float,
+        allow_redirects: bool,
+        proxies: dict[str, str],
+        stream: bool,
+        verify: bool | str,
+        cert: str | tuple[str, str] | None,
+    ) -> requests.Response:
+        """记录 send 收到的原 merged settings 并返回确定性响应。
+
+        Args:
+            session: 当前 attempt-local Session。
+            request: 唯一 prepared request。
+            timeout: 请求 timeout。
+            allow_redirects: 自动 redirect 开关。
+            proxies: merged proxy 映射。
+            stream: stream 开关。
+            verify: TLS verify 设置。
+            cert: client certificate 设置。
+
+        Returns:
+            确定性空响应。
+
+        Raises:
+            AssertionError: transport 调用参数漂移时抛出。
+        """
+
+        assert session.trust_env is True
+        assert request.url == target.normalized_url
+        assert timeout == 1.0
+        assert allow_redirects is False
+        assert proxies is proxy_settings
+        assert stream is True
+        assert verify is True
+        assert cert is None
+        sent_proxy_ids.append(id(proxies))
+        response = requests.Response()
+        response.status_code = 200
+        response.url = target.normalized_url
+        response.request = request
+        return response
+
+    monkeypatch.setattr(requests.Session, "prepare_request", record_prepare)
+    monkeypatch.setattr(requests.Session, "merge_environment_settings", record_merge)
+    monkeypatch.setattr(requests.utils, "select_proxy", record_select_proxy)
+    monkeypatch.setattr(requests.Session, "send", record_send)
+    caplog.set_level(logging.WARNING, logger=web_http_session.__name__)
+    try:
+        lease = web_http_session._send_authorized_request(
+            source_session,
+            target=target,
+            method="GET",
+            timeout=1.0,
+            headers={},
+            stream=True,
+            transport_policy=_PROXY_ALLOWED_TRANSPORT_POLICY,
+        )
+        lease.close()
+    finally:
+        source_session.close()
+
+    assert prepared_count == 1
+    assert merged_count == 1
+    assert selected_proxy_ids == sent_proxy_ids
+    warning_messages = [record.getMessage() for record in caplog.records if record.name == web_http_session.__name__]
+    assert warning_messages == ["environment_proxy_active=true " "reason=environment_proxy_active_without_peer_proof"]
+    assert "credential" not in warning_messages[0]
+    assert "example.com" not in warning_messages[0]
+
+
+def test_http_transport_proxy_deny_ignores_environment_and_sends_direct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """proxy deny 必须令 trust_env=false 且同次 send 收到空 proxies。
+
+    Args:
+        monkeypatch: pytest 属性替换夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: direct transport 读取环境或传入 proxy 时抛出。
+    """
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:8080")
+    source_session = web_http_session._create_no_retry_session()
+    target = AuthorizedHttpTarget(
+        normalized_url="https://example.com/report",
+        scheme="https",
+        hostname="example.com",
+        port=443,
+        approved_addresses=("93.184.216.34",),
+    )
+    observed_proxies: list[dict[str, str]] = []
+
+    def record_direct_send(
+        session: requests.Session,
+        request: requests.PreparedRequest,
+        *,
+        timeout: float,
+        allow_redirects: bool,
+        proxies: dict[str, str],
+        stream: bool,
+        verify: bool | str,
+        cert: str | tuple[str, str] | None,
+    ) -> requests.Response:
+        """记录 direct send 的 trust_env 与空 proxy settings。
+
+        Args:
+            session: 当前 attempt-local Session。
+            request: prepared request。
+            timeout: 请求 timeout。
+            allow_redirects: 自动 redirect 开关。
+            proxies: merge 后 proxy 映射。
+            stream: stream 开关。
+            verify: TLS verify 设置。
+            cert: client certificate 设置。
+
+        Returns:
+            确定性空响应。
+
+        Raises:
+            AssertionError: direct transport 参数漂移时抛出。
+        """
+
+        del timeout, allow_redirects, stream, verify, cert
+        assert session.trust_env is False
+        assert request.url == target.normalized_url
+        observed_proxies.append(proxies)
+        response = requests.Response()
+        response.status_code = 200
+        response.url = target.normalized_url
+        response.request = request
+        return response
+
+    monkeypatch.setattr(requests.Session, "send", record_direct_send)
+    try:
+        lease = web_http_session._send_authorized_request(
+            source_session,
+            target=target,
+            method="GET",
+            timeout=1.0,
+            headers={},
+            stream=False,
+            transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
+        )
+        lease.close()
+    finally:
+        source_session.close()
+
+    assert observed_proxies == [{}]
+
+
+def test_http_transport_proof_with_active_proxy_fails_typed_before_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """proof on 遇到当前 URL active proxy 必须 typed fail 且不得降级发送。
+
+    Args:
+        monkeypatch: pytest 属性替换夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: typed 冲突未在 send 前阻断时抛出。
+    """
+
+    source_session = web_http_session._create_no_retry_session()
+    target = AuthorizedHttpTarget(
+        normalized_url="https://example.com/report",
+        scheme="https",
+        hostname="example.com",
+        port=443,
+        approved_addresses=("93.184.216.34",),
+    )
+    proxy_settings = {"https": "http://proxy.invalid:8080"}
+    settings: web_http_session._MergedEnvironmentSettings = {
+        "proxies": proxy_settings,
+        "stream": False,
+        "verify": True,
+        "cert": None,
+    }
+    send_calls: list[str] = []
+
+    def return_proxy_settings(
+        session: requests.Session,
+        url: str,
+        proxies: Mapping[str, str],
+        stream: bool,
+        verify: bool | str,
+        cert: str | tuple[str, str] | None,
+    ) -> web_http_session._MergedEnvironmentSettings:
+        """为 proof/proxy 冲突返回确定性 active proxy settings。
+
+        Args:
+            session: 当前 attempt-local Session。
+            url: 当前 prepared URL。
+            proxies: per-call proxy 输入。
+            stream: stream 开关。
+            verify: TLS verify 设置。
+            cert: client certificate 设置。
+
+        Returns:
+            含 active proxy 的 merged settings。
+
+        Raises:
+            AssertionError: proof attempt 未允许读取环境时抛出。
+        """
+
+        del url, proxies, stream, verify, cert
+        assert session.trust_env is True
+        return settings
+
+    def select_active_proxy(
+        url: str,
+        proxies: Mapping[str, str] | None,
+    ) -> str | None:
+        """返回当前 URL 的 active proxy。
+
+        Args:
+            url: 当前 prepared URL。
+            proxies: merged proxy 映射。
+
+        Returns:
+            确定性 proxy URI。
+
+        Raises:
+            AssertionError: sender 未传同一 proxy 对象时抛出。
+        """
+
+        del url
+        assert proxies is proxy_settings
+        return proxy_settings["https"]
+
+    def reject_send(
+        session: requests.Session,
+        request: requests.PreparedRequest,
+        *,
+        timeout: float,
+        allow_redirects: bool,
+        proxies: dict[str, str],
+        stream: bool,
+        verify: bool | str,
+        cert: str | tuple[str, str] | None,
+    ) -> requests.Response:
+        """记录任何不应发生的 proof/proxy 降级发送。
+
+        Args:
+            session: 当前 Session。
+            request: prepared request。
+            timeout: 请求 timeout。
+            allow_redirects: 自动 redirect 开关。
+            proxies: merged proxy 映射。
+            stream: stream 开关。
+            verify: TLS verify 设置。
+            cert: client certificate 设置。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 始终抛出以暴露静默降级。
+        """
+
+        del session, request, timeout, allow_redirects, proxies, stream, verify, cert
+        send_calls.append("unexpected")
+        raise AssertionError("proof/proxy conflict must fail before send")
+
+    monkeypatch.setattr(
+        requests.Session,
+        "merge_environment_settings",
+        return_proxy_settings,
+    )
+    monkeypatch.setattr(requests.utils, "select_proxy", select_active_proxy)
+    monkeypatch.setattr(requests.Session, "send", reject_send)
+    proof_with_proxy = web_http_session.WebHttpTransportPolicy(
+        dns_peer_proof_enabled=True,
+        allow_environment_proxy=True,
+    )
+    try:
+        with pytest.raises(web_http_session.ProxyPeerProofIncompatibleError) as exc_info:
+            web_http_session._send_authorized_request(
+                source_session,
+                target=target,
+                method="GET",
+                timeout=1.0,
+                headers={},
+                stream=False,
+                transport_policy=proof_with_proxy,
+            )
+    finally:
+        source_session.close()
+
+    assert exc_info.value.reason == "proxy_peer_proof_incompatible"
+    assert str(exc_info.value) == "proxy_peer_proof_incompatible"
+    assert send_calls == []
+
+
 def test_egress_target_bound_http_preserves_host_and_numeric_destination() -> None:
     """真实 adapter/pool/connection 必须只连接授权 IP 并保留 HTTP Host。"""
 
@@ -2676,6 +3195,7 @@ def test_egress_target_bound_http_preserves_host_and_numeric_destination() -> No
             timeout=2.0,
             headers={},
             stream=False,
+            transport_policy=_PEER_PROOF_TRANSPORT_POLICY,
         )
         with lease:
             assert lease.response.content == b"pinned http"
@@ -2764,6 +3284,7 @@ def test_egress_target_bound_https_preserves_sni_certificate_and_host(
             timeout=2.0,
             headers={},
             stream=False,
+            transport_policy=_PEER_PROOF_TRANSPORT_POLICY,
         )
         with lease:
             assert lease.response.content == b"pinned https"
@@ -2825,6 +3346,7 @@ def test_egress_pinned_retry_uses_same_approved_addresses(monkeypatch: pytest.Mo
             timeout=2.0,
             headers={},
             stream=False,
+            transport_policy=_PEER_PROOF_TRANSPORT_POLICY,
         )
         with lease:
             assert lease.response.content == b"retry ok"
@@ -2883,6 +3405,7 @@ def test_egress_pinned_retry_exhaustion_has_no_fallback_dns(monkeypatch: pytest.
                 timeout=1.0,
                 headers={},
                 stream=False,
+                transport_policy=_PEER_PROOF_TRANSPORT_POLICY,
             )
     finally:
         source_session.close()
@@ -3096,9 +3619,7 @@ def test_web_process_target_timeout_budget_is_serialized_to_target(
 ) -> None:
     """process target 必须携带父进程投影的 timeout 标量。"""
 
-    definition = _definitions_by_name(
-        _discover_definitions({"allow_private_network_url": True})
-    )[tool_name]
+    definition = _definitions_by_name(_discover_definitions({"allow_private_network_url": True}))[tool_name]
     execution = cast(ProcessBackedToolExecutionCapability, definition.execution)
     target = execution.target_factory.build_process_target(
         _call(tool_name, _process_arguments_for_tool(tool_name)),
@@ -3123,9 +3644,7 @@ def test_web_process_backed_capsule_spawns_child_success() -> None:
         max_connections=8,
     )
     try:
-        definition = _definitions_by_name(
-            _discover_definitions({"allow_private_network_url": True})
-        )["fetch_web_page"]
+        definition = _definitions_by_name(_discover_definitions({"allow_private_network_url": True}))["fetch_web_page"]
         execution = cast(ProcessBackedToolExecutionCapability, definition.execution)
         target = execution.target_factory.build_process_target(
             _call("fetch_web_page", {"url": server.url}),
@@ -3169,9 +3688,7 @@ def test_web_toolruntime_cancel_real_process_target_has_no_late_accept() -> None
         )
         accept_port = _AcceptingPort()
         token = _ManualCancellationToken()
-        tool_runtime = DefaultToolRuntimeFactory(
-            EffectiveToolBundleBuilder()
-        ).create_tool_runtime(
+        tool_runtime = DefaultToolRuntimeFactory(EffectiveToolBundleBuilder()).create_tool_runtime(
             ToolRuntimeBuildRequest(
                 effective_bundle_request=EffectiveToolBundleBuildRequest(
                     business_tool_bundle=ToolBundle(definitions=output.definitions),
@@ -3207,9 +3724,7 @@ def test_web_toolruntime_cancel_real_process_target_has_no_late_accept() -> None
     assert elapsed < 2.0
     assert governed_outcome.result.hint is None
     assert len(accept_port.candidates) == 1
-    assert accept_port.candidates[0].governance.policy_decision.reason_code == (
-        "tool_runtime_cancelled"
-    )
+    assert accept_port.candidates[0].governance.policy_decision.reason_code == ("tool_runtime_cancelled")
 
 
 def test_search_public_web_provider_result_excludes_llm_guidance(
@@ -3227,23 +3742,32 @@ def test_search_public_web_provider_result_excludes_llm_guidance(
         timeout_seconds: float,
         timeout_budget: float | None = None,
         deadline_monotonic: float | None = None,
+        egress_policy: WebEgressPolicy,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
         normalize_whitespace: Callable[[str], str],
         resolve_timeout_budget: web_search_providers._TimeoutBudgetResolver,
         http_resource_budget: HttpResourceBudget,
     ) -> list[web_search_providers.SearchResultRow]:
         """返回确定性 provider 原始结果。
 
-        :param query: 检索关键词。
-        :param domains: 域名过滤。
-        :param max_results: 返回数量。
-        :param timeout_seconds: HTTP 请求超时秒数。
-        :param timeout_budget: 工具调用总预算。
-        :param deadline_monotonic: 工具调用 deadline。
-        :param normalize_whitespace: 空白规整函数。
-        :param resolve_timeout_budget: timeout 预算解析函数。
-        :param http_resource_budget: Web response 资源预算。
-        :returns: 单条 provider 原始结果。
-        :raises Exception: 不主动抛出异常。
+        Args:
+            query: 检索关键词。
+            domains: 域名过滤。
+            max_results: 返回数量。
+            timeout_seconds: HTTP 请求超时秒数。
+            timeout_budget: 工具调用总预算。
+            deadline_monotonic: 工具调用 deadline。
+            egress_policy: provider endpoint 出站策略。
+            transport_policy: 当前 attempt transport policy。
+            normalize_whitespace: 空白规整函数。
+            resolve_timeout_budget: timeout 预算解析函数。
+            http_resource_budget: Web response 资源预算。
+
+        Returns:
+            单条 provider 原始结果。
+
+        Raises:
+            无。
         """
 
         del (
@@ -3253,6 +3777,8 @@ def test_search_public_web_provider_result_excludes_llm_guidance(
             timeout_seconds,
             timeout_budget,
             deadline_monotonic,
+            egress_policy,
+            transport_policy,
             normalize_whitespace,
             resolve_timeout_budget,
         )
@@ -3311,6 +3837,7 @@ def test_search_public_web_provider_result_excludes_llm_guidance(
         timeout_budget=None,
         deadline_monotonic=None,
         egress_policy=_public_test_policy(),
+        transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
         normalize_whitespace=normalize_whitespace,
         resolve_timeout_budget=resolve_timeout_budget,
         http_resource_budget=_DEFAULT_HTTP_RESOURCE_BUDGET,
@@ -3439,9 +3966,7 @@ def test_search_web_receives_provider_config(
         )
     )["search_web"]
 
-    outcome = asyncio.run(
-        definition.callable(_call("search_web", {"query": "revenue"}), _context())
-    )
+    outcome = asyncio.run(definition.callable(_call("search_web", {"query": "revenue"}), _context()))
 
     assert isinstance(outcome, ToolCompletedOutcome)
     assert calls[0]["provider"] == "serper"
@@ -3472,6 +3997,7 @@ def test_search_web_receives_execution_context_and_passes_cancellation_token(
         timeout_budget: float | None,
         deadline_monotonic: float | None,
         egress_policy: WebEgressPolicy,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
         normalize_whitespace: Callable[[str], str],
         resolve_timeout_budget: web_search_providers._TimeoutBudgetResolver,
         http_resource_budget: HttpResourceBudget,
@@ -3479,22 +4005,28 @@ def test_search_web_receives_execution_context_and_passes_cancellation_token(
     ) -> web_search_providers.SearchWebProviderResult:
         """记录 token identity 并返回确定性搜索结果。
 
-        :param query: 检索关键词。
-        :param domains: 可选域名限制。
-        :param recency_days: 可选最近天数。
-        :param max_results: 请求结果数量。
-        :param max_search_results: 注册配置中的结果上限。
-        :param provider: provider 策略。
-        :param request_timeout_seconds: 单次 provider 请求超时。
-        :param timeout_budget: 当前工具调用预算。
-        :param deadline_monotonic: 当前工具调用 deadline。
-        :param egress_policy: 搜索结果出站策略。
-        :param normalize_whitespace: 空白规整函数。
-        :param resolve_timeout_budget: timeout 预算解析函数。
-        :param http_resource_budget: Web response 资源预算。
-        :param cancellation_token: execution context 注入的取消令牌。
-        :returns: 确定性 provider 搜索事实。
-        :raises Exception: 不主动抛出异常。
+        Args:
+            query: 检索关键词。
+            domains: 可选域名限制。
+            recency_days: 可选最近天数。
+            max_results: 请求结果数量。
+            max_search_results: 注册配置中的结果上限。
+            provider: provider 策略。
+            request_timeout_seconds: 单次 provider 请求超时。
+            timeout_budget: 当前工具调用预算。
+            deadline_monotonic: 当前工具调用 deadline。
+            egress_policy: 搜索结果出站策略。
+            transport_policy: 当前 attempt transport policy。
+            normalize_whitespace: 空白规整函数。
+            resolve_timeout_budget: timeout 预算解析函数。
+            http_resource_budget: Web response 资源预算。
+            cancellation_token: execution context 注入的取消令牌。
+
+        Returns:
+            确定性 provider 搜索事实。
+
+        Raises:
+            无。
         """
 
         del (
@@ -3506,6 +4038,7 @@ def test_search_web_receives_execution_context_and_passes_cancellation_token(
             timeout_budget,
             deadline_monotonic,
             egress_policy,
+            transport_policy,
             normalize_whitespace,
             resolve_timeout_budget,
             http_resource_budget,
@@ -3554,6 +4087,7 @@ def test_search_web_cancelled_before_provider_returns_host_cancelled(
         timeout_budget: float | None,
         deadline_monotonic: float | None,
         egress_policy: WebEgressPolicy,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
         normalize_whitespace: Callable[[str], str],
         resolve_timeout_budget: web_search_providers._TimeoutBudgetResolver,
         http_resource_budget: HttpResourceBudget,
@@ -3561,22 +4095,28 @@ def test_search_web_cancelled_before_provider_returns_host_cancelled(
     ) -> web_search_providers.SearchWebProviderResult:
         """记录非预期 provider 调用。
 
-        :param query: 检索关键词。
-        :param domains: 可选域名限制。
-        :param recency_days: 可选最近天数。
-        :param max_results: 请求结果数量。
-        :param max_search_results: 注册配置中的结果上限。
-        :param provider: provider 策略。
-        :param request_timeout_seconds: 单次 provider 请求超时。
-        :param timeout_budget: 当前工具调用预算。
-        :param deadline_monotonic: 当前工具调用 deadline。
-        :param egress_policy: 搜索结果出站策略。
-        :param normalize_whitespace: 空白规整函数。
-        :param resolve_timeout_budget: timeout 预算解析函数。
-        :param http_resource_budget: Web response 资源预算。
-        :param cancellation_token: execution context 注入的取消令牌。
-        :returns: 空 provider 搜索事实。
-        :raises Exception: 不主动抛出异常。
+        Args:
+            query: 检索关键词。
+            domains: 可选域名限制。
+            recency_days: 可选最近天数。
+            max_results: 请求结果数量。
+            max_search_results: 注册配置中的结果上限。
+            provider: provider 策略。
+            request_timeout_seconds: 单次 provider 请求超时。
+            timeout_budget: 当前工具调用预算。
+            deadline_monotonic: 当前工具调用 deadline。
+            egress_policy: 搜索结果出站策略。
+            transport_policy: 当前 attempt transport policy。
+            normalize_whitespace: 空白规整函数。
+            resolve_timeout_budget: timeout 预算解析函数。
+            http_resource_budget: Web response 资源预算。
+            cancellation_token: execution context 注入的取消令牌。
+
+        Returns:
+            空 provider 搜索事实。
+
+        Raises:
+            无。
         """
 
         del (
@@ -3589,6 +4129,7 @@ def test_search_web_cancelled_before_provider_returns_host_cancelled(
             timeout_budget,
             deadline_monotonic,
             egress_policy,
+            transport_policy,
             normalize_whitespace,
             resolve_timeout_budget,
             http_resource_budget,
@@ -3641,6 +4182,7 @@ def test_search_web_deep_cancel_message_is_sanitized(
         timeout_budget: float | None,
         deadline_monotonic: float | None,
         egress_policy: WebEgressPolicy,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
         normalize_whitespace: Callable[[str], str],
         resolve_timeout_budget: web_search_providers._TimeoutBudgetResolver,
         http_resource_budget: HttpResourceBudget,
@@ -3648,22 +4190,28 @@ def test_search_web_deep_cancel_message_is_sanitized(
     ) -> web_search_providers.SearchWebProviderResult:
         """模拟搜索 provider 在深层 checkpoint 抛出携带治理字段的取消。
 
-        :param query: 检索关键词。
-        :param domains: 可选域名限制。
-        :param recency_days: 可选最近天数。
-        :param max_results: 请求结果数量。
-        :param max_search_results: 注册配置中的结果上限。
-        :param provider: provider 策略。
-        :param request_timeout_seconds: 单次 provider 请求超时。
-        :param timeout_budget: 当前工具调用预算。
-        :param deadline_monotonic: 当前工具调用 deadline。
-        :param egress_policy: 搜索结果出站策略。
-        :param normalize_whitespace: 空白规整函数。
-        :param resolve_timeout_budget: timeout 预算解析函数。
-        :param http_resource_budget: Web response 资源预算。
-        :param cancellation_token: execution context 注入的取消令牌。
-        :returns: 不返回。
-        :raises web_search_providers.WebSearchCancelledError: 始终抛出测试取消。
+        Args:
+            query: 检索关键词。
+            domains: 可选域名限制。
+            recency_days: 可选最近天数。
+            max_results: 请求结果数量。
+            max_search_results: 注册配置中的结果上限。
+            provider: provider 策略。
+            request_timeout_seconds: 单次 provider 请求超时。
+            timeout_budget: 当前工具调用预算。
+            deadline_monotonic: 当前工具调用 deadline。
+            egress_policy: 搜索结果出站策略。
+            transport_policy: 当前 attempt transport policy。
+            normalize_whitespace: 空白规整函数。
+            resolve_timeout_budget: timeout 预算解析函数。
+            http_resource_budget: Web response 资源预算。
+            cancellation_token: execution context 注入的取消令牌。
+
+        Returns:
+            不返回。
+
+        Raises:
+            WebSearchCancelledError: 始终抛出测试取消。
         """
 
         del (
@@ -3677,6 +4225,7 @@ def test_search_web_deep_cancel_message_is_sanitized(
             timeout_budget,
             deadline_monotonic,
             egress_policy,
+            transport_policy,
             normalize_whitespace,
             resolve_timeout_budget,
             http_resource_budget,
@@ -3717,24 +4266,33 @@ def test_search_web_cancelled_between_provider_attempts_stops_fallback(
         recency_days: int | None,
         max_results: int,
         timeout_seconds: float,
+        egress_policy: WebEgressPolicy,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
         timeout_budget: float | None = None,
         deadline_monotonic: float | None = None,
-        resolve_timeout_budget: web_search_providers._TimeoutBudgetResolver = web_search_providers._default_resolve_timeout_budget,
+        resolve_timeout_budget: web_search_providers._TimeoutBudgetResolver,
         http_resource_budget: HttpResourceBudget,
     ) -> list[web_search_providers.SearchResultRow]:
         """模拟首个 provider 失败并同时触发 Host cancel。
 
-        :param query: 检索关键词。
-        :param domains: 域名限制。
-        :param recency_days: 最近天数。
-        :param max_results: 返回数量。
-        :param timeout_seconds: HTTP 请求超时。
-        :param timeout_budget: 当前工具预算。
-        :param deadline_monotonic: 当前工具 deadline。
-        :param resolve_timeout_budget: timeout 预算解析函数。
-        :param http_resource_budget: Web response 资源预算。
-        :returns: 不返回。
-        :raises RuntimeError: 始终抛出 provider 失败。
+        Args:
+            query: 检索关键词。
+            domains: 域名限制。
+            recency_days: 最近天数。
+            max_results: 返回数量。
+            timeout_seconds: HTTP 请求超时。
+            egress_policy: provider endpoint 出站策略。
+            transport_policy: 当前 attempt transport policy。
+            timeout_budget: 当前工具预算。
+            deadline_monotonic: 当前工具 deadline。
+            resolve_timeout_budget: timeout 预算解析函数。
+            http_resource_budget: Web response 资源预算。
+
+        Returns:
+            不返回。
+
+        Raises:
+            RuntimeError: 始终抛出 provider 失败。
         """
 
         del (
@@ -3743,6 +4301,8 @@ def test_search_web_cancelled_between_provider_attempts_stops_fallback(
             recency_days,
             max_results,
             timeout_seconds,
+            egress_policy,
+            transport_policy,
             timeout_budget,
             deadline_monotonic,
             resolve_timeout_budget,
@@ -3758,25 +4318,34 @@ def test_search_web_cancelled_between_provider_attempts_stops_fallback(
         domains: list[str],
         max_results: int,
         timeout_seconds: float,
+        egress_policy: WebEgressPolicy,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
         timeout_budget: float | None = None,
         deadline_monotonic: float | None = None,
-        normalize_whitespace: Callable[[str], str] = lambda value: " ".join(value.split()),
-        resolve_timeout_budget: web_search_providers._TimeoutBudgetResolver = web_search_providers._default_resolve_timeout_budget,
+        normalize_whitespace: Callable[[str], str],
+        resolve_timeout_budget: web_search_providers._TimeoutBudgetResolver,
         http_resource_budget: HttpResourceBudget,
     ) -> list[web_search_providers.SearchResultRow]:
         """记录非预期 DuckDuckGo fallback。
 
-        :param query: 检索关键词。
-        :param domains: 域名限制。
-        :param max_results: 返回数量。
-        :param timeout_seconds: HTTP 请求超时。
-        :param timeout_budget: 当前工具预算。
-        :param deadline_monotonic: 当前工具 deadline。
-        :param normalize_whitespace: 空白规整函数。
-        :param resolve_timeout_budget: timeout 预算解析函数。
-        :param http_resource_budget: Web response 资源预算。
-        :returns: 空结果。
-        :raises Exception: 不主动抛出异常。
+        Args:
+            query: 检索关键词。
+            domains: 域名限制。
+            max_results: 返回数量。
+            timeout_seconds: HTTP 请求超时。
+            egress_policy: provider endpoint 出站策略。
+            transport_policy: 当前 attempt transport policy。
+            timeout_budget: 当前工具预算。
+            deadline_monotonic: 当前工具 deadline。
+            normalize_whitespace: 空白规整函数。
+            resolve_timeout_budget: timeout 预算解析函数。
+            http_resource_budget: Web response 资源预算。
+
+        Returns:
+            空结果。
+
+        Raises:
+            无。
         """
 
         del (
@@ -3784,6 +4353,8 @@ def test_search_web_cancelled_between_provider_attempts_stops_fallback(
             domains,
             max_results,
             timeout_seconds,
+            egress_policy,
+            transport_policy,
             timeout_budget,
             deadline_monotonic,
             normalize_whitespace,
@@ -3887,9 +4458,7 @@ def test_fetch_private_url_fails_closed_with_explicit_false() -> None:
         AssertionError: private URL 未 fail closed 时抛出。
     """
 
-    definition = _definitions_by_name(
-        _discover_definitions({"allow_private_network_url": False})
-    )["fetch_web_page"]
+    definition = _definitions_by_name(_discover_definitions({"allow_private_network_url": False}))["fetch_web_page"]
 
     outcome = asyncio.run(
         definition.callable(
@@ -3908,10 +4477,7 @@ def test_fetch_private_url_can_be_allowed_with_explicit_config(
     """显式允许 private URL 后，抓取路径才可继续执行。"""
 
     sentinel = "5a" * 32
-    raw_final_url = (
-        f"https://{sentinel}:{sentinel}@example.com/report"
-        f"?token={sentinel}#{sentinel}"
-    )
+    raw_final_url = f"https://{sentinel}:{sentinel}@example.com/report" f"?token={sentinel}#{sentinel}"
     monkeypatch.setattr(web_tools, "_warmup_domain", lambda *args, **kwargs: {"attempted": True, "ok": True})
     monkeypatch.setattr(web_tools, "_probe_content_type", lambda *args, **kwargs: {"attempted": True, "ok": True})
     monkeypatch.setattr(web_tools, "_try_playwright_fallback", lambda *args, **kwargs: None)
@@ -3939,9 +4505,7 @@ def test_fetch_private_url_can_be_allowed_with_explicit_config(
         }
 
     monkeypatch.setattr(web_tools, "_fetch_and_convert_content", fake_fetch_and_convert_content)
-    definition = _definitions_by_name(
-        _discover_definitions({"allow_private_network_url": True})
-    )["fetch_web_page"]
+    definition = _definitions_by_name(_discover_definitions({"allow_private_network_url": True}))["fetch_web_page"]
 
     outcome = asyncio.run(
         definition.callable(
@@ -3968,9 +4532,7 @@ def test_fetch_redirect_to_private_url_fails_closed(monkeypatch: pytest.MonkeyPa
         body=b"",
         headers={"Location": "http://127.0.0.1/internal"},
     )
-    session = _QueuedSession(
-        [response]
-    )
+    session = _QueuedSession([response])
 
     monkeypatch.setattr(web_fetch_orchestrator, "_send_authorized_request", _queued_send_authorized_request)
     with pytest.raises(web_fetch_orchestrator._FetchUrlSafetyError) as exc_info:
@@ -3985,6 +4547,7 @@ def test_fetch_redirect_to_private_url_fails_closed(monkeypatch: pytest.MonkeyPa
             session=cast(requests.Session, session),
             headers={},
             egress_policy=_public_test_policy(),
+            transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
             http_resource_budget=_DEFAULT_HTTP_RESOURCE_BUDGET,
         )
 
@@ -4014,6 +4577,7 @@ def test_response_lease_transfers_final_response_and_closes_exactly_once(
         headers={},
         normalize_url_for_http=web_tools._normalize_url_for_http,
         egress_policy=_public_test_policy(),
+        transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
         stream=True,
         cancellation_token=None,
     )
@@ -4071,6 +4635,7 @@ def test_response_lease_closes_when_cancelled_after_request(
             headers={},
             normalize_url_for_http=web_tools._normalize_url_for_http,
             egress_policy=_public_test_policy(),
+            transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
             stream=True,
             cancellation_token=cast(CancellationToken, CancelAfterRequestToken()),
         )
@@ -4112,6 +4677,7 @@ def test_response_lease_closes_on_response_or_location_reject(
             headers={},
             normalize_url_for_http=web_tools._normalize_url_for_http,
             egress_policy=_public_test_policy(),
+            transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
             stream=True,
             cancellation_token=None,
         )
@@ -4141,6 +4707,7 @@ def test_response_lease_closes_on_too_many_redirects(monkeypatch: pytest.MonkeyP
             headers={},
             normalize_url_for_http=web_tools._normalize_url_for_http,
             egress_policy=_public_test_policy(),
+            transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
             stream=True,
             cancellation_token=None,
         )
@@ -4169,6 +4736,7 @@ def test_response_lease_closes_head_probe_success(monkeypatch: pytest.MonkeyPatc
         normalize_url_for_http=web_tools._normalize_url_for_http,
         is_timeout_like_exception=lambda error: False,
         egress_policy=_public_test_policy(),
+        transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
     )
 
     assert result["ok"] is True
@@ -4178,10 +4746,7 @@ def test_response_lease_closes_head_probe_success(monkeypatch: pytest.MonkeyPatc
 def test_fetch_meta_refresh_to_private_url_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     """HTML meta refresh 目标必须在继续抓取前复用同一 URL safety owner。"""
 
-    html = (
-        b'<html><head><meta http-equiv="refresh" '
-        b'content="0;url=http://127.0.0.1/internal"></head></html>'
-    )
+    html = b'<html><head><meta http-equiv="refresh" ' b'content="0;url=http://127.0.0.1/internal"></head></html>'
     session = _QueuedSession(
         [
             _raw_response(
@@ -4206,6 +4771,7 @@ def test_fetch_meta_refresh_to_private_url_fails_closed(monkeypatch: pytest.Monk
             session=cast(requests.Session, session),
             headers={},
             egress_policy=_public_test_policy(),
+            transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
             http_resource_budget=_DEFAULT_HTTP_RESOURCE_BUDGET,
         )
 
@@ -4216,10 +4782,7 @@ def test_fetch_meta_refresh_to_private_url_fails_closed(monkeypatch: pytest.Monk
 def test_fetch_meta_refresh_treats_redirect_hop_as_visited(monkeypatch: pytest.MonkeyPatch) -> None:
     """meta refresh 防环必须消费 HTTP redirect 已访问 URL 记录。"""
 
-    html = (
-        b'<html><head><meta http-equiv="refresh" '
-        b'content="0;url=https://example.com/redirected"></head></html>'
-    )
+    html = b'<html><head><meta http-equiv="refresh" ' b'content="0;url=https://example.com/redirected"></head></html>'
     session = _QueuedSession(
         [
             _raw_response(
@@ -4250,6 +4813,7 @@ def test_fetch_meta_refresh_treats_redirect_hop_as_visited(monkeypatch: pytest.M
             session=cast(requests.Session, session),
             headers={},
             egress_policy=_public_test_policy(),
+            transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
             http_resource_budget=_DEFAULT_HTTP_RESOURCE_BUDGET,
         )
 
@@ -4385,6 +4949,7 @@ def test_fetch_http_error_body_is_bounded_before_status_projection(
             session=cast(requests.Session, session),
             headers={},
             egress_policy=_public_test_policy(),
+            transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
             http_resource_budget=_http_resource_budget(
                 wire_body_bytes=4,
                 decoded_body_bytes=4,
@@ -4437,6 +5002,7 @@ def test_fetch_http_budget_success_paths_keep_html_and_non_html_semantics(
         session=cast(requests.Session, sessions[0]),
         headers={},
         egress_policy=_public_test_policy(),
+        transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
         http_resource_budget=_http_resource_budget(),
     )
     pdf_result = web_fetch_orchestrator._fetch_and_convert_content(
@@ -4450,6 +5016,7 @@ def test_fetch_http_budget_success_paths_keep_html_and_non_html_semantics(
         session=cast(requests.Session, sessions[1]),
         headers={},
         egress_policy=_public_test_policy(),
+        transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
         http_resource_budget=_http_resource_budget(),
     )
 
@@ -4484,9 +5051,7 @@ def test_resource_budget_constructor_rejects_bool_and_non_positive_integer(
 def test_resource_budget_provider_config_complete_object_and_default() -> None:
     """完整 nested resource_budget 成功，整个 object 缺失时使用 typed defaults。"""
 
-    parsed = web_provider._parse_config(
-        {"resource_budget": _resource_budget_json()}
-    )
+    parsed = web_provider._parse_config({"resource_budget": _resource_budget_json()})
     defaulted = web_provider._parse_config({})
 
     assert parsed.resource_budgets == _resource_budgets()
@@ -4513,9 +5078,7 @@ def test_resource_budget_provider_config_applies_only_local_child_default() -> N
         AssertionError: local default 改写 sibling owner 时抛出。
     """
 
-    parsed = web_provider._parse_config(
-        {"resource_budget": {"http": {"wire_body_bytes": 17}}}
-    )
+    parsed = web_provider._parse_config({"resource_budget": {"http": {"wire_body_bytes": 17}}})
 
     assert parsed.resource_budgets.http == HttpResourceBudget(
         wire_body_bytes=17,
@@ -4599,16 +5162,12 @@ def test_resource_budget_provider_config_rejects_unknown_and_invalid_values(
     """
 
     with pytest.raises(ValueError, match="wire_body_bytes"):
-        web_provider._parse_config(
-            {"resource_budget": {"http": {"wire_body_bytes": invalid_value}}}
-        )
+        web_provider._parse_config({"resource_budget": {"http": {"wire_body_bytes": invalid_value}}})
 
     with pytest.raises(ValueError, match="unknown groups: unexpected"):
         web_provider._parse_config({"resource_budget": {"unexpected": {}}})
     with pytest.raises(ValueError, match="http has unknown fields: unexpected"):
-        web_provider._parse_config(
-            {"resource_budget": {"http": {"unexpected": 1}}}
-        )
+        web_provider._parse_config({"resource_budget": {"http": {"unexpected": 1}}})
     with pytest.raises(ValueError, match="resource_budget.http must be an object"):
         web_provider._parse_config({"resource_budget": {"http": 1}})
 
@@ -4626,9 +5185,7 @@ def test_packaged_web_config_matches_typed_policy_and_budget_defaults() -> None:
         AssertionError: packaged projection 与 typed defaults 不同源时抛出。
     """
 
-    config_path = (
-        Path(__file__).resolve().parents[3] / "dayu" / "config" / "tool_discovery.json"
-    )
+    config_path = Path(__file__).resolve().parents[3] / "dayu" / "config" / "tool_discovery.json"
     document = cast(
         Mapping[str, JsonValue],
         json_module.loads(config_path.read_text(encoding="utf-8")),
@@ -4777,8 +5334,8 @@ def test_web_policy_config_rejects_non_boolean_values(
         web_provider._parse_config({field_name: invalid_value})
 
 
-def test_s1_budget_owner_signatures_and_worker_payload_are_closed() -> None:
-    """aggregate、probe、worker 与 process wrapper 必须满足 S1 owner 边界。
+def test_s2_owner_signatures_and_worker_payload_are_closed() -> None:
+    """预算、transport、worker 与 process wrapper 必须满足 S2 owner 边界。
 
     Args:
         无。
@@ -4803,20 +5360,16 @@ def test_s1_budget_owner_signatures_and_worker_payload_are_closed() -> None:
     assert all(field.default is MISSING for field in config_fields)
     assert all(field.default_factory is MISSING for field in config_fields)
 
-    probe_parameters = inspect.signature(
-        web_fetch_orchestrator._probe_content_type
-    ).parameters
+    probe_parameters = inspect.signature(web_fetch_orchestrator._probe_content_type).parameters
     assert "http_resource_budget" not in probe_parameters
     assert "browser_resource_budget" not in probe_parameters
     assert "diagnostic_resource_budget" not in probe_parameters
-    sender_parameters = inspect.signature(
-        web_http_session._send_authorized_request
-    ).parameters
-    assert "transport_policy" not in sender_parameters
+    sender_parameters = inspect.signature(web_http_session._send_authorized_request).parameters
+    assert sender_parameters["transport_policy"].default is inspect.Parameter.empty
+    plain_sender_parameters = inspect.signature(web_http_session._send_authorized_plain_request).parameters
+    assert plain_sender_parameters["transport_policy"].default is inspect.Parameter.empty
 
-    worker_parameters = inspect.signature(
-        web_playwright_backend._PlaywrightWorkerProtocol.__call__
-    ).parameters
+    worker_parameters = inspect.signature(web_playwright_backend._PlaywrightWorkerProtocol.__call__).parameters
     assert "browser_resource_budget" in worker_parameters
     assert "diagnostic_resource_budget" not in worker_parameters
     assert web_playwright_backend._WorkerKwargs.__required_keys__ == frozenset(
@@ -4830,10 +5383,9 @@ def test_s1_budget_owner_signatures_and_worker_payload_are_closed() -> None:
             "browser_resource_budget",
         }
     )
-    process_parameters = inspect.signature(
-        web_playwright_backend._run_playwright_worker_process
-    ).parameters
+    process_parameters = inspect.signature(web_playwright_backend._run_playwright_worker_process).parameters
     assert process_parameters["diagnostic_resource_budget"].default is inspect.Parameter.empty
+    assert process_parameters["allow_environment_proxy"].default is inspect.Parameter.empty
 
 
 @pytest.mark.parametrize(
@@ -4863,10 +5415,13 @@ def test_decompress_incremental_codec_exact_limit_and_limit_plus_one(
         wire_body_bytes=1024,
         decoded_body_bytes=len(exact_body),
     )
-    assert web_fetch_orchestrator._read_limited_response_body(
-        exact_response,
-        http_resource_budget=exact_budget,
-    ) == exact_body
+    assert (
+        web_fetch_orchestrator._read_limited_response_body(
+            exact_response,
+            http_resource_budget=exact_budget,
+        )
+        == exact_body
+    )
 
     overflow_body = exact_body + b"!"
     overflow_response = _raw_response(
@@ -4906,10 +5461,13 @@ def test_identity_body_exact_decoded_limit_and_limit_plus_one() -> None:
         status_code=200,
         body=exact_body,
     )
-    assert web_fetch_orchestrator._read_limited_response_body(
-        exact_response,
-        http_resource_budget=exact_budget,
-    ) == exact_body
+    assert (
+        web_fetch_orchestrator._read_limited_response_body(
+            exact_response,
+            http_resource_budget=exact_budget,
+        )
+        == exact_body
+    )
 
     overflow_body = exact_body + b"!"
     overflow_response = _raw_response(
@@ -4962,13 +5520,16 @@ def test_http_child_budget_owns_declared_length_and_bounded_codec_failures(
         body=b"ok",
         headers={"Content-Length": "invalid"},
     )
-    assert web_fetch_orchestrator._read_limited_response_body(
-        invalid_declared_length,
-        http_resource_budget=_http_resource_budget(
-            wire_body_bytes=8,
-            decoded_body_bytes=8,
-        ),
-    ) == b"ok"
+    assert (
+        web_fetch_orchestrator._read_limited_response_body(
+            invalid_declared_length,
+            http_resource_budget=_http_resource_budget(
+                wire_body_bytes=8,
+                decoded_body_bytes=8,
+            ),
+        )
+        == b"ok"
+    )
 
     monkeypatch.setattr(
         web_fetch_orchestrator,
@@ -5011,13 +5572,16 @@ def test_decompress_incremental_multi_layer_and_compression_bomb() -> None:
         body=multi_layer_wire,
         headers={"Content-Encoding": "gzip, deflate"},
     )
-    assert web_fetch_orchestrator._read_limited_response_body(
-        multi_layer_response,
-        http_resource_budget=_http_resource_budget(
-            wire_body_bytes=1024,
-            decoded_body_bytes=1024,
-        ),
-    ) == body
+    assert (
+        web_fetch_orchestrator._read_limited_response_body(
+            multi_layer_response,
+            http_resource_budget=_http_resource_budget(
+                wire_body_bytes=1024,
+                decoded_body_bytes=1024,
+            ),
+        )
+        == body
+    )
 
     bomb_response = _raw_response(
         url="https://example.com/bomb",
@@ -5051,9 +5615,7 @@ def test_decompress_brotli_without_bounded_output_api_is_unsupported() -> None:
             response,
             http_resource_budget=_http_resource_budget(),
         )
-    assert web_tools._build_fetch_headers("https://example.com/report")[
-        "Accept-Encoding"
-    ] == "gzip, deflate"
+    assert web_tools._build_fetch_headers("https://example.com/report")["Accept-Encoding"] == "gzip, deflate"
 
 
 def test_decompress_zstd_streaming_uses_http_child_budget(
@@ -5084,10 +5646,13 @@ def test_decompress_zstd_streaming_uses_http_child_budget(
         headers={"Content-Encoding": "zstd"},
     )
 
-    assert web_fetch_orchestrator._read_limited_response_body(
-        response,
-        http_resource_budget=_http_resource_budget(decoded_body_bytes=len(body)),
-    ) == body
+    assert (
+        web_fetch_orchestrator._read_limited_response_body(
+            response,
+            http_resource_budget=_http_resource_budget(decoded_body_bytes=len(body)),
+        )
+        == body
+    )
 
     overflow_response = _raw_response(
         url="https://example.com/report",
@@ -5129,6 +5694,7 @@ def test_warmup_streams_only_budgeted_body_and_closes_response(
         normalize_url_for_http=web_tools._normalize_url_for_http,
         is_timeout_like_exception=web_tools._is_timeout_like_exception,
         egress_policy=_public_test_policy(),
+        transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
         browser_resource_budget=_browser_resource_budget(warmup_body_bytes=7),
     )
 
@@ -5396,9 +5962,7 @@ def test_playwright_worker_browser_owner_controls_terminal_resource_paths() -> N
 
     with pytest.raises(RuntimeError, match="页面加载超时"):
         _run_synthetic_playwright_worker(
-            _SyntheticPlaywrightPage(
-                goto_error=PlaywrightTimeoutError("synthetic timeout")
-            ),
+            _SyntheticPlaywrightPage(goto_error=PlaywrightTimeoutError("synthetic timeout")),
             browser_resource_budget=_browser_resource_budget(),
             convert_html=_reject_browser_html_conversion,
         )
@@ -5431,7 +5995,7 @@ def test_playwright_worker_browser_owner_controls_terminal_resource_paths() -> N
     (
         ("browser_dom_too_large", "browser_dom_too_large"),
         ("browser_text_too_large", "browser_text_too_large"),
-        ("browser_egress_policy_unavailable", "browser_egress_policy_unavailable"),
+        ("browser_peer_proof_unavailable", "browser_peer_proof_unavailable"),
         ("browser_runtime_unavailable", None),
     ),
 )
@@ -5442,11 +6006,16 @@ def test_playwright_budget_failure_projects_stable_tool_error(
 ) -> None:
     """浏览器失败必须按显式 Diagnostic owner 投影或返回无结果。
 
-    :param monkeypatch: pytest 属性替换夹具。
-    :param failure_code: 当前 synthetic browser failure code。
-    :param expected_error_code: 预期工具失败码；``None`` 表示返回无结果。
-    :returns: ``None``。
-    :raises AssertionError: browser failure 未按当前 Diagnostic owner 投影时抛出。
+    Args:
+        monkeypatch: pytest 属性替换夹具。
+        failure_code: 当前 synthetic browser failure code。
+        expected_error_code: 预期工具失败码；``None`` 表示返回无结果。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: browser failure 未按当前 Diagnostic owner 投影时抛出。
     """
 
     def fake_fetch_with_playwright(
@@ -5459,6 +6028,7 @@ def test_playwright_budget_failure_projects_stable_tool_error(
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
         egress_policy: WebEgressPolicy,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
         browser_resource_budget: BrowserResourceBudget,
         diagnostic_resource_budget: DiagnosticResourceBudget,
         cancellation_token: CancellationToken | None = None,
@@ -5474,6 +6044,7 @@ def test_playwright_budget_failure_projects_stable_tool_error(
             playwright_channel: browser channel。
             playwright_storage_state_path: storage state 路径。
             egress_policy: Web 出站策略。
+            transport_policy: 当前 attempt 的 transport policy。
             browser_resource_budget: 浏览器资源预算。
             diagnostic_resource_budget: 诊断投影预算。
             cancellation_token: 取消令牌。
@@ -5494,6 +6065,7 @@ def test_playwright_budget_failure_projects_stable_tool_error(
             playwright_channel,
             playwright_storage_state_path,
             egress_policy,
+            transport_policy,
             browser_resource_budget,
             diagnostic_resource_budget,
             cancellation_token,
@@ -5519,6 +6091,8 @@ def test_playwright_budget_failure_projects_stable_tool_error(
             timeout_budget=None,
             deadline_monotonic=None,
             egress_policy=WebEgressPolicy(allow_private_network=True),
+            browser_enabled=True,
+            transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
             browser_resource_budget=_DEFAULT_BROWSER_RESOURCE_BUDGET,
             diagnostic_resource_budget=diagnostic_budget,
         )
@@ -5533,6 +6107,8 @@ def test_playwright_budget_failure_projects_stable_tool_error(
             timeout_budget=None,
             deadline_monotonic=None,
             egress_policy=WebEgressPolicy(allow_private_network=True),
+            browser_enabled=True,
+            transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
             browser_resource_budget=_DEFAULT_BROWSER_RESOURCE_BUDGET,
             diagnostic_resource_budget=diagnostic_budget,
         )
@@ -5553,10 +6129,7 @@ def test_challenge_strong_vendor_signal_is_confirmed_for_all_statuses(
     )
 
     assert result.decision is web_challenge_detection.BotChallengeDecision.CONFIRMED
-    assert (
-        web_challenge_detection.BotChallengeEvidenceClass.STRONG_VENDOR_CONTENT
-        in result.evidence_classes
-    )
+    assert web_challenge_detection.BotChallengeEvidenceClass.STRONG_VENDOR_CONTENT in result.evidence_classes
 
 
 def test_challenge_broad_text_and_header_single_signals_are_only_suspected() -> None:
@@ -5602,20 +6175,42 @@ def test_challenge_independent_signal_combinations_confirm_and_own_fallback() ->
 
     assert two_text_signals.decision is web_challenge_detection.BotChallengeDecision.CONFIRMED
     assert text_and_vendor_header.decision is web_challenge_detection.BotChallengeDecision.CONFIRMED
-    assert web_challenge_detection.challenge_fallback_action(
-        decision=two_text_signals.decision,
-        browser_available=True,
-    ) is web_challenge_detection.ChallengeFallbackAction.TRY_BROWSER
-    assert web_challenge_detection.challenge_fallback_action(
-        decision=two_text_signals.decision,
-        browser_available=False,
-    ) is web_challenge_detection.ChallengeFallbackAction.FAIL_BLOCKED
+    assert (
+        web_challenge_detection.challenge_fallback_action(
+            decision=two_text_signals.decision,
+            browser_available=web_tools._browser_fallback_available(
+                browser_enabled=True,
+                transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
+            ),
+        )
+        is web_challenge_detection.ChallengeFallbackAction.TRY_BROWSER
+    )
+    assert (
+        web_challenge_detection.challenge_fallback_action(
+            decision=two_text_signals.decision,
+            browser_available=False,
+        )
+        is web_challenge_detection.ChallengeFallbackAction.FAIL_BLOCKED
+    )
 
 
-def test_challenge_confirmed_http_500_invokes_fallback_once(
+@pytest.mark.parametrize("browser_enabled", (True, False))
+def test_challenge_confirmed_http_500_uses_current_browser_capability(
     monkeypatch: pytest.MonkeyPatch,
+    browser_enabled: bool,
 ) -> None:
-    """confirmed challenge + HTTP 500 也必须且只能调用一次 browser fallback。"""
+    """confirmed challenge + HTTP 500 必须按当前 browser capability 收口。
+
+    Args:
+        monkeypatch: pytest 属性替换夹具。
+        browser_enabled: 当前 typed browser capability。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: challenge fallback 未消费当前 browser capability 时抛出。
+    """
 
     session = _QueuedSession(
         [
@@ -5639,6 +6234,7 @@ def test_challenge_confirmed_http_500_invokes_fallback_once(
             ),
         ]
     )
+
     def get_test_session() -> requests.Session:
         """返回 challenge integration 使用的 queued Session。
 
@@ -5672,6 +6268,8 @@ def test_challenge_confirmed_http_500_invokes_fallback_once(
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
         egress_policy: WebEgressPolicy,
+        browser_enabled: bool,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
         browser_resource_budget: BrowserResourceBudget,
         diagnostic_resource_budget: DiagnosticResourceBudget,
         cancellation_token: CancellationToken | None = None,
@@ -5687,6 +6285,8 @@ def test_challenge_confirmed_http_500_invokes_fallback_once(
             playwright_channel: browser channel。
             playwright_storage_state_path: storage state 路径。
             egress_policy: Web 出站策略。
+            browser_enabled: 当前配置是否允许 browser fallback。
+            transport_policy: 当前 attempt transport policy。
             browser_resource_budget: 浏览器资源预算。
             diagnostic_resource_budget: 诊断投影预算。
             cancellation_token: 取消令牌。
@@ -5706,6 +6306,8 @@ def test_challenge_confirmed_http_500_invokes_fallback_once(
             playwright_channel,
             playwright_storage_state_path,
             egress_policy,
+            browser_enabled,
+            transport_policy,
             browser_resource_budget,
             diagnostic_resource_budget,
             cancellation_token,
@@ -5715,15 +6317,32 @@ def test_challenge_confirmed_http_500_invokes_fallback_once(
 
     monkeypatch.setattr(web_tools, "_try_playwright_fallback", fake_playwright_fallback)
 
-    result = web_tools._fetch_web_page_business(
-        url="http://127.0.0.1/report",
-        config=web_provider._parse_config({"allow_private_network_url": True}),
-        timeout_budget=None,
-        cancellation_token=cast(CancellationToken, _OpenCancellationToken()),
+    config = web_provider._parse_config(
+        {
+            "allow_private_network_url": True,
+            "browser_enabled": browser_enabled,
+        }
     )
+    if browser_enabled:
+        result = web_tools._fetch_web_page_business(
+            url="http://127.0.0.1/report",
+            config=config,
+            timeout_budget=None,
+            cancellation_token=cast(CancellationToken, _OpenCancellationToken()),
+        )
+        assert result["content"] == "browser result"
+        assert fallback_calls == ["http://127.0.0.1/report"]
+        return
 
-    assert result["content"] == "browser result"
-    assert fallback_calls == ["http://127.0.0.1/report"]
+    with pytest.raises(web_tools.ToolBusinessError) as exc_info:
+        web_tools._fetch_web_page_business(
+            url="http://127.0.0.1/report",
+            config=config,
+            timeout_budget=None,
+            cancellation_token=cast(CancellationToken, _OpenCancellationToken()),
+        )
+    assert exc_info.value.code == "blocked"
+    assert fallback_calls == []
 
 
 def test_duckduckgo_known_shape_and_exact_half_malformed_are_valid() -> None:
@@ -5909,38 +6528,49 @@ def test_tavily_provider_builds_typed_rows(
     captured_payloads: list[Mapping[str, JsonValue]] = []
     responses: list[_CloseCountingResponse] = []
 
-    def fake_post(
-        url: str,
+    def fake_send(
         *,
-        json: Mapping[str, JsonValue],
+        egress_policy: WebEgressPolicy,
+        url: str,
+        method: str,
         timeout: float,
-        headers: Mapping[str, str] | None = None,
-        allow_redirects: bool = True,
-        stream: bool = False,
-    ) -> requests.Response:
+        headers: Mapping[str, str],
+        stream: bool,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
+        request_params: Mapping[str, str] | None,
+        request_json: Mapping[str, JsonValue] | None,
+    ) -> web_http_session.AuthorizedResponseLease:
         """返回确定性 Tavily JSON response。
 
         Args:
+            egress_policy: 当前 endpoint egress policy。
             url: provider URL。
-            json: 请求 JSON。
+            method: HTTP 方法。
             timeout: 请求 timeout。
-            headers: 可选 headers。
-            allow_redirects: 是否允许 requests 自动跟随 redirect。
+            headers: provider headers。
             stream: 是否流式获取 response。
+            transport_policy: 当前 attempt transport policy。
+            request_params: 可选 query 参数。
+            request_json: 可选 JSON body。
 
         Returns:
-            确定性 JSON response。
+            确定性 response lease。
 
         Raises:
             无。
         """
 
-        del url, timeout
+        del timeout
+        assert egress_policy.allows_private_network is False
+        assert egress_policy.allows_custom_port is False
+        assert url == "https://api.tavily.com/search"
+        assert method == "POST"
         assert stream is True
-        assert allow_redirects is False
-        assert headers is not None
+        assert transport_policy is _PROXY_DENIED_TRANSPORT_POLICY
+        assert request_params is None
+        assert request_json is not None
         assert headers["Accept-Encoding"] == "gzip, deflate"
-        captured_payloads.append(dict(json))
+        captured_payloads.append(dict(request_json))
         response = _counting_response(
             url="https://api.tavily.com/search",
             status_code=200,
@@ -5958,15 +6588,22 @@ def test_tavily_provider_builds_typed_rows(
             ).encode("utf-8"),
         )
         responses.append(response)
-        return response
+        return _plain_response_lease(response)
 
-    monkeypatch.setattr(web_search_providers.requests, "post", fake_post)
+    monkeypatch.setattr(
+        web_search_providers,
+        "_send_authorized_plain_request",
+        fake_send,
+    )
     rows = web_search_providers._search_with_tavily(
         query="revenue",
         domains=["example.com"],
         recency_days=7,
         max_results=3,
         timeout_seconds=1.0,
+        egress_policy=_public_test_policy(),
+        transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
+        resolve_timeout_budget=web_search_providers._default_resolve_timeout_budget,
         http_resource_budget=_DEFAULT_HTTP_RESOURCE_BUDGET,
     )
 
@@ -5992,38 +6629,49 @@ def test_serper_provider_builds_typed_rows(
     captured_payloads: list[Mapping[str, JsonValue]] = []
     responses: list[_CloseCountingResponse] = []
 
-    def fake_post(
-        url: str,
+    def fake_send(
         *,
-        json: Mapping[str, JsonValue],
+        egress_policy: WebEgressPolicy,
+        url: str,
+        method: str,
         timeout: float,
-        headers: Mapping[str, str] | None = None,
-        allow_redirects: bool = True,
-        stream: bool = False,
-    ) -> requests.Response:
+        headers: Mapping[str, str],
+        stream: bool,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
+        request_params: Mapping[str, str] | None,
+        request_json: Mapping[str, JsonValue] | None,
+    ) -> web_http_session.AuthorizedResponseLease:
         """返回确定性 Serper JSON response。
 
         Args:
+            egress_policy: 当前 endpoint egress policy。
             url: provider URL。
-            json: 请求 JSON。
+            method: HTTP 方法。
             timeout: 请求 timeout。
             headers: provider headers。
-            allow_redirects: 是否允许 requests 自动跟随 redirect。
             stream: 是否流式获取 response。
+            transport_policy: 当前 attempt transport policy。
+            request_params: 可选 query 参数。
+            request_json: 可选 JSON body。
 
         Returns:
-            确定性 JSON response。
+            确定性 response lease。
 
         Raises:
             无。
         """
 
-        del url, timeout
+        del timeout
+        assert egress_policy.allows_private_network is False
+        assert egress_policy.allows_custom_port is False
+        assert url == "https://google.serper.dev/search"
+        assert method == "POST"
         assert stream is True
-        assert allow_redirects is False
-        assert headers is not None
+        assert transport_policy is _PROXY_DENIED_TRANSPORT_POLICY
+        assert request_params is None
+        assert request_json is not None
         assert headers["Accept-Encoding"] == "gzip, deflate"
-        captured_payloads.append(dict(json))
+        captured_payloads.append(dict(request_json))
         response = _counting_response(
             url="https://google.serper.dev/search",
             status_code=200,
@@ -6040,15 +6688,22 @@ def test_serper_provider_builds_typed_rows(
             ).encode("utf-8"),
         )
         responses.append(response)
-        return response
+        return _plain_response_lease(response)
 
-    monkeypatch.setattr(web_search_providers.requests, "post", fake_post)
+    monkeypatch.setattr(
+        web_search_providers,
+        "_send_authorized_plain_request",
+        fake_send,
+    )
     rows = web_search_providers._search_with_serper(
         query="revenue",
         domains=["example.com"],
         recency_days=7,
         max_results=3,
         timeout_seconds=1.0,
+        egress_policy=_public_test_policy(),
+        transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
+        resolve_timeout_budget=web_search_providers._default_resolve_timeout_budget,
         http_resource_budget=_DEFAULT_HTTP_RESOURCE_BUDGET,
     )
 
@@ -6083,40 +6738,55 @@ def test_duckduckgo_provider_streams_budgeted_body_and_closes_response(
         body=body,
     )
 
-    def fake_get(
-        url: str,
+    def fake_send(
         *,
-        params: Mapping[str, str],
+        egress_policy: WebEgressPolicy,
+        url: str,
+        method: str,
         timeout: float,
         headers: Mapping[str, str],
-        allow_redirects: bool,
         stream: bool,
-    ) -> requests.Response:
+        transport_policy: web_http_session.WebHttpTransportPolicy,
+        request_params: Mapping[str, str] | None,
+        request_json: Mapping[str, JsonValue] | None,
+    ) -> web_http_session.AuthorizedResponseLease:
         """返回带关闭计数的流式 DuckDuckGo response。
 
         Args:
+            egress_policy: 当前 endpoint egress policy。
             url: provider URL。
-            params: query 参数。
+            method: HTTP 方法。
             timeout: 请求 timeout。
             headers: provider headers。
-            allow_redirects: 是否允许 requests 自动跟随 redirect。
             stream: 是否流式获取 response。
+            transport_policy: 当前 attempt transport policy。
+            request_params: query 参数。
+            request_json: 可选 JSON body。
 
         Returns:
-            可计数关闭的 response。
+            可计数关闭的 response lease。
 
         Raises:
             无。
         """
 
-        del url, timeout
-        assert params == {"q": "revenue"}
+        del timeout
+        assert egress_policy.allows_private_network is False
+        assert egress_policy.allows_custom_port is False
+        assert url == "https://duckduckgo.com/html/"
+        assert method == "GET"
+        assert request_params == {"q": "revenue"}
+        assert request_json is None
         assert headers["Accept-Encoding"] == "gzip, deflate"
-        assert allow_redirects is False
+        assert transport_policy is _PROXY_DENIED_TRANSPORT_POLICY
         assert stream is True
-        return response
+        return _plain_response_lease(response)
 
-    monkeypatch.setattr(web_search_providers.requests, "get", fake_get)
+    monkeypatch.setattr(
+        web_search_providers,
+        "_send_authorized_plain_request",
+        fake_send,
+    )
     budget = _http_resource_budget(
         wire_body_bytes=len(body) + wire_limit_delta,
         decoded_body_bytes=len(body),
@@ -6129,18 +6799,423 @@ def test_duckduckgo_provider_streams_budgeted_body_and_closes_response(
                 domains=[],
                 max_results=3,
                 timeout_seconds=1.0,
+                egress_policy=_public_test_policy(),
+                transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
+                normalize_whitespace=web_tools._normalize_whitespace,
+                resolve_timeout_budget=web_search_providers._default_resolve_timeout_budget,
                 http_resource_budget=budget,
             )
     else:
-        assert web_search_providers._search_with_duckduckgo(
+        assert (
+            web_search_providers._search_with_duckduckgo(
+                query="revenue",
+                domains=[],
+                max_results=3,
+                timeout_seconds=1.0,
+                egress_policy=_public_test_policy(),
+                transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
+                normalize_whitespace=web_tools._normalize_whitespace,
+                resolve_timeout_budget=web_search_providers._default_resolve_timeout_budget,
+                http_resource_budget=budget,
+            )
+            == []
+        )
+
+    assert response.close_count == 1
+
+
+def test_duckduckgo_plain_sender_retains_egress_and_challenge_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DuckDuckGo plain sender 必须先授权、禁 redirect 并保留 challenge 失败。
+
+    Args:
+        monkeypatch: pytest 属性替换夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: egress、redirect 或 challenge 语义漂移时抛出。
+    """
+
+    resolver_calls: list[tuple[str, int]] = []
+    send_redirect_flags: list[bool] = []
+    detector_calls: list[str] = []
+    challenge_body = b"<html>asset from challenges.cloudflare.com</html>"
+    original_detector = web_challenge_detection.detect_bot_challenge
+
+    def resolve_provider(hostname: str, port: int) -> tuple[str, ...]:
+        """记录 provider endpoint 的唯一 DNS owner 调用。
+
+        Args:
+            hostname: provider hostname。
+            port: provider 端口。
+
+        Returns:
+            确定性公网地址。
+
+        Raises:
+            无。
+        """
+
+        resolver_calls.append((hostname, port))
+        return ("93.184.216.34",)
+
+    def return_challenge_response(
+        session: requests.Session,
+        request: requests.PreparedRequest,
+        *,
+        timeout: float,
+        allow_redirects: bool,
+        proxies: dict[str, str],
+        stream: bool,
+        verify: bool | str,
+        cert: str | tuple[str, str] | None,
+    ) -> requests.Response:
+        """返回确定性 challenge HTML 并记录 transport 调用事实。
+
+        Args:
+            session: attempt-local Session。
+            request: prepared provider request。
+            timeout: 请求 timeout。
+            allow_redirects: 自动 redirect 开关。
+            proxies: merged proxy 映射。
+            stream: stream 开关。
+            verify: TLS verify 设置。
+            cert: client certificate 设置。
+
+        Returns:
+            确定性 challenge response。
+
+        Raises:
+            AssertionError: provider transport 语义漂移时抛出。
+        """
+
+        del timeout, verify, cert
+        assert session.trust_env is False
+        assert request.url == "https://duckduckgo.com/html/?q=revenue"
+        assert proxies == {}
+        assert stream is True
+        send_redirect_flags.append(allow_redirects)
+        response = _counting_response(
+            url=request.url,
+            status_code=200,
+            body=challenge_body,
+            headers={"Content-Type": "text/html"},
+        )
+        response.request = request
+        return response
+
+    def record_challenge_detection(
+        *,
+        response: requests.Response | None,
+        response_headers: Mapping[str, str] | None = None,
+        http_status: int | None = None,
+        content_text: str,
+    ) -> web_challenge_detection.BotChallengeDetectionResult:
+        """记录 provider 复用共享 challenge detector 的输入。
+
+        Args:
+            response: provider response。
+            response_headers: 可选独立响应头。
+            http_status: 可选独立状态码。
+            content_text: 待检测 HTML。
+
+        Returns:
+            共享 detector 的原始结果。
+
+        Raises:
+            无。
+        """
+
+        detector_calls.append(content_text)
+        return original_detector(
+            response=response,
+            response_headers=response_headers,
+            http_status=http_status,
+            content_text=content_text,
+        )
+
+    monkeypatch.setattr(requests.Session, "send", return_challenge_response)
+    monkeypatch.setattr(
+        web_search_providers,
+        "detect_bot_challenge",
+        record_challenge_detection,
+    )
+    with pytest.raises(web_search_providers.WebSearchProviderResponseError) as exc_info:
+        web_search_providers._search_with_duckduckgo(
             query="revenue",
             domains=[],
             max_results=3,
             timeout_seconds=1.0,
-            http_resource_budget=budget,
-        ) == []
+            egress_policy=WebEgressPolicy(resolver=resolve_provider),
+            transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
+            normalize_whitespace=web_tools._normalize_whitespace,
+            resolve_timeout_budget=web_search_providers._default_resolve_timeout_budget,
+            http_resource_budget=_DEFAULT_HTTP_RESOURCE_BUDGET,
+        )
 
-    assert response.close_count == 1
+    assert resolver_calls == [("duckduckgo.com", 443)]
+    assert send_redirect_flags == [False]
+    assert detector_calls == [challenge_body.decode("utf-8")]
+    assert exc_info.value.reason == "challenge_response"
+
+
+@pytest.mark.parametrize(
+    "transport_policy",
+    (
+        _PROXY_ALLOWED_TRANSPORT_POLICY,
+        _PROXY_DENIED_TRANSPORT_POLICY,
+        _PEER_PROOF_TRANSPORT_POLICY,
+    ),
+)
+def test_search_provider_forwards_proxy_and_peer_policy_to_plain_sender(
+    monkeypatch: pytest.MonkeyPatch,
+    transport_policy: web_http_session.WebHttpTransportPolicy,
+) -> None:
+    """search provider 必须把每个 typed transport policy 交给共享 plain sender。
+
+    Args:
+        monkeypatch: pytest 属性替换夹具。
+        transport_policy: 当前参数化的 typed transport policy。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: provider 未原样传播 transport policy 时抛出。
+    """
+
+    observed_policies: list[web_http_session.WebHttpTransportPolicy] = []
+    response = _counting_response(
+        url="https://duckduckgo.com/html/?q=revenue",
+        status_code=200,
+        body=b'<div class="no-results">No results.</div>',
+    )
+
+    def record_plain_sender(
+        *,
+        egress_policy: WebEgressPolicy,
+        url: str,
+        method: str,
+        timeout: float,
+        headers: Mapping[str, str],
+        stream: bool,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
+        request_params: Mapping[str, str] | None,
+        request_json: Mapping[str, JsonValue] | None,
+    ) -> web_http_session.AuthorizedResponseLease:
+        """记录 provider 交付的 transport policy 并返回空结果响应。
+
+        Args:
+            egress_policy: provider endpoint 出站策略。
+            url: provider URL。
+            method: HTTP 方法。
+            timeout: 请求 timeout。
+            headers: provider headers。
+            stream: stream 开关。
+            transport_policy: 当前 attempt transport policy。
+            request_params: query 参数。
+            request_json: 可选 JSON body。
+
+        Returns:
+            确定性空结果 response lease。
+
+        Raises:
+            AssertionError: provider 请求语义漂移时抛出。
+        """
+
+        del timeout
+        assert egress_policy.allows_private_network is False
+        assert url == "https://duckduckgo.com/html/"
+        assert method == "GET"
+        assert headers["Accept-Encoding"] == "gzip, deflate"
+        assert stream is True
+        assert request_params == {"q": "revenue"}
+        assert request_json is None
+        observed_policies.append(transport_policy)
+        return _plain_response_lease(response)
+
+    monkeypatch.setattr(
+        web_search_providers,
+        "_send_authorized_plain_request",
+        record_plain_sender,
+    )
+    rows = web_search_providers._search_with_duckduckgo(
+        query="revenue",
+        domains=[],
+        max_results=3,
+        timeout_seconds=1.0,
+        egress_policy=_public_test_policy(),
+        transport_policy=transport_policy,
+        normalize_whitespace=web_tools._normalize_whitespace,
+        resolve_timeout_budget=web_search_providers._default_resolve_timeout_budget,
+        http_resource_budget=_DEFAULT_HTTP_RESOURCE_BUDGET,
+    )
+
+    assert rows == []
+    assert observed_policies == [transport_policy]
+
+
+def test_search_proxy_peer_incompatibility_is_not_provider_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """shared proxy/proof 冲突不得被 search 降级为 provider unavailable。
+
+    Args:
+        monkeypatch: pytest 属性替换夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: typed 冲突被 provider fallback 吞掉时抛出。
+    """
+
+    sender_calls: list[str] = []
+
+    def fail_plain_sender(
+        *,
+        egress_policy: WebEgressPolicy,
+        url: str,
+        method: str,
+        timeout: float,
+        headers: Mapping[str, str],
+        stream: bool,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
+        request_params: Mapping[str, str] | None,
+        request_json: Mapping[str, JsonValue] | None,
+    ) -> web_http_session.AuthorizedResponseLease:
+        """模拟共享 sender 产生 typed proxy/proof 冲突。
+
+        Args:
+            egress_policy: provider endpoint 出站策略。
+            url: provider URL。
+            method: HTTP 方法。
+            timeout: 请求 timeout。
+            headers: provider headers。
+            stream: stream 开关。
+            transport_policy: 当前 attempt transport policy。
+            request_params: query 参数。
+            request_json: 可选 JSON body。
+
+        Returns:
+            不返回。
+
+        Raises:
+            ProxyPeerProofIncompatibleError: 始终抛出 typed 冲突。
+        """
+
+        del (
+            egress_policy,
+            method,
+            timeout,
+            headers,
+            stream,
+            transport_policy,
+            request_params,
+            request_json,
+        )
+        sender_calls.append(url)
+        raise web_http_session.ProxyPeerProofIncompatibleError()
+
+    monkeypatch.setattr(
+        web_search_providers,
+        "_send_authorized_plain_request",
+        fail_plain_sender,
+    )
+    with pytest.raises(web_http_session.ProxyPeerProofIncompatibleError):
+        web_search_providers.search_public_web(
+            query="revenue",
+            domains=None,
+            recency_days=None,
+            max_results=3,
+            max_search_results=10,
+            provider="duckduckgo",
+            request_timeout_seconds=1.0,
+            timeout_budget=None,
+            deadline_monotonic=None,
+            egress_policy=_public_test_policy(),
+            transport_policy=_PEER_PROOF_TRANSPORT_POLICY,
+            normalize_whitespace=web_tools._normalize_whitespace,
+            resolve_timeout_budget=web_search_providers._default_resolve_timeout_budget,
+            http_resource_budget=_DEFAULT_HTTP_RESOURCE_BUDGET,
+        )
+
+    assert sender_calls == ["https://duckduckgo.com/html/"]
+
+
+def test_search_proxy_peer_incompatibility_projects_safe_tool_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """search tool 必须把 typed proxy/proof 冲突投影为安全稳定失败。
+
+    Args:
+        monkeypatch: pytest 属性替换夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 工具错误码或 LLM-facing 文本泄漏内部语义时抛出。
+    """
+
+    def fail_search_business(
+        *,
+        query: str,
+        domains: list[str] | None,
+        recency_days: int | None,
+        max_results: int,
+        config: web_tools.WebToolsConfig,
+        timeout_budget: float | None,
+        cancellation_token: CancellationToken,
+    ) -> web_tools.SearchWebOutput:
+        """模拟 search business 透出共享 transport typed 冲突。
+
+        Args:
+            query: 检索词。
+            domains: 可选域名过滤。
+            recency_days: 可选最近天数。
+            max_results: 最大结果数。
+            config: typed Web 配置。
+            timeout_budget: 工具 timeout 预算。
+            cancellation_token: 取消令牌。
+
+        Returns:
+            不返回。
+
+        Raises:
+            ProxyPeerProofIncompatibleError: 始终抛出 typed 冲突。
+        """
+
+        del (
+            query,
+            domains,
+            recency_days,
+            max_results,
+            config,
+            timeout_budget,
+            cancellation_token,
+        )
+        raise web_http_session.ProxyPeerProofIncompatibleError()
+
+    monkeypatch.setattr(web_tools, "_search_web_business", fail_search_business)
+    outcome = asyncio.run(
+        web_tools._call_search_web(
+            call=_call("search_web", {"query": "revenue"}),
+            context=_context(timeout_seconds=1.0),
+            config=web_provider._parse_config({"provider": "duckduckgo"}),
+            provider_lock=asyncio.Lock(),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "proxy_peer_proof_incompatible"
+    assert outcome.result.message == "当前连接验证策略与已启用的网络代理不兼容。"
+    llm_text = f"{outcome.result.message} {outcome.result.hint}"
+    assert "credential" not in llm_text
+    assert "proxy.invalid" not in llm_text
 
 
 def test_search_resource_budget_failure_projects_stable_tool_error(
@@ -6178,9 +7253,7 @@ def test_search_resource_budget_failure_projects_stable_tool_error(
 
     assert isinstance(outcome, ToolFailedOutcome)
     assert outcome.result.error == "response_body_too_large"
-    assert outcome.result.hint == (
-        web_tool_projection_text.WEB_SEARCH_RESPONSE_BODY_TOO_LARGE_HINT
-    )
+    assert outcome.result.hint == (web_tool_projection_text.WEB_SEARCH_RESPONSE_BODY_TOO_LARGE_HINT)
 
 
 def test_playwright_route_blocks_private_request_before_continue() -> None:
@@ -6220,66 +7293,280 @@ def test_playwright_route_blocks_private_request_before_continue() -> None:
     assert route.continued is False
 
 
-def test_playwright_public_direct_reports_typed_egress_policy_unavailable() -> None:
-    """公网 browser direct 无 peer 证明时必须在 worker 启动前 typed fail closed。"""
+def test_playwright_public_direct_runs_without_private_permission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """公网 browser fallback 与 private-network permission 必须双向解耦。
 
-    worker_calls: list[str] = []
+    Args:
+        monkeypatch: pytest 属性替换夹具。
 
-    def unexpected_worker(
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 公网 browser 被 private permission 错误阻断时抛出。
+    """
+
+    process_proxy_flags: list[bool] = []
+
+    def run_public_process(
         *,
-        url: str,
-        timeout_seconds: float,
-        headers: Mapping[str, str] | None = None,
-        playwright_channel: str | None = None,
-        playwright_storage_state_path: str = "",
-        egress_policy: WebEgressPolicy,
-        browser_resource_budget: BrowserResourceBudget,
-    ) -> dict[str, JsonValue]:
-        """记录不应发生的公网 browser worker 调用。
+        playwright_sync_worker: web_playwright_backend._PlaywrightWorkerProtocol,
+        worker_kwargs: web_playwright_backend._WorkerKwargs,
+        diagnostic_resource_budget: DiagnosticResourceBudget,
+        allow_environment_proxy: bool,
+        total_timeout: float,
+        cancellation_token: CancellationToken | None,
+    ) -> web_playwright_backend.WebPayload:
+        """记录公网 worker process 已启动并返回确定性成功事实。
 
-        :param url: 目标 URL。
-        :param timeout_seconds: browser timeout。
-        :param headers: 可选请求头。
-        :param playwright_channel: 可选浏览器 channel。
-        :param playwright_storage_state_path: storage state 路径。
-        :param egress_policy: 当前 Web 出站策略。
-        :param browser_resource_budget: Browser child 资源预算。
-        :returns: 确定性成功 payload，用于暴露错误 worker 启动。
-        :raises Exception: 不主动抛出异常。
+        Args:
+            playwright_sync_worker: 当前 browser worker。
+            worker_kwargs: browser worker 的 typed 参数。
+            diagnostic_resource_budget: 独立诊断预算。
+            allow_environment_proxy: 是否允许 worker 沿用 proxy 环境。
+            total_timeout: process 总 timeout。
+            cancellation_token: 可选取消令牌。
+
+        Returns:
+            确定性公网成功 payload。
+
+        Raises:
+            AssertionError: private permission 或预算 owner 漂移时抛出。
         """
 
-        del (
-            timeout_seconds,
-            headers,
-            playwright_channel,
-            playwright_storage_state_path,
-            egress_policy,
-            browser_resource_budget,
-        )
-        worker_calls.append(url)
-        return {"ok": True}
+        del playwright_sync_worker, total_timeout, cancellation_token
+        worker_policy = worker_kwargs["egress_policy"]
+        assert worker_policy.allows_private_network is False
+        assert worker_policy.allows_custom_port is False
+        assert diagnostic_resource_budget is _DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET
+        process_proxy_flags.append(allow_environment_proxy)
+        return {
+            "ok": True,
+            "content": "Revenue grew.",
+            "http_status": 200,
+            "response_headers": {"content-type": "text/html"},
+        }
+
+    monkeypatch.setattr(
+        web_playwright_backend,
+        "_is_picklable_worker",
+        _accept_picklable_playwright_worker,
+    )
+    monkeypatch.setattr(
+        web_playwright_backend,
+        "_run_playwright_worker_process",
+        run_public_process,
+    )
 
     result = web_playwright_backend._fetch_and_convert_with_playwright(
         url="https://example.com/report",
         timeout_seconds=1.0,
         egress_policy=_public_test_policy(),
+        transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
         browser_resource_budget=_DEFAULT_BROWSER_RESOURCE_BUDGET,
         diagnostic_resource_budget=_DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
-        resolve_timeout_budget=lambda timeout_seconds, **kwargs: timeout_seconds,
-        playwright_sync_worker=unexpected_worker,
-        detect_bot_challenge=lambda **kwargs: web_challenge_detection.BotChallengeDetectionResult(
-            decision=web_challenge_detection.BotChallengeDecision.NONE,
-            challenge_signals=(),
-            evidence_classes=(),
-        ),
+        resolve_timeout_budget=web_tools._resolve_timeout_budget,
+        playwright_sync_worker=_SyntheticProcessPlaywrightWorker(),
+        detect_bot_challenge=web_challenge_detection.detect_bot_challenge,
     )
 
-    assert result == {
+    assert result["ok"] is True
+    assert process_proxy_flags == [False]
+
+
+def test_browser_disabled_with_private_permission_does_not_start_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """private permission=true 不得反向启用已关闭的 browser capability。
+
+    Args:
+        monkeypatch: pytest 属性替换夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: browser-disabled 路径仍启动 backend 时抛出。
+    """
+
+    backend_calls: list[str] = []
+
+    def record_backend_call(
+        *,
+        url: str,
+        timeout_seconds: float,
+        headers: Mapping[str, str] | None = None,
+        timeout_budget: float | None = None,
+        deadline_monotonic: float | None = None,
+        playwright_channel: str | None = None,
+        playwright_storage_state_path: str = "",
+        egress_policy: WebEgressPolicy,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
+        browser_resource_budget: BrowserResourceBudget,
+        diagnostic_resource_budget: DiagnosticResourceBudget,
+        cancellation_token: CancellationToken | None = None,
+    ) -> web_playwright_backend.WebPayload:
+        """记录任何不应发生的 browser backend 调用。
+
+        Args:
+            url: 目标 URL。
+            timeout_seconds: browser timeout。
+            headers: 请求头。
+            timeout_budget: 工具预算。
+            deadline_monotonic: 工具 deadline。
+            playwright_channel: browser channel。
+            playwright_storage_state_path: storage state 路径。
+            egress_policy: 出站策略。
+            transport_policy: 当前 attempt transport policy。
+            browser_resource_budget: browser budget。
+            diagnostic_resource_budget: diagnostic budget。
+            cancellation_token: 可选取消令牌。
+
+        Returns:
+            确定性成功 payload，用于暴露错误启动。
+
+        Raises:
+            无。
+        """
+
+        del (
+            timeout_seconds,
+            headers,
+            timeout_budget,
+            deadline_monotonic,
+            playwright_channel,
+            playwright_storage_state_path,
+            egress_policy,
+            transport_policy,
+            browser_resource_budget,
+            diagnostic_resource_budget,
+            cancellation_token,
+        )
+        backend_calls.append(url)
+        return {"ok": True, "content": "unexpected"}
+
+    monkeypatch.setattr(
+        web_tools,
+        "_fetch_and_convert_with_playwright",
+        record_backend_call,
+    )
+    result = web_tools._try_playwright_fallback(
+        url="http://127.0.0.1/report",
+        timeout_seconds=1.0,
+        headers={},
+        timeout_budget=None,
+        deadline_monotonic=None,
+        egress_policy=WebEgressPolicy(allow_private_network=True),
+        browser_enabled=False,
+        transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
+        browser_resource_budget=_DEFAULT_BROWSER_RESOURCE_BUDGET,
+        diagnostic_resource_budget=_DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
+    )
+
+    assert result is None
+    assert backend_calls == []
+
+
+def test_browser_peer_proof_fails_before_process_with_safe_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实 browser fallback 遇到 proof=true 必须在 process 前 typed fail。
+
+    Args:
+        monkeypatch: pytest 属性替换夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: proof-incompatible browser 路径启动 process 或投影泄漏时抛出。
+    """
+
+    process_calls: list[str] = []
+
+    def record_process_call(
+        *,
+        playwright_sync_worker: web_playwright_backend._PlaywrightWorkerProtocol,
+        worker_kwargs: web_playwright_backend._WorkerKwargs,
+        diagnostic_resource_budget: DiagnosticResourceBudget,
+        allow_environment_proxy: bool,
+        total_timeout: float,
+        cancellation_token: CancellationToken | None,
+    ) -> web_playwright_backend.WebPayload:
+        """记录任何不应发生的 proof-incompatible process 启动。
+
+        Args:
+            playwright_sync_worker: browser worker。
+            worker_kwargs: browser worker 参数。
+            diagnostic_resource_budget: diagnostic budget。
+            allow_environment_proxy: proxy 环境继承开关。
+            total_timeout: process 总 timeout。
+            cancellation_token: 可选取消令牌。
+
+        Returns:
+            确定性成功 payload，用于暴露错误启动。
+
+        Raises:
+            无。
+        """
+
+        del (
+            playwright_sync_worker,
+            worker_kwargs,
+            diagnostic_resource_budget,
+            allow_environment_proxy,
+            total_timeout,
+            cancellation_token,
+        )
+        process_calls.append("unexpected")
+        return {"ok": True, "content": "unexpected"}
+
+    monkeypatch.setattr(
+        web_playwright_backend,
+        "_run_playwright_worker_process",
+        record_process_call,
+    )
+    backend_result = web_playwright_backend._fetch_and_convert_with_playwright(
+        url="https://example.com/report",
+        timeout_seconds=1.0,
+        egress_policy=_public_test_policy(),
+        transport_policy=_PEER_PROOF_TRANSPORT_POLICY,
+        browser_resource_budget=_DEFAULT_BROWSER_RESOURCE_BUDGET,
+        diagnostic_resource_budget=_DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
+        resolve_timeout_budget=web_tools._resolve_timeout_budget,
+        playwright_sync_worker=_SyntheticProcessPlaywrightWorker(),
+        detect_bot_challenge=web_challenge_detection.detect_bot_challenge,
+    )
+    assert backend_result == {
         "ok": False,
         "availability": "unprocessable",
-        "reason": "browser_egress_policy_unavailable",
+        "reason": "browser_peer_proof_unavailable",
     }
-    assert worker_calls == []
+
+    with pytest.raises(web_tools.ToolBusinessError) as exc_info:
+        web_tools._try_playwright_fallback(
+            url="https://example.com/report",
+            timeout_seconds=1.0,
+            headers={},
+            timeout_budget=None,
+            deadline_monotonic=None,
+            egress_policy=_public_test_policy(),
+            browser_enabled=True,
+            transport_policy=_PEER_PROOF_TRANSPORT_POLICY,
+            browser_resource_budget=_DEFAULT_BROWSER_RESOURCE_BUDGET,
+            diagnostic_resource_budget=_DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
+        )
+
+    assert exc_info.value.code == "browser_peer_proof_unavailable"
+    assert exc_info.value.message == "当前浏览器访问无法验证目标连接。"
+    llm_text = f"{exc_info.value.message} {exc_info.value.hint}"
+    assert "Playwright" not in llm_text
+    assert "socket" not in llm_text
+    assert "peer" not in llm_text
+    assert "proof" not in llm_text
+    assert process_calls == []
 
 
 def test_playwright_process_wrapper_keeps_diagnostic_budget_out_of_worker_kwargs(
@@ -6317,6 +7604,7 @@ def test_playwright_process_wrapper_keeps_diagnostic_budget_out_of_worker_kwargs
         playwright_sync_worker: web_playwright_backend._PlaywrightWorkerProtocol,
         worker_kwargs: web_playwright_backend._WorkerKwargs,
         diagnostic_resource_budget: DiagnosticResourceBudget,
+        allow_environment_proxy: bool,
         total_timeout: float,
         cancellation_token: CancellationToken | None,
     ) -> web_playwright_backend.WebPayload:
@@ -6326,6 +7614,7 @@ def test_playwright_process_wrapper_keeps_diagnostic_budget_out_of_worker_kwargs
             playwright_sync_worker: browser worker callable。
             worker_kwargs: 只含 Browser budget 的 worker payload。
             diagnostic_resource_budget: process/failure diagnostic budget。
+            allow_environment_proxy: 是否允许 worker 沿用 proxy 环境。
             total_timeout: process 总 timeout。
             cancellation_token: 当前取消令牌。
 
@@ -6336,7 +7625,7 @@ def test_playwright_process_wrapper_keeps_diagnostic_budget_out_of_worker_kwargs
             BaseException: 队列中的测试异常原样抛出。
         """
 
-        del playwright_sync_worker, cancellation_token
+        del playwright_sync_worker, allow_environment_proxy, cancellation_token
         assert total_timeout > 1.0
         observed_worker_kwargs.append(worker_kwargs)
         observed_diagnostic_budgets.append(diagnostic_resource_budget)
@@ -6361,6 +7650,7 @@ def test_playwright_process_wrapper_keeps_diagnostic_budget_out_of_worker_kwargs
             url="http://127.0.0.1/report",
             timeout_seconds=2.0,
             egress_policy=WebEgressPolicy(allow_private_network=True),
+            transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
             browser_resource_budget=browser_budget,
             diagnostic_resource_budget=diagnostic_budget,
         )
@@ -6379,10 +7669,7 @@ def test_playwright_process_wrapper_keeps_diagnostic_budget_out_of_worker_kwargs
         "reason": "playwright_error",
     }
     assert observed_diagnostic_budgets == [diagnostic_budget] * 3
-    assert all(
-        kwargs["browser_resource_budget"] is browser_budget
-        for kwargs in observed_worker_kwargs
-    )
+    assert all(kwargs["browser_resource_budget"] is browser_budget for kwargs in observed_worker_kwargs)
     assert all("diagnostic_resource_budget" not in kwargs for kwargs in observed_worker_kwargs)
 
 
@@ -6408,6 +7695,7 @@ def test_playwright_wrapper_retains_timeout_and_challenge_with_split_owners(
         url="http://127.0.0.1/report",
         timeout_seconds=1.0,
         egress_policy=WebEgressPolicy(allow_private_network=True),
+        transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
         browser_resource_budget=browser_budget,
         diagnostic_resource_budget=diagnostic_budget,
         resolve_timeout_budget=_exhaust_browser_timeout,
@@ -6424,6 +7712,7 @@ def test_playwright_wrapper_retains_timeout_and_challenge_with_split_owners(
         playwright_sync_worker: web_playwright_backend._PlaywrightWorkerProtocol,
         worker_kwargs: web_playwright_backend._WorkerKwargs,
         diagnostic_resource_budget: DiagnosticResourceBudget,
+        allow_environment_proxy: bool,
         total_timeout: float,
         cancellation_token: CancellationToken | None,
     ) -> web_playwright_backend.WebPayload:
@@ -6433,6 +7722,7 @@ def test_playwright_wrapper_retains_timeout_and_challenge_with_split_owners(
             playwright_sync_worker: 当前 typed browser worker。
             worker_kwargs: 只含 Browser budget 的 worker payload。
             diagnostic_resource_budget: 独立 Diagnostic child budget。
+            allow_environment_proxy: 是否允许 worker 沿用 proxy 环境。
             total_timeout: process 总 timeout。
             cancellation_token: 可选取消令牌。
 
@@ -6446,6 +7736,7 @@ def test_playwright_wrapper_retains_timeout_and_challenge_with_split_owners(
         del playwright_sync_worker, total_timeout, cancellation_token
         assert worker_kwargs["browser_resource_budget"] is browser_budget
         assert diagnostic_resource_budget is diagnostic_budget
+        assert allow_environment_proxy is False
         return {
             "ok": True,
             "content": "asset from challenges.cloudflare.com",
@@ -6467,6 +7758,7 @@ def test_playwright_wrapper_retains_timeout_and_challenge_with_split_owners(
         url="http://127.0.0.1/report",
         timeout_seconds=1.0,
         egress_policy=WebEgressPolicy(allow_private_network=True),
+        transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
         browser_resource_budget=browser_budget,
         diagnostic_resource_budget=diagnostic_budget,
         resolve_timeout_budget=web_tools._resolve_timeout_budget,
@@ -6522,6 +7814,7 @@ def test_playwright_process_entry_projects_separate_diagnostic_owner(
             worker,
             worker_kwargs,
             _diagnostic_resource_budget(error_chars=32, events=4),
+            False,
         )
         payloads.append(result_queue.get(timeout=1.0))
         result_queue.close()
@@ -6532,6 +7825,58 @@ def test_playwright_process_entry_projects_separate_diagnostic_owner(
     assert payloads[1]["blocked_url"] == "http://127.0.0.1/private"
     assert payloads[2]["error_type"] == "RuntimeError"
     assert len(str(payloads[2]["message"])) <= 32
+
+
+def test_playwright_process_entry_controls_proxy_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """browser worker 必须按 transport policy 沿用或清理标准 proxy 环境。
+
+    Args:
+        monkeypatch: pytest 属性替换夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: worker 可见 proxy 环境与 transport policy 不一致时抛出。
+    """
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:8080")
+    monkeypatch.setattr(
+        web_playwright_backend,
+        "enter_new_process_session_if_supported",
+        _skip_new_process_session,
+    )
+    worker_kwargs: web_playwright_backend._WorkerKwargs = {
+        "url": "https://example.com/report",
+        "timeout_seconds": 1.0,
+        "headers": None,
+        "playwright_channel": None,
+        "playwright_storage_state_path": "",
+        "egress_policy": _public_test_policy(),
+        "browser_resource_budget": _DEFAULT_BROWSER_RESOURCE_BUDGET,
+    }
+    observed_payloads: list[web_playwright_backend.WebPayload] = []
+    for allow_environment_proxy in (True, False):
+        raw_queue = multiprocessing.get_context("spawn").Queue(maxsize=1)
+        result_queue = cast(web_playwright_backend._ResultQueueProtocol, raw_queue)
+        web_playwright_backend._playwright_process_entry(
+            result_queue,
+            _process_entry_proxy_environment_worker,
+            worker_kwargs,
+            _DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
+            allow_environment_proxy,
+        )
+        envelope = result_queue.get(timeout=1.0)
+        observed_payloads.append(cast(web_playwright_backend.WebPayload, envelope["payload"]))
+        result_queue.close()
+        result_queue.join_thread()
+
+    enabled_names = cast(list[str], observed_payloads[0]["visible_proxy_environment"])
+    disabled_names = cast(list[str], observed_payloads[1]["visible_proxy_environment"])
+    assert "HTTPS_PROXY" in enabled_names
+    assert disabled_names == []
 
 
 def test_playwright_url_safety_error_survives_worker_process() -> None:
@@ -6555,6 +7900,7 @@ def test_playwright_url_safety_error_survives_worker_process() -> None:
             ),
             worker_kwargs=worker_kwargs,
             diagnostic_resource_budget=_DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
+            allow_environment_proxy=False,
             total_timeout=5.0,
             cancellation_token=None,
         )
@@ -6592,6 +7938,7 @@ def test_playwright_process_wrapper_projects_success_and_diagnostic_error() -> N
             error_chars=32,
             events=4,
         ),
+        allow_environment_proxy=False,
         total_timeout=5.0,
         cancellation_token=None,
     )
@@ -6607,6 +7954,7 @@ def test_playwright_process_wrapper_projects_success_and_diagnostic_error() -> N
                 error_chars=32,
                 events=4,
             ),
+            allow_environment_proxy=False,
             total_timeout=5.0,
             cancellation_token=None,
         )
@@ -6635,25 +7983,32 @@ def test_fetch_playwright_url_safety_projects_permission_denied(
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
         egress_policy: WebEgressPolicy,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
         browser_resource_budget: BrowserResourceBudget,
         diagnostic_resource_budget: DiagnosticResourceBudget,
         cancellation_token: CancellationToken | None = None,
     ) -> web_playwright_backend.WebPayload:
         """模拟 Playwright 导航阶段 URL safety 拒绝。
 
-        :param url: 目标 URL。
-        :param timeout_seconds: 浏览器抓取超时。
-        :param headers: 请求头。
-        :param timeout_budget: 工具总预算。
-        :param deadline_monotonic: 工具调用 deadline。
-        :param playwright_channel: 浏览器 channel。
-        :param playwright_storage_state_path: storage state 路径。
-        :param egress_policy: Web 出站策略。
-        :param browser_resource_budget: Browser child 资源预算。
-        :param diagnostic_resource_budget: Diagnostic child 诊断投影预算。
-        :param cancellation_token: 取消令牌。
-        :returns: 不返回。
-        :raises web_fetch_orchestrator._FetchUrlSafetyError: 始终抛出。
+        Args:
+            url: 目标 URL。
+            timeout_seconds: 浏览器抓取超时。
+            headers: 请求头。
+            timeout_budget: 工具总预算。
+            deadline_monotonic: 工具调用 deadline。
+            playwright_channel: 浏览器 channel。
+            playwright_storage_state_path: storage state 路径。
+            egress_policy: Web 出站策略。
+            transport_policy: 当前 attempt 的 transport policy。
+            browser_resource_budget: Browser child 资源预算。
+            diagnostic_resource_budget: Diagnostic child 诊断投影预算。
+            cancellation_token: 取消令牌。
+
+        Returns:
+            不返回。
+
+        Raises:
+            _FetchUrlSafetyError: 始终抛出。
         """
 
         del (
@@ -6665,6 +8020,7 @@ def test_fetch_playwright_url_safety_projects_permission_denied(
             playwright_channel,
             playwright_storage_state_path,
             egress_policy,
+            transport_policy,
             browser_resource_budget,
             diagnostic_resource_budget,
             cancellation_token,
@@ -6713,25 +8069,32 @@ def test_fetch_playwright_cancel_projects_to_host_cancelled(
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
         egress_policy: WebEgressPolicy,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
         browser_resource_budget: BrowserResourceBudget,
         diagnostic_resource_budget: DiagnosticResourceBudget,
         cancellation_token: CancellationToken | None = None,
     ) -> dict[str, JsonValue]:
         """模拟 Playwright worker 在 fallback 内部收到取消。
 
-        :param url: 目标 URL。
-        :param timeout_seconds: 浏览器抓取超时。
-        :param headers: 请求头。
-        :param timeout_budget: 工具总预算。
-        :param deadline_monotonic: 工具调用 deadline。
-        :param playwright_channel: 浏览器 channel。
-        :param playwright_storage_state_path: storage state 路径。
-        :param egress_policy: Web 出站策略。
-        :param browser_resource_budget: Browser child 资源预算。
-        :param diagnostic_resource_budget: Diagnostic child 诊断投影预算。
-        :param cancellation_token: 取消令牌。
-        :returns: 不返回。
-        :raises web_playwright_backend.CancelledError: 始终抛出。
+        Args:
+            url: 目标 URL。
+            timeout_seconds: 浏览器抓取超时。
+            headers: 请求头。
+            timeout_budget: 工具总预算。
+            deadline_monotonic: 工具调用 deadline。
+            playwright_channel: 浏览器 channel。
+            playwright_storage_state_path: storage state 路径。
+            egress_policy: Web 出站策略。
+            transport_policy: 当前 attempt 的 transport policy。
+            browser_resource_budget: Browser child 资源预算。
+            diagnostic_resource_budget: Diagnostic child 诊断投影预算。
+            cancellation_token: 取消令牌。
+
+        Returns:
+            不返回。
+
+        Raises:
+            CancelledError: 始终抛出。
         """
 
         received_playwright_tokens.append(cancellation_token)
@@ -6744,6 +8107,7 @@ def test_fetch_playwright_cancel_projects_to_host_cancelled(
             playwright_channel,
             playwright_storage_state_path,
             egress_policy,
+            transport_policy,
             browser_resource_budget,
             diagnostic_resource_budget,
         )
@@ -6754,9 +8118,7 @@ def test_fetch_playwright_cancel_projects_to_host_cancelled(
         "_fetch_and_convert_with_playwright",
         fake_fetch_and_convert_with_playwright,
     )
-    definition = _definitions_by_name(
-        _discover_definitions({"allow_private_network_url": True})
-    )["fetch_web_page"]
+    definition = _definitions_by_name(_discover_definitions({"allow_private_network_url": True}))["fetch_web_page"]
 
     outcome = asyncio.run(
         definition.callable(
@@ -6823,9 +8185,7 @@ def test_search_and_fetch_pass_tool_timeout_budget_to_business(
     monkeypatch.setattr(web_tools.asyncio, "to_thread", fake_to_thread)
     monkeypatch.setattr(web_tools, "_search_web_business", fake_search_business)
     monkeypatch.setattr(web_tools, "_fetch_web_page_business", fake_fetch_business)
-    definitions = _definitions_by_name(
-        _discover_definitions({"allow_private_network_url": True})
-    )
+    definitions = _definitions_by_name(_discover_definitions({"allow_private_network_url": True}))
     context = _context(timeout_seconds=2.5)
 
     search_outcome = asyncio.run(
@@ -6865,25 +8225,32 @@ def test_try_playwright_fallback_pre_cancel_does_not_start_playwright(
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
         egress_policy: WebEgressPolicy,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
         browser_resource_budget: BrowserResourceBudget,
         diagnostic_resource_budget: DiagnosticResourceBudget,
         cancellation_token: CancellationToken | None = None,
     ) -> dict[str, JsonValue]:
         """记录非预期 Playwright worker 调用。
 
-        :param url: 目标 URL。
-        :param timeout_seconds: 浏览器抓取超时。
-        :param headers: 请求头。
-        :param timeout_budget: 工具总预算。
-        :param deadline_monotonic: 工具调用 deadline。
-        :param playwright_channel: 浏览器 channel。
-        :param playwright_storage_state_path: storage state 路径。
-        :param egress_policy: Web 出站策略。
-        :param browser_resource_budget: Browser child 资源预算。
-        :param diagnostic_resource_budget: Diagnostic child 诊断投影预算。
-        :param cancellation_token: 取消令牌。
-        :returns: 成功结果。
-        :raises Exception: 不主动抛出异常。
+        Args:
+            url: 目标 URL。
+            timeout_seconds: 浏览器抓取超时。
+            headers: 请求头。
+            timeout_budget: 工具总预算。
+            deadline_monotonic: 工具调用 deadline。
+            playwright_channel: 浏览器 channel。
+            playwright_storage_state_path: storage state 路径。
+            egress_policy: Web 出站策略。
+            transport_policy: 当前 attempt 的 transport policy。
+            browser_resource_budget: Browser child 资源预算。
+            diagnostic_resource_budget: Diagnostic child 诊断投影预算。
+            cancellation_token: 取消令牌。
+
+        Returns:
+            成功结果。
+
+        Raises:
+            无。
         """
 
         del (
@@ -6894,6 +8261,7 @@ def test_try_playwright_fallback_pre_cancel_does_not_start_playwright(
             playwright_channel,
             playwright_storage_state_path,
             egress_policy,
+            transport_policy,
             browser_resource_budget,
             diagnostic_resource_budget,
             cancellation_token,
@@ -6915,6 +8283,8 @@ def test_try_playwright_fallback_pre_cancel_does_not_start_playwright(
             timeout_budget=None,
             deadline_monotonic=None,
             egress_policy=_public_test_policy(),
+            browser_enabled=True,
+            transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
             browser_resource_budget=_DEFAULT_BROWSER_RESOURCE_BUDGET,
             diagnostic_resource_budget=_DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
             cancellation_token=token,
@@ -6979,6 +8349,7 @@ def test_playwright_unpicklable_worker_fails_closed(
         playwright_channel=None,
         playwright_storage_state_path="",
         egress_policy=WebEgressPolicy(allow_private_network=True),
+        transport_policy=_PROXY_DENIED_TRANSPORT_POLICY,
         browser_resource_budget=_DEFAULT_BROWSER_RESOURCE_BUDGET,
         diagnostic_resource_budget=_DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
         cancellation_token=_OpenCancellationToken(),
@@ -7050,12 +8421,8 @@ def test_playwright_worker_process_cleanup_kills_synthetic_nested_child_on_posix
         assert "group_signal_sent=True" in caplog.text
         assert _wait_for_pid_absent(nested_pid, timeout_seconds=1.0)
         assert cleanup["kill"] is None
-        assert terminate_result.elapsed_seconds <= (
-            web_playwright_backend._PW_PROCESS_TERMINATE_GRACE_SECONDS
-        )
-        assert cleanup_elapsed_seconds <= (
-            web_playwright_backend._PW_PROCESS_TERMINATE_GRACE_SECONDS
-        )
+        assert terminate_result.elapsed_seconds <= (web_playwright_backend._PW_PROCESS_TERMINATE_GRACE_SECONDS)
+        assert cleanup_elapsed_seconds <= (web_playwright_backend._PW_PROCESS_TERMINATE_GRACE_SECONDS)
     finally:
         if process.is_alive():
             process.kill()
@@ -7095,10 +8462,7 @@ def test_playwright_worker_process_cleanup_supports_running_event_loop(
         terminate_result = cleanup["terminate"]
         assert terminate_result is not None
         if not terminate_result.cleanup.group_signal_sent:
-            pytest.skip(
-                "process-group cleanup fallback: "
-                f"{terminate_result.cleanup.reason.value}"
-            )
+            pytest.skip("process-group cleanup fallback: " f"{terminate_result.cleanup.reason.value}")
         assert terminate_result.cleanup.reason is ProcessGroupCleanupReason.GROUP_SIGNALED
         assert _wait_for_pid_absent(nested_pid, timeout_seconds=1.0)
     finally:
@@ -7128,8 +8492,7 @@ def test_playwright_live_browser_cleanup_smoke_is_manual_and_best_effort(
         pytest.skip("process descendant inspection via ps is unavailable")
     server = _SocketWebServer.start(
         response_body=(
-            b"<html><head><title>Live Browser Cleanup</title></head>"
-            b"<body>browser cleanup fixture</body></html>"
+            b"<html><head><title>Live Browser Cleanup</title></head>" b"<body>browser cleanup fixture</body></html>"
         ),
         max_connections=8,
     )
@@ -7158,10 +8521,7 @@ def test_playwright_live_browser_cleanup_smoke_is_manual_and_best_effort(
         terminate_result = cleanup["terminate"]
         assert terminate_result is not None
         if not terminate_result.cleanup.group_signal_sent:
-            pytest.skip(
-                "process-group cleanup fallback: "
-                f"{terminate_result.cleanup.reason.value}"
-            )
+            pytest.skip("process-group cleanup fallback: " f"{terminate_result.cleanup.reason.value}")
         assert _wait_for_pids_absent(
             descendant_pids,
             timeout_seconds=_PROCESS_DESCENDANT_WAIT_SECONDS,
@@ -7206,25 +8566,32 @@ def test_fetch_playwright_fallback_receives_channel_and_storage_state_path(
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
         egress_policy: WebEgressPolicy,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
         browser_resource_budget: BrowserResourceBudget,
         diagnostic_resource_budget: DiagnosticResourceBudget,
         cancellation_token: CancellationToken | None = None,
     ) -> Mapping[str, JsonValue]:
         """记录 browser fallback 参数并返回确定性内容。
 
-        :param url: 目标 URL。
-        :param timeout_seconds: 抓取超时。
-        :param headers: 请求 headers。
-        :param timeout_budget: 工具预算。
-        :param deadline_monotonic: 工具 deadline。
-        :param playwright_channel: 浏览器 channel。
-        :param playwright_storage_state_path: storage state 文件路径。
-        :param egress_policy: Web 出站策略。
-        :param browser_resource_budget: Browser child 资源预算。
-        :param diagnostic_resource_budget: Diagnostic child 诊断投影预算。
-        :param cancellation_token: 取消令牌。
-        :returns: 确定性抓取内容。
-        :raises Exception: 不主动抛出异常。
+        Args:
+            url: 目标 URL。
+            timeout_seconds: 抓取超时。
+            headers: 请求 headers。
+            timeout_budget: 工具预算。
+            deadline_monotonic: 工具 deadline。
+            playwright_channel: 浏览器 channel。
+            playwright_storage_state_path: storage state 文件路径。
+            egress_policy: Web 出站策略。
+            transport_policy: 当前 attempt 的 transport policy。
+            browser_resource_budget: Browser child 资源预算。
+            diagnostic_resource_budget: Diagnostic child 诊断投影预算。
+            cancellation_token: 取消令牌。
+
+        Returns:
+            确定性抓取内容。
+
+        Raises:
+            无。
         """
 
         del (
@@ -7232,6 +8599,7 @@ def test_fetch_playwright_fallback_receives_channel_and_storage_state_path(
             timeout_budget,
             deadline_monotonic,
             egress_policy,
+            transport_policy,
             browser_resource_budget,
             diagnostic_resource_budget,
             cancellation_token,
@@ -7310,25 +8678,32 @@ def test_fetch_playwright_fallback_uses_empty_storage_state_when_dir_empty(
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
         egress_policy: WebEgressPolicy,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
         browser_resource_budget: BrowserResourceBudget,
         diagnostic_resource_budget: DiagnosticResourceBudget,
         cancellation_token: CancellationToken | None = None,
     ) -> Mapping[str, JsonValue]:
         """记录空 storage state dir 的 browser fallback 参数。
 
-        :param url: 目标 URL。
-        :param timeout_seconds: 抓取超时。
-        :param headers: 请求 headers。
-        :param timeout_budget: 工具预算。
-        :param deadline_monotonic: 工具 deadline。
-        :param playwright_channel: 浏览器 channel。
-        :param playwright_storage_state_path: storage state 文件路径。
-        :param egress_policy: Web 出站策略。
-        :param browser_resource_budget: Browser child 资源预算。
-        :param diagnostic_resource_budget: Diagnostic child 诊断投影预算。
-        :param cancellation_token: 取消令牌。
-        :returns: 确定性抓取内容。
-        :raises Exception: 不主动抛出异常。
+        Args:
+            url: 目标 URL。
+            timeout_seconds: 抓取超时。
+            headers: 请求 headers。
+            timeout_budget: 工具预算。
+            deadline_monotonic: 工具 deadline。
+            playwright_channel: 浏览器 channel。
+            playwright_storage_state_path: storage state 文件路径。
+            egress_policy: Web 出站策略。
+            transport_policy: 当前 attempt 的 transport policy。
+            browser_resource_budget: Browser child 资源预算。
+            diagnostic_resource_budget: Diagnostic child 诊断投影预算。
+            cancellation_token: 取消令牌。
+
+        Returns:
+            确定性抓取内容。
+
+        Raises:
+            无。
         """
 
         del (
@@ -7336,6 +8711,7 @@ def test_fetch_playwright_fallback_uses_empty_storage_state_when_dir_empty(
             timeout_budget,
             deadline_monotonic,
             egress_policy,
+            transport_policy,
             browser_resource_budget,
             diagnostic_resource_budget,
             cancellation_token,
@@ -7473,9 +8849,7 @@ def test_search_provider_unavailable_projects_to_stable_business_failure(
     monkeypatch.setenv(web_search_providers.SERPER_API_KEY_ENV, "test-serper-key")
     definition = _definitions_by_name(_discover_definitions({}))["search_web"]
 
-    outcome = asyncio.run(
-        definition.callable(_call("search_web", {"query": "revenue"}), _context())
-    )
+    outcome = asyncio.run(definition.callable(_call("search_web", {"query": "revenue"}), _context()))
 
     assert isinstance(outcome, ToolFailedOutcome)
     assert outcome.result.error == "search_provider_unavailable"
@@ -7560,9 +8934,7 @@ def test_web_provider_serializes_search_and_fetch_business(
     monkeypatch.setattr(web_tools, "_try_playwright_fallback", lambda *args, **kwargs: None)
     monkeypatch.setattr(web_tools, "_fetch_and_convert_content", fake_fetch_and_convert_content)
 
-    definitions = _definitions_by_name(
-        _discover_definitions({"allow_private_network_url": True})
-    )
+    definitions = _definitions_by_name(_discover_definitions({"allow_private_network_url": True}))
 
     async def run_competing_calls() -> tuple[ToolCompletedOutcome, ToolCompletedOutcome]:
         """并发执行 search 与 fetch。
@@ -7765,6 +9137,7 @@ def _start_playwright_worker_process(
             worker_callable,
             worker_kwargs,
             _DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
+            False,
         ),
     )
     process.daemon = True

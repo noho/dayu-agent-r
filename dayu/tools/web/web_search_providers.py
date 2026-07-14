@@ -16,23 +16,30 @@ import requests
 from bs4 import BeautifulSoup
 
 from dayu.contracts.cancellation import CancellationToken
+from dayu.contracts.json_value import JsonValue
 
 from . import web_fetch_orchestrator as _web_fetch_orchestrator
 from .web_challenge_detection import BotChallengeDecision, detect_bot_challenge
 from .web_egress_policy import WebEgressPolicy
+from .web_http_session import (
+    ProxyPeerProofIncompatibleError,
+    WebHttpTransportPolicy,
+    _send_authorized_plain_request,
+)
 from .web_resource_budget import HttpResourceBudget
 
 MODULE = "ENGINE.WEB_SEARCH"
 _LOGGER = logging.getLogger(__name__)
 SERPER_API_KEY_ENV = "SERPER_API_KEY"
 TAVILY_API_KEY_ENV = "TAVILY_API_KEY"
+_TAVILY_ENDPOINT: Final[str] = "https://api.tavily.com/search"
+_SERPER_ENDPOINT: Final[str] = "https://google.serper.dev/search"
+_DUCKDUCKGO_ENDPOINT: Final[str] = "https://duckduckgo.com/html/"
 
 _ALL_PROVIDERS_UNAVAILABLE_MESSAGE: Final[str] = "联网检索失败：所有 provider 均不可用"
 _SEARCH_CANCELLED_MESSAGE: Final[str] = "工具调用已取消"
 _SEARCH_ACCEPT_ENCODING: Final[str] = "gzip, deflate"
-_DUCKDUCKGO_NO_RESULTS_TEXT: Final[frozenset[str]] = frozenset(
-    {"No results.", "No more results."}
-)
+_DUCKDUCKGO_NO_RESULTS_TEXT: Final[frozenset[str]] = frozenset({"No results.", "No more results."})
 _DUCKDUCKGO_CHALLENGE_SELECTORS: Final[tuple[str, ...]] = (
     "form#challenge-form",
     "form[action*='challenge']",
@@ -257,6 +264,7 @@ def search_public_web(
     timeout_budget: float | None,
     deadline_monotonic: float | None,
     egress_policy: WebEgressPolicy,
+    transport_policy: WebHttpTransportPolicy,
     normalize_whitespace: Callable[[str], str],
     resolve_timeout_budget: _TimeoutBudgetResolver,
     http_resource_budget: HttpResourceBudget,
@@ -275,6 +283,7 @@ def search_public_web(
         timeout_budget: 单次 tool call 总预算。
         deadline_monotonic: 当前调用 deadline。
         egress_policy: 与 fetch 同源的 private/custom-port typed policy。
+        transport_policy: 与 fetch 同源的 attempt-local HTTP transport policy。
         normalize_whitespace: 文本空白规整函数。
         resolve_timeout_budget: timeout 预算解析函数。
         http_resource_budget: 搜索响应 wire/decoded body 预算。
@@ -287,6 +296,7 @@ def search_public_web(
         ValueError: 当 query 或 domains 非法时抛出。
         WebSearchProviderUnavailableError: 当所有 provider 都失败时抛出。
         WebSearchProviderResourceError: 最终决定性失败为响应资源超限时抛出。
+        ProxyPeerProofIncompatibleError: active proxy 与 peer proof 冲突时抛出。
     """
 
     normalized_query = query.strip()
@@ -297,9 +307,7 @@ def search_public_web(
     limited_results = max(1, min(int(max_results), max_search_results))
     resolved_provider = _resolve_provider(preferred=provider)
     _raise_if_search_cancelled(cancellation_token)
-    last_decisive_error: (
-        WebSearchProviderResponseError | WebSearchProviderResourceError | None
-    ) = None
+    last_decisive_error: WebSearchProviderResponseError | WebSearchProviderResourceError | None = None
 
     for candidate_provider in _candidate_providers(resolved_provider):
         _raise_if_search_cancelled(cancellation_token)
@@ -314,6 +322,8 @@ def search_public_web(
                     timeout_seconds=request_timeout_seconds,
                     timeout_budget=timeout_budget,
                     deadline_monotonic=deadline_monotonic,
+                    egress_policy=egress_policy,
+                    transport_policy=transport_policy,
                     resolve_timeout_budget=resolve_timeout_budget,
                     http_resource_budget=http_resource_budget,
                 )
@@ -326,6 +336,8 @@ def search_public_web(
                     timeout_seconds=request_timeout_seconds,
                     timeout_budget=timeout_budget,
                     deadline_monotonic=deadline_monotonic,
+                    egress_policy=egress_policy,
+                    transport_policy=transport_policy,
                     resolve_timeout_budget=resolve_timeout_budget,
                     http_resource_budget=http_resource_budget,
                 )
@@ -337,6 +349,8 @@ def search_public_web(
                     timeout_seconds=request_timeout_seconds,
                     timeout_budget=timeout_budget,
                     deadline_monotonic=deadline_monotonic,
+                    egress_policy=egress_policy,
+                    transport_policy=transport_policy,
                     normalize_whitespace=normalize_whitespace,
                     resolve_timeout_budget=resolve_timeout_budget,
                     http_resource_budget=http_resource_budget,
@@ -344,6 +358,8 @@ def search_public_web(
             _raise_if_search_cancelled(cancellation_token)
         except Exception as exc:  # pragma: no cover - 失败路径由单测通过 monkeypatch 覆盖
             if _is_search_cancelled_error(exc):
+                raise
+            if isinstance(exc, ProxyPeerProofIncompatibleError):
                 raise
             if isinstance(
                 exc,
@@ -427,11 +443,7 @@ def _filter_visible_results(
         无。
     """
 
-    return [
-        row
-        for row in rows
-        if egress_policy.is_url_allowed(row["url"])
-    ]
+    return [row for row in rows if egress_policy.is_url_allowed(row["url"])]
 
 
 def _default_resolve_timeout_budget(
@@ -595,10 +607,12 @@ def _search_with_tavily(
     recency_days: Optional[int],
     max_results: int,
     timeout_seconds: float,
+    egress_policy: WebEgressPolicy,
+    transport_policy: WebHttpTransportPolicy,
+    resolve_timeout_budget: _TimeoutBudgetResolver,
+    http_resource_budget: HttpResourceBudget,
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
-    resolve_timeout_budget: _TimeoutBudgetResolver = _default_resolve_timeout_budget,
-    http_resource_budget: HttpResourceBudget,
 ) -> list[SearchResultRow]:
     """使用 Tavily API 搜索。
 
@@ -608,10 +622,12 @@ def _search_with_tavily(
         recency_days: 最近天数。
         max_results: 返回数量。
         timeout_seconds: HTTP 请求超时秒数。
-        timeout_budget: Runner 注入的单次 tool call 总预算。
-        deadline_monotonic: 当前工具调用的单调时钟 deadline。
+        egress_policy: 与 fetch 同源的 endpoint egress policy。
+        transport_policy: 与 fetch 同源的 attempt-local HTTP transport policy。
         resolve_timeout_budget: timeout 预算解析函数。
         http_resource_budget: Web response 资源预算唯一真源。
+        timeout_budget: Runner 注入的单次 tool call 总预算。
+        deadline_monotonic: 当前工具调用的单调时钟 deadline。
 
     Returns:
         结果列表。
@@ -624,30 +640,34 @@ def _search_with_tavily(
     if not api_key:
         raise RuntimeError("TAVILY_API_KEY 未配置")
 
-    payload: dict[str, str | int | list[str]] = {
+    payload: dict[str, JsonValue] = {
         "api_key": api_key,
         "query": query,
         "max_results": max_results,
         "search_depth": "advanced",
     }
     if domains:
-        payload["include_domains"] = domains
+        payload["include_domains"] = [domain for domain in domains]
     if recency_days is not None and recency_days >= 0:
         payload["days"] = int(recency_days)
 
-    response = requests.post(
-        "https://api.tavily.com/search",
+    lease = _send_authorized_plain_request(
+        egress_policy=egress_policy,
+        url=_TAVILY_ENDPOINT,
+        method="POST",
         headers={"Accept-Encoding": _SEARCH_ACCEPT_ENCODING},
-        json=payload,
         timeout=resolve_timeout_budget(
             timeout_seconds,
             timeout_budget=timeout_budget,
             deadline_monotonic=deadline_monotonic,
         ),
-        allow_redirects=False,
         stream=True,
+        transport_policy=transport_policy,
+        request_params=None,
+        request_json=payload,
     )
-    with response:
+    with lease:
+        response = lease.response
         _materialize_bounded_search_response(
             response,
             http_resource_budget=http_resource_budget,
@@ -679,10 +699,12 @@ def _search_with_serper(
     recency_days: Optional[int],
     max_results: int,
     timeout_seconds: float,
+    egress_policy: WebEgressPolicy,
+    transport_policy: WebHttpTransportPolicy,
+    resolve_timeout_budget: _TimeoutBudgetResolver,
+    http_resource_budget: HttpResourceBudget,
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
-    resolve_timeout_budget: _TimeoutBudgetResolver = _default_resolve_timeout_budget,
-    http_resource_budget: HttpResourceBudget,
 ) -> list[SearchResultRow]:
     """使用 Serper API 搜索。
 
@@ -692,10 +714,12 @@ def _search_with_serper(
         recency_days: 最近天数。
         max_results: 返回数量。
         timeout_seconds: HTTP 请求超时秒数。
-        timeout_budget: Runner 注入的单次 tool call 总预算。
-        deadline_monotonic: 当前工具调用的单调时钟 deadline。
+        egress_policy: 与 fetch 同源的 endpoint egress policy。
+        transport_policy: 与 fetch 同源的 attempt-local HTTP transport policy。
         resolve_timeout_budget: timeout 预算解析函数。
         http_resource_budget: Web response 资源预算唯一真源。
+        timeout_budget: Runner 注入的单次 tool call 总预算。
+        deadline_monotonic: 当前工具调用的单调时钟 deadline。
 
     Returns:
         结果列表。
@@ -713,30 +737,34 @@ def _search_with_serper(
         domain_expr = " OR ".join(f"site:{domain}" for domain in domains)
         query_with_domain = f"({query}) ({domain_expr})"
 
-    payload: dict[str, str | int] = {
+    payload: dict[str, JsonValue] = {
         "q": query_with_domain,
         "num": max_results,
     }
     if recency_days is not None and recency_days >= 0:
         payload["tbs"] = f"qdr:d{int(recency_days)}"
 
-    response = requests.post(
-        "https://google.serper.dev/search",
+    lease = _send_authorized_plain_request(
+        egress_policy=egress_policy,
+        url=_SERPER_ENDPOINT,
+        method="POST",
         headers={
             "X-API-KEY": api_key,
             "Content-Type": "application/json",
             "Accept-Encoding": _SEARCH_ACCEPT_ENCODING,
         },
-        json=payload,
         timeout=resolve_timeout_budget(
             timeout_seconds,
             timeout_budget=timeout_budget,
             deadline_monotonic=deadline_monotonic,
         ),
-        allow_redirects=False,
         stream=True,
+        transport_policy=transport_policy,
+        request_params=None,
+        request_json=payload,
     )
-    with response:
+    with lease:
+        response = lease.response
         _materialize_bounded_search_response(
             response,
             http_resource_budget=http_resource_budget,
@@ -767,11 +795,13 @@ def _search_with_duckduckgo(
     domains: list[str],
     max_results: int,
     timeout_seconds: float,
+    egress_policy: WebEgressPolicy,
+    transport_policy: WebHttpTransportPolicy,
+    normalize_whitespace: Callable[[str], str],
+    resolve_timeout_budget: _TimeoutBudgetResolver,
+    http_resource_budget: HttpResourceBudget,
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
-    normalize_whitespace: Callable[[str], str] = lambda value: " ".join(value.split()),
-    resolve_timeout_budget: _TimeoutBudgetResolver = _default_resolve_timeout_budget,
-    http_resource_budget: HttpResourceBudget,
 ) -> list[SearchResultRow]:
     """使用 DuckDuckGo HTML 页面搜索。
 
@@ -780,11 +810,13 @@ def _search_with_duckduckgo(
         domains: 域名过滤。
         max_results: 返回数量。
         timeout_seconds: HTTP 请求超时秒数。
-        timeout_budget: Runner 注入的单次 tool call 总预算。
-        deadline_monotonic: 当前工具调用的单调时钟 deadline。
+        egress_policy: 与 fetch 同源的 endpoint egress policy。
+        transport_policy: 与 fetch 同源的 attempt-local HTTP transport policy。
         normalize_whitespace: 文本空白规整函数。
         resolve_timeout_budget: timeout 预算解析函数。
         http_resource_budget: Web response 资源预算唯一真源。
+        timeout_budget: Runner 注入的单次 tool call 总预算。
+        deadline_monotonic: 当前工具调用的单调时钟 deadline。
 
     Returns:
         结果列表。
@@ -797,9 +829,10 @@ def _search_with_duckduckgo(
     if domains:
         query_with_domain = f"{query} " + " ".join(f"site:{domain}" for domain in domains)
 
-    response = requests.get(
-        "https://duckduckgo.com/html/",
-        params={"q": query_with_domain},
+    lease = _send_authorized_plain_request(
+        egress_policy=egress_policy,
+        url=_DUCKDUCKGO_ENDPOINT,
+        method="GET",
         timeout=resolve_timeout_budget(
             timeout_seconds,
             timeout_budget=timeout_budget,
@@ -809,10 +842,13 @@ def _search_with_duckduckgo(
             "User-Agent": "Mozilla/5.0",
             "Accept-Encoding": _SEARCH_ACCEPT_ENCODING,
         },
-        allow_redirects=False,
         stream=True,
+        transport_policy=transport_policy,
+        request_params={"q": query_with_domain},
+        request_json=None,
     )
-    with response:
+    with lease:
+        response = lease.response
         _materialize_bounded_search_response(
             response,
             http_resource_budget=http_resource_budget,
@@ -923,9 +959,7 @@ def _parse_duckduckgo_html(
     if not containers:
         no_result_markers = soup.select(".no-results")
         if len(no_result_markers) == 1:
-            marker_text = normalize_whitespace(
-                no_result_markers[0].get_text(" ", strip=True)
-            )
+            marker_text = normalize_whitespace(no_result_markers[0].get_text(" ", strip=True))
             if marker_text in _DUCKDUCKGO_NO_RESULTS_TEXT:
                 return []
         raise WebSearchProviderResponseError(
@@ -964,9 +998,7 @@ def _parse_duckduckgo_html(
     if not results or malformed_count * 2 > container_count:
         raise WebSearchProviderResponseError(
             reason="response_shape_changed",
-            message=(
-                "DuckDuckGo result containers exceeded the malformed response threshold."
-            ),
+            message=("DuckDuckGo result containers exceeded the malformed response threshold."),
         )
     return results[:max_results]
 

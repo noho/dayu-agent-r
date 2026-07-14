@@ -77,6 +77,7 @@ from .web_http_encoding import (
 )
 from .web_egress_policy import WebEgressPolicy
 from .web_http_session import (
+    ProxyPeerProofIncompatibleError,
     WebHttpTransportPolicy,
     _compute_deadline_monotonic,
     _create_no_retry_session,
@@ -173,6 +174,8 @@ _FETCH_WEB_PAGE_PARAMETERS: Final[ToolParametersSchema] = ToolParametersSchema(
 _SEARCH_PROVIDER_UNAVAILABLE_ERROR: Final[str] = "search_provider_unavailable"
 _SEARCH_PROVIDER_RESPONSE_INVALID_ERROR: Final[str] = "search_provider_response_invalid"
 _RESPONSE_BODY_TOO_LARGE_ERROR: Final[str] = "response_body_too_large"
+_PROXY_PEER_PROOF_INCOMPATIBLE_MESSAGE: Final[str] = "当前连接验证策略与已启用的网络代理不兼容。"
+_BROWSER_PEER_PROOF_UNAVAILABLE_MESSAGE: Final[str] = "当前浏览器访问无法验证目标连接。"
 WebPayload: TypeAlias = dict[str, JsonValue]
 WebMapping: TypeAlias = Mapping[str, JsonValue]
 StagePayload: TypeAlias = dict[str, str | bool | int | float | None]
@@ -186,8 +189,8 @@ class WebToolsConfig:
 
     :param allow_private_network_url: 是否允许内网 / 本地 URL。
     :param allow_custom_port_url: 是否允许非默认 HTTP(S) 端口。
-    :param browser_enabled: 是否允许浏览器能力；S1 只保存该事实。
-    :param transport_policy: HTTP transport policy；S1 尚不投影到 sender。
+    :param browser_enabled: 是否允许浏览器 fallback 能力。
+    :param transport_policy: 当前 tool attempt 的 HTTP/browser transport policy。
     :param resource_budgets: HTTP、browser 与 diagnostics child budget 纯组合。
     :param provider: 搜索 provider 策略。
     :param request_timeout_seconds: HTTP 请求超时秒数。
@@ -240,6 +243,8 @@ class _PlaywrightFallbackKwargs(TypedDict, total=False):
     playwright_channel: str | None
     playwright_storage_state_path: str
     egress_policy: WebEgressPolicy
+    browser_enabled: bool
+    transport_policy: WebHttpTransportPolicy
     browser_resource_budget: BrowserResourceBudget
     diagnostic_resource_budget: DiagnosticResourceBudget
     cancellation_token: CancellationToken
@@ -254,6 +259,7 @@ class _WarmupFetchKwargs(TypedDict, total=False):
     timeout_budget: float | None
     deadline_monotonic: float | None
     egress_policy: WebEgressPolicy
+    transport_policy: WebHttpTransportPolicy
     browser_resource_budget: BrowserResourceBudget
     cancellation_token: CancellationToken
 
@@ -268,6 +274,7 @@ class _FetchConvertKwargs(TypedDict, total=False):
     timeout_budget: float | None
     deadline_monotonic: float | None
     egress_policy: WebEgressPolicy
+    transport_policy: WebHttpTransportPolicy
     http_resource_budget: HttpResourceBudget
     cancellation_token: CancellationToken
 
@@ -905,6 +912,27 @@ def _raise_if_host_cancelled(cancellation_token: CancellationToken | None) -> No
             _raise_fetch_cancelled()
 
 
+def _browser_fallback_available(
+    *,
+    browser_enabled: bool,
+    transport_policy: WebHttpTransportPolicy,
+) -> bool:
+    """返回当前 challenge 分支是否具备可启动的 browser capability。
+
+    Args:
+        browser_enabled: 当前不可变配置是否允许 browser fallback。
+        transport_policy: 当前 attempt 的 HTTP/browser transport policy。
+
+    Returns:
+        browser 已启用且不要求 browser 无法提供的 numeric peer proof 时返回 ``True``。
+
+    Raises:
+        无。
+    """
+
+    return browser_enabled and not transport_policy.dns_peer_proof_enabled
+
+
 def _try_playwright_fallback(
     *,
     url: str,
@@ -915,6 +943,8 @@ def _try_playwright_fallback(
     playwright_channel: str | None = None,
     playwright_storage_state_path: str = "",
     egress_policy: WebEgressPolicy,
+    browser_enabled: bool,
+    transport_policy: WebHttpTransportPolicy,
     browser_resource_budget: BrowserResourceBudget,
     diagnostic_resource_budget: DiagnosticResourceBudget,
     cancellation_token: CancellationToken | None = None,
@@ -930,6 +960,8 @@ def _try_playwright_fallback(
         playwright_channel: 浏览器回退使用的 Chromium channel。
         playwright_storage_state_path: 浏览器回退可选 storage state 文件路径。
         egress_policy: 当前 Web 调用唯一的出站策略。
+        browser_enabled: 当前不可变配置是否允许 browser fallback。
+        transport_policy: 当前 attempt 的 HTTP/browser transport policy。
         browser_resource_budget: 浏览器 DOM/text/Markdown 资源预算。
         diagnostic_resource_budget: 浏览器失败诊断投影预算。
         cancellation_token: 当前工具调用取消令牌。
@@ -942,6 +974,8 @@ def _try_playwright_fallback(
         _FetchUrlSafetyError: Playwright URL 被安全策略拒绝时抛出。
     """
 
+    if not browser_enabled:
+        return None
     _raise_if_host_cancelled(cancellation_token)
     try:
         pw_result = _fetch_and_convert_with_playwright(
@@ -953,6 +987,7 @@ def _try_playwright_fallback(
             playwright_channel=playwright_channel,
             playwright_storage_state_path=playwright_storage_state_path,
             egress_policy=egress_policy,
+            transport_policy=transport_policy,
             browser_resource_budget=browser_resource_budget,
             diagnostic_resource_budget=diagnostic_resource_budget,
             cancellation_token=cancellation_token,
@@ -960,12 +995,12 @@ def _try_playwright_fallback(
     except _web_playwright_backend.CancelledError:
         _raise_fetch_cancelled()
     if not pw_result.get("ok"):
-        if pw_result.get("reason") == "browser_egress_policy_unavailable":
+        if pw_result.get("reason") == "browser_peer_proof_unavailable":
             _raise_fetch_failure(
                 url=url,
-                error_code="browser_egress_policy_unavailable",
-                message="This page requires a browser path that is unavailable under the current network policy.",
-                hint=build_hint(REASON_BLOCKED_BY_SITE_POLICY),
+                error_code="browser_peer_proof_unavailable",
+                message=_BROWSER_PEER_PROOF_UNAVAILABLE_MESSAGE,
+                hint=build_hint(REASON_HTTP_ERROR),
                 next_action=NEXT_ACTION_CHANGE_SOURCE,
                 diagnostic_error_chars=diagnostic_resource_budget.error_chars,
             )
@@ -1118,6 +1153,7 @@ def _warmup_domain(
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
     egress_policy: WebEgressPolicy,
+    transport_policy: WebHttpTransportPolicy,
     browser_resource_budget: BrowserResourceBudget,
     cancellation_token: CancellationToken | None = None,
 ) -> StagePayload:
@@ -1131,6 +1167,7 @@ def _warmup_domain(
         timeout_budget: 工具调用总预算。
         deadline_monotonic: 当前工具调用 deadline。
         egress_policy: 当前 Web 调用唯一出站策略。
+        transport_policy: 当前 tool attempt 的 HTTP transport policy。
         browser_resource_budget: warmup body 预算。
         cancellation_token: 当前工具调用取消令牌。
 
@@ -1151,6 +1188,7 @@ def _warmup_domain(
         normalize_url_for_http=_normalize_url_for_http,
         is_timeout_like_exception=_is_timeout_like_exception,
         egress_policy=egress_policy,
+        transport_policy=transport_policy,
         browser_resource_budget=browser_resource_budget,
         timeout_budget=timeout_budget,
         deadline_monotonic=deadline_monotonic,
@@ -1167,6 +1205,7 @@ def _probe_content_type(
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
     egress_policy: WebEgressPolicy,
+    transport_policy: WebHttpTransportPolicy,
     cancellation_token: CancellationToken | None = None,
 ) -> ContentProbePayload:
     """探测目标资源类型（HEAD 优先，失败降级到零 body GET）。
@@ -1179,6 +1218,7 @@ def _probe_content_type(
         timeout_budget: 工具调用总预算。
         deadline_monotonic: 当前工具调用 deadline。
         egress_policy: 当前 Web 调用唯一出站策略。
+        transport_policy: 当前 tool attempt 的 HTTP transport policy。
         cancellation_token: 当前工具调用取消令牌。
 
     Returns:
@@ -1197,6 +1237,7 @@ def _probe_content_type(
         normalize_url_for_http=_normalize_url_for_http,
         is_timeout_like_exception=_is_timeout_like_exception,
         egress_policy=egress_policy,
+        transport_policy=transport_policy,
         timeout_budget=timeout_budget,
         deadline_monotonic=deadline_monotonic,
         cancellation_token=cancellation_token,
@@ -1320,9 +1361,7 @@ def build_web_tool_definitions(config: WebToolsConfig) -> tuple[ToolDefinition, 
         parameters=_build_search_web_parameters(config.max_search_results),
         tags=_WEB_TOOL_TAGS,
         display_name="联网搜索",
-        execution=ProcessBackedToolExecutionCapability(
-            target_factory=process_target_factory
-        ),
+        execution=ProcessBackedToolExecutionCapability(target_factory=process_target_factory),
         truncate=ToolTruncateSpec(
             enabled=True,
             strategy=ToolTruncationStrategy.LIST_ITEMS,
@@ -1353,15 +1392,11 @@ def build_web_tool_definitions(config: WebToolsConfig) -> tuple[ToolDefinition, 
 
     @tool(
         name=_FETCH_WEB_PAGE_TOOL_NAME,
-        description=(
-            "抓取网页正文并转成 Markdown。失败时先看 hint 和 next_action，再决定重试、换来源或忽略当前网页。"
-        ),
+        description=("抓取网页正文并转成 Markdown。失败时先看 hint 和 next_action，再决定重试、换来源或忽略当前网页。"),
         parameters=_FETCH_WEB_PAGE_PARAMETERS,
         tags=_WEB_TOOL_TAGS,
         display_name="抓取网页",
-        execution=ProcessBackedToolExecutionCapability(
-            target_factory=process_target_factory
-        ),
+        execution=ProcessBackedToolExecutionCapability(target_factory=process_target_factory),
         truncate=ToolTruncateSpec(
             enabled=True,
             strategy=ToolTruncationStrategy.TEXT_CHARS,
@@ -1474,10 +1509,7 @@ async def _call_search_web(
     query = _required_string_argument(arguments, "query")
     domains = _optional_string_list_argument(arguments, "domains")
     recency_days = _optional_int_argument(arguments, "recency_days")
-    max_results = (
-        _optional_int_argument(arguments, "max_results")
-        or _SEARCH_WEB_DEFAULT_MAX_RESULTS
-    )
+    max_results = _optional_int_argument(arguments, "max_results") or _SEARCH_WEB_DEFAULT_MAX_RESULTS
 
     try:
         async with provider_lock:
@@ -1505,6 +1537,15 @@ async def _call_search_web(
             finished_at=datetime.now(UTC),
             message=WEB_SEARCH_CANCELLED_MESSAGE,
             hint=WEB_CANCELLED_HINT,
+        )
+    except ProxyPeerProofIncompatibleError as exc:
+        return failed_outcome(
+            tool_name=_SEARCH_WEB_TOOL_NAME,
+            error=exc.reason,
+            message=_PROXY_PEER_PROOF_INCOMPATIBLE_MESSAGE,
+            hint=build_hint(REASON_HTTP_ERROR),
+            started_at=started_at,
+            finished_at=datetime.now(UTC),
         )
     except WebSearchProviderResponseError as exc:
         return failed_outcome(
@@ -1677,6 +1718,7 @@ def _search_web_business(
         timeout_budget=timeout_budget,
         deadline_monotonic=_compute_deadline_monotonic(timeout_budget),
         egress_policy=egress_policy,
+        transport_policy=config.transport_policy,
         normalize_whitespace=_normalize_whitespace,
         resolve_timeout_budget=_resolve_timeout_budget,
         http_resource_budget=config.resource_budgets.http,
@@ -1733,10 +1775,7 @@ def _execute_web_process_business_value(
                 query=_required_string_argument(arguments, "query"),
                 domains=_optional_string_list_argument(arguments, "domains"),
                 recency_days=_optional_int_argument(arguments, "recency_days"),
-                max_results=(
-                    _optional_int_argument(arguments, "max_results")
-                    or _SEARCH_WEB_DEFAULT_MAX_RESULTS
-                ),
+                max_results=(_optional_int_argument(arguments, "max_results") or _SEARCH_WEB_DEFAULT_MAX_RESULTS),
                 config=config,
                 timeout_budget=timeout_budget,
                 cancellation_token=process_token,
@@ -1959,6 +1998,12 @@ def _fetch_web_page_business(
     playwright_channel = config.playwright_channel
     playwright_storage_state_dir = config.playwright_storage_state_dir
     resource_budgets = config.resource_budgets
+    transport_policy = config.transport_policy
+    browser_enabled = config.browser_enabled
+    browser_fallback_available = _browser_fallback_available(
+        browser_enabled=browser_enabled,
+        transport_policy=transport_policy,
+    )
     diagnostic_error_chars = resource_budgets.diagnostics.error_chars
     _raise_if_host_cancelled(cancellation_token)
 
@@ -2005,6 +2050,8 @@ def _fetch_web_page_business(
         "playwright_channel": playwright_channel,
         "playwright_storage_state_path": playwright_storage_state_path,
         "egress_policy": egress_policy,
+        "browser_enabled": browser_enabled,
+        "transport_policy": transport_policy,
         "browser_resource_budget": resource_budgets.browser,
         "diagnostic_resource_budget": resource_budgets.diagnostics,
     }
@@ -2019,6 +2066,7 @@ def _fetch_web_page_business(
             "timeout_budget": timeout_budget,
             "deadline_monotonic": deadline_monotonic,
             "egress_policy": egress_policy,
+            "transport_policy": transport_policy,
             "browser_resource_budget": resource_budgets.browser,
         }
         if cancellation_token is not None:
@@ -2040,6 +2088,7 @@ def _fetch_web_page_business(
             timeout_budget=timeout_budget,
             deadline_monotonic=deadline_monotonic,
             egress_policy=egress_policy,
+            transport_policy=transport_policy,
             cancellation_token=cancellation_token,
         )
         if _should_escalate_stage_result_to_browser(cast(StagePayload, content_type_probe)):
@@ -2055,6 +2104,7 @@ def _fetch_web_page_business(
             "timeout_budget": timeout_budget,
             "deadline_monotonic": deadline_monotonic,
             "egress_policy": egress_policy,
+            "transport_policy": transport_policy,
             "http_resource_budget": resource_budgets.http,
         }
         if cancellation_token is not None:
@@ -2064,7 +2114,7 @@ def _fetch_web_page_business(
             **fetch_kwargs,
         )
     except requests.TooManyRedirects as exc:
-        response = getattr(exc, "response", None)
+        response = exc.response
         _raise_fetch_failure(
             url=url,
             error_code="too_many_redirects",
@@ -2087,8 +2137,17 @@ def _fetch_web_page_business(
             diagnostic_error_chars=diagnostic_error_chars,
         )
     except requests.RequestException as exc:
-        response = getattr(exc, "response", None)
+        response = exc.response
         http_status = response.status_code if response is not None else None
+        if isinstance(exc, ProxyPeerProofIncompatibleError):
+            _raise_fetch_failure(
+                url=url,
+                error_code=exc.reason,
+                message=_PROXY_PEER_PROOF_INCOMPATIBLE_MESSAGE,
+                hint=build_hint(REASON_HTTP_ERROR),
+                next_action=NEXT_ACTION_CHANGE_SOURCE,
+                diagnostic_error_chars=diagnostic_error_chars,
+            )
         challenge_hint = ""
         error_code = "http_error"
         next_action = (
@@ -2126,7 +2185,7 @@ def _fetch_web_page_business(
         )
         challenge_action = challenge_fallback_action(
             decision=challenge.decision,
-            browser_available=True,
+            browser_available=browser_fallback_available,
         )
         if challenge_action is ChallengeFallbackAction.TRY_BROWSER:
             browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
@@ -2138,6 +2197,16 @@ def _fetch_web_page_business(
             )
             if terminal_challenge_action is not ChallengeFallbackAction.FAIL_BLOCKED:
                 raise RuntimeError("confirmed challenge did not produce terminal fallback action")
+            _raise_fetch_failure(
+                url=url,
+                error_code="blocked",
+                message="Page appears to be a bot challenge page or access gate; fetched content is unusable.",
+                http_status=http_status,
+                hint=build_hint(REASON_BLOCKED_BY_SITE_POLICY),
+                next_action=NEXT_ACTION_CHANGE_SOURCE,
+                diagnostic_error_chars=diagnostic_error_chars,
+            )
+        if challenge_action is ChallengeFallbackAction.FAIL_BLOCKED:
             _raise_fetch_failure(
                 url=url,
                 error_code="blocked",
@@ -2220,7 +2289,7 @@ def _fetch_web_page_business(
             challenge_decision = challenge_context.challenge_decision
             challenge_action = challenge_fallback_action(
                 decision=challenge_decision,
-                browser_available=True,
+                browser_available=browser_fallback_available,
             )
             if challenge_action is ChallengeFallbackAction.TRY_BROWSER:
                 browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
@@ -2246,9 +2315,7 @@ def _fetch_web_page_business(
         _raise_fetch_failure(
             url=url,
             error_code=(
-                "blocked"
-                if challenge_decision is BotChallengeDecision.CONFIRMED
-                else "content_conversion_failed"
+                "blocked" if challenge_decision is BotChallengeDecision.CONFIRMED else "content_conversion_failed"
             ),
             message=str(exc),
             hint=(
@@ -2275,7 +2342,7 @@ def _fetch_web_page_business(
     )
     challenge_action = challenge_fallback_action(
         decision=challenge.decision,
-        browser_available=True,
+        browser_available=browser_fallback_available,
     )
     if challenge_action is ChallengeFallbackAction.TRY_BROWSER:
         browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
@@ -2287,6 +2354,16 @@ def _fetch_web_page_business(
         )
         if terminal_challenge_action is not ChallengeFallbackAction.FAIL_BLOCKED:
             raise RuntimeError("confirmed challenge did not produce terminal fallback action")
+        _raise_fetch_failure(
+            url=url,
+            error_code="blocked",
+            message="Page appears to be a bot challenge page; fetched content is unusable.",
+            http_status=fetch_result.get("http_status"),
+            hint=build_hint(REASON_BLOCKED_BY_SITE_POLICY),
+            next_action=NEXT_ACTION_CHANGE_SOURCE,
+            diagnostic_error_chars=diagnostic_error_chars,
+        )
+    if challenge_action is ChallengeFallbackAction.FAIL_BLOCKED:
         _raise_fetch_failure(
             url=url,
             error_code="blocked",
@@ -2311,9 +2388,7 @@ def _fetch_web_page_business(
 
     success: WebPayload = {
         "url": url,
-        "final_url": project_safe_url_or_empty(
-            str(fetch_result.get("final_url", url) or url)
-        ),
+        "final_url": project_safe_url_or_empty(str(fetch_result.get("final_url", url) or url)),
         "title": fetch_result.get("title", ""),
         "content": content,
         "fetch_backend": "requests",
@@ -2328,9 +2403,7 @@ def _fetch_web_page_business(
             backend=WebDiagnosticBackend.REQUESTS,
             content=content,
             http_status=fetch_result.get("http_status"),
-            response_headers=_sanitize_plain_response_headers(
-                fetch_result.get("response_headers")
-            ),
+            response_headers=_sanitize_plain_response_headers(fetch_result.get("response_headers")),
         )
     )
     return success
@@ -2397,6 +2470,7 @@ def _fetch_and_convert_content(
     headers: Mapping[str, str] | None = None,
     content_type_probe: ContentProbePayload | None = None,
     egress_policy: WebEgressPolicy,
+    transport_policy: WebHttpTransportPolicy,
     http_resource_budget: HttpResourceBudget,
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
@@ -2411,6 +2485,7 @@ def _fetch_and_convert_content(
         headers: 可选请求头。
         content_type_probe: 可选内容类型探测结果。
         egress_policy: 当前 Web 调用唯一的出站策略。
+        transport_policy: 当前 tool attempt 的 HTTP transport policy。
         http_resource_budget: HTTP wire/decoded body child 预算。
         timeout_budget: Runner 注入的单次 tool call 总预算。
         deadline_monotonic: 当前工具调用的单调时钟 deadline。
@@ -2439,6 +2514,7 @@ def _fetch_and_convert_content(
             headers=dict(headers) if headers is not None else None,
             build_fetch_headers=_build_fetch_headers,
             egress_policy=egress_policy,
+            transport_policy=transport_policy,
             http_resource_budget=http_resource_budget,
             content_type_probe=content_type_probe,
             timeout_budget=timeout_budget,
@@ -2739,6 +2815,7 @@ def _fetch_and_convert_with_playwright(
     playwright_channel: str | None = None,
     playwright_storage_state_path: str = "",
     egress_policy: WebEgressPolicy,
+    transport_policy: WebHttpTransportPolicy,
     browser_resource_budget: BrowserResourceBudget,
     diagnostic_resource_budget: DiagnosticResourceBudget,
     cancellation_token: CancellationToken | None = None,
@@ -2757,6 +2834,7 @@ def _fetch_and_convert_with_playwright(
         playwright_channel: 浏览器回退使用的 Chromium channel。
         playwright_storage_state_path: 浏览器回退可选 storage state 文件路径。
         egress_policy: 当前 Web 调用唯一的出站策略。
+        transport_policy: 当前 attempt 的 HTTP/browser transport policy。
         browser_resource_budget: 浏览器 DOM/text/Markdown 资源预算。
         diagnostic_resource_budget: 浏览器失败诊断投影预算。
         cancellation_token: 当前工具调用的取消令牌。
@@ -2778,6 +2856,7 @@ def _fetch_and_convert_with_playwright(
         playwright_channel=playwright_channel,
         playwright_storage_state_path=playwright_storage_state_path,
         egress_policy=egress_policy,
+        transport_policy=transport_policy,
         browser_resource_budget=browser_resource_budget,
         diagnostic_resource_budget=diagnostic_resource_budget,
         cancellation_token=cancellation_token,

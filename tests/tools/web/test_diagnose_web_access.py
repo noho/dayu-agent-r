@@ -23,6 +23,7 @@ from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolFailedOutcome
 from dayu.contracts.tool_result import ToolResultFailure, ToolResultSuccess
 from dayu.contracts.tool_schema import ToolFunctionSchema, ToolParametersSchema, ToolSchema
 from dayu.documents.docling_runtime import DoclingRuntimeInitializationError
+from dayu.tools.web import provider as web_provider
 from dayu.tools.web import web_http_session
 from dayu.tools.web import web_tools as web_tools_module
 from dayu.tools.web.web_egress_policy import WebEgressPolicy
@@ -130,6 +131,7 @@ def _raise_diagnostic_request_exception(
     headers: dict[str, str],
     normalize_url_for_http: Callable[[str], str],
     egress_policy: WebEgressPolicy,
+    transport_policy: web_http_session.WebHttpTransportPolicy,
     stream: bool,
     cancellation_token: CancellationToken | None,
 ) -> tuple[web_http_session.AuthorizedResponseLease, int, tuple[str, ...]]:
@@ -143,6 +145,7 @@ def _raise_diagnostic_request_exception(
         headers: 请求头。
         normalize_url_for_http: URL 规范化函数。
         egress_policy: 当前 Web 出站策略。
+        transport_policy: provider parser 产生的 HTTP transport 策略快照。
         stream: 是否流式读取。
         cancellation_token: 取消令牌。
 
@@ -153,7 +156,8 @@ def _raise_diagnostic_request_exception(
         requests.Timeout: 始终抛出，用于验证异常路径 cleanup。
     """
 
-    del session, method, url, timeout, headers, normalize_url_for_http, egress_policy, stream, cancellation_token
+    del session, method, url, timeout, headers, normalize_url_for_http, egress_policy
+    del transport_policy, stream, cancellation_token
     raise diag.requests.Timeout("synthetic diagnostic timeout")
 
 
@@ -649,6 +653,7 @@ def test_single_diagnostic_private_mode_preserves_local_custom_port(
         *,
         timeout_seconds: float,
         egress_policy: WebEgressPolicy,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
     ) -> JsonObject:
         """在 utility policy construction boundary 验证 custom-port 授权。
 
@@ -656,6 +661,7 @@ def test_single_diagnostic_private_mode_preserves_local_custom_port(
             url: 待诊断 URL。
             timeout_seconds: 当前请求超时秒数。
             egress_policy: utility 构造的 Web 出站策略。
+            transport_policy: provider parser 产生的 HTTP transport 策略快照。
 
         Returns:
             完成授权后的确定性 skipped profile。
@@ -664,7 +670,7 @@ def test_single_diagnostic_private_mode_preserves_local_custom_port(
             WebEgressPolicyError: URL 未被当前出站策略授权时抛出。
         """
 
-        del timeout_seconds
+        del timeout_seconds, transport_policy
         target = egress_policy.authorize_http_target(
             url,
             stage="diagnostic_test",
@@ -688,6 +694,127 @@ def test_single_diagnostic_private_mode_preserves_local_custom_port(
 
     assert authorized_ports == [43117]
     assert payload["safe_url"] == "http://127.0.0.1:43117/fixture.pdf"
+
+
+def test_requests_profile_forwards_provider_owned_transport_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """single diagnostic 必须传播 provider parser 产生的 transport 快照。
+
+    Args:
+        monkeypatch: pytest 属性替换夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: raw mapping 未同源传播或 transport 值被重建时抛出。
+    """
+
+    raw_provider_config: JsonObject = {
+        "dns_peer_proof_enabled": True,
+        "allow_environment_proxy": False,
+    }
+    observed_transport_policies: list[web_http_session.WebHttpTransportPolicy] = []
+    observed_discovery_configs: list[Mapping[str, JsonValue]] = []
+    provider_config_calls = 0
+
+    def fake_provider_config(options: diag.CliOptions) -> JsonObject:
+        """返回含非默认 transport 组合的 raw provider 配置。
+
+        Args:
+            options: single diagnostic CLI 选项。
+
+        Returns:
+            由测试固定的 raw provider 配置对象。
+
+        Raises:
+            无。
+        """
+
+        nonlocal provider_config_calls
+        del options
+        provider_config_calls += 1
+        return raw_provider_config
+
+    def fake_build_requests_profile(
+        url: str,
+        *,
+        timeout_seconds: float,
+        egress_policy: WebEgressPolicy,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
+    ) -> JsonObject:
+        """记录 raw requests caller 收到的 typed transport 快照。
+
+        Args:
+            url: 待诊断 URL。
+            timeout_seconds: requests 超时秒数。
+            egress_policy: utility 构造的 Web 出站策略。
+            transport_policy: provider parser 产生的 transport 策略快照。
+
+        Returns:
+            确定性 skipped profile。
+
+        Raises:
+            无。
+        """
+
+        del timeout_seconds, egress_policy
+        observed_transport_policies.append(transport_policy)
+        return diag._skipped_profile(
+            "synthetic_requests",
+            url=url,
+            backend=diag.WebDiagnosticBackend.REQUESTS,
+        )
+
+    def fake_build_tool_fetch_profile(
+        url: str,
+        options: diag.CliOptions,
+        *,
+        provider_config: Mapping[str, JsonValue],
+    ) -> JsonObject:
+        """记录 provider discovery 将继续消费的同一 raw mapping。
+
+        Args:
+            url: 待诊断 URL。
+            options: single diagnostic CLI 选项。
+            provider_config: orchestration 传给 discovery 的 raw provider 配置。
+
+        Returns:
+            确定性 skipped profile。
+
+        Raises:
+            无。
+        """
+
+        del options
+        observed_discovery_configs.append(provider_config)
+        return diag._skipped_profile(
+            "synthetic_tool_fetch",
+            url=url,
+            backend=diag.WebDiagnosticBackend.TOOL,
+        )
+
+    monkeypatch.setattr(diag, "_provider_config", fake_provider_config)
+    monkeypatch.setattr(diag, "_build_requests_profile", fake_build_requests_profile)
+    monkeypatch.setattr(diag, "_build_tool_fetch_profile", fake_build_tool_fetch_profile)
+
+    diag._build_single_diagnostic_payload(
+        _options(
+            url="https://example.com/report",
+            skip_playwright=True,
+        )
+    )
+
+    assert provider_config_calls == 1
+    expected_transport_policy = web_provider._parse_config(
+        raw_provider_config
+    ).transport_policy
+    assert expected_transport_policy.dns_peer_proof_enabled is True
+    assert expected_transport_policy.allow_environment_proxy is False
+    assert observed_transport_policies == [expected_transport_policy]
+    assert observed_discovery_configs == [raw_provider_config]
+    assert observed_discovery_configs[0] is raw_provider_config
 
 
 def test_header_projection_never_persists_raw_values() -> None:
@@ -736,12 +863,33 @@ def test_requests_profile_records_raw_response_byte_length(monkeypatch: pytest.M
         headers: dict[str, str],
         normalize_url_for_http: Callable[[str], str],
         egress_policy: WebEgressPolicy,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
         stream: bool,
         cancellation_token: CancellationToken | None,
     ) -> tuple[web_http_session.AuthorizedResponseLease, int, tuple[str, ...]]:
-        """返回确定性 diagnostic response lease。"""
+        """返回确定性 diagnostic response lease。
 
-        del session, headers, normalize_url_for_http, egress_policy, cancellation_token
+        Args:
+            session: 当前 diagnostic 局部 Session。
+            method: HTTP 方法。
+            url: 请求 URL。
+            timeout: 超时秒数。
+            headers: 请求头。
+            normalize_url_for_http: URL 规范化函数。
+            egress_policy: 当前 Web 出站策略。
+            transport_policy: provider parser 产生的 HTTP transport 策略快照。
+            stream: 是否流式读取。
+            cancellation_token: 取消令牌。
+
+        Returns:
+            确定性 response lease、redirect 次数与访问 URL 序列。
+
+        Raises:
+            无。
+        """
+
+        del session, headers, normalize_url_for_http, egress_policy, transport_policy
+        del cancellation_token
         assert method == "GET"
         assert url == "http://127.0.0.1:43117/fixture.pdf"
         assert timeout == 1.0
@@ -771,6 +919,7 @@ def test_requests_profile_records_raw_response_byte_length(monkeypatch: pytest.M
         "http://127.0.0.1:43117/fixture.pdf",
         timeout_seconds=1.0,
         egress_policy=WebEgressPolicy(allow_private_network=True),
+        transport_policy=web_provider._parse_config({}).transport_policy,
     )
     response_headers = _object_value(profile["response_headers"])
     assert profile["outcome"] == "completed"
@@ -794,6 +943,7 @@ def test_requests_profile_closes_session_on_request_exception(monkeypatch: pytes
         "https://example.com/report",
         timeout_seconds=1.0,
         egress_policy=WebEgressPolicy(resolver=_resolve_example_public_address),
+        transport_policy=web_provider._parse_config({}).transport_policy,
     )
 
     assert profile["outcome"] == "failed"
@@ -809,6 +959,7 @@ def test_diagnostic_requests_egress_rejection_uses_shared_policy() -> None:
         "http://127.0.0.1/internal",
         timeout_seconds=1.0,
         egress_policy=WebEgressPolicy(),
+        transport_policy=web_provider._parse_config({}).transport_policy,
     )
 
     assert profile["sampled"] is False
@@ -1122,15 +1273,30 @@ def test_current_fetch_adapter_completed_outcome_generates_ok_profile(
             )
         )
 
-    def fake_definition(options: diag.CliOptions) -> ToolDefinition:
-        """返回 current contract 形状的工具定义。"""
+    def fake_definition(provider_config: Mapping[str, JsonValue]) -> ToolDefinition:
+        """返回 current contract 形状的工具定义。
 
-        assert options.request_timeout == 1.0
+        Args:
+            provider_config: single diagnostic 交给 provider discovery 的 raw 配置。
+
+        Returns:
+            确定性 fetch 工具定义。
+
+        Raises:
+            无。
+        """
+
+        assert provider_config["request_timeout_seconds"] == 1.0
         return _tool_definition(fake_callable)
 
     monkeypatch.setattr(diag, "_fetch_web_page_definition", fake_definition)
 
-    profile = diag._build_tool_fetch_profile("https://example.com", _options(request_timeout=1.0))
+    options = _options(request_timeout=1.0)
+    profile = diag._build_tool_fetch_profile(
+        "https://example.com",
+        options,
+        provider_config=diag._provider_config(options),
+    )
 
     assert profile["sampled"] is True
     assert profile["ok"] is True
@@ -1177,18 +1343,30 @@ def test_docling_wrapper_records_invoked_true_and_restores_callable(
             )
         )
 
-    def fake_definition(options: diag.CliOptions) -> ToolDefinition:
-        """返回会触发 Docling callable 的工具定义。"""
+    def fake_definition(provider_config: Mapping[str, JsonValue]) -> ToolDefinition:
+        """返回会触发 Docling callable 的工具定义。
 
-        assert options.url == "https://example.com/report.pdf"
+        Args:
+            provider_config: single diagnostic 交给 provider discovery 的 raw 配置。
+
+        Returns:
+            确定性 fetch 工具定义。
+
+        Raises:
+            无。
+        """
+
+        assert provider_config["request_timeout_seconds"] == 1.0
         return _tool_definition(fake_callable)
 
     monkeypatch.setattr(web_tools_module, "_docling_convert_to_markdown", fake_docling)
     monkeypatch.setattr(diag, "_fetch_web_page_definition", fake_definition)
 
+    options = _options(url="https://example.com/report.pdf")
     profile = diag._build_tool_fetch_profile(
         "https://example.com/report.pdf",
-        _options(url="https://example.com/report.pdf"),
+        options,
+        provider_config=diag._provider_config(options),
     )
 
     evidence = _object_field(profile, "docling_conversion_invocation_evidence")
@@ -1231,17 +1409,29 @@ def test_html_fetch_profile_records_docling_invoked_false(
             )
         )
 
-    def fake_definition(options: diag.CliOptions) -> ToolDefinition:
-        """返回不触发 Docling 的工具定义。"""
+    def fake_definition(provider_config: Mapping[str, JsonValue]) -> ToolDefinition:
+        """返回不触发 Docling 的工具定义。
 
-        assert options.url == "https://example.com/page"
+        Args:
+            provider_config: single diagnostic 交给 provider discovery 的 raw 配置。
+
+        Returns:
+            确定性 fetch 工具定义。
+
+        Raises:
+            无。
+        """
+
+        assert provider_config["request_timeout_seconds"] == 1.0
         return _tool_definition(fake_callable)
 
     monkeypatch.setattr(diag, "_fetch_web_page_definition", fake_definition)
 
+    options = _options(url="https://example.com/page")
     profile = diag._build_tool_fetch_profile(
         "https://example.com/page",
-        _options(url="https://example.com/page"),
+        options,
+        provider_config=diag._provider_config(options),
     )
 
     evidence = _object_field(profile, "docling_conversion_invocation_evidence")
@@ -1279,17 +1469,29 @@ def test_pdf_fetch_success_without_docling_invocation_keeps_failure_evidence_for
             )
         )
 
-    def fake_definition(options: diag.CliOptions) -> ToolDefinition:
-        """返回未触发 Docling 的 PDF 工具定义。"""
+    def fake_definition(provider_config: Mapping[str, JsonValue]) -> ToolDefinition:
+        """返回未触发 Docling 的 PDF 工具定义。
 
-        assert options.url == "https://example.com/report.pdf"
+        Args:
+            provider_config: single diagnostic 交给 provider discovery 的 raw 配置。
+
+        Returns:
+            确定性 fetch 工具定义。
+
+        Raises:
+            无。
+        """
+
+        assert provider_config["request_timeout_seconds"] == 1.0
         return _tool_definition(fake_callable)
 
     monkeypatch.setattr(diag, "_fetch_web_page_definition", fake_definition)
 
+    options = _options(url="https://example.com/report.pdf")
     profile = diag._build_tool_fetch_profile(
         "https://example.com/report.pdf",
-        _options(url="https://example.com/report.pdf"),
+        options,
+        provider_config=diag._provider_config(options),
     )
     evidence = _object_field(profile, "docling_conversion_invocation_evidence")
 
@@ -1323,18 +1525,30 @@ def test_docling_runtime_initialization_exception_becomes_skip_observed_item(
         web_tools_module._docling_convert_to_markdown(b"%PDF fixture", "page.pdf")
         raise AssertionError("Docling 初始化异常应在上一行透传。")
 
-    def fake_definition(options: diag.CliOptions) -> ToolDefinition:
-        """返回会触发 Docling 初始化异常的工具定义。"""
+    def fake_definition(provider_config: Mapping[str, JsonValue]) -> ToolDefinition:
+        """返回会触发 Docling 初始化异常的工具定义。
 
-        assert options.url == "https://example.com/report.pdf"
+        Args:
+            provider_config: single diagnostic 交给 provider discovery 的 raw 配置。
+
+        Returns:
+            确定性 fetch 工具定义。
+
+        Raises:
+            无。
+        """
+
+        assert provider_config["request_timeout_seconds"] == 1.0
         return _tool_definition(fake_callable)
 
     monkeypatch.setattr(web_tools_module, "_docling_convert_to_markdown", fake_docling)
     monkeypatch.setattr(diag, "_fetch_web_page_definition", fake_definition)
 
+    options = _options(url="https://example.com/report.pdf")
     profile = diag._build_tool_fetch_profile(
         "https://example.com/report.pdf",
-        _options(url="https://example.com/report.pdf"),
+        options,
+        provider_config=diag._provider_config(options),
     )
     evidence = _object_field(profile, "docling_conversion_invocation_evidence")
     payload = _payload(
@@ -1394,18 +1608,30 @@ def test_generic_docling_conversion_exception_is_not_skip_observed_item(
         web_tools_module._docling_convert_to_markdown(b"%PDF fixture", "page.pdf")
         raise AssertionError("普通转换异常应在上一行透传。")
 
-    def fake_definition(options: diag.CliOptions) -> ToolDefinition:
-        """返回会触发普通 Docling 转换异常的工具定义。"""
+    def fake_definition(provider_config: Mapping[str, JsonValue]) -> ToolDefinition:
+        """返回会触发普通 Docling 转换异常的工具定义。
 
-        assert options.url == "https://example.com/report.pdf"
+        Args:
+            provider_config: single diagnostic 交给 provider discovery 的 raw 配置。
+
+        Returns:
+            确定性 fetch 工具定义。
+
+        Raises:
+            无。
+        """
+
+        assert provider_config["request_timeout_seconds"] == 1.0
         return _tool_definition(fake_callable)
 
     monkeypatch.setattr(web_tools_module, "_docling_convert_to_markdown", fake_docling)
     monkeypatch.setattr(diag, "_fetch_web_page_definition", fake_definition)
 
+    options = _options(url="https://example.com/report.pdf")
     profile = diag._build_tool_fetch_profile(
         "https://example.com/report.pdf",
-        _options(url="https://example.com/report.pdf"),
+        options,
+        provider_config=diag._provider_config(options),
     )
     evidence = _object_field(profile, "docling_conversion_invocation_evidence")
     payload = _payload(
@@ -1459,15 +1685,30 @@ def test_current_fetch_adapter_failed_outcome_generates_business_readable_profil
             )
         )
 
-    def fake_definition(options: diag.CliOptions) -> ToolDefinition:
-        """返回 current contract 形状的工具定义。"""
+    def fake_definition(provider_config: Mapping[str, JsonValue]) -> ToolDefinition:
+        """返回 current contract 形状的工具定义。
 
-        assert options.tool_timeout_budget == 3.0
+        Args:
+            provider_config: single diagnostic 交给 provider discovery 的 raw 配置。
+
+        Returns:
+            确定性 fetch 工具定义。
+
+        Raises:
+            无。
+        """
+
+        assert provider_config["request_timeout_seconds"] == 1.0
         return _tool_definition(fake_callable)
 
     monkeypatch.setattr(diag, "_fetch_web_page_definition", fake_definition)
 
-    profile = diag._build_tool_fetch_profile("https://example.com", _options(tool_timeout_budget=3.0))
+    options = _options(tool_timeout_budget=3.0)
+    profile = diag._build_tool_fetch_profile(
+        "https://example.com",
+        options,
+        provider_config=diag._provider_config(options),
+    )
 
     assert profile["sampled"] is True
     assert profile["ok"] is False
@@ -1792,12 +2033,27 @@ def _fake_requests_profile(
     *,
     timeout_seconds: float,
     egress_policy: WebEgressPolicy,
+    transport_policy: web_http_session.WebHttpTransportPolicy,
 ) -> JsonObject:
-    """返回确定性 requests profile。"""
+    """返回确定性 requests profile。
+
+    Args:
+        url: 待诊断 URL。
+        timeout_seconds: requests 超时秒数。
+        egress_policy: utility 构造的 Web 出站策略。
+        transport_policy: provider parser 产生的 transport 策略快照。
+
+    Returns:
+        确定性 requests profile。
+
+    Raises:
+        AssertionError: 调用参数不符合测试约束时抛出。
+    """
 
     assert url == "https://example.com"
     assert timeout_seconds > 0
     assert egress_policy.allows_private_network is False
+    assert transport_policy == web_provider._parse_config({}).transport_policy
     return cast(JsonObject, _payload(
         requests_sampled=True,
         requests_ok=True,
@@ -1808,11 +2064,29 @@ def _fake_requests_profile(
     )["requests_profile"])
 
 
-def _fake_fetch_profile(url: str, options: diag.CliOptions) -> JsonObject:
-    """返回确定性 fetch profile。"""
+def _fake_fetch_profile(
+    url: str,
+    options: diag.CliOptions,
+    *,
+    provider_config: Mapping[str, JsonValue],
+) -> JsonObject:
+    """返回确定性 fetch profile。
+
+    Args:
+        url: 待诊断 URL。
+        options: single diagnostic CLI 选项。
+        provider_config: orchestration 交给 provider discovery 的 raw 配置。
+
+    Returns:
+        确定性 fetch profile。
+
+    Raises:
+        AssertionError: 调用参数不符合测试约束时抛出。
+    """
 
     assert url == "https://example.com"
     assert options.url == "https://example.com"
+    assert provider_config == diag._provider_config(options)
     return cast(JsonObject, _payload(
         requests_sampled=False,
         requests_ok=False,

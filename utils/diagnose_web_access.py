@@ -46,12 +46,13 @@ from dayu.runtime.tools_discovery import (
 from dayu.tools.web import web_tools as _web_tools_module
 from dayu.tools.web import web_fetch_orchestrator as _web_fetch_orchestrator
 from dayu.tools.web import web_playwright_backend as _web_playwright_backend
-from dayu.tools.web.provider import discover_tools
+from dayu.tools.web.provider import _parse_config, discover_tools
 from dayu.tools.web.web_challenge_detection import (
     BotChallengeDecision,
     detect_bot_challenge,
 )
 from dayu.tools.web.web_egress_policy import WebEgressPolicy, WebEgressPolicyError
+from dayu.tools.web.web_http_session import WebHttpTransportPolicy
 from dayu.tools.web.web_resource_budget import (
     DEFAULT_BROWSER_RESOURCE_BUDGET,
     DEFAULT_HTTP_RESOURCE_BUDGET,
@@ -1463,6 +1464,7 @@ def _build_requests_profile(
     *,
     timeout_seconds: float,
     egress_policy: WebEgressPolicy,
+    transport_policy: WebHttpTransportPolicy,
 ) -> JsonObject:
     """采集 raw requests 诊断路径证据。
 
@@ -1470,6 +1472,7 @@ def _build_requests_profile(
         url: 待诊断 URL。
         timeout_seconds: requests 超时秒数。
         egress_policy: 当前 diagnostic 调用共享的 Web 出站策略。
+        transport_policy: provider parser 产生的本次 HTTP transport 策略快照。
 
     Returns:
         raw requests profile JSON 对象。
@@ -1504,6 +1507,7 @@ def _build_requests_profile(
             headers=dict(headers),
             normalize_url_for_http=_normalize_url_for_http,
             egress_policy=egress_policy,
+            transport_policy=transport_policy,
             stream=True,
             cancellation_token=None,
         )
@@ -1602,11 +1606,13 @@ def _provider_config(options: CliOptions) -> JsonObject:
     return config
 
 
-def _fetch_web_page_definition(options: CliOptions) -> ToolDefinition:
+def _fetch_web_page_definition(
+    provider_config: Mapping[str, JsonValue],
+) -> ToolDefinition:
     """通过 current provider discovery 取得 ``fetch_web_page`` 定义。
 
     Args:
-        options: CLI 选项。
+        provider_config: single-diagnostic orchestration 生成的 raw provider 配置。
 
     Returns:
         current ``fetch_web_page`` 的 ``ToolDefinition``。
@@ -1620,7 +1626,7 @@ def _fetch_web_page_definition(options: CliOptions) -> ToolDefinition:
         spec_id="diagnose-web-tools",
         location=PythonImportPathProvider("dayu.tools.web.provider:discover_tools"),
         enabled=True,
-        config=_provider_config(options),
+        config=provider_config,
     )
     output = discover_tools(spec)
     for definition in output.definitions:
@@ -1761,12 +1767,18 @@ def _attach_docling_evidence(
     return profile
 
 
-def _build_tool_fetch_profile(url: str, options: CliOptions) -> JsonObject:
+def _build_tool_fetch_profile(
+    url: str,
+    options: CliOptions,
+    *,
+    provider_config: Mapping[str, JsonValue],
+) -> JsonObject:
     """采集 current ``fetch_web_page`` 工具路径证据。
 
     Args:
         url: 待诊断 URL。
         options: CLI 选项。
+        provider_config: 与 raw requests transport snapshot 同源的 provider 配置。
 
     Returns:
         current fetch 工具 profile JSON 对象。
@@ -1781,7 +1793,7 @@ def _build_tool_fetch_profile(url: str, options: CliOptions) -> JsonObject:
     wrapper = _DoclingInvocationWrapper(original=original_docling_callable, evidence=evidence)
     _web_tools_module._docling_convert_to_markdown = wrapper
     try:
-        definition = _fetch_web_page_definition(options)
+        definition = _fetch_web_page_definition(provider_config)
         outcome = asyncio.run(_call_fetch_tool_async(definition, url, options))
     except Exception as exc:
         failure = failed_projection(
@@ -2702,6 +2714,8 @@ def _build_single_diagnostic_payload(options: CliOptions) -> JsonObject:
     if not options.url:
         raise ValueError("单 URL 模式必须提供 --url。")
 
+    provider_config = _provider_config(options)
+    transport_policy = _parse_config(provider_config).transport_policy
     egress_policy = WebEgressPolicy(
         allow_private_network=options.allow_private_network_url,
         allow_custom_port=options.allow_private_network_url,
@@ -2724,6 +2738,7 @@ def _build_single_diagnostic_payload(options: CliOptions) -> JsonObject:
             options.url,
             timeout_seconds=options.request_timeout,
             egress_policy=egress_policy,
+            transport_policy=transport_policy,
         )
     )
     payload["fetch_web_page_profile"] = (
@@ -2733,7 +2748,11 @@ def _build_single_diagnostic_payload(options: CliOptions) -> JsonObject:
             backend=WebDiagnosticBackend.TOOL,
         )
         if options.skip_tool_fetch
-        else _build_tool_fetch_profile(options.url, options)
+        else _build_tool_fetch_profile(
+            options.url,
+            options,
+            provider_config=provider_config,
+        )
     )
     payload["docling_conversion_invocation_evidence"] = _docling_evidence_json_from_fetch_profile(
         diagnostic_url=options.url,

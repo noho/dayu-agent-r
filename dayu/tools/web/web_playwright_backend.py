@@ -36,6 +36,7 @@ from dayu.runtime.interruptible_process import (
 from .web_fetch_orchestrator import _FetchUrlSafetyError
 from .web_challenge_detection import BotChallengeDecision
 from .web_egress_policy import WebEgressPolicy, WebEgressPolicyError
+from .web_http_session import WebHttpTransportPolicy
 from .web_resource_budget import BrowserResourceBudget, DiagnosticResourceBudget
 from .web_diagnostics import (
     WebDiagnosticBackend,
@@ -225,6 +226,17 @@ _BROWSER_RESOURCE_BUDGET_FAILURE_REASONS: Final[frozenset[str]] = frozenset(
         _BROWSER_DOM_TOO_LARGE_REASON,
         _BROWSER_TEXT_TOO_LARGE_REASON,
     }
+)
+_BROWSER_PEER_PROOF_UNAVAILABLE_REASON: Final[str] = "browser_peer_proof_unavailable"
+_PROXY_ENVIRONMENT_NAMES: Final[tuple[str, ...]] = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
 )
 
 
@@ -521,6 +533,7 @@ def _playwright_process_entry(
     worker_callable: _PlaywrightWorkerProtocol,
     worker_kwargs: _WorkerKwargs,
     diagnostic_resource_budget: DiagnosticResourceBudget,
+    allow_environment_proxy: bool,
 ) -> None:
     """子进程入口：执行同步 Playwright worker 并回传结果。
 
@@ -529,6 +542,7 @@ def _playwright_process_entry(
         worker_callable: 同步 worker 函数。
         worker_kwargs: worker 关键字参数。
         diagnostic_resource_budget: process/failure 诊断投影预算。
+        allow_environment_proxy: 是否允许 worker 继承 proxy 环境变量。
 
     Returns:
         无。
@@ -537,14 +551,18 @@ def _playwright_process_entry(
         无。
     """
 
+    if not allow_environment_proxy:
+        _clear_proxy_environment()
     enter_new_process_session_if_supported()
     diagnostic_url = worker_kwargs["url"]
     max_error_chars = diagnostic_resource_budget.error_chars
     try:
-        result_queue.put({
-            "kind": "result",
-            "payload": worker_callable(**worker_kwargs),
-        })
+        result_queue.put(
+            {
+                "kind": "result",
+                "payload": worker_callable(**worker_kwargs),
+            }
+        )
     except _FetchUrlSafetyError as exc:
         result_queue.put(
             {
@@ -580,6 +598,23 @@ def _playwright_process_entry(
                 ).error_message,
             }
         )
+
+
+def _clear_proxy_environment() -> None:
+    """从当前 Playwright worker 进程删除标准 proxy 环境变量。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    for environment_name in _PROXY_ENVIRONMENT_NAMES:
+        os.environ.pop(environment_name, None)
 
 
 def _is_picklable_worker(worker_callable: _PlaywrightWorkerProtocol) -> bool:
@@ -798,6 +833,7 @@ def _run_playwright_worker_process(
     playwright_sync_worker: _PlaywrightWorkerProtocol,
     worker_kwargs: _WorkerKwargs,
     diagnostic_resource_budget: DiagnosticResourceBudget,
+    allow_environment_proxy: bool,
     total_timeout: float,
     cancellation_token: CancellationToken | None,
 ) -> WebPayload:
@@ -807,6 +843,7 @@ def _run_playwright_worker_process(
         playwright_sync_worker: 同步 worker 函数。
         worker_kwargs: worker 关键字参数。
         diagnostic_resource_budget: process/failure 诊断投影预算。
+        allow_environment_proxy: 是否允许 worker 沿用 proxy 环境。
         total_timeout: 父进程等待总时长。
         cancellation_token: 当前工具调用的取消令牌。
 
@@ -828,6 +865,7 @@ def _run_playwright_worker_process(
             playwright_sync_worker,
             worker_kwargs,
             diagnostic_resource_budget,
+            allow_environment_proxy,
         ),
     )
     process.daemon = True
@@ -869,9 +907,7 @@ def _run_playwright_worker_process(
                 blocked_stage = payload.get("blocked_stage")
                 if isinstance(blocked_url, str) and isinstance(blocked_stage, str):
                     raise _FetchUrlSafetyError(url=blocked_url, reason=blocked_stage)
-            raise RuntimeError(
-                f"{payload.get('error_type')}: {payload.get('message')}"
-            )
+            raise RuntimeError(f"{payload.get('error_type')}: {payload.get('message')}")
         return cast(WebPayload, payload["payload"])
     finally:
         if process.is_alive():
@@ -1035,9 +1071,7 @@ def _get_playwright_browser(
     return _PW_BROWSER
 
 
-def _raise_if_playwright_url_blocked(
-    *, url: str, egress_policy: WebEgressPolicy, reason: str
-) -> None:
+def _raise_if_playwright_url_blocked(*, url: str, egress_policy: WebEgressPolicy, reason: str) -> None:
     """在 Playwright 导航/request 边界复用 Web URL 安全谓词。
 
     Args:
@@ -1317,15 +1351,9 @@ def _materialize_bounded_page_projection(
         page,
         browser_resource_budget=browser_resource_budget,
     )
-    if (
-        metrics["dom_exceeded"]
-        or metrics["dom_chars"] > browser_resource_budget.dom_chars
-    ):
+    if metrics["dom_exceeded"] or metrics["dom_chars"] > browser_resource_budget.dom_chars:
         raise _BrowserResourceBudgetExceeded(_BROWSER_DOM_TOO_LARGE_REASON)
-    if (
-        metrics["text_exceeded"]
-        or metrics["text_chars"] > browser_resource_budget.text_chars
-    ):
+    if metrics["text_exceeded"] or metrics["text_chars"] > browser_resource_budget.text_chars:
         raise _BrowserResourceBudgetExceeded(_BROWSER_TEXT_TOO_LARGE_REASON)
 
     html = page.content()
@@ -1408,12 +1436,6 @@ def _playwright_sync_worker(
     """
 
     _ = headers
-    if not egress_policy.allows_private_network:
-        return {
-            "ok": False,
-            "availability": "unprocessable",
-            "reason": "browser_egress_policy_unavailable",
-        }
     try:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
     except ImportError as exc:
@@ -1563,6 +1585,7 @@ def _fetch_and_convert_with_playwright(
     playwright_channel: str | None = None,
     playwright_storage_state_path: str = "",
     egress_policy: WebEgressPolicy,
+    transport_policy: WebHttpTransportPolicy,
     browser_resource_budget: BrowserResourceBudget,
     diagnostic_resource_budget: DiagnosticResourceBudget,
     cancellation_token: CancellationToken | None = None,
@@ -1581,6 +1604,7 @@ def _fetch_and_convert_with_playwright(
         playwright_channel: 浏览器回退使用的 Chromium channel。
         playwright_storage_state_path: 浏览器回退可选 storage state 文件路径。
         egress_policy: 当前 Web 调用唯一的出站策略。
+        transport_policy: 当前 attempt 的 HTTP/browser proxy 与 peer policy。
         browser_resource_budget: 浏览器 DOM/text/Markdown 资源预算。
         diagnostic_resource_budget: process/failure 诊断投影预算。
         cancellation_token: 当前工具调用的可选取消令牌。
@@ -1595,11 +1619,11 @@ def _fetch_and_convert_with_playwright(
         _FetchUrlSafetyError: Playwright 导航或最终页面 URL 被安全策略拒绝时抛出。
     """
 
-    if not egress_policy.allows_private_network:
+    if transport_policy.dns_peer_proof_enabled:
         return {
             "ok": False,
             "availability": "unprocessable",
-            "reason": "browser_egress_policy_unavailable",
+            "reason": _BROWSER_PEER_PROOF_UNAVAILABLE_REASON,
         }
 
     try:
@@ -1643,13 +1667,12 @@ def _fetch_and_convert_with_playwright(
                     "browser_resource_budget": browser_resource_budget,
                 },
                 diagnostic_resource_budget=diagnostic_resource_budget,
+                allow_environment_proxy=transport_policy.allow_environment_proxy,
                 total_timeout=total_timeout,
                 cancellation_token=cancellation_token,
             )
         else:
-            Log.warning(
-                "Playwright worker 不可序列化，已拒绝同进程 fallback。", module=MODULE
-            )
+            Log.warning("Playwright worker 不可序列化，已拒绝同进程 fallback。", module=MODULE)
             return {
                 "ok": False,
                 "availability": "unprocessable",

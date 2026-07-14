@@ -48,7 +48,11 @@ from .web_egress_policy import (
     WebEgressPolicy,
     WebEgressPolicyError,
 )
-from .web_http_session import AuthorizedResponseLease, _send_authorized_request
+from .web_http_session import (
+    AuthorizedResponseLease,
+    WebHttpTransportPolicy,
+    _send_authorized_request,
+)
 from .web_resource_budget import BrowserResourceBudget, HttpResourceBudget
 
 _WARMUP_TIMEOUT_SECONDS = 6.0
@@ -208,9 +212,7 @@ class _UnsupportedBoundedContentEncoding(RuntimeError):
         """
 
         normalized_encoding = encoding.strip().lower()
-        super().__init__(
-            f"当前运行时不支持有界 {normalized_encoding} 增量解码。"
-        )
+        super().__init__(f"当前运行时不支持有界 {normalized_encoding} 增量解码。")
         self.encoding = normalized_encoding
 
 
@@ -328,11 +330,7 @@ def _sanitize_response_headers(
             continue
         text = str(value)
         if key == "set-cookie":
-            cookie_names = [
-                chunk.split("=", 1)[0].strip()
-                for chunk in text.split(";")
-                if "=" in chunk
-            ]
+            cookie_names = [chunk.split("=", 1)[0].strip() for chunk in text.split(";") if "=" in chunk]
             text = ",".join(sorted(set(filter(None, cookie_names))))
         normalized[key] = text[:200]
     return normalized
@@ -512,10 +510,7 @@ def _zlib_wrapped_deflate(data: bytes) -> bool:
         return False
     compression_method_and_flags = data[0]
     additional_flags = data[1]
-    return (
-        compression_method_and_flags & 0x0F == 8
-        and (compression_method_and_flags << 8 | additional_flags) % 31 == 0
-    )
+    return compression_method_and_flags & 0x0F == 8 and (compression_method_and_flags << 8 | additional_flags) % 31 == 0
 
 
 def _decode_zlib_layer(
@@ -606,9 +601,7 @@ def _decode_zstd_layer(
     try:
         while True:
             remaining_bytes = limit_bytes - observed_bytes
-            decoded_chunk = reader.read(
-                min(_FETCH_BODY_CHUNK_BYTES, remaining_bytes + 1)
-            )
+            decoded_chunk = reader.read(min(_FETCH_BODY_CHUNK_BYTES, remaining_bytes + 1))
             if not decoded_chunk:
                 break
             observed_bytes = _append_limited_body_chunk(
@@ -695,11 +688,7 @@ def _decompress_limited_response_body(
             decoded = _decode_zlib_layer(
                 response,
                 decoded,
-                window_bits=(
-                    zlib.MAX_WBITS
-                    if _zlib_wrapped_deflate(decoded)
-                    else -zlib.MAX_WBITS
-                ),
+                window_bits=(zlib.MAX_WBITS if _zlib_wrapped_deflate(decoded) else -zlib.MAX_WBITS),
                 limit_bytes=http_resource_budget.decoded_body_bytes,
             )
         elif encoding == "br":
@@ -808,6 +797,7 @@ def _request_with_safe_redirects(
     headers: dict[str, str],
     normalize_url_for_http: Callable[[str], str],
     egress_policy: WebEgressPolicy,
+    transport_policy: WebHttpTransportPolicy,
     stream: bool,
     cancellation_token: CancellationToken | None,
 ) -> tuple[AuthorizedResponseLease, int, tuple[str, ...]]:
@@ -821,6 +811,7 @@ def _request_with_safe_redirects(
         headers: 请求头。
         normalize_url_for_http: URL 规范化函数。
         egress_policy: 当前 Web 调用唯一的出站策略。
+        transport_policy: 当前 tool attempt 的 HTTP transport policy。
         stream: 是否以 stream 模式读取响应。
         cancellation_token: 取消令牌。
 
@@ -846,6 +837,7 @@ def _request_with_safe_redirects(
             timeout=timeout,
             headers=current_headers,
             stream=stream,
+            transport_policy=transport_policy,
         )
         transferred = False
         try:
@@ -1203,9 +1195,7 @@ def _should_escalate_pipeline_failure_to_browser(
     quality_flags = {str(flag).strip().lower() for flag in pipeline_error.quality_flags}
     extractor_found_no_body = text_length <= _EMPTY_CONTENT_MIN_CHARS or paragraph_count <= 0
     quality_indicates_empty_shell = bool({"too_short", "too_few_blocks"} & quality_flags)
-    return (
-        extractor_found_no_body or quality_indicates_empty_shell
-    ) and response_context.has_client_rendering_markers
+    return (extractor_found_no_body or quality_indicates_empty_shell) and response_context.has_client_rendering_markers
 
 
 def _get_session_warmed_hosts(session: requests.Session) -> set[str]:
@@ -1258,6 +1248,7 @@ def _warmup_domain(
     normalize_url_for_http: Callable[[str], str],
     is_timeout_like_exception: Callable[[BaseException], bool],
     egress_policy: WebEgressPolicy,
+    transport_policy: WebHttpTransportPolicy,
     browser_resource_budget: BrowserResourceBudget,
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
@@ -1275,6 +1266,7 @@ def _warmup_domain(
         normalize_url_for_http: HTTP URL 规范化函数。
         is_timeout_like_exception: timeout 异常识别函数。
         egress_policy: 当前 Web 调用唯一出站策略。
+        transport_policy: 当前 tool attempt 的 HTTP transport policy。
         browser_resource_budget: warmup body 预算。
         timeout_budget: 工具调用总预算。
         deadline_monotonic: 当前工具调用 deadline。
@@ -1316,6 +1308,7 @@ def _warmup_domain(
             headers=headers,
             normalize_url_for_http=normalize_url_for_http,
             egress_policy=egress_policy,
+            transport_policy=transport_policy,
             stream=True,
             cancellation_token=cancellation_token,
         )
@@ -1358,6 +1351,7 @@ def _probe_content_type(
     normalize_url_for_http: Callable[[str], str],
     is_timeout_like_exception: Callable[[BaseException], bool],
     egress_policy: WebEgressPolicy,
+    transport_policy: WebHttpTransportPolicy,
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
     cancellation_token: CancellationToken | None = None,
@@ -1373,6 +1367,7 @@ def _probe_content_type(
         normalize_url_for_http: HTTP URL 规范化函数。
         is_timeout_like_exception: timeout 异常识别函数。
         egress_policy: 当前 Web 调用唯一出站策略。
+        transport_policy: 当前 tool attempt 的 HTTP transport policy。
         timeout_budget: 工具调用总预算。
         deadline_monotonic: 当前工具调用 deadline。
         cancellation_token: 当前工具调用取消令牌。
@@ -1402,6 +1397,7 @@ def _probe_content_type(
             headers=headers,
             normalize_url_for_http=normalize_url_for_http,
             egress_policy=egress_policy,
+            transport_policy=transport_policy,
             stream=False,
             cancellation_token=cancellation_token,
         )
@@ -1428,6 +1424,7 @@ def _probe_content_type(
                 headers=headers,
                 normalize_url_for_http=normalize_url_for_http,
                 egress_policy=egress_policy,
+                transport_policy=transport_policy,
                 stream=True,
                 cancellation_token=cancellation_token,
             )
@@ -1555,6 +1552,7 @@ def _fetch_and_convert_content(
     headers: dict[str, str] | None = None,
     build_fetch_headers: Callable[[str], dict[str, str]] | None = None,
     egress_policy: WebEgressPolicy,
+    transport_policy: WebHttpTransportPolicy,
     http_resource_budget: HttpResourceBudget,
     content_type_probe: dict[str, str | bool | int | None] | None = None,
     timeout_budget: float | None = None,
@@ -1576,6 +1574,7 @@ def _fetch_and_convert_content(
         headers: 可选请求头。
         build_fetch_headers: 默认请求头构造器。
         egress_policy: 当前 Web 调用唯一的出站策略。
+        transport_policy: 当前 tool attempt 的 HTTP transport policy。
         http_resource_budget: HTTP wire/decoded body 预算。
         content_type_probe: 可选内容类型探测结果。
         timeout_budget: Runner 注入的单次 tool call 总预算。
@@ -1624,6 +1623,7 @@ def _fetch_and_convert_content(
             headers=current_headers,
             normalize_url_for_http=normalize_url_for_http,
             egress_policy=egress_policy,
+            transport_policy=transport_policy,
             stream=True,
             cancellation_token=cancellation_token,
         )

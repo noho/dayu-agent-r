@@ -215,7 +215,9 @@ provider 字段：
 | `allow_environment_proxy` | `true` | 是否允许环境 proxy |
 | `browser_enabled` | `true` | browser capability 开关；不从 private policy 反推 |
 
-当前 S1 只把 `dns_peer_proof_enabled`、`allow_environment_proxy` 与 `browser_enabled` 保存为不可变 typed snapshot；HTTP sender 仍保持既有 numeric pin / no-proxy 行为，browser backend 也保持既有 private-policy coupling。配置文档因此不把这些新字段描述成已经生效的 transport 或 browser 执行分支。
+`dns_peer_proof_enabled`、`allow_environment_proxy` 与 `browser_enabled` 会在一次 Web tool 调用中冻结为不可变 typed snapshot，并由 search/fetch/browser 执行路径共同消费。peer proof 关闭时 HTTP 使用标准 Session；允许环境 proxy 时 `trust_env=true`，禁止时 `trust_env=false` 且发送设置中的 proxy 映射为空。peer proof 开启且当前 URL 未选择 proxy 时复用 numeric target 与实际 peer 校验；若当前 URL 实际选择了环境 proxy，则以稳定的 `proxy_peer_proof_incompatible` 失败，不会静默降级。proxy warning 只记录是否启用与稳定原因，不记录 URL、proxy 值或 credential。
+
+`browser_enabled` 与 `allow_private_network_url` 互不授权：关闭 browser 不会因允许 private URL 而启动浏览器，关闭 private URL 也不阻止公网 browser 访问；browser 的每次 route/navigation 仍逐目标执行同一出站策略。只有真实 browser fallback 即将启动且 peer proof 已开启时，才会在导入或启动 browser process 前以 `browser_peer_proof_unavailable` 失败。禁止环境 proxy 时 browser worker 会清理标准 proxy 环境变量，允许时沿用当前运行环境。
 
 Web 资源预算的唯一 raw 配置路径是 `providers["web-tools"].config.resource_budget`。Provider 把它解析为 `http`、`browser`、`diagnostics` 三个 owner group；group 或 field 缺失时只补对应 child owner 的 typed default，已提供 sibling 保持不变。未知 group、未知 field、错误 object 类型、布尔值、零或负数都会按完整字段路径 fail fast。当前完整默认与等价显式示例为：
 

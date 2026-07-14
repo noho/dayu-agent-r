@@ -1,20 +1,21 @@
 """网页抓取的 Session、已授权 transport 与 timeout 基础设施。
 
-本模块消费 :class:`AuthorizedHttpTarget`，为每个 HTTP hop 创建私有的
-target-bound adapter/pool/connection，并管理 response lease。它不拥有 URL
-安全语义，也不包含内容转换或浏览器回退逻辑。
+本模块消费 :class:`AuthorizedHttpTarget` 与 attempt-local transport policy，
+在标准 Session 或 numeric peer proof transport 间作唯一选择，并管理 response
+lease。它不拥有 URL 安全语义，也不包含内容转换或浏览器回退逻辑。
 """
 
 from __future__ import annotations
 
 import ipaddress
+import logging
 import socket
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from threading import Lock
 from types import TracebackType
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Final, TypedDict, cast
 from urllib.parse import urlsplit
 
 import requests
@@ -27,7 +28,9 @@ from urllib3.exceptions import NewConnectionError
 from urllib3.util import connection as urllib3_connection
 from urllib3.util.retry import Retry
 
-from .web_egress_policy import AuthorizedHttpTarget
+from dayu.contracts.json_value import JsonValue
+
+from .web_egress_policy import AuthorizedHttpTarget, WebEgressPolicy
 
 if TYPE_CHECKING:
     from urllib3._base_connection import BaseHTTPConnection, BaseHTTPSConnection
@@ -39,17 +42,46 @@ _RETRY_BACKOFF_FACTOR = 0.8
 _RETRY_STATUS_FORCELIST = (429, 500, 502, 503, 504)
 _MAX_REDIRECTS = 8
 _MIN_TIMEOUT_BUDGET_SECONDS = 0.05
+_PROXY_WITHOUT_PEER_PROOF_WARNING_REASON: Final[str] = "environment_proxy_active_without_peer_proof"
+_PROXY_PEER_PROOF_INCOMPATIBLE_REASON: Final[str] = "proxy_peer_proof_incompatible"
 
 _WEB_SESSION: requests.Session | None = None
 _WEB_NO_RETRY_SESSION: requests.Session | None = None
 _WEB_SESSION_LOCK = Lock()
+_LOGGER = logging.getLogger(__name__)
+
+
+class _MergedEnvironmentSettings(TypedDict):
+    """约束同一次 prepared request 合并出的 transport settings 结构。
+
+    Fields:
+        proxies: 当前 prepared URL 实际可选择的 proxy 映射。
+        stream: 当前响应是否采用流式读取。
+        verify: TLS 证书校验设置。
+        cert: 可选 client certificate 路径或证书/密钥路径对。
+
+    Call contract:
+        由 ``Session.merge_environment_settings`` 的同次结果构造，并原样交给
+        proxy selection 与 ``Session.send``；调用方不得二次读取环境或重建字段。
+
+    Returns:
+        具有上述四个必填字段的 typed mapping。
+
+    Raises:
+        无。
+    """
+
+    proxies: dict[str, str]
+    stream: bool
+    verify: bool | str
+    cert: str | tuple[str, str] | None
 
 
 @dataclass(frozen=True, slots=True)
 class WebHttpTransportPolicy:
     """一次 Web tool attempt 的 HTTP transport 配置快照。
 
-    S1 只保存该 snapshot；sender 仍使用既有 numeric pin 与 no-proxy 路径。
+    sender 在每个 HTTP attempt 内只消费该不可变 snapshot，不重读部署配置。
 
     Args:
         dns_peer_proof_enabled: 是否要求 numeric target 与实际 peer proof。
@@ -64,6 +96,45 @@ class WebHttpTransportPolicy:
 
     dns_peer_proof_enabled: bool
     allow_environment_proxy: bool
+
+
+class ProxyPeerProofIncompatibleError(requests.RequestException):
+    """active proxy 与 origin numeric peer proof 不可同时成立的 typed 失败。
+
+    Args:
+        无。
+
+    Returns:
+        带稳定 ``reason`` 的 requests transport 异常。
+
+    Raises:
+        无。
+
+    Attributes:
+        reason: 不含 URL、proxy 值或 credential 的稳定失败原因。
+
+    Call contract:
+        sender 只在当前 URL 实际选择到 proxy 且同时要求 numeric peer proof 时
+        抛出；调用方必须保持 typed fail closed，不得转为 provider fallback。
+    """
+
+    reason: str
+
+    def __init__(self) -> None:
+        """初始化不包含 URL、proxy 值或 credential 的稳定失败。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        super().__init__(_PROXY_PEER_PROOF_INCOMPATIBLE_REASON)
+        self.reason = _PROXY_PEER_PROOF_INCOMPATIBLE_REASON
 
 
 class _PinnedHTTPConnection(HTTPConnection):
@@ -475,8 +546,9 @@ def _send_authorized_request(
     timeout: float,
     headers: Mapping[str, str],
     stream: bool,
+    transport_policy: WebHttpTransportPolicy,
 ) -> AuthorizedResponseLease:
-    """通过 target-bound transport 发送单个已授权 HTTP hop。
+    """按 attempt-local transport policy 发送单个已授权 HTTP hop。
 
     Args:
         source_session: 仅提供 retry、headers、cookies 与 TLS 配置的 source session。
@@ -485,21 +557,124 @@ def _send_authorized_request(
         timeout: 当前 hop 超时秒数。
         headers: 请求头。
         stream: 是否流式读取响应。
+        transport_policy: 当前 tool attempt 的不可变 HTTP transport policy。
 
     Returns:
         唯一拥有 response 与 pool 的 lease。
 
     Raises:
         requests.RequestException: prepare、connect、TLS 或请求失败时抛出。
+        ProxyPeerProofIncompatibleError: active proxy 与 numeric peer proof 冲突时抛出。
+    """
+
+    return _send_authorized_request_attempt(
+        source_session,
+        target=target,
+        method=method,
+        timeout=timeout,
+        headers=headers,
+        stream=stream,
+        transport_policy=transport_policy,
+        request_params=None,
+        request_json=None,
+    )
+
+
+def _send_authorized_plain_request(
+    *,
+    egress_policy: WebEgressPolicy,
+    url: str,
+    method: str,
+    timeout: float,
+    headers: Mapping[str, str],
+    stream: bool,
+    transport_policy: WebHttpTransportPolicy,
+    request_params: Mapping[str, str] | None,
+    request_json: Mapping[str, JsonValue] | None,
+) -> AuthorizedResponseLease:
+    """授权固定 provider endpoint 并发送单次无自动 redirect 请求。
+
+    Args:
+        egress_policy: 与 fetch 同源的 scheme/host/port/address policy。
+        url: provider 初始 endpoint。
+        method: HTTP 方法。
+        timeout: 当前请求超时秒数。
+        headers: provider 原始请求头。
+        stream: 是否流式读取响应。
+        transport_policy: 当前 tool attempt 的不可变 HTTP transport policy。
+        request_params: 原始 query 参数；没有时为 ``None``。
+        request_json: 原始 JSON body；没有时为 ``None``。
+
+    Returns:
+        唯一拥有 response 与 attempt-local Session 的 lease。
+
+    Raises:
+        WebEgressPolicyError: endpoint 未通过初始 egress/DNS/custom-port 校验时抛出。
+        requests.RequestException: prepare、connect、TLS 或请求失败时抛出。
+        ProxyPeerProofIncompatibleError: active proxy 与 numeric peer proof 冲突时抛出。
+    """
+
+    target = egress_policy.authorize_http_target(
+        url,
+        stage="search_provider_request",
+    )
+    source_session = _create_no_retry_session()
+    try:
+        return _send_authorized_request_attempt(
+            source_session,
+            target=target,
+            method=method,
+            timeout=timeout,
+            headers=headers,
+            stream=stream,
+            transport_policy=transport_policy,
+            request_params=request_params,
+            request_json=request_json,
+        )
+    finally:
+        source_session.close()
+
+
+def _send_authorized_request_attempt(
+    source_session: requests.Session,
+    *,
+    target: AuthorizedHttpTarget,
+    method: str,
+    timeout: float,
+    headers: Mapping[str, str],
+    stream: bool,
+    transport_policy: WebHttpTransportPolicy,
+    request_params: Mapping[str, str] | None,
+    request_json: Mapping[str, JsonValue] | None,
+) -> AuthorizedResponseLease:
+    """构造单次 Session、只 prepare 一次并完成 transport 发送。
+
+    Args:
+        source_session: retry/cookie/TLS 设置来源。
+        target: 当前请求已授权目标。
+        method: HTTP 方法。
+        timeout: 当前请求超时秒数。
+        headers: 请求头。
+        stream: 是否流式读取响应。
+        transport_policy: 当前 attempt 的 transport policy。
+        request_params: 可选 query 参数。
+        request_json: 可选 JSON body。
+
+    Returns:
+        唯一拥有 response 与 attempt-local Session 的 lease。
+
+    Raises:
+        RuntimeError: source adapter 或 merged settings 不满足 requests contract 时抛出。
+        requests.RequestException: prepare、connect、TLS 或请求失败时抛出。
+        ProxyPeerProofIncompatibleError: active proxy 与 numeric peer proof 冲突时抛出。
     """
 
     source_adapter = source_session.get_adapter(target.normalized_url)
     if not isinstance(source_adapter, HTTPAdapter):
         raise RuntimeError("source session adapter must be requests.HTTPAdapter")
     retry = source_adapter.max_retries
-    adapter = _TargetBoundHTTPAdapter(target=target, max_retries=retry)
     call_session = requests.Session()
-    call_session.trust_env = False
+    call_session.trust_env = transport_policy.allow_environment_proxy
     call_session.headers.clear()
     call_session.headers.update(source_session.headers)
     call_session.cookies.update(source_session.cookies)
@@ -507,19 +682,59 @@ def _send_authorized_request(
     call_session.verify = source_session.verify
     call_session.cert = source_session.cert
     call_session.max_redirects = source_session.max_redirects
+    call_session.proxies.clear()
+    adapter: HTTPAdapter
+    if transport_policy.dns_peer_proof_enabled:
+        adapter = _TargetBoundHTTPAdapter(target=target, max_retries=retry)
+    else:
+        adapter = HTTPAdapter(
+            max_retries=retry,
+            pool_connections=1,
+            pool_maxsize=1,
+            pool_block=True,
+        )
     replaced_adapter = call_session.get_adapter(target.normalized_url)
     call_session.mount(f"{target.scheme}://", adapter)
     replaced_adapter.close()
     response: requests.Response | None = None
     try:
-        response = call_session.request(
-            method,
-            target.normalized_url,
-            timeout=timeout,
+        request = requests.Request(
+            method=method,
+            url=target.normalized_url,
             headers=dict(headers),
+            params=dict(request_params) if request_params is not None else None,
+            json=dict(request_json) if request_json is not None else None,
+        )
+        prepared = call_session.prepare_request(request)
+        _validate_prepared_request_target(prepared, target=target)
+        settings = cast(
+            _MergedEnvironmentSettings,
+            call_session.merge_environment_settings(
+                prepared.url or target.normalized_url,
+                {},
+                stream,
+                call_session.verify,
+                call_session.cert,
+            ),
+        )
+        if not transport_policy.allow_environment_proxy and settings["proxies"]:
+            raise RuntimeError("proxy-denied attempt produced non-empty proxy settings")
+        selected_proxy = requests.utils.select_proxy(
+            prepared.url or target.normalized_url,
+            settings["proxies"],
+        )
+        if selected_proxy is not None and transport_policy.dns_peer_proof_enabled:
+            raise ProxyPeerProofIncompatibleError()
+        if selected_proxy is not None:
+            _LOGGER.warning(
+                "environment_proxy_active=true reason=%s",
+                _PROXY_WITHOUT_PEER_PROOF_WARNING_REASON,
+            )
+        response = call_session.send(
+            prepared,
+            timeout=timeout,
             allow_redirects=False,
-            stream=stream,
-            proxies={},
+            **settings,
         )
         source_session.cookies.update(call_session.cookies)
         return AuthorizedResponseLease(response=response, session=call_session)
