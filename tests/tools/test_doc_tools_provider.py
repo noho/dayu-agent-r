@@ -13,7 +13,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, fields, replace
 from datetime import datetime
 from pathlib import Path
-from typing import cast
+from typing import Final, cast
 
 import pytest
 
@@ -75,6 +75,13 @@ _FORBIDDEN_CANCEL_MESSAGE_PARTS = (
     "correlation_id",
     "cancellation_token",
 )
+_REAL_SMOKE_SMALL_FILE_COUNT: Final[int] = 10_001
+_REAL_SMOKE_CHUNK_BYTES: Final[int] = 1024 * 1024
+_REAL_SMOKE_CHUNK_COUNT: Final[int] = 34
+_REAL_SMOKE_MIN_LARGE_FILE_BYTES: Final[int] = 33 * _REAL_SMOKE_CHUNK_BYTES
+_REAL_SMOKE_LARGE_FILE_NAME: Final[str] = "zzzz-large-tail.txt"
+_REAL_SMOKE_OUTSIDE_LINK_NAME: Final[str] = "zzzz-outside-link.txt"
+_REAL_SMOKE_TAIL_MARKER: Final[str] = "DAYU_REAL_COMPLETE_INPUT_TAIL_MARKER"
 
 
 @dataclass(frozen=True, slots=True)
@@ -805,10 +812,10 @@ def test_list_and_search_return_paths_can_chain_to_read_tools(
     assert isinstance(read_section_from_search_outcome, ToolCompletedOutcome)
 
 
-def test_list_files_directory_entry_limit_returns_self_describing_partial(
+def test_list_files_observes_all_entries_and_omits_partial_only_fields(
     tmp_path: Path,
 ) -> None:
-    """目录 entry cap 命中时不得伪造 total 或完整扫描。"""
+    """list_files 必须完整观察目录并删除 entry partial 专用字段。"""
 
     nested = tmp_path / "nested"
     nested.mkdir()
@@ -823,18 +830,15 @@ def test_list_files_directory_entry_limit_returns_self_describing_partial(
             recursive=True,
             limit=2,
             max_files=2,
-            max_directory_entries=2,
             cancellation_token=_OpenCancellationToken(),
         ),
     )
 
-    assert value["scanned_entries"] == 2
-    assert value["scan_complete"] is False
-    assert value["total"] is None
-    assert value["truncated_reason"] == "directory_entry_limit"
-    returned = value["returned"]
-    assert isinstance(returned, int)
-    assert returned <= 2
+    assert value["scanned_entries"] == 4
+    assert value["total"] == 3
+    assert value["returned"] == 2
+    assert "scan_complete" not in value
+    assert "truncated_reason" not in value
 
 
 def test_list_files_directory_iteration_observes_cancellation(tmp_path: Path) -> None:
@@ -851,7 +855,6 @@ def test_list_files_directory_iteration_observes_cancellation(tmp_path: Path) ->
             recursive=False,
             limit=3,
             max_files=3,
-            max_directory_entries=10,
             cancellation_token=token,
         )
 
@@ -872,7 +875,6 @@ def test_list_files_result_limit_keeps_exact_total_after_complete_scan(
             recursive=False,
             limit=2,
             max_files=2,
-            max_directory_entries=10,
             cancellation_token=_OpenCancellationToken(),
         ),
     )
@@ -881,8 +883,165 @@ def test_list_files_result_limit_keeps_exact_total_after_complete_scan(
     assert [item["name"] for item in files] == ["a.txt", "b.txt"]
     assert value["returned"] == 2
     assert value["total"] == 3
-    assert value["scan_complete"] is True
-    assert value["truncated_reason"] is None
+    assert value["scanned_entries"] == 3
+    assert "scan_complete" not in value
+    assert "truncated_reason" not in value
+
+
+def test_list_and_search_order_is_stable_across_reversed_creation_order(
+    tmp_path: Path,
+) -> None:
+    """相同目录内容按相反顺序创建时 list/search 结果顺序必须一致。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: list 记录或 search 命中顺序不稳定时抛出。
+    """
+
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    relative_files = (
+        Path("zeta.txt"),
+        Path("Alpha.txt"),
+        Path("nested/bravo.txt"),
+        Path("nested/Charlie.txt"),
+    )
+    fixed_timestamp = 1_700_000_000
+    for root, creation_order in (
+        (first_root, relative_files),
+        (second_root, tuple(reversed(relative_files))),
+    ):
+        root.mkdir()
+        for relative_path in creation_order:
+            target = root / relative_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(f"Needle in {relative_path}\n", encoding="utf-8")
+            os.utime(target, (fixed_timestamp, fixed_timestamp))
+
+    list_values = [
+        cast(
+            Mapping[str, JsonValue],
+            doc_tools._list_files_business(
+                directory=str(root),
+                pattern="*.txt",
+                recursive=True,
+                limit=len(relative_files),
+                max_files=len(relative_files),
+                cancellation_token=_OpenCancellationToken(),
+            ),
+        )
+        for root in (first_root, second_root)
+    ]
+    search_values = [
+        cast(
+            Mapping[str, JsonValue],
+            doc_tools._search_files_business(
+                directory=str(root),
+                query="Needle",
+                include_types=None,
+                limit=len(relative_files) + 1,
+                max_results=len(relative_files) + 1,
+                allowed_roots=(root.resolve(),),
+                cancellation_token=_OpenCancellationToken(),
+            ),
+        )
+        for root in (first_root, second_root)
+    ]
+
+    assert list_values[0]["files"] == list_values[1]["files"]
+    list_files = cast(list[Mapping[str, JsonValue]], list_values[0]["files"])
+    assert [record["name"] for record in list_files] == [
+        "Alpha.txt",
+        "bravo.txt",
+        "Charlie.txt",
+        "zeta.txt",
+    ]
+    assert search_values[0]["matches"] == search_values[1]["matches"]
+    search_matches = cast(list[Mapping[str, JsonValue]], search_values[0]["matches"])
+    assert [record["file"] for record in search_matches] == [
+        "Alpha.txt",
+        str(Path("nested/bravo.txt")),
+        str(Path("nested/Charlie.txt")),
+        "zeta.txt",
+    ]
+
+
+def test_directory_symlink_entry_is_yielded_without_recursing_target(
+    tmp_path: Path,
+) -> None:
+    """确定性迭代器必须产出目录 symlink，但不得递归其目标。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: symlink entry 不可见或其目标被递归时抛出。
+    """
+
+    target_directory = tmp_path / "target"
+    target_directory.mkdir()
+    (target_directory / "inside.txt").write_text("inside", encoding="utf-8")
+    link = tmp_path / "linked-directory"
+    link.symlink_to(target_directory, target_is_directory=True)
+
+    entries = [
+        str(entry.relative_to(tmp_path))
+        for entry in doc_tools._iter_directory_entries(
+            tmp_path,
+            recursive=True,
+            cancellation_token=_OpenCancellationToken(),
+        )
+    ]
+
+    assert "linked-directory" in entries
+    assert str(Path("linked-directory/inside.txt")) not in entries
+    assert str(Path("target/inside.txt")) in entries
+
+
+def test_list_files_keeps_allowed_file_symlink_as_directory_entry(
+    tmp_path: Path,
+) -> None:
+    """list_files 必须继续按 symlink entry 路径列出内部 file symlink。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: file symlink 未按自身路径与名称列出时抛出。
+    """
+
+    target = tmp_path / "target.txt"
+    target.write_text("linked content", encoding="utf-8")
+    link = tmp_path / "alias.txt"
+    link.symlink_to(target)
+
+    value = cast(
+        Mapping[str, JsonValue],
+        doc_tools._list_files_business(
+            directory=str(tmp_path),
+            pattern="*.txt",
+            recursive=False,
+            limit=10,
+            max_files=10,
+            cancellation_token=_OpenCancellationToken(),
+        ),
+    )
+    files = cast(list[Mapping[str, JsonValue]], value["files"])
+
+    assert [record["name"] for record in files] == ["alias.txt", "target.txt"]
+    assert files[0]["path"] == "alias.txt"
+    assert files[0]["size"] == target.stat().st_size
 
 
 def test_read_file_long_single_line_stops_at_character_limit(
@@ -1011,7 +1170,6 @@ def test_search_files_raw_long_line_finds_late_query_with_bounded_excerpt(
             include_types=None,
             limit=5,
             max_results=5,
-            max_directory_entries=10,
             allowed_roots=(tmp_path.resolve(),),
             cancellation_token=_OpenCancellationToken(),
         ),
@@ -1075,7 +1233,6 @@ def test_search_files_complete_source_enters_processor_and_returns_match(
             include_types=None,
             limit=5,
             max_results=5,
-            max_directory_entries=10,
             allowed_roots=(tmp_path.resolve(),),
             cancellation_token=_OpenCancellationToken(),
         ),
@@ -1114,7 +1271,6 @@ def test_search_files_cumulative_match_limit_returns_result_partial(
             include_types=None,
             limit=2,
             max_results=2,
-            max_directory_entries=10,
             allowed_roots=(tmp_path.resolve(),),
             cancellation_token=_OpenCancellationToken(),
         ),
@@ -1125,13 +1281,14 @@ def test_search_files_cumulative_match_limit_returns_result_partial(
     assert value["truncated_reason"] == "result_limit"
 
 
-def test_search_files_directory_entry_limit_returns_directory_partial(
+def test_search_files_scans_to_eof_when_result_limit_is_not_reached(
     tmp_path: Path,
 ) -> None:
-    """search 目录 cap 命中时必须优先声明 directory_entry_limit。"""
+    """search 未达到结果 limit 时必须扫描到 EOF 并返回完整事实。"""
 
-    for name in ("a.txt", "b.txt", "c.txt"):
+    for name in ("a.txt", "b.txt"):
         (tmp_path / name).write_text("no match", encoding="utf-8")
+    (tmp_path / "c.txt").write_text("Needle", encoding="utf-8")
 
     value = cast(
         Mapping[str, JsonValue],
@@ -1141,15 +1298,15 @@ def test_search_files_directory_entry_limit_returns_directory_partial(
             include_types=None,
             limit=5,
             max_results=5,
-            max_directory_entries=1,
             allowed_roots=(tmp_path.resolve(),),
             cancellation_token=_OpenCancellationToken(),
         ),
     )
 
-    assert value["scanned_entries"] == 1
-    assert value["scan_complete"] is False
-    assert value["truncated_reason"] == "directory_entry_limit"
+    assert value["scanned_entries"] == 3
+    assert value["total_matches"] == 1
+    assert value["scan_complete"] is True
+    assert value["truncated_reason"] is None
 
 
 def test_search_files_processor_factory_receives_complete_snapshot(
@@ -1198,7 +1355,6 @@ def test_search_files_processor_factory_receives_complete_snapshot(
             include_types=None,
             limit=5,
             max_results=5,
-            max_directory_entries=10,
             allowed_roots=(tmp_path.resolve(),),
             cancellation_token=_OpenCancellationToken(),
         ),
@@ -1209,10 +1365,10 @@ def test_search_files_processor_factory_receives_complete_snapshot(
     assert value["total_matches"] == 1
 
 
-def test_doc_tool_descriptions_explain_retained_partial_fields(
+def test_doc_tool_descriptions_explain_only_retained_output_facts(
     tmp_path: Path,
 ) -> None:
-    """LLM-facing 描述应只解释仍存在的输出与目录 partial 事实。
+    """LLM-facing 描述应自足解释完整 list 与合法 output limit。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -1221,25 +1377,145 @@ def test_doc_tool_descriptions_explain_retained_partial_fields(
         无。
 
     Raises:
-        AssertionError: 描述缺少保留语义或仍暴露已删除语义时抛出。
+        AssertionError: 描述缺少完整遍历或合法 output limit 语义时抛出。
     """
 
     definitions = _definitions_by_name(_discover_definitions(tmp_path))
 
-    for tool_name in ("list_files", "search_files", "read_file"):
-        description = definitions[tool_name].schema.function.description
-        assert "scan_complete" in description
-        assert "truncated_reason" in description or "content_truncated" in description
-    assert "directory_entry_limit" in definitions["list_files"].schema.function.description
+    list_description = definitions["list_files"].schema.function.description
+    assert list_description == (
+        "列出配置允许访问目录中的文件。files 是按稳定顺序返回的首批记录，returned 是返回数，"
+        "total 是完整遍历后的匹配文件总数，scanned_entries 是完整检查的目录项数。"
+        "若 total 大于 returned，表示 limit 限制了本次返回数量；可收紧 pattern 或在参数允许范围内提高 limit。"
+        "定位后把 files[].path 交给 get_file_sections、read_file 或 read_file_section。"
+    )
+    assert "scan_complete" not in list_description
+    assert "truncated_reason" not in list_description
     search_description = definitions["search_files"].schema.function.description
     assert "result_limit" in search_description
-    assert "directory_entry_limit" in search_description
     assert search_description == (
         "在配置允许访问目录中按关键词查找。matches 是本次命中，total_matches 等于返回命中数，"
-        "scanned_entries 是已检查目录项数。scan_complete=false 表示结果不完整；"
-        "truncated_reason 会是 result_limit 或 directory_entry_limit，应分别收紧关键词或目录后重试。"
+        "scanned_entries 是已检查目录项数。scan_complete=false 且 truncated_reason=result_limit 表示"
+        "命中数达到 limit，可收紧关键词或在参数允许范围内提高 limit 后重试；完整扫描时"
+        "scan_complete=true 且 truncated_reason 为 null。"
         "若命中带 ref，把 matches[].file 和 ref 交给 read_file_section；ref 为 null 时用 read_file。"
     )
+    read_description = definitions["read_file"].schema.function.description
+    assert "content_truncated" in read_description
+    assert "scan_complete" in read_description
+
+
+def test_doc_complete_input_real_smoke_above_legacy_thresholds(
+    tmp_path: Path,
+) -> None:
+    """真实大目录与大文件必须经 discovery/callable 完整进入 Doc owner。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: list/read/search 完整输入、symlink containment 或既有
+            output limit contract 不符合预期时抛出。
+        OSError: 真实 fixture 创建失败时透出。
+    """
+
+    allowed_root = tmp_path / "allowed"
+    outside_root = tmp_path / "outside"
+    allowed_root.mkdir()
+    outside_root.mkdir()
+    small_content = b"ordinary content\n"
+    for index in range(_REAL_SMOKE_SMALL_FILE_COUNT):
+        (allowed_root / f"entry-{index:05d}.txt").write_bytes(small_content)
+
+    large_file = allowed_root / _REAL_SMOKE_LARGE_FILE_NAME
+    chunk = b"x" * _REAL_SMOKE_CHUNK_BYTES
+    with large_file.open("wb") as stream:
+        for _ in range(_REAL_SMOKE_CHUNK_COUNT):
+            stream.write(chunk)
+        stream.write(b"\n")
+        stream.write(_REAL_SMOKE_TAIL_MARKER.encode("ascii"))
+    assert large_file.stat().st_size > _REAL_SMOKE_MIN_LARGE_FILE_BYTES
+
+    outside_file = outside_root / "outside.txt"
+    outside_file.write_text(_REAL_SMOKE_TAIL_MARKER, encoding="utf-8")
+    outside_link = allowed_root / _REAL_SMOKE_OUTSIDE_LINK_NAME
+    outside_link.symlink_to(outside_file)
+    expected_scanned_entries = _REAL_SMOKE_SMALL_FILE_COUNT + 2
+
+    spec = _spec(allowed_root)
+    provider_output = discover_tools(spec)
+    definitions = _definitions_by_name(provider_output.definitions)
+
+    list_outcome = asyncio.run(
+        definitions["list_files"].callable(
+            _call(
+                "list_files",
+                {
+                    "directory": str(allowed_root),
+                    "pattern": _REAL_SMOKE_LARGE_FILE_NAME,
+                    "recursive": True,
+                },
+            ),
+            _context(),
+        )
+    )
+    assert isinstance(list_outcome, ToolCompletedOutcome)
+    list_value = cast(Mapping[str, JsonValue], list_outcome.result.value)
+    listed_files = cast(list[Mapping[str, JsonValue]], list_value["files"])
+    assert list_value["total"] == 1
+    assert list_value["returned"] == 1
+    assert list_value["scanned_entries"] == expected_scanned_entries
+    assert listed_files[0]["path"] == str(large_file.resolve())
+    assert "scan_complete" not in list_value
+    assert "truncated_reason" not in list_value
+
+    read_definition = definitions["read_file"]
+    read_outcome = asyncio.run(
+        read_definition.callable(
+            _call("read_file", {"file_path": str(large_file)}),
+            _context(),
+        )
+    )
+    assert isinstance(read_outcome, ToolCompletedOutcome)
+    read_value = cast(Mapping[str, JsonValue], read_outcome.result.value)
+    assert read_value["returned_chars"] == 2000
+    assert read_value["content_truncated"] is True
+    assert isinstance(read_definition.truncate, ToolTruncateSpec)
+    assert read_definition.truncate.target_field == "content"
+
+    search_outcome = asyncio.run(
+        definitions["search_files"].callable(
+            _call(
+                "search_files",
+                {
+                    "directory": str(allowed_root),
+                    "query": _REAL_SMOKE_TAIL_MARKER,
+                },
+            ),
+            _context(),
+        )
+    )
+    assert isinstance(search_outcome, ToolCompletedOutcome)
+    search_value = cast(Mapping[str, JsonValue], search_outcome.result.value)
+    matches = cast(list[Mapping[str, JsonValue]], search_value["matches"])
+    assert search_value["scanned_entries"] == expected_scanned_entries
+    assert search_value["total_matches"] == 1
+    assert search_value["scan_complete"] is True
+    assert search_value["truncated_reason"] is None
+    assert matches[0]["file"] == str(large_file.resolve())
+    assert _REAL_SMOKE_TAIL_MARKER in str(matches[0]["snippet"])
+
+    direct_read_escape = asyncio.run(
+        read_definition.callable(
+            _call("read_file", {"file_path": str(outside_link)}),
+            _context(),
+        )
+    )
+    assert isinstance(direct_read_escape, ToolFailedOutcome)
+    assert direct_read_escape.result.error == "permission_denied"
 
 
 def test_search_files_does_not_read_symlink_escape(

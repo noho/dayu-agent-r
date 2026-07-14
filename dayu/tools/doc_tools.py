@@ -81,7 +81,6 @@ _READ_FILE_ENCODINGS: Final[tuple[str, ...]] = ("utf-8", "gbk", "latin1", "cp125
 _READ_LINES_ENCODINGS: Final[tuple[str, ...]] = ("utf-8", "gbk")
 _MARKDOWN_SUFFIXES: Final[frozenset[str]] = frozenset({".md", ".markdown"})
 _DOC_LOOP_CANCELLATION_CHECK_INTERVAL: Final[int] = 1_000
-_DOC_DIRECTORY_MAX_ENTRIES: Final[int] = 10_000
 _DOC_STREAM_CHUNK_BYTES: Final[int] = 64 * 1024
 _DOC_SEARCH_EXCERPT_CHARS: Final[int] = 300
 
@@ -134,7 +133,7 @@ class _DocSourceCancellationCheck:
 class _ListedFileCandidate:
     """目录结果固定堆中的反向排序候选。"""
 
-    sort_key: tuple[str, str]
+    sort_key: tuple[str, str, str, str]
     value: dict[str, JsonValue]
 
     def __lt__(self, other: _ListedFileCandidate) -> bool:
@@ -647,10 +646,9 @@ def _build_list_files_definition(
     return _tool_definition(
         name=LIST_FILES_TOOL_NAME,
         description=(
-            "列出配置允许访问目录中的文件。files 是本次返回记录，returned 是返回数，"
-            "scanned_entries 是已检查目录项数。scan_complete=true 时 total 是完整匹配数且"
-            "truncated_reason 为 null；scan_complete=false 时 total 为 null、"
-            "truncated_reason=directory_entry_limit，必须缩小目录、关闭递归或收紧 pattern 后重试。"
+            "列出配置允许访问目录中的文件。files 是按稳定顺序返回的首批记录，returned 是返回数，"
+            "total 是完整遍历后的匹配文件总数，scanned_entries 是完整检查的目录项数。"
+            "若 total 大于 returned，表示 limit 限制了本次返回数量；可收紧 pattern 或在参数允许范围内提高 limit。"
             "定位后把 files[].path 交给 get_file_sections、read_file 或 read_file_section。"
         ),
         parameters=parameters,
@@ -790,8 +788,9 @@ def _build_search_files_definition(
         name=SEARCH_FILES_TOOL_NAME,
         description=(
             "在配置允许访问目录中按关键词查找。matches 是本次命中，total_matches 等于返回命中数，"
-            "scanned_entries 是已检查目录项数。scan_complete=false 表示结果不完整；"
-            "truncated_reason 会是 result_limit 或 directory_entry_limit，应分别收紧关键词或目录后重试。"
+            "scanned_entries 是已检查目录项数。scan_complete=false 且 truncated_reason=result_limit 表示"
+            "命中数达到 limit，可收紧关键词或在参数允许范围内提高 limit 后重试；完整扫描时"
+            "scan_complete=true 且 truncated_reason 为 null。"
             "若命中带 ref，把 matches[].file 和 ref 交给 read_file_section；ref 为 null 时用 read_file。"
         ),
         parameters=parameters,
@@ -1173,7 +1172,6 @@ def _route_doc_business(
             recursive=_required_bool(arguments, "recursive"),
             limit=_required_int(arguments, "limit"),
             max_files=limits.list_files_max,
-            max_directory_entries=_DOC_DIRECTORY_MAX_ENTRIES,
             cancellation_token=cancellation_token,
         )
     if tool_name == GET_FILE_SECTIONS_TOOL_NAME:
@@ -1190,7 +1188,6 @@ def _route_doc_business(
             include_types=_optional_string_list(arguments, "include_types"),
             limit=_required_int(arguments, "limit"),
             max_results=limits.search_files_max_results,
-            max_directory_entries=_DOC_DIRECTORY_MAX_ENTRIES,
             allowed_roots=allowed_roots,
             cancellation_token=cancellation_token,
         )
@@ -1416,6 +1413,62 @@ def _is_supported_doc_file_path(tool_name: str, candidate: Path) -> bool:
         return False
 
 
+def _directory_entry_sort_key(entry: Path) -> tuple[str, str]:
+    """构造目录 entry 的确定性名称排序键。
+
+    Args:
+        entry: 待排序的目录 entry。
+
+    Returns:
+        先按名称 ``casefold``、再按原名排序的二元组。
+
+    Raises:
+        无。
+    """
+
+    return (entry.name.casefold(), entry.name)
+
+
+def _iter_directory_entries(
+    directory: Path,
+    *,
+    recursive: bool,
+    cancellation_token: CancellationToken,
+) -> Iterator[Path]:
+    """按确定性 depth-first 顺序产出目录 entry。
+
+    Args:
+        directory: 当前待枚举目录。
+        recursive: 是否递归普通子目录。
+        cancellation_token: Host 注入的取消观察令牌。
+
+    Yields:
+        每层按名称 ``casefold`` 与原名稳定排序的目录 entry；目录 symlink
+        本身会产出但不会递归其目标，file symlink 也会作为 entry 产出。
+
+    Raises:
+        OSError: 目录枚举失败时透出。
+        _DocCancelledError: 枚举或产出 entry 时观察到 Host 取消后抛出。
+    """
+
+    entries: list[Path] = []
+    _raise_if_doc_cancelled(cancellation_token)
+    for entry in directory.iterdir():
+        _raise_if_doc_cancelled(cancellation_token)
+        entries.append(entry)
+    entries.sort(key=_directory_entry_sort_key)
+
+    for entry in entries:
+        _raise_if_doc_cancelled(cancellation_token)
+        yield entry
+        if recursive and not entry.is_symlink() and entry.is_dir():
+            yield from _iter_directory_entries(
+                entry,
+                recursive=True,
+                cancellation_token=cancellation_token,
+            )
+
+
 def _list_files_business(
     *,
     directory: str,
@@ -1423,7 +1476,6 @@ def _list_files_business(
     recursive: bool,
     limit: int,
     max_files: int,
-    max_directory_entries: int,
     cancellation_token: CancellationToken,
 ) -> JsonValue:
     """列出目录中的文件。
@@ -1434,7 +1486,6 @@ def _list_files_business(
         recursive: 是否递归搜索。
         limit: 最大返回数量。
         max_files: 配置硬上限。
-        max_directory_entries: 允许观察的最大目录 entry 数。
         cancellation_token: Host 注入的取消观察令牌。
 
     Returns:
@@ -1453,14 +1504,12 @@ def _list_files_business(
     files_heap: list[_ListedFileCandidate] = []
     matched_files = 0
     scanned_entries = 0
-    scan_complete = True
     _raise_if_doc_cancelled(cancellation_token)
-    entries = dir_path.rglob("*") if recursive else dir_path.iterdir()
-    for file_path in entries:
-        _raise_if_doc_cancelled(cancellation_token)
-        if scanned_entries >= max_directory_entries:
-            scan_complete = False
-            break
+    for file_path in _iter_directory_entries(
+        dir_path,
+        recursive=recursive,
+        cancellation_token=cancellation_token,
+    ):
         scanned_entries += 1
         if not file_path.is_file():
             continue
@@ -1477,7 +1526,11 @@ def _list_files_business(
             }
             matched_files += 1
             candidate = _ListedFileCandidate(
-                sort_key=(file_path.name.lower(), relative_path.lower()),
+                sort_key=(
+                    *_directory_entry_sort_key(file_path),
+                    relative_path.casefold(),
+                    relative_path,
+                ),
                 value=record,
             )
             if len(files_heap) < actual_limit:
@@ -1496,11 +1549,9 @@ def _list_files_business(
     return {
         "directory": str(dir_path),
         "files": filtered_files,
-        "total": matched_files if scan_complete else None,
+        "total": matched_files,
         "returned": len(filtered_files),
         "scanned_entries": scanned_entries,
-        "scan_complete": scan_complete,
-        "truncated_reason": None if scan_complete else "directory_entry_limit",
     }
 
 
@@ -1566,7 +1617,6 @@ def _search_files_business(
     include_types: list[str] | None,
     limit: int,
     max_results: int,
-    max_directory_entries: int,
     allowed_roots: tuple[Path, ...],
     cancellation_token: CancellationToken,
 ) -> JsonValue:
@@ -1578,7 +1628,6 @@ def _search_files_business(
         include_types: 可选文件扩展名过滤。
         limit: 最大返回数量。
         max_results: 配置硬上限。
-        max_directory_entries: 允许观察的最大目录 entry 数。
         allowed_roots: 已重新解析的允许访问根路径。
         cancellation_token: Host 注入的取消观察令牌。
 
@@ -1600,12 +1649,11 @@ def _search_files_business(
     scan_complete = True
     truncated_reason: str | None = None
     _raise_if_doc_cancelled(cancellation_token)
-    for file_path in dir_path.rglob("*"):
-        _raise_if_doc_cancelled(cancellation_token)
-        if scanned_entries >= max_directory_entries:
-            scan_complete = False
-            truncated_reason = "directory_entry_limit"
-            break
+    for file_path in _iter_directory_entries(
+        dir_path,
+        recursive=True,
+        cancellation_token=cancellation_token,
+    ):
         scanned_entries += 1
         if not file_path.is_file():
             continue
