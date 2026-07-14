@@ -26,7 +26,11 @@ from dayu.documents.docling_runtime import DoclingRuntimeInitializationError
 from dayu.tools.web import web_http_session
 from dayu.tools.web import web_tools as web_tools_module
 from dayu.tools.web.web_egress_policy import WebEgressPolicy
-from dayu.tools.web.web_resource_budget import WebResourceBudget
+from dayu.tools.web.web_resource_budget import (
+    DEFAULT_BROWSER_RESOURCE_BUDGET,
+    DEFAULT_HTTP_RESOURCE_BUDGET,
+    HttpResourceBudget,
+)
 JsonObject = dict[str, JsonValue]
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -151,6 +155,27 @@ def _raise_diagnostic_request_exception(
 
     del session, method, url, timeout, headers, normalize_url_for_http, egress_policy, stream, cancellation_token
     raise diag.requests.Timeout("synthetic diagnostic timeout")
+
+
+def _preserve_materialized_response_body(
+    response_value: diag.requests.Response,
+    *,
+    http_resource_budget: HttpResourceBudget,
+) -> None:
+    """保留测试已预置的 response body，不执行二次 materialize。
+
+    Args:
+        response_value: 已预置 body 的 diagnostic response。
+        http_resource_budget: 本次 HTTP child 资源预算。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    del response_value, http_resource_budget
 
 
 def test_jsonl_and_txt_corpus_parsing_retains_metadata_and_deduplicates(tmp_path: Path) -> None:
@@ -602,6 +627,69 @@ def test_url_safety_rejects_private_and_local_hosts_by_default() -> None:
     assert target.normalized_url == "https://example.com/report"
 
 
+def test_single_diagnostic_private_mode_preserves_local_custom_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """既有 private diagnostic 模式必须继续允许本地 custom-port URL。
+
+    Args:
+        monkeypatch: pytest 属性替换夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: utility policy construction 未保留 custom-port 行为时抛出。
+    """
+
+    authorized_ports: list[int] = []
+
+    def fake_build_requests_profile(
+        url: str,
+        *,
+        timeout_seconds: float,
+        egress_policy: WebEgressPolicy,
+    ) -> JsonObject:
+        """在 utility policy construction boundary 验证 custom-port 授权。
+
+        Args:
+            url: 待诊断 URL。
+            timeout_seconds: 当前请求超时秒数。
+            egress_policy: utility 构造的 Web 出站策略。
+
+        Returns:
+            完成授权后的确定性 skipped profile。
+
+        Raises:
+            WebEgressPolicyError: URL 未被当前出站策略授权时抛出。
+        """
+
+        del timeout_seconds
+        target = egress_policy.authorize_http_target(
+            url,
+            stage="diagnostic_test",
+        )
+        authorized_ports.append(target.port)
+        return diag._skipped_profile(
+            "synthetic_after_authorization",
+            url=url,
+            backend=diag.WebDiagnosticBackend.REQUESTS,
+        )
+
+    monkeypatch.setattr(diag, "_build_requests_profile", fake_build_requests_profile)
+    payload = diag._build_single_diagnostic_payload(
+        _options(
+            url="http://127.0.0.1:43117/fixture.pdf",
+            allow_private_network_url=True,
+            skip_tool_fetch=True,
+            skip_playwright=True,
+        )
+    )
+
+    assert authorized_ports == [43117]
+    assert payload["safe_url"] == "http://127.0.0.1:43117/fixture.pdf"
+
+
 def test_header_projection_never_persists_raw_values() -> None:
     """header 投影只能保留存在性与受限 media-type 语义。"""
 
@@ -672,10 +760,11 @@ def test_requests_profile_records_raw_response_byte_length(monkeypatch: pytest.M
         "_request_with_safe_redirects",
         fake_request_with_safe_redirects,
     )
+
     monkeypatch.setattr(
         diag._web_fetch_orchestrator,
         "_materialize_response_body",
-        lambda response_value, *, resource_budget: None,
+        _preserve_materialized_response_body,
     )
 
     profile = diag._build_requests_profile(
@@ -744,7 +833,9 @@ def test_diagnostic_playwright_public_egress_is_typed_unavailable() -> None:
 def test_playwright_response_body_projection_uses_exact_bytes_and_budget() -> None:
     """browser origin-content oracle 必须使用 exact bytes，并拒绝 declared/actual 超限。"""
 
-    budget = WebResourceBudget(decoded_body_bytes=4)
+    assert diag._DIAGNOSTIC_HTTP_RESOURCE_BUDGET is DEFAULT_HTTP_RESOURCE_BUDGET
+    assert diag._DIAGNOSTIC_BROWSER_RESOURCE_BUDGET is DEFAULT_BROWSER_RESOURCE_BUDGET
+    budget = HttpResourceBudget(wire_body_bytes=4, decoded_body_bytes=4)
     exact_response = _BodyResponse(
         body=b"pdf!",
         headers={"Content-Length": "4"},
@@ -760,17 +851,17 @@ def test_playwright_response_body_projection_uses_exact_bytes_and_budget() -> No
 
     assert diag._read_bounded_playwright_response_body(
         cast(diag._ResponseProtocol, exact_response),
-        resource_budget=budget,
+        http_resource_budget=budget,
     ) == b"pdf!"
     with pytest.raises(diag._DiagnosticBrowserBodyLimitExceeded):
         diag._read_bounded_playwright_response_body(
             cast(diag._ResponseProtocol, declared_too_large),
-            resource_budget=budget,
+            http_resource_budget=budget,
         )
     with pytest.raises(diag._DiagnosticBrowserBodyLimitExceeded):
         diag._read_bounded_playwright_response_body(
             cast(diag._ResponseProtocol, actual_too_large),
-            resource_budget=budget,
+            http_resource_budget=budget,
         )
 
 

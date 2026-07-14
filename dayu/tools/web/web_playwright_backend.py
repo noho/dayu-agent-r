@@ -36,7 +36,7 @@ from dayu.runtime.interruptible_process import (
 from .web_fetch_orchestrator import _FetchUrlSafetyError
 from .web_challenge_detection import BotChallengeDecision
 from .web_egress_policy import WebEgressPolicy, WebEgressPolicyError
-from .web_resource_budget import WebResourceBudget
+from .web_resource_budget import BrowserResourceBudget, DiagnosticResourceBudget
 from .web_diagnostics import (
     WebDiagnosticBackend,
     failed_projection,
@@ -198,7 +198,7 @@ class _WorkerKwargs(TypedDict):
     playwright_channel: str | None
     playwright_storage_state_path: str
     egress_policy: WebEgressPolicy
-    resource_budget: WebResourceBudget
+    browser_resource_budget: BrowserResourceBudget
 
 
 class _BudgetedDomMetrics(TypedDict):
@@ -262,9 +262,25 @@ class _PlaywrightWorkerProtocol(Protocol):
         playwright_channel: str | None = None,
         playwright_storage_state_path: str = "",
         egress_policy: WebEgressPolicy,
-        resource_budget: WebResourceBudget,
+        browser_resource_budget: BrowserResourceBudget,
     ) -> WebPayload:
-        """执行一次 Playwright 抓取。"""
+        """执行一次 Playwright 抓取。
+
+        Args:
+            url: 已通过调用入口校验的 URL。
+            timeout_seconds: 单次浏览器抓取超时秒数。
+            headers: 可选请求头。
+            playwright_channel: 可选浏览器 channel。
+            playwright_storage_state_path: 可选 storage state 路径。
+            egress_policy: 浏览器导航和子请求出站策略。
+            browser_resource_budget: 浏览器 DOM/text/Markdown 资源预算。
+
+        Returns:
+            浏览器抓取与转换后的 payload。
+
+        Raises:
+            Exception: 浏览器抓取或转换失败时透出。
+        """
         ...
 
 
@@ -504,6 +520,7 @@ def _playwright_process_entry(
     result_queue: _ResultQueueProtocol,
     worker_callable: _PlaywrightWorkerProtocol,
     worker_kwargs: _WorkerKwargs,
+    diagnostic_resource_budget: DiagnosticResourceBudget,
 ) -> None:
     """子进程入口：执行同步 Playwright worker 并回传结果。
 
@@ -511,6 +528,7 @@ def _playwright_process_entry(
         result_queue: 结果队列。
         worker_callable: 同步 worker 函数。
         worker_kwargs: worker 关键字参数。
+        diagnostic_resource_budget: process/failure 诊断投影预算。
 
     Returns:
         无。
@@ -521,7 +539,7 @@ def _playwright_process_entry(
 
     enter_new_process_session_if_supported()
     diagnostic_url = worker_kwargs["url"]
-    max_error_chars = worker_kwargs["resource_budget"].diagnostic_error_chars
+    max_error_chars = diagnostic_resource_budget.error_chars
     try:
         result_queue.put({
             "kind": "result",
@@ -779,6 +797,7 @@ def _run_playwright_worker_process(
     *,
     playwright_sync_worker: _PlaywrightWorkerProtocol,
     worker_kwargs: _WorkerKwargs,
+    diagnostic_resource_budget: DiagnosticResourceBudget,
     total_timeout: float,
     cancellation_token: CancellationToken | None,
 ) -> WebPayload:
@@ -787,6 +806,7 @@ def _run_playwright_worker_process(
     Args:
         playwright_sync_worker: 同步 worker 函数。
         worker_kwargs: worker 关键字参数。
+        diagnostic_resource_budget: process/failure 诊断投影预算。
         total_timeout: 父进程等待总时长。
         cancellation_token: 当前工具调用的取消令牌。
 
@@ -803,7 +823,12 @@ def _run_playwright_worker_process(
     result_queue = cast(_ResultQueueProtocol, ctx.Queue(maxsize=1))
     process = ctx.Process(
         target=_playwright_process_entry,
-        args=(result_queue, playwright_sync_worker, worker_kwargs),
+        args=(
+            result_queue,
+            playwright_sync_worker,
+            worker_kwargs,
+            diagnostic_resource_budget,
+        ),
     )
     process.daemon = True
     process.start()
@@ -1222,13 +1247,13 @@ def _settle_playwright_page(
 def _read_budgeted_dom_metrics(
     page: _PageProtocol,
     *,
-    resource_budget: WebResourceBudget,
+    browser_resource_budget: BrowserResourceBudget,
 ) -> _BudgetedDomMetrics:
     """执行不生成完整 DOM/text 的 bounded TreeWalker 预检。
 
     Args:
         page: 当前 Playwright Page。
-        resource_budget: Web 资源预算唯一真源。
+        browser_resource_budget: 浏览器 DOM/text 资源预算。
 
     Returns:
         有界 DOM/text counters 与超限标记。
@@ -1240,8 +1265,8 @@ def _read_budgeted_dom_metrics(
     raw_metrics = page.evaluate(
         _BUDGETED_DOM_METRICS_SCRIPT,
         {
-            "domLimit": resource_budget.browser_dom_chars,
-            "textLimit": resource_budget.browser_text_chars,
+            "domLimit": browser_resource_budget.dom_chars,
+            "textLimit": browser_resource_budget.text_chars,
         },
     )
     if not isinstance(raw_metrics, Mapping):
@@ -1272,13 +1297,13 @@ def _read_budgeted_dom_metrics(
 def _materialize_bounded_page_projection(
     page: _PageProtocol,
     *,
-    resource_budget: WebResourceBudget,
+    browser_resource_budget: BrowserResourceBudget,
 ) -> _BrowserPageProjection:
     """先 bounded preflight，再生成并复核完整 HTML/text 投影。
 
     Args:
         page: 当前 Playwright Page。
-        resource_budget: Web 资源预算唯一真源。
+        browser_resource_budget: 浏览器 DOM/text 资源预算。
 
     Returns:
         实际长度复核通过的完整 HTML 与页面文本。
@@ -1290,21 +1315,21 @@ def _materialize_bounded_page_projection(
 
     metrics = _read_budgeted_dom_metrics(
         page,
-        resource_budget=resource_budget,
+        browser_resource_budget=browser_resource_budget,
     )
     if (
         metrics["dom_exceeded"]
-        or metrics["dom_chars"] > resource_budget.browser_dom_chars
+        or metrics["dom_chars"] > browser_resource_budget.dom_chars
     ):
         raise _BrowserResourceBudgetExceeded(_BROWSER_DOM_TOO_LARGE_REASON)
     if (
         metrics["text_exceeded"]
-        or metrics["text_chars"] > resource_budget.browser_text_chars
+        or metrics["text_chars"] > browser_resource_budget.text_chars
     ):
         raise _BrowserResourceBudgetExceeded(_BROWSER_TEXT_TOO_LARGE_REASON)
 
     html = page.content()
-    if len(html) > resource_budget.browser_dom_chars:
+    if len(html) > browser_resource_budget.dom_chars:
         raise _BrowserResourceBudgetExceeded(_BROWSER_DOM_TOO_LARGE_REASON)
     try:
         raw_page_text = page.evaluate(_FULL_PAGE_TEXT_SCRIPT)
@@ -1315,7 +1340,7 @@ def _materialize_bounded_page_projection(
             module=MODULE,
         )
         page_text = html
-    if len(page_text) > resource_budget.browser_text_chars:
+    if len(page_text) > browser_resource_budget.text_chars:
         raise _BrowserResourceBudgetExceeded(_BROWSER_TEXT_TOO_LARGE_REASON)
     return _BrowserPageProjection(html=html, page_text=page_text)
 
@@ -1355,7 +1380,7 @@ def _playwright_sync_worker(
     sanitize_response_headers: Callable[[Mapping[str, str]], dict[str, str]],
     convert_html_to_markdown: _HtmlConverterProtocol,
     egress_policy: WebEgressPolicy,
-    resource_budget: WebResourceBudget,
+    browser_resource_budget: BrowserResourceBudget,
     time_monotonic: Callable[[], float] = time.monotonic,
 ) -> WebPayload:
     """在独立线程中执行完整的 Playwright 同步抓取流程。
@@ -1372,7 +1397,7 @@ def _playwright_sync_worker(
         sanitize_response_headers: 响应头裁剪函数。
         convert_html_to_markdown: HTML 四段式转换函数。
         egress_policy: 当前 Web 调用唯一的出站策略。
-        resource_budget: HTTP、browser 与诊断共享的完整资源预算。
+        browser_resource_budget: 浏览器 DOM/text/Markdown 资源预算。
         time_monotonic: 可注入的单调时钟函数。
 
     Returns:
@@ -1496,7 +1521,7 @@ def _playwright_sync_worker(
         try:
             page_projection = _materialize_bounded_page_projection(
                 page,
-                resource_budget=resource_budget,
+                browser_resource_budget=browser_resource_budget,
             )
         except _BrowserResourceBudgetExceeded as exc:
             context.close()
@@ -1511,7 +1536,7 @@ def _playwright_sync_worker(
         context.close()
 
     pipeline_result = convert_html_to_markdown(html, url=final_url)
-    if len(pipeline_result.markdown) > resource_budget.browser_text_chars:
+    if len(pipeline_result.markdown) > browser_resource_budget.text_chars:
         return _browser_budget_failure(_BROWSER_TEXT_TOO_LARGE_REASON)
     return {
         "ok": True,
@@ -1538,7 +1563,8 @@ def _fetch_and_convert_with_playwright(
     playwright_channel: str | None = None,
     playwright_storage_state_path: str = "",
     egress_policy: WebEgressPolicy,
-    resource_budget: WebResourceBudget,
+    browser_resource_budget: BrowserResourceBudget,
+    diagnostic_resource_budget: DiagnosticResourceBudget,
     cancellation_token: CancellationToken | None = None,
     resolve_timeout_budget: _ResolveTimeoutBudgetProtocol,
     playwright_sync_worker: _PlaywrightWorkerProtocol,
@@ -1555,7 +1581,9 @@ def _fetch_and_convert_with_playwright(
         playwright_channel: 浏览器回退使用的 Chromium channel。
         playwright_storage_state_path: 浏览器回退可选 storage state 文件路径。
         egress_policy: 当前 Web 调用唯一的出站策略。
-        resource_budget: HTTP、browser 与诊断共享的完整资源预算。
+        browser_resource_budget: 浏览器 DOM/text/Markdown 资源预算。
+        diagnostic_resource_budget: process/failure 诊断投影预算。
+        cancellation_token: 当前工具调用的可选取消令牌。
         resolve_timeout_budget: timeout 预算解析函数。
         playwright_sync_worker: 同步 worker 函数。
         detect_bot_challenge: challenge 检测函数。
@@ -1612,8 +1640,9 @@ def _fetch_and_convert_with_playwright(
                     "playwright_channel": playwright_channel,
                     "playwright_storage_state_path": playwright_storage_state_path,
                     "egress_policy": egress_policy,
-                    "resource_budget": resource_budget,
+                    "browser_resource_budget": browser_resource_budget,
                 },
+                diagnostic_resource_budget=diagnostic_resource_budget,
                 total_timeout=total_timeout,
                 cancellation_token=cancellation_token,
             )
@@ -1633,7 +1662,7 @@ def _fetch_and_convert_with_playwright(
             elapsed_seconds=total_timeout,
             error_code="playwright_timeout",
             error_message="Playwright 浏览器回退在预算内未返回结果。",
-            max_error_chars=resource_budget.diagnostic_error_chars,
+            max_error_chars=diagnostic_resource_budget.error_chars,
             backend=WebDiagnosticBackend.PLAYWRIGHT,
         )
         Log.debug(
@@ -1656,7 +1685,7 @@ def _fetch_and_convert_with_playwright(
             elapsed_seconds=0.0,
             error_code="playwright_error",
             error_message=str(exc),
-            max_error_chars=resource_budget.diagnostic_error_chars,
+            max_error_chars=diagnostic_resource_budget.error_chars,
             backend=WebDiagnosticBackend.PLAYWRIGHT,
         )
         Log.debug(

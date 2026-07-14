@@ -31,6 +31,7 @@ WEB_DIAGNOSTIC_SCHEMA_REVISION: Final[int] = 2
 _CONTENT_DIGEST_PREFIX: Final[str] = "sha256:"
 _ERROR_REDACTION_MARKER: Final[str] = "<redacted>"
 _ERROR_TRUNCATION_SUFFIX: Final[str] = "...<truncated>"
+_MINIMAL_ERROR_TRUNCATION_MARKER: Final[str] = "…"
 _OBSERVABLE_RESPONSE_HEADER_NAMES: Final[frozenset[str]] = frozenset(
     {"cache-control", "content-length", "content-type", "retry-after"}
 )
@@ -413,14 +414,14 @@ def project_error_message(
 
     Args:
         message: 原始错误文本。
-        max_chars: 投影最大字符数，必须大于截断后缀长度。
+        max_chars: 投影最大字符数，必须为正整数。
         sensitive_values: caller 已知的 query、userinfo、header 或 sentinel value。
 
     Returns:
         已删除已知敏感值、高熵十六进制 token，并经 runtime primitive 脱敏和截断的文本。
 
     Raises:
-        ValueError: ``max_chars`` 不满足 runtime 截断 primitive 约束时抛出。
+        ValueError: ``max_chars`` 不是正整数时抛出。
     """
 
     projected = message
@@ -432,10 +433,24 @@ def project_error_message(
         projected,
         redaction_marker=_ERROR_REDACTION_MARKER,
     )
+    if max_chars == 1:
+        single_char_projection = truncate_diagnostic_text(
+            projected,
+            max_chars=max_chars,
+            truncated_suffix="",
+        )
+        if single_char_projection == projected:
+            return single_char_projection
+        return _MINIMAL_ERROR_TRUNCATION_MARKER
+    truncated_suffix = (
+        _ERROR_TRUNCATION_SUFFIX
+        if max_chars > len(_ERROR_TRUNCATION_SUFFIX)
+        else _MINIMAL_ERROR_TRUNCATION_MARKER
+    )
     return truncate_diagnostic_text(
         projected,
         max_chars=max_chars,
-        truncated_suffix=_ERROR_TRUNCATION_SUFFIX,
+        truncated_suffix=truncated_suffix,
     )
 
 

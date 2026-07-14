@@ -19,7 +19,8 @@ from dayu.contracts.cancellation import CancellationToken
 
 from . import web_fetch_orchestrator as _web_fetch_orchestrator
 from .web_challenge_detection import BotChallengeDecision, detect_bot_challenge
-from .web_resource_budget import WebResourceBudget
+from .web_egress_policy import WebEgressPolicy
+from .web_resource_budget import HttpResourceBudget
 
 MODULE = "ENGINE.WEB_SEARCH"
 _LOGGER = logging.getLogger(__name__)
@@ -244,15 +245,6 @@ class _TimeoutBudgetResolver(Protocol):
         ...
 
 
-class _PublicUrlSafetyChecker(Protocol):
-    """公网 URL 安全校验协议。"""
-
-    def __call__(self, url: str, *, allow_private_network_url: bool = False) -> bool:
-        """判断 URL 是否允许暴露给上层。"""
-
-        ...
-
-
 def search_public_web(
     *,
     query: str,
@@ -264,11 +256,10 @@ def search_public_web(
     request_timeout_seconds: float,
     timeout_budget: float | None,
     deadline_monotonic: float | None,
-    allow_private_network_url: bool,
-    is_safe_public_url: _PublicUrlSafetyChecker,
+    egress_policy: WebEgressPolicy,
     normalize_whitespace: Callable[[str], str],
     resolve_timeout_budget: _TimeoutBudgetResolver,
-    resource_budget: WebResourceBudget,
+    http_resource_budget: HttpResourceBudget,
     cancellation_token: CancellationToken | None = None,
 ) -> SearchWebProviderResult:
     """执行公开网页检索并组装结构化 provider 事实。
@@ -283,11 +274,10 @@ def search_public_web(
         request_timeout_seconds: provider 请求超时秒数。
         timeout_budget: 单次 tool call 总预算。
         deadline_monotonic: 当前调用 deadline。
-        allow_private_network_url: 是否允许保留私网 URL 结果。
-        is_safe_public_url: 公网 URL 安全校验函数。
+        egress_policy: 与 fetch 同源的 private/custom-port typed policy。
         normalize_whitespace: 文本空白规整函数。
         resolve_timeout_budget: timeout 预算解析函数。
-        resource_budget: HTTP、browser 与诊断共享的完整资源预算。
+        http_resource_budget: 搜索响应 wire/decoded body 预算。
         cancellation_token: 当前工具调用取消令牌。
 
     Returns:
@@ -325,7 +315,7 @@ def search_public_web(
                     timeout_budget=timeout_budget,
                     deadline_monotonic=deadline_monotonic,
                     resolve_timeout_budget=resolve_timeout_budget,
-                    resource_budget=resource_budget,
+                    http_resource_budget=http_resource_budget,
                 )
             elif candidate_provider == "serper":
                 rows = _search_with_serper(
@@ -337,7 +327,7 @@ def search_public_web(
                     timeout_budget=timeout_budget,
                     deadline_monotonic=deadline_monotonic,
                     resolve_timeout_budget=resolve_timeout_budget,
-                    resource_budget=resource_budget,
+                    http_resource_budget=http_resource_budget,
                 )
             else:
                 rows = _search_with_duckduckgo(
@@ -349,7 +339,7 @@ def search_public_web(
                     deadline_monotonic=deadline_monotonic,
                     normalize_whitespace=normalize_whitespace,
                     resolve_timeout_budget=resolve_timeout_budget,
-                    resource_budget=resource_budget,
+                    http_resource_budget=http_resource_budget,
                 )
             _raise_if_search_cancelled(cancellation_token)
         except Exception as exc:  # pragma: no cover - 失败路径由单测通过 monkeypatch 覆盖
@@ -368,8 +358,7 @@ def search_public_web(
 
         visible_results = _filter_visible_results(
             rows=rows,
-            allow_private_network_url=allow_private_network_url,
-            is_safe_public_url=is_safe_public_url,
+            egress_policy=egress_policy,
         )[:limited_results]
         preferred_result = _build_search_web_preferred_result(visible_results)
         return {
@@ -423,15 +412,13 @@ def _is_search_cancelled_error(error: Exception) -> bool:
 def _filter_visible_results(
     *,
     rows: list[SearchResultRow],
-    allow_private_network_url: bool,
-    is_safe_public_url: _PublicUrlSafetyChecker,
+    egress_policy: WebEgressPolicy,
 ) -> list[SearchResultRow]:
     """按 URL 安全策略过滤 provider 结果。
 
     Args:
         rows: provider 返回的原始结果列表。
-        allow_private_network_url: 是否允许保留私网 URL。
-        is_safe_public_url: 公网 URL 安全校验函数。
+        egress_policy: 与 fetch 同源的 private/custom-port typed policy。
 
     Returns:
         通过安全过滤的结果列表。
@@ -443,10 +430,7 @@ def _filter_visible_results(
     return [
         row
         for row in rows
-        if is_safe_public_url(
-            row["url"],
-            allow_private_network_url=allow_private_network_url,
-        )
+        if egress_policy.is_url_allowed(row["url"])
     ]
 
 
@@ -614,7 +598,7 @@ def _search_with_tavily(
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
     resolve_timeout_budget: _TimeoutBudgetResolver = _default_resolve_timeout_budget,
-    resource_budget: WebResourceBudget,
+    http_resource_budget: HttpResourceBudget,
 ) -> list[SearchResultRow]:
     """使用 Tavily API 搜索。
 
@@ -627,7 +611,7 @@ def _search_with_tavily(
         timeout_budget: Runner 注入的单次 tool call 总预算。
         deadline_monotonic: 当前工具调用的单调时钟 deadline。
         resolve_timeout_budget: timeout 预算解析函数。
-        resource_budget: Web response 资源预算唯一真源。
+        http_resource_budget: Web response 资源预算唯一真源。
 
     Returns:
         结果列表。
@@ -666,7 +650,7 @@ def _search_with_tavily(
     with response:
         _materialize_bounded_search_response(
             response,
-            resource_budget=resource_budget,
+            http_resource_budget=http_resource_budget,
         )
         _raise_for_search_provider_status(response)
         data = response.json()
@@ -698,7 +682,7 @@ def _search_with_serper(
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
     resolve_timeout_budget: _TimeoutBudgetResolver = _default_resolve_timeout_budget,
-    resource_budget: WebResourceBudget,
+    http_resource_budget: HttpResourceBudget,
 ) -> list[SearchResultRow]:
     """使用 Serper API 搜索。
 
@@ -711,7 +695,7 @@ def _search_with_serper(
         timeout_budget: Runner 注入的单次 tool call 总预算。
         deadline_monotonic: 当前工具调用的单调时钟 deadline。
         resolve_timeout_budget: timeout 预算解析函数。
-        resource_budget: Web response 资源预算唯一真源。
+        http_resource_budget: Web response 资源预算唯一真源。
 
     Returns:
         结果列表。
@@ -755,7 +739,7 @@ def _search_with_serper(
     with response:
         _materialize_bounded_search_response(
             response,
-            resource_budget=resource_budget,
+            http_resource_budget=http_resource_budget,
         )
         _raise_for_search_provider_status(response)
         data = response.json()
@@ -787,7 +771,7 @@ def _search_with_duckduckgo(
     deadline_monotonic: float | None = None,
     normalize_whitespace: Callable[[str], str] = lambda value: " ".join(value.split()),
     resolve_timeout_budget: _TimeoutBudgetResolver = _default_resolve_timeout_budget,
-    resource_budget: WebResourceBudget,
+    http_resource_budget: HttpResourceBudget,
 ) -> list[SearchResultRow]:
     """使用 DuckDuckGo HTML 页面搜索。
 
@@ -800,7 +784,7 @@ def _search_with_duckduckgo(
         deadline_monotonic: 当前工具调用的单调时钟 deadline。
         normalize_whitespace: 文本空白规整函数。
         resolve_timeout_budget: timeout 预算解析函数。
-        resource_budget: Web response 资源预算唯一真源。
+        http_resource_budget: Web response 资源预算唯一真源。
 
     Returns:
         结果列表。
@@ -831,7 +815,7 @@ def _search_with_duckduckgo(
     with response:
         _materialize_bounded_search_response(
             response,
-            resource_budget=resource_budget,
+            http_resource_budget=http_resource_budget,
         )
         _raise_for_search_provider_status(response)
         return _parse_duckduckgo_html(
@@ -845,13 +829,13 @@ def _search_with_duckduckgo(
 def _materialize_bounded_search_response(
     response: requests.Response,
     *,
-    resource_budget: WebResourceBudget,
+    http_resource_budget: HttpResourceBudget,
 ) -> None:
     """在解析 provider payload 前执行共享 wire/codec 资源预算。
 
     Args:
         response: 使用 ``stream=True`` 获得的 provider response。
-        resource_budget: Web response 资源预算唯一真源。
+        http_resource_budget: Web response 资源预算唯一真源。
 
     Returns:
         无。
@@ -864,7 +848,7 @@ def _materialize_bounded_search_response(
     try:
         _web_fetch_orchestrator._materialize_response_body(
             response,
-            resource_budget=resource_budget,
+            http_resource_budget=http_resource_budget,
         )
     except _web_fetch_orchestrator._FetchBodyLimitExceeded as exc:
         raise WebSearchProviderResourceError(

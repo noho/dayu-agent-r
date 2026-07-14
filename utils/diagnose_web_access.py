@@ -52,7 +52,12 @@ from dayu.tools.web.web_challenge_detection import (
     detect_bot_challenge,
 )
 from dayu.tools.web.web_egress_policy import WebEgressPolicy, WebEgressPolicyError
-from dayu.tools.web.web_resource_budget import WebResourceBudget
+from dayu.tools.web.web_resource_budget import (
+    DEFAULT_BROWSER_RESOURCE_BUDGET,
+    DEFAULT_HTTP_RESOURCE_BUDGET,
+    BrowserResourceBudget,
+    HttpResourceBudget,
+)
 from dayu.tools.web.web_diagnostics import (
     WEB_DIAGNOSTIC_SCHEMA_REVISION,
     WEB_DIAGNOSTIC_SCHEMA_VERSION,
@@ -116,7 +121,12 @@ _STORAGE_STATE_FINAL_SUFFIX: Final[str] = ".json"
 _STORAGE_STATE_TEMP_SUFFIX: Final[str] = ".tmp"
 _PRIVATE_DIRECTORY_MODE: Final[int] = 0o700
 _PRIVATE_FILE_MODE: Final[int] = 0o600
-_DIAGNOSTIC_RESOURCE_BUDGET: Final[WebResourceBudget] = WebResourceBudget()
+_DIAGNOSTIC_HTTP_RESOURCE_BUDGET: Final[HttpResourceBudget] = (
+    DEFAULT_HTTP_RESOURCE_BUDGET
+)
+_DIAGNOSTIC_BROWSER_RESOURCE_BUDGET: Final[BrowserResourceBudget] = (
+    DEFAULT_BROWSER_RESOURCE_BUDGET
+)
 
 
 class _DiagnosticBrowserBodyLimitExceeded(RuntimeError):
@@ -1528,7 +1538,7 @@ def _build_requests_profile(
             response = lease.response
             _web_fetch_orchestrator._materialize_response_body(
                 response,
-                resource_budget=_DIAGNOSTIC_RESOURCE_BUDGET,
+                http_resource_budget=_DIAGNOSTIC_HTTP_RESOURCE_BUDGET,
             )
             response_text = response.text
             response_bytes = bytes(response.content)
@@ -2292,7 +2302,7 @@ def _route_diagnostic_browser_request(
 def _read_bounded_playwright_response_body(
     response: _ResponseProtocol,
     *,
-    resource_budget: WebResourceBudget,
+    http_resource_budget: HttpResourceBudget,
 ) -> bytes:
     """读取 Playwright 主响应 bytes，并复用共享 decoded-body budget。
 
@@ -2302,7 +2312,7 @@ def _read_bounded_playwright_response_body(
 
     Args:
         response: Playwright 主导航 response。
-        resource_budget: Web 共享资源预算。
+        http_resource_budget: HTTP decoded body 预算。
 
     Returns:
         未超过上限的 response body bytes。
@@ -2320,12 +2330,12 @@ def _read_bounded_playwright_response_body(
             declared_length = int(str(raw_content_length).strip())
         except ValueError:
             declared_length = 0
-        if declared_length > resource_budget.decoded_body_bytes:
+        if declared_length > http_resource_budget.decoded_body_bytes:
             raise _DiagnosticBrowserBodyLimitExceeded(
                 "Playwright diagnostic response body exceeds decoded-body limit."
             )
     body = response.body()
-    if len(body) > resource_budget.decoded_body_bytes:
+    if len(body) > http_resource_budget.decoded_body_bytes:
         raise _DiagnosticBrowserBodyLimitExceeded(
             "Playwright diagnostic response body exceeds decoded-body limit."
         )
@@ -2440,7 +2450,7 @@ def _build_playwright_profile(
                 _wait_for_manual_confirmation("[诊断] 按 Enter 后采样页面并保存 storage state...")
             page_projection = _web_playwright_backend._materialize_bounded_page_projection(
                 cast(_web_playwright_backend._PageProtocol, page),
-                resource_budget=_DIAGNOSTIC_RESOURCE_BUDGET,
+                browser_resource_budget=_DIAGNOSTIC_BROWSER_RESOURCE_BUDGET,
             )
             html = page_projection.html
             page_text = page_projection.page_text
@@ -2450,7 +2460,7 @@ def _build_playwright_profile(
             response_body = (
                 _read_bounded_playwright_response_body(
                     response,
-                    resource_budget=_DIAGNOSTIC_RESOURCE_BUDGET,
+                    http_resource_budget=_DIAGNOSTIC_HTTP_RESOURCE_BUDGET,
                 )
                 if response is not None
                 else b""
@@ -2694,6 +2704,7 @@ def _build_single_diagnostic_payload(options: CliOptions) -> JsonObject:
 
     egress_policy = WebEgressPolicy(
         allow_private_network=options.allow_private_network_url,
+        allow_custom_port=options.allow_private_network_url,
     )
     payload: JsonObject = {
         "schema_version": _SCHEMA_VERSION,

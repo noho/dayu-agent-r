@@ -77,6 +77,7 @@ from .web_http_encoding import (
 )
 from .web_egress_policy import WebEgressPolicy
 from .web_http_session import (
+    WebHttpTransportPolicy,
     _compute_deadline_monotonic,
     _create_no_retry_session,
     _create_retry_session,
@@ -117,7 +118,12 @@ from .web_search_providers import (
     WebSearchProviderUnavailableError,
     search_public_web,
 )
-from .web_resource_budget import WebResourceBudget
+from .web_resource_budget import (
+    BrowserResourceBudget,
+    DiagnosticResourceBudget,
+    HttpResourceBudget,
+    WebResourceBudgets,
+)
 from .web_tool_projection_text import (
     WEB_CANCELLED_HINT,
     WEB_FETCH_CANCELLED_MESSAGE,
@@ -167,9 +173,6 @@ _FETCH_WEB_PAGE_PARAMETERS: Final[ToolParametersSchema] = ToolParametersSchema(
 _SEARCH_PROVIDER_UNAVAILABLE_ERROR: Final[str] = "search_provider_unavailable"
 _SEARCH_PROVIDER_RESPONSE_INVALID_ERROR: Final[str] = "search_provider_response_invalid"
 _RESPONSE_BODY_TOO_LARGE_ERROR: Final[str] = "response_body_too_large"
-_DEFAULT_WEB_DIAGNOSTIC_ERROR_CHARS: Final[int] = (
-    WebResourceBudget().diagnostic_error_chars
-)
 WebPayload: TypeAlias = dict[str, JsonValue]
 WebMapping: TypeAlias = Mapping[str, JsonValue]
 StagePayload: TypeAlias = dict[str, str | bool | int | float | None]
@@ -181,26 +184,32 @@ _FetchContentRuntimeContext = _web_fetch_orchestrator._FetchContentRuntimeContex
 class WebToolsConfig:
     """Web 工具 provider 配置。
 
+    :param allow_private_network_url: 是否允许内网 / 本地 URL。
+    :param allow_custom_port_url: 是否允许非默认 HTTP(S) 端口。
+    :param browser_enabled: 是否允许浏览器能力；S1 只保存该事实。
+    :param transport_policy: HTTP transport policy；S1 尚不投影到 sender。
+    :param resource_budgets: HTTP、browser 与 diagnostics child budget 纯组合。
     :param provider: 搜索 provider 策略。
     :param request_timeout_seconds: HTTP 请求超时秒数。
     :param max_search_results: 搜索最大返回条数。
     :param fetch_truncate_chars: 抓取正文截断声明字符数。
-    :param allow_private_network_url: 是否允许内网 / 本地 URL。
     :param playwright_channel: Playwright fallback 使用的浏览器 channel。
     :param playwright_storage_state_dir: Playwright storage state 目录。
-    :param resource_budget: HTTP、browser 与诊断共享的完整资源预算。
     :returns: dataclass 实例本身。
     :raises Exception: 构造期不主动抛出异常。
     """
 
-    provider: str = "auto"
-    request_timeout_seconds: float = 12.0
-    max_search_results: int = 20
-    fetch_truncate_chars: int = 80_000
-    allow_private_network_url: bool = False
-    playwright_channel: str | None = "chrome"
-    playwright_storage_state_dir: str = ""
-    resource_budget: WebResourceBudget = WebResourceBudget()
+    allow_private_network_url: bool
+    allow_custom_port_url: bool
+    browser_enabled: bool
+    transport_policy: WebHttpTransportPolicy
+    resource_budgets: WebResourceBudgets
+    provider: str
+    request_timeout_seconds: float
+    max_search_results: int
+    fetch_truncate_chars: int
+    playwright_channel: str | None
+    playwright_storage_state_dir: str
 
 
 class _FetchContentResult(TypedDict, total=False):
@@ -231,12 +240,13 @@ class _PlaywrightFallbackKwargs(TypedDict, total=False):
     playwright_channel: str | None
     playwright_storage_state_path: str
     egress_policy: WebEgressPolicy
-    resource_budget: WebResourceBudget
+    browser_resource_budget: BrowserResourceBudget
+    diagnostic_resource_budget: DiagnosticResourceBudget
     cancellation_token: CancellationToken
 
 
-class _StageFetchKwargs(TypedDict, total=False):
-    """requests 阶段调用的共享参数。"""
+class _WarmupFetchKwargs(TypedDict, total=False):
+    """requests warmup 阶段的精确参数。"""
 
     url: str
     timeout_seconds: float
@@ -244,7 +254,7 @@ class _StageFetchKwargs(TypedDict, total=False):
     timeout_budget: float | None
     deadline_monotonic: float | None
     egress_policy: WebEgressPolicy
-    resource_budget: WebResourceBudget
+    browser_resource_budget: BrowserResourceBudget
     cancellation_token: CancellationToken
 
 
@@ -258,7 +268,7 @@ class _FetchConvertKwargs(TypedDict, total=False):
     timeout_budget: float | None
     deadline_monotonic: float | None
     egress_policy: WebEgressPolicy
-    resource_budget: WebResourceBudget
+    http_resource_budget: HttpResourceBudget
     cancellation_token: CancellationToken
 
 
@@ -753,27 +763,6 @@ def _is_timeout_like_exception(error: BaseException) -> bool:
     return _is_timeout_like_request_exception(error)
 
 
-def _is_search_result_url_allowed(
-    url: str,
-    *,
-    allow_private_network_url: bool = False,
-) -> bool:
-    """把 search result filtering 投影到统一 Web egress owner。
-
-    Args:
-        url: provider 返回的候选结果 URL。
-        allow_private_network_url: 是否使用显式 local/dev profile。
-
-    Returns:
-        统一 policy 可授权该 URL 时返回 ``True``。
-
-    Raises:
-        无。
-    """
-
-    return WebEgressPolicy(allow_private_network=allow_private_network_url).is_url_allowed(url)
-
-
 def _raise_fetch_cancelled() -> NoReturn:
     """将工具取消投影为 Web 模块内取消信号。
 
@@ -926,7 +915,8 @@ def _try_playwright_fallback(
     playwright_channel: str | None = None,
     playwright_storage_state_path: str = "",
     egress_policy: WebEgressPolicy,
-    resource_budget: WebResourceBudget,
+    browser_resource_budget: BrowserResourceBudget,
+    diagnostic_resource_budget: DiagnosticResourceBudget,
     cancellation_token: CancellationToken | None = None,
 ) -> WebPayload | None:
     """尝试使用 Playwright 浏览器回退抓取页面。
@@ -940,7 +930,8 @@ def _try_playwright_fallback(
         playwright_channel: 浏览器回退使用的 Chromium channel。
         playwright_storage_state_path: 浏览器回退可选 storage state 文件路径。
         egress_policy: 当前 Web 调用唯一的出站策略。
-        resource_budget: HTTP、browser 与诊断共享的完整资源预算。
+        browser_resource_budget: 浏览器 DOM/text/Markdown 资源预算。
+        diagnostic_resource_budget: 浏览器失败诊断投影预算。
         cancellation_token: 当前工具调用取消令牌。
 
     Returns:
@@ -962,7 +953,8 @@ def _try_playwright_fallback(
             playwright_channel=playwright_channel,
             playwright_storage_state_path=playwright_storage_state_path,
             egress_policy=egress_policy,
-            resource_budget=resource_budget,
+            browser_resource_budget=browser_resource_budget,
+            diagnostic_resource_budget=diagnostic_resource_budget,
             cancellation_token=cancellation_token,
         )
     except _web_playwright_backend.CancelledError:
@@ -975,6 +967,7 @@ def _try_playwright_fallback(
                 message="This page requires a browser path that is unavailable under the current network policy.",
                 hint=build_hint(REASON_BLOCKED_BY_SITE_POLICY),
                 next_action=NEXT_ACTION_CHANGE_SOURCE,
+                diagnostic_error_chars=diagnostic_resource_budget.error_chars,
             )
         browser_budget_reason = pw_result.get("reason")
         if isinstance(browser_budget_reason, str) and browser_budget_reason in (
@@ -987,6 +980,7 @@ def _try_playwright_fallback(
                 message="Browser-rendered page exceeded the configured resource budget.",
                 hint=build_hint(REASON_CONTENT_CONVERSION_FAILED),
                 next_action=NEXT_ACTION_CHANGE_SOURCE,
+                diagnostic_error_chars=diagnostic_resource_budget.error_chars,
             )
         Log.debug(
             "Playwright 浏览器回退未成功: "
@@ -1124,10 +1118,28 @@ def _warmup_domain(
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
     egress_policy: WebEgressPolicy,
-    resource_budget: WebResourceBudget,
+    browser_resource_budget: BrowserResourceBudget,
     cancellation_token: CancellationToken | None = None,
 ) -> StagePayload:
-    """对目标域做一次预热请求以建立 Cookie。"""
+    """对目标域做一次有界预热请求以建立 Cookie。
+
+    Args:
+        session: 当前 requests Session。
+        url: 目标 URL。
+        timeout_seconds: 基础请求超时秒数。
+        headers: 请求头。
+        timeout_budget: 工具调用总预算。
+        deadline_monotonic: 当前工具调用 deadline。
+        egress_policy: 当前 Web 调用唯一出站策略。
+        browser_resource_budget: warmup body 预算。
+        cancellation_token: 当前工具调用取消令牌。
+
+    Returns:
+        warmup 尝试、状态、跳数和消费字节等事实。
+
+    Raises:
+        web_fetch_orchestrator 内部取消异常: 当前调用被取消时透出。
+    """
 
     return _web_fetch_orchestrator._warmup_domain(
         session,
@@ -1139,7 +1151,7 @@ def _warmup_domain(
         normalize_url_for_http=_normalize_url_for_http,
         is_timeout_like_exception=_is_timeout_like_exception,
         egress_policy=egress_policy,
-        resource_budget=resource_budget,
+        browser_resource_budget=browser_resource_budget,
         timeout_budget=timeout_budget,
         deadline_monotonic=deadline_monotonic,
         cancellation_token=cancellation_token,
@@ -1155,10 +1167,26 @@ def _probe_content_type(
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
     egress_policy: WebEgressPolicy,
-    resource_budget: WebResourceBudget,
     cancellation_token: CancellationToken | None = None,
 ) -> ContentProbePayload:
-    """探测目标资源类型（HEAD 优先，失败降级到 GET）。"""
+    """探测目标资源类型（HEAD 优先，失败降级到零 body GET）。
+
+    Args:
+        session: 当前 requests Session。
+        url: 目标 URL。
+        timeout_seconds: 基础请求超时秒数。
+        headers: 请求头。
+        timeout_budget: 工具调用总预算。
+        deadline_monotonic: 当前工具调用 deadline。
+        egress_policy: 当前 Web 调用唯一出站策略。
+        cancellation_token: 当前工具调用取消令牌。
+
+    Returns:
+        HEAD 或零 body GET 观察到的内容类型与响应事实。
+
+    Raises:
+        web_fetch_orchestrator 内部取消异常: 当前调用被取消时透出。
+    """
 
     return _web_fetch_orchestrator._probe_content_type(
         session,
@@ -1169,7 +1197,6 @@ def _probe_content_type(
         normalize_url_for_http=_normalize_url_for_http,
         is_timeout_like_exception=_is_timeout_like_exception,
         egress_policy=egress_policy,
-        resource_budget=resource_budget,
         timeout_budget=timeout_budget,
         deadline_monotonic=deadline_monotonic,
         cancellation_token=cancellation_token,
@@ -1183,6 +1210,7 @@ def _raise_fetch_failure(
     message: str,
     hint: str,
     next_action: str,
+    diagnostic_error_chars: int,
     http_status: int | None = None,
 ) -> None:
     """记录诊断日志并抛出 ToolBusinessError。
@@ -1196,6 +1224,7 @@ def _raise_fetch_failure(
         message: 错误说明。
         hint: LLM 可执行提示（来自 web_recovery.build_hint）。
         next_action: 下一步动作（retry/change_source/continue_without_web）。
+        diagnostic_error_chars: 当前不可变配置快照的诊断错误字符上限。
         http_status: HTTP 状态码（可选）。
 
     Returns:
@@ -1211,7 +1240,7 @@ def _raise_fetch_failure(
         elapsed_seconds=0.0,
         error_code=error_code,
         error_message=message,
-        max_error_chars=_DEFAULT_WEB_DIAGNOSTIC_ERROR_CHARS,
+        max_error_chars=diagnostic_error_chars,
         http_status=http_status,
     )
     _log_fetch_diagnostics(projection)
@@ -1633,6 +1662,10 @@ def _search_web_business(
     """
 
     _raise_if_host_cancelled(cancellation_token)
+    egress_policy = WebEgressPolicy(
+        allow_private_network=config.allow_private_network_url,
+        allow_custom_port=config.allow_custom_port_url,
+    )
     provider_result: SearchWebProviderResult = search_public_web(
         query=query,
         domains=domains,
@@ -1643,11 +1676,10 @@ def _search_web_business(
         request_timeout_seconds=config.request_timeout_seconds,
         timeout_budget=timeout_budget,
         deadline_monotonic=_compute_deadline_monotonic(timeout_budget),
-        allow_private_network_url=config.allow_private_network_url,
-        is_safe_public_url=_is_search_result_url_allowed,
+        egress_policy=egress_policy,
         normalize_whitespace=_normalize_whitespace,
         resolve_timeout_budget=_resolve_timeout_budget,
-        resource_budget=config.resource_budget,
+        http_resource_budget=config.resource_budgets.http,
         cancellation_token=cancellation_token,
     )
     return build_search_web_output(provider_result)
@@ -1924,13 +1956,16 @@ def _fetch_web_page_business(
     """
 
     request_timeout_seconds = config.request_timeout_seconds
-    allow_private_network_url = config.allow_private_network_url
     playwright_channel = config.playwright_channel
     playwright_storage_state_dir = config.playwright_storage_state_dir
-    resource_budget = config.resource_budget
+    resource_budgets = config.resource_budgets
+    diagnostic_error_chars = resource_budgets.diagnostics.error_chars
     _raise_if_host_cancelled(cancellation_token)
 
-    egress_policy = WebEgressPolicy(allow_private_network=allow_private_network_url)
+    egress_policy = WebEgressPolicy(
+        allow_private_network=config.allow_private_network_url,
+        allow_custom_port=config.allow_custom_port_url,
+    )
     try:
         normalized_url = _normalize_url_for_http(url)
     except ValueError:
@@ -1940,6 +1975,7 @@ def _fetch_web_page_business(
             message=f"URL is blocked by fetch safety policy: {url}",
             hint=build_hint(REASON_BLOCKED_BY_SITE_POLICY),
             next_action=NEXT_ACTION_CHANGE_SOURCE,
+            diagnostic_error_chars=diagnostic_error_chars,
         )
         raise AssertionError("unreachable fetch failure path")
     deadline_monotonic = _compute_deadline_monotonic(timeout_budget)
@@ -1969,20 +2005,21 @@ def _fetch_web_page_business(
         "playwright_channel": playwright_channel,
         "playwright_storage_state_path": playwright_storage_state_path,
         "egress_policy": egress_policy,
-        "resource_budget": resource_budget,
+        "browser_resource_budget": resource_budgets.browser,
+        "diagnostic_resource_budget": resource_budgets.diagnostics,
     }
     if cancellation_token is not None:
         playwright_fallback_kwargs["cancellation_token"] = cancellation_token
     try:
         _raise_if_host_cancelled(cancellation_token)
-        warmup_kwargs: _StageFetchKwargs = {
+        warmup_kwargs: _WarmupFetchKwargs = {
             "url": normalized_url,
             "timeout_seconds": request_timeout_seconds,
             "headers": headers,
             "timeout_budget": timeout_budget,
             "deadline_monotonic": deadline_monotonic,
             "egress_policy": egress_policy,
-            "resource_budget": resource_budget,
+            "browser_resource_budget": resource_budgets.browser,
         }
         if cancellation_token is not None:
             warmup_kwargs["cancellation_token"] = cancellation_token
@@ -1995,20 +2032,15 @@ def _fetch_web_page_business(
             if browser_result is not None:
                 return browser_result
         _raise_if_host_cancelled(cancellation_token)
-        probe_kwargs: _StageFetchKwargs = {
-            "url": normalized_url,
-            "timeout_seconds": request_timeout_seconds,
-            "headers": headers,
-            "timeout_budget": timeout_budget,
-            "deadline_monotonic": deadline_monotonic,
-            "egress_policy": egress_policy,
-            "resource_budget": resource_budget,
-        }
-        if cancellation_token is not None:
-            probe_kwargs["cancellation_token"] = cancellation_token
         content_type_probe = _probe_content_type(
             session,
-            **probe_kwargs,
+            url=normalized_url,
+            timeout_seconds=request_timeout_seconds,
+            headers=headers,
+            timeout_budget=timeout_budget,
+            deadline_monotonic=deadline_monotonic,
+            egress_policy=egress_policy,
+            cancellation_token=cancellation_token,
         )
         if _should_escalate_stage_result_to_browser(cast(StagePayload, content_type_probe)):
             browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
@@ -2023,7 +2055,7 @@ def _fetch_web_page_business(
             "timeout_budget": timeout_budget,
             "deadline_monotonic": deadline_monotonic,
             "egress_policy": egress_policy,
-            "resource_budget": resource_budget,
+            "http_resource_budget": resource_budgets.http,
         }
         if cancellation_token is not None:
             fetch_kwargs["cancellation_token"] = cancellation_token
@@ -2040,6 +2072,7 @@ def _fetch_web_page_business(
             http_status=response.status_code if response is not None else None,
             hint=build_hint(REASON_REDIRECT_CHAIN_TOO_LONG),
             next_action=NEXT_ACTION_CHANGE_SOURCE,
+            diagnostic_error_chars=diagnostic_error_chars,
         )
     except requests.Timeout as exc:
         browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
@@ -2051,6 +2084,7 @@ def _fetch_web_page_business(
             message=f"Request timed out: {exc}",
             hint=build_hint(REASON_REQUEST_TIMEOUT),
             next_action=NEXT_ACTION_RETRY,
+            diagnostic_error_chars=diagnostic_error_chars,
         )
     except requests.RequestException as exc:
         response = getattr(exc, "response", None)
@@ -2072,6 +2106,7 @@ def _fetch_web_page_business(
                 message=str(exc),
                 hint=build_hint(REASON_REQUEST_TIMEOUT),
                 next_action=NEXT_ACTION_RETRY,
+                diagnostic_error_chars=diagnostic_error_chars,
             )
         if _is_ssl_like_request_exception(exc):
             browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
@@ -2083,6 +2118,7 @@ def _fetch_web_page_business(
                 message=f"SSL/TLS 握手失败: {exc}",
                 hint=build_hint(REASON_HTTP_ERROR),
                 next_action=NEXT_ACTION_CHANGE_SOURCE,
+                diagnostic_error_chars=diagnostic_error_chars,
             )
         challenge = _detect_bot_challenge(
             response=response,
@@ -2109,6 +2145,7 @@ def _fetch_web_page_business(
                 http_status=http_status,
                 hint=build_hint(REASON_BLOCKED_BY_SITE_POLICY),
                 next_action=NEXT_ACTION_CHANGE_SOURCE,
+                diagnostic_error_chars=diagnostic_error_chars,
             )
         if _should_escalate_http_status_to_browser(http_status):
             browser_result = _try_playwright_fallback(url=url, **playwright_fallback_kwargs)
@@ -2128,6 +2165,7 @@ def _fetch_web_page_business(
             http_status=http_status,
             hint=challenge_hint or build_hint(REASON_HTTP_ERROR),
             next_action=next_action,
+            diagnostic_error_chars=diagnostic_error_chars,
         )
     except _FetchUrlSafetyError as exc:
         _raise_fetch_failure(
@@ -2136,6 +2174,7 @@ def _fetch_web_page_business(
             message=f"URL is blocked by fetch safety policy: {exc.url}",
             hint=build_hint(REASON_BLOCKED_BY_SITE_POLICY),
             next_action=NEXT_ACTION_CHANGE_SOURCE,
+            diagnostic_error_chars=diagnostic_error_chars,
         )
     except _FetchBodyLimitExceeded as exc:
         _raise_fetch_failure(
@@ -2145,6 +2184,7 @@ def _fetch_web_page_business(
             http_status=exc.response_context.http_status,
             hint=build_hint(REASON_CONTENT_CONVERSION_FAILED),
             next_action=NEXT_ACTION_CHANGE_SOURCE,
+            diagnostic_error_chars=diagnostic_error_chars,
         )
     except RuntimeError as exc:
         if cancellation_token.is_cancelled():
@@ -2166,6 +2206,7 @@ def _fetch_web_page_business(
                     http_status=challenge_context.http_status,
                     hint=build_hint(REASON_BLOCKED_BY_SITE_POLICY),
                     next_action=NEXT_ACTION_CHANGE_SOURCE,
+                    diagnostic_error_chars=diagnostic_error_chars,
                 )
         elif isinstance(exc, HtmlPipelineStageError):
             pipeline_error = exc
@@ -2217,6 +2258,7 @@ def _fetch_web_page_business(
             ),
             next_action=NEXT_ACTION_CHANGE_SOURCE,
             http_status=challenge_context.http_status if challenge_context is not None else None,
+            diagnostic_error_chars=diagnostic_error_chars,
         )
     finally:
         if should_close_session:
@@ -2252,6 +2294,7 @@ def _fetch_web_page_business(
             http_status=fetch_result.get("http_status"),
             hint=build_hint(REASON_BLOCKED_BY_SITE_POLICY),
             next_action=NEXT_ACTION_CHANGE_SOURCE,
+            diagnostic_error_chars=diagnostic_error_chars,
         )
 
     content = fetch_result.get("content", "")
@@ -2263,6 +2306,7 @@ def _fetch_web_page_business(
             http_status=fetch_result.get("http_status"),
             hint=build_hint(REASON_EMPTY_CONTENT),
             next_action=NEXT_ACTION_CONTINUE_WITHOUT_WEB,
+            diagnostic_error_chars=diagnostic_error_chars,
         )
 
     success: WebPayload = {
@@ -2353,12 +2397,32 @@ def _fetch_and_convert_content(
     headers: Mapping[str, str] | None = None,
     content_type_probe: ContentProbePayload | None = None,
     egress_policy: WebEgressPolicy,
-    resource_budget: WebResourceBudget,
+    http_resource_budget: HttpResourceBudget,
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
     cancellation_token: CancellationToken | None = None,
 ) -> _FetchContentResult:
-    """先下载页面内容，再按内容类型转换为低噪音 Markdown。"""
+    """先下载页面内容，再按内容类型转换为低噪音 Markdown。
+
+    Args:
+        url: 待抓取的网页 URL。
+        timeout_seconds: HTTP 请求超时秒数。
+        session: 可选复用 requests Session。
+        headers: 可选请求头。
+        content_type_probe: 可选内容类型探测结果。
+        egress_policy: 当前 Web 调用唯一的出站策略。
+        http_resource_budget: HTTP wire/decoded body child 预算。
+        timeout_budget: Runner 注入的单次 tool call 总预算。
+        deadline_monotonic: 当前工具调用的单调时钟 deadline。
+        cancellation_token: 当前工具调用的可选取消令牌。
+
+    Returns:
+        抓取和转换结果，包含正文、最终 URL 与 HTTP 投影字段。
+
+    Raises:
+        RuntimeError: HTTP 请求或内容转换失败时透出。
+        ValueError: 下层抓取输入不满足调用契约时透出。
+    """
 
     return cast(
         _FetchContentResult,
@@ -2375,7 +2439,7 @@ def _fetch_and_convert_content(
             headers=dict(headers) if headers is not None else None,
             build_fetch_headers=_build_fetch_headers,
             egress_policy=egress_policy,
-            resource_budget=resource_budget,
+            http_resource_budget=http_resource_budget,
             content_type_probe=content_type_probe,
             timeout_budget=timeout_budget,
             deadline_monotonic=deadline_monotonic,
@@ -2619,7 +2683,7 @@ def _playwright_sync_worker(
     playwright_channel: str | None = None,
     playwright_storage_state_path: str = "",
     egress_policy: WebEgressPolicy,
-    resource_budget: WebResourceBudget,
+    browser_resource_budget: BrowserResourceBudget,
 ) -> WebPayload:
     """在独立线程中执行完整的 Playwright 同步抓取流程。
 
@@ -2636,7 +2700,7 @@ def _playwright_sync_worker(
         playwright_channel: 浏览器回退使用的 Chromium channel。
         playwright_storage_state_path: 浏览器回退可选 storage state 文件路径。
         egress_policy: 当前 Web 调用唯一的出站策略。
-        resource_budget: HTTP、browser 与诊断共享的完整资源预算。
+        browser_resource_budget: 浏览器 DOM/text/Markdown 资源预算。
 
     Returns:
         成功时返回含 ``ok=True`` 的结果字典；失败时抛出异常由调用方处理。
@@ -2653,7 +2717,7 @@ def _playwright_sync_worker(
         playwright_storage_state_path=playwright_storage_state_path,
         get_playwright_browser=_get_playwright_browser,
         egress_policy=egress_policy,
-        resource_budget=resource_budget,
+        browser_resource_budget=browser_resource_budget,
         build_domain_home_url=_build_domain_home_url,
         normalize_url_for_http=_normalize_url_for_http,
         sanitize_response_headers=_sanitize_plain_response_headers,
@@ -2675,7 +2739,8 @@ def _fetch_and_convert_with_playwright(
     playwright_channel: str | None = None,
     playwright_storage_state_path: str = "",
     egress_policy: WebEgressPolicy,
-    resource_budget: WebResourceBudget,
+    browser_resource_budget: BrowserResourceBudget,
+    diagnostic_resource_budget: DiagnosticResourceBudget,
     cancellation_token: CancellationToken | None = None,
 ) -> WebPayload:
     """使用 Playwright 执行浏览器抓取并转换为 Markdown。
@@ -2692,7 +2757,8 @@ def _fetch_and_convert_with_playwright(
         playwright_channel: 浏览器回退使用的 Chromium channel。
         playwright_storage_state_path: 浏览器回退可选 storage state 文件路径。
         egress_policy: 当前 Web 调用唯一的出站策略。
-        resource_budget: HTTP、browser 与诊断共享的完整资源预算。
+        browser_resource_budget: 浏览器 DOM/text/Markdown 资源预算。
+        diagnostic_resource_budget: 浏览器失败诊断投影预算。
         cancellation_token: 当前工具调用的取消令牌。
 
     Returns:
@@ -2712,7 +2778,8 @@ def _fetch_and_convert_with_playwright(
         playwright_channel=playwright_channel,
         playwright_storage_state_path=playwright_storage_state_path,
         egress_policy=egress_policy,
-        resource_budget=resource_budget,
+        browser_resource_budget=browser_resource_budget,
+        diagnostic_resource_budget=diagnostic_resource_budget,
         cancellation_token=cancellation_token,
         resolve_timeout_budget=_resolve_timeout_budget,
         playwright_sync_worker=_playwright_sync_worker,

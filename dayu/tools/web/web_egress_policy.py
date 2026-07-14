@@ -256,12 +256,14 @@ class WebEgressPolicy:
         self,
         *,
         allow_private_network: bool = False,
+        allow_custom_port: bool = False,
         resolver: WebAddressResolver = _default_resolver,
     ) -> None:
         """初始化 policy。
 
         Args:
             allow_private_network: 是否启用显式 local/dev profile。
+            allow_custom_port: 是否允许非默认 HTTP(S) 端口。
             resolver: 每 hop 唯一的 hostname resolver。
 
         Returns:
@@ -272,6 +274,7 @@ class WebEgressPolicy:
         """
 
         self._allow_private_network = bool(allow_private_network)
+        self._allow_custom_port = bool(allow_custom_port)
         self._resolver = resolver
 
     @property
@@ -289,6 +292,22 @@ class WebEgressPolicy:
         """
 
         return self._allow_private_network
+
+    @property
+    def allows_custom_port(self) -> bool:
+        """返回当前 policy 是否允许非默认 HTTP(S) 端口。
+
+        Args:
+            无。
+
+        Returns:
+            允许自定义端口时返回 ``True``。
+
+        Raises:
+            无。
+        """
+
+        return self._allow_custom_port
 
     def authorize_http_target(self, url: str, *, stage: str) -> AuthorizedHttpTarget:
         """授权一个 HTTP hop 并冻结其 numeric destination。
@@ -309,7 +328,7 @@ class WebEgressPolicy:
         except ValueError as exc:
             raise WebEgressPolicyError(url=url, stage=stage, reason=str(exc)) from exc
 
-        if not self._allow_private_network and port != _DEFAULT_PORTS[scheme]:
+        if not self._allow_custom_port and port != _DEFAULT_PORTS[scheme]:
             raise WebEgressPolicyError(url=url, stage=stage, reason="custom port is not allowed")
         if not self._allow_private_network and (
             hostname == "localhost" or hostname.endswith(_LOCAL_HOST_SUFFIXES)

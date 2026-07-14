@@ -19,7 +19,8 @@ from dayu.runtime.tools_discovery import (
     ToolsDiscoveryProviderSpec,
 )
 
-from .web_resource_budget import WebResourceBudget, web_resource_budget_from_json
+from .web_http_session import WebHttpTransportPolicy
+from .web_resource_budget import WebResourceBudgets, web_resource_budgets_from_json
 from .web_tools import WebToolsConfig, build_web_tool_definitions
 
 _PROVIDER_ID: Final[str] = "web-tools"
@@ -30,10 +31,41 @@ _CONFIG_REQUEST_TIMEOUT_SECONDS_FIELD: Final[str] = "request_timeout_seconds"
 _CONFIG_MAX_SEARCH_RESULTS_FIELD: Final[str] = "max_search_results"
 _CONFIG_FETCH_TRUNCATE_CHARS_FIELD: Final[str] = "fetch_truncate_chars"
 _CONFIG_ALLOW_PRIVATE_NETWORK_URL_FIELD: Final[str] = "allow_private_network_url"
+_CONFIG_ALLOW_CUSTOM_PORT_URL_FIELD: Final[str] = "allow_custom_port_url"
+_CONFIG_DNS_PEER_PROOF_ENABLED_FIELD: Final[str] = "dns_peer_proof_enabled"
+_CONFIG_ALLOW_ENVIRONMENT_PROXY_FIELD: Final[str] = "allow_environment_proxy"
+_CONFIG_BROWSER_ENABLED_FIELD: Final[str] = "browser_enabled"
 _CONFIG_PLAYWRIGHT_CHANNEL_FIELD: Final[str] = "playwright_channel"
 _CONFIG_PLAYWRIGHT_STORAGE_STATE_DIR_FIELD: Final[str] = "playwright_storage_state_dir"
 _CONFIG_RESOURCE_BUDGET_FIELD: Final[str] = "resource_budget"
+_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        _CONFIG_PROVIDER_FIELD,
+        _CONFIG_REQUEST_TIMEOUT_SECONDS_FIELD,
+        _CONFIG_MAX_SEARCH_RESULTS_FIELD,
+        _CONFIG_FETCH_TRUNCATE_CHARS_FIELD,
+        _CONFIG_ALLOW_PRIVATE_NETWORK_URL_FIELD,
+        _CONFIG_ALLOW_CUSTOM_PORT_URL_FIELD,
+        _CONFIG_DNS_PEER_PROOF_ENABLED_FIELD,
+        _CONFIG_ALLOW_ENVIRONMENT_PROXY_FIELD,
+        _CONFIG_BROWSER_ENABLED_FIELD,
+        _CONFIG_PLAYWRIGHT_CHANNEL_FIELD,
+        _CONFIG_PLAYWRIGHT_STORAGE_STATE_DIR_FIELD,
+        _CONFIG_RESOURCE_BUDGET_FIELD,
+    }
+)
 _WEB_TOOL_NAMES: Final[tuple[str, ...]] = ("search_web", "fetch_web_page")
+_DEFAULT_PROVIDER: Final[str] = "auto"
+_DEFAULT_REQUEST_TIMEOUT_SECONDS: Final[float] = 20.0
+_DEFAULT_MAX_SEARCH_RESULTS: Final[int] = 8
+_DEFAULT_FETCH_TRUNCATE_CHARS: Final[int] = 80_000
+_DEFAULT_ALLOW_PRIVATE_NETWORK_URL: Final[bool] = True
+_DEFAULT_ALLOW_CUSTOM_PORT_URL: Final[bool] = True
+_DEFAULT_DNS_PEER_PROOF_ENABLED: Final[bool] = False
+_DEFAULT_ALLOW_ENVIRONMENT_PROXY: Final[bool] = True
+_DEFAULT_BROWSER_ENABLED: Final[bool] = True
+_DEFAULT_PLAYWRIGHT_CHANNEL: Final[str] = "chrome"
+_DEFAULT_PLAYWRIGHT_STORAGE_STATE_DIR: Final[str] = ".dayu/web_tools_storage_states"
 
 
 def discover_tools(spec: ToolsDiscoveryProviderSpec) -> ToolsDiscoveryProviderOutput:
@@ -74,66 +106,94 @@ def _parse_config(config: Mapping[str, JsonValue]) -> WebToolsConfig:
         ValueError: 字段类型或取值非法时抛出。
     """
 
-    defaults = WebToolsConfig()
+    unknown_fields = set(config) - _CONFIG_FIELDS
+    if unknown_fields:
+        unknown_field = min(unknown_fields)
+        raise ValueError(
+            f"web provider config.{unknown_field} is not a supported field"
+        )
+
+    allow_private_network_url = _bool_default(
+        config,
+        _CONFIG_ALLOW_PRIVATE_NETWORK_URL_FIELD,
+        default=_DEFAULT_ALLOW_PRIVATE_NETWORK_URL,
+    )
+    allow_custom_port_url = _bool_default(
+        config,
+        _CONFIG_ALLOW_CUSTOM_PORT_URL_FIELD,
+        default=_DEFAULT_ALLOW_CUSTOM_PORT_URL,
+    )
+    dns_peer_proof_enabled = _bool_default(
+        config,
+        _CONFIG_DNS_PEER_PROOF_ENABLED_FIELD,
+        default=_DEFAULT_DNS_PEER_PROOF_ENABLED,
+    )
+    allow_environment_proxy = _bool_default(
+        config,
+        _CONFIG_ALLOW_ENVIRONMENT_PROXY_FIELD,
+        default=_DEFAULT_ALLOW_ENVIRONMENT_PROXY,
+    )
+    browser_enabled = _bool_default(
+        config,
+        _CONFIG_BROWSER_ENABLED_FIELD,
+        default=_DEFAULT_BROWSER_ENABLED,
+    )
     return WebToolsConfig(
-        provider=_parse_provider(config, defaults.provider),
+        allow_private_network_url=allow_private_network_url,
+        allow_custom_port_url=allow_custom_port_url,
+        browser_enabled=browser_enabled,
+        transport_policy=WebHttpTransportPolicy(
+            dns_peer_proof_enabled=dns_peer_proof_enabled,
+            allow_environment_proxy=allow_environment_proxy,
+        ),
+        resource_budgets=_resource_budgets_default(config),
+        provider=_parse_provider(config, _DEFAULT_PROVIDER),
         request_timeout_seconds=_positive_float(
             config,
             _CONFIG_REQUEST_TIMEOUT_SECONDS_FIELD,
-            defaults.request_timeout_seconds,
+            _DEFAULT_REQUEST_TIMEOUT_SECONDS,
         ),
         max_search_results=_positive_int(
             config,
             _CONFIG_MAX_SEARCH_RESULTS_FIELD,
-            defaults.max_search_results,
+            _DEFAULT_MAX_SEARCH_RESULTS,
         ),
         fetch_truncate_chars=_positive_int(
             config,
             _CONFIG_FETCH_TRUNCATE_CHARS_FIELD,
-            defaults.fetch_truncate_chars,
-        ),
-        allow_private_network_url=_bool_default(
-            config,
-            _CONFIG_ALLOW_PRIVATE_NETWORK_URL_FIELD,
-            default=defaults.allow_private_network_url,
+            _DEFAULT_FETCH_TRUNCATE_CHARS,
         ),
         playwright_channel=_optional_text_default(
             config,
             _CONFIG_PLAYWRIGHT_CHANNEL_FIELD,
-            defaults.playwright_channel,
+            _DEFAULT_PLAYWRIGHT_CHANNEL,
         ),
         playwright_storage_state_dir=_text_default(
             config,
             _CONFIG_PLAYWRIGHT_STORAGE_STATE_DIR_FIELD,
-            defaults.playwright_storage_state_dir,
-        ),
-        resource_budget=_resource_budget_default(
-            config,
-            defaults.resource_budget,
+            _DEFAULT_PLAYWRIGHT_STORAGE_STATE_DIR,
         ),
     )
 
 
-def _resource_budget_default(
+def _resource_budgets_default(
     config: Mapping[str, JsonValue],
-    default: WebResourceBudget,
-) -> WebResourceBudget:
-    """读取完整 Web 资源预算。
+) -> WebResourceBudgets:
+    """读取 nested Web 资源预算并按 child owner 局部补默认。
 
     Args:
         config: provider 自有 JSON 配置。
-        default: 整个 ``resource_budget`` 缺失时使用的完整默认值。
 
     Returns:
-        完整、已校验的资源预算。
+        已校验的三个 child budget 纯组合。
 
     Raises:
-        ValueError: ``resource_budget`` 存在但不是完整合法 object 时抛出。
+        ValueError: ``resource_budget`` 或其 group/field 非法时抛出。
     """
 
     if _CONFIG_RESOURCE_BUDGET_FIELD not in config:
-        return default
-    return web_resource_budget_from_json(config[_CONFIG_RESOURCE_BUDGET_FIELD])
+        return web_resource_budgets_from_json({})
+    return web_resource_budgets_from_json(config[_CONFIG_RESOURCE_BUDGET_FIELD])
 
 
 def _parse_provider(config: Mapping[str, JsonValue], default: str) -> str:
@@ -235,9 +295,9 @@ def _bool_default(
         ValueError: 字段存在但不是布尔值时抛出。
     """
 
-    value = config.get(field_name)
-    if value is None:
+    if field_name not in config:
         return default
+    value = config[field_name]
     if not isinstance(value, bool):
         raise ValueError(f"web provider config.{field_name} must be boolean")
     return value

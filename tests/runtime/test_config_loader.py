@@ -468,7 +468,26 @@ def test_default_runtime_config_files_load_as_typed_views() -> None:
         web_provider.config["playwright_storage_state_dir"]
         == ".dayu/web_tools_storage_states"
     )
-    assert web_provider.config["allow_private_network_url"] is False
+    assert web_provider.config["allow_private_network_url"] is True
+    assert web_provider.config["allow_custom_port_url"] is True
+    assert web_provider.config["dns_peer_proof_enabled"] is False
+    assert web_provider.config["allow_environment_proxy"] is True
+    assert web_provider.config["browser_enabled"] is True
+    assert web_provider.config["resource_budget"] == {
+        "http": {
+            "wire_body_bytes": 134217728,
+            "decoded_body_bytes": 268435456,
+        },
+        "browser": {
+            "warmup_body_bytes": 1048576,
+            "dom_chars": 16777216,
+            "text_chars": 8388608,
+        },
+        "diagnostics": {
+            "error_chars": 8192,
+            "events": 512,
+        },
+    }
     utils_provider = config.tool_discovery.providers["utils-tools"]
     assert utils_provider.enabled is True
     assert utils_provider.import_path == "dayu.tools.utils:discover_tools"

@@ -49,7 +49,7 @@ from .web_egress_policy import (
     WebEgressPolicyError,
 )
 from .web_http_session import AuthorizedResponseLease, _send_authorized_request
-from .web_resource_budget import WebResourceBudget
+from .web_resource_budget import BrowserResourceBudget, HttpResourceBudget
 
 _WARMUP_TIMEOUT_SECONDS = 6.0
 _EMPTY_CONTENT_MIN_CHARS = 5
@@ -663,13 +663,14 @@ def _decompress_limited_response_body(
     response: requests.Response,
     wire_body: bytes,
     *,
-    resource_budget: WebResourceBudget,
+    http_resource_budget: HttpResourceBudget,
 ) -> bytes:
     """按 ``Content-Encoding`` 解压并限制 decompressed body 大小。
 
     Args:
         response: 当前 HTTP 响应。
         wire_body: 已按 wire 上限读取的原始字节。
+        http_resource_budget: HTTP decoded body 预算。
 
     Returns:
         解压后的 body 字节。
@@ -688,7 +689,7 @@ def _decompress_limited_response_body(
                 response,
                 decoded,
                 window_bits=zlib.MAX_WBITS | 16,
-                limit_bytes=resource_budget.decoded_body_bytes,
+                limit_bytes=http_resource_budget.decoded_body_bytes,
             )
         elif encoding == "deflate":
             decoded = _decode_zlib_layer(
@@ -699,7 +700,7 @@ def _decompress_limited_response_body(
                     if _zlib_wrapped_deflate(decoded)
                     else -zlib.MAX_WBITS
                 ),
-                limit_bytes=resource_budget.decoded_body_bytes,
+                limit_bytes=http_resource_budget.decoded_body_bytes,
             )
         elif encoding == "br":
             raise _UnsupportedBoundedContentEncoding("brotli")
@@ -707,26 +708,27 @@ def _decompress_limited_response_body(
             decoded = _decode_zstd_layer(
                 response,
                 decoded,
-                limit_bytes=resource_budget.decoded_body_bytes,
+                limit_bytes=http_resource_budget.decoded_body_bytes,
             )
         else:
             raise _UnsupportedBoundedContentEncoding(encoding)
     return _bounded_identity_layer(
         response,
         decoded,
-        limit_bytes=resource_budget.decoded_body_bytes,
+        limit_bytes=http_resource_budget.decoded_body_bytes,
     )
 
 
 def _read_limited_response_body(
     response: requests.Response,
     *,
-    resource_budget: WebResourceBudget,
+    http_resource_budget: HttpResourceBudget,
 ) -> bytes:
     """读取响应 body，并同时执行 wire/decompressed 上限。
 
     Args:
         response: 使用 ``stream=True`` 创建的 HTTP 响应。
+        http_resource_budget: HTTP wire/decoded body 预算。
 
     Returns:
         已解压、可供后续 HTML/Docling 转换消费的 body 字节。
@@ -742,12 +744,12 @@ def _read_limited_response_body(
             declared_length = int(content_length)
         except ValueError:
             declared_length = 0
-        if declared_length > resource_budget.wire_body_bytes:
+        if declared_length > http_resource_budget.wire_body_bytes:
             raise _FetchBodyLimitExceeded(
                 "HTTP response declared body exceeded fetch wire limit.",
                 final_url=str(getattr(response, "url", "") or ""),
                 limit_kind="wire",
-                limit_bytes=resource_budget.wire_body_bytes,
+                limit_bytes=http_resource_budget.wire_body_bytes,
                 observed_bytes=declared_length,
                 response_context=_build_fetch_body_limit_runtime_context(response),
             )
@@ -759,26 +761,27 @@ def _read_limited_response_body(
             chunks=chunks,
             chunk=chunk,
             observed_bytes=observed_bytes,
-            limit_bytes=resource_budget.wire_body_bytes,
+            limit_bytes=http_resource_budget.wire_body_bytes,
             limit_kind="wire",
             response=response,
         )
     return _decompress_limited_response_body(
         response,
         b"".join(chunks),
-        resource_budget=resource_budget,
+        http_resource_budget=http_resource_budget,
     )
 
 
 def _materialize_response_body(
     response: requests.Response,
     *,
-    resource_budget: WebResourceBudget,
+    http_resource_budget: HttpResourceBudget,
 ) -> None:
     """把有界读取后的响应 body 写回 ``requests.Response``。
 
     Args:
         response: 当前 HTTP 响应。
+        http_resource_budget: HTTP wire/decoded body 预算。
 
     Returns:
         无。
@@ -790,7 +793,7 @@ def _materialize_response_body(
 
     decoded_body = _read_limited_response_body(
         response,
-        resource_budget=resource_budget,
+        http_resource_budget=http_resource_budget,
     )
     setattr(response, "_content", decoded_body)
     response.raw.decode_content = False
@@ -1255,12 +1258,34 @@ def _warmup_domain(
     normalize_url_for_http: Callable[[str], str],
     is_timeout_like_exception: Callable[[BaseException], bool],
     egress_policy: WebEgressPolicy,
-    resource_budget: WebResourceBudget,
+    browser_resource_budget: BrowserResourceBudget,
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
     cancellation_token: CancellationToken | None = None,
 ) -> dict[str, str | bool | int | float | None]:
-    """对目标域做一次预热请求以建立 Cookie。"""
+    """对目标域做一次有界预热请求以建立 Cookie。
+
+    Args:
+        session: 当前 requests Session。
+        url: 目标 URL。
+        timeout_seconds: 基础请求超时秒数。
+        headers: 请求头。
+        resolve_timeout_budget: 当前阶段 timeout 解析函数。
+        build_domain_home_url: 同域首页 URL 构造函数。
+        normalize_url_for_http: HTTP URL 规范化函数。
+        is_timeout_like_exception: timeout 异常识别函数。
+        egress_policy: 当前 Web 调用唯一出站策略。
+        browser_resource_budget: warmup body 预算。
+        timeout_budget: 工具调用总预算。
+        deadline_monotonic: 当前工具调用 deadline。
+        cancellation_token: 当前工具调用取消令牌。
+
+    Returns:
+        warmup 尝试、状态、跳数和消费字节等事实。
+
+    Raises:
+        无。请求失败会投影为返回事实；取消由内部检查函数抛出。
+    """
 
     host = (urlparse(url).hostname or "").lower().strip()
     if not host:
@@ -1299,7 +1324,7 @@ def _warmup_domain(
             _raise_if_cancelled(cancellation_token)
             consumed_body_bytes = _consume_warmup_response_body(
                 response,
-                max_bytes=resource_budget.warmup_body_bytes,
+                max_bytes=browser_resource_budget.warmup_body_bytes,
             )
             result: dict[str, str | bool | int | float | None] = {
                 "attempted": True,
@@ -1333,15 +1358,30 @@ def _probe_content_type(
     normalize_url_for_http: Callable[[str], str],
     is_timeout_like_exception: Callable[[BaseException], bool],
     egress_policy: WebEgressPolicy,
-    resource_budget: WebResourceBudget,
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
     cancellation_token: CancellationToken | None = None,
 ) -> dict[str, str | bool | int | None]:
     """探测目标资源类型（HEAD 优先，失败降级到零 body GET）。
 
-    ``resource_budget`` 由与 main/warmup 相同的 owner 显式传入；probe 只读
-    response headers 并立即关闭 lease，因此不消费其 body budget。
+    Args:
+        session: 当前 requests Session。
+        url: 目标 URL。
+        timeout_seconds: 基础请求超时秒数。
+        headers: 请求头。
+        resolve_timeout_budget: 当前阶段 timeout 解析函数。
+        normalize_url_for_http: HTTP URL 规范化函数。
+        is_timeout_like_exception: timeout 异常识别函数。
+        egress_policy: 当前 Web 调用唯一出站策略。
+        timeout_budget: 工具调用总预算。
+        deadline_monotonic: 当前工具调用 deadline。
+        cancellation_token: 当前工具调用取消令牌。
+
+    Returns:
+        HEAD 或零 body GET 观察到的内容类型与响应事实。
+
+    Raises:
+        无。两种探测失败均投影为返回事实；取消由内部检查函数抛出。
     """
 
     timeout = min(
@@ -1515,7 +1555,7 @@ def _fetch_and_convert_content(
     headers: dict[str, str] | None = None,
     build_fetch_headers: Callable[[str], dict[str, str]] | None = None,
     egress_policy: WebEgressPolicy,
-    resource_budget: WebResourceBudget,
+    http_resource_budget: HttpResourceBudget,
     content_type_probe: dict[str, str | bool | int | None] | None = None,
     timeout_budget: float | None = None,
     deadline_monotonic: float | None = None,
@@ -1536,9 +1576,11 @@ def _fetch_and_convert_content(
         headers: 可选请求头。
         build_fetch_headers: 默认请求头构造器。
         egress_policy: 当前 Web 调用唯一的出站策略。
+        http_resource_budget: HTTP wire/decoded body 预算。
         content_type_probe: 可选内容类型探测结果。
         timeout_budget: Runner 注入的单次 tool call 总预算。
         deadline_monotonic: 当前工具调用的单调时钟 deadline。
+        cancellation_token: 当前工具调用的可选取消令牌。
 
     Returns:
         抓取和转换结果，包含 ``title/content/http_status/final_url`` 等字段。
@@ -1593,7 +1635,7 @@ def _fetch_and_convert_content(
             try:
                 _materialize_response_body(
                     response,
-                    resource_budget=resource_budget,
+                    http_resource_budget=http_resource_budget,
                 )
             except _UnsupportedBoundedContentEncoding as exc:
                 raise _FetchContentConversionError(

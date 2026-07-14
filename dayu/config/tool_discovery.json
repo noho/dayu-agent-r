@@ -75,7 +75,26 @@
         "fetch_truncate_chars": 80000,
         "playwright_channel": "chrome",
         "playwright_storage_state_dir": ".dayu/web_tools_storage_states",
-        "allow_private_network_url": false
+        "allow_private_network_url": true,
+        "allow_custom_port_url": true,
+        "dns_peer_proof_enabled": false,
+        "allow_environment_proxy": true,
+        "browser_enabled": true,
+        "resource_budget": {
+          "http": {
+            "wire_body_bytes": 134217728,
+            "decoded_body_bytes": 268435456
+          },
+          "browser": {
+            "warmup_body_bytes": 1048576,
+            "dom_chars": 16777216,
+            "text_chars": 8388608
+          },
+          "diagnostics": {
+            "error_chars": 8192,
+            "events": 512
+          }
+        }
       }
     },
     "utils-tools": {

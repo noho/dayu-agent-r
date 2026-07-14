@@ -11,6 +11,7 @@ import ipaddress
 import socket
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from threading import Lock
 from types import TracebackType
 from typing import TYPE_CHECKING, cast
@@ -42,6 +43,27 @@ _MIN_TIMEOUT_BUDGET_SECONDS = 0.05
 _WEB_SESSION: requests.Session | None = None
 _WEB_NO_RETRY_SESSION: requests.Session | None = None
 _WEB_SESSION_LOCK = Lock()
+
+
+@dataclass(frozen=True, slots=True)
+class WebHttpTransportPolicy:
+    """一次 Web tool attempt 的 HTTP transport 配置快照。
+
+    S1 只保存该 snapshot；sender 仍使用既有 numeric pin 与 no-proxy 路径。
+
+    Args:
+        dns_peer_proof_enabled: 是否要求 numeric target 与实际 peer proof。
+        allow_environment_proxy: 是否允许 ``requests`` 读取环境 proxy。
+
+    Returns:
+        不可变 transport policy。
+
+    Raises:
+        无。
+    """
+
+    dns_peer_proof_enabled: bool
+    allow_environment_proxy: bool
 
 
 class _PinnedHTTPConnection(HTTPConnection):
