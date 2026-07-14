@@ -26,11 +26,13 @@ from dataclasses import MISSING, dataclass, field, fields
 from datetime import datetime
 from multiprocessing.process import BaseProcess
 from pathlib import Path
+from queue import Empty
 from types import ModuleType
 from typing import ParamSpec, TypeVar, cast
 
 import pytest
 import requests
+import playwright.sync_api as playwright_sync_api
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from urllib3.response import HTTPResponse
 
@@ -126,6 +128,8 @@ _PEER_PROOF_TRANSPORT_POLICY = web_http_session.WebHttpTransportPolicy(
     dns_peer_proof_enabled=True,
     allow_environment_proxy=False,
 )
+_ROUTE_ABORT_ACTION = "abort"
+_ROUTE_CONTINUE_ACTION = "continue"
 
 
 def test_web_diagnostic_projection_removes_secret_content_url_headers_exception_and_network() -> None:
@@ -203,6 +207,78 @@ def test_playwright_success_final_url_uses_safe_projection() -> None:
 
     assert payload["final_url"] == "https://example.com/report"
     assert sentinel not in str(payload["final_url"])
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        "//example.com/report",
+        "https:///report",
+        "https://@/report",
+    ),
+)
+def test_normalize_url_for_http_rejects_missing_transport_parts(url: str) -> None:
+    """HTTP normalizer 必须直接拒绝缺 scheme、netloc 或 hostname 的输入。
+
+    Args:
+        url: 缺少一个 transport URL 必填部分的输入。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: normalizer 未拒绝非法输入时抛出。
+    """
+
+    with pytest.raises(ValueError, match="无效 URL"):
+        web_tools._normalize_url_for_http(url)
+
+
+def test_normalize_url_for_http_encodes_idna_and_userinfo_for_transport() -> None:
+    """HTTP normalizer 只负责 IDNA 与 userinfo/path/query/fragment 传输 quoting。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: ASCII/IDNA/userinfo quoting 结果不符合 owner 契约时抛出。
+    """
+
+    normalized = web_tools._normalize_url_for_http(
+        "https://用户名:密 码@例子.测试/财报?q=营业收入#片段"
+    )
+
+    assert normalized == (
+        "https://%E7%94%A8%E6%88%B7%E5%90%8D:%E5%AF%86%20%E7%A0%81@"
+        "xn--fsqu00a.xn--0zwm56d/%E8%B4%A2%E6%8A%A5?"
+        "q=%E8%90%A5%E4%B8%9A%E6%94%B6%E5%85%A5#%E7%89%87%E6%AE%B5"
+    )
+
+
+def test_web_egress_policy_owner_rejects_userinfo_url() -> None:
+    """WebEgressPolicy 必须作为唯一安全 owner 拒绝 URL userinfo。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: userinfo URL 未在 egress owner 边界被拒绝时抛出。
+    """
+
+    with pytest.raises(WebEgressPolicyError) as exc_info:
+        _public_test_policy().authorize_http_target(
+            "https://user:secret@example.com/report",
+            stage="tool_input",
+        )
+
+    assert exc_info.value.reason == "userinfo is not allowed"
+    assert exc_info.value.stage == "tool_input"
 
 
 def test_raise_fetch_failure_accepts_only_owner_projection_inputs() -> None:
@@ -1127,6 +1203,293 @@ class _SyntheticPlaywrightBrowser:
         return
 
 
+class _LifecyclePlaywrightBrowser:
+    """记录 browser singleton 生命周期动作并可注入关闭异常。"""
+
+    def __init__(self, *, close_error: RuntimeError | None = None) -> None:
+        """初始化 browser 生命周期替身。
+
+        Args:
+            close_error: ``close`` 调用后需要抛出的可选异常。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.close_error = close_error
+        self.close_calls = 0
+
+    def new_context(
+        self,
+        **kwargs: JsonValue,
+    ) -> web_playwright_backend._BrowserContextProtocol:
+        """拒绝生命周期测试范围外的 browser context 创建。
+
+        Args:
+            kwargs: Playwright browser context 参数。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 生命周期 owner 测试意外创建 context 时抛出。
+        """
+
+        del kwargs
+        raise AssertionError("lifecycle fake browser must not create a context")
+
+    def close(self) -> None:
+        """记录 browser close，并按配置抛出异常。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            RuntimeError: 配置了关闭异常时抛出。
+        """
+
+        self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
+
+
+class _LifecycleChromiumLauncher:
+    """记录 Chromium launch 输入并返回指定 lifecycle browser。"""
+
+    def __init__(
+        self,
+        browser: _LifecyclePlaywrightBrowser,
+        *,
+        launch_error: RuntimeError | None = None,
+    ) -> None:
+        """初始化 Chromium launcher 替身。
+
+        Args:
+            browser: launch 成功时返回的 browser。
+            launch_error: launch 时需要抛出的可选异常。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.browser = browser
+        self.launch_error = launch_error
+        self.launch_calls: list[dict[str, JsonValue]] = []
+
+    def launch(
+        self,
+        **kwargs: JsonValue,
+    ) -> web_playwright_backend._BrowserProtocol:
+        """记录 launch 参数并返回或拒绝 browser 创建。
+
+        Args:
+            kwargs: Chromium launch 参数。
+
+        Returns:
+            配置的 browser。
+
+        Raises:
+            RuntimeError: 配置了 launch 异常时抛出。
+        """
+
+        self.launch_calls.append(dict(kwargs))
+        if self.launch_error is not None:
+            raise self.launch_error
+        return cast(web_playwright_backend._BrowserProtocol, self.browser)
+
+
+class _LifecyclePlaywrightInstance:
+    """提供 typed Chromium launcher 并记录 runtime stop。"""
+
+    def __init__(
+        self,
+        chromium: _LifecycleChromiumLauncher,
+        *,
+        stop_error: RuntimeError | None = None,
+    ) -> None:
+        """初始化 Playwright runtime 替身。
+
+        Args:
+            chromium: 当前 runtime 的 Chromium launcher。
+            stop_error: ``stop`` 调用后需要抛出的可选异常。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.chromium = chromium
+        self.stop_error = stop_error
+        self.stop_calls = 0
+
+    def stop(self) -> None:
+        """记录 runtime stop，并按配置抛出异常。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            RuntimeError: 配置了停止异常时抛出。
+        """
+
+        self.stop_calls += 1
+        if self.stop_error is not None:
+            raise self.stop_error
+
+
+class _LifecyclePlaywrightStarter:
+    """模拟 ``sync_playwright()`` 返回值的 start 边界。"""
+
+    def __init__(self, instance: _LifecyclePlaywrightInstance) -> None:
+        """保存一次 start 应返回的 runtime。
+
+        Args:
+            instance: start 后返回的 Playwright runtime。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.instance = instance
+        self.start_calls = 0
+
+    def start(self) -> _LifecyclePlaywrightInstance:
+        """记录 start 并返回配置的 runtime。
+
+        Args:
+            无。
+
+        Returns:
+            配置的 Playwright runtime。
+
+        Raises:
+            无。
+        """
+
+        self.start_calls += 1
+        return self.instance
+
+
+class _LifecycleSyncPlaywrightFactory:
+    """按调用顺序提供 typed Playwright starter。"""
+
+    def __init__(self, instances: tuple[_LifecyclePlaywrightInstance, ...]) -> None:
+        """初始化有界 runtime 序列。
+
+        Args:
+            instances: 每次 ``sync_playwright`` 调用应启动的 runtime。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: 没有提供 runtime 时抛出。
+        """
+
+        if not instances:
+            raise ValueError("at least one lifecycle Playwright instance is required")
+        self.instances = instances
+        self.starters: list[_LifecyclePlaywrightStarter] = []
+
+    def __call__(self) -> _LifecyclePlaywrightStarter:
+        """返回下一项 starter，不允许测试静默超用 runtime。
+
+        Args:
+            无。
+
+        Returns:
+            下一项 typed Playwright starter。
+
+        Raises:
+            AssertionError: 调用次数超过配置 runtime 数量时抛出。
+        """
+
+        if len(self.starters) >= len(self.instances):
+            raise AssertionError("unexpected extra sync_playwright call")
+        starter = _LifecyclePlaywrightStarter(self.instances[len(self.starters)])
+        self.starters.append(starter)
+        return starter
+
+
+@dataclass(frozen=True, slots=True)
+class _RecordingRouteRequest:
+    """提供 route owner 所需的资源类型和 URL 输入。"""
+
+    resource_type: str
+    url: str
+
+
+class _RecordingPlaywrightRoute:
+    """只记录 browser route owner 选择的 abort/continue 动作。"""
+
+    def __init__(self, *, resource_type: str, url: str) -> None:
+        """初始化 route action recorder。
+
+        Args:
+            resource_type: Playwright request 资源类型。
+            url: Playwright request URL。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.request = cast(
+            web_playwright_backend._RouteRequestProtocol,
+            _RecordingRouteRequest(resource_type=resource_type, url=url),
+        )
+        self.actions: list[str] = []
+
+    def abort(self) -> None:
+        """记录 route owner 选择了 abort。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.actions.append(_ROUTE_ABORT_ACTION)
+
+    def continue_(self) -> None:
+        """记录 route owner 选择了 continue。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.actions.append(_ROUTE_CONTINUE_ACTION)
+
+
 @dataclass(frozen=True, slots=True)
 class _SyntheticHtmlPipelineResult:
     """browser worker HTML converter 的最小成功结果。"""
@@ -1309,6 +1672,30 @@ def _diagnostic_resource_budget(
     """
 
     return DiagnosticResourceBudget(error_chars=error_chars, events=events)
+
+
+def _playwright_worker_process_kwargs() -> web_playwright_backend._WorkerKwargs:
+    """构造 process owner 测试共用的 typed worker kwargs。
+
+    Args:
+        无。
+
+    Returns:
+        不依赖真实浏览器、网络或子进程的 worker 参数。
+
+    Raises:
+        无。
+    """
+
+    return {
+        "url": "https://example.com/report",
+        "timeout_seconds": 1.0,
+        "headers": None,
+        "playwright_channel": None,
+        "playwright_storage_state_path": "",
+        "egress_policy": _public_test_policy(),
+        "browser_resource_budget": _DEFAULT_BROWSER_RESOURCE_BUDGET,
+    }
 
 
 def _resource_budgets(
@@ -1570,6 +1957,428 @@ class _ManualCancellationToken:
         """
 
         return self._requested_at
+
+
+class _FakePlaywrightResultQueue:
+    """模拟 multiprocessing Queue，并记录 finally cleanup 动作。"""
+
+    def __init__(
+        self,
+        payloads: tuple[web_playwright_backend.WebPayload, ...] = (),
+    ) -> None:
+        """初始化结果队列替身。
+
+        Args:
+            payloads: 按读取顺序返回的 worker payload。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.payloads = list(payloads)
+        self.put_calls: list[web_playwright_backend.WebPayload] = []
+        self.get_calls: list[float | None] = []
+        self.close_calls = 0
+        self.join_thread_calls = 0
+
+    def put(
+        self,
+        obj: web_playwright_backend.WebPayload,
+        block: bool = True,
+        timeout: float | None = None,
+    ) -> None:
+        """记录 worker 写入，不执行跨进程通信。
+
+        Args:
+            obj: worker 结果 payload。
+            block: 是否阻塞写入。
+            timeout: 写入 timeout。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        del block, timeout
+        self.put_calls.append(obj)
+
+    def get(
+        self,
+        block: bool = True,
+        timeout: float | None = None,
+    ) -> web_playwright_backend.WebPayload:
+        """返回下一项 payload，空队列时立即报告 ``Empty``。
+
+        Args:
+            block: 是否阻塞读取。
+            timeout: 读取 timeout；仅记录，不等待。
+
+        Returns:
+            下一项 worker payload。
+
+        Raises:
+            Empty: 没有预置 payload 时抛出。
+        """
+
+        del block
+        self.get_calls.append(timeout)
+        if not self.payloads:
+            raise Empty
+        return self.payloads.pop(0)
+
+    def get_nowait(self) -> web_playwright_backend.WebPayload:
+        """非阻塞返回下一项 payload。
+
+        Args:
+            无。
+
+        Returns:
+            下一项 worker payload。
+
+        Raises:
+            Empty: 没有预置 payload 时抛出。
+        """
+
+        return self.get(block=False, timeout=0.0)
+
+    def close(self) -> None:
+        """记录父进程关闭 queue 句柄。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.close_calls += 1
+
+    def join_thread(self) -> None:
+        """记录父进程等待 queue feeder thread。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.join_thread_calls += 1
+
+
+class _FakePlaywrightProcess:
+    """模拟 multiprocessing Process 的启动、存活与 join 状态。"""
+
+    def __init__(self, *, alive_after_start: bool) -> None:
+        """初始化进程替身。
+
+        Args:
+            alive_after_start: ``start`` 后 ``is_alive`` 的初始结果。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.alive_after_start = alive_after_start
+        self.alive = False
+        self.started = False
+        self.daemon = False
+        self.join_timeouts: list[float | None] = []
+
+    def start(self) -> None:
+        """记录进程启动但不创建真实子进程。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.started = True
+        self.alive = self.alive_after_start
+
+    def is_alive(self) -> bool:
+        """返回当前 fake process 存活状态。
+
+        Args:
+            无。
+
+        Returns:
+            当前存活状态。
+
+        Raises:
+            无。
+        """
+
+        return self.alive
+
+    def join(self, timeout: float | None = None) -> None:
+        """记录非阻塞 join 调用。
+
+        Args:
+            timeout: join timeout。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.join_timeouts.append(timeout)
+
+    def mark_terminated(self) -> None:
+        """让 termination collaborator 标记 fake process 已退出。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.alive = False
+
+
+class _FakePlaywrightMultiprocessingContext:
+    """向 process owner 提供固定 queue/process 的 typed context。"""
+
+    def __init__(
+        self,
+        *,
+        result_queue: _FakePlaywrightResultQueue,
+        process: _FakePlaywrightProcess,
+    ) -> None:
+        """初始化 multiprocessing context 替身。
+
+        Args:
+            result_queue: 本次 owner 调用应取得的 queue。
+            process: 本次 owner 调用应取得的 process。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.result_queue = result_queue
+        self.process = process
+        self.queue_maxsizes: list[int] = []
+        self.process_target: Callable[
+            [
+                web_playwright_backend._ResultQueueProtocol,
+                web_playwright_backend._PlaywrightWorkerProtocol,
+                web_playwright_backend._WorkerKwargs,
+                DiagnosticResourceBudget,
+                bool,
+            ],
+            None,
+        ] | None = None
+        self.process_args: tuple[
+            web_playwright_backend._ResultQueueProtocol,
+            web_playwright_backend._PlaywrightWorkerProtocol,
+            web_playwright_backend._WorkerKwargs,
+            DiagnosticResourceBudget,
+            bool,
+        ] | None = None
+
+    def Queue(
+        self,
+        *,
+        maxsize: int,
+    ) -> web_playwright_backend._ResultQueueProtocol:
+        """记录 queue 上限并返回固定 fake queue。
+
+        Args:
+            maxsize: owner 请求的结果队列容量。
+
+        Returns:
+            固定 fake result queue。
+
+        Raises:
+            无。
+        """
+
+        self.queue_maxsizes.append(maxsize)
+        return cast(web_playwright_backend._ResultQueueProtocol, self.result_queue)
+
+    def Process(
+        self,
+        *,
+        target: Callable[
+            [
+                web_playwright_backend._ResultQueueProtocol,
+                web_playwright_backend._PlaywrightWorkerProtocol,
+                web_playwright_backend._WorkerKwargs,
+                DiagnosticResourceBudget,
+                bool,
+            ],
+            None,
+        ],
+        args: tuple[
+            web_playwright_backend._ResultQueueProtocol,
+            web_playwright_backend._PlaywrightWorkerProtocol,
+            web_playwright_backend._WorkerKwargs,
+            DiagnosticResourceBudget,
+            bool,
+        ],
+    ) -> BaseProcess:
+        """记录 process target/args并返回固定 fake process。
+
+        Args:
+            target: production worker process entrypoint。
+            args: production worker process typed 参数。
+
+        Returns:
+            作为 ``BaseProcess`` 消费的固定 fake process。
+
+        Raises:
+            无。
+        """
+
+        self.process_target = target
+        self.process_args = args
+        return cast(BaseProcess, self.process)
+
+
+class _FakePlaywrightContextFactory:
+    """记录 ``multiprocessing.get_context`` 的 spawn 请求。"""
+
+    def __init__(self, context: _FakePlaywrightMultiprocessingContext) -> None:
+        """保存固定 multiprocessing context。
+
+        Args:
+            context: production owner 应取得的 fake context。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.context = context
+        self.methods: list[str | None] = []
+
+    def __call__(self, method: str | None = None) -> _FakePlaywrightMultiprocessingContext:
+        """记录 context method 并返回固定 context。
+
+        Args:
+            method: multiprocessing start method。
+
+        Returns:
+            固定 fake context。
+
+        Raises:
+            AssertionError: owner 未请求 ``spawn`` 时抛出。
+        """
+
+        self.methods.append(method)
+        assert method == "spawn"
+        return self.context
+
+
+class _RecordingPlaywrightProcessTerminator:
+    """只记录 process owner 发出的 terminate 动作。"""
+
+    def __init__(self) -> None:
+        """初始化 termination 记录。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.processes: list[_FakePlaywrightProcess] = []
+
+    def __call__(
+        self,
+        process: BaseProcess,
+    ) -> web_playwright_backend._PlaywrightProcessCleanup:
+        """记录 fake process 终止并返回空 cleanup 诊断。
+
+        Args:
+            process: production owner 要求终止的 process。
+
+        Returns:
+            terminate/kill 均未执行真实信号的 cleanup 诊断。
+
+        Raises:
+            AssertionError: 收到非 fake process 时抛出。
+        """
+
+        assert isinstance(process, _FakePlaywrightProcess)
+        self.processes.append(process)
+        process.mark_terminated()
+        return {"terminate": None, "kill": None}
+
+
+class _ScriptedMonotonicClock:
+    """按序返回单调时钟值，避免 timeout 测试等待真实时间。"""
+
+    def __init__(self, values: tuple[float, ...]) -> None:
+        """初始化时钟序列。
+
+        Args:
+            values: 每次调用依次返回的单调时间值。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: 时钟序列为空时抛出。
+        """
+
+        if not values:
+            raise ValueError("scripted monotonic clock requires values")
+        self.values = values
+        self.index = 0
+
+    def __call__(self) -> float:
+        """返回下一项时钟值，耗尽后保持最后值。
+
+        Args:
+            无。
+
+        Returns:
+            当前 scripted 单调时间值。
+
+        Raises:
+            无。
+        """
+
+        if self.index >= len(self.values):
+            return self.values[-1]
+        value = self.values[self.index]
+        self.index += 1
+        return value
 
 
 class _AcceptingPort(HostToolFactAcceptPort):
@@ -5704,6 +6513,160 @@ def test_warmup_streams_only_budgeted_body_and_closes_response(
     assert response.close_count == 1
 
 
+def test_get_playwright_browser_owner_creates_reuses_and_replaces_by_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Browser lifecycle owner 必须按 channel/headless key 创建、复用和替换。
+
+    Args:
+        monkeypatch: pytest 属性替换夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 单例创建、同 key 复用或 key 变化 cleanup/recreate 漂移时抛出。
+    """
+
+    browsers = tuple(_LifecyclePlaywrightBrowser() for _ in range(3))
+    launchers = tuple(_LifecycleChromiumLauncher(browser) for browser in browsers)
+    instances = tuple(_LifecyclePlaywrightInstance(launcher) for launcher in launchers)
+    factory = _LifecycleSyncPlaywrightFactory(instances)
+    monkeypatch.setattr(playwright_sync_api, "sync_playwright", factory)
+    monkeypatch.setattr(web_playwright_backend, "_PW_INSTANCE", None)
+    monkeypatch.setattr(web_playwright_backend, "_PW_BROWSER", None)
+    monkeypatch.setattr(web_playwright_backend, "_PW_BROWSER_KEY", None)
+
+    first = web_playwright_backend._get_playwright_browser(
+        playwright_channel="chrome",
+        headless=True,
+    )
+    reused = web_playwright_backend._get_playwright_browser(
+        playwright_channel=" chrome ",
+        headless=True,
+    )
+    channel_changed = web_playwright_backend._get_playwright_browser(
+        playwright_channel="chromium",
+        headless=True,
+    )
+    headless_changed = web_playwright_backend._get_playwright_browser(
+        playwright_channel="chromium",
+        headless=False,
+    )
+
+    assert first is browsers[0]
+    assert reused is first
+    assert channel_changed is browsers[1]
+    assert headless_changed is browsers[2]
+    assert len(factory.starters) == 3
+    assert [starter.start_calls for starter in factory.starters] == [1, 1, 1]
+    assert [len(launcher.launch_calls) for launcher in launchers] == [1, 1, 1]
+    assert [
+        (
+            launcher.launch_calls[0]["headless"],
+            launcher.launch_calls[0]["channel"],
+        )
+        for launcher in launchers
+    ] == [
+        (True, "chrome"),
+        (True, "chromium"),
+        (False, "chromium"),
+    ]
+    assert [browser.close_calls for browser in browsers] == [1, 1, 0]
+    assert [instance.stop_calls for instance in instances] == [1, 1, 0]
+    assert web_playwright_backend._PW_BROWSER is browsers[2]
+    assert web_playwright_backend._PW_INSTANCE is instances[2]
+    assert web_playwright_backend._PW_BROWSER_KEY == ("chromium", False)
+
+
+@pytest.mark.parametrize(
+    ("runtime_stop_error", "expected_cleanup_failure_diagnostics"),
+    (
+        (None, 0),
+        (
+            RuntimeError(
+                "sensitive-stop-body "
+                "url=https://user:password@example.test/private?token=secret "
+                "header=Authorization credential=secret-value "
+                "storage_path=/private/browser-state.json"
+            ),
+            1,
+        ),
+    ),
+)
+def test_get_playwright_browser_owner_cleans_local_runtime_without_publishing_failed_state(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    runtime_stop_error: RuntimeError | None,
+    expected_cleanup_failure_diagnostics: int,
+) -> None:
+    """Browser launch失败必须停止局部runtime且不得发布singleton半状态。
+
+    Args:
+        monkeypatch: pytest 属性替换夹具。
+        caplog: pytest 日志捕获夹具。
+        runtime_stop_error: 局部runtime stop时需要抛出的可选异常。
+        expected_cleanup_failure_diagnostics: 预期脱敏 cleanup-failure 诊断数量。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: cleanup、脱敏诊断、返回值或global发布契约漂移时抛出。
+    """
+
+    caplog.set_level(logging.DEBUG, logger=web_playwright_backend.__name__)
+    browser = _LifecyclePlaywrightBrowser()
+    launcher = _LifecycleChromiumLauncher(
+        browser,
+        launch_error=RuntimeError("synthetic launch failure"),
+    )
+    instance = _LifecyclePlaywrightInstance(
+        launcher,
+        stop_error=runtime_stop_error,
+    )
+    factory = _LifecycleSyncPlaywrightFactory((instance,))
+    monkeypatch.setattr(playwright_sync_api, "sync_playwright", factory)
+    monkeypatch.setattr(web_playwright_backend, "_PW_INSTANCE", None)
+    monkeypatch.setattr(web_playwright_backend, "_PW_BROWSER", None)
+    monkeypatch.setattr(web_playwright_backend, "_PW_BROWSER_KEY", None)
+
+    result = web_playwright_backend._get_playwright_browser(
+        playwright_channel="chrome",
+        headless=True,
+    )
+
+    assert result is None
+    assert len(factory.starters) == 1
+    assert factory.starters[0].start_calls == 1
+    assert len(launcher.launch_calls) == 1
+    assert instance.stop_calls == 1
+    assert web_playwright_backend._PW_INSTANCE is None
+    assert web_playwright_backend._PW_BROWSER is None
+    assert web_playwright_backend._PW_BROWSER_KEY is None
+    cleanup_failure_diagnostics = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == web_playwright_backend.__name__
+        and record.levelno == logging.DEBUG
+        and "stage=browser_launch_failure_runtime_stop" in record.getMessage()
+    ]
+    assert len(cleanup_failure_diagnostics) == expected_cleanup_failure_diagnostics
+    if cleanup_failure_diagnostics:
+        assert cleanup_failure_diagnostics == [
+            "[ENGINE.WEB_PLAYWRIGHT] Playwright runtime cleanup failed "
+            "stage=browser_launch_failure_runtime_stop exception_type=RuntimeError"
+        ]
+        for sensitive_fragment in (
+            "sensitive-stop-body",
+            "https://user:password@example.test/private?token=secret",
+            "Authorization",
+            "secret-value",
+            "/private/browser-state.json",
+        ):
+            assert sensitive_fragment not in caplog.text
+
+
 def test_playwright_budget_preflight_uses_only_tree_walker_before_projection() -> None:
     """DOM 超限预检不得调用完整 serialization 或 full text extraction。"""
 
@@ -5741,6 +6704,57 @@ def test_playwright_budget_preflight_uses_only_tree_walker_before_projection() -
         "innerText",
     ):
         assert forbidden not in script
+
+
+@pytest.mark.parametrize(
+    ("preflight_text_exceeded", "expected_content_calls", "expected_evaluate_calls"),
+    (
+        (True, 0, 1),
+        (False, 1, 2),
+    ),
+)
+def test_materialize_bounded_page_projection_owns_text_too_large_reason(
+    preflight_text_exceeded: bool,
+    expected_content_calls: int,
+    expected_evaluate_calls: int,
+) -> None:
+    """DOM 界内时 text 预检或实际超限都必须产生 typed text-too-large reason。
+
+    Args:
+        preflight_text_exceeded: 是否在 bounded text 预检阶段直接超限。
+        expected_content_calls: 预期完整 HTML 读取次数。
+        expected_evaluate_calls: 预期 page evaluate 总次数。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: text owner 未产生稳定 typed reason 或调用边界漂移时抛出。
+    """
+
+    page = _BudgetProbePage(
+        metrics={
+            "domChars": 5,
+            "textChars": 11 if preflight_text_exceeded else 2,
+            "domExceeded": False,
+            "textExceeded": preflight_text_exceeded,
+        },
+        html="short",
+        page_text="x" * 11,
+    )
+
+    with pytest.raises(web_playwright_backend._BrowserResourceBudgetExceeded) as exc_info:
+        web_playwright_backend._materialize_bounded_page_projection(
+            cast(web_playwright_backend._PageProtocol, page),
+            browser_resource_budget=_browser_resource_budget(
+                dom_chars=10,
+                text_chars=10,
+            ),
+        )
+
+    assert exc_info.value.reason == web_playwright_backend._BROWSER_TEXT_TOO_LARGE_REASON
+    assert page.content_calls == expected_content_calls
+    assert len(page.evaluate_calls) == expected_evaluate_calls
 
 
 def test_playwright_budget_rechecks_dynamic_full_projection_lengths() -> None:
@@ -7256,41 +8270,46 @@ def test_search_resource_budget_failure_projects_stable_tool_error(
     assert outcome.result.hint == (web_tool_projection_text.WEB_SEARCH_RESPONSE_BODY_TOO_LARGE_HINT)
 
 
-def test_playwright_route_blocks_private_request_before_continue() -> None:
-    """Playwright request 目标必须在 continue 前复用 URL safety owner。"""
+@pytest.mark.parametrize(
+    ("resource_type", "url", "expected_action"),
+    (
+        ("image", "https://example.com/image.png", _ROUTE_ABORT_ACTION),
+        ("font", "https://example.com/font.woff2", _ROUTE_ABORT_ACTION),
+        ("media", "https://example.com/video.mp4", _ROUTE_ABORT_ACTION),
+        ("document", "http://127.0.0.1/internal", _ROUTE_ABORT_ACTION),
+        ("document", "https://example.com/report", _ROUTE_CONTINUE_ACTION),
+    ),
+)
+def test_route_handler_owner_selects_resource_policy_or_continue_action(
+    resource_type: str,
+    url: str,
+    expected_action: str,
+) -> None:
+    """Browser route owner 必须覆盖资源 abort、policy deny 与 allowed continue。
 
-    class FakeRequest:
-        """测试用 Playwright request。"""
+    Args:
+        resource_type: Playwright request 资源类型。
+        url: Playwright request URL。
+        expected_action: owner 应选择的唯一 route action。
 
-        resource_type: str = "document"
-        url: str = "http://127.0.0.1/internal"
+    Returns:
+        无。
 
-    class FakeRoute:
-        """测试用 Playwright route。"""
+    Raises:
+        AssertionError: route owner 选择的 action 不符合 contract 时抛出。
+    """
 
-        request: web_playwright_backend._RouteRequestProtocol = FakeRequest()
-        aborted: bool = False
-        continued: bool = False
-
-        def abort(self) -> None:
-            """记录 abort 调用。"""
-
-            self.aborted = True
-
-        def continue_(self) -> None:
-            """记录 continue 调用。"""
-
-            self.continued = True
-
-    route = FakeRoute()
+    route = _RecordingPlaywrightRoute(
+        resource_type=resource_type,
+        url=url,
+    )
 
     web_playwright_backend._route_handler_abort_resources(
-        route,
+        cast(web_playwright_backend._RouteProtocol, route),
         egress_policy=_public_test_policy(),
     )
 
-    assert route.aborted is True
-    assert route.continued is False
+    assert route.actions == [expected_action]
 
 
 def test_playwright_public_direct_runs_without_private_permission(
@@ -7877,6 +8896,227 @@ def test_playwright_process_entry_controls_proxy_environment(
     disabled_names = cast(list[str], observed_payloads[1]["visible_proxy_environment"])
     assert "HTTPS_PROXY" in enabled_names
     assert disabled_names == []
+
+
+def test_run_playwright_worker_process_cancellation_terminates_and_cleans_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Process owner 收到取消后必须 terminate、抛 CancelledError 并清理 queue。
+
+    Args:
+        monkeypatch: pytest 属性替换夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 取消、终止或 finally cleanup 契约漂移时抛出。
+    """
+
+    result_queue = _FakePlaywrightResultQueue()
+    process = _FakePlaywrightProcess(alive_after_start=True)
+    context = _FakePlaywrightMultiprocessingContext(
+        result_queue=result_queue,
+        process=process,
+    )
+    context_factory = _FakePlaywrightContextFactory(context)
+    terminator = _RecordingPlaywrightProcessTerminator()
+    cancellation_token = _ManualCancellationToken()
+    cancellation_token.cancel("controller cancellation")
+    monkeypatch.setattr(
+        web_playwright_backend.multiprocessing,
+        "get_context",
+        context_factory,
+    )
+    monkeypatch.setattr(
+        web_playwright_backend,
+        "_terminate_playwright_process",
+        terminator,
+    )
+
+    with pytest.raises(web_playwright_backend.CancelledError) as exc_info:
+        web_playwright_backend._run_playwright_worker_process(
+            playwright_sync_worker=_SyntheticProcessPlaywrightWorker(),
+            worker_kwargs=_playwright_worker_process_kwargs(),
+            diagnostic_resource_budget=_DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
+            allow_environment_proxy=False,
+            total_timeout=5.0,
+            cancellation_token=cancellation_token,
+        )
+
+    assert str(exc_info.value) == "controller cancellation"
+    assert context_factory.methods == ["spawn"]
+    assert context.queue_maxsizes == [1]
+    assert context.process_target is web_playwright_backend._playwright_process_entry
+    assert process.started is True
+    assert process.daemon is True
+    assert terminator.processes == [process]
+    assert result_queue.close_calls == 1
+    assert result_queue.join_thread_calls == 1
+
+
+def test_run_playwright_worker_process_no_result_exit_cleans_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker 无结果退出后必须抛稳定错误并执行 finally queue cleanup。
+
+    Args:
+        monkeypatch: pytest 属性替换夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: result-drain fencing 或 finally cleanup 契约漂移时抛出。
+    """
+
+    result_queue = _FakePlaywrightResultQueue()
+    process = _FakePlaywrightProcess(alive_after_start=False)
+    context = _FakePlaywrightMultiprocessingContext(
+        result_queue=result_queue,
+        process=process,
+    )
+    context_factory = _FakePlaywrightContextFactory(context)
+    terminator = _RecordingPlaywrightProcessTerminator()
+    clock = _ScriptedMonotonicClock((0.0, 0.0, 0.0, 0.5))
+    monkeypatch.setattr(
+        web_playwright_backend.multiprocessing,
+        "get_context",
+        context_factory,
+    )
+    monkeypatch.setattr(
+        web_playwright_backend,
+        "_terminate_playwright_process",
+        terminator,
+    )
+    monkeypatch.setattr(web_playwright_backend.time, "monotonic", clock)
+
+    with pytest.raises(RuntimeError, match="playwright worker exited without result"):
+        web_playwright_backend._run_playwright_worker_process(
+            playwright_sync_worker=_SyntheticProcessPlaywrightWorker(),
+            worker_kwargs=_playwright_worker_process_kwargs(),
+            diagnostic_resource_budget=_DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
+            allow_environment_proxy=False,
+            total_timeout=5.0,
+            cancellation_token=None,
+        )
+
+    assert process.started is True
+    assert process.join_timeouts == [0]
+    assert terminator.processes == []
+    assert len(result_queue.get_calls) == 1
+    assert result_queue.close_calls == 1
+    assert result_queue.join_thread_calls == 1
+
+
+def test_run_playwright_worker_process_timeout_terminates_and_cleans_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker timeout 必须 terminate 并执行 finally queue cleanup。
+
+    Args:
+        monkeypatch: pytest 属性替换夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: timeout fencing、终止或 finally cleanup 契约漂移时抛出。
+    """
+
+    result_queue = _FakePlaywrightResultQueue()
+    process = _FakePlaywrightProcess(alive_after_start=True)
+    context = _FakePlaywrightMultiprocessingContext(
+        result_queue=result_queue,
+        process=process,
+    )
+    context_factory = _FakePlaywrightContextFactory(context)
+    terminator = _RecordingPlaywrightProcessTerminator()
+    clock = _ScriptedMonotonicClock((1.0, 1.0))
+    monkeypatch.setattr(
+        web_playwright_backend.multiprocessing,
+        "get_context",
+        context_factory,
+    )
+    monkeypatch.setattr(
+        web_playwright_backend,
+        "_terminate_playwright_process",
+        terminator,
+    )
+    monkeypatch.setattr(web_playwright_backend.time, "monotonic", clock)
+
+    with pytest.raises(TimeoutError, match="playwright worker timeout"):
+        web_playwright_backend._run_playwright_worker_process(
+            playwright_sync_worker=_SyntheticProcessPlaywrightWorker(),
+            worker_kwargs=_playwright_worker_process_kwargs(),
+            diagnostic_resource_budget=_DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
+            allow_environment_proxy=False,
+            total_timeout=0.0,
+            cancellation_token=None,
+        )
+
+    assert process.started is True
+    assert terminator.processes == [process]
+    assert result_queue.get_calls == []
+    assert result_queue.close_calls == 1
+    assert result_queue.join_thread_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("browser_close_error", "runtime_stop_error"),
+    (
+        (None, None),
+        (RuntimeError("synthetic browser close failure"), None),
+        (None, RuntimeError("synthetic runtime stop failure")),
+    ),
+)
+def test_close_playwright_browser_clears_singletons_after_success_or_error(
+    monkeypatch: pytest.MonkeyPatch,
+    browser_close_error: RuntimeError | None,
+    runtime_stop_error: RuntimeError | None,
+) -> None:
+    """Browser/runtime close 成功或抛异常时都必须清空三项 singleton 状态。
+
+    Args:
+        monkeypatch: pytest 属性替换夹具。
+        browser_close_error: browser close 时需要抛出的可选异常。
+        runtime_stop_error: runtime stop 时需要抛出的可选异常。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: cleanup 调用或 singleton 状态清空契约漂移时抛出。
+    """
+
+    browser = _LifecyclePlaywrightBrowser(close_error=browser_close_error)
+    instance = _LifecyclePlaywrightInstance(
+        _LifecycleChromiumLauncher(browser),
+        stop_error=runtime_stop_error,
+    )
+    monkeypatch.setattr(
+        web_playwright_backend,
+        "_PW_BROWSER",
+        cast(web_playwright_backend._BrowserProtocol, browser),
+    )
+    monkeypatch.setattr(
+        web_playwright_backend,
+        "_PW_INSTANCE",
+        cast(web_playwright_backend._PlaywrightInstanceProtocol, instance),
+    )
+    monkeypatch.setattr(
+        web_playwright_backend,
+        "_PW_BROWSER_KEY",
+        ("chrome", True),
+    )
+
+    web_playwright_backend._close_playwright_browser()
+
+    assert browser.close_calls == 1
+    assert instance.stop_calls == 1
+    assert web_playwright_backend._PW_BROWSER is None
+    assert web_playwright_backend._PW_INSTANCE is None
+    assert web_playwright_backend._PW_BROWSER_KEY is None
 
 
 def test_playwright_url_safety_error_survives_worker_process() -> None:

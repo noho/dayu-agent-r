@@ -413,6 +413,7 @@ _PW_NETWORK_IDLE_TIMEOUT_MS = 1500
 _PW_RESULT_POLL_INTERVAL_SECONDS = 0.05
 _PW_RESULT_DRAIN_GRACE_SECONDS = 0.5
 _PW_PROCESS_TERMINATE_GRACE_SECONDS = 1.0
+_PW_LAUNCH_FAILURE_RUNTIME_STOP_STAGE: Final = "browser_launch_failure_runtime_stop"
 _BUDGETED_DOM_METRICS_SCRIPT = """
 ({domLimit, textLimit}) => {
   let domChars = 0;
@@ -1053,6 +1054,7 @@ def _get_playwright_browser(
             return _PW_BROWSER
         if _PW_BROWSER is not None or _PW_INSTANCE is not None:
             _close_playwright_browser()
+        pw: _PlaywrightInstanceProtocol | None = None
         try:
             from playwright.sync_api import sync_playwright
 
@@ -1066,6 +1068,17 @@ def _get_playwright_browser(
             _PW_BROWSER = browser
             _PW_BROWSER_KEY = browser_key
         except Exception as exc:
+            if pw is not None:
+                # runtime 尚未发布到全局，必须在当前 owner 异常边界就地回收。
+                try:
+                    pw.stop()
+                except Exception as stop_exc:
+                    Log.debug(
+                        "Playwright runtime cleanup failed "
+                        f"stage={_PW_LAUNCH_FAILURE_RUNTIME_STOP_STAGE} "
+                        f"exception_type={type(stop_exc).__name__}",
+                        module=MODULE,
+                    )
             Log.warning(f"Playwright 浏览器初始化失败，回退不可用: {exc}", module=MODULE)
             return None
     return _PW_BROWSER
