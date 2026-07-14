@@ -6,10 +6,10 @@
 - **内部 remediation sub-WU**：`R02`，slug 固定为 `r02-web-owner-policy`；它不是新 WU、feature、issue，也不改变 umbrella 身份。
 - **artifact 身份**：本文是 R02 的独立 plan gate artifact；不是 implementation、review、completion 或 control artifact。
 - **mandatory temporal baseline**：分支 `phaseflow/host-issues-control`，plan-time HEAD `02fcc5d8325fc7c3c2ef2f60a049910edb6ebfcb`；证据审计范围 `b1a0631f397967e7530b676a90ef7467d83a1817^..HEAD`。
-- **当前 gate verdict**：`PLAN REVIEW FINDING FIX AUTHORED — WAITING CONTROLLER / NOT ACCEPTED / NO IMPLEMENTATION`。`docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-plan-entry-controller-adjudication.md` 已精确接受并关闭 `R02-B01`、`R02-B02`；两路完整 plan review 已完成，且 `docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-plan-review-controller-adjudication.md` 是 `R02-PF-01..10` finding disposition 的唯一真源。本文已消费全部 accepted/narrowed finding，但尚未经过 controller validation、双路完整 re-review 或 accepted-plan commit，因此仍不是 accepted/code-generation execution truth，绝不授权 implementation。
-- **plan-entry blocker 状态**：`R02-B01=accepted/closed`、`R02-B02=accepted/closed`。只按 adjudication 增加一个 production file和一个 test file；不得用旧类型名、兼容 property、跳过受影响测试或 inherited-failure 声明绕过，也不得再扩展其它 allowlist。
-- **本 gate 写权限**：AgentCodex只修改本文并新增固定 fix artifact `docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-plan-fix-codex.md`；plan-entry adjudication、两路 review与plan-review controller adjudication均为只读输入。AgentCodex不得改产品代码、测试、README、design、control或既有review/controller artifact；不得 commit、push、建 PR、启动 re-review 或进入任一 implementation slice。
-- **执行终点**：本轮只消费 plan-review controller adjudication、完成plan finding fix与只读验证，随后立即停止等待controller。只有controller validation、双路完整re-review及其controller裁决闭合并产生accepted-plan commit后，R02才可进入S1 implementation。
+- **当前 gate verdict**：`R02-S1 PLAN DRIFT FIX AUTHORED — WAITING CONTROLLER VALIDATION / ACCEPTED PLAN 6e2a76b3 SUPERSEDED / NO IMPLEMENTATION`。原 plan review/re-review 链已由 Controller 接受并产生历史 accepted-plan commit `6e2a76b3`，但 S1 entry 的直接 consumer 审计随后发现 material slice/allowlist drift。`docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-s1-plan-drift-controller-adjudication.md` 是 `R02-S1-DR-01..04` 的唯一 disposition 真源；本文已按该裁决修订，但在 controller validation、双路完整 drift re-review、controller 裁决与新的 superseding accepted-plan commit 前仍不是可执行 S1 truth，绝不授权 implementation。
+- **plan-entry 与 S1 drift 状态**：`R02-B01/B02=accepted/closed`、`R02-PF-01..10=closed`、`R02-RR-F01=rejected/no-fix`；`R02-S1-DR-01..04` 已写回本文、等待 Controller 验证。四个 drift 文件本来就在 R02 总 production/test allowlist 内；本修订只把其旧 budget type 的最小迁移前移到 S1，不扩大 R02 product scope。不得用旧类型名、兼容 property、dual schema、跳过受影响测试或 inherited-failure 声明绕过。
+- **本 gate 写权限**：AgentCodex只修改本文并新增固定 drift fix artifact `docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-s1-plan-drift-fix-codex.md`；control、产品、测试、README、既有 plan-entry/plan review/fix/re-review、drift evidence/controller artifacts均为只读输入。AgentCodex不得 commit、push、建 PR、自行启动 drift re-review 或进入任一 implementation slice。
+- **执行终点**：本轮只消费 S1 plan-drift controller adjudication、完成 `R02-S1-DR-01..04` plan fix与只读扫描，随后立即停止等待controller validation。后续双路完整 drift re-review及新的accepted-plan commit只能由controller另行启动；在此之前不得进入S1。
 - **Issue 178**：`WU-SEMANTIC-OWNERSHIP-01-WEB-STORAGE-R1` / GitHub Issue #178 是未来 credential storage-state lifecycle 的唯一 owner。R02 只删除提前实现的 lifecycle，保留显式路径输入，并保持现有普通诊断/smoke artifact writer语义不变；不实施、部分实施或预埋 Issue 178。
 
 ## 1. 必读真源、三路指定证据与冲突规则
@@ -19,14 +19,15 @@
 本文按以下顺序冻结 contract；低优先级材料不能覆盖高优先级裁决：
 
 1. 本轮用户指令与 `AGENTS.md` 的语义 owner、LLM-facing、分层、类型、测试和 README 硬约束。
-2. `docs/reviews/wu-semantic-ownership-01-overdesign-controller-discussion.md` Topic 2 / Topic 9 的最终 controller discussion。
-3. 永久设计真源：`docs/host/design.md`、`docs/engine/design.md`、`docs/tool/design.md`、`docs/fins/design.md`、`docs/ui/design.md`。
-4. `docs/host/issues-implementation-control.md` 与 `docs/phaseflow-umbrella-optimization-control.md` 的 gate、baseline failure、成本和 handoff 纪律。
-5. `docs/host/wu-semantic-ownership-01-overdesign-remediation-plan.md` 的全局规则、R02 mandatory starting baseline、闭集和 retained-security 约束。
-6. `docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-plan-entry-controller-adjudication.md`：只拥有 `R02-B01/B02` 的 plan-entry allowlist disposition与精确授权边界；不接受计划中的其它设计项，也不授权 implementation。
-7. `docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-plan-review-controller-adjudication.md`：`R02-PF-01..10` finding disposition与rejected边界的唯一真源；两路review建议不得覆盖它。
-8. 下表精确指定的三路原始 overdesign review；它们只提供当前代码证据和反例，发生冲突时必须服从 controller discussion。
-9. 当前 HEAD 的 production code、tests、fixtures、README 与可执行 smoke；它们是 temporal evidence 或被修复对象，不是产品授权真源。
+2. `docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-s1-plan-drift-controller-adjudication.md`：`R02-S1-DR-01..04` 的唯一 disposition 真源；它覆盖本文、历史 accepted plan与旧 review链中冲突的 S1 allowlist、owner propagation、utility default时序和validation文字，但不重开其它产品裁决。
+3. `docs/reviews/wu-semantic-ownership-01-overdesign-controller-discussion.md` Topic 2 / Topic 9 的最终 controller discussion。
+4. 永久设计真源：`docs/host/design.md`、`docs/engine/design.md`、`docs/tool/design.md`、`docs/fins/design.md`、`docs/ui/design.md`。
+5. `docs/host/issues-implementation-control.md` 与 `docs/phaseflow-umbrella-optimization-control.md` 的 gate、baseline failure、成本和 handoff 纪律。
+6. `docs/host/wu-semantic-ownership-01-overdesign-remediation-plan.md` 的全局规则、R02 mandatory starting baseline、闭集和 retained-security 约束。
+7. `docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-plan-entry-controller-adjudication.md`：只拥有 `R02-B01/B02` 的 plan-entry allowlist disposition与精确授权边界；不接受计划中的其它设计项，也不授权 implementation。
+8. `docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-plan-review-controller-adjudication.md` 与 `docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-plan-rereview-controller-adjudication.md`：分别拥有 `R02-PF-01..10` 与原 re-review finding 的历史 disposition；不能覆盖本次 S1 drift 裁决。
+9. 下表精确指定的三路原始 overdesign review；它们只提供当前代码证据和反例，发生冲突时必须服从 controller discussion。
+10. 当前 HEAD 的 production code、tests、fixtures、README 与可执行 smoke；它们是 temporal evidence 或被修复对象，不是产品授权真源。
 
 ### 1.2 精确指定的三路原始 review evidence table
 
@@ -56,6 +57,16 @@
 | `docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-plan-review-controller-adjudication.md` | 唯一finding disposition真源 | 精确接受/缩窄`R02-PF-01..10`并拒绝六组替代方案；本文不得重新裁决 |
 
 本轮只实施controller接受或缩窄接受的plan文字修复。固定provider endpoint仍执行初始DNS/address/custom-port与proof防御；diagnostic `--allow-private-network-url`仍删除；changed production file coverage仍逐文件`>=80%`；不恢复64 KiB、不新增fixture path authority、不实施Issue #178、统一authorization、其它deferred Issue或R03。
+
+### 1.5 S1 plan-drift evidence 与 Controller adjudication
+
+| artifact | role | 本计划消费方式 |
+|---|---|---|
+| `docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-s1-plan-drift-codex.md` | 九文件旧类型直接引用闭集、四个漏项文件与签名/payload/test断裂证据 | 只提供直接证据，不拥有 disposition |
+| `docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-s1-plan-drift-controller-adjudication.md` | `R02-S1-DR-01..04` 唯一裁决真源 | 精确写回 §4、§6、§8、§10、§14、§15/§17 及相关 commands/completion；冲突时覆盖历史 accepted plan |
+| `docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-s1-plan-drift-fix-codex.md` | 本轮 plan 修订记录 | 只记录裁决写回、边界保持与只读扫描；不授权 implementation/re-review |
+
+本次 drift recovery 不重开 `R02-B01/B02`、`R02-PF-01..10` 或 `R02-RR-F01`，也不改变 S2/S3 产品终态。它只修复 S1 删除 `WebResourceBudget` 时遗漏的四个直接 consumer、typed owner propagation、utility defaults时序与validation闭集。
 
 ## 2. 第一性原理判断、root cause 与 owner
 
@@ -105,17 +116,19 @@
 | `94a12c9e` | R3-E S3 diagnostics/storage lifecycle | diagnostics v2 保留；credential lifecycle 删除 |
 | `02fcc5d8` | control 进入 R02 independent plan gate | 只定义 gate，不改变 Web code |
 
-`01bbf74c..02fcc5d8` 在 R02 Web production、允许测试和 README 路径上无 diff，因此 umbrella 编写后的 Web 行为没有 silent product drift。存在的两类 plan-time drift 是：
+`01bbf74c..02fcc5d8` 在 R02 Web production、允许测试和 README 路径上无 diff，因此 umbrella 编写后的 Web 行为没有 silent product drift。原 plan gate 识别并关闭两类 plan-time drift：
 
 1. umbrella对ordinary diagnostic artifact既有writer行为的假设与HEAD不一致；Controller已裁决这不授权R02新增普通artifact行为，因此当前普通writer保持不变，也不构成R02 residual obligation；
 2. 当前调用链/packaged-default consumer 暴露 umbrella closed allowlist 漏项；该 material drift 已由 `docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-plan-entry-controller-adjudication.md` 精确接受并关闭，最终边界见 §6.4。
+
+历史 accepted-plan commit `6e2a76b3` 之后，S1 entry 的直接 source audit 又暴露第三类 material drift：S1 一方面删除 `WebResourceBudget` 并要求全仓旧符号零残留，另一方面却把 `web_fetch_orchestrator.py`、`web_playwright_backend.py` 只列在 S2，把 `utils/diagnose_web_access.py`、`tests/tools/web/test_diagnose_web_access.py` 只列在 S3。四文件均直接 import/annotation/constructor 消费旧类型，且完整 pyright覆盖`dayu/tests/utils`，因此不能等后续 slice。该 drift 由 §1.5 的 Controller adjudication精确接受；它只修正四文件的S1 type-only时序，不扩大R02总闭集。
 
 ### 3.2 当前 owner/contract 判定
 
 - config owner、HTTP transport owner、browser capability owner、diagnostics v2 owner与 Issue #178 destination 均清晰，没有 owner blocker。
 - private/custom/proxy/peer/browser 与三组 budget 的产品裁决没有漂移。
 - `R02-S1 -> R02-S2 -> R02-S3` 的依赖顺序没有漂移。
-- plan-entry allowlist blocker已全部关闭，没有其它allowlist扩展。双路完整plan review、controller finding adjudication与本轮plan fix已完成；implementation仍被controller validation、双路完整re-review及accepted-plan commit gate阻止，禁止提前启动re-review或编码。
+- plan-entry allowlist blocker与原 plan review findings均已关闭；历史 accepted plan 的 S1 drift 已由 `R02-S1-DR-01..04` 收敛为四文件 type-only propagation与validation修订，没有 R02 product scope扩展。当前implementation被本轮controller validation、双路完整drift re-review及新的superseding accepted-plan commit gate阻止；AgentCodex禁止提前启动re-review或编码。
 
 ## 4. Exact target config 与 typed owner contract
 
@@ -160,14 +173,26 @@
 
 ### 4.2 三个 budget owner
 
-`web_resource_budget.py` 只定义以下 frozen typed values、默认常量和 parser helper：
+`web_resource_budget.py` 只定义以下 frozen typed values、owner default constants和 parser helper：
 
 - `HttpResourceBudget(wire_body_bytes, decoded_body_bytes)`：只由 HTTP fetch/search response materialization 消费。
 - `BrowserResourceBudget(warmup_body_bytes, dom_chars, text_chars)`：只由 browser warmup/DOM/text producer 消费。
 - `DiagnosticResourceBudget(error_chars, events)`：只由 diagnostics v2 projection 消费。
 - `WebResourceBudgets(http, browser, diagnostics)`：只作为无default的frozen typed composition；不实现`__post_init__`、跨owner validation、flattened property、validator facade或第二组defaults。三个child budget各自在自身constructor/parser边界拥有非bool正整数校验。
+- `DEFAULT_HTTP_RESOURCE_BUDGET`、`DEFAULT_BROWSER_RESOURCE_BUDGET`、`DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET`：分别是三个 child owner 的唯一 typed default constants；packaged config逐字段与其同源。backend/utility不得用constructor默认调用或本地literal再建立第二套默认。aggregate没有default constant。
 
-删除 `WebResourceBudget` 七字段 class、旧 flattened JSON field、complete-object requirement 和所有旧默认。不得保留 alias、re-export、`max_*` compatibility property 或接收 old/new 两种 schema。
+删除 `WebResourceBudget` 七字段 class、旧 flattened JSON field、complete-object requirement 和由该七字段owner承载的旧默认。不得保留 alias、re-export、`max_*` compatibility property 或接收 old/new 两种 schema。utility-local diagnostic `1_024/80` 的独立时序只按本节末尾与§10处理，不能据此保留旧type。
+
+S1 child type、参数和 payload owner map冻结如下；`WebResourceBudgets` aggregate只允许停留在`WebToolsConfig` immutable snapshot，由`web_tools.py`在唯一projection point拆成child值，下游不得接aggregate或从raw config重建：
+
+| owner type | 精确业务字段/参数 | S1 consumers |
+|---|---|---|
+| `HttpResourceBudget` | HTTP wire/decoded body materialization、search provider body、diagnostic Playwright response body | `web_search_providers.py`、`web_fetch_orchestrator.py`、`utils/diagnose_web_access.py`及对应wrapper/test |
+| `BrowserResourceBudget` | HTTP warmup body、browser DOM/text/markdown、browser worker callable input | `web_fetch_orchestrator.py`、`web_playwright_backend.py`、`utils/diagnose_web_access.py`及`web_tools.py` wrappers |
+| `DiagnosticResourceBudget` | browser process/failure error projection与diagnostics v2 error/event projection | `web_playwright_backend.py` process wrapper、`web_diagnostics.py`及`web_tools.py` wrappers |
+| no budget | `_probe_content_type`不读取任何budget字段 | 删除该参数和forwarding，不为接口对称保留无语义输入 |
+
+Playwright worker/process payload必须按owner拆开：worker callable protocol/kwargs只含`BrowserResourceBudget`；process wrapper另有显式`DiagnosticResourceBudget` input，并逐字段构造worker kwargs。不得把worker不消费的diagnostic budget放进kwargs/extra payload，不得用`**kwargs`或兼容default掩盖签名。
 
 ### 4.3 Egress、transport 与 browser capability
 
@@ -207,6 +232,8 @@ Browser capability 直接由 `WebToolsConfig.browser_enabled: bool` 表达，不
 - production pre-range host candidate read-only lookup、storage cookies 注入、Playwright context read input；不新增 refresh/retention/publish。这里保留的是显式目录下的现有input selection，不是credential final owner命名contract。
 - ordinary JSON/JSONL/markdown diagnostic/smoke artifact继续使用当前writer语义；R02不新增任何普通artifact writer contract。
 
+S1 对 diagnostic utility 只有一个临时时序例外：`utils/diagnose_web_access.py` 的 `_DEFAULT_DIAGNOSTIC_ERROR_CHARS = 1_024` 与 `--max-network` 的本地 `default=80` 不是旧 `WebResourceBudget` 直接字段，本 slice保持其现有行为。S1 新增的HTTP/Browser utility defaults必须分别直接复用`DEFAULT_HTTP_RESOURCE_BUDGET`与`DEFAULT_BROWSER_RESOURCE_BUDGET`，不得把`1_024/80`扩散到任何新producer或描述为最终contract。S3在utility消费typed Web config时删除这两个本地diagnostic defaults，分别由`DiagnosticResourceBudget.error_chars/events`同源提供，并同步CLI/profile/tests/README；普通writer contract仍不变。
+
 删除：
 
 - CLI `--storage-state-out`、`--storage-state-ttl-seconds` 及 batch command propagation。
@@ -223,7 +250,7 @@ credential lifecycle自带的publish/permission/reconcile状态机直接删除�
 
 - private/custom/browser coupling 和 browser 的 `allows_private_network` 前置禁用。
 - HTTP 的 unconditional pinned transport、unconditional proxy ban、unconditional `trust_env=false`。
-- 七字段 `WebResourceBudget` god dataclass、flat complete-object config和旧默认数值。
+- 七字段 `WebResourceBudget` god dataclass、flat complete-object config和该旧owner承载的默认数值；S1完成后全仓旧类型/import/signature/constructor零残留。
 - diagnostic credential TTL/owner filename/0700/0600/orphan/expired/publish/reconcile lifecycle 全链与 artifact/test/README contract。
 - `storage_state_out`/TTL 的 CLI/batch command projection。
 - 任何为保持旧 import、旧 config、旧 test 所加的 alias、property、wrapper、fallback、dual parser 或 test shim。
@@ -241,6 +268,7 @@ credential lifecycle自带的publish/permission/reconcile状态机直接删除�
 - 显式 storage-state path/dir read input。
 - header/cookie/URL/proxy credential redaction、diagnostic containment，以及现有普通artifact writer行为。
 - 现有storage-input/output directory containment与symlink防御。
+- S1期间 diagnostic utility既有`1_024` error chars与`--max-network`本地`default=80`行为；它们只是已登记的S1→S3临时状态，S3必须由typed diagnostic config同源替换，不得成为新producer默认。
 
 ### 5.3 明确非目标
 
@@ -252,7 +280,7 @@ credential lifecycle自带的publish/permission/reconcile状态机直接删除�
 - 把 safety ceilings 宣称为业务 complete/财报完整性或写入 LLM-facing 文本。
 - 为旧 config/schema/import/tests 保留兼容行为。
 
-## 6. Controller-final closed allowlist、预期 diff 与已关闭 drift
+## 6. Controller-final R02闭集、S1 drift时序与预期 diff
 
 ### 6.1 Controller-final production/config/scripts 闭集
 
@@ -263,15 +291,15 @@ credential lifecycle自带的publish/permission/reconcile状态机直接删除�
 | `dayu/tools/web/web_resource_budget.py` | S1 以三 owner budgets/aggregate 替换七字段 class |
 | `dayu/tools/web/web_egress_policy.py` | S1 拆 private/custom policy；S2 retained-security fix 仅在 test 证明必要时 |
 | `dayu/tools/web/web_http_session.py` | S1只定义最小frozen transport policy并由config snapshot保存，sender保持secure pinned/no-proxy；S2原子增加必填named policy参数并实施proxy/proof分支 |
-| `dayu/tools/web/web_tools.py` | S1 接收 typed snapshot；S2 按 owner 分发 HTTP/browser/diagnostic budgets/capabilities |
-| `dayu/tools/web/web_playwright_backend.py` | S2 删除 private/browser coupling，改接 browser budget与 transport constraints |
-| `dayu/tools/web/web_fetch_orchestrator.py` | S2 传递 transport/http budget并保留每跳重检 |
+| `dayu/tools/web/web_tools.py` | S1接收typed snapshot并作为唯一projection point向全部consumer显式分发HTTP/browser/diagnostic child budgets；S2只分发transport/browser capability并改变对应行为 |
+| `dayu/tools/web/web_playwright_backend.py` | S1只做Browser/Diagnostic type、annotation、docstring、worker callable kwargs/process diagnostic input与forwarding拆分；S2才删除private/browser coupling并实施proof/proxy/route/navigation行为 |
+| `dayu/tools/web/web_fetch_orchestrator.py` | S1只做HTTP body=`HttpResourceBudget`、warmup=`BrowserResourceBudget`、删除probe无语义budget参数及typed forwarding；S2才增加transport policy并改变proxy/peer行为，始终保留每跳重检 |
 | `dayu/tools/web/web_recovery.py` | 闭集内 inspect-only，预期无 diff；只有真实 challenge/capability reason 传播缺口才允许 S2 修改 |
 | `dayu/tools/web/web_diagnostics.py` | S1/S3 改接 diagnostic budget；schema/revision/redaction预期无语义 diff |
 | `dayu/tools/web/web_tool_projection_text.py` | inspect-only，预期无 diff；R02 不改 LLM-facing schema |
 | `dayu/tools/web/web_search_projection.py` | inspect-only，预期无 diff；R02 不改 search business projection |
 | `dayu/tools/web/web_search_providers.py` | plan-entry adjudication精确新增，plan-review adjudication再以`R02-PF-07`冻结同文件owner修复：S1把budget依赖收窄到`HttpResourceBudget`并让result visibility消费private/custom-port typed policy；S2只复用Web HTTP transport owner的proxy/peer-proof/egress决定与脱敏warning；provider选择、业务结果、credential读取、query/domain语义和LLM-facing projection不得改变 |
-| `utils/diagnose_web_access.py` | S3 删除 lifecycle、消费新 config；现有ordinary artifact writer保持不变 |
+| `utils/diagnose_web_access.py` | S1只删除旧budget direct usage，复用owner typed HTTP/Browser default constants并同步typed calls；既有CLI/lifecycle/writer/profile/browser availability与本地diagnostic `1_024/80`行为不变。S3再删除lifecycle、消费typed diagnostic config并删除本地`1_024/default=80`；ordinary writer保持不变 |
 | `utils/smoke_web_ci.py` | S3 更新 deterministic/real smoke与模块私有版本化fixture case；现有ordinary artifact writer保持不变 |
 | `utils/diag_web_batch.sh` | S3 删除已删 CLI 参数传播；无命中则预期无 diff |
 
@@ -279,17 +307,17 @@ credential lifecycle自带的publish/permission/reconcile状态机直接删除�
 
 ### 6.2 Controller-final tests/docs 闭集
 
-- tests：`tests/tools/web/test_web_tools_provider.py`、`tests/tools/web/test_diagnose_web_access.py`、`tests/tools/web/test_smoke_web_ci.py`；plan-entry adjudication精确新增`tests/runtime/test_config_loader.py`，仅允许更新packaged Web五bool与三budget groups的精确断言，不得改其它ConfigLoader行为。
+- tests：`tests/tools/web/test_web_tools_provider.py`、`tests/tools/web/test_diagnose_web_access.py`、`tests/tools/web/test_smoke_web_ci.py`；plan-entry adjudication精确新增`tests/runtime/test_config_loader.py`，仅允许更新packaged Web五bool与三budget groups的精确断言，不得改其它ConfigLoader行为。`test_diagnose_web_access.py`在S1只迁移旧import和`test_playwright_response_body_projection_uses_exact_bytes_and_budget`的HTTP child budget输入；其lifecycle/storage/CLI/artifact tests留在S3。
 - README：`dayu/config/README.md`、`tests/README.md`；根 `README.md` 仅在最终用户诊断 CLI 工作流变化时允许。
 - inspect/run-only：其它 tests、README、design、control 不得产生 diff。
 
-最终闭集由umbrella baseline与`docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-plan-entry-controller-adjudication.md`共同确定；除上述一个production file与一个test file外没有其它扩展。
+最终R02总闭集由umbrella baseline与plan-entry adjudication共同确定；S1 plan-drift adjudication只把已在总闭集中的四个直接consumer前移做type-only迁移，不新增第五个production/test文件，也不扩大任何产品语义。
 
 ### 6.3 每 slice 在当前授权内的预期 changed files
 
-- S1：`tool_discovery.json`、`provider.py`、`web_resource_budget.py`、`web_egress_policy.py`、`web_http_session.py`、`web_tools.py`、`web_diagnostics.py`、精确授权的`web_search_providers.py`、`test_web_tools_provider.py`、精确授权的`tests/runtime/test_config_loader.py`、`dayu/config/README.md`、`tests/README.md`。
-- S2：`web_http_session.py`、`web_playwright_backend.py`、`web_tools.py`、`web_fetch_orchestrator.py`、精确授权的`web_search_providers.py`、必要的 `web_egress_policy.py`/`web_recovery.py`、`test_web_tools_provider.py`。
-- S3：`utils/diagnose_web_access.py`、`utils/smoke_web_ci.py`、必要的 `utils/diag_web_batch.sh`、三份允许 Web tests、`tests/README.md`；若 `dayu/config/README.md` 的诊断段受影响则同 slice closure。根 README 经 §12 决策，当前预期无 diff。
+- S1：`tool_discovery.json`、`provider.py`、`web_resource_budget.py`、`web_egress_policy.py`、`web_http_session.py`、`web_tools.py`、`web_diagnostics.py`、精确授权的`web_search_providers.py`、type-only前移的`web_fetch_orchestrator.py`与`web_playwright_backend.py`、type-only前移的`utils/diagnose_web_access.py`、`test_web_tools_provider.py`、direct-budget-node前移的`tests/tools/web/test_diagnose_web_access.py`、精确授权的`tests/runtime/test_config_loader.py`、`dayu/config/README.md`、`tests/README.md`。
+- S2：`web_http_session.py`、已完成child type迁移的`web_playwright_backend.py`、`web_tools.py`、已完成child type迁移的`web_fetch_orchestrator.py`、精确授权的`web_search_providers.py`、必要的 `web_egress_policy.py`/`web_recovery.py`、`test_web_tools_provider.py`；S2不得重做或兼容S1 type migration。
+- S3：已完成HTTP/Browser type迁移的`utils/diagnose_web_access.py`、`utils/smoke_web_ci.py`、必要的 `utils/diag_web_batch.sh`、三份允许 Web tests、`tests/README.md`；若 `dayu/config/README.md` 的诊断段受影响则同 slice closure。S3在utility消费typed Web config时删除`1_024/default=80`本地diagnostic defaults及credential lifecycle；根 README 经 §12 决策，当前预期无 diff。
 
 ### 6.4 Material allowlist drift controller adjudication（accepted/closed）
 
@@ -298,9 +326,20 @@ credential lifecycle自带的publish/permission/reconcile状态机直接删除�
 | `R02-B01=accepted/closed` | `web_search_providers.py`直接import/消费`WebResourceBudget`；模块级`requests.get/post`会使search与fetch产生不同proxy/peer-proof事实 | 精确增加该production file | S1仅迁移`HttpResourceBudget`；S2仅复用同一Web HTTP transport policy。不得改变provider选择、业务结果、credential读取、query/domain语义、LLM-facing projection或复制DNS/proxy/peer rule |
 | `R02-B02=accepted/closed` | `test_packaged_config_loads_expected_provider_metadata`直接断言旧private默认false | 精确增加该test file | 仅更新packaged Web五个独立bool与三组resource budget projection精确断言；不得改其它ConfigLoader行为、兼容旧schema或skip |
 
-`R02-B01/B02`的唯一裁决artifact是`docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-plan-entry-controller-adjudication.md`。两项drift均已关闭且无其它allowlist扩展；任何超出上表的新增文件或语义仍触发§15.3 stop，不得采用alias、旧类残留、test exclusion或baseline waiver。
+`R02-B01/B02`的唯一裁决artifact是`docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-plan-entry-controller-adjudication.md`。两项plan-entry drift均已关闭；其后S1 type-consumer时序以§6.5的plan-drift adjudication为准。任何超出两份Controller裁决共同边界的新增文件或语义仍触发§15.3 stop，不得采用alias、旧类残留、test exclusion或baseline waiver。
 
-其后`docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-plan-review-controller-adjudication.md`以`R02-PF-07`要求同一已授权production file在S1修复search result visibility；这不新增文件，也不授权provider业务语义变化。最终S1边界以§6.1、§8.2和该后续controller adjudication为准。
+其后`docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-plan-review-controller-adjudication.md`以`R02-PF-07`要求同一已授权production file在S1修复search result visibility；这不新增文件，也不授权provider业务语义变化。最终S1边界以§6.1、§6.5、§8.2和S1 plan-drift controller adjudication为准。
+
+### 6.5 S1 plan-drift Controller adjudication（accepted/closed-in-plan，待validation）
+
+| finding | accepted decision | exact S1 authorization boundary |
+|---|---|---|
+| `R02-S1-DR-01` | 四个直接consumer前移到S1 | `web_fetch_orchestrator.py`、`web_playwright_backend.py`、`utils/diagnose_web_access.py`、`tests/tools/web/test_diagnose_web_access.py`只做§4.2 owner map与direct test同步；不提前S2/S3行为 |
+| `R02-S1-DR-02` | child type/参数/payload owner map | aggregate只停留在`WebToolsConfig`；HTTP、Browser、Diagnostic显式分发；probe删无语义参数；worker kwargs与process diagnostic input拆开 |
+| `R02-S1-DR-03` | utility defaults时序缩窄接受 | S1 HTTP/Browser defaults复用owner typed constants；utility-local`1_024/default=80`保持。S3由typed diagnostic config删除并同源到`error_chars/events` |
+| `R02-S1-DR-04` | tests/validation闭集扩展 | S1增加direct diagnostic budget node；旧类型scan覆盖`dayu tests utils`；coverage候选增加两个实际changed production consumer；utils免coverage但必须有direct behavior test；完整pyright不排除任何路径 |
+
+四项只修正S1执行真源。必须保留S1 sender pinned/no-proxy、search provider raw `requests.get/post`、browser/private coupling、diagnostic lifecycle/CLI/writer现有行为；不得提前S2/S3、Issue #178、R03或统一authorization。
 
 ## 7. Umbrella R02 mandatory baseline 逐项映射
 
@@ -320,10 +359,10 @@ credential lifecycle自带的publish/permission/reconcile状态机直接删除�
 | storage path input | 保留并细化 | 保留 explicit file/dir read input；不把 pre-range host lookup误判为 lifecycle |
 | 删除 credential lifecycle | 保留 | S3 删除符号、CLI、artifact、tests、README全链；转交 Issue #178 |
 | ordinary diagnostic writers | 按controller finding adjudication缩窄 | HEAD直接写语义保持不变；S3只删除credential lifecycle publish/permission/reconcile状态机，不新增普通writer contract |
-| S1 `-k` command | 保留并加强 | 先跑 umbrella filter，再跑完整 owner file与新增 config-loader node；coverage逐 changed production file |
+| S1 `-k` command | 保留并加强 | 先跑 umbrella filter，再跑完整 owner file、config-loader target与diagnostic direct budget node；不提前整份S3 lifecycle suite；coverage逐 changed production file |
 | S2 `-k` command | 保留并加强 | 先跑 umbrella filter，再跑完整 provider file与 deterministic proxy/peer/browser nodes |
 | S3 `-k` command | 保留并加强 | 先跑 umbrella filter，再跑三份完整允许 test；v2/lifecycle deletion exact assertions |
-| coverage include baseline | 基于直接代码证据细化 | include 只是上界；§14 必须从 JSON逐个 changed production file `>=80%`；utils按 AGENTS 免覆盖但必须行为测试 |
+| coverage include baseline | 基于直接代码证据细化 | include只是上界；§14必须从JSON逐个changed production file`>=80%`，S1候选含`web_fetch_orchestrator.py`/`web_playwright_backend.py`；utils按AGENTS免覆盖但其S1 type-only diff必须由direct behavior node覆盖 |
 | pyright/diff/allowed/source/README | 保留 | 每 slice和aggregate都执行；任一新增/扩散 error或越界 diff stop |
 | 本地 + real Playwright/diagnostic smoke | 保留并细化 | §13 同时要求 deterministic local、真实 Playwright、真实 diagnostic v2和财报 budget probe；external只补充不替代 |
 
@@ -333,7 +372,7 @@ credential lifecycle自带的publish/permission/reconcile状态机直接删除�
 
 ### 8.1 Entry 与原子目标
 
-`R02-B01/B02`已由plan-entry adjudication关闭。S1 entry仍必须同时满足：本文完成双路完整plan review、controller finding adjudication、accepted finding fix、双路完整re-review并有accepted-plan commit。controller冻结的全部budget values直接进入S1，不再设置implementation前的数值充分性裁决。S1在一个reviewable diff中建立packaged config、typed defaults、parser、immutable tool snapshot与三个budget owner；不得留下旧/new双schema或一半consumer仍接七字段类型。
+`R02-B01/B02`与原`R02-PF-01..10`已关闭，但历史accepted-plan commit `6e2a76b3`已被S1 direct-consumer drift证据supersede。S1 entry必须重新满足：`R02-S1-DR-01..04` plan fix经controller validation、MiMo/DS对修订后完整plan与全链的双路完整re-review、controller裁决闭合，并产生新的superseding accepted-plan commit。AgentCodex本轮不得自行启动re-review。controller冻结的全部budget values直接进入S1，不再设置implementation前的数值充分性裁决。S1在一个reviewable diff中建立packaged config、typed defaults、parser、immutable tool snapshot与三个budget owner，并同步迁移九文件旧类型直接引用闭集；不得留下旧/new双schema、compatibility facade、旧符号残留或一半consumer仍接七字段类型。
 
 ### 8.2 逐文件、符号与 call chain
 
@@ -351,15 +390,30 @@ credential lifecycle自带的publish/permission/reconcile状态机直接删除�
    - 新增最小 frozen `WebHttpTransportPolicy(dns_peer_proof_enabled, allow_environment_proxy)`；不在此定义部署默认数值。S1不修改`_send_authorized_request`签名或行为，继续secure pinned/no-proxy。
 6. `web_tools.py`
    - `WebToolsConfig`保存由parser构造的frozen `WebHttpTransportPolicy`、private/custom/browser typed facts、`WebResourceBudgets`纯组合及现有browser/storage设置；不存raw JSON。S1只保存transport policy，不把它thread到sender。
-   - `_search_web_business`只传`http_resource_budget`，并把同一typed `WebEgressPolicy(private, custom-port)`直接交给search result visibility；移除由raw `allow_private_network_url`单独代签visibility的接口。fetch path按consumer分发各自budget。browser同时产生rendered input与diagnostic error，因此显式接收browser/diagnostic两个小类型，不接aggregate。
+   - 本文件是aggregate唯一projection point：`_search_web_business`只传`config.resource_budgets.http`，并把同一typed `WebEgressPolicy(private, custom-port)`直接交给search result visibility；fetch path将warmup=`browser`、probe=无budget、HTTP fetch=`http`、browser fallback=`browser + diagnostics`。browser同时产生rendered input与diagnostic error，因此显式接收browser/diagnostic两个小类型，不接aggregate。
+   - `_PlaywrightFallbackKwargs`拆为browser/diagnostic两个显式typed字段；`_StageFetchKwargs`不再让warmup/probe共用budget；`_FetchConvertKwargs`只接HTTP budget。所有wrapper/fake/callable使用精确参数，不给新参数compatibility default、不用`**kwargs`。
 7. `web_diagnostics.py`
    - diagnostics projection signatures只接 `DiagnosticResourceBudget`或两个显式 owner fields；schema/revision/redaction不改。
 8. `web_search_providers.py`（plan-entry adjudication已精确授权）
    - S1 import/signatures/docstrings由 `WebResourceBudget` 改为 `HttpResourceBudget`；response materialization逻辑不变。
    - `search_public_web`/`_filter_visible_results`消费caller已构造的typed `WebEgressPolicy`，由其`is_url_allowed`同源决定private/custom-port visibility；不得重读raw config或保留只接private bool的旧checker contract。
-   - S2再把三个模块级`requests.get/post`调用迁到`web_http_session.py`的同一typed attempt sender，使proxy-disable/proof/sanitized-warning对search与fetch同源；不得在S1提前混入transport行为。
-9. tests/README
-   - 将 complete-object tests改为 group/field local override、unknown/invalid、packaged/typed conformance；更新 config/tests README实际 contract。
+   - 三个模块级`requests.get/post`、endpoint、redirect、credential、provider fallback、challenge与result semantics在S1逐行为保持；S2才迁到同一typed attempt sender。不得在S1提前混入transport行为。
+9. `web_fetch_orchestrator.py`（`R02-S1-DR-01/02` type-only前移）
+   - `_decompress_limited_response_body`、`_read_limited_response_body`、`_materialize_response_body`、`_fetch_and_convert_content`只接`HttpResourceBudget`；`_warmup_domain`只接`BrowserResourceBudget`；`_probe_content_type`删除未使用的budget参数。
+   - 只修改import、annotation、parameter name、中文docstring、typed forwarding与probe无效参数；`_send_authorized_request`签名/调用、numeric pin、no-proxy、redirect每hop authorization、mixed DNS、response lease、timeout/cancellation和body materialization算法逐行为不变。
+10. `web_playwright_backend.py`（`R02-S1-DR-01/02` type-only前移）
+   - DOM/text/markdown producer与`_PlaywrightWorkerProtocol`只接`BrowserResourceBudget`；`_playwright_process_entry`及failure projection显式接`DiagnosticResourceBudget`；`_fetch_and_convert_with_playwright`显式接两个child values。
+   - worker callable kwargs只包含browser budget，process wrapper另有独立diagnostic input并精确构造worker kwargs；不得把diagnostic budget塞入worker不消费的extra/kwargs。
+   - `allows_private_network`前置return、Playwright import/process start、browser availability、proxy env、route/navigation与既有error reasons逐行为不变；删除coupling与proof gate只在S2。
+11. `utils/diagnose_web_access.py`（`R02-S1-DR-01/03` type-only前移）
+   - 旧aggregate import/constant/calls拆为`HttpResourceBudget`与`BrowserResourceBudget`；HTTP与Browser utility常量分别直接引用owner的`DEFAULT_HTTP_RESOURCE_BUDGET`、`DEFAULT_BROWSER_RESOURCE_BUDGET`，不得调用`HttpResourceBudget()`/`BrowserResourceBudget()`隐式取默认或复制数值。
+   - requests response materialization与`_read_bounded_playwright_response_body`只接HTTP budget；Playwright DOM/text projection只接Browser budget；bytes/DOM/text算法与exception semantics不变。
+   - `_DEFAULT_DIAGNOSTIC_ERROR_CHARS = 1_024`、`--max-network default=80`、CLI、storage lifecycle、ordinary writer、profile schema与browser availability在S1保持；S3按§10删除两项本地diagnostic defaults与credential lifecycle。
+12. tests
+   - `test_web_tools_provider.py`将complete-object tests改为group/field local override、unknown/invalid、packaged/typed conformance；helpers/fakes/workers按§4.2 owner map拆分，不用loose signature保留旧bag。
+   - `test_diagnose_web_access.py`在S1只把旧import改为`HttpResourceBudget`，并把`test_playwright_response_body_projection_uses_exact_bytes_and_budget`的输入改为显式`HttpResourceBudget(wire_body_bytes=4, decoded_body_bytes=4)`；exact/declared-over/actual-over三条既有断言不变。不得修改其它lifecycle/storage/CLI/artifact tests。
+13. README
+   - 更新 config/tests README实际typed owner、S1 direct-node与S3 default删除contract；本plan fix不修改README，只有未来implementation slice按§12触发。
 
 目标调用链：
 
@@ -380,10 +434,13 @@ ConfigLoader
 - packaged JSON逐字段等于 typed defaults；old数值/flat字段零残留。
 - 五 bool每个 default、true/false override、bool-as-int/string/null拒绝，且final record中改变一个不改变其余四个typed defaults。
 - 保持并运行ConfigLoader既有record-replace test且不修改其contract；provider owner test把final partial record直接交给`_parse_config`，证明整体budget缺失、单group缺失、单field缺失只补对应typed default，已有sibling不变；unknown group/field、wrong object type、bool、0、negative拒绝并指向精确path。
-- HTTP search/fetch只收到 `HttpResourceBudget`；browser只收到 `BrowserResourceBudget`；diagnostics只收到 `DiagnosticResourceBudget`。
+- HTTP search/fetch与diagnostic Playwright response body只收到`HttpResourceBudget`；warmup/browser DOM/text/markdown与browser worker只收到`BrowserResourceBudget`；browser process/failure与diagnostics v2只收到`DiagnosticResourceBudget`或其显式owner field；`_probe_content_type`没有budget参数。
+- Playwright worker callable kwargs不含diagnostic budget，process wrapper持有独立diagnostic input并精确构造worker kwargs；新增参数无default、fakes不用`**kwargs`或loose typing。
 - `WebResourceBudgets`无default、无`__post_init__`/validator、无flattened compatibility properties；三个child各自拒绝非bool正整数；全仓旧class/import零残留。
+- utility S1 HTTP/Browser defaults与`web_resource_budget.py` owner typed constants是对象/字段同源；utility没有constructor-default调用或重复literal。`1_024/default=80`仅作为已登记S1临时状态保持，相关既有CLI/profile断言不改写成S3预期。
 - search result visibility对private/custom-port allow/deny的决定与fetch使用同一typed policy；无raw config重读。
 - S1 sender仍是当前pinned/no-proxy行为，`_send_authorized_request`尚无transport policy参数；防止在S1留下半迁移transport。
+- `web_search_providers.py`仍由原三个模块级raw `requests.get/post`发送；`web_playwright_backend.py`的browser/private coupling、process start时序、route/navigation与error reason保持；`utils/diagnose_web_access.py`的lifecycle/CLI/ordinary writer/profile schema保持。S1 tests只同步type/signature并断言这些非行为不变量，不提前S2/S3 expected behavior。
 - config-loader packaged snapshot更新为 accepted default，而不是跳过旧断言。
 
 ### 8.4 S1 gate commands
@@ -391,21 +448,26 @@ ConfigLoader
 ```bash
 source .venv/bin/activate
 pytest tests/tools/web/test_web_tools_provider.py -k 'config or resource_budget or egress_policy or provider' -q
-pytest tests/tools/web/test_web_tools_provider.py tests/runtime/test_config_loader.py -q
+pytest tests/tools/web/test_diagnose_web_access.py::test_playwright_response_body_projection_uses_exact_bytes_and_budget -q
+pytest tests/tools/web/test_web_tools_provider.py \
+  tests/runtime/test_config_loader.py \
+  tests/tools/web/test_diagnose_web_access.py::test_playwright_response_body_projection_uses_exact_bytes_and_budget -q
 
 coverage run --data-file=workspace/tmp/.coverage-r02-s1 -m pytest \
   tests/tools/web/test_web_tools_provider.py \
-  tests/runtime/test_config_loader.py -q
+  tests/runtime/test_config_loader.py \
+  tests/tools/web/test_diagnose_web_access.py::test_playwright_response_body_projection_uses_exact_bytes_and_budget -q
 coverage json --data-file=workspace/tmp/.coverage-r02-s1 \
   -o workspace/tmp/coverage-r02-s1.json
 
 python -m pyright
 git diff --check
-rg -n 'WebResourceBudget|max_wire_body_bytes|max_decoded_body_bytes|max_browser_warmup_body_bytes|max_browser_dom_chars|max_browser_text_chars|max_diagnostic_error_chars|max_diagnostic_events' dayu tests README.md
+rg -n '\bWebResourceBudget\b|max_wire_body_bytes|max_decoded_body_bytes|max_browser_warmup_body_bytes|max_browser_dom_chars|max_browser_text_chars|max_diagnostic_error_chars|max_diagnostic_events' dayu tests utils README.md
 rg -n '26214400|52428800|65536|5000000|1000000|1024|"events"[^0-9]*80' dayu/config/tool_discovery.json dayu/tools/web tests/tools/web dayu/config/README.md tests/README.md
+rg -n '_DEFAULT_DIAGNOSTIC_ERROR_CHARS|1_024|--max-network|default=80' utils/diagnose_web_access.py tests/tools/web/test_diagnose_web_access.py
 ```
 
-第一条 semantic scan 预期对旧 class/flat field零命中；数值 scan逐条分类，`1000000` 若命中无关 timeout/fixture必须在 artifact记录，不能用泛化数值 grep冒充语义证明。逐文件 coverage命令见 §14。
+第一条semantic scan覆盖`dayu tests utils`并预期旧class/import/flat field零命中；不得exclude utility/test。第二条旧数值scan不覆盖utility transitional diagnostics，逐条分类，`1000000`若命中无关timeout/fixture必须在artifact记录。第三条在S1预期只确认utility既有`1_024`与`--max-network default=80`仍保持且未扩散；S3/aggregate再按§10/§14要求其本地default零残留。逐文件coverage命令见§14，实际有diff的`web_fetch_orchestrator.py`与`web_playwright_backend.py`必须逐文件`>=80%`；`utils/**`免coverage但上面的direct behavior node不可省略。
 
 ### 8.5 S1 accepted gate
 
@@ -466,10 +528,10 @@ HTTP terminal/challenge
 ### 9.4 逐文件改动
 
 - `web_http_session.py`：把当前 pinned-only adapter变为 proof-on strategy；standard path、trust_env、基于同一次`merge_environment_settings`/`send` settings的selected proxy、typed incompatibility与sanitized warning。`_send_authorized_request`及plain sender的`transport_policy`都是必填named参数且无default。
-- `web_fetch_orchestrator.py`：每 redirect hop重复 authorization/transport选择并传 `HttpResourceBudget`与必填transport policy；保留 redirect cap/error。
+- `web_fetch_orchestrator.py`：保持S1已经完成的`HttpResourceBudget`/`BrowserResourceBudget`/probe无budget签名；S2只为每redirect hop增加必填transport policy并实施重复authorization/transport选择，保留redirect cap/error及所有body/warmup算法。
 - `web_search_providers.py`（plan-entry adjudication精确授权）：Tavily/Serper/DuckDuckGo固定endpoint不跟随redirect，但初始URL仍走同一egress与peer防御；实际I/O改调`web_http_session`的plain typed sender，传`HttpResourceBudget`、egress/transport policy和原headers/json/params。API key不得进入warning/diagnostic；search module不自行解释环境变量、DNS或peer，不新增known-safe endpoint bypass。
-- `web_playwright_backend.py`：删 private/browser coupling，接 `browser_enabled`前由 caller gate；route policy与browser budget分离；rendered input只读`BrowserResourceBudget`，错误/事件投影只读`DiagnosticResourceBudget`。proof-on reason由fallback启动前的browser owner产生，backend不得启动进程后再补偿。
-- `web_tools.py`：在 fetch/challenge/recovery path分发 capability、egress、transport和三个 budgets；challenge availability不再硬编码。
+- `web_playwright_backend.py`：保持S1已经完成的Browser worker/Diagnostic process typed payload；S2只删private/browser coupling，`browser_enabled`由caller gate，实施proof/proxy/route/navigation行为。rendered input继续只读`BrowserResourceBudget`，错误/事件投影继续只读`DiagnosticResourceBudget`；proof-on reason由fallback启动前的browser owner产生，backend不得启动进程后再补偿。
+- `web_tools.py`：保持S1已经完成的三个child budget projection；S2只在fetch/challenge/recovery path新增capability、egress、transport行为分发，challenge availability不再硬编码。
 - `web_egress_policy.py`：仅修直接测试暴露的 custom/private/standard-port decision，不能移动 transport authority。
 - `web_recovery.py`：只有 challenge/recovery reason当前丢失 capability事实时修改；否则无 diff。
 
@@ -526,7 +588,7 @@ git diff --exit-code -- dayu/tools/web/web_challenge_detection.py
 
 ### 10.1 原子目标
 
-删除 diagnostic utility 对 credential生成、命名、TTL、权限、发布、回收的全部 authority；同时保留显式 read input、diagnostics v2/challenge evidence和现有普通artifact writer行为。不能只隐藏CLI字段而留下后台reconcile，也不能误删pre-range read-only input；不得把credential publish状态机迁移成普通writer。
+删除 diagnostic utility 对 credential生成、命名、TTL、权限、发布、回收的全部 authority；同时让utility消费typed Web diagnostic config，删除S1明确保留的`_DEFAULT_DIAGNOSTIC_ERROR_CHARS = 1_024`与`--max-network default=80`两项本地defaults，由`DiagnosticResourceBudget.error_chars/events`同源提供。保留显式 read input、diagnostics v2/challenge evidence和现有普通artifact writer行为。不能只隐藏CLI字段而留下后台reconcile，也不能误删pre-range read-only input；不得把credential publish状态机迁移成普通writer。
 
 ### 10.2 目标调用链
 
@@ -534,6 +596,7 @@ git diff --exit-code -- dayu/tools/web/web_challenge_detection.py
 diagnose_web_access CLI
   -> explicit --storage-state-in file / --storage-state-dir directory (optional, read-only)
   -> typed Web config/policies/budgets
+       -> DiagnosticResourceBudget.error_chars/events (utility diagnostic defaults唯一真源)
   -> HTTP and optional real Playwright attempt
   -> diagnostics-v2 revision 2 projection
   -> existing ordinary JSON/JSONL/markdown writer
@@ -548,8 +611,10 @@ smoke_web_ci
 ### 10.3 逐文件删除/保留
 
 1. `utils/diagnose_web_access.py`
+   - 保持S1已经完成的HTTP/Browser child type签名；S3不得重建aggregate、旧类型或兼容wrapper。
    - `CliOptions`、arg parser、command render删除 storage-state out/TTL；保留 in/dir。
    - 删除`--allow-private-network-url`与对应option/config overlay；诊断默认直接消费packaged private=true，显式deny测试通过smoke的typed provider overlay进入唯一parser。
+   - 删除`_DEFAULT_DIAGNOSTIC_ERROR_CHARS = 1_024`与`--max-network`的本地`default=80`；utility/profile从typed Web config的`DiagnosticResourceBudget.error_chars/events`取得默认值，不在utility、CLI、profile或test复制literal。`--max-network`只保留为显式单次override，argparse未提供态使用`None`而非业务default；未提供时直接使用typed config的`events`，显式值经同一个positive-int owner validation形成该run的typed diagnostic value。不得保留`80`兼容分支或让profile接裸默认。
    - 删除 `_StorageStateLifecycle`及 owner name/permission/reconcile/prepare/publish/cancel cleanup helpers。
    - raw Playwright profile只消费显式`--storage-state-in` file；`--storage-state-dir`只传给tool provider的既有production resolver，不在diagnostic中派生host filename。profile不再投影 lifecycle fields。
    - `_write_json`、`_write_jsonl`和summary writer保持当前普通写语义；不得新增普通writer helper，也不得复用待删credential lifecycle。
@@ -565,7 +630,7 @@ smoke_web_ci
 5. tests
    - 删除 owner filename、permissions、TTL、orphan/expired、publish/reconcile、replace-failure credential tests。
    - 新增explicit input可读/缺失/非法、artifact无lifecycle字段，以及模块私有版本化fixture case存在/regular-file与真实执行测试；普通artifact writer不新增测试要求。
-   - v2/revision2/challenge/redaction/budget tests原样或迁移到新的 diagnostic type。
+   - v2/revision2/challenge/redaction/budget tests原样或迁移到新的 diagnostic type；新增utility无本地`1_024/default=80`、默认`error_chars/events`来自typed diagnostic config的owner-level断言，并更新对应CLI/profile/README contract。
 
 ### 10.4 S3 gate commands
 
@@ -587,9 +652,11 @@ rg -n 'storage_state_out|storage-state-out|storage_state_ttl|storage-state-ttl|_
 rg -n -- '--allow-private-network-url|options\.allow_private_network_url' utils/diagnose_web_access.py utils/smoke_web_ci.py utils/diag_web_batch.sh tests/tools/web tests/README.md README.md
 rg -n '0700|0600|chmod|fchmod' utils/diagnose_web_access.py tests/tools/web/test_diagnose_web_access.py
 rg -n 'web-diagnostics-v2|diagnostic_revision|revision' dayu/tools/web/web_diagnostics.py utils/diagnose_web_access.py tests/tools/web
+rg -n '_DEFAULT_DIAGNOSTIC_ERROR_CHARS|1_024|default=80' utils/diagnose_web_access.py tests/tools/web/test_diagnose_web_access.py tests/README.md dayu/config/README.md
+rg -n 'DiagnosticResourceBudget|error_chars|events|max_network' utils/diagnose_web_access.py tests/tools/web/test_diagnose_web_access.py dayu/config/README.md tests/README.md
 ```
 
-前三条删除scan预期零语义残留；若 `expired` 等命中无关 HTTP header/test文字，必须逐条归属。diagnostics scan必须证明 schema version与revision 2仍由单一 producer定义并被consumer断言。
+前三条credential/CLI删除scan与第五条utility-local default scan预期零语义残留；若`expired`、`1_024`等命中无关HTTP header/test文字，必须逐条归属。diagnostics与最后一条typed projection scan必须证明schema version/revision 2和`DiagnosticResourceBudget.error_chars/events`各自只有一个owner并被consumer断言；不得用删除`--max-network`字面值冒充events已同源。
 
 ### 10.5 S3 accepted gate
 
@@ -620,7 +687,7 @@ S3以`smoke_web_ci.py`模块级私有版本化fixture constant/case把现有SEC 
 ## 12. README 决策
 
 - `dayu/config/README.md`：S1 必须更新 Web config字段、五 bool默认、三 owner groups/local override、initial values、proxy+proof typed incompatibility、browser/private独立；先读取并遵守其 Agent更新约束。不得承诺 Issue #178 lifecycle。
-- `tests/README.md`：S1/S3更新 owner-level config、transport/browser matrix、diagnostics v2、lifecycle deletion、deterministic/real smoke意图；先读取其约束。
+- `tests/README.md`：S1/S3更新 owner-level config、S1 diagnostic direct budget node、transport/browser matrix、diagnostics v2、utility-local`1_024/default=80`在S3由typed diagnostic config删除、lifecycle deletion与deterministic/real smoke意图；先读取其约束。
 - 根 `README.md`：当前不描述 `utils/diagnose_web_access.py` 的developer CLI参数，R02不改变安装/初始化/最终用户Web入口，因此预期无 diff。若 implementation scan发现根README实际列出被删out/TTL workflow，S3才可按umbrella条件更新；否则记录“无需更新+零命中”。
 - `dayu/README.md`、Host/Engine/Fins/UI README：层级、装配和这些模块contract未变，且不在R02文档allowlist，必须无 diff。
 
@@ -677,9 +744,9 @@ coverage report --data-file=workspace/tmp/.coverage-r02-sN \
   --include='dayu/tools/web/<exact-file>.py' --fail-under=80
 ```
 
-- S1候选：`provider.py`、`web_resource_budget.py`、`web_egress_policy.py`、`web_http_session.py`、`web_tools.py`、`web_diagnostics.py`、plan-entry adjudication精确授权的`web_search_providers.py`。
+- S1候选：`provider.py`、`web_resource_budget.py`、`web_egress_policy.py`、`web_http_session.py`、`web_tools.py`、`web_diagnostics.py`、plan-entry adjudication精确授权的`web_search_providers.py`，以及plan-drift adjudication前移且实际有diff的`web_fetch_orchestrator.py`、`web_playwright_backend.py`。
 - S2候选：`web_http_session.py`、`web_playwright_backend.py`、`web_tools.py`、`web_fetch_orchestrator.py`、plan-entry adjudication精确授权的`web_search_providers.py`及实际有diff的`web_egress_policy.py`/`web_recovery.py`。
-- S3若production `web_diagnostics.py`有diff则仍需逐文件>=80%；`utils/**`按AGENTS免coverage，但三份行为tests与真实smoke不可省略。
+- S3若production `web_diagnostics.py`有diff则仍需逐文件>=80%；`utils/**`按AGENTS免coverage，但S1的diagnostic direct budget node、S3三份行为tests与真实smoke不可省略。
 - JSON/config/README/tests不计production coverage；无diff候选不伪造coverage。
 
 ### 14.2 每 slice通用 gates
@@ -692,7 +759,7 @@ git diff --name-only <slice-base> --
 ```
 
 - pyright必须0新增/扩散；触及的旧错误必须修复。只有与control中baseline registry六项同指纹且与changed owner/propagation无交集才可 inherited。
-- allowed-file scan预期所有路径落入controller最终批准的R02闭集和固定artifact命名；任何其它路径立即stop。
+- allowed-file scan预期所有路径落入plan-entry与S1 plan-drift两份controller adjudication共同批准的R02闭集、slice时序和固定artifact命名；任何其它路径立即stop。
 - 每 slice记录 README decision；S3结束再跑aggregate decision。
 
 ### 14.3 Source/propagation scans
@@ -700,16 +767,19 @@ git diff --name-only <slice-base> --
 除各 slice scans外，R02 completion前运行：
 
 ```bash
-rg -n 'WebResourceBudget|storage_state_out|storage-state-out|storage_state_ttl|storage-state-ttl|_StorageStateLifecycle|owner_final_name|reconcile' dayu utils tests README.md
+rg -n '\bWebResourceBudget\b|storage_state_out|storage-state-out|storage_state_ttl|storage-state-ttl|_StorageStateLifecycle|owner_final_name|reconcile' dayu utils tests README.md
 rg -n 'allow_private_network_url|allow_custom_port_url|dns_peer_proof_enabled|allow_environment_proxy|browser_enabled' dayu/config/tool_discovery.json dayu/tools/web utils tests/tools/web tests/runtime/test_config_loader.py dayu/config/README.md tests/README.md
 rg -n 'web-diagnostics-v2|WEB_DIAGNOSTIC_SCHEMA_REVISION|challenge' dayu/tools/web utils/diagnose_web_access.py utils/smoke_web_ci.py tests/tools/web
 rg -n 'redirect|approved_addresses|peer|multicast|unspecified|contain|symlink' dayu/tools/web utils tests/tools/web
+rg -n '_DEFAULT_DIAGNOSTIC_ERROR_CHARS|1_024|default=80' utils/diagnose_web_access.py tests/tools/web/test_diagnose_web_access.py dayu/config/README.md tests/README.md
+rg -n 'DEFAULT_HTTP_RESOURCE_BUDGET|DEFAULT_BROWSER_RESOURCE_BUDGET|DiagnosticResourceBudget|error_chars|events|max_network' dayu/tools/web/web_resource_budget.py utils/diagnose_web_access.py tests/tools/web/test_diagnose_web_access.py dayu/config/README.md tests/README.md
 rg -n 'authorization framework|policy DSL|capability token|storage state refresh|storage state retention' dayu utils tests README.md docs/host/wu-semantic-ownership-01-r02-web-owner-policy-plan.md
 ```
 
 - 第一条旧contract预期对production/test/README零残留；显式 storage input不在删除pattern内。
 - 第二条逐字段建立“一个raw parser owner -> typed snapshot -> exact consumers”清单，不以零/单命中作为目标。
 - 第三/四条逐条证明retained contracts仍有owner/tests。
+- 第五条在S1 artifact中必须精确记录`1_024/default=80`仍只存在于utility既有位置且未扩散；S3与R02 completion时预期utility-local diagnostic defaults零残留。第六条证明S1 utility HTTP/Browser defaults复用owner typed constants，S3 diagnostic values从typed config同源投影。
 - 最后一条只能命中本文非目标说明；production/tests/README零新增。不得进入R03 source、Host LLM projection或统一framework。
 
 ### 14.4 Aggregate validation
@@ -741,6 +811,11 @@ docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-plan-review-controlle
 docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-plan-fix-codex.md
 docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-plan-rereview-{mimo,ds}.md
 docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-plan-rereview-controller-adjudication.md
+docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-s1-plan-drift-codex.md
+docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-s1-plan-drift-controller-adjudication.md
+docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-s1-plan-drift-fix-codex.md
+docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-s1-plan-drift-rereview-{mimo,ds}.md
+docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-s1-plan-drift-rereview-controller-adjudication.md
 
 docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-implementation-s{1,2,3}-codex.md
 docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-s{1,2,3}-controller-validation.md
@@ -758,9 +833,21 @@ docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-completion.md
 
 花括号表示分别存在文件，不是literal filename。零accepted finding也必须有zero-change fix/adjudication记录；不得conversation-only pass。
 
+当前只创建`...-s1-plan-drift-fix-codex.md`；两个drift rereview与其controller adjudication是后续controller gate命名，不得由本轮AgentCodex提前创建或启动。
+
 ### 15.2 每 slice 状态机
 
 ```text
+historical accepted plan 6e2a76b3
+  -> S1 direct-consumer drift evidence
+  -> S1 plan-drift controller adjudication
+  -> Codex plan-drift fix + exact scans
+  -> controller validation
+  -> MiMo/DS full drift re-review
+  -> controller adjudication
+  -> superseding accepted-plan local commit
+  -> S1 implementation entry
+
 previous accepted base
   -> implementation-sN artifact + exact validation
   -> MiMo/DS independent full-slice code review
@@ -771,7 +858,7 @@ previous accepted base
   -> next slice
 ```
 
-- S1 base必须包含controller accepted plan commit；S2/S3 base分别是前一slice accepted commit。
+- S1 base必须包含S1 drift闭合后的controller superseding accepted-plan commit；历史`6e2a76b3`不得继续作为execution truth。S2/S3 base分别是前一slice accepted commit。
 - reviewer只能并发读同一immutable target，不并发改共享工作区。
 - `needs-more-evidence`未裁决、任一accepted finding未修、任一retained security失败时不得commit/下一slice。
 - commit、control更新、next-gate启动只归controller；AgentCodex不得自行执行。
@@ -780,11 +867,13 @@ previous accepted base
 
 任一项出现立即停止回controller，不用fallback/compatibility继续：
 
-- implementation diff超出plan-entry adjudication对`R02-B01/B02`的精确边界，或需要任何其它production/test/README allowlist扩展。
+- implementation diff超出plan-entry与S1 plan-drift两份controller adjudication共同冻结的文件/时序/语义边界，或需要任何其它production/test/README allowlist扩展。
 - owner、accepted contract、依赖或production/test allowlist发生新的material drift。
 - 需要修改当前最终批准闭集外production/test/README。
 - 需要设计Issue #178 lifecycle、统一authorization、proxy credential schema或进入R03。
 - packaged/typed defaults无法同源，或backend出现第二默认。
+- S1仍残留`WebResourceBudget` import/type/signature/constructor、旧/new dual schema/facade，或utility HTTP/Browser defaults没有复用owner typed constants。
+- S1改变sender pinned/no-proxy、search provider raw requests、browser/private coupling、diagnostic lifecycle/CLI/writer/profile现有行为，或把utility-local`1_024/default=80`提前删除/扩散；S3未由typed diagnostic config删除这两项本地defaults。
 - proxy+peer proof被静默降级、browser绕过egress、redirect/mixed DNS/deny/peer/budget/containment/symlink任一回归。
 - diagnostics v2/revision2/challenge evidence被删改，或artifact泄漏敏感值。
 - S3/aggregate真实fixture metrics直接证明冻结ceiling不足，但controller尚未裁决后续动作。
@@ -796,18 +885,18 @@ previous accepted base
 `...-completion.md` 必须逐项填写，不得只写“all passed”：
 
 1. umbrella/sub-WU/slug、plan/implementation base SHA、accepted plan SHA、S1/S2/S3 accepted SHA、最终 R02 accepted SHA。
-2. 引用`docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-plan-entry-controller-adjudication.md`，记录`R02-B01/B02=accepted/closed`、一个production/一个test精确新增、实际diff符合各自S1/S2边界，并证明无其它allowlist扩展。
-3. exact changed files，按 production/config/scripts/tests/README/artifacts 分类；证明无R03/Issue178/其它diff。
-4. owner contract：五 bool、三 budgets、parser/default同源、HTTP transport、browser capability、diagnostics v2。
-5. 删除 contract：旧七字段type/config、unconditional proxy/pin、browser/private coupling、storage lifecycle符号/CLI/artifact/tests/README，附零残留scan。
+2. 同时引用plan-entry与S1 plan-drift两份controller adjudication：记录`R02-B01/B02=accepted/closed`、`R02-S1-DR-01..04`最终disposition、一个production/一个test的plan-entry新增，以及四个既有R02文件的S1 type-only时序修正；证明实际diff符合各自S1/S2/S3边界且无第五个drift文件/其它allowlist扩展。
+3. exact changed files，按 production/config/scripts/tests/README/artifacts 分类；S1单列`web_fetch_orchestrator.py`、`web_playwright_backend.py`、`utils/diagnose_web_access.py`、`test_diagnose_web_access.py`的精确type-only diff，并证明无R03/Issue178/其它diff。
+4. owner contract：五 bool、三 budgets、aggregate-only-in-`WebToolsConfig`、HTTP/Browser/Diagnostic参数与worker/process payload map、parser/default同源、utility owner typed constants、HTTP transport、browser capability、diagnostics v2。
+5. 删除 contract：S1旧七字段type/config/import/signature/constructor零残留且无dual schema/facade；S3再删除utility-local`1_024/default=80`；最终删除unconditional proxy/pin、browser/private coupling、storage lifecycle符号/CLI/artifact/tests/README，附逐slice零残留scan。
 6. 保留 contract：redirect、deny、dangerous/mixed DNS、proof-on、budgets、challenge、v2、explicit storage input、redaction、containment/symlink，附test/smoke证据。
 7. frozen budget evidence：逐fixture记录observed wire/decoded/warmup/DOM/text/error/events与§4.1冻结值；证明数值未改、无backend second default，并在存在直接不足证据时记录stop。
-8. 每 slice targeted/full/aggregate pytest命令、exit、passed/skipped/failed count和artifact路径。
-9. 每个 changed production file的coverage百分比与coverage JSON；utils exemption及其行为test证据。
-10. 全量pyright结果、baseline registry delta/六项同指纹证明、`git diff --check`、allowed-file和source/propagation scan结果。
+8. 每 slice targeted/full/aggregate pytest命令、exit、passed/skipped/failed count和artifact路径；S1必须单列diagnostic direct budget node且不得声称整份S3 lifecycle suite已迁移。
+9. 每个 changed production file的coverage百分比与coverage JSON；S1必须包含实际有diff的`web_fetch_orchestrator.py`与`web_playwright_backend.py`，并记录utils exemption及direct behavior node证据。
+10. 覆盖`dayu/tests/utils`且无skip/exclude的全量pyright结果、baseline registry delta/六项同指纹证明、`git diff --check`、allowed-file和source/propagation scan结果；S1旧类型scan必须覆盖三棵目录并为零。
 11. deterministic local、proxy/peer、真实Playwright、真实diagnostic v2、财报fixture smoke命令/结果/metric/artifact。
 12. README逐文件 `updated | no-update-with-evidence` 决定。
-13. plan review/fix/rereview、每slice code review/fix/rereview、aggregate deepreview的所有finding ID和最终disposition；accepted全闭合。
+13. plan-entry、原plan review/fix/rereview、S1 plan-drift evidence/adjudication/fix/rereview、每slice code review/fix/rereview、aggregate deepreview的所有finding ID和最终disposition；accepted全闭合。
 14. residual risks的owner/destination/non-blocking依据；不得出现无owner residual。
 15. handoff明确写“等待controller；不得自行commit/control update/进入R03”。
 
@@ -825,14 +914,18 @@ previous accepted base
 
 ## 17. 本 plan gate 完成信号与 handoff
 
-本轮只有以下条件同时成立才算“plan review finding fix已authored并等待controller validation”，不等于R02 accepted/code-generation execution entry：
+本轮只有以下条件同时成立才算“R02-S1 plan-drift fix已authored并等待controller validation”，不等于R02 accepted/code-generation execution entry：
 
 - 必读文档、三路精确designtruth reviews、补充audit与HEAD/range证据已记录；controller discussion优先级明确。
 - root cause、owner、现状、baseline drift、三 slices、逐文件/符号/call chain、删除/保留contract、tests/coverage/pyright/README/scans/smokes均可直接执行。
 - initial budgets保持controller冻结字面值；S1 entry无数值充分性gate，S3/aggregate只记录metrics且直接不足才stop，无backend第二默认。
-- `R02-B01/B02`已按plan-entry adjudication精确写回为accepted/closed；新增闭集只含`web_search_providers.py`与`tests/runtime/test_config_loader.py`，未被兼容方案扩大或绕过。
-- `R02-PF-01..10`均按plan-review controller adjudication闭合；rejected项保持未实施。
-- AgentCodex authored changes恰好为本文与`docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-plan-fix-codex.md`；其它既有control/plan-entry/review/controller artifacts不修改。无产品、测试、README、control、design改动，whitespace检查通过且无commit。
+- `R02-B01/B02`、`R02-PF-01..10`与原re-review disposition保持不变；本次唯一新裁决真源是S1 plan-drift controller adjudication。
+- `R02-S1-DR-01`已把四个精确direct consumer文件移入S1 type-only闭集；没有第五个文件或R02 product scope扩展。
+- `R02-S1-DR-02`已在§4/§8冻结HTTP/Browser/Diagnostic参数、aggregate projection与worker/process payload owner map；probe无budget，旧类型零残留且无dual schema/facade。
+- `R02-S1-DR-03`已冻结utility复用owner typed HTTP/Browser constants、S1保留`1_024/default=80`、S3由typed diagnostic config删除并同源到`error_chars/events`的时序。
+- `R02-S1-DR-04`已把diagnostic direct budget node、`dayu tests utils`旧类型scan、两个新增production coverage候选、utils coverage exemption/direct test与完整pyright写入S1/aggregate commands和completion。
+- S1 sender pinned/no-proxy、search provider raw requests、browser/private coupling、diagnostic lifecycle/CLI/writer/profile现有行为均明确保持；S2/S3、Issue178、R03、统一authorization没有提前。
+- AgentCodex authored changes恰好为本文与`docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-s1-plan-drift-fix-codex.md`；其它既有control、产品、测试、README、design与review/controller artifacts不修改。plan/fix artifact whitespace与关键一致性scans通过且无commit。
 
 ### 17.1 Plan-time read-only validation baseline
 
@@ -846,6 +939,8 @@ previous accepted base
 | current plan diff whitespace | `git diff --check`无输出且exit 0；对未跟踪新增artifact的`git diff --no-index --check /dev/null <artifact>`无whitespace输出（no-index因“存在差异”返回1） | plan artifact自身无whitespace error；不能把no-index的expected difference exit误报为校验失败 |
 | historical range whitespace | `git diff --check b1a0631f^..HEAD`命中既有review artifacts的trailing whitespace/blank EOF | 这些都在本轮唯一allowlist之外且不是本plan产生；不修改、不登记成R02 implementation baseline waiver |
 
+上述原plan-time test/pyright/smoke结果只保留为历史baseline；它们不能验证本次plan文字修订，也不授权implementation。本次S1 drift-fix gate只运行plan/fix artifact whitespace、`R02-S1-DR-01..04`关键一致性、authored-path与status scans；不得运行implementation测试来假装S1已验证。
+
 历史range whitespace失败不削弱本轮current diff gate：R02 implementation仍必须以各slice base运行`git diff --check`并要求自身diff为0。
 
-Handoff：当前AgentCodex到此停止并等待controller validation；本轮不自行启动双路re-review、不commit、不更新control、不进入implementation或R03。后续gate只能由controller授权。
+Handoff：当前AgentCodex到此停止并等待controller validation；本轮不自行启动双路drift re-review、不commit、不更新control、不进入implementation或R03。后续gate只能由controller授权。
