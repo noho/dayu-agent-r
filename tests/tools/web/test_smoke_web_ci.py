@@ -49,6 +49,79 @@ def test_local_fixture_urls_and_pdf_fixture_are_stable() -> None:
     assert smoke.PDF_FETCH_MIN_CHARS >= 20
 
 
+def test_versioned_filing_fixture_is_regular_and_registered_directly() -> None:
+    """版本化 AAPL filing 必须以模块常量和 LocalFixtureCase 直接注册。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: fixture 缺失、不是常规文件或 bytes 未同源注册时抛出。
+    """
+
+    assert smoke._VERSIONED_FILING_FIXTURE.is_file()
+    expected_bytes = smoke._VERSIONED_FILING_FIXTURE.read_bytes()
+    filing_cases = tuple(
+        case
+        for case in smoke._build_local_fixture_cases(43117)
+        if case.case_kind == smoke._CASE_LOCAL_FILING
+    )
+
+    assert tuple(case.case_name for case in filing_cases) == (
+        "local-filing-http",
+        "local-filing-playwright",
+    )
+    assert all(case.response_body == expected_bytes for case in filing_cases)
+    assert filing_cases[0].sample_playwright is False
+    assert filing_cases[1].sample_playwright is True
+
+
+def test_diagnostic_command_has_no_private_cli_and_forwards_explicit_input(
+    tmp_path: Path,
+) -> None:
+    """smoke child 命令不得依赖旧 private CLI，只转发显式只读输入。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 命令残留旧 CLI 或丢失显式输入时抛出。
+    """
+
+    storage_input = tmp_path / "explicit-storage-state-input.json"
+    options = smoke.SmokeOptions(
+        output_dir=tmp_path,
+        request_timeout=1.0,
+        tool_timeout_budget=2.0,
+        include_playwright=True,
+        external_url_file=None,
+        external_limit=0,
+        diagnostic_only_external=True,
+        run_label="command-owner",
+        log_level=smoke.LogLevel.DEBUG,
+    )
+
+    command = smoke._diagnostic_command(
+        url="http://127.0.0.1:43117/aapl-20240928.htm",
+        artifact_path=tmp_path / "filing.json",
+        options=options,
+        sample_playwright=True,
+        skip_requests=True,
+        skip_tool_fetch=True,
+        storage_state_input=storage_input,
+    )
+
+    assert "--allow-private-network-url" not in command
+    assert _command_value(command, "--storage-state-in") == str(storage_input)
+    assert "--skip-playwright" not in command
+
+
 def test_fixture_session_owns_unique_sentinels_negative_controls_and_freeze_order() -> None:
     """父进程 fixture session 必须绑定唯一 sentinel、负控与 shutdown/freeze 顺序。"""
 
@@ -183,6 +256,137 @@ def test_local_assembly_config_case_writes_overlay_and_truncate_artifact(
         artifact["assembly_path"]
         == "ConfigLoader -> assemble_effective_tool_provider_configs -> discover_service_tools -> ToolDefinition.callable"
     )
+
+
+@pytest.mark.parametrize(
+    ("case_name", "case_kind", "provider_config"),
+    (
+        (
+            "local-private-deny",
+            "local_private_deny",
+            {"allow_private_network_url": False, "allow_custom_port_url": True},
+        ),
+        (
+            "local-custom-port-deny",
+            "local_custom_port_deny",
+            {"allow_private_network_url": True, "allow_custom_port_url": False},
+        ),
+    ),
+)
+def test_typed_egress_deny_cases_use_provider_overlay_and_callable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case_name: str,
+    case_kind: str,
+    provider_config: JsonObject,
+) -> None:
+    """private/custom-port deny 必须经 overlay、discovery 与正式 callable 证明。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest 属性替换夹具。
+        case_name: 稳定 deny case 名称。
+        case_kind: deny case 类型。
+        provider_config: 仅关闭一个出站维度的 typed provider overlay。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: smoke 绕过 typed provider 链或错误接受 URL 时抛出。
+    """
+
+    async def denied_fetch_callable(
+        call: smoke.ToolCallRequest,
+        context: smoke.BatchToolExecutionContext,
+    ) -> smoke.ToolFailedOutcome:
+        """模拟正式 callable 投影 typed egress denial。
+
+        Args:
+            call: fetch_web_page 调用。
+            context: smoke 批式调用上下文。
+
+        Returns:
+            permission_denied 工具失败 outcome。
+
+        Raises:
+            无。
+        """
+
+        assert call.name == "fetch_web_page"
+        assert context.run_id == "web-smoke-run"
+        return ToolFailedOutcome(
+            result=ToolResultFailure(
+                ok=False,
+                error="permission_denied",
+                message="typed egress denied",
+                hint=None,
+                meta=None,
+            )
+        )
+
+    def fake_load_runtime_config(workspace_config_dir: Path) -> smoke.RuntimeConfig:
+        """确认 overlay 已写入后返回占位 RuntimeConfig。
+
+        Args:
+            workspace_config_dir: 当前 deny case 的 workspace config 目录。
+
+        Returns:
+            测试占位 RuntimeConfig。
+
+        Raises:
+            AssertionError: overlay 未包含本次 provider config 时抛出。
+        """
+
+        overlay = _load_json_object(workspace_config_dir / "tool_discovery.json")
+        providers = _object_value(overlay["providers"])
+        web_tools = _object_value(providers["web-tools"])
+        assert _object_value(web_tools["config"]) == provider_config
+        return cast(smoke.RuntimeConfig, object())
+
+    def fake_discover_tools(
+        config: smoke.RuntimeConfig,
+        *,
+        workspace_root: Path,
+    ) -> Mapping[str, ToolDefinition]:
+        """返回会产生 permission_denied 的 fetch_web_page 定义。
+
+        Args:
+            config: 占位 runtime config。
+            workspace_root: smoke diagnostics workspace root。
+
+        Returns:
+            只含 fetch_web_page 的工具定义映射。
+
+        Raises:
+            AssertionError: workspace root 不符合调用 contract 时抛出。
+        """
+
+        del config
+        assert workspace_root == tmp_path
+        return {
+            "fetch_web_page": _tool_definition(
+                "fetch_web_page",
+                denied_fetch_callable,
+            )
+        }
+
+    monkeypatch.setattr(smoke, "_load_runtime_config_for_overlay", fake_load_runtime_config)
+    monkeypatch.setattr(smoke, "_discover_tools_by_name", fake_discover_tools)
+
+    result = smoke._run_local_typed_egress_deny_case(
+        case_name=case_name,
+        case_kind=case_kind,
+        fixture_url="http://127.0.0.1:43117/index.html?dayu_smoke_token=test",
+        diagnostics_dir=tmp_path,
+        provider_config=provider_config,
+    )
+    artifact = _load_json_object(Path(result.evidence_path))
+
+    assert result.status == "passed"
+    assert result.bucket == "passed"
+    assert artifact["observed_error_code"] == "permission_denied"
+    assert artifact["passed"] is True
 
 
 def test_search_provider_cases_are_typed_diagnostic_only(
@@ -713,6 +917,58 @@ def test_local_browser_case_without_playwright_execution_is_failure(tmp_path: Pa
     assert browser.exit_code == 1
     assert summary.status == "failed"
     assert summary.exit_code == 1
+
+
+@pytest.mark.parametrize(
+    "case_name",
+    ("local-filing-http", "local-filing-playwright"),
+)
+def test_versioned_filing_http_and_playwright_execution_are_hard_gates(
+    tmp_path: Path,
+    case_name: str,
+) -> None:
+    """版本化 filing 的 HTTP 与真实 Playwright artifact 都必须可独立判 PASS。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        case_name: filing HTTP 或 Playwright case 名称。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: filing metrics、显式输入或 exact bytes contract 缺失时抛出。
+    """
+
+    case = _fixture_case(case_name)
+    artifact_path = tmp_path / f"{case_name}.json"
+    payload = _diagnostic_payload_for_case(case)
+    _write_payload(artifact_path, payload)
+
+    result = smoke._classify_child_result(
+        case_name=case.case_name,
+        case_kind=case.case_kind,
+        fallback_url=case.url,
+        artifact_path=artifact_path,
+        child_result=smoke.DiagnosticChildResult(
+            returncode=0,
+            stdout="",
+            stderr="",
+        ),
+        fixture_case=case,
+        frozen_ledger=_frozen_ledger_for_case(case),
+    )
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+    assert result.status == "passed"
+    assert result.exit_code == 0
+    for forbidden in (
+        "output_enabled",
+        "output_label",
+        "ttl_seconds",
+        "published",
+    ):
+        assert forbidden not in serialized
 
 
 def test_browser_package_missing_is_independently_verified_skip(
@@ -1674,6 +1930,10 @@ def _frozen_ledger_for_case(
 def _diagnostic_payload_for_case(case: smoke.LocalFixtureCase) -> JsonObject:
     """按父进程 expected bytes 构造可被独立 oracle 验证的 v2 artifact。"""
 
+    playwright_case = case.case_kind == "local_browser" or (
+        case.case_kind == "local_filing"
+        and case.case_name == "local-filing-playwright"
+    )
     payload = _diagnostic_payload(
         url=case.url,
         content_type=(
@@ -1686,12 +1946,12 @@ def _diagnostic_payload_for_case(case: smoke.LocalFixtureCase) -> JsonObject:
         docling_invoked=case.case_kind == "local_pdf" and case.case_name.endswith("-tool"),
         docling_completed=case.case_kind == "local_pdf" and case.case_name.endswith("-tool"),
         fetch_backend=case.expected_backend,
-        playwright_sampled=case.case_kind == "local_browser",
-        playwright_ok=case.case_kind == "local_browser",
+        playwright_sampled=playwright_case,
+        playwright_ok=playwright_case,
     )
     profile_name = (
         "playwright_profile"
-        if case.case_kind == "local_browser"
+        if playwright_case
         else "fetch_web_page_profile"
         if case.case_name.endswith("-tool")
         else "requests_profile"
@@ -1711,6 +1971,12 @@ def _diagnostic_payload_for_case(case: smoke.LocalFixtureCase) -> JsonObject:
         profile["projected_content_digest"] = "sha256:" + "d" * 64
     if case.case_kind == "local_challenge_control":
         profile["challenge_decision"] = "confirmed"
+    if case.case_name == "local-filing-playwright":
+        profile["storage_state"] = {"input_used": True}
+        profile["rendered_html_length"] = case.response_length
+        profile["rendered_text_length"] = 1024
+        profile["network_event_count"] = 2
+        profile["network_event_limit"] = 512
     payload[profile_name] = profile
     for skipped_profile_name in {
         "requests_profile",

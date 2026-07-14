@@ -75,6 +75,9 @@ _CASE_LOCAL_PDF: Final[str] = "local_pdf"
 _CASE_LOCAL_BROWSER: Final[str] = "local_browser"
 _CASE_LOCAL_CHALLENGE_CONTROL: Final[str] = "local_challenge_control"
 _CASE_LOCAL_ASSEMBLY_CONFIG: Final[str] = "local_assembly_config"
+_CASE_LOCAL_FILING: Final[str] = "local_filing"
+_CASE_LOCAL_PRIVATE_DENY: Final[str] = "local_private_deny"
+_CASE_LOCAL_CUSTOM_PORT_DENY: Final[str] = "local_custom_port_deny"
 _CASE_EXTERNAL: Final[str] = "external"
 _CASE_SEARCH_PROVIDER: Final[str] = "search_provider"
 _JSONL_SUFFIXES: Final[frozenset[str]] = frozenset({".jsonl", ".jsonlines"})
@@ -84,6 +87,7 @@ _LOCAL_HTML_PATH: Final[str] = "/index.html"
 _LOCAL_PDF_PATH: Final[str] = "/fixture.pdf"
 _LOCAL_BROWSER_PATH: Final[str] = "/client-rendered.html"
 _LOCAL_CHALLENGE_PATH: Final[str] = "/challenge-control.html"
+_LOCAL_FILING_PATH: Final[str] = "/aapl-20240928.htm"
 _LOCAL_NEGATIVE_PATH: Final[str] = "/negative-control"
 _FIXTURE_TOKEN_QUERY_KEY: Final[str] = "dayu_smoke_token"
 _LOCAL_HTML_CONTENT_TYPE: Final[str] = "text/html; charset=utf-8"
@@ -124,6 +128,7 @@ _BUCKET_WEB_TOOL_MISSING: Final[str] = "web_tool_missing"
 _BUCKET_WEB_ASSEMBLY_FETCH_FAILURE: Final[str] = "web_assembly_fetch_failure"
 _BUCKET_WEB_ASSEMBLY_FETCH_CONTENT_FAILURE: Final[str] = "web_assembly_fetch_content_failure"
 _BUCKET_WEB_ASSEMBLY_CONFIG_MISMATCH: Final[str] = "web_assembly_config_mismatch"
+_BUCKET_TYPED_EGRESS_DENY_FAILED: Final[str] = "typed_egress_deny_failed"
 _BUCKET_SEARCH_PROVIDER_PASSED: Final[str] = "search_provider_passed"
 _BUCKET_PROVIDER_KEY_MISSING: Final[str] = "provider_key_missing"
 _BUCKET_PROVIDER_AUTH_FAILURE: Final[str] = "provider_auth_failure"
@@ -142,6 +147,15 @@ _ASSEMBLY_PATH_LABEL: Final[str] = (
     "discover_service_tools -> ToolDefinition.callable"
 )
 _PACKAGE_CONFIG_DIR: Final[Path] = Path(__file__).resolve().parents[1] / "dayu" / "config"
+_VERSIONED_FILING_FIXTURE: Final[Path] = (
+    Path(__file__).resolve().parents[1]
+    / "tests"
+    / "fins"
+    / "fixtures"
+    / "aapl_xbrl"
+    / "fil_0000320193-24-000123"
+    / "aapl-20240928.htm"
+)
 _NOISY_DEBUG_LOGGER_NAMES: Final[tuple[str, ...]] = (
     "dayu.fins",
     "dayu.tools.web",
@@ -156,7 +170,6 @@ _ASSEMBLY_PROVIDER_CONFIG: Final[JsonObject] = {
     "request_timeout_seconds": 6.0,
     "max_search_results": 3,
     "fetch_truncate_chars": _ASSEMBLY_FETCH_TRUNCATE_CHARS,
-    "allow_private_network_url": True,
     "playwright_channel": "chrome",
     "playwright_storage_state_dir": "",
 }
@@ -902,15 +915,19 @@ def _build_local_fixture_cases(port: int) -> tuple[LocalFixtureCase, ...]:
         port: local server 端口。
 
     Returns:
-        HTML requests/tool、PDF requests/tool、browser、challenge 与 assembly cases。
+        HTML、PDF、browser、challenge、版本化 filing 与 assembly cases。
 
     Raises:
-        ValueError: port 非正时抛出。
+        OSError: 版本化 filing fixture 读取失败时抛出。
+        ValueError: port 非正或版本化 fixture 不是常规文件时抛出。
     """
 
     html_bytes = _html_fixture_bytes()
     pdf_bytes = _pdf_fixture_bytes()
     browser_bytes = _browser_fixture_bytes()
+    if not _VERSIONED_FILING_FIXTURE.is_file():
+        raise ValueError("版本化 AAPL filing fixture 缺失或不是常规文件。")
+    filing_bytes = _VERSIONED_FILING_FIXTURE.read_bytes()
     return (
         _new_fixture_case(
             port=port,
@@ -982,6 +999,30 @@ def _build_local_fixture_cases(port: int) -> tuple[LocalFixtureCase, ...]:
             expected_backend="requests",
             sample_playwright=False,
             skip_requests=False,
+            skip_tool_fetch=True,
+        ),
+        _new_fixture_case(
+            port=port,
+            case_name="local-filing-http",
+            case_kind=_CASE_LOCAL_FILING,
+            path=_LOCAL_FILING_PATH,
+            response_kind=FixtureResponseKind.HTML,
+            response_body=filing_bytes,
+            expected_backend="requests",
+            sample_playwright=False,
+            skip_requests=False,
+            skip_tool_fetch=True,
+        ),
+        _new_fixture_case(
+            port=port,
+            case_name="local-filing-playwright",
+            case_kind=_CASE_LOCAL_FILING,
+            path=_LOCAL_FILING_PATH,
+            response_kind=FixtureResponseKind.HTML,
+            response_body=filing_bytes,
+            expected_backend="playwright",
+            sample_playwright=True,
+            skip_requests=True,
             skip_tool_fetch=True,
         ),
         _new_fixture_case(
@@ -2575,6 +2616,10 @@ def _classify_loaded_artifact(
     profile_name = (
         "playwright_profile"
         if case_kind == _CASE_LOCAL_BROWSER
+        or (
+            case_kind == _CASE_LOCAL_FILING
+            and case_name == "local-filing-playwright"
+        )
         else "fetch_web_page_profile"
         if case_name.endswith("-tool")
         else "requests_profile"
@@ -2588,7 +2633,7 @@ def _classify_loaded_artifact(
             evidence_path=evidence_path,
             bucket=(
                 _BUCKET_BROWSER_FETCH_FAILURE
-                if case_kind == _CASE_LOCAL_BROWSER
+                if profile_name == "playwright_profile"
                 else _BUCKET_LOCAL_FETCH_FAILURE
                 if profile_name == "fetch_web_page_profile"
                 else _BUCKET_LOCAL_REQUESTS_FAILURE
@@ -2616,7 +2661,7 @@ def _classify_loaded_artifact(
             evidence_path=evidence_path,
             bucket=(
                 _BUCKET_BROWSER_BACKEND_NOT_OBSERVED
-                if case_kind == _CASE_LOCAL_BROWSER
+                if profile_name == "playwright_profile"
                 else _BUCKET_LOCAL_FETCH_FAILURE
             ),
             exit_code=_EXIT_LOCAL_FAILURE,
@@ -2644,6 +2689,22 @@ def _classify_loaded_artifact(
             exit_code=_EXIT_LOCAL_FAILURE,
             suggested_next_step="普通 local fixture 不得被分类为 confirmed challenge。",
         )
+
+    if case_kind == _CASE_LOCAL_FILING:
+        filing_gap = _filing_artifact_gap(
+            payload=payload,
+            profile_name=profile_name,
+        )
+        if filing_gap:
+            return _case_failure(
+                case_name=case_name,
+                case_kind=case_kind,
+                url=url,
+                evidence_path=evidence_path,
+                bucket=_BUCKET_BROWSER_BACKEND_NOT_OBSERVED,
+                exit_code=_EXIT_LOCAL_FAILURE,
+                suggested_next_step=filing_gap,
+            )
 
     if case_kind == _CASE_LOCAL_PDF and profile_name == "fetch_web_page_profile":
         pdf_failure = _classify_pdf_tool_loaded_artifact(
@@ -2858,6 +2919,54 @@ def _classify_browser_loaded_artifact(
             suggested_next_step="Playwright profile 未提供 browser_executed=true 的执行证据。",
         )
     return None
+
+
+def _filing_artifact_gap(
+    *,
+    payload: Mapping[str, JsonValue],
+    profile_name: str,
+) -> str:
+    """校验版本化 filing 的 HTTP 或真实 Playwright 执行事实。
+
+    Args:
+        payload: diagnostics artifact。
+        profile_name: 当前 filing case 的执行 profile 名称。
+
+    Returns:
+        空字符串表示 filing 执行证据完整；否则返回 gap 说明。
+
+    Raises:
+        无。
+    """
+
+    if profile_name != "playwright_profile":
+        return ""
+    profile = _nested_object(payload, profile_name)
+    if not _playwright_profile_sampled(payload):
+        return "版本化 filing 未执行 Playwright profile。"
+    if not _bool_field(profile, "browser_executed"):
+        return "版本化 filing 缺少 browser_executed=true。"
+    storage_state = _nested_object(profile, "storage_state")
+    if not _bool_field(storage_state, "input_used"):
+        return "版本化 filing 未证明显式 storage state 输入已被 raw Playwright 消费。"
+    if _int_field(profile, "rendered_html_length") is None:
+        return "版本化 filing 缺少 rendered HTML length metric。"
+    if _int_field(profile, "rendered_text_length") is None:
+        return "版本化 filing 缺少 rendered text length metric。"
+    if _int_field(profile, "network_event_count") is None:
+        return "版本化 filing 缺少 network event count metric。"
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    for forbidden_field in (
+        "output_enabled",
+        "output_label",
+        "ttl_seconds",
+        "published",
+        "reconcile",
+        "cleanup",
+    ):
+        if forbidden_field in serialized:
+            return f"版本化 filing artifact 残留 credential lifecycle 字段：{forbidden_field}。"
+    return ""
 
 
 def _case_failure(
@@ -3366,10 +3475,10 @@ def _diagnostic_command(
     url: str,
     artifact_path: Path,
     options: SmokeOptions,
-    allow_private_network_url: bool,
     sample_playwright: bool,
     skip_requests: bool = False,
     skip_tool_fetch: bool = False,
+    storage_state_input: Path | None = None,
 ) -> list[str]:
     """构造单 URL diagnostics 命令。
 
@@ -3377,10 +3486,10 @@ def _diagnostic_command(
         url: 待诊断 URL。
         artifact_path: diagnostics 输出 artifact。
         options: smoke 选项。
-        allow_private_network_url: 是否允许 diagnostics 访问内网或本地 URL。
         sample_playwright: 是否让 diagnostics 采样 Playwright。
         skip_requests: 是否跳过 raw requests profile。
         skip_tool_fetch: 是否跳过 tool fetch profile。
+        storage_state_input: 可选的显式 Playwright storage state 输入文件。
 
     Returns:
         子进程命令参数列表。
@@ -3402,15 +3511,106 @@ def _diagnostic_command(
         "--tool-timeout-budget",
         str(options.tool_timeout_budget),
     ]
-    if allow_private_network_url:
-        command.append("--allow-private-network-url")
     if not sample_playwright:
         command.append("--skip-playwright")
     if skip_requests:
         command.append("--skip-requests")
     if skip_tool_fetch:
         command.append("--skip-tool-fetch")
+    if storage_state_input is not None:
+        command.extend(["--storage-state-in", str(storage_state_input)])
     return command
+
+
+def _run_local_typed_egress_deny_case(
+    *,
+    case_name: str,
+    case_kind: str,
+    fixture_url: str,
+    diagnostics_dir: Path,
+    provider_config: Mapping[str, JsonValue],
+) -> SmokeCaseResult:
+    """通过正式 config assembly 与工具 callable 验证一个 typed egress deny。
+
+    Args:
+        case_name: 稳定 smoke case 名称。
+        case_kind: private 或 custom-port deny case 类型。
+        fixture_url: 本地 custom-port fixture URL。
+        diagnostics_dir: local diagnostics 输出目录。
+        provider_config: 含单一显式 deny 的 Web provider overlay。
+
+    Returns:
+        typed deny 的 smoke 分类结果。
+
+    Raises:
+        OSError: overlay 或 artifact 写入失败时抛出。
+    """
+
+    artifact_path = diagnostics_dir / f"{case_name}.json"
+    workspace_config_dir = diagnostics_dir / f"{case_name}-workspace-config"
+    _write_web_tool_discovery_overlay(
+        workspace_config_dir,
+        provider_config=provider_config,
+    )
+    error_type = ""
+    observed_error_code = ""
+    try:
+        config = _load_runtime_config_for_overlay(workspace_config_dir)
+        definitions = _discover_tools_by_name(config, workspace_root=diagnostics_dir)
+        fetch_definition = definitions.get("fetch_web_page")
+        if fetch_definition is None:
+            error_type = "MissingFetchWebPage"
+        else:
+            outcome = asyncio.run(
+                fetch_definition.callable(
+                    _tool_call("fetch_web_page", {"url": fixture_url}),
+                    _tool_context(),
+                )
+            )
+            if isinstance(outcome, ToolFailedOutcome):
+                observed_error_code = outcome.result.error
+            else:
+                error_type = type(outcome).__name__
+    except Exception as exc:
+        error_type = type(exc).__name__
+
+    passed = observed_error_code == "permission_denied"
+    _write_json(
+        artifact_path,
+        {
+            "schema_version": "web-smoke-typed-egress-v1",
+            "case_kind": case_kind,
+            "safe_url": project_safe_url_or_empty(fixture_url),
+            "provider_config": dict(provider_config),
+            "expected_error_code": "permission_denied",
+            "observed_error_code": observed_error_code,
+            "error_type": error_type,
+            "passed": passed,
+        },
+    )
+    if not passed:
+        return _case_failure(
+            case_name=case_name,
+            case_kind=case_kind,
+            url=fixture_url,
+            evidence_path=str(artifact_path),
+            bucket=_BUCKET_TYPED_EGRESS_DENY_FAILED,
+            exit_code=_EXIT_LOCAL_FAILURE,
+            suggested_next_step=(
+                "显式 typed provider deny 必须在正式 fetch_web_page callable 中投影为 permission_denied。"
+            ),
+        )
+    return SmokeCaseResult(
+        case_name=case_name,
+        case_kind=case_kind,
+        url=project_safe_url_or_empty(fixture_url),
+        status=_STATUS_PASSED,
+        bucket=_BUCKET_PASSED,
+        evidence_path=str(artifact_path),
+        suggested_next_step="",
+        reason="",
+        exit_code=_EXIT_OK,
+    )
 
 
 def _run_local_assembly_config_case(
@@ -3821,8 +4021,16 @@ def _run_local_cases(*, options: SmokeOptions, runner: DiagnosticRunner) -> list
     """
 
     diagnostics_dir = options.output_dir / "diagnostics" / "local"
+    filing_diagnostics_dir = options.output_dir / "diagnostics" / "filing"
     diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    filing_diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    filing_storage_state_input = filing_diagnostics_dir / "explicit-storage-state-input.json"
+    _write_json(
+        filing_storage_state_input,
+        {"cookies": [], "origins": []},
+    )
     pending_diagnostics: list[PendingLocalDiagnostic] = []
+    typed_deny_results: list[SmokeCaseResult] = []
     assembly_pending: tuple[LocalFixtureCase, SmokeCaseResult] | None = None
     with _running_local_fixture_server() as session:
         _LOGGER.info(
@@ -3836,7 +4044,12 @@ def _run_local_cases(*, options: SmokeOptions, runner: DiagnosticRunner) -> list
             if case.case_kind != _CASE_LOCAL_ASSEMBLY_CONFIG
         )
         for case in diagnostic_cases:
-            artifact_path = diagnostics_dir / f"{case.case_name}.json"
+            artifact_dir = (
+                filing_diagnostics_dir
+                if case.case_kind == _CASE_LOCAL_FILING
+                else diagnostics_dir
+            )
+            artifact_path = artifact_dir / f"{case.case_name}.json"
             _LOGGER.debug(
                 "running local smoke case: case=%s kind=%s sample_playwright=%s artifact=%s",
                 case.case_name,
@@ -3853,10 +4066,14 @@ def _run_local_cases(*, options: SmokeOptions, runner: DiagnosticRunner) -> list
                 url=case.url,
                 artifact_path=artifact_path,
                 options=options,
-                allow_private_network_url=True,
                 sample_playwright=case.sample_playwright,
                 skip_requests=case.skip_requests,
                 skip_tool_fetch=case.skip_tool_fetch,
+                storage_state_input=(
+                    filing_storage_state_input
+                    if case.case_name == "local-filing-playwright"
+                    else None
+                ),
             )
             child_result = runner(command)
             _log_diagnostic_child_result(
@@ -3871,6 +4088,30 @@ def _run_local_cases(*, options: SmokeOptions, runner: DiagnosticRunner) -> list
                     child_result=child_result,
                 )
             )
+        private_deny_config = dict(_ASSEMBLY_PROVIDER_CONFIG)
+        private_deny_config["allow_private_network_url"] = False
+        private_deny_config["allow_custom_port_url"] = True
+        typed_deny_results.append(
+            _run_local_typed_egress_deny_case(
+                case_name="local-private-deny",
+                case_kind=_CASE_LOCAL_PRIVATE_DENY,
+                fixture_url=session.urls.html_url,
+                diagnostics_dir=diagnostics_dir,
+                provider_config=private_deny_config,
+            )
+        )
+        custom_port_deny_config = dict(_ASSEMBLY_PROVIDER_CONFIG)
+        custom_port_deny_config["allow_private_network_url"] = True
+        custom_port_deny_config["allow_custom_port_url"] = False
+        typed_deny_results.append(
+            _run_local_typed_egress_deny_case(
+                case_name="local-custom-port-deny",
+                case_kind=_CASE_LOCAL_CUSTOM_PORT_DENY,
+                fixture_url=session.urls.html_url,
+                diagnostics_dir=diagnostics_dir,
+                provider_config=custom_port_deny_config,
+            )
+        )
         assembly_fixture_case = next(
             case
             for case in session.cases
@@ -3905,6 +4146,7 @@ def _run_local_cases(*, options: SmokeOptions, runner: DiagnosticRunner) -> list
         )
         for pending in pending_diagnostics
     ]
+    results.extend(typed_deny_results)
     if assembly_pending is None:
         raise RuntimeError("local assembly case 未执行。")
     assembly_fixture_case, preliminary_assembly_result = assembly_pending
@@ -3948,7 +4190,6 @@ def _run_external_cases(*, options: SmokeOptions, runner: DiagnosticRunner) -> l
             url=url,
             artifact_path=artifact_path,
             options=options,
-            allow_private_network_url=False,
             sample_playwright=options.include_playwright,
         )
         child_result = runner(command)

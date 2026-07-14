@@ -12,9 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 import re
-import secrets
 import subprocess
 import sys
 import time
@@ -55,8 +53,10 @@ from dayu.tools.web.web_egress_policy import WebEgressPolicy, WebEgressPolicyErr
 from dayu.tools.web.web_http_session import WebHttpTransportPolicy
 from dayu.tools.web.web_resource_budget import (
     DEFAULT_BROWSER_RESOURCE_BUDGET,
+    DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
     DEFAULT_HTTP_RESOURCE_BUDGET,
     BrowserResourceBudget,
+    DiagnosticResourceBudget,
     HttpResourceBudget,
 )
 from dayu.tools.web.web_diagnostics import (
@@ -86,7 +86,6 @@ _FETCH_TOOL_NAME: Final[str] = "fetch_web_page"
 _DEFAULT_BATCH_OUTPUT_ROOT: Final[Path] = Path("workspace/output/web_diagnostics")
 _JSONL_SUFFIXES: Final[frozenset[str]] = frozenset({".jsonl", ".jsonlines"})
 _DEFAULT_FETCH_TRUNCATE_CHARS: Final[int] = 80_000
-_DEFAULT_DIAGNOSTIC_ERROR_CHARS: Final[int] = 1_024
 _DEFAULT_USER_AGENT: Final[str] = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -116,12 +115,6 @@ _PATH_DOCLING_CONVERSION: Final[str] = "docling_conversion"
 _DOCLING_DEPENDENCY_EXCEPTION_TYPES: Final[frozenset[str]] = frozenset(
     {"DoclingRuntimeInitializationError", "ModuleNotFoundError", "ImportError"}
 )
-_STORAGE_STATE_FINAL_PREFIX: Final[str] = "dayu-web-diagnostic-storage-state-"
-_STORAGE_STATE_TEMP_PREFIX: Final[str] = ".dayu-web-diagnostic-storage-state-"
-_STORAGE_STATE_FINAL_SUFFIX: Final[str] = ".json"
-_STORAGE_STATE_TEMP_SUFFIX: Final[str] = ".tmp"
-_PRIVATE_DIRECTORY_MODE: Final[int] = 0o700
-_PRIVATE_FILE_MODE: Final[int] = 0o600
 _DIAGNOSTIC_HTTP_RESOURCE_BUDGET: Final[HttpResourceBudget] = (
     DEFAULT_HTTP_RESOURCE_BUDGET
 )
@@ -177,15 +170,12 @@ class CliOptions:
         manual_wait_seconds: 导航后人工等待秒数。
         pause_before_snapshot: 采样页面状态前是否等待人工确认。
         storage_state_in: Playwright storage state 输入路径。
-        storage_state_out: Playwright storage state 输出路径。
-        storage_state_dir: host 级 storage state 目录。
-        storage_state_ttl_seconds: 显式输出 storage state 的正 TTL 秒数。
+        storage_state_dir: production Web provider 的 storage state 输入目录。
         skip_playwright: 是否跳过浏览器路径。
         skip_requests: 是否跳过 raw requests 路径。
         skip_tool_fetch: 是否跳过 current fetch 工具路径。
-        max_network: 最多记录的浏览器网络摘要数。
+        max_network: 可选的本次浏览器网络摘要数 typed override。
         fetch_truncate_chars: 传给 current provider 的截断声明字符数。
-        allow_private_network_url: 是否允许诊断内网或本地 URL。
 
     Returns:
         无。
@@ -207,162 +197,12 @@ class CliOptions:
     manual_wait_seconds: float
     pause_before_snapshot: bool
     storage_state_in: str
-    storage_state_out: str
     storage_state_dir: str
-    storage_state_ttl_seconds: int
     skip_playwright: bool
     skip_requests: bool
     skip_tool_fetch: bool
-    max_network: int
+    max_network: int | None
     fetch_truncate_chars: int
-    allow_private_network_url: bool
-
-
-@dataclass(slots=True)
-class _StorageStateLifecycle:
-    """单次 diagnostic storage-state 的原子发布生命周期。
-
-    Args:
-        input_path: 可选显式或 owner 目录输入文件。
-        final_path: 显式 opt-in 的 owner 命名 final path。
-        ttl_seconds: 成功 final 的正 TTL 秒数；未启用输出时为零。
-        temp_path: 当前 run 创建的同目录临时文件。
-        published: final 是否已由当前 run 原子发布。
-
-    Returns:
-        无。
-
-    Raises:
-        无。
-    """
-
-    input_path: Path | None
-    final_path: Path | None
-    ttl_seconds: int
-    temp_path: Path | None = None
-    published: bool = False
-
-    @property
-    def output_enabled(self) -> bool:
-        """返回当前运行是否显式启用 storage-state 输出。
-
-        Args:
-            无。
-
-        Returns:
-            final path 存在时返回 ``True``。
-
-        Raises:
-            无。
-        """
-
-        return self.final_path is not None
-
-    def artifact_projection(self) -> JsonObject:
-        """构造不暴露绝对路径或登录态内容的 artifact 投影。
-
-        Args:
-            无。
-
-        Returns:
-            输入是否使用、输出是否启用、sanitized label 与 TTL。
-
-        Raises:
-            无。
-        """
-
-        return {
-            "input_used": self.input_path is not None,
-            "output_enabled": self.output_enabled,
-            "output_label": self.final_path.name if self.final_path is not None else "",
-            "ttl_seconds": self.ttl_seconds if self.output_enabled else None,
-            "published": self.published,
-        }
-
-    def publish(self, context: _BrowserContextProtocol) -> None:
-        """读取 Playwright storage state 并原子发布到 final。
-
-        Args:
-            context: 已完成页面采样的浏览器上下文。
-
-        Returns:
-            无。
-
-        Raises:
-            OSError: 目录、临时文件、flush/fsync、replace 或权限确认失败时抛出。
-            TypeError: Playwright 返回值无法 JSON 序列化时抛出。
-        """
-
-        final_path = self.final_path
-        if final_path is None:
-            return
-        temp_path = final_path.parent / (
-            f"{_STORAGE_STATE_TEMP_PREFIX}{secrets.token_hex(16)}"
-            f"{_STORAGE_STATE_TEMP_SUFFIX}"
-        )
-        self.temp_path = temp_path
-        payload = context.storage_state()
-        serialized = json.dumps(
-            payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ) + "\n"
-        descriptor = os.open(
-            temp_path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            _PRIVATE_FILE_MODE,
-        )
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                stream.write(serialized)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.chmod(temp_path, _PRIVATE_FILE_MODE)
-            os.replace(temp_path, final_path)
-            self.temp_path = None
-            self.published = True
-            os.chmod(final_path, _PRIVATE_FILE_MODE)
-        except BaseException:
-            self._unlink_temp()
-            raise
-
-    def cleanup_failure(self) -> None:
-        """清理普通 failure/cancel 路径的本 run temp 与已发布 final。
-
-        Args:
-            无。
-
-        Returns:
-            无。
-
-        Raises:
-            OSError: 当前 run 文件无法删除时抛出。
-        """
-
-        self._unlink_temp()
-        if self.published and self.final_path is not None:
-            self.final_path.unlink(missing_ok=True)
-            self.published = False
-
-    def _unlink_temp(self) -> None:
-        """删除当前 run 创建的临时文件。
-
-        Args:
-            无。
-
-        Returns:
-            无。
-
-        Raises:
-            OSError: 临时文件无法删除时抛出。
-        """
-
-        if self.temp_path is None:
-            return
-        self.temp_path.unlink(missing_ok=True)
-        self.temp_path = None
 
 
 @dataclass(slots=True)
@@ -771,21 +611,6 @@ class _BrowserContextProtocol(Protocol):
 
         Raises:
             Exception: 页面创建失败时抛出。
-        """
-
-        ...
-
-    def storage_state(self, *, path: str | None = None) -> JsonValue:
-        """读取或保存 storage state。
-
-        Args:
-            path: 可选输出路径；存在时写入文件。
-
-        Returns:
-            Playwright 返回的 storage state JSON 载荷。
-
-        Raises:
-            Exception: 读取或写入失败时抛出。
         """
 
         ...
@@ -1210,25 +1035,26 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manual-wait-seconds", type=float, default=0.0, help="导航后额外等待秒数。")
     parser.add_argument("--pause-before-snapshot", action="store_true", help="采样页面前等待人工确认。")
     parser.add_argument("--storage-state-in", default="", help="Playwright storage state 输入文件。")
-    parser.add_argument("--storage-state-out", default="", help="Playwright storage state 输出文件。")
-    parser.add_argument("--storage-state-dir", default="", help="按 host 查找 owner 命名 storage state 输入的目录；不会自动启用输出。")
     parser.add_argument(
-        "--storage-state-ttl-seconds",
-        type=int,
-        default=0,
-        help="显式 --storage-state-out 的正 TTL 秒数；缺省为 0，表示不持久化。",
+        "--storage-state-dir",
+        default="",
+        help="传给 production Web provider 的 storage state 输入目录。",
     )
     parser.add_argument("--skip-playwright", action="store_true", help="跳过 Playwright 浏览器路径。")
     parser.add_argument("--skip-requests", action="store_true", help="跳过 raw requests 对照路径。")
     parser.add_argument("--skip-tool-fetch", action="store_true", help="跳过 current fetch_web_page 工具路径。")
-    parser.add_argument("--max-network", type=int, default=80, help="最多记录的 Playwright 网络摘要条数。")
+    parser.add_argument(
+        "--max-network",
+        type=int,
+        default=None,
+        help="显式覆盖本次 Playwright 网络摘要条数；未提供时使用 typed Web 配置。",
+    )
     parser.add_argument(
         "--fetch-truncate-chars",
         type=int,
         default=_DEFAULT_FETCH_TRUNCATE_CHARS,
         help="传给 current provider 的 fetch 内容截断字符数。",
     )
-    parser.add_argument("--allow-private-network-url", action="store_true", help="允许诊断内网或本地 URL。")
     return parser
 
 
@@ -1260,15 +1086,14 @@ def _parse_options(argv: Sequence[str] | None) -> CliOptions:
         manual_wait_seconds=max(float(namespace.manual_wait_seconds), 0.0),
         pause_before_snapshot=bool(namespace.pause_before_snapshot),
         storage_state_in=str(namespace.storage_state_in or "").strip(),
-        storage_state_out=str(namespace.storage_state_out or "").strip(),
         storage_state_dir=str(namespace.storage_state_dir or "").strip(),
-        storage_state_ttl_seconds=int(namespace.storage_state_ttl_seconds),
         skip_playwright=bool(namespace.skip_playwright),
         skip_requests=bool(namespace.skip_requests),
         skip_tool_fetch=bool(namespace.skip_tool_fetch),
-        max_network=max(int(namespace.max_network), 1),
+        max_network=(
+            None if namespace.max_network is None else int(namespace.max_network)
+        ),
         fetch_truncate_chars=max(int(namespace.fetch_truncate_chars), 1),
-        allow_private_network_url=bool(namespace.allow_private_network_url),
     )
 
 
@@ -1465,6 +1290,7 @@ def _build_requests_profile(
     timeout_seconds: float,
     egress_policy: WebEgressPolicy,
     transport_policy: WebHttpTransportPolicy,
+    diagnostic_resource_budget: DiagnosticResourceBudget,
 ) -> JsonObject:
     """采集 raw requests 诊断路径证据。
 
@@ -1473,6 +1299,7 @@ def _build_requests_profile(
         timeout_seconds: requests 超时秒数。
         egress_policy: 当前 diagnostic 调用共享的 Web 出站策略。
         transport_policy: provider parser 产生的本次 HTTP transport 策略快照。
+        diagnostic_resource_budget: provider parser 产生的本次诊断预算。
 
     Returns:
         raw requests profile JSON 对象。
@@ -1491,7 +1318,7 @@ def _build_requests_profile(
             elapsed_seconds=_round_elapsed(started_at),
             error_code="blocked_by_web_egress_policy",
             error_message=str(exc),
-            max_error_chars=_DEFAULT_DIAGNOSTIC_ERROR_CHARS,
+            max_error_chars=diagnostic_resource_budget.error_chars,
             backend=WebDiagnosticBackend.REQUESTS,
             sampled=False,
         ).to_json()
@@ -1518,7 +1345,7 @@ def _build_requests_profile(
             elapsed_seconds=_round_elapsed(started_at),
             error_code="blocked_by_web_egress_policy",
             error_message=str(exc),
-            max_error_chars=_DEFAULT_DIAGNOSTIC_ERROR_CHARS,
+            max_error_chars=diagnostic_resource_budget.error_chars,
             backend=WebDiagnosticBackend.REQUESTS,
             sampled=False,
         ).to_json()
@@ -1531,7 +1358,7 @@ def _build_requests_profile(
             elapsed_seconds=_round_elapsed(started_at),
             error_code="request_exception",
             error_message=str(exc),
-            max_error_chars=_DEFAULT_DIAGNOSTIC_ERROR_CHARS,
+            max_error_chars=diagnostic_resource_budget.error_chars,
             backend=WebDiagnosticBackend.REQUESTS,
         ).to_json()
         session.close()
@@ -1571,7 +1398,7 @@ def _build_requests_profile(
             elapsed_seconds=_round_elapsed(started_at),
             error_code="request_exception",
             error_message=str(exc),
-            max_error_chars=_DEFAULT_DIAGNOSTIC_ERROR_CHARS,
+            max_error_chars=diagnostic_resource_budget.error_chars,
             backend=WebDiagnosticBackend.REQUESTS,
         ).to_json()
     finally:
@@ -1595,8 +1422,6 @@ def _provider_config(options: CliOptions) -> JsonObject:
         "request_timeout_seconds": options.request_timeout,
         "fetch_truncate_chars": options.fetch_truncate_chars,
     }
-    if options.allow_private_network_url:
-        config["allow_private_network_url"] = True
     if options.playwright_channel:
         config["playwright_channel"] = options.playwright_channel
     else:
@@ -1772,6 +1597,7 @@ def _build_tool_fetch_profile(
     options: CliOptions,
     *,
     provider_config: Mapping[str, JsonValue],
+    diagnostic_resource_budget: DiagnosticResourceBudget,
 ) -> JsonObject:
     """采集 current ``fetch_web_page`` 工具路径证据。
 
@@ -1779,6 +1605,7 @@ def _build_tool_fetch_profile(
         url: 待诊断 URL。
         options: CLI 选项。
         provider_config: 与 raw requests transport snapshot 同源的 provider 配置。
+        diagnostic_resource_budget: provider parser 产生的本次诊断预算。
 
     Returns:
         current fetch 工具 profile JSON 对象。
@@ -1802,7 +1629,7 @@ def _build_tool_fetch_profile(
             elapsed_seconds=_round_elapsed(started_at),
             error_code="callable_exception",
             error_message=str(exc),
-            max_error_chars=_DEFAULT_DIAGNOSTIC_ERROR_CHARS,
+            max_error_chars=diagnostic_resource_budget.error_chars,
             backend=WebDiagnosticBackend.TOOL,
         ).to_json()
         return _attach_docling_evidence(
@@ -1857,7 +1684,7 @@ def _build_tool_fetch_profile(
             elapsed_seconds=elapsed,
             error_code=outcome.result.error,
             error_message=outcome.result.message,
-            max_error_chars=_DEFAULT_DIAGNOSTIC_ERROR_CHARS,
+            max_error_chars=diagnostic_resource_budget.error_chars,
             backend=WebDiagnosticBackend.TOOL,
         ).to_json()
         failure["next_action"] = _next_action_from_hint(hint)
@@ -1877,7 +1704,7 @@ def _build_tool_fetch_profile(
             error_code=outcome.reason,
             error_message=project_error_message(
                 outcome.message,
-                max_chars=_DEFAULT_DIAGNOSTIC_ERROR_CHARS,
+                max_chars=diagnostic_resource_budget.error_chars,
             ),
         ).to_json()
         return _attach_docling_evidence(
@@ -1891,7 +1718,7 @@ def _build_tool_fetch_profile(
             elapsed_seconds=elapsed,
             error_code="unexpected_awaiting_outcome",
             error_message="fetch_web_page returned awaiting outcome in diagnostics.",
-            max_error_chars=_DEFAULT_DIAGNOSTIC_ERROR_CHARS,
+            max_error_chars=diagnostic_resource_budget.error_chars,
             backend=WebDiagnosticBackend.TOOL,
         ).to_json()
         return _attach_docling_evidence(
@@ -1904,7 +1731,7 @@ def _build_tool_fetch_profile(
         elapsed_seconds=elapsed,
         error_code="unknown_outcome",
         error_message="current fetch_web_page returned an unknown outcome.",
-        max_error_chars=_DEFAULT_DIAGNOSTIC_ERROR_CHARS,
+        max_error_chars=diagnostic_resource_budget.error_chars,
         backend=WebDiagnosticBackend.TOOL,
     ).to_json()
     return _attach_docling_evidence(
@@ -1961,165 +1788,32 @@ def _tool_failed_outcome_diagnostics(error_code: str) -> JsonObject:
     }
 
 
-def _storage_state_owner_final_name(url: str) -> str:
-    """按 URL host 构造 owner 命名的 storage-state final 文件名。
+def _resolve_explicit_storage_state_input(path_value: str) -> Path | None:
+    """校验并解析显式 Playwright storage state 输入文件。
 
     Args:
-        url: 当前诊断 URL。
+        path_value: ``--storage-state-in`` 提供的文件路径；空字符串表示未提供。
 
     Returns:
-        只包含 owner prefix、规范化 host 与 ``.json`` 后缀的文件名。
+        已校验 JSON object 的绝对常规文件路径；未提供时返回 ``None``。
 
     Raises:
-        ValueError: URL 无有效 host 时抛出。
+        OSError: 文件读取失败时抛出。
+        ValueError: 路径不存在、不是常规文件、JSON 非法或根值不是 object 时抛出。
     """
 
-    host = (urlparse(_normalize_url_for_http(url)).hostname or "").strip().lower()
-    if not host:
-        raise ValueError("storage state URL 缺少 host。")
-    label = re.sub(r"[^a-z0-9.-]+", "-", host).strip("-.")
-    if not label:
-        raise ValueError("storage state URL host 无法形成安全文件名。")
-    return f"{_STORAGE_STATE_FINAL_PREFIX}{label}{_STORAGE_STATE_FINAL_SUFFIX}"
-
-
-def _resolve_storage_state_paths(options: CliOptions, url: str) -> tuple[str, str]:
-    """解析单 URL 的 storage state 输入与显式输出路径。
-
-    Args:
-        options: CLI 选项。
-        url: 当前 URL。
-
-    Returns:
-        ``(storage_state_in, storage_state_out)``；目录只会推导输入，不会启用输出。
-
-    Raises:
-        ValueError: 输出未同时提供正 TTL，或 final 不是 owner 命名时抛出。
-    """
-
-    storage_state_in = options.storage_state_in
-    storage_state_out = options.storage_state_out
-    if options.storage_state_dir:
-        storage_dir = Path(options.storage_state_dir).expanduser().resolve()
-        host_path = storage_dir / _storage_state_owner_final_name(url)
-        if not storage_state_in and host_path.is_file():
-            storage_state_in = str(host_path)
-    if storage_state_out:
-        final_path = Path(storage_state_out).expanduser().resolve()
-        if options.storage_state_ttl_seconds <= 0:
-            raise ValueError("--storage-state-out 必须同时提供正的 --storage-state-ttl-seconds。")
-        if final_path.name != _storage_state_owner_final_name(url):
-            raise ValueError(
-                "storage state final 必须使用当前 URL host 对应的 owner 命名。"
-            )
-        storage_state_out = str(final_path)
-    elif options.storage_state_ttl_seconds != 0:
-        raise ValueError("--storage-state-ttl-seconds 只能与显式 --storage-state-out 一起使用。")
-    return storage_state_in, storage_state_out
-
-
-def _ensure_private_storage_directory(path: Path) -> None:
-    """确保 storage-state 输出父目录为 ``0700``。
-
-    Args:
-        path: 输出父目录。
-
-    Returns:
-        无。
-
-    Raises:
-        OSError: 目录创建、检查或 chmod 失败时抛出。
-        ValueError: 已存在父目录不是 ``0700`` 时抛出，避免修改共享目录权限。
-    """
-
-    if path.exists():
-        if not path.is_dir():
-            raise ValueError("storage state 父路径不是目录。")
-        if path.stat().st_mode & 0o777 != _PRIVATE_DIRECTORY_MODE:
-            raise ValueError("storage state 已存在父目录必须预先设置为 0700。")
-        return
-    # 中间目录属于调用方路径结构，按普通 umask 创建；只有 storage owner 的
-    # 最终目录由本 helper 收紧到 0700。
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.mkdir(mode=_PRIVATE_DIRECTORY_MODE)
-    os.chmod(path, _PRIVATE_DIRECTORY_MODE)
-
-
-def _reconcile_storage_state_directory(
-    directory: Path,
-    *,
-    ttl_seconds: int,
-    now_epoch_seconds: float | None = None,
-) -> None:
-    """删除本 owner 命名的 orphan temp 与过期 final。
-
-    Args:
-        directory: 已明确 opt-in 的目标目录。
-        ttl_seconds: 判断 final 过期的正 TTL 秒数。
-        now_epoch_seconds: 测试可注入的当前 epoch 秒数。
-
-    Returns:
-        无。
-
-    Raises:
-        ValueError: TTL 不是正整数时抛出。
-        OSError: 目录扫描、stat 或 owner 文件删除失败时抛出。
-    """
-
-    if isinstance(ttl_seconds, bool) or ttl_seconds <= 0:
-        raise ValueError("storage state TTL must be a positive integer")
-    now_value = time.time() if now_epoch_seconds is None else now_epoch_seconds
-    for candidate in directory.iterdir():
-        name = candidate.name
-        if name.startswith(_STORAGE_STATE_TEMP_PREFIX) and name.endswith(
-            _STORAGE_STATE_TEMP_SUFFIX
-        ):
-            candidate.unlink(missing_ok=True)
-            continue
-        if not (
-            name.startswith(_STORAGE_STATE_FINAL_PREFIX)
-            and name.endswith(_STORAGE_STATE_FINAL_SUFFIX)
-        ):
-            continue
-        if candidate.stat().st_mtime + ttl_seconds <= now_value:
-            candidate.unlink(missing_ok=True)
-
-
-def _prepare_storage_state_lifecycle(
-    options: CliOptions,
-    url: str,
-) -> _StorageStateLifecycle:
-    """解析 opt-in 并在 diagnostic 启动时执行 owner 范围 reconciliation。
-
-    Args:
-        options: CLI 选项。
-        url: 当前诊断 URL。
-
-    Returns:
-        当前 run 的 storage-state lifecycle。
-
-    Raises:
-        ValueError: opt-in、owner 命名或目录权限非法时抛出。
-        OSError: 目录或 startup cleanup 失败时抛出。
-    """
-
-    storage_state_in, storage_state_out = _resolve_storage_state_paths(options, url)
-    input_path = (
-        Path(storage_state_in).expanduser().resolve() if storage_state_in else None
-    )
-    final_path = Path(storage_state_out) if storage_state_out else None
-    lifecycle = _StorageStateLifecycle(
-        input_path=input_path,
-        final_path=final_path,
-        ttl_seconds=options.storage_state_ttl_seconds if final_path is not None else 0,
-    )
-    if final_path is not None:
-        _ensure_private_storage_directory(final_path.parent)
-        _reconcile_storage_state_directory(
-            final_path.parent,
-            ttl_seconds=options.storage_state_ttl_seconds,
-        )
-    return lifecycle
+    if not path_value:
+        return None
+    input_path = Path(path_value).expanduser().resolve()
+    if not input_path.is_file():
+        raise ValueError("--storage-state-in 必须指向存在的常规文件。")
+    try:
+        payload = json.loads(input_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("--storage-state-in 必须包含合法 JSON object。") from exc
+    if not isinstance(payload, Mapping):
+        raise ValueError("--storage-state-in 的 JSON 根值必须是 object。")
+    return input_path
 
 
 def _safe_close_context(context: _BrowserContextProtocol | None) -> None:
@@ -2232,14 +1926,14 @@ def _append_bounded_network_event(
     events: list[JsonValue],
     event: _PlaywrightNetworkEvent,
     *,
-    max_network: int,
+    diagnostic_resource_budget: DiagnosticResourceBudget,
 ) -> None:
     """追加有上限的网络事件摘要。
 
     Args:
         events: 已收集事件列表。
         event: Playwright 网络事件。
-        max_network: 最大事件数。
+        diagnostic_resource_budget: 本次诊断的 typed 事件与错误文本预算。
 
     Returns:
         无。
@@ -2248,7 +1942,7 @@ def _append_bounded_network_event(
         无。
     """
 
-    if len(events) >= max_network:
+    if len(events) >= diagnostic_resource_budget.events:
         return
     try:
         events.append(_network_event_summary(event))
@@ -2259,7 +1953,7 @@ def _append_bounded_network_event(
                 "error_type": type(exc).__name__,
                 "error_message": project_error_message(
                     str(exc),
-                    max_chars=_DEFAULT_DIAGNOSTIC_ERROR_CHARS,
+                    max_chars=diagnostic_resource_budget.error_chars,
                 ),
             }
         )
@@ -2359,6 +2053,8 @@ def _build_playwright_profile(
     options: CliOptions,
     *,
     egress_policy: WebEgressPolicy,
+    storage_state_input: Path | None,
+    diagnostic_resource_budget: DiagnosticResourceBudget,
 ) -> JsonObject:
     """采集 Playwright 浏览器路径证据。
 
@@ -2366,6 +2062,8 @@ def _build_playwright_profile(
         url: 待诊断 URL。
         options: CLI 选项。
         egress_policy: 当前 diagnostic 调用共享的 Web 出站策略。
+        storage_state_input: 已校验的显式 storage state 输入文件。
+        diagnostic_resource_budget: provider parser 产生或显式覆盖的本次诊断预算。
 
     Returns:
         Playwright profile JSON 对象。
@@ -2374,16 +2072,7 @@ def _build_playwright_profile(
         无。
     """
 
-    storage_lifecycle = _prepare_storage_state_lifecycle(options, url)
     started_at = time.perf_counter()
-    if not egress_policy.allows_private_network:
-        profile = _skipped_profile(
-            "browser_egress_policy_unavailable",
-            url=url,
-            backend=WebDiagnosticBackend.PLAYWRIGHT,
-        )
-        profile["storage_state"] = storage_lifecycle.artifact_projection()
-        return profile
     try:
         target = egress_policy.authorize_http_target(
             _normalize_url_for_http(url),
@@ -2397,11 +2086,11 @@ def _build_playwright_profile(
             elapsed_seconds=_round_elapsed(started_at),
             error_code="blocked_by_web_egress_policy",
             error_message=str(exc),
-            max_error_chars=_DEFAULT_DIAGNOSTIC_ERROR_CHARS,
+            max_error_chars=diagnostic_resource_budget.error_chars,
             backend=WebDiagnosticBackend.PLAYWRIGHT,
             sampled=False,
         ).to_json()
-        profile["storage_state"] = storage_lifecycle.artifact_projection()
+        profile["storage_state"] = {"input_used": storage_state_input is not None}
         return profile
 
     try:
@@ -2413,11 +2102,11 @@ def _build_playwright_profile(
             elapsed_seconds=_round_elapsed(started_at),
             error_code="playwright_package_missing",
             error_message=str(exc),
-            max_error_chars=_DEFAULT_DIAGNOSTIC_ERROR_CHARS,
+            max_error_chars=diagnostic_resource_budget.error_chars,
             backend=WebDiagnosticBackend.PLAYWRIGHT,
             sampled=False,
         ).to_json()
-        profile["storage_state"] = storage_lifecycle.artifact_projection()
+        profile["storage_state"] = {"input_used": storage_state_input is not None}
         return profile
 
     browser: _BrowserProtocol | None = None
@@ -2430,8 +2119,8 @@ def _build_playwright_profile(
         "user_agent": _DEFAULT_USER_AGENT,
         "ignore_https_errors": True,
     }
-    if storage_lifecycle.input_path is not None:
-        context_options["storage_state"] = str(storage_lifecycle.input_path)
+    if storage_state_input is not None:
+        context_options["storage_state"] = str(storage_state_input)
 
     try:
         manager = cast(_PlaywrightContextManagerProtocol, sync_playwright())
@@ -2445,11 +2134,19 @@ def _build_playwright_profile(
             )
             page.on(
                 "request",
-                lambda event: _append_bounded_network_event(network_events, event, max_network=options.max_network),
+                lambda event: _append_bounded_network_event(
+                    network_events,
+                    event,
+                    diagnostic_resource_budget=diagnostic_resource_budget,
+                ),
             )
             page.on(
                 "response",
-                lambda event: _append_bounded_network_event(network_events, event, max_network=options.max_network),
+                lambda event: _append_bounded_network_event(
+                    network_events,
+                    event,
+                    diagnostic_resource_budget=diagnostic_resource_budget,
+                ),
             )
             response = page.goto(
                 normalized_url,
@@ -2459,7 +2156,7 @@ def _build_playwright_profile(
             if options.manual_wait_seconds > 0:
                 time.sleep(options.manual_wait_seconds)
             if options.pause_before_snapshot:
-                _wait_for_manual_confirmation("[诊断] 按 Enter 后采样页面并保存 storage state...")
+                _wait_for_manual_confirmation("[诊断] 按 Enter 后采样页面状态...")
             page_projection = _web_playwright_backend._materialize_bounded_page_projection(
                 cast(_web_playwright_backend._PageProtocol, page),
                 browser_resource_budget=_DIAGNOSTIC_BROWSER_RESOURCE_BUDGET,
@@ -2483,7 +2180,6 @@ def _build_playwright_profile(
                 http_status=status_code,
                 content_text=f"{page_text}\n{html}",
             )
-            storage_lifecycle.publish(context)
             profile = completed_bytes_projection(
                 stage="playwright",
                 url=final_url,
@@ -2504,46 +2200,41 @@ def _build_playwright_profile(
             profile["challenge_signals"] = list(challenge.challenge_signals)
             profile["network_events"] = network_events
             profile["network_event_count"] = len(network_events)
-            profile["network_event_limit"] = options.max_network
-            profile["storage_state"] = storage_lifecycle.artifact_projection()
+            profile["network_event_limit"] = diagnostic_resource_budget.events
+            profile["storage_state"] = {"input_used": storage_state_input is not None}
             return profile
     except _DiagnosticBrowserBodyLimitExceeded as exc:
-        storage_lifecycle.cleanup_failure()
         profile = failed_projection(
             stage="playwright",
             url=url,
             elapsed_seconds=_round_elapsed(started_at),
             error_code="response_body_too_large",
             error_message=str(exc),
-            max_error_chars=_DEFAULT_DIAGNOSTIC_ERROR_CHARS,
+            max_error_chars=diagnostic_resource_budget.error_chars,
             backend=WebDiagnosticBackend.PLAYWRIGHT,
         ).to_json()
         profile["browser_executed"] = True
         profile["network_events"] = network_events
         profile["network_event_count"] = len(network_events)
-        profile["network_event_limit"] = options.max_network
-        profile["storage_state"] = storage_lifecycle.artifact_projection()
+        profile["network_event_limit"] = diagnostic_resource_budget.events
+        profile["storage_state"] = {"input_used": storage_state_input is not None}
         return profile
     except Exception as exc:
-        storage_lifecycle.cleanup_failure()
         profile = failed_projection(
             stage="playwright",
             url=url,
             elapsed_seconds=_round_elapsed(started_at),
             error_code="playwright_error",
             error_message=str(exc),
-            max_error_chars=_DEFAULT_DIAGNOSTIC_ERROR_CHARS,
+            max_error_chars=diagnostic_resource_budget.error_chars,
             backend=WebDiagnosticBackend.PLAYWRIGHT,
         ).to_json()
         profile["browser_executed"] = True
         profile["network_events"] = network_events
         profile["network_event_count"] = len(network_events)
-        profile["network_event_limit"] = options.max_network
-        profile["storage_state"] = storage_lifecycle.artifact_projection()
+        profile["network_event_limit"] = diagnostic_resource_budget.events
+        profile["storage_state"] = {"input_used": storage_state_input is not None}
         return profile
-    except BaseException:
-        storage_lifecycle.cleanup_failure()
-        raise
     finally:
         _safe_close_context(context)
         _safe_close_browser(browser)
@@ -2715,10 +2406,19 @@ def _build_single_diagnostic_payload(options: CliOptions) -> JsonObject:
         raise ValueError("单 URL 模式必须提供 --url。")
 
     provider_config = _provider_config(options)
-    transport_policy = _parse_config(provider_config).transport_policy
+    web_config = _parse_config(provider_config)
+    diagnostic_resource_budget = web_config.resource_budgets.diagnostics
+    if options.max_network is not None:
+        diagnostic_resource_budget = DiagnosticResourceBudget(
+            error_chars=diagnostic_resource_budget.error_chars,
+            events=options.max_network,
+        )
     egress_policy = WebEgressPolicy(
-        allow_private_network=options.allow_private_network_url,
-        allow_custom_port=options.allow_private_network_url,
+        allow_private_network=web_config.allow_private_network_url,
+        allow_custom_port=web_config.allow_custom_port_url,
+    )
+    storage_state_input = _resolve_explicit_storage_state_input(
+        options.storage_state_in
     )
     payload: JsonObject = {
         "schema_version": _SCHEMA_VERSION,
@@ -2738,7 +2438,8 @@ def _build_single_diagnostic_payload(options: CliOptions) -> JsonObject:
             options.url,
             timeout_seconds=options.request_timeout,
             egress_policy=egress_policy,
-            transport_policy=transport_policy,
+            transport_policy=web_config.transport_policy,
+            diagnostic_resource_budget=diagnostic_resource_budget,
         )
     )
     payload["fetch_web_page_profile"] = (
@@ -2752,26 +2453,34 @@ def _build_single_diagnostic_payload(options: CliOptions) -> JsonObject:
             options.url,
             options,
             provider_config=provider_config,
+            diagnostic_resource_budget=diagnostic_resource_budget,
         )
     )
     payload["docling_conversion_invocation_evidence"] = _docling_evidence_json_from_fetch_profile(
         diagnostic_url=options.url,
         fetch_profile=_nested_object(payload, "fetch_web_page_profile"),
     )
-    if options.skip_playwright:
-        storage_lifecycle = _prepare_storage_state_lifecycle(options, options.url)
+    if options.skip_playwright or not web_config.browser_enabled:
         playwright_profile = _skipped_profile(
-            "user_skipped_playwright",
+            (
+                "user_skipped_playwright"
+                if options.skip_playwright
+                else "browser_disabled"
+            ),
             url=options.url,
             backend=WebDiagnosticBackend.PLAYWRIGHT,
         )
-        playwright_profile["storage_state"] = storage_lifecycle.artifact_projection()
+        playwright_profile["storage_state"] = {
+            "input_used": storage_state_input is not None
+        }
         payload["playwright_profile"] = playwright_profile
     else:
         payload["playwright_profile"] = _build_playwright_profile(
             options.url,
             options,
             egress_policy=egress_policy,
+            storage_state_input=storage_state_input,
+            diagnostic_resource_budget=diagnostic_resource_budget,
         )
     payload["comparison_bucket"] = _classify_diagnostic_bucket(payload)
     return payload
@@ -3024,20 +2733,15 @@ def _build_batch_child_command(
         str(options.playwright_timeout),
         "--playwright-channel",
         options.playwright_channel,
-        "--max-network",
-        str(options.max_network),
         "--fetch-truncate-chars",
         str(options.fetch_truncate_chars),
     ]
+    if options.max_network is not None:
+        command.extend(["--max-network", str(options.max_network)])
     if options.storage_state_dir:
         command.extend(["--storage-state-dir", options.storage_state_dir])
     if options.storage_state_in:
         command.extend(["--storage-state-in", options.storage_state_in])
-    if options.storage_state_out:
-        command.extend(["--storage-state-out", options.storage_state_out])
-        command.extend(
-            ["--storage-state-ttl-seconds", str(options.storage_state_ttl_seconds)]
-        )
     if options.headed:
         command.append("--headed")
     if options.manual_wait_seconds > 0:
@@ -3050,8 +2754,6 @@ def _build_batch_child_command(
         command.append("--skip-requests")
     if options.skip_tool_fetch:
         command.append("--skip-tool-fetch")
-    if options.allow_private_network_url:
-        command.append("--allow-private-network-url")
     return command
 
 
@@ -3751,7 +3453,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception as exc:
         safe_error = project_error_message(
             str(exc),
-            max_chars=_DEFAULT_DIAGNOSTIC_ERROR_CHARS,
+            max_chars=DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET.error_chars,
         )
         print(f"[诊断失败] {type(exc).__name__}: {safe_error}", file=sys.stderr)
         return 2

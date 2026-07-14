@@ -4,12 +4,10 @@ from __future__ import annotations
 
 import ast
 import json
-import os
 import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from types import TracebackType
 from typing import cast
 
 import pytest
@@ -29,7 +27,9 @@ from dayu.tools.web import web_tools as web_tools_module
 from dayu.tools.web.web_egress_policy import WebEgressPolicy
 from dayu.tools.web.web_resource_budget import (
     DEFAULT_BROWSER_RESOURCE_BUDGET,
+    DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
     DEFAULT_HTTP_RESOURCE_BUDGET,
+    DiagnosticResourceBudget,
     HttpResourceBudget,
 )
 JsonObject = dict[str, JsonValue]
@@ -88,23 +88,6 @@ class _SessionCloseSpy(diag.requests.Session):
 
         self.close_count += 1
         super().close()
-
-
-class _StorageStateContext:
-    """storage-state atomic lifecycle 测试用最小 context。"""
-
-    def __init__(self, payload: JsonValue) -> None:
-        """保存待序列化 payload。"""
-
-        self.payload = payload
-        self.call_count = 0
-
-    def storage_state(self, *, path: str | None = None) -> JsonValue:
-        """返回内存 payload，并拒绝 Playwright 直接写路径。"""
-
-        assert path is None
-        self.call_count += 1
-        return self.payload
 
 
 class _BodyResponse:
@@ -236,8 +219,18 @@ def test_invalid_jsonl_reports_line_number(tmp_path: Path) -> None:
         diag._read_url_entries(path)
 
 
-def test_storage_state_dir_resolves_existing_host_input_without_default_output(tmp_path: Path) -> None:
-    """storage-state 目录只允许解析 owner 输入，默认必须零写入。"""
+def test_storage_state_dir_only_flows_to_provider_config(tmp_path: Path) -> None:
+    """storage state 目录只进入 production resolver 配置，不派生 raw 输入。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: utility 重新从目录推导 host 文件名时抛出。
+    """
 
     storage_dir = tmp_path / "state"
     storage_dir.mkdir()
@@ -245,323 +238,128 @@ def test_storage_state_dir_resolves_existing_host_input_without_default_output(t
     host_state.write_text('{"cookies":[]}', encoding="utf-8")
     options = _options(storage_state_dir=str(storage_dir))
 
-    storage_state_in, storage_state_out = diag._resolve_storage_state_paths(
-        options,
-        "https://example.com/report",
+    provider_config = diag._provider_config(options)
+    storage_state_input = diag._resolve_explicit_storage_state_input(
+        options.storage_state_in
     )
 
-    assert storage_state_in == str(host_state)
-    assert storage_state_out == ""
-
-
-def test_storage_state_default_publish_is_zero_write(tmp_path: Path) -> None:
-    """未显式 opt-in 时不得创建目录、temp 或 final。"""
-
-    context = _StorageStateContext({"cookies": [{"value": "secret"}]})
-    lifecycle = diag._prepare_storage_state_lifecycle(
-        _options(storage_state_dir=str(tmp_path / "missing")),
-        "https://example.com/report",
+    assert provider_config["playwright_storage_state_dir"] == str(
+        storage_dir.resolve()
     )
-
-    lifecycle.publish(cast(diag._BrowserContextProtocol, context))
-
-    assert lifecycle.output_enabled is False
-    assert context.call_count == 0
-    assert not (tmp_path / "missing").exists()
+    assert storage_state_input is None
 
 
-def test_ensure_private_storage_directory_creates_private_leaf(tmp_path: Path) -> None:
-    """新 storage owner 目录必须创建为 0700。"""
+def test_explicit_storage_state_input_reads_valid_json_object(tmp_path: Path) -> None:
+    """显式 storage state 输入必须读取合法 JSON object 常规文件。
 
-    storage_directory = tmp_path / "private-state"
+    Args:
+        tmp_path: pytest 临时目录。
 
-    diag._ensure_private_storage_directory(storage_directory)
+    Returns:
+        无。
 
-    assert storage_directory.is_dir()
-    assert storage_directory.stat().st_mode & 0o777 == 0o700
+    Raises:
+        AssertionError: 合法输入未解析为同一绝对文件路径时抛出。
+    """
+
+    input_path = tmp_path / "storage-state.json"
+    input_path.write_text('{"cookies":[],"origins":[]}', encoding="utf-8")
+
+    resolved = diag._resolve_explicit_storage_state_input(str(input_path))
+
+    assert resolved == input_path.resolve()
 
 
-def test_ensure_private_storage_directory_accepts_existing_private_leaf(
+@pytest.mark.parametrize("path_kind", ("missing", "directory"))
+def test_explicit_storage_state_input_rejects_missing_or_non_file(
+    tmp_path: Path,
+    path_kind: str,
+) -> None:
+    """显式 storage state 输入缺失或不是常规文件时必须 fail fast。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        path_kind: 待构造的非法路径类别。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非常规文件未触发 ValueError 时抛出。
+    """
+
+    input_path = tmp_path / path_kind
+    if path_kind == "directory":
+        input_path.mkdir()
+
+    with pytest.raises(ValueError, match="存在的常规文件"):
+        diag._resolve_explicit_storage_state_input(str(input_path))
+
+
+@pytest.mark.parametrize("payload_text", ("{", "[]", "null"))
+def test_explicit_storage_state_input_rejects_invalid_json_shape(
+    tmp_path: Path,
+    payload_text: str,
+) -> None:
+    """显式 storage state 输入必须拒绝非法 JSON 或非 object 根值。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        payload_text: 待写入的非法 JSON 或错误根值。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法输入未触发 ValueError 时抛出。
+    """
+
+    input_path = tmp_path / "storage-state.json"
+    input_path.write_text(payload_text, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="JSON"):
+        diag._resolve_explicit_storage_state_input(str(input_path))
+
+
+def test_diagnostic_artifact_only_projects_storage_state_input_fact(
     tmp_path: Path,
 ) -> None:
-    """已存在且为 0700 的 owner 目录必须原样接受。"""
+    """诊断 artifact 只投影显式输入事实，不得残留 lifecycle 字段。
 
-    storage_directory = tmp_path / "private-state"
-    storage_directory.mkdir(mode=0o700)
+    Args:
+        tmp_path: pytest 临时目录。
 
-    diag._ensure_private_storage_directory(storage_directory)
+    Returns:
+        无。
 
-    assert storage_directory.stat().st_mode & 0o777 == 0o700
+    Raises:
+        AssertionError: artifact 出现 lifecycle authority 字段时抛出。
+    """
 
+    input_path = tmp_path / "storage-state.json"
+    input_path.write_text('{"cookies":[],"origins":[]}', encoding="utf-8")
 
-def test_ensure_private_storage_directory_rejects_non_private_leaf(
-    tmp_path: Path,
-) -> None:
-    """已存在但权限不是 0700 的 owner 目录必须 fail closed。"""
-
-    storage_directory = tmp_path / "shared-state"
-    storage_directory.mkdir(mode=0o755)
-    os.chmod(storage_directory, 0o755)
-
-    with pytest.raises(ValueError, match="必须预先设置为 0700"):
-        diag._ensure_private_storage_directory(storage_directory)
-
-
-def test_ensure_private_storage_directory_rejects_non_directory_path(
-    tmp_path: Path,
-) -> None:
-    """owner 路径已被普通文件占用时必须拒绝。"""
-
-    storage_directory = tmp_path / "state-file"
-    storage_directory.write_text("not a directory", encoding="utf-8")
-
-    with pytest.raises(ValueError, match="不是目录"):
-        diag._ensure_private_storage_directory(storage_directory)
-
-
-def test_ensure_private_storage_directory_does_not_harden_intermediate_parents(
-    tmp_path: Path,
-) -> None:
-    """嵌套路径只收紧最终 storage dir，不把中间父目录强制改成 0700。"""
-
-    storage_directory = tmp_path / "shared" / "nested" / "private-state"
-    previous_umask = os.umask(0o022)
-    try:
-        diag._ensure_private_storage_directory(storage_directory)
-    finally:
-        os.umask(previous_umask)
-
-    assert (tmp_path / "shared").stat().st_mode & 0o777 == 0o755
-    assert (tmp_path / "shared" / "nested").stat().st_mode & 0o777 == 0o755
-    assert storage_directory.stat().st_mode & 0o777 == 0o700
-
-
-def test_storage_state_atomic_publish_permissions_and_cleanup(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """显式 opt-in 必须执行 0700/0600、flush/fsync、replace 与 failure cleanup。"""
-
-    parent = tmp_path / "private-state"
-    final_path = parent / "dayu-web-diagnostic-storage-state-example.com.json"
-    options = _options(
-        storage_state_out=str(final_path),
-        storage_state_ttl_seconds=60,
-    )
-    lifecycle = diag._prepare_storage_state_lifecycle(
-        options,
-        "https://example.com/report",
-    )
-    context = _StorageStateContext({"cookies": [{"name": "sid", "value": "secret"}]})
-    fsync_calls: list[int] = []
-    replace_calls: list[tuple[Path, Path]] = []
-    original_fsync = os.fsync
-    original_replace = os.replace
-
-    def fsync_spy(descriptor: int) -> None:
-        """记录并执行真实 fsync。"""
-
-        fsync_calls.append(descriptor)
-        original_fsync(descriptor)
-
-    def replace_spy(source: Path, destination: Path) -> None:
-        """记录并执行真实 atomic replace。"""
-
-        replace_calls.append((source, destination))
-        original_replace(source, destination)
-
-    monkeypatch.setattr(diag.os, "fsync", fsync_spy)
-    monkeypatch.setattr(diag.os, "replace", replace_spy)
-
-    lifecycle.publish(cast(diag._BrowserContextProtocol, context))
-
-    assert parent.stat().st_mode & 0o777 == 0o700
-    assert final_path.stat().st_mode & 0o777 == 0o600
-    assert fsync_calls
-    assert len(replace_calls) == 1
-    assert replace_calls[0][1] == final_path
-    assert not tuple(parent.glob(".dayu-web-diagnostic-storage-state-*.tmp"))
-    assert lifecycle.artifact_projection() == {
-        "input_used": False,
-        "output_enabled": True,
-        "output_label": final_path.name,
-        "ttl_seconds": 60,
-        "published": True,
-    }
-
-    lifecycle.cleanup_failure()
-    assert not final_path.exists()
-    assert lifecycle.published is False
-
-
-def test_storage_state_replace_failure_removes_run_temp(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """普通 publish failure 必须删除本 run temp，且不得留下 final。"""
-
-    parent = tmp_path / "state"
-    final_path = parent / "dayu-web-diagnostic-storage-state-example.com.json"
-    lifecycle = diag._prepare_storage_state_lifecycle(
+    payload = diag._build_single_diagnostic_payload(
         _options(
-            storage_state_out=str(final_path),
-            storage_state_ttl_seconds=30,
-        ),
-        "https://example.com/report",
-    )
-
-    def fail_replace(source: Path, destination: Path) -> None:
-        """模拟 ordinary replace failure。"""
-
-        del source, destination
-        raise OSError("replace failed")
-
-    monkeypatch.setattr(diag.os, "replace", fail_replace)
-    with pytest.raises(OSError, match="replace failed"):
-        lifecycle.publish(
-            cast(diag._BrowserContextProtocol, _StorageStateContext({"cookies": []}))
+            storage_state_in=str(input_path),
+            skip_requests=True,
+            skip_tool_fetch=True,
+            skip_playwright=True,
         )
-
-    assert not final_path.exists()
-    assert not tuple(parent.glob(".dayu-web-diagnostic-storage-state-*.tmp"))
-
-
-def test_storage_state_post_replace_failure_marks_and_cleans_published_final(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """replace 后 chmod 失败时必须保留 published 事实供 cleanup 删除 final。"""
-
-    parent = tmp_path / "state"
-    final_path = parent / "dayu-web-diagnostic-storage-state-example.com.json"
-    lifecycle = diag._prepare_storage_state_lifecycle(
-        _options(
-            storage_state_out=str(final_path),
-            storage_state_ttl_seconds=30,
-        ),
-        "https://example.com/report",
     )
-    original_chmod = os.chmod
+    playwright_profile = _object_field(payload, "playwright_profile")
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
-    def fail_final_chmod(path: Path, mode: int) -> None:
-        """只在 final 已由 replace 发布后模拟 chmod failure。"""
-
-        if Path(path) == final_path:
-            raise OSError("final chmod failed")
-        original_chmod(path, mode)
-
-    monkeypatch.setattr(diag.os, "chmod", fail_final_chmod)
-
-    with pytest.raises(OSError, match="final chmod failed"):
-        lifecycle.publish(
-            cast(diag._BrowserContextProtocol, _StorageStateContext({"cookies": []}))
-        )
-
-    assert final_path.exists()
-    assert lifecycle.published is True
-    lifecycle.cleanup_failure()
-    assert not final_path.exists()
-    assert lifecycle.published is False
-
-
-def test_storage_state_cancel_path_cleans_temp_and_published_final(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """BaseException/cancel 路径必须调用同一 lifecycle cleanup，不承诺 SIGKILL。"""
-
-    import playwright.sync_api as playwright_sync_api
-
-    parent = tmp_path / "state"
-    parent.mkdir(mode=0o700)
-    final_path = parent / "dayu-web-diagnostic-storage-state-127.0.0.1.json"
-    temp_path = parent / ".dayu-web-diagnostic-storage-state-cancel.tmp"
-    final_path.write_text("{}", encoding="utf-8")
-    temp_path.write_text("{}", encoding="utf-8")
-    lifecycle = diag._StorageStateLifecycle(
-        input_path=None,
-        final_path=final_path,
-        ttl_seconds=60,
-        temp_path=temp_path,
-        published=True,
-    )
-
-    class _CancelledManager:
-        """在 browser manager enter 阶段模拟协作取消。"""
-
-        def __enter__(self) -> diag._PlaywrightProtocol:
-            """模拟取消异常。"""
-
-            raise KeyboardInterrupt("cancelled")
-
-        def __exit__(
-            self,
-            exc_type: type[BaseException] | None,
-            exc_value: BaseException | None,
-            traceback: TracebackType | None,
-        ) -> None:
-            """保持 context manager 协议。"""
-
-            del exc_type, exc_value, traceback
-
-    def fake_prepare(
-        options: diag.CliOptions,
-        url: str,
-    ) -> diag._StorageStateLifecycle:
-        """返回预置 cancellation lifecycle。"""
-
-        del options, url
-        return lifecycle
-
-    def fake_sync_playwright() -> _CancelledManager:
-        """返回会在 enter 抛取消的 manager。"""
-
-        return _CancelledManager()
-
-    monkeypatch.setattr(diag, "_prepare_storage_state_lifecycle", fake_prepare)
-    monkeypatch.setattr(playwright_sync_api, "sync_playwright", fake_sync_playwright)
-
-    with pytest.raises(KeyboardInterrupt, match="cancelled"):
-        diag._build_playwright_profile(
-            "http://127.0.0.1/report",
-            _options(
-                url="http://127.0.0.1/report",
-                allow_private_network_url=True,
-            ),
-            egress_policy=WebEgressPolicy(allow_private_network=True),
-        )
-
-    assert not temp_path.exists()
-    assert not final_path.exists()
-    assert lifecycle.published is False
-
-
-def test_storage_state_startup_reconciliation_is_owner_scoped_and_ttl_bounded(
-    tmp_path: Path,
-) -> None:
-    """startup 只删除 owner orphan temp 与过期 final，保留 fresh/unrelated 文件。"""
-
-    directory = tmp_path / "state"
-    directory.mkdir(mode=0o700)
-    orphan = directory / ".dayu-web-diagnostic-storage-state-orphan.tmp"
-    expired = directory / "dayu-web-diagnostic-storage-state-expired.example.json"
-    fresh = directory / "dayu-web-diagnostic-storage-state-fresh.example.json"
-    unrelated = directory / "customer-storage.json"
-    for path in (orphan, expired, fresh, unrelated):
-        path.write_text("{}", encoding="utf-8")
-    os.utime(expired, (100.0, 100.0))
-    os.utime(fresh, (180.0, 180.0))
-
-    diag._reconcile_storage_state_directory(
-        directory,
-        ttl_seconds=60,
-        now_epoch_seconds=200.0,
-    )
-
-    assert not orphan.exists()
-    assert not expired.exists()
-    assert fresh.exists()
-    assert unrelated.exists()
+    assert playwright_profile["storage_state"] == {"input_used": True}
+    for forbidden in (
+        "output_enabled",
+        "output_label",
+        "ttl_seconds",
+        "published",
+        "reconcile",
+        "cleanup",
+    ):
+        assert forbidden not in serialized
 
 
 def test_url_normalization_requires_http_url() -> None:
@@ -631,10 +429,10 @@ def test_url_safety_rejects_private_and_local_hosts_by_default() -> None:
     assert target.normalized_url == "https://example.com/report"
 
 
-def test_single_diagnostic_private_mode_preserves_local_custom_port(
+def test_single_diagnostic_packaged_defaults_allow_private_custom_port(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """既有 private diagnostic 模式必须继续允许本地 custom-port URL。
+    """diagnostic 必须消费 packaged typed private/custom-port true 默认值。
 
     Args:
         monkeypatch: pytest 属性替换夹具。
@@ -643,7 +441,7 @@ def test_single_diagnostic_private_mode_preserves_local_custom_port(
         无。
 
     Raises:
-        AssertionError: utility policy construction 未保留 custom-port 行为时抛出。
+        AssertionError: utility 未从唯一 parser 取得完整 typed 默认值时抛出。
     """
 
     authorized_ports: list[int] = []
@@ -654,6 +452,7 @@ def test_single_diagnostic_private_mode_preserves_local_custom_port(
         timeout_seconds: float,
         egress_policy: WebEgressPolicy,
         transport_policy: web_http_session.WebHttpTransportPolicy,
+        diagnostic_resource_budget: DiagnosticResourceBudget,
     ) -> JsonObject:
         """在 utility policy construction boundary 验证 custom-port 授权。
 
@@ -662,6 +461,7 @@ def test_single_diagnostic_private_mode_preserves_local_custom_port(
             timeout_seconds: 当前请求超时秒数。
             egress_policy: utility 构造的 Web 出站策略。
             transport_policy: provider parser 产生的 HTTP transport 策略快照。
+            diagnostic_resource_budget: provider parser 产生的诊断预算。
 
         Returns:
             完成授权后的确定性 skipped profile。
@@ -671,6 +471,7 @@ def test_single_diagnostic_private_mode_preserves_local_custom_port(
         """
 
         del timeout_seconds, transport_policy
+        assert diagnostic_resource_budget == DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET
         target = egress_policy.authorize_http_target(
             url,
             stage="diagnostic_test",
@@ -686,7 +487,6 @@ def test_single_diagnostic_private_mode_preserves_local_custom_port(
     payload = diag._build_single_diagnostic_payload(
         _options(
             url="http://127.0.0.1:43117/fixture.pdf",
-            allow_private_network_url=True,
             skip_tool_fetch=True,
             skip_playwright=True,
         )
@@ -694,6 +494,93 @@ def test_single_diagnostic_private_mode_preserves_local_custom_port(
 
     assert authorized_ports == [43117]
     assert payload["safe_url"] == "http://127.0.0.1:43117/fixture.pdf"
+
+
+@pytest.mark.parametrize(
+    ("raw_provider_config", "expected_error"),
+    (
+        ({"allow_private_network_url": False, "allow_custom_port_url": True}, "not allowed"),
+        ({"allow_private_network_url": True, "allow_custom_port_url": False}, "port"),
+    ),
+)
+def test_single_diagnostic_private_and_custom_port_denies_are_independent(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_provider_config: JsonObject,
+    expected_error: str,
+) -> None:
+    """显式 private/custom-port deny 必须经 typed provider parser 独立生效。
+
+    Args:
+        monkeypatch: pytest 属性替换夹具。
+        raw_provider_config: 仅关闭一个出站维度的 provider overlay。
+        expected_error: 期望错误消息包含的维度文本。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 两个独立 typed 开关被重新耦合时抛出。
+    """
+
+    def fake_provider_config(options: diag.CliOptions) -> JsonObject:
+        """返回显式 typed deny overlay。
+
+        Args:
+            options: 当前 CLI 选项。
+
+        Returns:
+            测试提供的 raw provider 配置。
+
+        Raises:
+            无。
+        """
+
+        del options
+        return raw_provider_config
+
+    def authorize_in_requests_profile(
+        url: str,
+        *,
+        timeout_seconds: float,
+        egress_policy: WebEgressPolicy,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
+        diagnostic_resource_budget: DiagnosticResourceBudget,
+    ) -> JsonObject:
+        """在 raw requests 边界触发本次 typed 出站裁决。
+
+        Args:
+            url: 待诊断 URL。
+            timeout_seconds: 当前请求超时。
+            egress_policy: 唯一 parser 配置产生的出站策略。
+            transport_policy: 唯一 parser 配置产生的 transport 策略。
+            diagnostic_resource_budget: 唯一 parser 配置产生的诊断预算。
+
+        Returns:
+            授权成功时的 synthetic profile；本测试预期不返回。
+
+        Raises:
+            ValueError: 当前独立 deny 拒绝本地 custom-port URL 时抛出。
+        """
+
+        del timeout_seconds, transport_policy, diagnostic_resource_budget
+        egress_policy.authorize_http_target(url, stage="diagnostic_test")
+        return diag._skipped_profile(
+            "unexpected_authorization",
+            url=url,
+            backend=diag.WebDiagnosticBackend.REQUESTS,
+        )
+
+    monkeypatch.setattr(diag, "_provider_config", fake_provider_config)
+    monkeypatch.setattr(diag, "_build_requests_profile", authorize_in_requests_profile)
+
+    with pytest.raises(ValueError, match=expected_error):
+        diag._build_single_diagnostic_payload(
+            _options(
+                url="http://127.0.0.1:43117/fixture.pdf",
+                skip_tool_fetch=True,
+                skip_playwright=True,
+            )
+        )
 
 
 def test_requests_profile_forwards_provider_owned_transport_policy(
@@ -716,6 +603,7 @@ def test_requests_profile_forwards_provider_owned_transport_policy(
         "allow_environment_proxy": False,
     }
     observed_transport_policies: list[web_http_session.WebHttpTransportPolicy] = []
+    observed_diagnostic_budgets: list[DiagnosticResourceBudget] = []
     observed_discovery_configs: list[Mapping[str, JsonValue]] = []
     provider_config_calls = 0
 
@@ -743,6 +631,7 @@ def test_requests_profile_forwards_provider_owned_transport_policy(
         timeout_seconds: float,
         egress_policy: WebEgressPolicy,
         transport_policy: web_http_session.WebHttpTransportPolicy,
+        diagnostic_resource_budget: DiagnosticResourceBudget,
     ) -> JsonObject:
         """记录 raw requests caller 收到的 typed transport 快照。
 
@@ -751,6 +640,7 @@ def test_requests_profile_forwards_provider_owned_transport_policy(
             timeout_seconds: requests 超时秒数。
             egress_policy: utility 构造的 Web 出站策略。
             transport_policy: provider parser 产生的 transport 策略快照。
+            diagnostic_resource_budget: provider parser 产生的 diagnostic 快照。
 
         Returns:
             确定性 skipped profile。
@@ -761,6 +651,7 @@ def test_requests_profile_forwards_provider_owned_transport_policy(
 
         del timeout_seconds, egress_policy
         observed_transport_policies.append(transport_policy)
+        observed_diagnostic_budgets.append(diagnostic_resource_budget)
         return diag._skipped_profile(
             "synthetic_requests",
             url=url,
@@ -772,6 +663,7 @@ def test_requests_profile_forwards_provider_owned_transport_policy(
         options: diag.CliOptions,
         *,
         provider_config: Mapping[str, JsonValue],
+        diagnostic_resource_budget: DiagnosticResourceBudget,
     ) -> JsonObject:
         """记录 provider discovery 将继续消费的同一 raw mapping。
 
@@ -779,6 +671,7 @@ def test_requests_profile_forwards_provider_owned_transport_policy(
             url: 待诊断 URL。
             options: single diagnostic CLI 选项。
             provider_config: orchestration 传给 discovery 的 raw provider 配置。
+            diagnostic_resource_budget: provider parser 产生的 diagnostic 快照。
 
         Returns:
             确定性 skipped profile。
@@ -788,6 +681,7 @@ def test_requests_profile_forwards_provider_owned_transport_policy(
         """
 
         del options
+        observed_diagnostic_budgets.append(diagnostic_resource_budget)
         observed_discovery_configs.append(provider_config)
         return diag._skipped_profile(
             "synthetic_tool_fetch",
@@ -813,8 +707,134 @@ def test_requests_profile_forwards_provider_owned_transport_policy(
     assert expected_transport_policy.dns_peer_proof_enabled is True
     assert expected_transport_policy.allow_environment_proxy is False
     assert observed_transport_policies == [expected_transport_policy]
+    assert observed_diagnostic_budgets == [
+        DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
+        DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
+    ]
     assert observed_discovery_configs == [raw_provider_config]
     assert observed_discovery_configs[0] is raw_provider_config
+
+
+@pytest.mark.parametrize(
+    ("max_network", "expected_events"),
+    ((None, 13), (7, 7)),
+)
+def test_single_diagnostic_uses_typed_budget_default_and_run_override(
+    monkeypatch: pytest.MonkeyPatch,
+    max_network: int | None,
+    expected_events: int,
+) -> None:
+    """缺省 events 与显式 override 必须形成同源 typed diagnostic value。
+
+    Args:
+        monkeypatch: pytest 属性替换夹具。
+        max_network: 可选的本次 CLI override。
+        expected_events: raw profile 应收到的 typed events 值。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: utility 复制默认或丢失 error chars owner 时抛出。
+    """
+
+    raw_provider_config: JsonObject = {
+        "resource_budget": {
+            "diagnostics": {"error_chars": 37, "events": 13}
+        }
+    }
+    observed_budgets: list[DiagnosticResourceBudget] = []
+
+    def fake_provider_config(options: diag.CliOptions) -> JsonObject:
+        """返回含非默认 diagnostic child budget 的 raw 配置。
+
+        Args:
+            options: 当前 CLI 选项。
+
+        Returns:
+            测试固定的 raw provider 配置。
+
+        Raises:
+            无。
+        """
+
+        del options
+        return raw_provider_config
+
+    def capture_requests_profile(
+        url: str,
+        *,
+        timeout_seconds: float,
+        egress_policy: WebEgressPolicy,
+        transport_policy: web_http_session.WebHttpTransportPolicy,
+        diagnostic_resource_budget: DiagnosticResourceBudget,
+    ) -> JsonObject:
+        """记录 raw requests 收到的 typed diagnostic child budget。
+
+        Args:
+            url: 待诊断 URL。
+            timeout_seconds: 当前请求超时。
+            egress_policy: 本次 typed 出站策略。
+            transport_policy: 本次 typed transport 策略。
+            diagnostic_resource_budget: 本次 typed diagnostic child budget。
+
+        Returns:
+            synthetic skipped profile。
+
+        Raises:
+            无。
+        """
+
+        del timeout_seconds, egress_policy, transport_policy
+        observed_budgets.append(diagnostic_resource_budget)
+        return diag._skipped_profile(
+            "synthetic_budget_capture",
+            url=url,
+            backend=diag.WebDiagnosticBackend.REQUESTS,
+        )
+
+    monkeypatch.setattr(diag, "_provider_config", fake_provider_config)
+    monkeypatch.setattr(diag, "_build_requests_profile", capture_requests_profile)
+
+    diag._build_single_diagnostic_payload(
+        _options(
+            max_network=max_network,
+            skip_tool_fetch=True,
+            skip_playwright=True,
+        )
+    )
+
+    assert observed_budgets == [
+        DiagnosticResourceBudget(error_chars=37, events=expected_events)
+    ]
+
+
+def test_cli_max_network_absent_is_none_and_invalid_override_fails() -> None:
+    """CLI 缺省不得复制 events 默认，非正 override 必须由 typed value 拒绝。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: CLI 恢复本地默认或 typed validation 未执行时抛出。
+    """
+
+    options = diag._parse_options(["--url", "https://example.com"])
+
+    assert options.max_network is None
+    for invalid_value in (0, -1):
+        with pytest.raises(ValueError, match="positive integer"):
+            diag._build_single_diagnostic_payload(
+                _options(
+                    max_network=invalid_value,
+                    skip_requests=True,
+                    skip_tool_fetch=True,
+                    skip_playwright=True,
+                )
+            )
 
 
 def test_header_projection_never_persists_raw_values() -> None:
@@ -920,6 +940,7 @@ def test_requests_profile_records_raw_response_byte_length(monkeypatch: pytest.M
         timeout_seconds=1.0,
         egress_policy=WebEgressPolicy(allow_private_network=True),
         transport_policy=web_provider._parse_config({}).transport_policy,
+        diagnostic_resource_budget=DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
     )
     response_headers = _object_value(profile["response_headers"])
     assert profile["outcome"] == "completed"
@@ -944,6 +965,7 @@ def test_requests_profile_closes_session_on_request_exception(monkeypatch: pytes
         timeout_seconds=1.0,
         egress_policy=WebEgressPolicy(resolver=_resolve_example_public_address),
         transport_policy=web_provider._parse_config({}).transport_policy,
+        diagnostic_resource_budget=DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
     )
 
     assert profile["outcome"] == "failed"
@@ -960,6 +982,7 @@ def test_diagnostic_requests_egress_rejection_uses_shared_policy() -> None:
         timeout_seconds=1.0,
         egress_policy=WebEgressPolicy(),
         transport_policy=web_provider._parse_config({}).transport_policy,
+        diagnostic_resource_budget=DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
     )
 
     assert profile["sampled"] is False
@@ -967,18 +990,31 @@ def test_diagnostic_requests_egress_rejection_uses_shared_policy() -> None:
     assert profile["error_code"] == "blocked_by_web_egress_policy"
 
 
-def test_diagnostic_playwright_public_egress_is_typed_unavailable() -> None:
-    """diagnostic 公网 browser direct 不得绕过 production safe-profile gate。"""
+def test_diagnostic_playwright_private_egress_rejection_precedes_browser() -> None:
+    """raw Playwright 必须在启动 browser 前保留共享 private egress 拒绝。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: browser 绕过 typed egress owner 时抛出。
+    """
 
     profile = diag._build_playwright_profile(
-        "https://example.com/report",
+        "http://127.0.0.1/report",
         _options(),
-        egress_policy=WebEgressPolicy(resolver=_resolve_example_public_address),
+        egress_policy=WebEgressPolicy(),
+        storage_state_input=None,
+        diagnostic_resource_budget=DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
     )
 
     assert profile["sampled"] is False
-    assert profile["outcome"] == "skipped"
-    assert profile["error_code"] == "browser_egress_policy_unavailable"
+    assert profile["outcome"] == "failed"
+    assert profile["error_code"] == "blocked_by_web_egress_policy"
+    assert profile["storage_state"] == {"input_used": False}
 
 
 def test_playwright_response_body_projection_uses_exact_bytes_and_budget() -> None:
@@ -1296,6 +1332,7 @@ def test_current_fetch_adapter_completed_outcome_generates_ok_profile(
         "https://example.com",
         options,
         provider_config=diag._provider_config(options),
+        diagnostic_resource_budget=DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
     )
 
     assert profile["sampled"] is True
@@ -1367,6 +1404,7 @@ def test_docling_wrapper_records_invoked_true_and_restores_callable(
         "https://example.com/report.pdf",
         options,
         provider_config=diag._provider_config(options),
+        diagnostic_resource_budget=DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
     )
 
     evidence = _object_field(profile, "docling_conversion_invocation_evidence")
@@ -1432,6 +1470,7 @@ def test_html_fetch_profile_records_docling_invoked_false(
         "https://example.com/page",
         options,
         provider_config=diag._provider_config(options),
+        diagnostic_resource_budget=DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
     )
 
     evidence = _object_field(profile, "docling_conversion_invocation_evidence")
@@ -1492,6 +1531,7 @@ def test_pdf_fetch_success_without_docling_invocation_keeps_failure_evidence_for
         "https://example.com/report.pdf",
         options,
         provider_config=diag._provider_config(options),
+        diagnostic_resource_budget=DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
     )
     evidence = _object_field(profile, "docling_conversion_invocation_evidence")
 
@@ -1549,6 +1589,7 @@ def test_docling_runtime_initialization_exception_becomes_skip_observed_item(
         "https://example.com/report.pdf",
         options,
         provider_config=diag._provider_config(options),
+        diagnostic_resource_budget=DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
     )
     evidence = _object_field(profile, "docling_conversion_invocation_evidence")
     payload = _payload(
@@ -1632,6 +1673,7 @@ def test_generic_docling_conversion_exception_is_not_skip_observed_item(
         "https://example.com/report.pdf",
         options,
         provider_config=diag._provider_config(options),
+        diagnostic_resource_budget=DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
     )
     evidence = _object_field(profile, "docling_conversion_invocation_evidence")
     payload = _payload(
@@ -1708,6 +1750,7 @@ def test_current_fetch_adapter_failed_outcome_generates_business_readable_profil
         "https://example.com",
         options,
         provider_config=diag._provider_config(options),
+        diagnostic_resource_budget=DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET,
     )
 
     assert profile["sampled"] is True
@@ -1883,17 +1926,42 @@ def _options(
     manual_wait_seconds: float = 0.0,
     pause_before_snapshot: bool = False,
     storage_state_in: str = "",
-    storage_state_out: str = "",
     storage_state_dir: str = "",
-    storage_state_ttl_seconds: int = 0,
     skip_playwright: bool = False,
     skip_requests: bool = False,
     skip_tool_fetch: bool = False,
-    max_network: int = 3,
+    max_network: int | None = None,
     fetch_truncate_chars: int = 1000,
-    allow_private_network_url: bool = False,
 ) -> diag.CliOptions:
-    """构造测试用 CLI 选项。"""
+    """构造测试用 CLI 选项。
+
+    Args:
+        url: 单 URL 输入。
+        url_file: 批量 URL 输入文件。
+        output: 单 URL artifact 路径。
+        batch_output_dir: 批量 artifact 目录。
+        run_label: 批量运行标签。
+        request_timeout: HTTP 请求超时。
+        tool_timeout_budget: 工具调用超时预算。
+        playwright_timeout: 浏览器导航超时。
+        playwright_channel: 浏览器 channel。
+        headed: 是否使用有界面浏览器。
+        manual_wait_seconds: 导航后等待秒数。
+        pause_before_snapshot: 是否在页面采样前等待确认。
+        storage_state_in: 显式 storage state 输入文件。
+        storage_state_dir: production provider storage state 目录。
+        skip_playwright: 是否跳过 Playwright。
+        skip_requests: 是否跳过 raw requests。
+        skip_tool_fetch: 是否跳过工具调用。
+        max_network: 可选的本次 diagnostic events override。
+        fetch_truncate_chars: 工具内容截断字符数。
+
+    Returns:
+        强类型诊断 CLI 选项。
+
+    Raises:
+        无。
+    """
 
     return diag.CliOptions(
         url=url,
@@ -1909,15 +1977,12 @@ def _options(
         manual_wait_seconds=manual_wait_seconds,
         pause_before_snapshot=pause_before_snapshot,
         storage_state_in=storage_state_in,
-        storage_state_out=storage_state_out,
         storage_state_dir=storage_state_dir,
-        storage_state_ttl_seconds=storage_state_ttl_seconds,
         skip_playwright=skip_playwright,
         skip_requests=skip_requests,
         skip_tool_fetch=skip_tool_fetch,
         max_network=max_network,
         fetch_truncate_chars=fetch_truncate_chars,
-        allow_private_network_url=allow_private_network_url,
     )
 
 
@@ -2034,6 +2099,7 @@ def _fake_requests_profile(
     timeout_seconds: float,
     egress_policy: WebEgressPolicy,
     transport_policy: web_http_session.WebHttpTransportPolicy,
+    diagnostic_resource_budget: DiagnosticResourceBudget,
 ) -> JsonObject:
     """返回确定性 requests profile。
 
@@ -2042,6 +2108,7 @@ def _fake_requests_profile(
         timeout_seconds: requests 超时秒数。
         egress_policy: utility 构造的 Web 出站策略。
         transport_policy: provider parser 产生的 transport 策略快照。
+        diagnostic_resource_budget: provider parser 产生的 diagnostic 快照。
 
     Returns:
         确定性 requests profile。
@@ -2052,8 +2119,9 @@ def _fake_requests_profile(
 
     assert url == "https://example.com"
     assert timeout_seconds > 0
-    assert egress_policy.allows_private_network is False
+    assert egress_policy.allows_private_network is True
     assert transport_policy == web_provider._parse_config({}).transport_policy
+    assert diagnostic_resource_budget == DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET
     return cast(JsonObject, _payload(
         requests_sampled=True,
         requests_ok=True,
@@ -2069,6 +2137,7 @@ def _fake_fetch_profile(
     options: diag.CliOptions,
     *,
     provider_config: Mapping[str, JsonValue],
+    diagnostic_resource_budget: DiagnosticResourceBudget,
 ) -> JsonObject:
     """返回确定性 fetch profile。
 
@@ -2076,6 +2145,7 @@ def _fake_fetch_profile(
         url: 待诊断 URL。
         options: single diagnostic CLI 选项。
         provider_config: orchestration 交给 provider discovery 的 raw 配置。
+        diagnostic_resource_budget: provider parser 产生的 diagnostic 快照。
 
     Returns:
         确定性 fetch profile。
@@ -2087,6 +2157,7 @@ def _fake_fetch_profile(
     assert url == "https://example.com"
     assert options.url == "https://example.com"
     assert provider_config == diag._provider_config(options)
+    assert diagnostic_resource_budget == DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET
     return cast(JsonObject, _payload(
         requests_sampled=False,
         requests_ok=False,
@@ -2109,12 +2180,30 @@ def _fake_playwright_profile(
     options: diag.CliOptions,
     *,
     egress_policy: WebEgressPolicy,
+    storage_state_input: Path | None,
+    diagnostic_resource_budget: DiagnosticResourceBudget,
 ) -> JsonObject:
-    """返回确定性 Playwright profile。"""
+    """返回确定性 Playwright profile。
+
+    Args:
+        url: 待诊断 URL。
+        options: single diagnostic CLI 选项。
+        egress_policy: 唯一 parser 配置产生的出站策略。
+        storage_state_input: 已校验的显式 storage state 输入。
+        diagnostic_resource_budget: provider parser 产生的 diagnostic 快照。
+
+    Returns:
+        确定性 Playwright profile。
+
+    Raises:
+        AssertionError: orchestration 未传播 typed owner 值时抛出。
+    """
 
     assert url == "https://example.com"
     assert options.url == "https://example.com"
-    assert egress_policy.allows_private_network is False
+    assert egress_policy.allows_private_network is True
+    assert storage_state_input is None
+    assert diagnostic_resource_budget == DEFAULT_DIAGNOSTIC_RESOURCE_BUDGET
     return cast(JsonObject, _payload(
         requests_sampled=False,
         requests_ok=False,
