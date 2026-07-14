@@ -137,6 +137,13 @@ Engine 不读取配置文件，也不从 `ToolExecutor` 查询 schema。`tool_sc
 
 Runner 异常会转为 `run_failed(runner_exception)`。Runner 流结束但没有 `runner_done` 会转为 `run_failed(runner_abnormal_stop)`。同一 run 内重复 `tool_call_id` 会转为 `run_failed(duplicate_tool_call_id)`。
 
+普通 Python 异常逃出 Runner 时，Engine 先在 operator 日志记录完整 traceback，再把异常类型与
+有界、脱敏的异常文本投影为 `RunFailedData.message`。疑似包含 API key、Authorization、password、
+secret 或 token value 的文本整体替换为中性 redacted message；其它异常文本最多保留 240 字符，
+截断时显式追加 `... [truncated]`。240 是 Engine public/durable error-message projection 的固定
+实现上限，允许硬编码，不需要进入 runtime config。它不截断原始异常或 traceback，也不表示
+错误消息会进入 Conversation Memory 或其它 LLM-facing 业务证据。
+
 ### Length 续写
 
 当最终回答候选的 `finish_reason` 为 `LENGTH` 时，表示本次生成达到模型输出上限，例如 `max_tokens`、`max_output_tokens`、`max_completion_tokens` 或 provider 的最大输出 token cap；它不是输入上下文窗口溢出，不触发 `context_compaction_requested`。Agent 会在仍有续写次数和 iteration 预算的前提下：
@@ -388,7 +395,7 @@ Outbound roundtrip 分两条独立通道：
 - 若 timeout 先到，runtime helper 会取消 execute await task，并等待该 task 收口。
 - Engine 以不可恢复 `run_failed(tool_execution_timeout)` 收口。
 
-该 timeout 只表示 Engine 不再等待 `execute()` 的 handshake outcome。它不证明工具内部线程、子进程、HTTP 请求或远端 job 已停止。若工具已经启动外部长事务但未在 timeout 前返回 `ToolAwaitingOutcome`，Engine 没有 `await_spec` 或 snapshot，因此不能恢复、监控或取消该长事务。
+该 timeout 只表示 Engine 不再等待 `execute()` 的 handshake outcome。它不证明工具内部线程、子进程、HTTP 请求或远端 job 已停止。合法的长事务工具必须在该 handshake budget 内返回 `ToolAwaitingOutcome`；Host durable accepted 之后继续运行的外部长事务不受 `tool_execution_timeout_seconds` 限制，其 deadline、poll / callback observation、取消与物理清理由 Host wait contract、具体 Tool / provider runtime policy 和外部 job owner 负责。若工具已经启动外部长事务但未在 timeout 前返回 `ToolAwaitingOutcome`，Engine 没有 `await_spec` 或 snapshot，因此不能恢复、监控或取消该长事务。
 
 ## 12. Suspend 与 Resume
 

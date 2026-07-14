@@ -98,6 +98,8 @@ usage 是 provider capability 驱动的治理观测信号，不是 scene / Servi
 
 `host_runtime.json` 表达 Host opener 的部署默认值：store / artifact roots、SQLite、`host_execution_lane_name`、worker backend、dispatch poll interval 与 memory projection catch-up page size 等。这些都是 `open_host(options)` construction-time assembly inputs，不是 per-run override。`memory_projection_catchup_batch_size` 只表示 required catch-up / rebuild 的内部读取页大小和单批 transaction 粒度，不表示“本次最多追多少事件”的语义预算，也不能作为 correctness 停止条件。顶层 selector 使用 `default_host_runtime_id`；host runtime record 不重复内部 id。`worker_backend` 当前支持 `local`，未来可扩展 `remote`；ConfigLoader 只读取该值，Service / composition root 负责映射为 `OpenHostOptions.worker_factory`。`runtime_lanes.json` 表达层中立 runtime lane coordinator 与 lane catalog；`host_runtime.json.host_execution_lane_name` 引用该 lane catalog，Service / composition root 再映射到 `OpenHostOptions` 的 lane fields。`tool_discovery.json` 表达 ToolsDiscovery provider 配置：provider id、import path 或 entry point、source kind、source id、enabled 与 provider config；ConfigLoader 只读出 typed provider specs，ToolsDiscovery 才负责 import provider、聚合 `ToolBundle` 与计算 digest。
 
+wait resolution 配置不得写入 scene manifest。具体 awaiting provider 选择 `poll`、`callback` 或 `manual` 的恢复策略属于该 provider / adapter binding 的工具级事实，写在 `tool_discovery.json` 对应 provider config，并由 provider assembly 校验所选策略确实可用；当前 product runtime 尚未装配真实 authenticated callback transport 时，选择 `callback` 必须在 Host 打开前 fail fast。wait poller 的启停、poll / idle cadence、retry / backoff、单次 adapter observation budget、close drain budget、claim 与 outstanding invocation 上限属于 Host opener runtime policy，写在 `host_runtime.json`，不得放进 per-Run `execution_profiles.json`。Service 只能在 effective Host runtime policy 已启用、当前工具集合至少包含一个选择 `poll` 的 awaiting provider、且匹配 poll adapter registry 存在时启动 poller；scene tool selection 只用于筛选本次实际暴露的工具，不拥有后台 runtime authority。
+
 ConfigLoader overlay 规则必须保持可预测：包内默认配置与 workspace 覆盖配置按配置文件类型分别加载；顶层 map 按稳定 id 合并，同 id 记录由 workspace 整条替换，不做隐式 deep merge。需要复用配置时使用显式 `extends`，且只允许单继承；继承解析后必须得到完整 typed record。ConfigLoader 不解析环境变量、不替换 secret、不脱敏，只原样读取 schema 表达的值。`dayu.runtime` 提供层中立 location resolver：当 `workspace/config` 存在时输出 `config_overlay_dir=workspace/config`，否则输出 `None`；同时解析 `prompt_asset_root` 与 `scene_manifest_root` 的实际可用路径。ConfigLoader 和 ScenePrepare 都不内置 workspace fallback 策略。
 
 多 Run 财报流程由 Service workflow 或未来 typed Skill orchestration 控制。scene manifest 不表达 step graph、next scene、产物传递、artifact store、structured parser、replay policy、retry / stop policy、failure classification 或 checkpoint / resume 语义。这些属于 Service workflow / skill orchestration 的状态机和持久化边界，不属于 `ScenePrepare`，也不得进入 Host 状态机。Scene manifest 只保留稳定 scene identity、capability tags / refs 与 source digest，作为后续 workflow / skill 可引用的 scene capability。
@@ -1585,7 +1587,7 @@ canonical event contract 必须转成 typed dataclass / enum / validation tests�
 | `ATTEMPT_RUNNING` | `session_id`、`run_id`、`attempt_id`、`execution_id` | worker accepted / dispatch accepted info | Attempt status=`RUNNING` | resume 不消费，除非用于诊断 | audit yes / Host event stream optional |
 | `ATTEMPT_SUCCEEDED` / `ATTEMPT_FAILED` / `ATTEMPT_CANCELLED` / `ATTEMPT_SUSPENDED` / `ATTEMPT_STEERED` / `ATTEMPT_LOST` | `session_id`、`run_id`、`attempt_id`、`execution_id` | terminal reason / error / wait_id | 关闭 Attempt | resume 按需消费 suspended / lost reason | audit yes / Host event stream emit |
 | `STEER_REQUESTED` / `CANCEL_REQUESTED` / `RESUME_REQUESTED` / `RETRY_REQUESTED` / `REPLAY_REQUESTED` | `session_id`、`run_id`、operation idempotency key | control input / reason / policy / source_run_id when retry or replay | 触发对应状态机；retry / replay 创建关联新 Run，不重开源 Run | 改变模型语义时进入 messages | audit yes / Host event stream emit |
-| `TOOL_CALL_REQUESTED` | `session_id`、`run_id`、`attempt_id`、`execution_id` | tool_call_id / tool name / LLM-safe arguments atom / normalized args digest / optional semantic query atom | 记录工具调用 intent | resume、memory 与 compact evidence 可消费业务可读 tool name / query / bounded arguments projection | audit 是 / tool trace 是 |
+| `TOOL_CALL_REQUESTED` | `session_id`、`run_id`、`attempt_id`、`execution_id` | tool_call_id / tool name / accepted arguments atom / normalized args digest / optional source-owned semantic query atom | 记录工具调用 intent | resume、memory 与 compact evidence 只消费业务可读 tool name / query / 参数文本；不得把 Host 内部字段或下游字段名过滤结果当作 LLM-facing 语义 | audit 是 / tool trace 是 |
 | `TOOL_CALL_GOVERNED` | `session_id`、`run_id`、`attempt_id`、`execution_id` | policy decision / duplicate key / action | 不直接改 Run；可触发 guidance / hard stop | action 影响模型继续时进入 messages | audit 是 / tool trace 是 |
 | `TOOL_RESULT_ACCEPTED` | `session_id`、`run_id`、`attempt_id`、`execution_id` | result ref / digest / accepted evidence envelope / raw outcome / status；wait terminal result 通过 wait-specific fields 表达来源与状态 | 记录工具事实；P1-P7 accepted waiting terminal result 不另建 `TOOL_TERMINAL_RESULT` canonical fact | resume 是 / memory 工具事实 | audit 是 / tool trace 是 |
 | `TOOL_AWAITING` | `session_id`、`run_id`、`attempt_id`、`execution_id` | wait_id / await_spec / external_job_id | 与 `TOOL_CALL_REQUESTED`、`RUN_WAITING`、`ATTEMPT_SUSPENDED` 同事务创建 wait record；Run -> `WAITING`；Attempt -> `SUSPENDED` | 不进入 LLM-facing memory；resume 参数不得从此治理事实推断 | audit 是 / tool trace 是 |
@@ -1610,9 +1612,11 @@ control event 的 `run_id` 绑定规则：
 
 Runner-call reconstruction contract 使用以下 scalar aliases：`Digest` 表示对 contract 声明的 canonical bytes 计算出的 lowercase hex SHA-256；`HostInternalRef` 表示只供 Host / trace / smoke consumer 使用的 typed Host ref string 或 descriptor object，永远不进入 LLM-facing material；`JsonObject` 表示 JSON-compatible mapping，key 必须是 string，value 只能是 JSON scalar / list / object，不能是 provider object、binary blob、callable、Python `Any` 或无结构内部对象。
 
-`TOOL_CALL_REQUESTED` payload contract 固定为工具调用 intent、原始 accepted 参数 digest 与 LLM-safe 参数投影的同源 durable atom。payload required fields 至少包括 `tool_call_id`、`tool_name`、`normalized_arguments_digest`、`arguments_json_size_bytes`、`arguments_storage_kind`、`arguments_payload_digest`、`semantic_input_digest`、`semantic_query_storage_kind`。`normalized_arguments_digest` 绑定 ToolRuntime 已接受的原始 canonical arguments preimage；`arguments_inline_json` 或 `arguments_payload_ref` 只保存可进入 LLM replay / evidence 的安全参数投影，敏感字段必须已脱敏。`arguments_storage_kind` 只允许 `inline_json` 或 `payload_descriptor`：当安全参数 JSON 字节数小于等于 `payload_inline_threshold_bytes` 时必须使用 `inline_json` 并提供 `arguments_inline_json`；超过阈值时必须使用 `payload_descriptor` 并提供 `arguments_payload_ref`，descriptor kind 为 `tool_call_arguments_json`。`arguments_payload_digest` 校验安全参数 JSON 投影，不要求等于 `normalized_arguments_digest`；消费者配对 request/result 时必须用 `normalized_arguments_digest`，读取 LLM-facing 参数时必须校验 `arguments_payload_digest`。
+`TOOL_CALL_REQUESTED` payload contract 固定为工具调用 intent、原始 accepted 参数 atom 与可选 source-owned semantic query atom。payload required fields 至少包括 `tool_call_id`、`tool_name`、`normalized_arguments_digest`、`arguments_json_size_bytes`、`arguments_storage_kind`、`arguments_payload_digest`、`semantic_input_digest`、`semantic_query_storage_kind`。`normalized_arguments_digest` 绑定 ToolRuntime 已接受的原始 canonical arguments preimage；`arguments_inline_json` 或 `arguments_payload_ref` 保存同一份 accepted canonical arguments JSON，只服务幂等、audit、payload integrity、internal replay、tool trace 和诊断，不是 Host 新增的 LLM-safe 参数投影。`arguments_storage_kind` 只允许 `inline_json` 或 `payload_descriptor`：当 accepted canonical arguments JSON 字节数小于等于 `payload_inline_threshold_bytes` 时必须使用 `inline_json` 并提供 `arguments_inline_json`；超过阈值时必须使用 `payload_descriptor` 并提供 `arguments_payload_ref`，descriptor kind 为 `tool_call_arguments_json`。`arguments_payload_digest` 校验 accepted canonical arguments JSON，必须等于 `normalized_arguments_digest`。Host 不得创建第二份 normalized / redacted / LLM-safe arguments JSON，也不得用字段名黑名单把 raw arguments 事后改写成 LLM-facing 语义。
 
-可选 semantic query 是业务可读输入，不等同于 `semantic_input_digest` 的 preimage。`semantic_input_digest` 只表达幂等或语义归一 digest，可以没有可读文本；若工具/runtime 提供可读 query，`semantic_query_storage_kind` 可以是 `inline_text` 或 `payload_descriptor`，并必须提供 `semantic_query_digest`。长 query 使用 payload descriptor kind `tool_call_semantic_query_text`。缺少 semantic query 时 `semantic_query_storage_kind="absent"`，compact evidence projection 可以退回到 bounded arguments projection 或业务中性“工具参数不可读”说明，但不得把 `tool_call_id`、payload ref、digest、cursor 或 Host 内部账本字段渲染给 LLM。WU-CM-01-F02 的真实缺口是 query_text arguments / semantic query 的业务可读表达，不是 tool name 缺失。
+可选 semantic query 是业务可读输入，不等同于 `semantic_input_digest` 的 preimage。`semantic_input_digest` 只表达幂等或语义归一 digest，可以没有可读文本；若工具/runtime 提供可读 query，`semantic_query_storage_kind` 可以是 `inline_text` 或 `payload_descriptor`，并必须提供 `semantic_query_digest`。长 query 使用 payload descriptor kind `tool_call_semantic_query_text`。缺少 semantic query 时 `semantic_query_storage_kind="absent"`，compact evidence projection 只能使用源头符合 LLM-facing 文本约束的工具名、query 或参数文本，或使用业务中性“工具参数不可读”说明 / fail closed；不得把 `tool_call_id`、payload ref、digest、cursor、Host 内部账本字段或 projection 层字段名黑名单结果渲染给 LLM。WU-CM-01-F02 的真实缺口是 query_text / accepted arguments 的业务可读表达，不是 tool name 缺失。
+
+Host LLM-facing 参数文本不做独立 normalized/safe-args 层。LLM-facing 合规必须从源头保证：prompt assets、tool schema name/description、参数说明、枚举说明、错误说明、测试中模拟真实 LLM 的 prompt，以及 Host / Engine / Tool projection renderers 都必须遵守 `AGENTS.md` 的 LLM-facing 文本约束。若某个 schema、prompt 或 renderer 暴露 Host 内部术语、治理字段、裸 ref/digest/cursor、不可自解释缩写或安全敏感实现细节，必须在该 source owner 修正；Host projection 不得用下游 fallback、字段名 blacklist、兼容别名、`hasattr/getattr`、默认值或字符串猜测来补救。
 
 `ToolCallArgumentsAtom` 字段固定为：
 
@@ -1624,7 +1628,7 @@ Runner-call reconstruction contract 使用以下 scalar aliases：`Digest` 表�
 | `normalized_arguments_digest` | `Digest` | yes | digest used for idempotency/tool intent validation | equals digest of normalized canonical arguments |
 | `arguments_json_size_bytes` | `int` | yes | canonical JSON byte size | non-negative |
 | `arguments_storage_kind` | `"inline_json" | "payload_descriptor"` | yes | storage form for accepted arguments | inline iff size `<= payload_inline_threshold_bytes`; descriptor otherwise |
-| `arguments_inline_json` | `JsonObject | null` | conditional | bounded accepted arguments when small | required for `inline_json`; forbidden for descriptor path |
+| `arguments_inline_json` | `JsonObject | null` | conditional | accepted canonical arguments when small; internal/audit/replay material, not a separate LLM-safe projection | required for `inline_json`; forbidden for descriptor path |
 | `arguments_payload_ref` | `HostInternalRef | null` | conditional | descriptor ref for accepted arguments JSON | required for descriptor path; forbidden for inline path |
 | `arguments_payload_digest` | `Digest` | yes | digest of canonical accepted arguments JSON | durable args digest must equal `normalized_arguments_digest` |
 | `semantic_input_digest` | `Digest | null` | no | existing idempotency semantic digest | retained; not assumed to be readable query preimage |
@@ -1722,7 +1726,7 @@ Tool trace 是 EventLog 派生 projection，不是 Host durable truth。它必�
 - EventLog 对 tool trace 只记录必要 event、ref 与 digest；不得把 JSONL 当作恢复、resume、memory 或 Run 状态迁移真源。
 - tool trace projection 损坏或缺失时，应能从 EventLog 与外移 payload ref 尽力重建热数据；冷 JSONL 丢失只能影响深度诊断和离线审计。
 
-Tool Trace 的 hot `trace_summary_json` 与 cold JSONL summary 是日常排障入口，必须能直接回答“模型请求了什么工具、业务参数是什么、Host 接受了什么、工具最终返回了什么、哪些内容可进入 memory / 下一轮上下文”。`TOOL_CALL_REQUESTED` summary 必须从该 event 的 request atom 派生，包含业务可读工具名、tool call label、LLM-safe request / query 文本、脱敏后的参数摘要和参数 digest / ref 校验锚点；不得只保留 digest / ref。`TOOL_RESULT_ACCEPTED` summary 必须从 accepted evidence envelope 定位同源 `TOOL_CALL_REQUESTED` request atom，并从 digest-checked `raw_tool_outcome` 生成 bounded、脱敏的结果状态、details / summary 文本和 outcome digest / ref 校验锚点。wait-resolution result 与普通 tool result 使用同一 readable summary contract；Tool Trace 不得从 `TOOL_AWAITING`、wait record、poll 记录、observation handle、runtime 状态或当前代码路径反推 request / result 语义，也不得把 wait id、observation handle、runtime 等 Host / Tool 治理术语作为模型或开发者理解业务事实的主体。
+Tool Trace 的 hot `trace_summary_json` 与 cold JSONL summary 是日常排障入口，必须能直接回答“模型请求了什么工具、业务参数是什么、Host 接受了什么、工具最终返回了什么、哪些内容可进入 memory / 下一轮上下文”。`TOOL_CALL_REQUESTED` summary 必须从该 event 的 request atom 派生，包含业务可读工具名、tool call label、source-owned request / query 文本、符合 LLM-facing 文本约束的参数摘要（若有）和参数 digest / ref 校验锚点；不得只保留 digest / ref。`TOOL_RESULT_ACCEPTED` summary 必须从 accepted evidence envelope 定位同源 `TOOL_CALL_REQUESTED` request atom，并从 digest-checked `raw_tool_outcome` 生成 bounded、脱敏的结果状态、details / summary 文本和 outcome digest / ref 校验锚点。wait-resolution result 与普通 tool result 使用同一 readable summary contract；Tool Trace 不得从 `TOOL_AWAITING`、wait record、poll 记录、observation handle、runtime 状态或当前代码路径反推 request / result 语义，也不得把 wait id、observation handle、runtime 等 Host / Tool 治理术语作为模型或开发者理解业务事实的主体。
 
 Tool Trace 对 runner-call reconstruction 的消费边界固定为 read-only signal。它只能消费 `RUNNER_CALL_INPUT_ASSEMBLED` manifest refs / digests、`TOOL_CALL_REQUESTED` arguments / semantic query atoms、Engine 可观察的 iteration/message count 以及 projection artifact refs；不得读取旧 provider request、EngineRunner 内存、当前 prompt builder 代码或重新运行 compact material selection 来猜测历史输入。Tool Trace hot projection 只能缓存固定上界 scalar / diagnostic signal；projector metadata 的五字段 summary 必须在 query 时从 digest-verified manifest descriptor 的完整六字段 metadata 重建，不能读取 hot payload 中的数组或 raw string 作为语义真源。读取 descriptor bytes 后还必须经 shared runner-call manifest owner 解析完整 typed graph，至少校验当前 schema/version、scope 与 runner-call identity、message count 与连续 indexes、message-to-metadata 引用闭合、metadata id 唯一、projector/purpose closed enum、projection descriptor pair，以及 hot/manifest identity；只有该 typed manifest 可以产生 metadata summary。以下字段只是 projection copy，不是 recovery、memory、dispatch 或 Run 状态真源：
 
@@ -2205,7 +2209,7 @@ tool fact candidate 必须包含足以治理和追溯的信息：
 ToolRuntime 负责：
 
 - 消费 Host 传入的业务 `ToolBundle` 并生成 attempt-local effective `ToolBundle`。
-- 权限 / policy。
+- 消费当前已装配的权限 / policy；统一 tool authorization 目标边界见 18.4。
 - 并发 / timeout / orphan cleanup。
 - tool awaiting placeholder；wait record、`WAITING` 与 `resolve_wait` 由 Phase 7 实现。
 - truncation / fetch_more。
@@ -2257,6 +2261,37 @@ EventLog 规则：
 - 对财报读取类 read-only 工具，同一 Attempt 内重复调用默认优先 `reuse` / `hint`，除非参数或 evidence scope 明确变化；跨 Attempt 不默认复用。
 - 对外部写入或付费工具，必须依赖工具 schema / policy 提供 idempotency key；Host 的 duplicate governance 不能替代工具级幂等。
 - 该治理不能进入 Engine，也不能让 RemoteStub 拥有 Host 状态。
+
+### 18.4 Tool Authorization 与防御性安全边界
+
+Tool 的统一 security 设计主要指 authorization：谁发起的哪次 Run / Attempt 可以调用哪个
+工具，以及该调用允许读、写、执行或访问哪些资源。该授权决策的最终语义 owner 在 Host，
+执行 gate 位于 ToolRuntime 或与 ToolRuntime 同级、由 Host 拥有的 tool-governance boundary。
+Engine、LLM、Service adapter、CLI 和具体业务工具不得各自拥有第二套最终权限判断。
+
+当前 `HostCallContext.authorization_claims` 只记录上层已经验证的权限声明；它尚未定义 claims
+如何映射为 tool path roots、read/write operations、network targets、side-effect authority 或
+process capability。当前 WU 不实现 repository-wide tool authorization framework，也不提前冻结
+permission schema、角色模型、capability token、policy language、sandbox backend 或配置位置。
+
+未来设计统一权限时必须至少明确：
+
+- principal / actor 与 Run / Attempt / tool call 的绑定。
+- tool identity、允许操作类型和资源 scope，例如 read roots、write roots、network scope 与
+  destructive/paid side effects。
+- authorization claims、scene/tool selection、operator config 与 tool declaration 的组合及
+  deny precedence。
+- attempt snapshot、retry/resume/recovery 的权限冻结或重新授权规则。
+- dispatch 前决策、实际 I/O enforcement、process/remote backend 传播、audit/trace 和拒绝错误码。
+
+Host 拥有授权语义不等于 Host 可以只检查一次字符串后取消下层防御。路径 resolve、symlink
+containment、文件原子发布、socket peer/DNS/redirect 验证、资源预算和 provider protocol 校验必须
+在最接近实际 I/O 的 Tool/provider/storage/process boundary 继续执行。未来 Host authority 是调用
+可以做什么的上限；下层防御可以因实际环境 fail closed，但不得扩大 Host 已拒绝的权限。
+
+在统一 authorization 设计落地前，现有 Tool config 权限机制保持现状，例如 Doc
+`allowed_paths` 与 Web 网络策略。它们是当前有效执行约束，不因未来 owner 已确定而删除；未来
+迁移必须在一个独立 WU 中建立同源 Host authority 并移除重复真源，不保留长期双重权限配置。
 
 ## 19. TruncationManager / fetch_more
 
@@ -2388,8 +2423,11 @@ finite-positive close drain 预算与 positive outstanding cap 约束。每个 i
 adapter、immutable wait snapshot、发布 token 与单槽结果通道的 daemon thread；token 按
 `ACTIVE -> INVALIDATED -> FINISHED` 迁移。timeout 或 supervisor close 必须先撤销发布权，
 迟到结果只能以 `publish=false` 丢弃，不能接触 resolver 或 durable authority。poll observation
-超时表示外部状态不可确认，wait / Run 收为 `lost(wait_observation_timeout)`；cancelled wait 的
-abandon 超时只写 `wait_abandon_timeout` diagnostic/close marker，不宣称 provider 已取消成功。
+超时只证明本次状态查询没有在预算内返回，不证明外部 job 已丢失；poller 必须记录 transient
+diagnostic、释放 claim 并按 policy backoff，不得调用 `resolve_wait` 或把 wait / Run 收为 `LOST`。
+只有 adapter 基于 authoritative provider / external-job 状态显式返回 typed lost outcome，Host
+才能通过 common resolve path 收为 `LOST`。cancelled wait 的 abandon 超时只写
+`wait_abandon_timeout` diagnostic/close marker，不宣称 provider 已取消成功。
 supervisor close 对 poller loop 与全部 observation thread 只使用一个 shared monotonic deadline；
 预算耗尽后可保持 `CLOSING` 有界返回，最后一个 tracked thread finally 结束后才进入 `STOPPED`。
 
@@ -2434,7 +2472,7 @@ resume policy 覆盖 internal / manual、poll、callback 三类入口。所有�
 - Engine 不读取 wait record，也不恢复旧 Agent / Runner。
 - Host recovery scan 遇到 `WAITING` Run 时不得创建新 Attempt；它只能恢复 wait record 的 adapter 状态。
 - wait record 的 `resume_policy` / `await_spec` / `external_job_id` 必须包含足以在 Host restart 后恢复 adapter observation 的 durable refs。adapter registry / lookup 由 Host composition root 提供 typed adapter binding；wait record 只保存 adapter key / policy ref / external job refs，不保存进程内 adapter 对象。
-- `poll` adapter 从 wait record 读取 `external_job_id` / `await_spec` 后继续轮询，并在完成时调用同一个 `resolve_wait`；若 provider observation 前已确认 durable deadline，则调用 common expiry helper，provider call count 必须为零。生产 poller 由 `open_host` composition root 在显式配置 poll adapter registry 与 wait poller policy 后启动；默认不启动。poller 每轮通过 durable claim / expiry / next-observe / backoff 字段判断 wait record 是否可观察，防止多个 poller 同时处理同一 wait。正常 `not_ready` 表示外部 job 仍在运行，只写入短间隔 next-observe，不增加错误 backoff attempt；adapter error、missing adapter、capacity、resolve error 或 shutdown-skipped 才写入可重试 backoff。没有可 claim wait record 时，supervisor 使用 idle 间隔降低空查频率；有 active wait 但未到 next-observe / claim expiry 时，supervisor 睡眠到下一次 due 或 idle 上限，并可被本地 wakeup 打断。空轮询不逐轮输出空摘要日志。claim / backoff 只约束 poll observation 资格，不是 Attempt ownership、EventLog truth 或外部 job ownership。
+- `poll` adapter 从 wait record 读取 `external_job_id` / `await_spec` 后继续轮询，并在完成时调用同一个 `resolve_wait`；若 provider observation 前已确认 durable deadline，则调用 common expiry helper，provider call count 必须为零。生产 poller 由 `open_host` composition root 在显式配置 poll adapter registry 与 wait poller policy 后启动；默认不启动。poller 每轮通过 durable claim / expiry / next-observe / backoff 字段判断 wait record 是否可观察，防止多个 poller 同时处理同一 wait。正常 `not_ready` 表示外部 job 仍在运行，只写入短间隔 next-observe，不增加错误 backoff attempt；observation timeout、adapter error、missing adapter、capacity、resolve error 或 shutdown-skipped 写入可重试 backoff，不把 observation failure 猜成 external-job terminal fact。没有可 claim wait record 时，supervisor 使用 idle 间隔降低空查频率；有 active wait 但未到 next-observe / claim expiry 时，supervisor 睡眠到下一次 due 或 idle 上限，并可被本地 wakeup 打断。空轮询不逐轮输出空摘要日志。claim / backoff 只约束 poll observation 资格，不是 Attempt ownership、EventLog truth 或外部 job ownership。
 - `callback` source 在 Phase 7 只保留 adapter contract 与 common pipeline 入口；专属 HTTP callback 服务、认证入口、复杂
   重放防护和外部系统专属 callback adapter 不属于第一版实现。后续 callback 产品化入口必须验证认证、重放防护和 idempotency
   key，然后调用同一个 `resolve_wait`。
@@ -2664,7 +2702,7 @@ system envelope 的 LLM-facing section 顺序、标题和分隔符是设计契�
 | 1 | `Task Instructions` | caller / Service system prompt 与场景约束 | 保留调用方给模型的任务规则；不得附带 prompt fragment ref、source digest 或 scene manifest 诊断。 |
 | 2 | `Execution Guidance` | Host-neutral execution instruction、当前运行约束、工具可用性或必要继续说明 | 只写模型需要遵守的业务动作和限制；不得暴露 policy snapshot ref、Attempt / execution ledger 或调度状态。 |
 | 3 | `Conversation Summary` | Session Summary Memory 或 accepted compacted view 中的会话摘要 | 只写 compact / memory 已接受的业务摘要；不得内联 raw compact artifact JSON 或 compact boundary。 |
-| 4 | `Verified Evidence and Facts` | Evidence / Fact Memory、accepted evidence-backed facts，以及 memory / fact pipeline 已接受的 evidence material | 写业务可读 tool name、query / arguments projection、response / source text 和 prompt-local source label；不得写 tool_call_id、event id、payload ref、digest 或 cursor。 |
+| 4 | `Verified Evidence and Facts` | Evidence / Fact Memory、accepted evidence-backed facts，以及 memory / fact pipeline 已接受的 evidence material | 写业务可读 tool name、query / 参数文本、response / source text 和 prompt-local source label；不得写 tool_call_id、event id、payload ref、digest 或 cursor。 |
 | 5 | `Prior Answer Anchors` | Answer Anchor Memory | 写可被后续指代的历史回答轮廓；不得把 anchor 当作事实证明。 |
 | 6 | `Open Follow-up Context` | Forward Intent Memory | 写未完成任务、待澄清点或下一步上下文；不得把 intent 当作工具执行计划或事实。 |
 | 7 | `Reference Continuity` | Trace Memory reference continuity items | 写解析“刚才”“第二点”等局部指代所需的最小文本。 |
@@ -2680,7 +2718,7 @@ ordinary RunInput 的 LLM-facing material 不得暴露内部治理标识。下�
 | 内部字段 / 标识 | LLM-facing 策略 | 可接受替代文本 |
 |---|---|---|
 | `policy_snapshot_ref`、policy ref、policy name | 删除 ref；如模型需要知道行为约束，只保留 Host-neutral 业务规则 | “Use the available context and tools under the current run limits.” |
-| `tool_call_id`、tool request id、tool result id | 删除 id；用业务 tool name、query / arguments projection、response / source text 表达 | “A previous tool call to `<tool name>` returned: ...”；若 query 不可读则写 “The original tool query is not available in readable form.” |
+| `tool_call_id`、tool request id、tool result id | 删除 id；用业务 tool name、query / 参数文本、response / source text 表达 | “A previous tool call to `<tool name>` returned: ...”；若 query 不可读则写 “The original tool query is not available in readable form.” |
 | EventLog event id、event sequence、durable event ref | 删除；如需顺序，只用自然语言或 prompt-local label 表达 | “Earlier in this conversation...” 或 `Source E1` 这类 prompt-local label。 |
 | payload ref、artifact ref、payload descriptor、artifact descriptor | 删除；改用已校验的 bounded readable content | 直接展示业务文本摘要或 “The detailed artifact is not available in readable form.” |
 | digest、content digest、semantic input digest、role sequence digest | 删除；不得把 digest 当作业务事实或 query 文本 | “The original query text is not available in readable form.” |
@@ -2937,7 +2975,7 @@ prompt-local label 是本次 LLM 调用内的 opaque citation handle，只用于
 
 LLM compact output 只能返回业务语义字段和 prompt-local labels。Host 负责把 labels 映射回 durable refs，校验 provenance、长度、枚举、source boundary 和 quality gate。模型不得返回 durable refs、event ids、digests、artifact refs、policy decisions 或任何 Host 内部状态字段。
 
-compact material / prompt / query_text 的 LLM-facing 语义必须自解释。工具材料可以暴露业务可读 tool name、Host 改写后的业务可读 query text、bounded arguments projection 与工具响应/来源文本；不得暴露 `tool_call_id`、EventLog id、payload ref、artifact ref、digest、cursor、projection checkpoint、policy 名称、Attempt / execution ledger、Projector metadata 或 Host 内部账本字段。若工具只有 `semantic_input_digest` 而没有 durable semantic query text，Host 不得把 digest 当作 query 文本，也不得要求模型理解 digest；compact evidence projection 只能使用可读 arguments projection 或业务中性的 unavailable wording。若 accepted arguments atom 缺失，projection 必须产生 `missing_tool_call_arguments_atom` limited-signal，并避免向 LLM 展示内部诊断细节。
+compact material / prompt / query_text 的 LLM-facing 语义必须自解释。工具材料可以暴露业务可读 tool name、source-owned 业务可读 query text、符合 LLM-facing 文本约束的参数文本与工具响应/来源文本；不得暴露 `tool_call_id`、EventLog id、payload ref、artifact ref、digest、cursor、projection checkpoint、policy 名称、Attempt / execution ledger、Projector metadata 或 Host 内部账本字段。若工具只有 `semantic_input_digest` 而没有 durable semantic query text，Host 不得把 digest 当作 query 文本，也不得要求模型理解 digest；compact evidence projection 只能使用源头合规的 query / 参数文本或业务中性的 unavailable wording。若 accepted arguments atom 缺失，projection 必须产生 `missing_tool_call_arguments_atom` limited-signal，并避免向 LLM 展示内部诊断细节。
 
 F02 的稳定问题陈述固定为：`EvidenceReadableItem.tool_name` 已有业务可读位置；真实缺口是 `query_text` 缺少 durable arguments / semantic query 的业务可读表达。实现和测试不得把该问题降级成“tool name 缺失”，也不得用 `tool_call_id=...`、payload ref、digest 或 Host 内部 id 伪装成业务 query。
 
@@ -3128,7 +3166,7 @@ Projection 规则：
 - compact 前，Session Summary Memory、Answer Anchor Memory 与 Forward Intent Memory 为空。
 - compact 前，Trace Memory 与 Evidence / Fact Memory 只能从 selected recent window 中的 user / assistant / user-visible state / readable tool material 表达；它们不自动生成高阶结构化 item。
 - `TOOL_AWAITING` 是 Host / ToolRuntime 之间的等待治理事实，对模型不可见。`TOOL_AWAITING`、`RUN_WAITING`、`ATTEMPT_SUSPENDED`、wait record、poll outcome、cancel / abandon lifecycle 等 Host / ToolRuntime 等待治理事实不得成为 Conversation Memory producer，也不得投影为 LLM-facing selected recent window、recent evidence、reference continuity 或 semantic memory item。对 LLM 来说，awaiting 与非 awaiting 不改变跨轮 memory 语义；同样的 user input、ordinary tool result 与 final answer，有无中间 awaiting governance event，LLM-facing memory 必须等价。
-- wait-resolution 的 `TOOL_RESULT_ACCEPTED` 必须与普通工具结果一样携带 accepted evidence envelope 和 digest-checked raw outcome。Envelope 必须指向同一工具调用的 `TOOL_CALL_REQUESTED` request atom；Conversation Memory 从 request atom 读取 LLM-safe request / query 语义，从 raw outcome 读取结果摘要，不从 `TOOL_AWAITING`、wait record、event id、payload ref 或 digest 推断模型需要理解的业务语义。
+- wait-resolution 的 `TOOL_RESULT_ACCEPTED` 必须与普通工具结果一样携带 accepted evidence envelope 和 digest-checked raw outcome。Envelope 必须指向同一工具调用的 `TOOL_CALL_REQUESTED` request atom；Conversation Memory 从 request atom 读取 source-owned 业务可读 request / query 语义，从 raw outcome 读取结果摘要，不从 `TOOL_AWAITING`、wait record、event id、payload ref 或 digest 推断模型需要理解的业务语义。
 - 当前 schema 下 awaiting accept 必须同事务写入 `TOOL_CALL_REQUESTED` request atom；wait-resolution 不实现旧库兼容读取分支。历史或测试构造的旧格式 wait result 若缺少 envelope / request atom，只能在 resume input 层降级为自解释 guidance，不能进入 self-explaining Conversation Memory evidence，也不能从 `TOOL_AWAITING` 反推 request/query 语义。
 - compact 成功后，accepted compact output 生成或更新五类 session memory；post-compact delta material 继续按 selected recent window 进入 prompt assembly。
 - fallback tier 1-3 属于 compact recovery fallback：它们仍送 LLM compactor；accepted output 可以提交 `CONTEXT_COMPACTED`，并由 projection 生成五类 Session Semantic Memory。
@@ -3383,6 +3421,8 @@ material data block 的 section 映射必须一对一，不允许同一 canonica
 - `trace_material` 渲染 user / assistant continuity 与用户可见 Run 状态；accepted tool result raw content 不在 trace section 中重复出现。
 - `evidence_material` 渲染 accepted tool evidence block。raw evidence 内容来自 `TOOL_RESULT_ACCEPTED` canonical fact 所引用且 digest 校验通过的 Host payload / raw result descriptor；accepted evidence envelope 只提供 Host 内部 provenance mapping，不作为 lossy result preview 或事实内容容器。
 - `answer_material` 渲染 assistant final answer / conclusion 的可读文本，用于 answer anchor candidate；它不得作为 evidence-backed fact 的 source。
+
+`OpaqueEvidenceRef` 以及 accepted evidence envelope 的 `source_refs` / `locator_refs` 只拥有 Host 内部 provenance identity；其 `ref_kind`、`ref_id` 与 `digest` 不承诺业务可读语义。Host、Conversation Memory、RunInput、Compact 及其他 LLM-facing projection 不得用 kind 黑白名单、未知 kind 默认分支或 `kind:id` 拼接去猜测业务来源；仅当具体 Tool / Fins producer 通过显式 contract 直接提供任务所需、业务可读且自解释的来源语义时，该语义才能进入 LLM-facing source 文本，否则统一投影为来源不可用。Opaque ref 可以继续进入 EventLog、audit 与内部 provenance / diagnostic trace，但不得因此被包装成财报事实或业务来源。当前没有实际 producer 需要通用业务来源类型，因此本规则不要求预先新增 `BusinessSource` 抽象。
 
 Compact material data block build 启动前必须校验 EventLog / payload / artifact source refs 与 digest 可读、可校验，并且 latest accepted compact boundary 与 post-compact delta boundary 一致。对 `TOOL_RESULT_ACCEPTED`，strict compact consumer 必须先通过 shared durable JSON resolver 解析 result payload，再把已校验 payload 交给 accepted-result 业务投影；不得让 read/display 用的 lenient projection 把 descriptor、SQLite row、artifact 或 canonical JSON corruption 降级为“没有 evidence”。它不得因为 Conversation Memory snapshot lag 而要求先追平 memory projection；如果 EventLog-backed material source 不完整、payload 损坏、artifact 缺失或 source boundary 不可校验，按 compaction failure / pre-dispatch failure 收口。这不是 Run crash recovery，不得把 Run 推入 `RECOVERING`。
 
