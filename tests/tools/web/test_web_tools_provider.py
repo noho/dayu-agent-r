@@ -4274,6 +4274,13 @@ def test_web_tool_display_and_description_stay_at_declaration_boundary() -> None
     assert fetch_definition.schema.function.description == (
         "抓取网页正文并转成 Markdown。失败时先看 hint 和 next_action，再决定重试、换来源或忽略当前网页。"
     )
+    assert fetch_definition.schema.function.parameters.properties["url"] == {
+        "type": "string",
+        "description": (
+            "要抓取的完整 http/https URL。"
+            "优先使用 search_web 返回的 URL。"
+        ),
+    }
 
 
 def test_web_audit_matrix_context_injection_and_schema_no_leak() -> None:

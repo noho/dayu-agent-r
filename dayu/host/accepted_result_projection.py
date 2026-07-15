@@ -25,9 +25,6 @@ from dayu.host.evidence import (
     derive_accepted_evidence_id,
 )
 from dayu.host.evidence import (
-    ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT as _ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT,
-)
-from dayu.host.evidence import (
     ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT as _ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
 )
 from dayu.host.evidence import (
@@ -87,7 +84,6 @@ class AcceptedToolResultQueryState(StrEnum):
 
     SEMANTIC_QUERY = "semantic_query"
     ARGUMENTS_SUMMARY = "arguments_summary"
-    LIMITED_SIGNAL = "limited_signal"
 
 
 class AcceptedToolResultSourceState(StrEnum):
@@ -103,7 +99,7 @@ class AcceptedToolResultQueryProjection:
 
     :param text: LLM-facing query 文本。
     :param state: query 文本来源。
-    :param diagnostic_reason: limited-signal 或降级原因。
+    :param diagnostic_reason: query 来源说明或降级原因。
     """
 
     text: str
@@ -210,7 +206,7 @@ def project_accepted_tool_result(
         result_row,
         envelope,
     )
-    query = _query_projection(request_atoms, diagnostics)
+    query = _query_projection(request_atoms)
     source = _source_projection(envelope, diagnostics)
     llm_material = _llm_material(
         tool_name=tool_name,
@@ -505,12 +501,10 @@ def _request_atoms_projection(
 
 def _query_projection(
     atoms: ToolCallRequestAtoms,
-    diagnostics: list[str],
 ) -> AcceptedToolResultQueryProjection:
     """构造 query 可读投影。
 
     :param atoms: 已校验 request atom。
-    :param diagnostics: projection 诊断列表。
     :returns: query projection。
     """
 
@@ -520,9 +514,6 @@ def _query_projection(
             state=AcceptedToolResultQueryState.SEMANTIC_QUERY,
             diagnostic_reason=None,
         )
-    if _contains_unsafe_argument_key(atoms.arguments_json):
-        diagnostics.append("arguments_summary_unsafe")
-        return _limited_query("arguments_summary_unsafe")
     return AcceptedToolResultQueryProjection(
         text=_bounded_text(
             f"参数：{canonical_json_dumps(atoms.arguments_json)}",
@@ -530,46 +521,6 @@ def _query_projection(
         ),
         state=AcceptedToolResultQueryState.ARGUMENTS_SUMMARY,
         diagnostic_reason="semantic_query_missing",
-    )
-
-
-def _contains_unsafe_argument_key(value: JsonValue) -> bool:
-    """判断参数 JSON 是否含不应进入 LLM-facing query 摘要的字段。
-
-    :param value: 参数 JSON。
-    :returns: 含敏感或本地路径类字段时返回 ``True``。
-    """
-
-    if isinstance(value, Mapping):
-        for key, item in value.items():
-            normalized = key.strip().lower()
-            if (
-                "api_key" in normalized
-                or "token" in normalized
-                or "secret" in normalized
-                or "password" in normalized
-                or normalized.endswith("path")
-                or "path_" in normalized
-            ):
-                return True
-            if _contains_unsafe_argument_key(item):
-                return True
-    if isinstance(value, list):
-        return any(_contains_unsafe_argument_key(item) for item in value)
-    return False
-
-
-def _limited_query(reason: str) -> AcceptedToolResultQueryProjection:
-    """构造 query limited-signal 投影。
-
-    :param reason: limited-signal 原因。
-    :returns: query projection。
-    """
-
-    return AcceptedToolResultQueryProjection(
-        text=_ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT,
-        state=AcceptedToolResultQueryState.LIMITED_SIGNAL,
-        diagnostic_reason=reason,
     )
 
 

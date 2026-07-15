@@ -83,7 +83,6 @@ from dayu.host.evidence import (
     accepted_evidence_envelope_to_json_value,
 )
 from dayu.host.evidence import (
-    ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT,
     ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
     AcceptedToolEvidenceLLMMaterial,
     render_accepted_tool_evidence_for_llm,
@@ -118,7 +117,6 @@ _OCCURRED_AT = datetime(2026, 5, 16, tzinfo=UTC)
 _REQUEST_PAYLOAD_KIND_VALID = "valid"
 _REQUEST_PAYLOAD_KIND_INVALID = "invalid"
 _FAIL_SAFE_QUERY_TEXT = "这个 request query 不应进入 memory"
-_FAIL_SAFE_LIMITED_QUERY_TEXT = ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT
 _COMPACT_ARTIFACT_DIGEST = (
     "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 )
@@ -2575,26 +2573,28 @@ def test_projection_consumer_fails_closed_for_request_query_source_mismatch(
     _assert_tool_query_projection_fails_closed(tmp_path, case)
 
 
-def test_projection_consumer_uses_limited_query_for_unsafe_argument_fallback(
+def test_projection_consumer_mechanically_displays_legal_business_argument_names(
     tmp_path: Path,
 ) -> None:
-    """缺少 semantic query 时，unsafe 参数不裸露进入 memory。"""
+    """缺少 semantic query 时，memory 沿共享投影展示 exact 业务参数。"""
 
     policy = _policy()
-    tool_call_id = "tool-call-unsafe-argument-memory"
-    request_event_id = "event-tool-call-requested-unsafe-memory"
-    result_event_id = "event-tool-result-unsafe-memory"
-    secret = "sk-live-secret"
-    local_path = "/Users/leo/private/report.pdf"
+    tool_call_id = "tool-call-business-argument-memory"
+    request_event_id = "event-tool-call-requested-business-memory"
+    result_event_id = "event-tool-result-business-memory"
+    file_path = "reports/COIN/annual-report.pdf"
+    scope_token = "scope-visible-business-label"
+    password_policy_name = "research-read-policy"
     arguments_json: Mapping[str, JsonValue] = {
         "arguments": {
-            "api_key": secret,
-            "input_path": local_path,
+            "file_path": file_path,
+            "password_policy_name": password_policy_name,
+            "scope_token": scope_token,
             "ticker": "COIN",
         }
     }
     arguments_digest = sha256_digest_json(arguments_json)
-    semantic_input_digest = sha256_digest_json({"semantic_input": "unsafe"})
+    semantic_input_digest = sha256_digest_json({"semantic_input": "business"})
     with open_host_durable_store(_options(tmp_path)) as store:
         store.transaction_runner.run_write(
             lambda transaction: _append_tool_request_and_result_events(
@@ -2603,7 +2603,7 @@ def test_projection_consumer_uses_limited_query_for_unsafe_argument_fallback(
                 result_event_id=result_event_id,
                 request_payload=_tool_call_requested_payload(
                     tool_call_id=tool_call_id,
-                    tool_name="lookup_private_file",
+                    tool_name="read_business_document",
                     arguments_json=arguments_json,
                     semantic_input_digest=semantic_input_digest,
                     semantic_query_text=None,
@@ -2612,7 +2612,7 @@ def test_projection_consumer_uses_limited_query_for_unsafe_argument_fallback(
                     result_event_id=result_event_id,
                     request_event_id=request_event_id,
                     tool_call_id=tool_call_id,
-                    tool_name="lookup_private_file",
+                    tool_name="read_business_document",
                     arguments_digest=arguments_digest,
                     semantic_input_digest=semantic_input_digest,
                     raw_tool_outcome={"status": "ok"},
@@ -2635,15 +2635,14 @@ def test_projection_consumer_uses_limited_query_for_unsafe_argument_fallback(
 
         assert latest is not None
         text = latest.snapshot.trace_memory.selected_recent_window[0].text
-        assert _FAIL_SAFE_LIMITED_QUERY_TEXT in text
+        assert file_path in text
+        assert scope_token in text
+        assert password_policy_name in text
+        assert "file_path" in text
+        assert "scope_token" in text
+        assert "password_policy_name" in text
+        assert '"ticker":"COIN"' in text
         assert '"status":"ok"' in text
-        assert secret not in text
-        assert local_path not in text
-        assert "arguments" not in text
-        assert "api_key" not in text
-        assert "input_path" not in text
-        assert "ticker" not in text
-        assert "COIN" not in text
         assert request_event_id not in text
         assert result_event_id not in text
         assert tool_call_id not in text

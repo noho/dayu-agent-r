@@ -1422,10 +1422,7 @@ def _list_documents_parameters() -> ToolParametersSchema:
     return ToolParametersSchema(
         type="object",
         properties={
-            "ticker": {
-                "type": "string",
-                "description": "直接传最自然的写法即可，不要手工穷举变体。",
-            },
+            "ticker": _ticker_parameter_schema(),
             "document_types": {
                 "type": "array",
                 "items": {
@@ -1477,8 +1474,8 @@ def _ticker_document_parameters() -> ToolParametersSchema:
     return ToolParametersSchema(
         type="object",
         properties={
-            "ticker": {"type": "string"},
-            "document_id": {"type": "string"},
+            "ticker": _ticker_parameter_schema(),
+            "document_id": _document_id_parameter_schema(),
         },
         required=("ticker", "document_id"),
         additional_properties=False,
@@ -1501,8 +1498,8 @@ def _read_section_parameters() -> ToolParametersSchema:
     return ToolParametersSchema(
         type="object",
         properties={
-            "ticker": {"type": "string"},
-            "document_id": {"type": "string"},
+            "ticker": _ticker_parameter_schema(),
+            "document_id": _document_id_parameter_schema(),
             "ref": {
                 "type": "string",
                 "description": "章节ref。只能来自于 `get_document_sections` 的 `sections[].ref`，`search_document` 的 `next_section_to_read.section.ref`，或 `search_document` 的 `next_section_by_query[*].section.ref`。仅在当前 `document_id` 内有效；切换 `document_id` 后必须重新对新文档 grounding，禁止复用其他 `document_id` 的 `ref`。",
@@ -1529,8 +1526,8 @@ def _search_document_parameters() -> ToolParametersSchema:
     return ToolParametersSchema(
         type="object",
         properties={
-            "ticker": {"type": "string"},
-            "document_id": {"type": "string"},
+            "ticker": _ticker_parameter_schema(),
+            "document_id": _document_id_parameter_schema(),
             "query": {
                 "type": "string",
                 "description": "单个搜索词。只搜一个概念时使用；避免裸数字、裸百分比或过于宽泛的词。",
@@ -1572,8 +1569,8 @@ def _list_tables_parameters() -> ToolParametersSchema:
     return ToolParametersSchema(
         type="object",
         properties={
-            "ticker": {"type": "string"},
-            "document_id": {"type": "string"},
+            "ticker": _ticker_parameter_schema(),
+            "document_id": _document_id_parameter_schema(),
             "financial_only": {
                 "type": "boolean",
                 "description": "只在你明确只看财务报表类表格时设为 true；否则保持默认 false。",
@@ -1605,8 +1602,8 @@ def _get_table_parameters() -> ToolParametersSchema:
     return ToolParametersSchema(
         type="object",
         properties={
-            "ticker": {"type": "string"},
-            "document_id": {"type": "string"},
+            "ticker": _ticker_parameter_schema(),
+            "document_id": _document_id_parameter_schema(),
             "table_ref": {
                 "type": "string",
                 "description": "表格ref。只能来自于`list_tables` 的 `tables[].table_ref` 或 `read_section` 正文里的 `[[t_XXXX]]`。仅在当前 `document_id` 内有效；切换 `document_id` 后必须重新对新文档 grounding，禁止复用其他 `document_id` 的 `table_ref`。",
@@ -1633,8 +1630,8 @@ def _get_page_content_parameters() -> ToolParametersSchema:
     return ToolParametersSchema(
         type="object",
         properties={
-            "ticker": {"type": "string"},
-            "document_id": {"type": "string"},
+            "ticker": _ticker_parameter_schema(),
+            "document_id": _document_id_parameter_schema(),
             "page_no": {"type": "integer", "description": "页码，从 1 开始。", "minimum": 1},
         },
         required=("ticker", "document_id", "page_no"),
@@ -1658,8 +1655,8 @@ def _get_financial_statement_parameters() -> ToolParametersSchema:
     return ToolParametersSchema(
         type="object",
         properties={
-            "ticker": {"type": "string"},
-            "document_id": {"type": "string"},
+            "ticker": _ticker_parameter_schema(),
+            "document_id": _document_id_parameter_schema(),
             "statement_type": {
                 "type": "string",
                 "description": "报表类型。通常先看 income、balance_sheet、cash_flow；只有明确需要时再看 equity 或 comprehensive_income。",
@@ -1687,8 +1684,8 @@ def _query_xbrl_facts_parameters() -> ToolParametersSchema:
     return ToolParametersSchema(
         type="object",
         properties={
-            "ticker": {"type": "string"},
-            "document_id": {"type": "string"},
+            "ticker": _ticker_parameter_schema(),
+            "document_id": _document_id_parameter_schema(),
             "concepts": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -1708,6 +1705,51 @@ def _query_xbrl_facts_parameters() -> ToolParametersSchema:
         required=("ticker", "document_id"),
         additional_properties=False,
     )
+
+
+def _ticker_parameter_schema() -> dict[str, JsonValue]:
+    """构造 Fins read 工具共用的 ticker 参数 schema。
+
+    Args:
+        无。
+
+    Returns:
+        包含自足业务语义的 ticker 参数 schema。
+
+    Raises:
+        无。
+    """
+
+    return {
+        "type": "string",
+        "description": (
+            "股票代码。直接使用自然的股票代码写法，例如 AAPL、600519 或 0700；"
+            "不要传公司名称，也不要手工穷举代码变体。"
+        ),
+    }
+
+
+def _document_id_parameter_schema() -> dict[str, JsonValue]:
+    """构造 Fins read 工具共用的 document_id 参数 schema。
+
+    Args:
+        无。
+
+    Returns:
+        包含来源约束的 document_id 参数 schema。
+
+    Raises:
+        无。
+    """
+
+    return {
+        "type": "string",
+        "description": (
+            "文档 ID。只能使用同一 ticker 的 "
+            "list_documents.documents[].document_id；切换 ticker 后必须重新调用 "
+            "list_documents 选择，禁止猜测或复用其他 ticker 的 document_id。"
+        ),
+    }
 
 
 def _text_truncate(max_chars: int, target_field: str) -> ToolTruncateSpec:

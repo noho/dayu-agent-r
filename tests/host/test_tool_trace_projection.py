@@ -996,9 +996,11 @@ def test_wait_resolution_tool_trace_summarizes_request_and_result_details(
     cold_path = tmp_path / "trace" / "wait-resolution.jsonl"
     arguments_json: Mapping[str, JsonValue] = {
         "arguments": {
+            "file_path": "reports/ATAT/annual-report.pdf",
+            "password_policy_name": "research-read-policy",
+            "scope_token": "scope-atat-visible",
             "ticker": "ATAT",
             "source": "auto",
-            "api_token": "<redacted>",
         }
     }
     arguments_digest = sha256_digest_json(arguments_json)
@@ -1110,7 +1112,17 @@ def test_wait_resolution_tool_trace_summarizes_request_and_result_details(
         assert request_summary["tool_name"] == "start_fins_download"
         assert request_summary["query_text"] == semantic_query_text
         assert "ticker=ATAT" in str(request_summary["arguments_summary_text"])
-        assert "<redacted>" in json.dumps(request_summary, ensure_ascii=False)
+        assert request_summary["arguments"] == arguments_json["arguments"]
+        assert "file_path=reports/ATAT/annual-report.pdf" in str(
+            request_summary["arguments_summary_text"]
+        )
+        assert "password_policy_name=research-read-policy" in str(
+            request_summary["arguments_summary_text"]
+        )
+        assert "scope_token=scope-atat-visible" in str(
+            request_summary["arguments_summary_text"]
+        )
+        assert "<redacted>" not in json.dumps(request_summary, ensure_ascii=False)
         assert result_row is not None
         result_request = result_row.trace_summary["tool_request"]
         result_summary = result_row.trace_summary["tool_result"]
@@ -1118,12 +1130,16 @@ def test_wait_resolution_tool_trace_summarizes_request_and_result_details(
         assert isinstance(result_summary, Mapping)
         assert result_request["tool_name"] == "start_fins_download"
         assert "ticker=ATAT" in str(result_request["arguments_summary_text"])
+        assert result_request["arguments"] == arguments_json["arguments"]
         assert result_summary["result_status"] == "completed"
         assert "discovered=27" in str(result_summary["result_details"])
         assert "downloaded=12" in str(result_summary["result_details"])
         assert "downloaded=12" in str(result_summary["result_summary_text"])
         cold_text = json.dumps(cold_lines, ensure_ascii=False, sort_keys=True)
         assert "ticker=ATAT" in cold_text
+        assert "reports/ATAT/annual-report.pdf" in cold_text
+        assert "research-read-policy" in cold_text
+        assert "scope-atat-visible" in cold_text
         assert "discovered=27" in cold_text
         assert "wait-atat-should-not-project" not in cold_text
         assert "payload-source-internal" not in cold_text
@@ -2080,35 +2096,52 @@ def test_tool_trace_does_not_inline_large_tool_call_arguments(
                 ),
             )
         )
+        request_payload: Mapping[str, JsonValue] = {
+            "tool_call_id": "tool-call-large-arguments",
+            "tool_name": "lookup_filing",
+            "tool_schema_digest": "sha256:schema",
+            "tool_identity_digest": "sha256:identity",
+            "normalized_arguments_digest": arguments_digest,
+            "arguments_json_size_bytes": 2048,
+            "arguments_storage_kind": "payload_descriptor",
+            "arguments_inline_json": None,
+            "arguments_payload_ref": "payload-tool-call-arguments-large",
+            "arguments_payload_digest": arguments_digest,
+            "semantic_input_digest": "sha256:semantic",
+            "semantic_query_storage_kind": "absent",
+            "semantic_query_text": None,
+            "semantic_query_payload_ref": None,
+            "semantic_query_digest": None,
+        }
         _append_tool_event(
             store.transaction_runner,
             event_id="event-requested-large-arguments",
             event_type="TOOL_CALL_REQUESTED",
-            payload={
-                "tool_call_id": "tool-call-large-arguments",
-                "tool_name": "lookup_filing",
-                "tool_schema_digest": "sha256:schema",
-                "tool_identity_digest": "sha256:identity",
-                "normalized_arguments_digest": arguments_digest,
-                "arguments_json_size_bytes": 2048,
-                "arguments_storage_kind": "payload_descriptor",
-                "arguments_inline_json": None,
-                "arguments_payload_ref": "payload-tool-call-arguments-large",
-                "arguments_payload_digest": arguments_digest,
-                "semantic_input_digest": "sha256:semantic",
-                "semantic_query_storage_kind": "absent",
-                "semantic_query_text": None,
-                "semantic_query_payload_ref": None,
-                "semantic_query_digest": None,
-            },
+            payload=cast(JsonValue, request_payload),
         )
 
         _run_trace_once(store.transaction_runner, cold_path)
+        hot_row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(
+                transaction, "event-requested-large-arguments"
+            )
+        )
         cold_lines = _json_lines(cold_path)
 
+        assert request_payload["arguments_payload_ref"] == (
+            "payload-tool-call-arguments-large"
+        )
+        assert request_payload["arguments_payload_digest"] == arguments_digest
+        assert hot_row is not None
+        assert hot_row.normalized_arguments_digest == arguments_digest
         assert len(cold_lines) == 1
         line_text = json.dumps(cold_lines[0], sort_keys=True)
+        readable_text = json.dumps(
+            cold_lines[0]["trace_summary"], sort_keys=True
+        )
         assert arguments_digest in line_text
+        assert "payload-tool-call-arguments-large" not in readable_text
+        assert arguments_digest not in readable_text
         assert "x" * 128 not in line_text
 
 

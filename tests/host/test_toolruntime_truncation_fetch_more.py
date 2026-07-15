@@ -223,6 +223,50 @@ def test_truncate_declaration_allows_missing_limit_and_ttl() -> None:
     assert effective.ttl_seconds == _DEFAULT_TTL_SECONDS
 
 
+def test_fetch_more_schema_explains_continuation_reference_labels() -> None:
+    """fetch_more schema 自足说明续读范围与两个引用标签。"""
+
+    handle, _accept_port = _handle(
+        _TextTool("ABCDEFGHIJ"),
+        _truncate_spec(max_chars=4),
+    )
+    definition = handle.effective_bundle.definitions_by_name[
+        FrameworkToolName.FETCH_MORE.value
+    ]
+    function = definition.schema.function
+
+    assert function.description == (
+        "仅用于继续读取上一条被截断的工具结果；必须使用该结果给出的 "
+        "cursor 与 scope_token，不能用于发起新的业务查询。"
+    )
+    assert function.parameters.properties == {
+        "cursor": {
+            "type": "string",
+            "description": (
+                "上一条截断结果给出的 cursor 引用标签。必须原样使用；"
+                "它只用于定位待续读内容，不是业务事实或推理依据。"
+            ),
+        },
+        "scope_token": {
+            "type": "string",
+            "description": (
+                "上一条截断结果给出的 scope_token 引用标签。必须原样使用；"
+                "它只用于校验本次续读范围，不是业务事实或推理依据。"
+            ),
+        },
+        "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "description": (
+                "可选的本次补读单位数，必须是正整数；"
+                "省略时由系统使用当前续读上限。"
+            ),
+        },
+    }
+    assert function.parameters.required == ("cursor", "scope_token")
+    assert function.parameters.additional_properties is False
+
+
 def test_truncate_declaration_rejects_ambiguous_target() -> None:
     """截断声明不能同时设置 target_field 与 field_path。"""
 

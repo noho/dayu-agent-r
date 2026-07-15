@@ -1562,11 +1562,31 @@ def test_fins_read_tool_schemas_do_not_expose_execution_context(tmp_path: Path) 
 
     workspace_root = _build_fins_workspace(tmp_path)
     definitions = _discover_definitions(workspace_root)
+    ticker_schema: Mapping[str, JsonValue] = {
+        "type": "string",
+        "description": (
+            "股票代码。直接使用自然的股票代码写法，例如 AAPL、600519 或 0700；"
+            "不要传公司名称，也不要手工穷举代码变体。"
+        ),
+    }
+    document_id_schema: Mapping[str, JsonValue] = {
+        "type": "string",
+        "description": (
+            "文档 ID。只能使用同一 ticker 的 "
+            "list_documents.documents[].document_id；切换 ticker 后必须重新调用 "
+            "list_documents 选择，禁止猜测或复用其他 ticker 的 document_id。"
+        ),
+    }
 
     assert tuple(definition.name for definition in definitions) == _FINS_READ_TOOL_NAMES
     for definition in definitions:
         properties = definition.schema.function.parameters.properties
         required = definition.schema.function.parameters.required
+        assert properties["ticker"] == ticker_schema
+        if definition.name == "list_documents":
+            assert "document_id" not in properties
+        else:
+            assert properties["document_id"] == document_id_schema
         assert "execution_context" not in properties
         assert "cancellation_token" not in properties
         assert "execution_context" not in required

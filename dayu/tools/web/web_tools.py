@@ -166,6 +166,10 @@ _FETCH_WEB_PAGE_PARAMETERS: Final[ToolParametersSchema] = ToolParametersSchema(
     properties={
         "url": {
             "type": "string",
+            "description": (
+                "要抓取的完整 http/https URL。"
+                "优先使用 search_web 返回的 URL。"
+            ),
         },
     },
     required=("url",),

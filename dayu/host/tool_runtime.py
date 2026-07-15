@@ -279,7 +279,10 @@ _ONE_MILLISECOND = timedelta(milliseconds=1)
 _SIDE_EFFECT_IDEMPOTENCY_HINT = (
     "side-effect or paid tool requires a tool idempotency key"
 )
-_FETCH_MORE_DESCRIPTION = "Fetch more content from a truncated tool result."
+_FETCH_MORE_DESCRIPTION = (
+    "仅用于继续读取上一条被截断的工具结果；必须使用该结果给出的 "
+    "cursor 与 scope_token，不能用于发起新的业务查询。"
+)
 _FETCH_MORE_CURSOR_FIELD = "cursor"
 _FETCH_MORE_SCOPE_TOKEN_FIELD = "scope_token"
 _FETCH_MORE_LIMIT_FIELD = "limit"
@@ -5707,9 +5710,28 @@ def _fetch_more_tool_definition(callable_: FetchMoreToolCallable) -> ToolDefinit
     """
 
     properties: dict[str, JsonValue] = {
-        _FETCH_MORE_CURSOR_FIELD: {"type": "string"},
-        _FETCH_MORE_SCOPE_TOKEN_FIELD: {"type": "string"},
-        _FETCH_MORE_LIMIT_FIELD: {"type": "integer", "minimum": 1},
+        _FETCH_MORE_CURSOR_FIELD: {
+            "type": "string",
+            "description": (
+                "上一条截断结果给出的 cursor 引用标签。必须原样使用；"
+                "它只用于定位待续读内容，不是业务事实或推理依据。"
+            ),
+        },
+        _FETCH_MORE_SCOPE_TOKEN_FIELD: {
+            "type": "string",
+            "description": (
+                "上一条截断结果给出的 scope_token 引用标签。必须原样使用；"
+                "它只用于校验本次续读范围，不是业务事实或推理依据。"
+            ),
+        },
+        _FETCH_MORE_LIMIT_FIELD: {
+            "type": "integer",
+            "minimum": 1,
+            "description": (
+                "可选的本次补读单位数，必须是正整数；"
+                "省略时由系统使用当前续读上限。"
+            ),
+        },
     }
     schema = ToolSchema(
         type="function",

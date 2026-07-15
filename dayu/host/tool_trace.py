@@ -36,14 +36,12 @@ from dayu.host.durable.tool_trace import (
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.accepted_result_projection import (
     AcceptedToolResultProjection,
-    AcceptedToolResultQueryState,
     project_accepted_tool_result,
 )
 from dayu.host.lifecycle_events import (
     HOST_RUN_LIFECYCLE_EVENT_TYPES,
     event_type_values,
 )
-from dayu.host.payload_resolution import event_payload_object
 from dayu.host.projection import (
     ProjectionApplyResult,
     ProjectionApplyStatus,
@@ -78,7 +76,6 @@ from dayu.host.tool_trace_signals import (
 )
 from dayu.runtime.diagnostic_text import truncate_diagnostic_text
 from dayu.runtime.filelock import file_lock
-from dayu.runtime.json_redaction import redact_sensitive_json_fields
 
 TOOL_TRACE_CONSUMER_ID = ProjectionConsumerId("host.tool-trace")
 """Tool Trace projection consumer id。"""
@@ -1125,29 +1122,23 @@ def _tool_request_summary_from_tool_result(
     :returns: Tool Trace request summary。
     """
 
-    status = (
-        "available"
-        if projection.query.state is not AcceptedToolResultQueryState.LIMITED_SIGNAL
-        else "limited_signal"
-    )
     arguments = _projection_arguments_object(projection)
-    redacted_arguments = _redacted_json(arguments) if arguments is not None else None
     arguments_summary_text = (
-        _arguments_summary_text(redacted_arguments)
-        if redacted_arguments is not None
+        _arguments_summary_text(arguments)
+        if arguments is not None
         else None
     )
     arguments_text = (
         _bounded_json_text(
-            redacted_arguments,
+            arguments,
             max_chars=_TOOL_TRACE_ARGUMENTS_TEXT_MAX_CHARS,
         )
-        if redacted_arguments is not None
+        if arguments is not None
         else None
     )
     return {
         _FIELD_SCHEMA_VERSION: _TOOL_TRACE_READABLE_SCHEMA_VERSION,
-        "status": status,
+        "status": "available",
         "reason": projection.query.diagnostic_reason,
         _FIELD_TOOL_NAME: projection.tool_name,
         _FIELD_TOOL_CALL_ID: projection.tool_call_id,
@@ -1169,15 +1160,12 @@ def _tool_request_summary_from_tool_result(
         "query_state": projection.query.state.value,
         "arguments_summary_text": arguments_summary_text,
         "arguments": (
-            redacted_arguments
+            arguments
             if arguments_text is not None
             and not arguments_text.endswith(_TRUNCATED_SUFFIX)
             else None
         ),
         "arguments_text": arguments_text,
-        _FIELD_NORMALIZED_ARGUMENTS_DIGEST: None,
-        "arguments_payload_ref": None,
-        "arguments_payload_digest": None,
     }
 
 
@@ -1187,7 +1175,7 @@ def _tool_request_summary_from_payload(
     """从 ``TOOL_CALL_REQUESTED`` payload 构造业务可读请求摘要。
 
     :param payload: request atom payload。
-    :returns: LLM-safe request summary。
+    :returns: bounded exact request summary。
     :raises HostDurableError: 已命名字段类型非法时抛出。
     """
 
@@ -1195,16 +1183,15 @@ def _tool_request_summary_from_payload(
     tool_call_id = _optional_text(payload, _FIELD_TOOL_CALL_ID)
     arguments_json = _inline_arguments_json(payload)
     arguments = _arguments_object(arguments_json)
-    redacted_arguments = _redacted_json(arguments) if arguments is not None else None
     arguments_text = (
-        _bounded_json_text(redacted_arguments, max_chars=_TOOL_TRACE_ARGUMENTS_TEXT_MAX_CHARS)
-        if redacted_arguments is not None
+        _bounded_json_text(arguments, max_chars=_TOOL_TRACE_ARGUMENTS_TEXT_MAX_CHARS)
+        if arguments is not None
         else None
     )
     arguments_summary_text = (
-        _arguments_summary_text(redacted_arguments)
-        if redacted_arguments is not None
-        else _descriptor_arguments_summary(payload)
+        _arguments_summary_text(arguments)
+        if arguments is not None
+        else None
     )
     query_text = _optional_text(payload, "semantic_query_text")
     summary_text = _join_summary_parts(
@@ -1229,19 +1216,12 @@ def _tool_request_summary_from_payload(
         ),
         "arguments_summary_text": arguments_summary_text,
         "arguments": (
-            redacted_arguments
+            arguments
             if arguments_text is not None
             and not arguments_text.endswith(_TRUNCATED_SUFFIX)
             else None
         ),
         "arguments_text": arguments_text,
-        "arguments_storage_kind": _optional_text(payload, "arguments_storage_kind"),
-        _FIELD_NORMALIZED_ARGUMENTS_DIGEST: _optional_text(
-            payload, _FIELD_NORMALIZED_ARGUMENTS_DIGEST
-        ),
-        "arguments_payload_ref": _optional_text(payload, "arguments_payload_ref"),
-        "arguments_payload_digest": _optional_text(payload, "arguments_payload_digest"),
-        "semantic_query_digest": _optional_text(payload, "semantic_query_digest"),
     }
 
 
@@ -1787,30 +1767,10 @@ def _arguments_object(
     return cast(Mapping[str, JsonValue], value)
 
 
-def _descriptor_arguments_summary(payload: Mapping[str, JsonValue]) -> str | None:
-    """构造 descriptor 参数的有限摘要。
-
-    :param payload: request atom payload。
-    :returns: 有限摘要或 ``None``。
-    """
-
-    payload_ref = _optional_text(payload, "arguments_payload_ref")
-    digest = _optional_text(payload, "arguments_payload_digest")
-    if payload_ref is None and digest is None:
-        return None
-    return _join_summary_parts(
-        (
-            "arguments stored in payload descriptor",
-            f"arguments_payload_ref={payload_ref}" if payload_ref is not None else None,
-            f"arguments_payload_digest={digest}" if digest is not None else None,
-        )
-    )
-
-
 def _arguments_summary_text(arguments: JsonValue) -> str:
     """把参数 JSON 投影成短的 key=value 摘要。
 
-    :param arguments: 已脱敏参数 JSON。
+    :param arguments: exact accepted 参数 JSON。
     :returns: bounded 参数摘要。
     """
 
@@ -1833,16 +1793,6 @@ def _arguments_summary_text(arguments: JsonValue) -> str:
         ", ".join(parts),
         max_chars=_TOOL_TRACE_ARGUMENTS_TEXT_MAX_CHARS,
     )
-
-
-def _redacted_json(value: JsonValue) -> JsonValue:
-    """对 JSON 值做敏感字段脱敏。
-
-    :param value: 原始 JSON。
-    :returns: 脱敏 JSON。
-    """
-
-    return redact_sensitive_json_fields(value)
 
 
 def _bounded_json_text(value: JsonValue, *, max_chars: int) -> str:

@@ -772,36 +772,43 @@ def test_projection_missing_event_payload_fails_closed(
             )
 
 
-def test_projection_unsafe_argument_keys_return_limited_signal(tmp_path: Path) -> None:
-    """敏感或本地路径参数 key 不进入 LLM-facing query 摘要。"""
+def test_projection_mechanically_displays_legal_business_argument_names(
+    tmp_path: Path,
+) -> None:
+    """合法业务参数名不经字段名分类，直接投影 canonical JSON。"""
 
     event_log = EventLogStore()
     projection: AcceptedToolResultProjection | None = None
     with open_host_durable_store(_durable_options(tmp_path)) as store:
         def seed(transaction: HostTransaction) -> EventLogRow:
-            """写入含敏感参数 key 的 accepted result。
+            """写入含合法路径、引用标签与 password-like 业务名的结果。
 
             :param transaction: Host transaction。
             :returns: accepted result row。
             """
 
             arguments_json: JsonValue = {
-                "arguments": {"ticker": "MSFT", "api_key": "secret-value"}
+                "arguments": {
+                    "file_path": "reports/COIN/annual-report.pdf",
+                    "password_policy_name": "research-read-policy",
+                    "scope_token": "scope-visible-business-label",
+                    "ticker": "COIN",
+                }
             }
             arguments_digest = sha256_digest_json(arguments_json)
             request = _append_tool_call_requested(
                 transaction,
                 event_log,
-                event_id="event-request-unsafe-arguments",
-                tool_call_id="tool-call-unsafe-arguments",
+                event_id="event-request-business-arguments",
+                tool_call_id="tool-call-business-arguments",
                 arguments_json=arguments_json,
                 semantic_query_text=None,
             )
             return _append_tool_result(
                 transaction,
                 event_log,
-                event_id="event-result-unsafe-arguments",
-                tool_call_id="tool-call-unsafe-arguments",
+                event_id="event-result-business-arguments",
+                tool_call_id="tool-call-business-arguments",
                 request_event_ref=request.event_id,
                 normalized_arguments_digest=arguments_digest,
                 tool_fact_kind="completed",
@@ -815,9 +822,13 @@ def test_projection_unsafe_argument_keys_return_limited_signal(tmp_path: Path) -
         )
 
     assert projection is not None
-    assert projection.query.state is AcceptedToolResultQueryState.LIMITED_SIGNAL
-    assert projection.query.diagnostic_reason == "arguments_summary_unsafe"
-    assert "secret-value" not in projection.query.text
+    assert projection.query.state is AcceptedToolResultQueryState.ARGUMENTS_SUMMARY
+    assert projection.query.diagnostic_reason == "semantic_query_missing"
+    assert projection.query.text == (
+        '参数：{"arguments":{"file_path":"reports/COIN/annual-report.pdf",'
+        '"password_policy_name":"research-read-policy",'
+        '"scope_token":"scope-visible-business-label","ticker":"COIN"}}'
+    )
 
 
 def test_projection_maps_raw_result_ok_false_and_extracts_details(
