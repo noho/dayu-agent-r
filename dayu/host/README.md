@@ -393,6 +393,8 @@ Engine 不拥有 wait record、activation 或外部 job 生命周期。Engine �
 
 Production wait poller 是 `open_host` 可选装配的 Host runtime。它使用 construction-time poll adapter registry 观察 durable wait record 指向的外部 job，并通过 durable claim / expiry / next-observe / backoff 控制可观察资格；调用 provider adapter 前，Host 只把 durable row 投影成 `WaitAdapterSnapshot(tool_name, resume_token, created_at)`，adapter 不接收 Host wait row、deadline / expiry、claim 或 state mutator。完成或 lost 时仍调用同一个 `resolve_wait` command path。正常 `not_ready` 只表示外部 job 仍在运行，poller 会短间隔复查；Host 等待时间边界拒绝、adapter error、missing adapter、resolve error 或 shutdown-skipped 才进入可重试 backoff，并分别写入有界 durable poll outcome。没有可 claim wait record 时，supervisor 使用 idle 间隔降低空查频率；有 active wait 但未到 next-observe / claim expiry 时，supervisor 睡眠到下一次 due 或 idle 上限，并可被本地 wakeup 打断。空轮询不逐轮输出空摘要日志。poller runtime diagnostics 保持在内存中，不写 EventLog，不成为业务事实或用户结论。
 
+同步 adapter observation timeout 只是 Host poller 的本地边界诊断，不是外部 job 的业务结果。poll observation 超时时，Host 撤销该 observation token 的发布权、释放 claim 并按统一 backoff 真源安排重试，Run 与 wait record 继续保持 `WAITING`；线程随后返回的迟到 Ready / Lost 不能进入 `resolve_wait`。cancelled wait 的 abandon observation 超时同样只释放 claim 并保持 `CANCELLED` 可重试，不写 `poll_abandoned_at`。只有 adapter 明确返回 Ready / Lost，或 cancelled external lifecycle 明确返回 applied / unsupported / noop，才可沿各自 owner path 写入对应 durable 语义。
+
 Host 不拥有 wait poller 的 deployment defaults。`WaitPollerRuntimePolicy` 的十二个字段、
 `WaitPoller` 与 `WaitPollerSupervisor` 的 policy 都必须由 composition root 显式提供；
 不存在无参 policy、模块数值默认或 `None` fallback。`OpenHostOptions.wait_poller_policy=None`

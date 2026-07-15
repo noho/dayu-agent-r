@@ -35,7 +35,6 @@ from dayu.host.admission import (
     create_host_admission_service,
 )
 from dayu.host.api import (
-    AttemptStatus,
     AuthorizationClaim,
     CancelRunRequest,
     CancelSessionRunsRequest,
@@ -83,9 +82,7 @@ from dayu.host.durable.errors import (
     HostUniqueConstraintError,
 )
 from dayu.host.durable.options import (
-    HostDurableStoreOptions,
-    HostSQLiteStoragePolicy,
-    PayloadStoragePolicy,
+    project_host_durable_store_options,
 )
 from dayu.host.durable.purge import (
     PurgeSessionAlreadyPurgedError,
@@ -106,7 +103,6 @@ from dayu.host.durable.state import (
     DispatchRecordRow,
     WaitRecordRow,
     WaitRecordStatus,
-    read_run_by_id,
     read_wait_record_by_id,
     run_snapshot_from_row,
 )
@@ -374,7 +370,7 @@ def create_host_command_handle(
             "HostCommandHandleOptions.local_execution is not supported by "
             "create_host_command_handle; open HostDispatchScheduler explicitly"
         )
-    durable_options = _durable_options_from_public_options(options)
+    durable_options = project_host_durable_store_options(options)
     try:
         durable_store = open_host_durable_store(durable_options)
     except HostDurableError as exc:
@@ -1289,33 +1285,6 @@ def _host_api_error_from_durable_error(error: HostDurableError) -> HostApiError:
         code=HostApiErrorCode.INTERNAL_ERROR,
         message="Host durable operation failed",
         retryable=False,
-    )
-
-
-def _durable_options_from_public_options(
-    options: HostCommandHandleOptions,
-) -> HostDurableStoreOptions:
-    """把 public handle options 映射为 durable store options。
-
-    :param options: Host command handle 公共构造选项。
-    :returns: Host durable store options。
-    """
-
-    return HostDurableStoreOptions(
-        db_path=options.db_path,
-        payload_policy=PayloadStoragePolicy(
-            artifact_root=options.artifact_root,
-            payload_inline_threshold_bytes=(options.payload_inline_threshold_bytes),
-            create_artifact_root=options.create_parent_dirs,
-        ),
-        create_parent_dirs=options.create_parent_dirs,
-        sqlite_policy=HostSQLiteStoragePolicy(
-            busy_timeout_seconds=options.sqlite_busy_timeout_seconds,
-            write_busy_retry_count=options.sqlite_write_busy_retry_count,
-            write_retry_initial_delay_seconds=(options.sqlite_write_retry_initial_delay_seconds),
-            write_retry_backoff_multiplier=(options.sqlite_write_retry_backoff_multiplier),
-            write_retry_max_delay_seconds=(options.sqlite_write_retry_max_delay_seconds),
-        ),
     )
 
 

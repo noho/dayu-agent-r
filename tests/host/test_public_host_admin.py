@@ -29,16 +29,13 @@ from dayu.host import (
 from dayu.host.admission import create_host_admission_service
 from dayu.host.api import HostCommandHandleOptions, HostLocalExecutionOptions
 from dayu.host.command import (
-    create_host_command_handle,
     ensure_session,
     submit_followup,
 )
-from dayu.host.command import (
-    HostCommandHandle,
-    _durable_options_from_public_options,
-)
+from dayu.host.command import HostCommandHandle
 from dayu.host.dispatch import ActiveWorkerRegistry, HostDispatchScheduler
 from dayu.host.durable.connection import open_host_durable_store
+from dayu.host.durable.options import project_host_durable_store_options
 from dayu.host.durable.transaction import HostTransactionRunner
 from dayu.host.projection import ProjectionCatchupPort
 from dayu.host.recovery import StartupRecoveryScanner
@@ -209,7 +206,7 @@ def _seed_nonterminal_runs(tmp_path: Path) -> str:
 
     options = _command_options(tmp_path)
     durable_store = open_host_durable_store(
-        _durable_options_from_public_options(options)
+        project_host_durable_store_options(options)
     )
     handle = HostCommandHandle(
         host_handle_id="host-admin-seed",

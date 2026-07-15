@@ -79,9 +79,6 @@ from dayu.host.command import (
     submit_followup as _submit_followup,
 )
 from dayu.host.waiting import ExpireWaitInput, ExpireWaitResult
-from dayu.host.command import (
-    _durable_options_from_public_options as _durable_options_from_command_options,
-)
 from dayu.host.dispatch import (
     ActiveCancelMessage,
     ActiveWorkerCancelPort,
@@ -93,6 +90,7 @@ from dayu.host.durable.connection import (
     HostDurableStore,
     open_host_durable_store,
 )
+from dayu.host.durable.options import project_host_durable_store_options
 from dayu.host.durable.event_log import EventLogStore
 from dayu.host.llm_compaction import LLMContextCompactor
 from dayu.host.outbox import (
@@ -524,7 +522,7 @@ class _OpenHostWaitPollerFactory(WaitPollerFactory):
         """
 
         durable_store = open_host_durable_store(
-            _durable_options_from_command_options(self.command_options)
+            project_host_durable_store_options(self.command_options)
         )
         try:
             admission_service = create_host_admission_service(
@@ -590,7 +588,7 @@ class _ExecutionCommandHandleFactory:
         """
 
         durable_store = open_host_durable_store(
-            _durable_options_from_command_options(self.command_options)
+            project_host_durable_store_options(self.command_options)
         )
         try:
             admission_service = create_host_admission_service(
@@ -631,7 +629,7 @@ class _AdminCommandHandleFactory:
         """
 
         durable_store = open_host_durable_store(
-            _durable_options_from_command_options(self.command_options)
+            project_host_durable_store_options(self.command_options)
         )
         try:
             admission_service = create_host_admission_service(
@@ -1309,7 +1307,7 @@ class _OpenHostContextManager(AbstractAsyncContextManager[Host]):
             host_handle_id,
         )
         scheduler_store = open_host_durable_store(
-            _durable_options_from_command_options(command_options)
+            project_host_durable_store_options(command_options)
         )
         scheduler: HostDispatchScheduler | None = None
         close_projection_catchup_port: ProjectionCatchupPort | None = None

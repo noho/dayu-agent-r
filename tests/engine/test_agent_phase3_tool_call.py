@@ -93,6 +93,9 @@ from tests.host.fake_cancellation import ControllableCancellationToken
 _TOOL_EXECUTION_TIMEOUT_SECONDS: float = 5.0
 _FAST_TOOL_EXECUTION_TIMEOUT_SECONDS: float = 0.01
 _SLOW_TOOL_EXECUTION_SECONDS: float = 5.0
+_AWAITING_HANDSHAKE_TIMEOUT_SECONDS: float = 0.1
+_AWAITING_EXTERNAL_OPERATION_SECONDS: float = 0.25
+_AWAITING_EXTERNAL_OPERATION_WAIT_SECONDS: float = 1.0
 _MINIMAL_MAX_ITERATIONS: int = 1
 _NO_CONTINUATION_ATTEMPTS: int = 0
 _TEST_FALLBACK_PROMPT: str = "test fallback prompt"
@@ -378,6 +381,66 @@ class _HangingToolExecutor:
             for call in request.calls
         )
         return BatchToolExecutionOutcome(records=records)
+
+
+@dataclass(slots=True)
+class _AwaitingExternalOperationExecutor:
+    """返回 awaiting 握手并启动独立异步 operation 的 fake executor。"""
+
+    operation_duration_seconds: float
+    operation_started: asyncio.Event = field(default_factory=asyncio.Event)
+    operation_finished: asyncio.Event = field(default_factory=asyncio.Event)
+    operation_task: asyncio.Task[None] | None = None
+    operation_started_at: float | None = None
+    operation_finished_at: float | None = None
+    handshake_started_at: float | None = None
+    handshake_returned_at: float | None = None
+    operation_cancelled: bool = False
+    requests: list[BatchToolExecutionRequest] = field(default_factory=list)
+
+    async def execute(
+        self, request: BatchToolExecutionRequest
+    ) -> BatchToolExecutionOutcome:
+        """启动独立 operation，并在握手预算内返回 awaiting outcome。
+
+        :param request: 批式工具执行请求。
+        :returns: 与输入调用一一对应的 awaiting outcome。
+        :raises RuntimeError: 同一 fake executor 被重复调用时抛出。
+        """
+
+        if self.operation_task is not None:
+            raise RuntimeError("awaiting external operation was started twice")
+        loop = asyncio.get_running_loop()
+        self.requests.append(request)
+        self.handshake_started_at = loop.time()
+        self.operation_task = asyncio.create_task(self._run_external_operation())
+        records = tuple(
+            BatchToolExecutionRecord(
+                tool_call_id=call.tool_call_id,
+                outcome=_awaiting(),
+            )
+            for call in request.calls
+        )
+        self.handshake_returned_at = loop.time()
+        return BatchToolExecutionOutcome(records=records)
+
+    async def _run_external_operation(self) -> None:
+        """运行不受 Engine 握手 timer 拥有的独立异步 operation。
+
+        :returns: ``None``。
+        :raises asyncio.CancelledError: operation task 被外部错误取消时透传。
+        """
+
+        loop = asyncio.get_running_loop()
+        self.operation_started_at = loop.time()
+        self.operation_started.set()
+        try:
+            await asyncio.sleep(self.operation_duration_seconds)
+        except asyncio.CancelledError:
+            self.operation_cancelled = True
+            raise
+        self.operation_finished_at = loop.time()
+        self.operation_finished.set()
 
 
 def _event(event_type: RunnerEventType, data: RunnerEventData) -> RunnerEvent:
@@ -1694,6 +1757,79 @@ async def test_tool_awaiting_suspends_run_with_accepted_and_awaiting_records() -
     assert runner.call_count == 1
     assert runner.close_count == 1
     assert len(runner.messages_seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_accepted_awaiting_external_operation_outlives_handshake_timeout() -> (
+    None
+):
+    """accepted awaiting 后独立 operation 可越过握手预算且不被 timer 取消。
+
+    :returns: ``None``。
+    :raises Exception: Agent 执行、operation task 或具名等待预算失败时透出。
+    """
+
+    executor = _AwaitingExternalOperationExecutor(
+        operation_duration_seconds=_AWAITING_EXTERNAL_OPERATION_SECONDS
+    )
+    runner = _ScriptedRunner(scripts=(_tool_script(_tool_call("tc_1")),))
+    events: list[EngineEvent] = []
+    try:
+        events = await _collect(
+            _AsyncAgent(
+                request=_request(
+                    executor=executor,
+                    tool_execution_timeout_seconds=(
+                        _AWAITING_HANDSHAKE_TIMEOUT_SECONDS
+                    ),
+                ),
+                runner=runner,
+            )
+        )
+        await asyncio.wait_for(
+            executor.operation_finished.wait(),
+            timeout=_AWAITING_EXTERNAL_OPERATION_WAIT_SECONDS,
+        )
+    finally:
+        operation_task = executor.operation_task
+        if operation_task is not None and not operation_task.done():
+            operation_task.cancel()
+        if operation_task is not None:
+            try:
+                await operation_task
+            except asyncio.CancelledError:
+                pass
+
+    assert len(executor.requests) == 1
+    assert (
+        executor.requests[0].context.timeout_seconds
+        == _AWAITING_HANDSHAKE_TIMEOUT_SECONDS
+    )
+    assert executor.handshake_started_at is not None
+    assert executor.handshake_returned_at is not None
+    assert (
+        executor.handshake_returned_at - executor.handshake_started_at
+        < _AWAITING_HANDSHAKE_TIMEOUT_SECONDS
+    )
+    assert executor.operation_started.is_set()
+    assert executor.operation_finished.is_set()
+    assert executor.operation_started_at is not None
+    assert executor.operation_finished_at is not None
+    assert (
+        executor.operation_finished_at - executor.operation_started_at
+        > _AWAITING_HANDSHAKE_TIMEOUT_SECONDS
+    )
+    assert not executor.operation_cancelled
+    assert _terminal(events).type is EngineEventType.RUN_SUSPENDED
+    assert [
+        event.type
+        for event in events
+        if event.type in {
+            EngineEventType.TOOL_AWAITING,
+            EngineEventType.RUN_SUSPENDED,
+        }
+    ] == [EngineEventType.TOOL_AWAITING, EngineEventType.RUN_SUSPENDED]
+    assert EngineEventType.RUN_FAILED not in {event.type for event in events}
 
 
 @pytest.mark.asyncio
