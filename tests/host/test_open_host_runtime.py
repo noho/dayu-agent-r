@@ -60,7 +60,7 @@ from dayu.host import (
     open_host,
     open_host_admin,
 )
-from dayu.host.api import AuthorizationClaim, HostInput, HostLocalExecutionOptions
+from dayu.host.api import AuthorizationClaim, HostLocalExecutionOptions
 from dayu.host.command import HostCommandHandle, create_host_command_handle
 from dayu.host._durable_actor import DurableActor
 from dayu.host._execution_health import (
@@ -2132,7 +2132,11 @@ def _wait_poller_policy(*, enabled: bool = True) -> WaitPollerRuntimePolicy:
         backoff_initial_delay_seconds=0.01,
         backoff_multiplier=2.0,
         backoff_max_delay_seconds=0.05,
+        not_ready_observe_interval_seconds=0.01,
+        idle_poll_interval_seconds=0.01,
+        adapter_call_timeout_seconds=0.1,
         close_drain_timeout_seconds=0.2,
+        max_outstanding_adapter_calls=4,
     )
 
 

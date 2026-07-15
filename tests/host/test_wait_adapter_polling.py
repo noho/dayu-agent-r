@@ -39,7 +39,6 @@ from dayu.host.durable.state import WaitPollLastOutcome, WaitRecordRow, WaitReco
 from dayu.host.durable.transaction import (
     HostTransaction,
     HostTransactionOperation,
-    HostTransactionRunner,
 )
 from dayu.host.wait_adapter import (
     WaitAdapterSnapshot,
@@ -57,6 +56,7 @@ from dayu.host.wait_adapter import (
     WaitPollReady,
     WaitPollResult,
     WaitPoller,
+    WaitPollerRuntimePolicy,
     WaitResolvePort,
 )
 from dayu.host.waiting import ExpireWaitInput, ExpireWaitResult
@@ -846,6 +846,7 @@ def test_poll_adapter_empty_round_does_not_log_poll_summary(
             resolver=_NoResolveResolver(),
             context=_context("poller"),
             clock=_FixedClock(),
+            policy=_wait_poller_policy(),
         )
 
         with caplog.at_level(VERBOSE_LOG_LEVEL, logger="dayu.host.wait_adapter"):
@@ -1085,6 +1086,7 @@ def test_missing_poll_adapter_registration_logs_warning(
             resolver=_PublicCommandResolver(host),
             context=_context("poller-missing-adapter"),
             clock=_FixedClock(),
+            policy=_wait_poller_policy(),
         )
 
         with caplog.at_level(logging.WARNING, logger="dayu.host.wait_adapter"):
@@ -1129,6 +1131,7 @@ def test_cancelled_poll_wait_missing_adapter_stays_retryable(
             resolver=_NoResolveResolver(),
             context=_context("poller-cancelled-missing-adapter"),
             clock=_FixedClock(),
+            policy=_wait_poller_policy(),
         )
 
         with caplog.at_level(logging.WARNING, logger="dayu.host.wait_adapter"):
@@ -1225,6 +1228,7 @@ def test_resolve_wait_exception_isolated_per_wait_record(
             resolver=resolver,
             context=_context("poller-resolve-failure"),
             clock=_FixedClock(),
+            policy=_wait_poller_policy(),
         )
 
         with caplog.at_level(logging.WARNING, logger="dayu.host.wait_adapter"):
@@ -1298,6 +1302,7 @@ def test_resolve_wait_exception_readback_failure_isolated(
             resolver=resolver,
             context=_context("poller-resolve-readback-failure"),
             clock=_FixedClock(),
+            policy=_wait_poller_policy(),
         )
 
         with caplog.at_level(logging.WARNING, logger="dayu.host.wait_adapter"):
@@ -1437,6 +1442,7 @@ def test_resolve_failure_releases_with_backoff_and_reuses_idempotency_key(
             resolver=failing_resolver,
             context=_context("poller-resolve-failure"),
             clock=_FixedClock(),
+            policy=_wait_poller_policy(),
         )
 
         failed = failing_poller.poll_once()
@@ -1456,6 +1462,7 @@ def test_resolve_failure_releases_with_backoff_and_reuses_idempotency_key(
             resolver=recording_resolver,
             context=_context("poller-resolve-retry"),
             clock=_FixedClock(),
+            policy=_wait_poller_policy(),
         )
         retried = retry_poller.poll_once()
 
@@ -1717,6 +1724,7 @@ def _poller(
         resolver=_PublicCommandResolver(host),
         context=_context("poller"),
         clock=_FixedClock(),
+        policy=_wait_poller_policy(),
         lifecycle_gate=lifecycle_gate,
     )
 
@@ -1762,6 +1770,29 @@ def _poller_with_resolver(
         resolver=resolver,
         context=_context("poller"),
         clock=_FixedClock(),
+        policy=_wait_poller_policy(),
+    )
+
+
+def _wait_poller_policy() -> WaitPollerRuntimePolicy:
+    """构造字段完整的测试 wait poller policy。
+
+    :returns: 显式包含十二个部署字段的 policy。
+    """
+
+    return WaitPollerRuntimePolicy(
+        enabled=True,
+        poll_interval_seconds=1.0,
+        claim_ttl_seconds=60.0,
+        claim_batch_size=100,
+        backoff_initial_delay_seconds=30.0,
+        backoff_multiplier=2.0,
+        backoff_max_delay_seconds=300.0,
+        not_ready_observe_interval_seconds=1.0,
+        idle_poll_interval_seconds=5.0,
+        adapter_call_timeout_seconds=30.0,
+        close_drain_timeout_seconds=5.0,
+        max_outstanding_adapter_calls=8,
     )
 
 

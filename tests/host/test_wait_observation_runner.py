@@ -14,7 +14,7 @@ from dayu.host._wait_observation import (
     WaitObservationTimedOut,
 )
 from dayu.host.command import HostCommandHandle, create_host_command_handle
-from dayu.host.durable.state import WaitPollLastOutcome, WaitRecordRow, WaitRecordStatus
+from dayu.host.durable.state import WaitPollLastOutcome, WaitRecordStatus
 from dayu.host.wait_adapter import (
     WaitAdapterSnapshot,
     WaitExternalJobLifecycleApplied,
@@ -369,7 +369,7 @@ def test_supervisor_close_uses_one_shared_deadline_and_stays_closing() -> None:
     factory = _SharedDeadlineFactory()
     supervisor = WaitPollerSupervisor(
         poller_factory=factory,
-        policy=WaitPollerRuntimePolicy(
+        policy=_wait_poller_policy(
             poll_interval_seconds=1.0,
             adapter_call_timeout_seconds=10.0,
             close_drain_timeout_seconds=0.03,
@@ -430,12 +430,44 @@ def _poller(
         resolver=_PublicCommandResolver(host),
         context=_context("bounded-observation-poller"),
         clock=_FixedClock(),
-        policy=WaitPollerRuntimePolicy(
+        policy=_wait_poller_policy(
             adapter_call_timeout_seconds=0.01,
             close_drain_timeout_seconds=0.02,
             max_outstanding_adapter_calls=1,
         ),
         observation_runner=runner,
+    )
+
+
+def _wait_poller_policy(
+    *,
+    poll_interval_seconds: float = 0.01,
+    adapter_call_timeout_seconds: float = 0.05,
+    close_drain_timeout_seconds: float = 0.05,
+    max_outstanding_adapter_calls: int = 2,
+) -> WaitPollerRuntimePolicy:
+    """构造字段完整的 bounded observation 测试 policy。
+
+    :param poll_interval_seconds: supervisor 轮询间隔秒数。
+    :param adapter_call_timeout_seconds: 单次 adapter 调用预算秒数。
+    :param close_drain_timeout_seconds: close 共享预算秒数。
+    :param max_outstanding_adapter_calls: 最大并发 adapter 调用数。
+    :returns: 显式包含十二个部署字段的 policy。
+    """
+
+    return WaitPollerRuntimePolicy(
+        enabled=True,
+        poll_interval_seconds=poll_interval_seconds,
+        claim_ttl_seconds=0.5,
+        claim_batch_size=4,
+        backoff_initial_delay_seconds=0.01,
+        backoff_multiplier=2.0,
+        backoff_max_delay_seconds=0.05,
+        not_ready_observe_interval_seconds=0.01,
+        idle_poll_interval_seconds=0.01,
+        adapter_call_timeout_seconds=adapter_call_timeout_seconds,
+        close_drain_timeout_seconds=close_drain_timeout_seconds,
+        max_outstanding_adapter_calls=max_outstanding_adapter_calls,
     )
 
 

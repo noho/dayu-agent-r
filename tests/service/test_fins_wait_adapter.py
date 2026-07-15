@@ -37,6 +37,7 @@ from dayu.service.fins_wait_adapter import (
     FinsIngestionWaitPollAdapter,
     build_fins_wait_activation_registry,
     build_fins_wait_adapter_registry,
+    _operation_kind_from_tool_name,
 )
 from dayu.fins.direct_events import (
     FINS_RESULT_EXIT_FAILURE,
@@ -63,6 +64,7 @@ from dayu.fins.ingestion_runtime import (
     FinsUploadRequest,
 )
 from dayu.fins.tools.download_tools import DOWNLOAD_TOOL_NAME
+from dayu.fins.tools._ingestion_tool_helpers import AwaitingResolutionMode
 from dayu.fins.tools.preprocess_tools import PREPROCESS_TOOL_NAME
 from dayu.fins.tools.upload_tools import UPLOAD_TOOL_NAME
 
@@ -74,7 +76,11 @@ def test_fins_wait_adapter_registry_binds_supported_tools(tmp_path: Path) -> Non
 
     registry = build_fins_wait_adapter_registry(
         workspace_root=tmp_path.resolve(strict=False),
-        tool_names=(UPLOAD_TOOL_NAME, DOWNLOAD_TOOL_NAME, PREPROCESS_TOOL_NAME),
+        tool_modes=(
+            (UPLOAD_TOOL_NAME, AwaitingResolutionMode.MANUAL),
+            (DOWNLOAD_TOOL_NAME, AwaitingResolutionMode.POLL),
+            (PREPROCESS_TOOL_NAME, AwaitingResolutionMode.CALLBACK),
+        ),
     )
 
     download_binding = registry.resolve_binding(
@@ -97,8 +103,31 @@ def test_fins_wait_adapter_registry_binds_supported_tools(tmp_path: Path) -> Non
     assert preprocess_binding.adapter_key == FINS_INGESTION_WAIT_ADAPTER_KEY
     assert upload_binding.adapter_key == FINS_INGESTION_WAIT_ADAPTER_KEY
     assert download_binding.resume_policy is WaitResumePolicy.POLL
-    assert preprocess_binding.resume_policy is WaitResumePolicy.POLL
-    assert upload_binding.resume_policy is WaitResumePolicy.POLL
+    assert preprocess_binding.resume_policy is WaitResumePolicy.CALLBACK
+    assert upload_binding.resume_policy is WaitResumePolicy.MANUAL
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "expected"),
+    (
+        (DOWNLOAD_TOOL_NAME, FinsOperationKind.DOWNLOAD),
+        (PREPROCESS_TOOL_NAME, FinsOperationKind.PREPROCESS),
+        (UPLOAD_TOOL_NAME, FinsOperationKind.UPLOAD),
+    ),
+)
+def test_fins_operation_kind_structural_mapping_remains_stable(
+    tool_name: str,
+    expected: FinsOperationKind,
+) -> None:
+    """observation handle 的 tool-name 结构映射不得被 mode mapping 替代。
+
+    :param tool_name: Fins awaiting 工具名。
+    :param expected: 预期 operation kind。
+    :returns: ``None``。
+    :raises AssertionError: 结构映射漂移时抛出。
+    """
+
+    assert _operation_kind_from_tool_name(tool_name) is expected
 
 
 def test_fins_wait_adapter_registry_duplicate_binding_fails(tmp_path: Path) -> None:
@@ -109,7 +138,10 @@ def test_fins_wait_adapter_registry_duplicate_binding_fails(tmp_path: Path) -> N
     with pytest.raises(ValueError, match="duplicate Fins wait adapter binding"):
         build_fins_wait_adapter_registry(
             workspace_root=workspace_root,
-            tool_names=(DOWNLOAD_TOOL_NAME, DOWNLOAD_TOOL_NAME),
+            tool_modes=(
+                (DOWNLOAD_TOOL_NAME, AwaitingResolutionMode.POLL),
+                (DOWNLOAD_TOOL_NAME, AwaitingResolutionMode.MANUAL),
+            ),
         )
 
 

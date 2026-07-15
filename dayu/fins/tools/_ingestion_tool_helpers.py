@@ -1,13 +1,15 @@
 """Fins ingestion awaiting tools 的私有共享辅助函数。
 
-本模块只承载 download/preprocess/upload 工具适配层共用的 outcome 构造和
-JSON 参数读取逻辑；具体请求对象仍由各工具模块自行构造。
+本模块只承载 download/preprocess/upload 工具适配层共用的恢复模式解析、
+outcome 构造和 JSON 参数读取逻辑；具体请求对象仍由各工具模块自行构造。
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime, timezone
+from enum import StrEnum
+from typing import Final
 
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSnapshot, ToolAwaitSpec
@@ -17,6 +19,50 @@ from dayu.fins.ingestion.observation_handle import (
     FinsObservationHandle,
     observation_handle_id_to_resume_token,
 )
+
+AWAITING_RESOLUTION_MODE_CONFIG_FIELD: Final[str] = "awaiting_resolution_mode"
+"""Fins awaiting provider 恢复模式的配置字段名。"""
+
+
+class AwaitingResolutionMode(StrEnum):
+    """Fins awaiting provider 支持的恢复模式。"""
+
+    POLL = "poll"
+    CALLBACK = "callback"
+    MANUAL = "manual"
+
+
+def parse_awaiting_resolution_mode(
+    config: Mapping[str, JsonValue],
+) -> AwaitingResolutionMode:
+    """严格解析 Fins awaiting provider 的恢复模式。
+
+    Args:
+        config: provider 自有的 JSON 配置。
+
+    Returns:
+        已校验的 closed typed 恢复模式。
+
+    Raises:
+        ValueError: 字段缺失、不是字符串或不属于受支持闭集时抛出。
+    """
+
+    if AWAITING_RESOLUTION_MODE_CONFIG_FIELD not in config:
+        raise ValueError(
+            "Fins awaiting provider config.awaiting_resolution_mode is required"
+        )
+    value = config[AWAITING_RESOLUTION_MODE_CONFIG_FIELD]
+    if not isinstance(value, str):
+        raise ValueError(
+            "Fins awaiting provider config.awaiting_resolution_mode must be a string"
+        )
+    try:
+        return AwaitingResolutionMode(value)
+    except ValueError as exc:
+        raise ValueError(
+            "Fins awaiting provider config.awaiting_resolution_mode must be one of: "
+            "poll, callback, manual"
+        ) from exc
 
 
 def _awaiting_outcome_from_observation_handle(

@@ -17,7 +17,21 @@
       "dispatch_poll_interval_seconds": 0.2,
       "payload_inline_threshold_bytes": 65535,
       "worker_startup_timeout_seconds": 10.0,
-      "memory_projection_catch_up_batch_size": 100
+      "memory_projection_catch_up_batch_size": 100,
+      "wait_poller_policy": {
+        "enabled": true,
+        "poll_interval_seconds": 1,
+        "claim_ttl_seconds": 60,
+        "claim_batch_size": 100,
+        "backoff_initial_delay_seconds": 30,
+        "backoff_multiplier": 2,
+        "backoff_max_delay_seconds": 300,
+        "not_ready_observe_interval_seconds": 1,
+        "idle_poll_interval_seconds": 5,
+        "adapter_call_timeout_seconds": 30,
+        "close_drain_timeout_seconds": 5,
+        "max_outstanding_adapter_calls": 8
+      }
     }
   }
 }

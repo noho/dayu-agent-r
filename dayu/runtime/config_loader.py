@@ -486,6 +486,38 @@ class ProcessCapsuleInterruptPolicyConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class WaitPollerRuntimePolicyConfig:
+    """层中立的 Host wait poller runtime policy 配置投影。
+
+    :param enabled: 是否启用 production wait poller。
+    :param poll_interval_seconds: background loop 基础轮询间隔秒数。
+    :param claim_ttl_seconds: 单条 poll claim 有效秒数。
+    :param claim_batch_size: 单轮最多 claim 的 wait record 数。
+    :param backoff_initial_delay_seconds: retry 初始退避秒数。
+    :param backoff_multiplier: retry 指数退避倍率。
+    :param backoff_max_delay_seconds: retry 最大退避秒数。
+    :param not_ready_observe_interval_seconds: 正常未就绪时的下次观察间隔秒数。
+    :param idle_poll_interval_seconds: 没有可 claim wait 时的空闲间隔秒数。
+    :param adapter_call_timeout_seconds: 单次同步 adapter 调用预算秒数。
+    :param close_drain_timeout_seconds: supervisor close 共享预算秒数。
+    :param max_outstanding_adapter_calls: live adapter invocation 上限。
+    """
+
+    enabled: bool
+    poll_interval_seconds: float
+    claim_ttl_seconds: float
+    claim_batch_size: int
+    backoff_initial_delay_seconds: float
+    backoff_multiplier: float
+    backoff_max_delay_seconds: float
+    not_ready_observe_interval_seconds: float
+    idle_poll_interval_seconds: float
+    adapter_call_timeout_seconds: float
+    close_drain_timeout_seconds: float
+    max_outstanding_adapter_calls: int
+
+
+@dataclass(frozen=True, slots=True)
 class HostRuntimeProfileConfig:
     """Host opener 部署默认值配置。
 
@@ -499,6 +531,7 @@ class HostRuntimeProfileConfig:
     :param payload_inline_threshold_bytes: payload 内联存储阈值字节数。
     :param worker_startup_timeout_seconds: worker accept timeout 秒数。
     :param memory_projection_catch_up_batch_size: memory catch-up 批次大小。
+    :param wait_poller_policy: 完整且必填的 wait poller runtime policy snapshot。
     :param process_capsule_interrupt_policy: process-backed capsule cleanup
         interrupt 配置；缺省时由 Host typed policy 默认值决定。
     """
@@ -513,6 +546,7 @@ class HostRuntimeProfileConfig:
     payload_inline_threshold_bytes: int
     worker_startup_timeout_seconds: float
     memory_projection_catch_up_batch_size: int
+    wait_poller_policy: WaitPollerRuntimePolicyConfig
     process_capsule_interrupt_policy: ProcessCapsuleInterruptPolicyConfig | None
 
 
@@ -1895,6 +1929,7 @@ def _parse_host_runtime_profile(
                 "payload_inline_threshold_bytes",
                 "worker_startup_timeout_seconds",
                 "memory_projection_catch_up_batch_size",
+                "wait_poller_policy",
             }
         ),
         optional=frozenset({"process_capsule_interrupt_policy"}),
@@ -1918,10 +1953,89 @@ def _parse_host_runtime_profile(
         payload_inline_threshold_bytes=_require_positive_int_field(record, field_name="payload_inline_threshold_bytes", context=context),
         worker_startup_timeout_seconds=_require_positive_float_field(record, field_name="worker_startup_timeout_seconds", context=context),
         memory_projection_catch_up_batch_size=_require_positive_int_field(record, field_name="memory_projection_catch_up_batch_size", context=context),
+        wait_poller_policy=_parse_wait_poller_runtime_policy(
+            _require_mapping_field(
+                record,
+                field_name="wait_poller_policy",
+                context=context,
+            ),
+            context=f"{context}.wait_poller_policy",
+        ),
         process_capsule_interrupt_policy=_optional_process_capsule_interrupt_policy(
             record,
             field_name="process_capsule_interrupt_policy",
             context=context,
+        ),
+    )
+
+
+def _parse_wait_poller_runtime_policy(
+    record: JsonObject, *, context: str
+) -> WaitPollerRuntimePolicyConfig:
+    """解析完整 wait poller runtime policy snapshot。
+
+    :param record: policy JSON object。
+    :param context: 错误消息上下文。
+    :returns: 层中立 typed policy 配置。
+    :raises ConfigFieldError: 字段缺失、多余、类型错误、非有限或非正时抛出。
+    """
+
+    _require_exact_fields(
+        record,
+        allowed=frozenset(
+            {
+                "enabled",
+                "poll_interval_seconds",
+                "claim_ttl_seconds",
+                "claim_batch_size",
+                "backoff_initial_delay_seconds",
+                "backoff_multiplier",
+                "backoff_max_delay_seconds",
+                "not_ready_observe_interval_seconds",
+                "idle_poll_interval_seconds",
+                "adapter_call_timeout_seconds",
+                "close_drain_timeout_seconds",
+                "max_outstanding_adapter_calls",
+            }
+        ),
+        context=context,
+    )
+    return WaitPollerRuntimePolicyConfig(
+        enabled=_require_bool_field(record, field_name="enabled", context=context),
+        poll_interval_seconds=_require_positive_float_field(
+            record, field_name="poll_interval_seconds", context=context
+        ),
+        claim_ttl_seconds=_require_positive_float_field(
+            record, field_name="claim_ttl_seconds", context=context
+        ),
+        claim_batch_size=_require_positive_int_field(
+            record, field_name="claim_batch_size", context=context
+        ),
+        backoff_initial_delay_seconds=_require_positive_float_field(
+            record, field_name="backoff_initial_delay_seconds", context=context
+        ),
+        backoff_multiplier=_require_positive_float_field(
+            record, field_name="backoff_multiplier", context=context
+        ),
+        backoff_max_delay_seconds=_require_positive_float_field(
+            record, field_name="backoff_max_delay_seconds", context=context
+        ),
+        not_ready_observe_interval_seconds=_require_positive_float_field(
+            record,
+            field_name="not_ready_observe_interval_seconds",
+            context=context,
+        ),
+        idle_poll_interval_seconds=_require_positive_float_field(
+            record, field_name="idle_poll_interval_seconds", context=context
+        ),
+        adapter_call_timeout_seconds=_require_positive_float_field(
+            record, field_name="adapter_call_timeout_seconds", context=context
+        ),
+        close_drain_timeout_seconds=_require_positive_float_field(
+            record, field_name="close_drain_timeout_seconds", context=context
+        ),
+        max_outstanding_adapter_calls=_require_positive_int_field(
+            record, field_name="max_outstanding_adapter_calls", context=context
         ),
     )
 

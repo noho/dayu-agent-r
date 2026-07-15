@@ -24,7 +24,7 @@ from dayu.host import (
 from dayu.host.api import HostCommandHandleOptions
 from dayu.host.command import HostCommandHandle, create_host_command_handle, expire_wait
 from dayu.host._wait_observation import WaitObservationRunner
-from dayu.host.durable.state import WaitPollLastOutcome, WaitRecordRow, WaitRecordStatus
+from dayu.host.durable.state import WaitPollLastOutcome, WaitRecordStatus
 from dayu.host.wait_adapter import (
     WaitAdapterSnapshot,
     WaitExternalJobLifecycleAction,
@@ -59,6 +59,7 @@ _POLL_NOW = datetime(2026, 5, 16, 2, 0, 0, tzinfo=UTC)
 class _PolicyKwargs(TypedDict):
     """测试用 runtime policy kwargs。"""
 
+    enabled: bool
     poll_interval_seconds: float
     claim_ttl_seconds: float
     claim_batch_size: int
@@ -1134,6 +1135,7 @@ def _policy_kwargs() -> _PolicyKwargs:
     """
 
     return {
+        "enabled": True,
         "poll_interval_seconds": 0.01,
         "claim_ttl_seconds": 0.5,
         "claim_batch_size": 4,

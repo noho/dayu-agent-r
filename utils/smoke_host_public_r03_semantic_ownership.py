@@ -103,7 +103,6 @@ from dayu.service.host_assembly import (
     compose_open_host_options,
     compose_submit_followup_request,
     discover_service_tools,
-    with_entrypoint_wait_poller_policy,
 )
 from dayu.service.scene_context import CURRENT_TIME_SLOT, current_time
 
@@ -352,11 +351,6 @@ def prepare_runtime_assembly(
             ),
         )
     )
-    overrides = with_entrypoint_wait_poller_policy(
-        overrides=ServiceAssemblyOverrides(),
-        scene_inputs=scene_inputs,
-        discovered_tools=discovered,
-    )
     assembly = compose_open_host_options(
         ServiceOpenHostAssemblyRequest(
             workspace_root=args.workspace_root,
@@ -364,7 +358,7 @@ def prepare_runtime_assembly(
             locations=locations,
             scene_inputs=scene_inputs,
             discovered_tools=discovered,
-            overrides=overrides,
+            overrides=ServiceAssemblyOverrides(),
             env=env,
         )
     )

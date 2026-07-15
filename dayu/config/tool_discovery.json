@@ -27,7 +27,9 @@
       "source_kind": "explicit_provider",
       "source_id": "dayu.fins.tools.download_provider",
       "enabled": true,
-      "config": {}
+      "config": {
+        "awaiting_resolution_mode": "poll"
+      }
     },
     "financial-preprocess-tools": {
       "import_path": "dayu.fins.tools.preprocess_provider:discover_tools",
@@ -35,7 +37,9 @@
       "source_kind": "explicit_provider",
       "source_id": "dayu.fins.tools.preprocess_provider",
       "enabled": true,
-      "config": {}
+      "config": {
+        "awaiting_resolution_mode": "poll"
+      }
     },
     "financial-upload-tools": {
       "import_path": "dayu.fins.tools.upload_provider:discover_tools",
@@ -43,7 +47,9 @@
       "source_kind": "explicit_provider",
       "source_id": "dayu.fins.tools.upload_provider",
       "enabled": true,
-      "config": {}
+      "config": {
+        "awaiting_resolution_mode": "poll"
+      }
     },
     "doc-tools": {
       "import_path": "dayu.tools.doc_provider:discover_tools",

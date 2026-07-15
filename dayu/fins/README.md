@@ -55,7 +55,7 @@ Fins 与其它层的稳定边界如下：
 
 - Host 不导入 `dayu.fins`，不读取财报仓储，不执行财报下载 / 预处理，不解释财报业务规则；Host 只接收受治理工具结果或 wait adapter 映射后的 wait poll 结果。
 - Engine 不导入 `dayu.fins`，不感知财报业务语义；Engine 只看到 Host 传入的 `ToolSchema` 和 `ToolExecutor`。
-- Service / composition root 可以装配 Fins tools provider，也可以基于显式 Fins awaiting provider 配置构造 Host `WaitAdapterRegistry` 与 Service-owned Fins wait adapter；Service 负责把 raw config 映射为 typed assembly 输入。
+- Service / composition root 可以装配 Fins tools provider，也可以基于显式 Fins awaiting provider 配置构造 Host `WaitAdapterRegistry` 与 Service-owned Fins wait adapter；Service 只负责识别 provider identity，并把 raw provider config 交给 Fins 唯一 parser，再复用并行的私有 typed projection 完成 assembly。
 - `dayu.fins` 不依赖 Host。Fins awaiting observation 只暴露 lightweight handle、snapshot 与 observation runtime；Host wait-resume integration 位于 `dayu.service.fins_wait_adapter`，它只使用 Host wait adapter public snapshot / outcome contract，不读取 Host durable store，也不改变 Host / Engine contract。
 - Fins 不依赖 `dayu.service`、`dayu.ui` 或 `dayu.engine`；`dayu.engine` 与 `dayu.runtime` 也不得反向导入 Fins。
 
@@ -167,6 +167,13 @@ Fins ingestion 通过三个独立 awaiting provider 暴露 awaiting tools：
 - `dayu.fins.tools.upload_provider.discover_tools(spec)`：provider id 为 `financial-upload-tools`，返回 `start_fins_upload`。
 
 三个 awaiting provider 都必须通过 effective spec 获得绝对 `workspace_root`。upload provider 启用时注册 `start_fins_upload`；上传工具只在工具边界校验本地路径存在、指向普通文件且文件非空。当前实现不把本地源文件授权建模为 upload provider 的配置职责；调用方仍需在进入工具前承担本地文件来源可信性与用户授权。工具调用只注册 lightweight observation handle 并返回 `ToolAwaitingOutcome(EXTERNAL_JOB)`，不等待长事务完成、不直接 resolve Host wait，也不把 handle 当作业务事实返回给模型。上传后的 source/blob/processed 写入仍必须通过 Fins workspace repository 完成。
+
+三个 awaiting provider 还必须显式提供 provider-owned
+`config.awaiting_resolution_mode`。Fins 私有共享 helper 是该字段的唯一 parser 与 enum owner，
+只接受精确的 `poll`、`callback`、`manual`；缺失、`null`、非字符串、空串、大小写变体、
+前后空白和未知值都失败，不提供默认或 loose parsing。每个 provider 在创建 runtime/tool
+definition 前调用同一 parser；Service discovery 路径也在 enabled filtering 前调用该
+parser，并把 typed mode 保存到独立私有 metadata，而不是改写 raw provider config。
 
 ### Batch upload plan
 
@@ -550,6 +557,7 @@ Read path 只读取 Fins workspace 中已经存在的财报材料。九个 read 
 ```text
 ToolsDiscovery
   -> dayu.fins.tools.download_provider / preprocess_provider / upload_provider
+  -> parse explicit awaiting_resolution_mode once at provider assembly boundary
   -> parse explicit absolute workspace_root
   -> upload provider builds start_fins_upload from Fins ingestion runtime
   -> DefaultFinsRuntime.create(workspace_root=...)
@@ -754,7 +762,7 @@ CN/HK Docling convert 当前通过 `asyncio.to_thread(...)` 调用同步第三�
 
 ### Service wait adapter 与 Host resume
 
-Fins awaiting tools 不直接恢复 Host Run。Service assembly 根据启用的 Fins awaiting provider 显式构造 wait adapter registry、wait activation registry 与 wait poll adapter registry，并确保 awaiting tool callable、activation adapter 与 poll adapter 使用同一个 workspace-scoped ingestion runtime。Host poller 通过 Service `FinsIngestionWaitPollAdapter` 读取 process-local observation snapshot，再由 Host 自己执行 resolve / resume / failed / lost 治理。Service wait adapter 不改变 Host wait record，不写 Host EventLog，也不恢复旧 Engine 生成器；等待 deadline / expiry 的 durable truth 属于 Host wait record，adapter 只返回 observation not-ready / ready / lost / lifecycle outcome。
+Fins awaiting tools 不直接恢复 Host Run。Service assembly 根据 active typed provider metadata 显式构造 wait adapter registry 与 wait activation registry；只有 typed mode 为 `poll` 的工具进入 wait poll adapter registry，`manual` 不启动后台观察，`callback` 在当前缺少 authenticated transport 时于 Host 打开前失败。awaiting tool callable、activation adapter 与 poll adapter 使用同一个 workspace-scoped ingestion runtime。Host poller 通过 Service `FinsIngestionWaitPollAdapter` 读取 process-local observation snapshot，再由 Host 自己执行 resolve / resume / failed / lost 治理。Service wait adapter 不改变 Host wait record，不写 Host EventLog，也不恢复旧 Engine 生成器；等待 deadline / expiry 的 durable truth 属于 Host wait record，adapter 只返回 observation not-ready / ready / lost / lifecycle outcome。
 
 ### Ticker normalization
 

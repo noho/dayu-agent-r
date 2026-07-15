@@ -7,7 +7,7 @@ import asyncio
 import os
 import sys
 from collections.abc import AsyncIterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -31,20 +31,15 @@ from dayu.contracts import (
     ToolSchema,
 )
 from dayu.engine import (
-    AgentFallbackMode,
-    AgentPolicy,
     AgentRunRequest,
     AssistantToolCallBatchSnapshot,
     AwaitingToolExecutionRecord,
-    ClientCorrelationPolicy,
     EngineEvent,
     EngineEventType,
     FinalAnswerData,
     FinishReason,
     RUN_SUSPENDED_REASON_TOOL_AWAITING,
     RunSuspendedData,
-    RunnerCallOptions,
-    RunnerSpec,
     ToolAwaitingData,
 )
 from dayu.host import (
@@ -54,64 +49,32 @@ from dayu.host import (
     FollowupBehavior,
     HostCallContext,
     HostTerminalStatus,
-    HostToolingOptions,
     LocalEngineWorker,
     LocalWorkerHandle,
     OpenHostOptions,
     OperationContext,
-    OrdinaryRunExecutionBaseline,
     OutboxTerminalCursor,
     ReadOutboxTerminalItemsRequest,
     ResolveWaitCompletedOutcome,
     RunStatus,
-    WaitAdapterKey,
     open_host,
 )
-from dayu.host.memory import default_memory_projection_policy
 from dayu.host.wait_adapter import (
-    WaitAdapterBinding,
-    WaitAdapterRegistry,
     WaitAdapterSnapshot,
     WaitExternalJobLifecycleResult,
     WaitExternalJobLifecycleUnsupported,
-    WaitExternalJobRefSource,
     WaitPollAdapterRegistration,
     WaitPollAdapterRegistry,
     WaitPollNotReady,
     WaitPollReady,
-    WaitPollerRuntimePolicy,
     WaitPollResult,
     WaitResumePolicy,
 )
-from dayu.runtime.assembly import (
-    ExecutionProfileCompatibilityDiagnostic,
-    MergedAgentPolicyConfig,
-    RuntimeSelectionDiagnostic,
-    RunnerOptionHintSelection,
-)
+from dayu.fins.tools._ingestion_tool_helpers import AwaitingResolutionMode
 from dayu.runtime.config_loader import (
-    AgentPolicyConfig,
-    BinaryBytesLimitConfig,
-    CompactorBaselineConfig,
-    ContextBudgetConfig,
-    ExecutionBaselineConfig,
-    ExecutionProfileConfig,
-    HostRuntimeProfileConfig,
-    ListItemsLimitConfig,
-    MemoryProjectionConfig,
-    ModelConfig,
-    ModelRuntimeHintsConfig,
-    ProcessCapsuleInterruptPolicyConfig,
-    RunnerKind,
-    RunnerOptionHintConfig,
-    RuntimeLaneConfig,
-    SQLiteRuntimeConfig,
-    TextCharsLimitConfig,
-    TextLinesLimitConfig,
-    ToolDuplicateGovernanceMessagesConfig,
-    ToolDuplicateGovernancePolicyConfig,
-    ToolTruncationDefaultLimitsConfig,
-    ToolTruncationPolicyConfig,
+    HostRuntimeConfig,
+    RuntimeConfig,
+    ToolDiscoveryProviderConfig,
 )
 from dayu.runtime.scene_prepare import (
     PreparedSceneInputs,
@@ -124,17 +87,48 @@ from dayu.service.entrypoint_runtime import (
     EntrypointActivity,
     EntrypointActivityStatus,
     EntrypointTerminalSource,
+    EntrypointRuntimeRequest,
+    EntrypointRuntimeResult,
     EntrypointTurnRequest,
+    prepare_entrypoint_runtime,
     submit_entrypoint_turn_and_wait,
 )
+from dayu.service.fins_wait_adapter import (
+    FINS_DOWNLOAD_AWAITING_TOOL_NAME,
+    FINS_INGESTION_WAIT_ADAPTER_KEY,
+    FINS_PREPROCESS_AWAITING_TOOL_NAME,
+    FINS_UPLOAD_AWAITING_TOOL_NAME,
+)
 from dayu.service.host_assembly import (
-    ServiceOpenHostAssemblyDiagnostics,
+    ServiceAssemblyOverrides,
+    ServiceOpenHostAssemblyRequest,
     ServiceOpenHostAssemblyResult,
     ServiceRunOverrides,
+    assemble_effective_tool_provider_configs,
+    compose_open_host_options,
+    discover_service_tools,
 )
 
-_AWAITING_TOOL_NAME = "await_public_smoke_job"
-_ADAPTER_KEY = WaitAdapterKey("service.awaiting-smoke")
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_PACKAGE_CONFIG_ROOT = _PROJECT_ROOT / "dayu" / "config"
+_AWAITING_TOOL_NAME = FINS_PREPROCESS_AWAITING_TOOL_NAME
+_ADAPTER_KEY = FINS_INGESTION_WAIT_ADAPTER_KEY
+_FINS_AWAITING_PROVIDER_IDS = frozenset(
+    {
+        "financial-download-tools",
+        "financial-preprocess-tools",
+        "financial-upload-tools",
+    }
+)
+_FINS_AWAITING_TOOL_NAMES = (
+    FINS_DOWNLOAD_AWAITING_TOOL_NAME,
+    FINS_PREPROCESS_AWAITING_TOOL_NAME,
+    FINS_UPLOAD_AWAITING_TOOL_NAME,
+)
+_LOCAL_PROVIDER_ENV = {
+    "DEEPSEEK_API_KEY": "local-smoke-placeholder",
+    "MIMO_PLAN_API_KEY": "local-smoke-placeholder",
+}
 _NOW = datetime(2026, 7, 5, 0, 0, 0, tzinfo=UTC)
 _FINAL_ANSWER = "等待任务已完成，已收到轮询恢复结果。"
 _RESUME_TOKEN = "service-awaiting-smoke-token"
@@ -146,7 +140,7 @@ _SOURCE_REF = ToolBundleSourceRef(
 _DEFAULT_WORKSPACE_PARENT = Path("workspace/tmp")
 _DEFAULT_WORKSPACE_PREFIX = "host-public-awaiting-entrypoint-smoke"
 _DEFAULT_SLOT_KEY_PREFIX = "manual-smoke-awaiting-entrypoint"
-_TERMINAL_TIMEOUT_SECONDS = 5.0
+_TERMINAL_TIMEOUT_SECONDS = 10.0
 _POLL_INTERVAL_SECONDS = 0.01
 
 
@@ -156,6 +150,24 @@ class SmokeArgs:
 
     workspace_root: Path
     keep_workspace: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _CompositionSmokeMatrix:
+    """packaged composition smoke 的无网络分支结果。
+
+    :param poll: packaged poll + enabled policy 结果。
+    :param manual: active manual providers 结果。
+    :param no_provider: 不包含 awaiting provider 的结果。
+    :param provider_disabled: awaiting providers 全部 disabled 的结果。
+    :param runtime_disabled: active poll + disabled runtime policy 结果。
+    """
+
+    poll: ServiceOpenHostAssemblyResult
+    manual: ServiceOpenHostAssemblyResult
+    no_provider: ServiceOpenHostAssemblyResult
+    provider_disabled: ServiceOpenHostAssemblyResult
+    runtime_disabled: ServiceOpenHostAssemblyResult
 
 
 async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
@@ -168,21 +180,56 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
     """
 
     del env
+    interactive_runtime = await _prepare_packaged_entrypoint_runtime(
+        workspace_root=args.workspace_root,
+        scene_id="interactive",
+    )
+    prompt_runtime = await _prepare_packaged_entrypoint_runtime(
+        workspace_root=args.workspace_root,
+        scene_id="prompt",
+    )
+    composition_matrix = _packaged_composition_matrix(
+        workspace_root=args.workspace_root,
+        interactive_runtime=interactive_runtime,
+        prompt_runtime=prompt_runtime,
+    )
+    await _open_non_poll_composition_cases(composition_matrix)
     poll_adapter = _GatedReadyPollAdapter()
     worker_factory = _AwaitingThenAnswerWorkerFactory()
-    options = _open_options(
-        args.workspace_root,
+    options = _deterministic_public_poll_options(
+        composition_matrix.poll.options,
         worker_factory=worker_factory,
         poll_adapter=poll_adapter,
     )
     scene_inputs = _scene_inputs()
-    host_assembly = _host_assembly(options=options, effective_tool_bundle=_tool_bundle())
+    host_assembly = replace(
+        composition_matrix.poll,
+        options=options,
+        effective_tool_bundle=_tool_bundle(),
+    )
     accepted_run_ids: list[str] = []
     activities: list[EntrypointActivity] = []
     waiting_activity_seen = asyncio.Event()
 
-    print("SMOKE START Host public awaiting entrypoint")
+    print("SMOKE START packaged composition -> Host public awaiting entrypoint")
     print(f"SMOKE WORKSPACE_ROOT {args.workspace_root}")
+    print(
+        "SMOKE TYPED_PROVIDER_MODES "
+        f"poll={AwaitingResolutionMode.POLL.value} "
+        f"manual={AwaitingResolutionMode.MANUAL.value} "
+        f"callback={AwaitingResolutionMode.CALLBACK.value}"
+    )
+    print(
+        "SMOKE RUNTIME_POLICY "
+        f"{_wait_poller_policy_summary(composition_matrix.poll.options)}"
+    )
+    print(
+        "SMOKE COMPOSITION "
+        "poll_registry=true poll_policy=true manual_poller=false "
+        "callback_pre_open_failure=true no_provider_poller=false "
+        "provider_disabled_poller=false runtime_disabled_poller=false "
+        "prompt_interactive_same=true"
+    )
     print("SMOKE CONTRACT open_host -> ensure_session -> submit_entrypoint_turn_and_wait")
     print("SMOKE WAIT_RECOVERY production poller via public wait poll adapter registry")
 
@@ -233,6 +280,10 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
             )
             print("SMOKE OBSERVED_WAITING true")
 
+            await asyncio.wait_for(
+                _wait_for_not_ready_observation(poll_adapter),
+                timeout=_TERMINAL_TIMEOUT_SECONDS,
+            )
             poll_adapter.open_gate()
             result = await asyncio.wait_for(
                 submit_task, timeout=_TERMINAL_TIMEOUT_SECONDS
@@ -257,6 +308,13 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
             _require(
                 worker_factory.accept_count == 2,
                 message=f"worker accept count mismatch: {worker_factory.accept_count}",
+            )
+            _require(
+                poll_adapter.not_ready_count >= 1,
+                message=(
+                    "poll not-ready count mismatch: "
+                    f"{poll_adapter.not_ready_count}"
+                ),
             )
             _require(
                 poll_adapter.ready_count == 1,
@@ -296,6 +354,7 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
             )
             print("SMOKE OUTBOX_TERMINAL_MATCH true")
             print(f"SMOKE WORKER_ACCEPT_COUNT {worker_factory.accept_count}")
+            print(f"SMOKE POLL_NOT_READY_COUNT {poll_adapter.not_ready_count}")
             print(f"SMOKE POLL_READY_COUNT {poll_adapter.ready_count}")
             print("SMOKE PASS Host public awaiting entrypoint")
             if args.keep_workspace:
@@ -308,6 +367,383 @@ async def run_smoke(args: SmokeArgs, env: Mapping[str, str]) -> int:
                     await submit_task
                 except asyncio.CancelledError:
                     pass
+
+
+async def _prepare_packaged_entrypoint_runtime(
+    *, workspace_root: Path, scene_id: str
+) -> EntrypointRuntimeResult:
+    """通过 packaged ConfigLoader 与共享 Service 路径准备 entrypoint runtime。
+
+    :param workspace_root: smoke workspace 根目录。
+    :param scene_id: ``prompt`` 或 ``interactive`` scene id。
+    :returns: packaged entrypoint runtime 结果。
+    :raises Exception: config、provider discovery、scene 或 composition 失败时透出。
+    """
+
+    return await prepare_entrypoint_runtime(
+        EntrypointRuntimeRequest(
+            workspace_root=workspace_root,
+            package_config_root=_PACKAGE_CONFIG_ROOT,
+            explicit_config_dir=None,
+            scene_id=scene_id,
+            context_slot_values={
+                "fins_default_subject": "DAYU",
+                "current_time": "2026-07-15 12:00:00 +08:00",
+            },
+            assembly_overrides=ServiceAssemblyOverrides(),
+            env=_LOCAL_PROVIDER_ENV,
+        )
+    )
+
+
+def _packaged_composition_matrix(
+    *,
+    workspace_root: Path,
+    interactive_runtime: EntrypointRuntimeResult,
+    prompt_runtime: EntrypointRuntimeResult,
+) -> _CompositionSmokeMatrix:
+    """验证 packaged provider modes 与 runtime policy 的完整装配分支。
+
+    :param workspace_root: smoke workspace 根目录。
+    :param interactive_runtime: packaged interactive runtime。
+    :param prompt_runtime: packaged prompt runtime。
+    :returns: 可用于 public Host open 的 composition matrix。
+    :raises RuntimeError: 任一 registry、binding、policy 或 fail-closed 断言不成立。
+    """
+
+    poll = interactive_runtime.host_assembly
+    prompt_policy = prompt_runtime.host_assembly.options.wait_poller_policy
+    _require(poll.options.wait_poller_policy is not None, message="poll policy missing")
+    _require(prompt_policy == poll.options.wait_poller_policy, message="prompt/interactive policy diverged")
+    _require_poll_bindings(poll, expected_policy=WaitResumePolicy.POLL)
+
+    config = interactive_runtime.runtime_config
+    providers = tuple(config.tool_discovery.providers.values())
+    manual = _compose_provider_case(
+        workspace_root=workspace_root,
+        runtime=interactive_runtime,
+        config=config,
+        provider_configs=_fins_provider_configs(
+            providers,
+            mode=AwaitingResolutionMode.MANUAL,
+            enabled=True,
+            include=True,
+        ),
+    )
+    _require(manual.options.wait_poller_policy is None, message="manual policy must be absent")
+    _require_poll_bindings(manual, expected_policy=WaitResumePolicy.MANUAL)
+    manual_tooling = manual.options.tooling_options
+    if manual_tooling is None:
+        raise RuntimeError("manual tooling missing")
+    _require(
+        manual_tooling.wait_poll_adapter_registry is None,
+        message="manual poll registry must be absent",
+    )
+
+    no_provider = _compose_provider_case(
+        workspace_root=workspace_root,
+        runtime=interactive_runtime,
+        config=config,
+        provider_configs=_fins_provider_configs(
+            providers,
+            mode=AwaitingResolutionMode.POLL,
+            enabled=True,
+            include=False,
+        ),
+    )
+    _require(
+        no_provider.options.wait_poller_policy is None,
+        message="no-provider policy must be absent",
+    )
+
+    provider_disabled = _compose_provider_case(
+        workspace_root=workspace_root,
+        runtime=interactive_runtime,
+        config=config,
+        provider_configs=_fins_provider_configs(
+            providers,
+            mode=AwaitingResolutionMode.POLL,
+            enabled=False,
+            include=True,
+        ),
+    )
+    _require(
+        provider_disabled.options.wait_poller_policy is None,
+        message="provider-disabled policy must be absent",
+    )
+
+    runtime_disabled = _compose_provider_case(
+        workspace_root=workspace_root,
+        runtime=interactive_runtime,
+        config=_runtime_config_with_wait_poller_enabled(config, enabled=False),
+        provider_configs=_fins_provider_configs(
+            providers,
+            mode=AwaitingResolutionMode.POLL,
+            enabled=True,
+            include=True,
+        ),
+    )
+    disabled_policy = runtime_disabled.options.wait_poller_policy
+    if disabled_policy is None:
+        raise RuntimeError("runtime-disabled policy missing")
+    _require(not disabled_policy.enabled, message="runtime-disabled policy was enabled")
+    _require_poll_bindings(runtime_disabled, expected_policy=WaitResumePolicy.POLL)
+
+    callback_configs = _fins_provider_configs(
+        providers,
+        mode=AwaitingResolutionMode.CALLBACK,
+        enabled=True,
+        include=True,
+    )
+    try:
+        _compose_provider_case(
+            workspace_root=workspace_root,
+            runtime=interactive_runtime,
+            config=config,
+            provider_configs=callback_configs,
+        )
+    except ValueError as exc:
+        _require(
+            "authenticated callback transport" in str(exc),
+            message=f"callback failure mismatch: {exc}",
+        )
+    else:
+        raise RuntimeError("callback composition did not fail before open_host")
+
+    return _CompositionSmokeMatrix(
+        poll=poll,
+        manual=manual,
+        no_provider=no_provider,
+        provider_disabled=provider_disabled,
+        runtime_disabled=runtime_disabled,
+    )
+
+
+def _compose_provider_case(
+    *,
+    workspace_root: Path,
+    runtime: EntrypointRuntimeResult,
+    config: RuntimeConfig,
+    provider_configs: tuple[ToolDiscoveryProviderConfig, ...],
+) -> ServiceOpenHostAssemblyResult:
+    """通过真实 provider discovery 与 Service composition 构造一个矩阵分支。
+
+    :param workspace_root: smoke workspace 根目录。
+    :param runtime: packaged entrypoint runtime，复用其 location 与 scene input。
+    :param config: 当前分支的 typed runtime config。
+    :param provider_configs: 当前分支的 provider owner inputs。
+    :returns: Service Host assembly 结果。
+    :raises Exception: provider discovery 或 composition 失败时透出。
+    """
+
+    discovered = discover_service_tools(
+        assemble_effective_tool_provider_configs(
+            provider_configs,
+            workspace_root=workspace_root,
+        )
+    )
+    return compose_open_host_options(
+        ServiceOpenHostAssemblyRequest(
+            workspace_root=workspace_root,
+            config=config,
+            locations=runtime.locations,
+            scene_inputs=runtime.scene_inputs,
+            discovered_tools=discovered,
+            overrides=ServiceAssemblyOverrides(),
+            env=_LOCAL_PROVIDER_ENV,
+        )
+    )
+
+
+def _fins_provider_configs(
+    provider_configs: Sequence[ToolDiscoveryProviderConfig],
+    *,
+    mode: AwaitingResolutionMode,
+    enabled: bool,
+    include: bool,
+) -> tuple[ToolDiscoveryProviderConfig, ...]:
+    """构造 smoke 分支的 Fins provider owner inputs。
+
+    :param provider_configs: packaged provider configs。
+    :param mode: 写入 owner config 的 closed typed mode。
+    :param enabled: awaiting providers 是否启用。
+    :param include: 是否保留 awaiting providers；``False`` 表示 no-provider。
+    :returns: 只在 Fins awaiting provider owner input 上变化的 configs。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    resolved: list[ToolDiscoveryProviderConfig] = []
+    for provider in provider_configs:
+        if provider.provider_id not in _FINS_AWAITING_PROVIDER_IDS:
+            resolved.append(provider)
+            continue
+        if not include:
+            continue
+        provider_config = dict(provider.config)
+        provider_config["awaiting_resolution_mode"] = mode.value
+        resolved.append(replace(provider, enabled=enabled, config=provider_config))
+    return tuple(resolved)
+
+
+def _runtime_config_with_wait_poller_enabled(
+    config: RuntimeConfig, *, enabled: bool
+) -> RuntimeConfig:
+    """为 smoke 分支替换选中 runtime 的 typed policy enabled 值。
+
+    :param config: ConfigLoader 产出的完整 runtime config。
+    :param enabled: 分支期望的 runtime policy 开关。
+    :returns: 除 typed enabled 字段外保持不变的 runtime config。
+    :raises Exception: packaged 默认 runtime 缺失时由映射访问抛出。
+    """
+
+    runtime_id = config.host_runtime.default_host_runtime_id
+    profile = config.host_runtime.runtimes[runtime_id]
+    runtimes = dict(config.host_runtime.runtimes)
+    runtimes[runtime_id] = replace(
+        profile,
+        wait_poller_policy=replace(profile.wait_poller_policy, enabled=enabled),
+    )
+    return replace(
+        config,
+        host_runtime=HostRuntimeConfig(
+            default_host_runtime_id=runtime_id,
+            runtimes=runtimes,
+        ),
+    )
+
+
+def _require_poll_bindings(
+    assembly: ServiceOpenHostAssemblyResult,
+    *,
+    expected_policy: WaitResumePolicy,
+) -> None:
+    """断言三个 packaged Fins awaiting binding 的精确 resume policy。
+
+    :param assembly: Service assembly 结果。
+    :param expected_policy: 当前分支期望的 Host resume policy。
+    :returns: ``None``。
+    :raises RuntimeError: tooling、registry 或任一 binding 不符合预期。
+    """
+
+    tooling = assembly.options.tooling_options
+    if tooling is None:
+        raise RuntimeError("Fins tooling missing")
+    registry = tooling.wait_adapter_registry
+    if registry is None:
+        raise RuntimeError("Fins wait binding registry missing")
+    for tool_name in _FINS_AWAITING_TOOL_NAMES:
+        binding = registry.resolve_binding(
+            tool_name=tool_name,
+            await_kind=ToolAwaitKind.EXTERNAL_JOB,
+        )
+        if binding is None:
+            raise RuntimeError(f"binding missing: {tool_name}")
+        _require(
+            binding.resume_policy is expected_policy,
+            message=f"binding policy mismatch: {tool_name}",
+        )
+
+
+async def _open_non_poll_composition_cases(
+    matrix: _CompositionSmokeMatrix,
+) -> None:
+    """通过 public Host opener 验证无 poller 与 disabled 分支均可安全打开关闭。
+
+    :param matrix: 已验证的 packaged composition matrix。
+    :returns: ``None``。
+    :raises Exception: 任一 public Host open/close 失败时透出。
+    """
+
+    for assembly in (
+        matrix.manual,
+        matrix.no_provider,
+        matrix.provider_disabled,
+        matrix.runtime_disabled,
+    ):
+        async with open_host(assembly.options):
+            pass
+
+
+def _deterministic_public_poll_options(
+    options: OpenHostOptions,
+    *,
+    worker_factory: _AwaitingThenAnswerWorkerFactory,
+    poll_adapter: _GatedReadyPollAdapter,
+) -> OpenHostOptions:
+    """在真实 composition 结果上替换无网络 deterministic execution driver。
+
+    :param options: packaged Service composition 产出的 public Host options。
+    :param worker_factory: deterministic local worker factory。
+    :param poll_adapter: deterministic not-ready/ready observation driver。
+    :returns: 保留真实 binding/policy 的无网络 public Host options。
+    :raises RuntimeError: packaged tooling 或 poll registry 缺失时抛出。
+    """
+
+    tooling = options.tooling_options
+    if tooling is None:
+        raise RuntimeError("packaged poll tooling missing")
+    packaged_poll_registry = tooling.wait_poll_adapter_registry
+    if packaged_poll_registry is None:
+        raise RuntimeError("packaged poll registry missing")
+    _require(
+        packaged_poll_registry.resolve_adapter(_ADAPTER_KEY) is not None,
+        message="packaged Fins poll adapter missing",
+    )
+    deterministic_tooling = replace(
+        tooling,
+        business_tool_bundle=_tool_bundle(),
+        wait_activation_registry=None,
+        wait_poll_adapter_registry=WaitPollAdapterRegistry(
+            (
+                WaitPollAdapterRegistration(
+                    adapter_key=_ADAPTER_KEY,
+                    adapter=poll_adapter,
+                ),
+            )
+        ),
+    )
+    return replace(
+        options,
+        worker_factory=worker_factory,
+        tooling_options=deterministic_tooling,
+    )
+
+
+async def _wait_for_not_ready_observation(adapter: _GatedReadyPollAdapter) -> None:
+    """等待 production poller 至少完成一次 deterministic not-ready 观察。
+
+    :param adapter: deterministic poll adapter。
+    :returns: ``None``。
+    :raises Exception: 不主动抛出；外层 ``wait_for`` 负责超时。
+    """
+
+    while adapter.not_ready_count == 0:
+        await asyncio.sleep(0.01)
+
+
+def _wait_poller_policy_summary(options: OpenHostOptions) -> str:
+    """格式化不含凭证的完整 wait poller policy snapshot。
+
+    :param options: Service composition 产出的 Host options。
+    :returns: 十二字段紧凑摘要。
+    :raises RuntimeError: packaged poll policy 缺失时抛出。
+    """
+
+    policy = options.wait_poller_policy
+    if policy is None:
+        raise RuntimeError("packaged wait poller policy missing")
+    return (
+        f"enabled={policy.enabled} poll={policy.poll_interval_seconds} "
+        f"claim_ttl={policy.claim_ttl_seconds} claim_batch={policy.claim_batch_size} "
+        f"backoff_initial={policy.backoff_initial_delay_seconds} "
+        f"backoff_multiplier={policy.backoff_multiplier} "
+        f"backoff_max={policy.backoff_max_delay_seconds} "
+        f"not_ready={policy.not_ready_observe_interval_seconds} "
+        f"idle={policy.idle_poll_interval_seconds} "
+        f"adapter_timeout={policy.adapter_call_timeout_seconds} "
+        f"close_drain={policy.close_drain_timeout_seconds} "
+        f"max_outstanding={policy.max_outstanding_adapter_calls}"
+    )
 
 
 def parse_args(argv: Sequence[str]) -> SmokeArgs:
@@ -725,87 +1161,6 @@ def _awaiting_tool_call() -> ToolCallRequest:
     )
 
 
-def _open_options(
-    workspace_root: Path,
-    *,
-    worker_factory: _AwaitingThenAnswerWorkerFactory,
-    poll_adapter: _GatedReadyPollAdapter,
-) -> OpenHostOptions:
-    """构造 public Host opener options。
-
-    :param workspace_root: smoke workspace root。
-    :param worker_factory: deterministic worker factory。
-    :param poll_adapter: deterministic poll adapter。
-    :returns: Host opener options。
-    :raises Exception: typed options 字段非法时由底层抛出。
-    """
-
-    agent_policy = _agent_policy(allow_tool_calls=True)
-    return OpenHostOptions(
-        db_path=workspace_root / "host.sqlite3",
-        artifact_root=workspace_root / "artifacts",
-        create_parent_dirs=True,
-        sqlite_busy_timeout_seconds=1.0,
-        sqlite_write_busy_retry_count=8,
-        sqlite_write_retry_initial_delay_seconds=0.001,
-        sqlite_write_retry_backoff_multiplier=1.2,
-        sqlite_write_retry_max_delay_seconds=0.02,
-        payload_inline_threshold_bytes=4096,
-        lane_db_path=workspace_root / "lane.sqlite3",
-        lane_name="service-awaiting-smoke",
-        lane_capacity=1,
-        lane_default_timeout_seconds=1.0,
-        lane_claim_ttl_seconds=3.0,
-        lane_heartbeat_interval_seconds=0.2,
-        worker_startup_timeout_seconds=3.0,
-        dispatch_poll_interval_seconds=0.01,
-        ordinary_run_baseline=OrdinaryRunExecutionBaseline(
-            runner_spec=_runner_spec(),
-            runner_options=_runner_options(),
-            agent_policy=agent_policy,
-        ),
-        worker_factory=worker_factory,
-        tooling_options=HostToolingOptions(
-            business_tool_bundle=_tool_bundle(),
-            source_refs=(_SOURCE_REF,),
-            wait_adapter_registry=WaitAdapterRegistry(
-                (
-                    WaitAdapterBinding(
-                        tool_name=_AWAITING_TOOL_NAME,
-                        await_kind=ToolAwaitKind.EXTERNAL_JOB,
-                        adapter_key=_ADAPTER_KEY,
-                        resume_policy=WaitResumePolicy.POLL,
-                        external_job_ref_source=WaitExternalJobRefSource.RESUME_TOKEN,
-                    ),
-                )
-            ),
-            wait_poll_adapter_registry=WaitPollAdapterRegistry(
-                (
-                    WaitPollAdapterRegistration(
-                        adapter_key=_ADAPTER_KEY,
-                        adapter=poll_adapter,
-                    ),
-                )
-            ),
-        ),
-        context_budget_policy=None,
-        compactor_runner_baseline=None,
-        memory_projection_policy=default_memory_projection_policy(),
-        memory_projection_catchup_batch_size=128,
-        enable_truncation_manager=True,
-        wait_poller_policy=WaitPollerRuntimePolicy(
-            enabled=True,
-            poll_interval_seconds=0.01,
-            claim_ttl_seconds=1.0,
-            claim_batch_size=1,
-            backoff_initial_delay_seconds=0.01,
-            backoff_multiplier=1.2,
-            backoff_max_delay_seconds=0.05,
-            close_drain_timeout_seconds=0.2,
-        ),
-    )
-
-
 def _tool_bundle() -> ToolBundle:
     """构造等待型业务工具 bundle。
 
@@ -916,311 +1271,6 @@ def _host_context(request_id: str) -> HostCallContext:
             business_object_id=None,
             scenario="wu_wait_04_s2",
             correlation_id=None,
-        ),
-    )
-
-
-def _runner_spec() -> RunnerSpec:
-    """构造 deterministic runner spec。
-
-    :returns: Runner spec。
-    :raises Exception: typed 字段非法时由底层抛出。
-    """
-
-    return RunnerSpec(
-        provider="test",
-        model="awaiting-smoke-model",
-        endpoint="https://example.invalid",
-        api_key_ref="secret:test",
-        headers={},
-        client_correlation_policy=ClientCorrelationPolicy.DISABLED,
-        supports_tool_calling=True,
-        supports_streaming=False,
-        supports_stream_usage=False,
-        default_timeout_seconds=1.0,
-        max_retries=0,
-        provider_request=None,
-        stream_idle_timeout_seconds=None,
-        stream_idle_heartbeat_seconds=None,
-    )
-
-
-def _runner_options() -> RunnerCallOptions:
-    """构造 runner options。
-
-    :returns: Runner options。
-    :raises Exception: typed 字段非法时由底层抛出。
-    """
-
-    return RunnerCallOptions(
-        temperature=0.0,
-        max_tokens=256,
-        top_p=None,
-        stream=False,
-    )
-
-
-def _agent_policy(*, allow_tool_calls: bool) -> AgentPolicy:
-    """构造 Agent policy。
-
-    :param allow_tool_calls: 是否允许工具调用。
-    :returns: Agent policy。
-    :raises Exception: typed 字段非法时由底层抛出。
-    """
-
-    return AgentPolicy(
-        max_iterations=2 if allow_tool_calls else 1,
-        continuation_max_attempts=0,
-        allow_tool_calls=allow_tool_calls,
-        tool_execution_timeout_seconds=1.0,
-        fallback_mode=AgentFallbackMode.RAISE_ERROR,
-        fallback_prompt="不允许降级回答。",
-        continuation_prompt="继续。",
-        max_consecutive_failed_tool_batches=1,
-    )
-
-
-def _host_assembly(
-    *,
-    options: OpenHostOptions,
-    effective_tool_bundle: ToolBundle,
-) -> ServiceOpenHostAssemblyResult:
-    """构造 Service submit helper 所需的 assembly 结果。
-
-    :param options: Host opener options。
-    :param effective_tool_bundle: 当前工具 bundle。
-    :returns: Service assembly result。
-    :raises Exception: typed 字段非法时由底层抛出。
-    """
-
-    model = _model_config()
-    hint = RunnerOptionHintConfig(temperature=0.0, top_p=1.0, stream=False)
-    selection = RunnerOptionHintSelection(
-        model_id=model.model_id,
-        runner_option_hint_id="interactive",
-        model=model,
-        runner_option_hint=hint,
-        diagnostic=RuntimeSelectionDiagnostic(
-            selected_model_id=model.model_id,
-            selected_model_source="test",
-            selected_runner_option_hint_id="interactive",
-            selected_runner_option_hint_source="test",
-        ),
-    )
-    agent_policy_config = MergedAgentPolicyConfig(
-        max_iterations=2,
-        continuation_max_attempts=0,
-        allow_tool_calls=True,
-        tool_execution_timeout_seconds=1.0,
-        fallback_mode=AgentFallbackMode.RAISE_ERROR.value,
-        fallback_prompt="不允许降级回答。",
-        continuation_prompt="继续。",
-        max_consecutive_failed_tool_batches=1,
-        field_sources={},
-    )
-    lane = RuntimeLaneConfig(
-        lane_name="service-awaiting-smoke",
-        capacity=1,
-        default_timeout_seconds=1.0,
-        claim_ttl_seconds=3.0,
-        heartbeat_interval_seconds=0.2,
-    )
-    compatibility = ExecutionProfileCompatibilityDiagnostic(
-        profile_id="smoke",
-        context_window_class="small",
-        min_context_window_tokens=4096,
-        selected_model_id=model.model_id,
-        model_context_window_tokens=model.context_window_tokens,
-        status="compatible",
-    )
-    return ServiceOpenHostAssemblyResult(
-        options=options,
-        diagnostics=ServiceOpenHostAssemblyDiagnostics(
-            config_overlay_dir=None,
-            prompt_asset_root=Path("dayu/config/prompts"),
-            scene_manifest_root=Path("dayu/config/scenes"),
-            host_runtime_id="smoke",
-            execution_profile_id="smoke",
-            model_id=model.model_id,
-            model_source="test",
-            runner_option_hint_id="interactive",
-            runner_option_hint_source="test",
-            compactor_model_id=model.model_id,
-            compactor_runner_option_hint_id="interactive",
-            lane_name=lane.lane_name,
-            tool_provider_reports=(),
-            tool_selection="select",
-            context_budget_policy_ref="none",
-            agent_policy_sources=(),
-            tool_truncation_policy="disabled",
-            ordinary_provider_extension_status="none",
-            compactor_provider_extension_status="none",
-            ordinary_profile_compatibility=compatibility,
-            compactor_profile_compatibility=compatibility,
-        ),
-        host_runtime=_host_runtime_config(),
-        execution_profile=_execution_profile_config(),
-        lane=lane,
-        ordinary_selection=selection,
-        compactor_selection=selection,
-        agent_policy_config=agent_policy_config,
-        effective_tool_bundle=effective_tool_bundle,
-    )
-
-
-def _model_config() -> ModelConfig:
-    """构造 runtime model config。
-
-    :returns: Model config。
-    :raises Exception: typed 字段非法时由底层抛出。
-    """
-
-    return ModelConfig(
-        model_id="awaiting-smoke-model",
-        runner_kind=RunnerKind.OPENAI_COMPATIBLE,
-        provider="test",
-        model="awaiting-smoke-model",
-        endpoint="https://example.invalid",
-        api_key_ref="secret:test",
-        headers={},
-        supports_tool_calling=True,
-        supports_stream=False,
-        supports_stream_usage=False,
-        default_timeout_seconds=1.0,
-        max_retries=0,
-        sse_idle_timeout_seconds=1.0,
-        sse_heartbeat_seconds=1.0,
-        provider_request_extension=None,
-        context_window_tokens=4096,
-        runtime_hints=ModelRuntimeHintsConfig(
-            runner_option_hints={
-                "interactive": RunnerOptionHintConfig(
-                    temperature=0.0,
-                    top_p=1.0,
-                    stream=False,
-                )
-            }
-        ),
-    )
-
-
-def _host_runtime_config() -> HostRuntimeProfileConfig:
-    """构造未被当前 smoke 行为消费的 runtime config。
-
-    :returns: Host runtime config。
-    :raises Exception: typed 字段非法时由底层抛出。
-    """
-
-    return HostRuntimeProfileConfig(
-        host_runtime_id="smoke",
-        store_root="workspace/tmp",
-        artifact_root="workspace/tmp/artifacts",
-        sqlite=SQLiteRuntimeConfig(
-            path="workspace/tmp/host.sqlite3",
-            busy_timeout_seconds=1.0,
-            write_busy_retry_count=1,
-            write_retry_initial_delay_seconds=0.001,
-            write_retry_backoff_multiplier=1.2,
-            write_retry_max_delay_seconds=0.01,
-        ),
-        host_execution_lane_name="service-awaiting-smoke",
-        worker_backend="local",
-        dispatch_poll_interval_seconds=0.01,
-        payload_inline_threshold_bytes=4096,
-        worker_startup_timeout_seconds=3.0,
-        memory_projection_catch_up_batch_size=128,
-        process_capsule_interrupt_policy=ProcessCapsuleInterruptPolicyConfig(
-            terminate_grace_seconds=0.1,
-            kill_grace_seconds=0.1,
-        ),
-    )
-
-
-def _execution_profile_config() -> ExecutionProfileConfig:
-    """构造未被当前 smoke 行为消费的 execution profile config。
-
-    :returns: Execution profile config。
-    :raises Exception: typed 字段非法时由底层抛出。
-    """
-
-    return ExecutionProfileConfig(
-        execution_profile_id="smoke",
-        context_window_class="small",
-        min_context_window_tokens=4096,
-        run_baseline=ExecutionBaselineConfig(
-            model_id="awaiting-smoke-model",
-            runner_option_hint_id="interactive",
-        ),
-        compactor_baseline=CompactorBaselineConfig(
-            model_id="awaiting-smoke-model",
-            scene_id="compactor",
-            runner_option_hint_id="interactive",
-            user_prompt_template_path="compactor.md",
-            artifact_root="workspace/tmp/compact",
-        ),
-        context_budget_policy=ContextBudgetConfig(
-            soft_threshold_context_ratio=0.7,
-            hard_threshold_context_ratio=0.9,
-            max_proactive_compactions_per_run=0,
-            max_reactive_compactions_per_run=0,
-            max_compaction_attempts_per_operation=1,
-            policy_ref="smoke",
-        ),
-        memory_projection_policy=MemoryProjectionConfig(
-            context_window_size=4096,
-            selected_recent_window_item_cap=10,
-            selected_recent_window_char_cap=1000,
-            selected_recent_window_turn_floor=1,
-            fallback_selected_recent_window_item_cap=10,
-            fallback_selected_recent_window_char_cap=1000,
-            evidence_fact_item_cap=10,
-            evidence_fact_char_cap=1000,
-            evidence_fact_floor=0,
-            session_summary_char_cap=1000,
-            answer_anchor_item_cap=10,
-            answer_anchor_char_cap=1000,
-            forward_intent_item_cap=10,
-            forward_intent_char_cap=1000,
-            reference_continuity_item_cap=10,
-            reference_continuity_char_cap=1000,
-            reference_continuity_item_floor=0,
-            max_lag_events_for_inline_delta=10,
-            max_delta_repair_events=10,
-            policy_ref="smoke",
-        ),
-        tool_truncation_policy=ToolTruncationPolicyConfig(
-            enabled=False,
-            default_cursor_ttl_seconds=60.0,
-            default_limits=ToolTruncationDefaultLimitsConfig(
-                text_chars=TextCharsLimitConfig(max_chars=1000),
-                text_lines=TextLinesLimitConfig(max_lines=50),
-                list_items=ListItemsLimitConfig(max_items=50),
-                binary_bytes=BinaryBytesLimitConfig(max_bytes=1024),
-            ),
-        ),
-        tool_duplicate_governance_policy=ToolDuplicateGovernancePolicyConfig(
-            default_duplicate_decision="allow",
-            decisions_by_tool_name={},
-            justification_argument_names_by_tool_name={},
-            messages=ToolDuplicateGovernanceMessagesConfig(
-                allow="allow",
-                reuse="reuse",
-                hint="hint",
-                require_justification="require",
-                hard_stop="stop",
-                attempt_scope_diagnostic="attempt",
-                prior_accept_missing="missing",
-            ),
-        ),
-        agent_policy=AgentPolicyConfig(
-            max_iterations=2,
-            continuation_max_attempts=0,
-            allow_tool_calls=True,
-            tool_execution_timeout_seconds=1.0,
-            fallback_mode=AgentFallbackMode.RAISE_ERROR.value,
-            fallback_prompt="不允许降级回答。",
-            continuation_prompt="继续。",
-            max_consecutive_failed_tool_batches=1,
         ),
     )
 

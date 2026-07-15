@@ -15,7 +15,7 @@ import pytest
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
-from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
+from dayu.contracts.tool_await import ToolAwaitKind
 from dayu.contracts.tool_call import BatchToolExecutionContext, ToolCallRequest
 from dayu.contracts.tool_declaration import ToolDefinition
 from dayu.contracts.tool_outcome import (
@@ -55,14 +55,12 @@ from dayu.fins.direct_events import (
     FinsResultStatus,
     FinsResultSummary,
 )
-from dayu.fins.direct_event_text import (
-    wait_cancelled_hint,
-    wait_cancelled_message,
-    wait_failed_hint,
-)
-from dayu.fins.domain.enums import SourceKind
 from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.tools import download_provider, preprocess_provider, provider as read_provider
+from dayu.fins.tools._ingestion_tool_helpers import (
+    AwaitingResolutionMode,
+    parse_awaiting_resolution_mode,
+)
 from dayu.fins.tools.download_tools import DOWNLOAD_TOOL_NAME, FinsDownloadToolCallable
 from dayu.fins.tools.preprocess_tools import PREPROCESS_TOOL_NAME, FinsPreprocessToolCallable
 from dayu.fins.tools import upload_provider
@@ -72,6 +70,7 @@ from dayu.runtime.tools_discovery import (
     PythonImportPathProvider,
     ToolsDiscovery,
     ToolsDiscoveryProviderBinding,
+    ToolsDiscoveryProviderOutput,
     ToolsDiscoveryProviderSpec,
 )
 
@@ -96,6 +95,109 @@ _OBSERVATION_TIME: Final[datetime] = datetime(2026, 6, 16, tzinfo=timezone.utc)
 _OBSERVATION_HANDLE_ID: Final[str] = (
     f"{FINS_OBSERVATION_HANDLE_ID_PREFIX}aaaaaaaaaaaaaaaa"
 )
+
+
+@pytest.mark.parametrize(
+    ("raw_mode", "expected"),
+    (
+        ("poll", AwaitingResolutionMode.POLL),
+        ("callback", AwaitingResolutionMode.CALLBACK),
+        ("manual", AwaitingResolutionMode.MANUAL),
+    ),
+)
+def test_awaiting_resolution_mode_parser_accepts_closed_typed_modes(
+    raw_mode: str,
+    expected: AwaitingResolutionMode,
+) -> None:
+    """Fins 唯一 parser 必须精确接受三种 closed mode。
+
+    :param raw_mode: provider config 原始字符串。
+    :param expected: 预期 typed enum。
+    :returns: ``None``。
+    :raises AssertionError: parser 未返回精确 enum 时抛出。
+    """
+
+    assert (
+        parse_awaiting_resolution_mode({"awaiting_resolution_mode": raw_mode})
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    "config",
+    (
+        {},
+        {"awaiting_resolution_mode": None},
+        {"awaiting_resolution_mode": 1},
+        {"awaiting_resolution_mode": True},
+        {"awaiting_resolution_mode": ""},
+        {"awaiting_resolution_mode": "POLL"},
+        {"awaiting_resolution_mode": " poll"},
+        {"awaiting_resolution_mode": "automatic"},
+    ),
+)
+def test_awaiting_resolution_mode_parser_rejects_missing_or_illegal_values(
+    config: Mapping[str, JsonValue],
+) -> None:
+    """Fins 唯一 parser 不得默认、trim 或 loose parse raw mode。
+
+    :param config: 非法 provider config。
+    :returns: ``None``。
+    :raises AssertionError: 非法值未失败时抛出。
+    """
+
+    with pytest.raises(ValueError, match="awaiting_resolution_mode"):
+        parse_awaiting_resolution_mode(config)
+
+
+@pytest.mark.parametrize(
+    ("provider", "spec_id", "import_path"),
+    (
+        (
+            download_provider.discover_tools,
+            _DOWNLOAD_SPEC_ID,
+            "dayu.fins.tools.download_provider:discover_tools",
+        ),
+        (
+            preprocess_provider.discover_tools,
+            _PREPROCESS_SPEC_ID,
+            "dayu.fins.tools.preprocess_provider:discover_tools",
+        ),
+        (
+            upload_provider.discover_tools,
+            _UPLOAD_SPEC_ID,
+            "dayu.fins.tools.upload_provider:discover_tools",
+        ),
+    ),
+)
+def test_each_fins_awaiting_provider_validates_mode_before_runtime_creation(
+    tmp_path: Path,
+    provider: Callable[[ToolsDiscoveryProviderSpec], ToolsDiscoveryProviderOutput],
+    spec_id: str,
+    import_path: str,
+) -> None:
+    """三个 Fins provider 的直接 discovery 都必须先走同一 parser。
+
+    :param tmp_path: pytest 临时目录。
+    :param provider: 本 case 的 provider callable。
+    :param spec_id: provider spec id。
+    :param import_path: provider import path。
+    :returns: ``None``。
+    :raises AssertionError: 非法 mode 未在 runtime 创建前失败时抛出。
+    """
+
+    with pytest.raises(ValueError, match="awaiting_resolution_mode"):
+        provider(
+            ToolsDiscoveryProviderSpec(
+                spec_id=spec_id,
+                location=PythonImportPathProvider(import_path=import_path),
+                enabled=True,
+                config={
+                    "workspace_root": str(tmp_path.resolve(strict=False)),
+                    "awaiting_resolution_mode": "POLL",
+                },
+            )
+        )
 
 
 def test_observation_handle_resume_token_is_opaque_handle_id() -> None:
@@ -759,7 +861,10 @@ def test_upload_provider_registers_upload_tool_without_local_file_roots(
                 import_path="dayu.fins.tools.upload_provider:discover_tools"
             ),
             enabled=True,
-            config={"workspace_root": str(workspace_root)},
+            config={
+                "workspace_root": str(workspace_root),
+                "awaiting_resolution_mode": "poll",
+            },
         )
     )
 
@@ -778,7 +883,7 @@ def test_upload_provider_rejects_missing_workspace_root() -> None:
                     import_path="dayu.fins.tools.upload_provider:discover_tools"
                 ),
                 enabled=True,
-                config={},
+                config={"awaiting_resolution_mode": "poll"},
             )
         )
 
@@ -1531,7 +1636,10 @@ def _write_split_fins_provider_overlay(
                 "source_kind": "explicit_provider",
                 "source_id": "dayu.fins.tools.download_provider",
                 "enabled": True,
-                "config": {"workspace_root": str(workspace_root)},
+                "config": {
+                    "workspace_root": str(workspace_root),
+                    "awaiting_resolution_mode": "poll",
+                },
             },
             _PREPROCESS_SPEC_ID: {
                 "import_path": "dayu.fins.tools.preprocess_provider:discover_tools",
@@ -1539,7 +1647,10 @@ def _write_split_fins_provider_overlay(
                 "source_kind": "explicit_provider",
                 "source_id": "dayu.fins.tools.preprocess_provider",
                 "enabled": True,
-                "config": {"workspace_root": str(workspace_root)},
+                "config": {
+                    "workspace_root": str(workspace_root),
+                    "awaiting_resolution_mode": "poll",
+                },
             },
             _UPLOAD_SPEC_ID: {
                 "import_path": "dayu.fins.tools.upload_provider:discover_tools",
@@ -1547,7 +1658,10 @@ def _write_split_fins_provider_overlay(
                 "source_kind": "explicit_provider",
                 "source_id": "dayu.fins.tools.upload_provider",
                 "enabled": True,
-                "config": {"workspace_root": str(workspace_root)},
+                "config": {
+                    "workspace_root": str(workspace_root),
+                    "awaiting_resolution_mode": "poll",
+                },
             },
         }
     }
@@ -1625,7 +1739,10 @@ def _spec(
         spec_id=spec_id,
         location=PythonImportPathProvider(import_path=import_path),
         enabled=True,
-        config={"workspace_root": str(workspace_root)},
+        config={
+            "workspace_root": str(workspace_root),
+            "awaiting_resolution_mode": "poll",
+        },
     )
 
 
@@ -1653,7 +1770,10 @@ def _upload_spec(
             import_path="dayu.fins.tools.upload_provider:discover_tools"
         ),
         enabled=True,
-        config={"workspace_root": str(workspace_root)},
+        config={
+            "workspace_root": str(workspace_root),
+            "awaiting_resolution_mode": "poll",
+        },
     )
 
 

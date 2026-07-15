@@ -7,7 +7,7 @@ import asyncio
 import io
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Final, cast
@@ -692,12 +692,9 @@ def _with_fake_search_web(
         replaced = True
     if not replaced:
         raise ValueError("combined tool bundle must include search_web")
-    return ServiceDiscoveredTools(
+    return replace(
+        discovered_tools,
         tool_bundle=ToolBundle(definitions=tuple(definitions)),
-        source_refs=discovered_tools.source_refs,
-        provider_reports=discovered_tools.provider_reports,
-        effective_provider_configs=discovered_tools.effective_provider_configs,
-        fins_awaiting_runtime=discovered_tools.fins_awaiting_runtime,
     )
 
 

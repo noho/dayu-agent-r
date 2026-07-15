@@ -66,36 +66,6 @@ if TYPE_CHECKING:
     from dayu.host.waiting import ToolAwaitingAcceptedAck
 
 _LOGGER = logging.getLogger(__name__)
-_DEFAULT_CLAIM_BATCH_SIZE = 100
-"""单轮 poll 默认最多 claim 的 wait record 数。"""
-
-_POLL_CLAIM_TTL_SECONDS = 60.0
-"""单条 poll claim 默认有效秒数。"""
-
-_POLL_BACKOFF_INITIAL_DELAY_SECONDS = 30.0
-"""poll retry 初始退避秒数。"""
-
-_POLL_NOT_READY_OBSERVE_INTERVAL_SECONDS = 1.0
-"""外部 job 正常运行中时的下一次观察间隔秒数。"""
-
-_POLL_IDLE_INTERVAL_SECONDS = 5.0
-"""没有可 claim wait record 时的空闲轮询间隔秒数。"""
-
-_POLL_BACKOFF_MAX_DELAY_SECONDS = 300.0
-"""poll retry 最大退避秒数。"""
-
-_POLL_BACKOFF_MULTIPLIER = 2.0
-"""poll retry 指数退避倍率。"""
-
-_ADAPTER_CALL_TIMEOUT_SECONDS = 30.0
-"""单次同步 adapter observation 的默认最大秒数。"""
-
-_CLOSE_DRAIN_TIMEOUT_SECONDS = 5.0
-"""wait supervisor 单次 close 的默认共享预算秒数。"""
-
-_MAX_OUTSTANDING_ADAPTER_CALLS = 8
-"""单个 Host wait supervisor 的默认 live adapter invocation 上限。"""
-
 _POLL_ERROR_CODE_ADAPTER_EXCEPTION = "adapter_exception"
 _POLL_ERROR_CODE_MISSING_ADAPTER = "missing_adapter"
 _POLL_ERROR_CODE_RESOLVE_EXCEPTION = "resolve_exception"
@@ -445,18 +415,18 @@ class WaitPollerRuntimePolicy:
     :param max_outstanding_adapter_calls: live adapter invocation 正数上限。
     """
 
-    enabled: bool = True
-    poll_interval_seconds: float = 1.0
-    claim_ttl_seconds: float = _POLL_CLAIM_TTL_SECONDS
-    claim_batch_size: int = _DEFAULT_CLAIM_BATCH_SIZE
-    backoff_initial_delay_seconds: float = _POLL_BACKOFF_INITIAL_DELAY_SECONDS
-    backoff_multiplier: float = _POLL_BACKOFF_MULTIPLIER
-    backoff_max_delay_seconds: float = _POLL_BACKOFF_MAX_DELAY_SECONDS
-    not_ready_observe_interval_seconds: float = _POLL_NOT_READY_OBSERVE_INTERVAL_SECONDS
-    idle_poll_interval_seconds: float = _POLL_IDLE_INTERVAL_SECONDS
-    adapter_call_timeout_seconds: float = _ADAPTER_CALL_TIMEOUT_SECONDS
-    close_drain_timeout_seconds: float = _CLOSE_DRAIN_TIMEOUT_SECONDS
-    max_outstanding_adapter_calls: int = _MAX_OUTSTANDING_ADAPTER_CALLS
+    enabled: bool
+    poll_interval_seconds: float
+    claim_ttl_seconds: float
+    claim_batch_size: int
+    backoff_initial_delay_seconds: float
+    backoff_multiplier: float
+    backoff_max_delay_seconds: float
+    not_ready_observe_interval_seconds: float
+    idle_poll_interval_seconds: float
+    adapter_call_timeout_seconds: float
+    close_drain_timeout_seconds: float
+    max_outstanding_adapter_calls: int
 
     def __post_init__(self) -> None:
         """校验 runtime policy 字段。
@@ -471,6 +441,10 @@ class WaitPollerRuntimePolicy:
             self.poll_interval_seconds, field_name="poll_interval_seconds"
         )
         _require_positive_float(self.claim_ttl_seconds, field_name="claim_ttl_seconds")
+        if not isinstance(self.claim_batch_size, int) or isinstance(
+            self.claim_batch_size, bool
+        ):
+            raise TypeError("claim_batch_size must be int")
         if self.claim_batch_size <= 0:
             raise ValueError("claim_batch_size must be positive")
         _require_positive_float(
@@ -957,8 +931,8 @@ class WaitPoller:
         adapter_registry: WaitPollAdapterRegistry,
         resolver: WaitResolvePort,
         context: HostCallContext,
+        policy: WaitPollerRuntimePolicy,
         clock: WaitPollClock | None = None,
-        policy: WaitPollerRuntimePolicy | None = None,
         lifecycle_gate: WaitPollLifecycleGate | None = None,
         observation_runner: WaitObservationRunner | None = None,
         owner_id: str | None = None,
@@ -969,8 +943,8 @@ class WaitPoller:
         :param adapter_registry: poll adapter registry。
         :param resolver: resolve_wait 端口。
         :param context: poller 调用上下文。
+        :param policy: 显式 poller runtime policy。
         :param clock: UTC 时钟；缺省使用系统 UTC 时间。
-        :param policy: poller runtime policy；缺省使用默认 policy。
         :param lifecycle_gate: close gate；缺省为永不关闭。
         :param observation_runner: supervisor-owned bounded observation runner；
             同步 ``poll_once`` 测试未提供时创建当前 poller 私有 runner。
@@ -982,13 +956,12 @@ class WaitPoller:
         resolved_owner_id = owner_id if owner_id is not None else _new_poller_owner_id()
         if resolved_owner_id.strip() == "":
             raise ValueError("owner_id must be non-empty")
-        resolved_policy = policy if policy is not None else WaitPollerRuntimePolicy()
         self._transaction_runner = transaction_runner
         self._adapter_registry = adapter_registry
         self._resolver = resolver
         self._context = context
         self._clock = clock if clock is not None else _SystemUtcClock()
-        self._policy = resolved_policy
+        self._policy = policy
         self._lifecycle_gate = (
             lifecycle_gate if lifecycle_gate is not None else _AlwaysOpenLifecycleGate()
         )
@@ -997,7 +970,7 @@ class WaitPoller:
             if observation_runner is not None
             else WaitObservationRunner(
                 max_outstanding_adapter_calls=(
-                    resolved_policy.max_outstanding_adapter_calls
+                    policy.max_outstanding_adapter_calls
                 ),
                 thread_name_prefix=f"dayu-wait-observation-{resolved_owner_id}",
             )
@@ -1635,14 +1608,14 @@ class WaitPollerSupervisor:
         self,
         *,
         poller_factory: WaitPollerFactory,
-        policy: WaitPollerRuntimePolicy | None = None,
+        policy: WaitPollerRuntimePolicy,
         owner_id: str | None = None,
     ) -> None:
         """初始化 supervisor。
 
         :param poller_factory: 创建 poller 的 factory；后台线程必须由 factory
             提供线程内可用的 durable runner。
-        :param policy: runtime policy；缺省使用默认 policy。
+        :param policy: 显式 runtime policy。
         :param owner_id: poller owner id；缺省生成随机 id。
         :returns: ``None``。
         :raises ValueError: owner id 为空时抛出。
@@ -1651,7 +1624,7 @@ class WaitPollerSupervisor:
         resolved_owner_id = owner_id if owner_id is not None else _new_poller_owner_id()
         if resolved_owner_id.strip() == "":
             raise ValueError("owner_id must be non-empty")
-        self._policy = policy if policy is not None else WaitPollerRuntimePolicy()
+        self._policy = policy
         self._owner_id = resolved_owner_id
         self._poller_factory = poller_factory
         self._close_event = threading.Event()

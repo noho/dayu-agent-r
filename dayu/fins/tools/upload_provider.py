@@ -6,6 +6,7 @@ from typing import Final
 
 from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 from dayu.fins.service_runtime import DefaultFinsRuntime
+from dayu.fins.tools._ingestion_tool_helpers import parse_awaiting_resolution_mode
 from dayu.fins.tools.provider import parse_fins_workspace_root_config
 from dayu.fins.tools.upload_tools import build_fins_upload_tool
 from dayu.runtime.tools_discovery import (
@@ -32,6 +33,7 @@ def discover_tools(spec: ToolsDiscoveryProviderSpec) -> ToolsDiscoveryProviderOu
         OSError: Fins runtime 仓储初始化失败时抛出。
     """
 
+    parse_awaiting_resolution_mode(spec.config)
     source_ref = _source_ref()
     workspace_root = parse_fins_workspace_root_config(spec.config)
     runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)

@@ -151,7 +151,19 @@ dayu/config/
 - `payload_inline_threshold_bytes`，包内默认值为 `65535` bytes。
 - `worker_startup_timeout_seconds`。
 - `memory_projection_catch_up_batch_size`。
+- 必填 `wait_poller_policy`：完整保存 production wait poller 的部署 snapshot；
+  ConfigLoader 只做层中立 typed projection，不解释 provider 或 Fins 语义。
 - 可选 `process_capsule_interrupt_policy`：process-backed 工具子进程取消 / 超时后的 cleanup interrupt 策略，只包含 `terminate_grace_seconds` 与 `kill_grace_seconds`。字段缺省时由 Host typed 默认值决定；显式配置必须是有限非负数，不能使用 boolean、NaN 或正负无穷。该策略只约束 cleanup grace，不是单次工具业务执行 deadline，不能替代 execution profile 中的 `agent_policy.tool_execution_timeout_seconds`。
+
+`wait_poller_policy` 必须同时提供 `enabled`、`poll_interval_seconds`、
+`claim_ttl_seconds`、`claim_batch_size`、`backoff_initial_delay_seconds`、
+`backoff_multiplier`、`backoff_max_delay_seconds`、
+`not_ready_observe_interval_seconds`、`idle_poll_interval_seconds`、
+`adapter_call_timeout_seconds`、`close_drain_timeout_seconds` 与
+`max_outstanding_adapter_calls`。除 `enabled` 外所有字段都是有限正数；两个整数位
+`claim_batch_size`、`max_outstanding_adapter_calls` 显式拒绝 JSON boolean。
+缺字段、多余字段、`null`、零、负数或非有限值都会加载失败。包内 snapshot 固定为
+`true, 1, 60, 100, 30, 2, 300, 1, 5, 30, 5, 8`，顺序与上述字段一致。
 
 这些配置都是 `open_host(options)` construction-time assembly inputs 的来源，不是单个 Run 的 override。prompt asset root 与 scene manifest root 不在 `host_runtime.json` 中配置，由 runtime location resolver 解析。
 
@@ -196,6 +208,13 @@ provider 字段：
 | `financial-download-tools` | `dayu.fins.tools.download_provider:discover_tools` | 财报 download awaiting tool |
 | `financial-preprocess-tools` | `dayu.fins.tools.preprocess_provider:discover_tools` | 财报 preprocess awaiting tool |
 | `financial-upload-tools` | `dayu.fins.tools.upload_provider:discover_tools` | 财报 upload awaiting tool |
+
+三个 awaiting provider 的 `config.awaiting_resolution_mode` 都是必填 provider-owned
+字段，只允许精确的 `poll`、`callback`、`manual`；包内配置均显式写为 `poll`。
+ConfigLoader 仍把 `config` 当作 opaque JSON，不解析、规范化或默认该字段；唯一业务
+解析由 Fins 共享 parser 完成。即使 provider 为 disabled，Service 也会先把 raw config
+交给该 parser 严格校验，再做 active filtering。已识别的 Fins read / Web non-awaiting
+provider 声明该字段会作为 owner misuse 失败，未知第三方 provider 不由此配置契约扩展语义。
 
 启用任一 Fins provider 时，传给 provider 的 effective spec 必须包含绝对 `workspace_root`；该值可以来自 workspace overlay 的 `config.workspace_root`，也可以由 Service 调用方用当前 runtime workspace 注入。provider 不从 cwd 或环境变量猜路径。`financial-read-tools` 的 packaged `config.limits` 显式写入默认值：`processor_cache_max_entries=128`、`list_documents_max_items=300`、`get_document_sections_max_items=1200`、`search_document_max_items=20`、`list_tables_max_items=50`、`read_section_max_chars=80000`、`get_page_content_max_chars=80000`、`get_table_max_items=800`、`get_financial_statement_max_items=1200` 与 `query_xbrl_facts_max_items=1200`。workspace overlay 可用同名正整数字段覆盖这些 read limits。`financial-upload-tools` 启用时注册 `start_fins_upload`；上传工具只校验本地路径必须指向存在的非空普通文件，财报写入仍通过 Fins workspace repository 完成。Download / preprocess / upload 能力通过独立 provider 启用，不通过 read provider 的布尔开关混合启用。
 

@@ -21,13 +21,7 @@ from dayu.contracts.tool_outcome import (
     ToolCancelledOutcome,
 )
 from dayu.contracts.tool_result import ToolResultFailure, ToolResultMeta, ToolResultSuccess
-from dayu.fins.direct_events import (
-    FinsErrorKind,
-    FinsEventDetail,
-    FinsOperationKind,
-    FinsResultStatus,
-    FinsResultSummary,
-)
+from dayu.fins.direct_events import FinsEventDetail, FinsOperationKind, FinsResultSummary
 from dayu.fins.direct_event_text import (
     wait_cancelled_hint,
     wait_cancelled_message,
@@ -43,6 +37,7 @@ from dayu.fins.ingestion.observation_handle import (
     parse_observation_handle_id_token,
 )
 from dayu.fins.service_runtime import DefaultFinsRuntime
+from dayu.fins.tools._ingestion_tool_helpers import AwaitingResolutionMode
 from dayu.fins.tools.download_tools import DOWNLOAD_TOOL_NAME
 from dayu.fins.tools.preprocess_tools import PREPROCESS_TOOL_NAME
 from dayu.fins.tools.upload_tools import UPLOAD_TOOL_NAME
@@ -229,14 +224,16 @@ class FinsIngestionWaitActivationAdapter:
 
 
 def build_fins_wait_adapter_registry(
-    *, workspace_root: Path, tool_names: Sequence[str]
+    *,
+    workspace_root: Path,
+    tool_modes: Sequence[tuple[str, AwaitingResolutionMode]],
 ) -> WaitAdapterRegistry:
     """为启用的 Fins awaiting tools 构造 Host wait adapter registry。
 
     :param workspace_root: 已验证的绝对 Fins workspace root；binding 本身不把
         workspace 写入 Host durable wait record，但 factory 在装配期 fail fast。
-    :param tool_names: 本次 Service assembly 中由启用 provider 声明的 Fins
-        awaiting 工具名；重复名称视为配置错误。
+    :param tool_modes: 本次 Service assembly 中 active Fins awaiting 工具名与
+        owner-parsed typed mode；重复名称视为配置错误。
     :returns: Host wait adapter registry。
     :raises ValueError: 工具名为空、重复或不属于 Fins awaiting 稳定工具名时
         抛出。
@@ -244,7 +241,8 @@ def build_fins_wait_adapter_registry(
 
     _require_absolute_workspace_root(workspace_root)
     bindings = tuple(
-        _binding_for_tool_name(tool_name) for tool_name in _deterministic_tool_names(tool_names)
+        _binding_for_tool_name(tool_name, mode)
+        for tool_name, mode in _deterministic_tool_modes(tool_modes)
     )
     return WaitAdapterRegistry(bindings)
 
@@ -339,10 +337,33 @@ def _deterministic_tool_names(tool_names: Sequence[str]) -> tuple[str, ...]:
     return tuple(sorted(ordered))
 
 
-def _binding_for_tool_name(tool_name: str) -> WaitAdapterBinding:
+def _deterministic_tool_modes(
+    tool_modes: Sequence[tuple[str, AwaitingResolutionMode]],
+) -> tuple[tuple[str, AwaitingResolutionMode], ...]:
+    """校验并稳定排序 Fins awaiting 工具与 typed mode。
+
+    :param tool_modes: 待绑定的工具名与 Fins owner-parsed mode。
+    :returns: 按工具名字典序排序的 typed pair。
+    :raises TypeError: mode 不是 ``AwaitingResolutionMode`` 时抛出。
+    :raises ValueError: 工具名为空、重复或不受支持时抛出。
+    """
+
+    names = _deterministic_tool_names(tuple(item[0] for item in tool_modes))
+    mode_by_name: dict[str, AwaitingResolutionMode] = {}
+    for tool_name, mode in tool_modes:
+        if not isinstance(mode, AwaitingResolutionMode):
+            raise TypeError("Fins wait adapter mode must be AwaitingResolutionMode")
+        mode_by_name[tool_name.strip()] = mode
+    return tuple((tool_name, mode_by_name[tool_name]) for tool_name in names)
+
+
+def _binding_for_tool_name(
+    tool_name: str, mode: AwaitingResolutionMode
+) -> WaitAdapterBinding:
     """构造单个 Fins awaiting 工具 binding。
 
     :param tool_name: 已校验的 Fins awaiting 工具名。
+    :param mode: Fins owner 已解析的恢复模式。
     :returns: Host wait adapter binding。
     :raises ValueError: binding 字段非法时由 Host 契约抛出。
     """
@@ -351,9 +372,28 @@ def _binding_for_tool_name(tool_name: str) -> WaitAdapterBinding:
         tool_name=tool_name,
         await_kind=ToolAwaitKind.EXTERNAL_JOB,
         adapter_key=FINS_INGESTION_WAIT_ADAPTER_KEY,
-        resume_policy=WaitResumePolicy.POLL,
+        resume_policy=_wait_resume_policy_from_mode(mode),
         external_job_ref_source=WaitExternalJobRefSource.RESUME_TOKEN,
     )
+
+
+def _wait_resume_policy_from_mode(
+    mode: AwaitingResolutionMode,
+) -> WaitResumePolicy:
+    """把 Fins typed 恢复模式映射为 Host binding policy。
+
+    :param mode: Fins owner 已解析的恢复模式。
+    :returns: 精确对应的 Host wait resume policy。
+    :raises ValueError: 收到未知 enum 成员时抛出。
+    """
+
+    if mode is AwaitingResolutionMode.POLL:
+        return WaitResumePolicy.POLL
+    if mode is AwaitingResolutionMode.CALLBACK:
+        return WaitResumePolicy.CALLBACK
+    if mode is AwaitingResolutionMode.MANUAL:
+        return WaitResumePolicy.MANUAL
+    raise ValueError(f"unsupported Fins awaiting resolution mode: {mode}")
 
 
 def _handle_from_snapshot(snapshot: WaitAdapterSnapshot) -> FinsObservationHandle | None:
