@@ -886,7 +886,8 @@ def test_poll_adapter_lost_result_closes_run(
                 ),
             )
         )
-        poller = _poller(host, adapter, seeded.wait_id)
+        resolver = _RecordingPublicCommandResolver(host)
+        poller = _poller_with_resolver(host, adapter, seeded.wait_id, resolver)
 
         result = poller.poll_once()
 
@@ -895,6 +896,9 @@ def test_poll_adapter_lost_result_closes_run(
         assert result.resolved == 0
         assert result.lost == 1
         assert adapter.poll_count == 1
+        assert len(resolver.idempotency_keys) == 1
+        assert wait_record.resolve_idempotency_key == resolver.idempotency_keys[0]
+        assert wait_record.poll_last_error_code is None
         assert wait_record.status is WaitRecordStatus.LOST
         assert snapshot.status is RunStatus.LOST
     finally:

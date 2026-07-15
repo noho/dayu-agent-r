@@ -4,9 +4,18 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
-from dayu.host import CancelMode, CancelRunRequest, cancel_run
+from dayu.contracts.tool_result import ToolResultSuccess
+from dayu.host import (
+    CancelMode,
+    CancelRunRequest,
+    ResolveWaitCompletedOutcome,
+    RunStatus,
+    cancel_run,
+    get_run,
+)
 from dayu.host._wait_observation import (
     WaitObservationCapacityExceeded,
     WaitObservationPublished,
@@ -14,6 +23,7 @@ from dayu.host._wait_observation import (
     WaitObservationTimedOut,
 )
 from dayu.host.command import HostCommandHandle, create_host_command_handle
+from dayu.host.durable.codec import format_utc_timestamp
 from dayu.host.durable.state import WaitPollLastOutcome, WaitRecordStatus
 from dayu.host.wait_adapter import (
     WaitAdapterSnapshot,
@@ -22,15 +32,17 @@ from dayu.host.wait_adapter import (
     WaitExternalJobLifecycleResult,
     WaitPollAdapterRegistration,
     WaitPollAdapterRegistry,
+    WaitPollClock,
     WaitPollLifecycleGate,
-    WaitPollNotReady,
     WaitPollOnceResult,
+    WaitPollReady,
     WaitPollResult,
     WaitPoller,
     WaitPollerFactory,
     WaitPollerLoopStatus,
     WaitPollerRuntimePolicy,
     WaitPollerSupervisor,
+    WaitResolvePort,
 )
 from tests.host.test_resolve_wait_command import (
     _context,
@@ -38,7 +50,11 @@ from tests.host.test_resolve_wait_command import (
     _read_wait,
     _seed_waiting_run,
 )
-from tests.host.test_wait_adapter_polling import _FixedClock, _PublicCommandResolver
+from tests.host.test_wait_adapter_polling import (
+    _FixedClock,
+    _NoResolveResolver,
+    _RecordingPublicCommandResolver,
+)
 
 
 class _BlockingAdapter:
@@ -61,14 +77,23 @@ class _BlockingAdapter:
         """阻塞 poll 直到测试释放。
 
         :param snapshot: adapter snapshot。
-        :returns: not-ready 结果。
+        :returns: ready 结果；首轮超时后的迟到结果必须被 dropped。
         """
 
         del snapshot
         self.poll_calls += 1
         self.poll_entered.set()
         self.poll_release.wait()
-        return WaitPollNotReady()
+        return WaitPollReady(
+            ResolveWaitCompletedOutcome(
+                result=ToolResultSuccess(
+                    ok=True,
+                    value={"ready": True},
+                    meta=None,
+                ),
+                payload_ref=None,
+            )
+        )
 
     def abandon_wait(
         self, snapshot: WaitAdapterSnapshot
@@ -87,6 +112,38 @@ class _BlockingAdapter:
             action=WaitExternalJobLifecycleAction.ABANDON,
             message="released after Host timeout",
         )
+
+
+class _MutableClock:
+    """可显式推进的 wait poll 测试时钟。"""
+
+    def __init__(self) -> None:
+        """以既有 fixed clock 的时点初始化。
+
+        :returns: ``None``。
+        """
+
+        self._now = _FixedClock().now()
+
+    def now(self) -> datetime:
+        """返回当前测试时间。
+
+        :returns: 当前 UTC aware 时间。
+        """
+
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        """推进测试时间。
+
+        :param seconds: 推进秒数。
+        :returns: ``None``。
+        :raises ValueError: 秒数不是正数时抛出。
+        """
+
+        if seconds <= 0.0:
+            raise ValueError("seconds must be positive")
+        self._now += timedelta(seconds=seconds)
 
 
 class _SharedDeadlinePoller(WaitPoller):
@@ -287,10 +344,10 @@ def test_outstanding_cap_does_not_spawn_second_thread() -> None:
     assert second_called.is_set()
 
 
-def test_stuck_poll_times_out_to_lost_and_late_result_is_dropped(
+def test_poll_observation_timeout_releases_with_backoff_and_late_result_cannot_resolve(
     tmp_path: Path,
 ) -> None:
-    """provider poll 卡住时 Host 有界收为 LOST，迟到结果无 durable authority。"""
+    """poll observation timeout 释放 claim，迟到 Ready 无 durable authority。"""
 
     host = create_host_command_handle(_options(tmp_path))
     runner = WaitObservationRunner(
@@ -298,30 +355,65 @@ def test_stuck_poll_times_out_to_lost_and_late_result_is_dropped(
         thread_name_prefix="wait-observation-poll-timeout",
     )
     adapter = _BlockingAdapter()
+    clock = _MutableClock()
+    resolver = _RecordingPublicCommandResolver(host)
     try:
         seeded = _seed_waiting_run(host)
-        poller = _poller(host, seeded.wait_id, adapter, runner)
+        poller = _poller(
+            host,
+            seeded.wait_id,
+            adapter,
+            runner,
+            clock=clock,
+            resolver=resolver,
+        )
 
         result = poller.poll_once()
         wait = _read_wait(host._transaction_runner(), seeded.wait_id)
         assert adapter.poll_entered.is_set()
-        assert result.lost == 1
-        assert wait.status is WaitRecordStatus.LOST
+        assert result.lost == 0
+        assert result.adapter_errors == 1
+        assert wait.status is WaitRecordStatus.WAITING
+        assert get_run(host, seeded.run_id).status is RunStatus.WAITING
+        assert wait.poll_claim_id is None
+        assert wait.poll_claim_owner_id is None
+        assert wait.poll_claimed_at is None
+        assert wait.poll_claim_expires_at is None
+        assert wait.poll_backoff_attempt == 1
+        assert wait.poll_next_observe_at == format_utc_timestamp(
+            clock.now() + timedelta(seconds=0.01)
+        )
+        assert wait.poll_last_outcome is WaitPollLastOutcome.ADAPTER_ERROR
+        assert wait.poll_last_error_code == "wait_observation_timeout"
+        assert resolver.idempotency_keys == []
         assert runner.diagnostics_snapshot().invalidated_count == 1
 
         adapter.poll_release.set()
         _wait_for_runner_count(runner, expected=0)
         assert runner.diagnostics_snapshot().dropped_count == 1
-        assert _read_wait(host._transaction_runner(), seeded.wait_id).status is WaitRecordStatus.LOST
+        assert resolver.idempotency_keys == []
+        assert (
+            _read_wait(host._transaction_runner(), seeded.wait_id).status
+            is WaitRecordStatus.WAITING
+        )
+
+        clock.advance(0.01)
+        next_round = poller.poll_once()
+        resolved_wait = _read_wait(host._transaction_runner(), seeded.wait_id)
+        assert next_round.resolved == 1
+        assert next_round.lost == 0
+        assert len(resolver.idempotency_keys) == 1
+        assert resolved_wait.status is WaitRecordStatus.RESOLVED
+        assert get_run(host, seeded.run_id).status is RunStatus.RUNNING
     finally:
         adapter.poll_release.set()
         host.close()
 
 
-def test_stuck_abandon_writes_timeout_marker_without_external_success(
+def test_cancelled_abandon_timeout_releases_with_backoff_and_late_result_cannot_mark_terminal(
     tmp_path: Path,
 ) -> None:
-    """abandon 卡住时写 timeout marker、停止重试且迟到 applied 不生效。"""
+    """abandon timeout 保持 CANCELLED retryable，迟到 Applied 不写终态。"""
 
     host = create_host_command_handle(_options(tmp_path))
     runner = WaitObservationRunner(
@@ -329,6 +421,8 @@ def test_stuck_abandon_writes_timeout_marker_without_external_success(
         thread_name_prefix="wait-observation-abandon-timeout",
     )
     adapter = _BlockingAdapter()
+    clock = _MutableClock()
+    resolver = _NoResolveResolver()
     try:
         seeded = _seed_waiting_run(host)
         cancel_run(
@@ -341,23 +435,52 @@ def test_stuck_abandon_writes_timeout_marker_without_external_success(
                 mode=CancelMode.GRACEFUL,
             ),
         )
-        poller = _poller(host, seeded.wait_id, adapter, runner)
+        poller = _poller(
+            host,
+            seeded.wait_id,
+            adapter,
+            runner,
+            clock=clock,
+            resolver=resolver,
+        )
 
         first = poller.poll_once()
         wait = _read_wait(host._transaction_runner(), seeded.wait_id)
         assert adapter.abandon_entered.is_set()
         assert first.abandoned == 0
         assert first.adapter_errors == 1
-        assert wait.poll_abandoned_at is not None
+        assert wait.status is WaitRecordStatus.CANCELLED
+        assert wait.poll_abandoned_at is None
+        assert wait.poll_claim_id is None
+        assert wait.poll_claim_owner_id is None
+        assert wait.poll_claimed_at is None
+        assert wait.poll_claim_expires_at is None
+        assert wait.poll_backoff_attempt == 1
+        assert wait.poll_next_observe_at == format_utc_timestamp(
+            clock.now() + timedelta(seconds=0.01)
+        )
         assert wait.poll_last_outcome is WaitPollLastOutcome.ABANDON_ERROR
         assert wait.poll_last_error_code == "wait_abandon_timeout"
         assert poller.poll_once().observed == 0
         assert adapter.abandon_calls == 1
+        assert resolver.calls == []
 
         adapter.abandon_release.set()
         _wait_for_runner_count(runner, expected=0)
         assert runner.diagnostics_snapshot().dropped_count == 1
-        assert _read_wait(host._transaction_runner(), seeded.wait_id).status is WaitRecordStatus.CANCELLED
+        late_wait = _read_wait(host._transaction_runner(), seeded.wait_id)
+        assert late_wait.status is WaitRecordStatus.CANCELLED
+        assert late_wait.poll_abandoned_at is None
+
+        clock.advance(0.01)
+        next_round = poller.poll_once()
+        terminal_wait = _read_wait(host._transaction_runner(), seeded.wait_id)
+        assert next_round.abandoned == 1
+        assert adapter.abandon_calls == 2
+        assert terminal_wait.status is WaitRecordStatus.CANCELLED
+        assert terminal_wait.poll_abandoned_at is not None
+        assert terminal_wait.poll_last_outcome is WaitPollLastOutcome.ABANDONED
+        assert resolver.calls == []
     finally:
         adapter.abandon_release.set()
         host.close()
@@ -406,6 +529,9 @@ def _poller(
     wait_id: str,
     adapter: _BlockingAdapter,
     runner: WaitObservationRunner,
+    *,
+    clock: WaitPollClock | None = None,
+    resolver: WaitResolvePort | None = None,
 ) -> WaitPoller:
     """构造使用显式 observation runner 的 poller。
 
@@ -413,6 +539,8 @@ def _poller(
     :param wait_id: wait id。
     :param adapter: blocking adapter。
     :param runner: observation owner。
+    :param clock: 可选测试时钟。
+    :param resolver: 可选 wait resolve port。
     :returns: configured poller。
     """
 
@@ -427,9 +555,9 @@ def _poller(
                 ),
             )
         ),
-        resolver=_PublicCommandResolver(host),
+        resolver=resolver or _RecordingPublicCommandResolver(host),
         context=_context("bounded-observation-poller"),
-        clock=_FixedClock(),
+        clock=clock or _FixedClock(),
         policy=_wait_poller_policy(
             adapter_call_timeout_seconds=0.01,
             close_drain_timeout_seconds=0.02,

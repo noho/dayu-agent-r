@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -60,6 +60,7 @@ from dayu.host.api import (
     WaitAdapterKey,
 )
 from dayu.host.command import create_host_command_handle, start_run
+from dayu.host._wait_observation import WaitObservationRunner
 from dayu.host.dispatch import HostDispatchScheduler
 from dayu.host.durable.session_lifecycle import ensure_session
 from dayu.host.durable.state import (
@@ -101,6 +102,12 @@ from tests.host.test_resolve_wait_command import (
     _options,
     _read_wait,
     _seed_active_run,
+)
+from tests.host.test_wait_observation_runner import (
+    _BlockingAdapter,
+    _MutableClock,
+    _poller as _bounded_wait_poller,
+    _wait_for_runner_count,
 )
 
 _ITERATION_ID = "iteration-phase7-waiting-integration"
@@ -367,6 +374,92 @@ def test_local_awaiting_tool_manual_resolve_resumes_run(
         tool_content = json.loads(tool_message.content)
         assert tool_content["answer"] == 42
     finally:
+        host.close()
+
+
+def test_poll_observation_timeout_keeps_waiting_then_ready_resumes_run(
+    tmp_path: Path,
+) -> None:
+    """真实 awaiting durable record 在 poll timeout 后仍可由下一轮 Ready 恢复。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    runner = WaitObservationRunner(
+        max_outstanding_adapter_calls=1,
+        thread_name_prefix="phase7-poll-observation-timeout",
+    )
+    adapter = _BlockingAdapter()
+    clock = _MutableClock()
+    try:
+        seeded = _seed_active_integration_run(host._transaction_runner())
+        tool = _AwaitingBusinessTool()
+        tool_runtime = DefaultToolRuntimeFactory(
+            EffectiveToolBundleBuilder()
+        ).create_tool_runtime(
+            ToolRuntimeBuildRequest(
+                effective_bundle_request=EffectiveToolBundleBuildRequest(
+                    business_tool_bundle=ToolBundle(definitions=(_definition(tool),)),
+                    source_refs=(_source_ref(),),
+                    framework_tool_policy=default_framework_tool_policy_view(),
+                    policy_snapshot_digest=_POLICY_DIGEST,
+                ),
+                execution_scope=ToolRuntimeExecutionScope(
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    attempt_id=seeded.attempt_id,
+                    execution_id=seeded.execution_id,
+                    allow_tool_calls=True,
+                ),
+                accept_port=DefaultHostToolFactAcceptPort(
+                    transaction_runner=host._transaction_runner()
+                ),
+                awaiting_accept_port=DefaultHostToolAwaitingAcceptPort(
+                    transaction_runner=host._transaction_runner()
+                ),
+                wait_adapter_registry=_wait_adapter_registry(),
+            )
+        )
+        _execute_tool_runtime(
+            tool_runtime.tool_executor,
+            _awaiting_tool_request(seeded),
+        )
+        waiting = _active_wait(host._transaction_runner(), seeded.run_id)
+        poller = _bounded_wait_poller(
+            host,
+            waiting.wait_id,
+            adapter,
+            runner,
+            clock=clock,
+        )
+
+        timed_out = poller.poll_once()
+        after_timeout = _read_wait(host._transaction_runner(), waiting.wait_id)
+        assert timed_out.lost == 0
+        assert timed_out.adapter_errors == 1
+        assert after_timeout.status is WaitRecordStatus.WAITING
+        assert _run(host._transaction_runner(), seeded.run_id).status is RunStatus.WAITING
+        assert after_timeout.poll_claim_id is None
+        assert after_timeout.poll_next_observe_at is not None
+        assert after_timeout.poll_last_error_code == "wait_observation_timeout"
+
+        adapter.poll_release.set()
+        _wait_for_runner_count(runner, expected=0)
+        assert runner.diagnostics_snapshot().dropped_count == 1
+        assert (
+            _read_wait(host._transaction_runner(), waiting.wait_id).status
+            is WaitRecordStatus.WAITING
+        )
+
+        clock.advance(0.01)
+        ready = poller.poll_once()
+        assert ready.resolved == 1
+        assert ready.lost == 0
+        assert (
+            _read_wait(host._transaction_runner(), waiting.wait_id).status
+            is WaitRecordStatus.RESOLVED
+        )
+        assert _run(host._transaction_runner(), seeded.run_id).status is RunStatus.RUNNING
+    finally:
+        adapter.poll_release.set()
         host.close()
 
 

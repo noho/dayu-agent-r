@@ -37,7 +37,6 @@ from dayu.host.api import (
 from dayu.contracts.json_value import JsonValue
 from dayu.host.durable._row_rules import (
     TERMINAL_ATTEMPT_STATUS_VALUES,
-    TERMINAL_RUN_STATUS_VALUES,
     WAIT_RECORD_CANCELLED_STATUS_VALUE,
     WAIT_RECORD_FAILED_STATUS_VALUE,
     WAIT_RECORD_LOST_STATUS_VALUE,
@@ -2713,78 +2712,6 @@ def mark_wait_record_poll_abandoned(
         """,
         (
             serialize_wait_poll_last_outcome(last_outcome),
-            abandoned_at,
-            updated_at,
-            wait_id,
-            claim_id,
-            serialize_wait_record_status(WaitRecordStatus.CANCELLED),
-        ),
-    )
-    return _wait_record_poll_mutation_result(
-        transaction, wait_id=wait_id, rowcount=result.rowcount
-    )
-
-
-def mark_wait_record_poll_abandon_timeout(
-    transaction: HostTransaction,
-    *,
-    wait_id: str,
-    claim_id: str,
-    abandoned_at: str,
-    updated_at: str,
-    error_code: str,
-    error_message: str,
-) -> WaitRecordMutationResult:
-    """标记 cancelled wait 的外部 abandon 已超时并停止重复观察。
-
-    该 marker 只声明 Host 已放弃等待 external cancel confirmation，不声明
-    provider job 已取消成功。
-
-    :param transaction: 调用方提供的 Host transaction。
-    :param wait_id: wait record id。
-    :param claim_id: 当前 poll claim id。
-    :param abandoned_at: Host 停止等待的 UTC timestamp。
-    :param updated_at: durable row 更新时间。
-    :param error_code: 稳定 timeout diagnostic code。
-    :param error_message: timeout diagnostic message。
-    :returns: wait record mutation 结果。
-    :raises HostDurableError: 输入非法时抛出。
-    """
-
-    _require_text_max_length(wait_id, field_name="wait_id", max_length=HOST_WAIT_ID_MAX_LENGTH)
-    _require_text_max_length(
-        claim_id,
-        field_name="poll_claim_id",
-        max_length=HOST_WAIT_IDEMPOTENCY_KEY_MAX_LENGTH,
-    )
-    _require_non_empty_text(abandoned_at, field_name="poll_abandoned_at")
-    _require_non_empty_text(updated_at, field_name="updated_at")
-    _require_non_empty_text(error_code, field_name="poll_last_error_code")
-    _require_non_empty_text(error_message, field_name="poll_last_error_message")
-    result = transaction.execute(
-        f"""
-        UPDATE {TABLE_HOST_WAIT_RECORDS}
-        SET
-          poll_claim_id = NULL,
-          poll_claim_owner_id = NULL,
-          poll_claimed_at = NULL,
-          poll_claim_expires_at = NULL,
-          poll_next_observe_at = NULL,
-          poll_backoff_attempt = 0,
-          poll_last_outcome = ?,
-          poll_last_error_code = ?,
-          poll_last_error_message = ?,
-          poll_abandoned_at = ?,
-          updated_at = ?
-        WHERE wait_id = ?
-          AND poll_claim_id = ?
-          AND status = ?
-          AND poll_abandoned_at IS NULL
-        """,
-        (
-            serialize_wait_poll_last_outcome(WaitPollLastOutcome.ABANDON_ERROR),
-            error_code,
-            error_message,
             abandoned_at,
             updated_at,
             wait_id,

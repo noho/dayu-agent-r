@@ -1061,6 +1061,75 @@ def test_cancelled_poll_abandoned_row_is_not_eligible(tmp_path: Path) -> None:
         assert store.transaction_runner.run_write(operation) is StateMutationStatus.NOT_FOUND
 
 
+def test_cancelled_poll_timeout_release_preserves_claimability_after_due(
+    tmp_path: Path,
+) -> None:
+    """cancelled wait timeout release 后保持非终态并可在到期时再次 claim。"""
+
+    options = _options(tmp_path)
+    with open_host_durable_store(options) as store:
+
+        def operation(transaction: HostTransaction) -> tuple[WaitRecordRow, WaitRecordRow]:
+            """claim、release cancelled wait，再在 due 时重新 claim。
+
+            :param transaction: Host transaction。
+            :returns: release 后与重新 claim 后的 wait row。
+            """
+
+            _seed_run(transaction)
+            insert_wait_record(
+                transaction,
+                _wait_row(transaction, status=WaitRecordStatus.CANCELLED),
+            )
+            claimed = claim_wait_record_for_poll(
+                transaction,
+                claim_id="claim-timeout",
+                owner_id="poller-timeout",
+                now=_TIMESTAMP,
+                claim_expires_at=_LATER_TIMESTAMP,
+            )
+            assert claimed.status is StateMutationStatus.UPDATED
+            released = release_wait_record_poll_claim(
+                transaction,
+                wait_id="wait-1",
+                claim_id="claim-timeout",
+                next_observe_at=_LATER_TIMESTAMP,
+                backoff_attempt=1,
+                last_outcome=WaitPollLastOutcome.ABANDON_ERROR,
+                last_error_code="wait_abandon_timeout",
+                last_error_message="wait adapter abandon exceeded Host time budget",
+                updated_at=_TIMESTAMP,
+            )
+            assert released.status is StateMutationStatus.UPDATED
+            assert released.row is not None
+            retry = claim_wait_record_for_poll(
+                transaction,
+                claim_id="claim-retry",
+                owner_id="poller-retry",
+                now=_LATER_TIMESTAMP,
+                claim_expires_at=_FUTURE_TIMESTAMP,
+            )
+            assert retry.status is StateMutationStatus.UPDATED
+            assert retry.row is not None
+            return released.row, retry.row
+
+        released_row, retry_row = store.transaction_runner.run_write(operation)
+        assert released_row.status is WaitRecordStatus.CANCELLED
+        assert released_row.poll_claim_id is None
+        assert released_row.poll_claim_owner_id is None
+        assert released_row.poll_claimed_at is None
+        assert released_row.poll_claim_expires_at is None
+        assert released_row.poll_next_observe_at == _LATER_TIMESTAMP
+        assert released_row.poll_backoff_attempt == 1
+        assert released_row.poll_last_outcome is WaitPollLastOutcome.ABANDON_ERROR
+        assert released_row.poll_last_error_code == "wait_abandon_timeout"
+        assert released_row.poll_abandoned_at is None
+        assert retry_row.poll_claim_id == "claim-retry"
+        assert retry_row.poll_claim_owner_id == "poller-retry"
+        assert retry_row.poll_backoff_attempt == 1
+        assert retry_row.poll_abandoned_at is None
+
+
 @pytest.mark.parametrize(
     "last_outcome",
     (

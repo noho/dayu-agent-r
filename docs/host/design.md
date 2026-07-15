@@ -2426,8 +2426,10 @@ adapter、immutable wait snapshot、发布 token 与单槽结果通道的 daemon
 超时只证明本次状态查询没有在预算内返回，不证明外部 job 已丢失；poller 必须记录 transient
 diagnostic、释放 claim 并按 policy backoff，不得调用 `resolve_wait` 或把 wait / Run 收为 `LOST`。
 只有 adapter 基于 authoritative provider / external-job 状态显式返回 typed lost outcome，Host
-才能通过 common resolve path 收为 `LOST`。cancelled wait 的 abandon 超时只写
-`wait_abandon_timeout` diagnostic/close marker，不宣称 provider 已取消成功。
+才能通过 common resolve path 收为 `LOST`。cancelled wait 的 abandon observation timeout 只写
+poll-local transient `wait_abandon_timeout` diagnostic、释放 claim 并按 Host policy backoff，durable
+status 保持 `CANCELLED` 且不写 terminal `poll_abandoned_at`；只有 provider 显式返回 applied、unsupported
+或 noop lifecycle outcome，才沿既有 transition 写 terminal abandon marker，且不调用 wait resolve。
 supervisor close 对 poller loop 与全部 observation thread 只使用一个 shared monotonic deadline；
 预算耗尽后可保持 `CLOSING` 有界返回，最后一个 tracked thread finally 结束后才进入 `STOPPED`。
 

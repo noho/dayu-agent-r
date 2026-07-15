@@ -48,7 +48,6 @@ from dayu.host.durable.state import (
     WaitRecordStatus,
     WaitResumePolicy,
     claim_wait_record_for_poll,
-    mark_wait_record_poll_abandon_timeout,
     mark_wait_record_poll_abandoned,
     read_next_wait_record_poll_due_at,
     read_wait_record_by_id,
@@ -703,35 +702,6 @@ class _MarkWaitRecordAbandonedOperation:
 
 
 @dataclass(frozen=True, slots=True)
-class _MarkWaitRecordAbandonTimeoutOperation:
-    """记录 cancelled wait abandon timeout 的 transaction operation。"""
-
-    wait_id: str
-    claim_id: str
-    abandoned_at: str
-    updated_at: str
-    error_code: str
-    error_message: str
-
-    def __call__(self, transaction: HostTransaction) -> StateMutationStatus:
-        """提交 timeout marker 并停止该 cancelled wait 重复 observation。
-
-        :param transaction: Host transaction。
-        :returns: mutation 状态。
-        """
-
-        return mark_wait_record_poll_abandon_timeout(
-            transaction,
-            wait_id=self.wait_id,
-            claim_id=self.claim_id,
-            abandoned_at=self.abandoned_at,
-            updated_at=self.updated_at,
-            error_code=self.error_code,
-            error_message=self.error_message,
-        ).status
-
-
-@dataclass(frozen=True, slots=True)
 class _ReadWaitRecordOperation:
     """读取单条 wait record 的 transaction operation。"""
 
@@ -1104,27 +1074,14 @@ class WaitPoller:
                     shutdown_skipped += 1
                     claim_conflicts += self._release_shutdown_skipped(record, claim_id)
                     continue
-                timeout_result = WaitPollLost(
-                    ResolveWaitLostOutcome(
-                        reason_code=_POLL_ERROR_CODE_OBSERVATION_TIMEOUT,
-                        message="wait adapter observation exceeded Host time budget",
-                        provider_status_ref=None,
-                    )
+                adapter_errors += 1
+                claim_conflicts += self._release_with_backoff(
+                    record,
+                    claim_id,
+                    outcome=WaitPollLastOutcome.ADAPTER_ERROR,
+                    error_code=_POLL_ERROR_CODE_OBSERVATION_TIMEOUT,
+                    error_message="wait adapter observation exceeded Host time budget",
                 )
-                resolve_status = self._resolve_claimed_wait(record, timeout_result)
-                if resolve_status is StateMutationStatus.UPDATED:
-                    lost += 1
-                elif resolve_status is StateMutationStatus.CAS_LOST:
-                    claim_conflicts += 1
-                else:
-                    adapter_errors += 1
-                    claim_conflicts += self._release_with_backoff(
-                        record,
-                        claim_id,
-                        outcome=WaitPollLastOutcome.RESOLVE_ERROR,
-                        error_code=_POLL_ERROR_CODE_OBSERVATION_TIMEOUT,
-                        error_message=resolve_status.value,
-                    )
                 continue
             if not isinstance(observation, WaitObservationPublished):
                 raise RuntimeError("wait observation result is invalid")
@@ -1363,21 +1320,16 @@ class WaitPoller:
         if isinstance(observation, WaitObservationTimedOut):
             if self._lifecycle_gate.is_closed():
                 return 0, 0, self._release_shutdown_skipped(record, claim_id), 1
-            now = format_utc_timestamp(self._clock.now())
-            status = self._transaction_runner.run_write(
-                _MarkWaitRecordAbandonTimeoutOperation(
-                    wait_id=record.wait_id,
-                    claim_id=claim_id,
-                    abandoned_at=now,
-                    updated_at=now,
-                    error_code=_POLL_ERROR_CODE_ABANDON_TIMEOUT,
-                    error_message="wait adapter abandon exceeded Host time budget",
-                )
-            )
             return (
                 0,
                 1,
-                0 if status is StateMutationStatus.UPDATED else 1,
+                self._release_with_backoff(
+                    record,
+                    claim_id,
+                    outcome=WaitPollLastOutcome.ABANDON_ERROR,
+                    error_code=_POLL_ERROR_CODE_ABANDON_TIMEOUT,
+                    error_message="wait adapter abandon exceeded Host time budget",
+                ),
                 0,
             )
         if not isinstance(observation, WaitObservationPublished):
