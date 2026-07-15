@@ -6,9 +6,9 @@
 - 当前分支：`phaseflow/host-issues-control`。
 - plan base / HEAD：`5ba0d8b61f9d03f52c4529f5b83a6cd353d002b1`。
 - 硬依赖：R04 completion commit `4898c6aa` 已是当前 HEAD 的 ancestor。
-- 当前 gate：`R05 remediation second plan fix`；本轮只关闭 `R05-PRR-F01`，`R05-PF-01` 至 `R05-PF-04` 保持关闭；完成后停回 Controller validation，未经 Controller 接受不得启动下一轮 AgentMiMo / AgentDS 全文双路 re-review，更不得进入 implementation、commit、push 或 PR。
-- 计划状态：`WAITING_FOR_CONTROLLER_VALIDATION_AFTER_SECOND_PLAN_FIX`。
-- owner / allowlist 裁决：Controller 已在 `docs/reviews/wu-semantic-ownership-01-r05-plan-review-controller-adjudication.md` 明确扩大 R05-S1 边界：`dayu/host/durable/state.py` 是 invalid timeout-only terminal primitive 的删除 owner，`docs/host/design.md` 是既有 retry 语义的设计真源纠错 owner；第二轮 plan-fix 只在既定 `state.py` touched-file 内增加 §2.3 已登记的唯一 unused import hygiene，不新增 schema、policy 字段、owner、allowlist 或 slice。若实现证据要求超过这三项精确变化，按 §13 stop conditions 立即停回 Controller。
+- 当前 gate：同一 `R05-S1 validation plan correction` 已由 AgentCodex 完成，当前等待 Controller validation；Controller 接受后只进入 AgentMiMo / AgentDS 双路完整 plan-correction review，未经该 review / fix / re-review / Controller adjudication 闭环不得恢复 R05-S1 validation，更不得进入 R05-S2、code review、commit、aggregate gate、push 或 PR。
+- 计划状态：`WAITING_FOR_CONTROLLER_VALIDATION_AFTER_R05_S1_VALIDATION_PLAN_CORRECTION`。
+- owner / allowlist 裁决：历史 plan review 中 `R05-PF-01` 至 `R05-PF-04` 与 `R05-PRR-F01` 均已关闭；其既有 owner / allowlist 裁决继续有效：`dayu/host/durable/state.py` 是 invalid timeout-only terminal primitive 的删除 owner，`docs/host/design.md` 是既有 retry 语义的设计真源纠错 owner，`state.py` touched-file 只额外包含 §2.3 已登记的唯一 unused import hygiene。本次同一 R05-S1 correction 只修订 validation / gate-state 文本与 correction artifact，不新增 schema、policy 字段、owner、产品 allowlist 或 slice；若实现证据要求超过既定精确变化，按 §13 stop conditions 立即停回 Controller。
 
 第一性原理结论如下：
 
@@ -460,13 +460,16 @@ python -m pytest -q \
 
 不得使用会收集零节点的 `tests/service/test_entrypoint_runtime.py -k 'awaiting or resume'` 作为 validation；当前 base 该命令是 `43 deselected`，R05 已以上述 exact Service nodes 作等价、非空替换。
 
-## 8. Coverage 门禁
+## 8. Coverage 门禁：R05 changed-owner coverage measurement
 
-R05-S1 先运行 §7.1 的 exact owner/focused/aggregate 功能矩阵；覆盖率门禁另用扩大后的 read-only Host 集，避免用原三文件集的聚合数值掩盖 `durable/state.py`：
+R05-S1 必须先完整运行并通过 §7.1 的 exact owner / focused / aggregate 功能矩阵；本节 session 只测量 R05 两个实际 changed production owner 的覆盖率，不是完整 Host regression acceptance，也不能替代、删减或放宽 §7.1 的任何功能节点。
+
+R05 changed-owner coverage measurement 的唯一命令为：
 
 ```bash
 python -m pytest -q tests/host \
   --ignore=tests/host/test_toolruntime_executor.py \
+  --ignore=tests/host/test_dispatch_scheduler.py \
   --cov=dayu.host.durable.state \
   --cov=dayu.host.wait_adapter \
   --cov-branch \
@@ -476,7 +479,11 @@ python -m coverage report --include='dayu/host/durable/state.py' --fail-under=80
 python -m coverage report --include='dayu/host/wait_adapter.py' --fail-under=80
 ```
 
-plan-fix 期间的直接 probe 证明原四文件 owner 集只有 `durable/state.py=64%`、`wait_adapter.py=78%`，不满足门禁；上面的 green 扩大集当前得到 `1916 passed, 1 skipped, 5 deselected`、`durable/state.py=83%`、`wait_adapter.py=85%`。排除的 `test_toolruntime_executor.py` 属于无关 process-backed ToolRuntime 路径，不参与这两个 owner 的 R05 contract；它仍受项目其它矩阵治理，不能把排除解释成忽略 R05 propagation。planned changed production files `durable/state.py` 与 `wait_adapter.py` 必须各自 >=80%；`_wait_observation.py`、`waiting.py` 只要出现 diff 就先触发 owner/allowlist stop，而不是仅靠覆盖率继续。
+只允许上述两个 `--ignore`：保留既有 `tests/host/test_toolruntime_executor.py` 排除，并只额外排除 `tests/host/test_dispatch_scheduler.py`。不得再增加其它 ignore、deselect、xfail、retry、failure exemption 或测试选择豁免。
+
+plan-fix 期间的直接 probe 证明原四文件 owner 集只有 `durable/state.py=64%`、`wait_adapter.py=78%`，不满足门禁。Controller 在当前 R05-S1 diff 上独立运行上述候选 session，结果为 `1830 passed, 2 skipped, 5 deselected`，`durable/state.py=83%`、`wait_adapter.py=86%`，随后两个逐文件 `coverage report --fail-under=80` 均通过；这只证明修订后的 coverage measurement 可执行，不提前接受 S1。排除的 `test_toolruntime_executor.py` 属于无关 process-backed ToolRuntime 路径；额外排除的 `test_dispatch_scheduler.py` 属于 §12 已确定的 Host scheduler close / terminal promotion coordination owner，且对 R05 wait observation owner 无 source / propagation 交集。两者仍受各自 owner 的项目矩阵治理，不能把排除解释成忽略 R05 propagation 或把 scheduler 缺陷称为已修复。
+
+修订后的 R05 changed-owner coverage measurement 必须整体绿色；planned changed production files `durable/state.py` 与 `wait_adapter.py` 必须分别 >=80%，不得用 aggregate coverage 替代逐文件门禁。`_wait_observation.py`、`waiting.py` 只要出现 diff 就先触发 owner/allowlist stop，而不是仅靠覆盖率继续。
 
 R05-S2：
 
@@ -655,7 +662,7 @@ smoke orchestration 必须按以下 condition-driven phase 顺序执行：
 
 smoke workspace 只位于 `workspace/tmp/`，不删除 Host artifacts；输出不得包含 secret。
 
-## 12. Baseline failure registry 规则
+## 12. Baseline failure registry 与非 R05 root-cause disposition
 
 每个非绿 command 都必须登记：
 
@@ -674,7 +681,44 @@ smoke workspace 只位于 `workspace/tmp/`，不删除 Host artifacts；输出�
 - timeout semantic assertion、terminal event、claim state 或 smoke 行为变化；
 - pyright 从零变为非零。
 
-R05 的 required functional commands 与 §8 green coverage command 当前没有可继承的 pytest/pyright failure。plan-fix 探索性完整 `tests/host` coverage probe 另触发 15 个 `test_toolruntime_executor.py` process-backed `PicklingError`；其六元组登记在 plan-fix artifact，不能当作通过证据或 R05 inherited exemption。正式 coverage command 明确排除该无关文件并已实测全绿，同时覆盖两个实际 changed owner。Ruff 全量 167 是唯一 required-gate 已知既有红线；两条 changed-file F401 明确在本 WU 修复，预期 residual 为 165，其余 residual 必须逐六元组匹配。任何测试新增失败都不是“因为旧测试也绿/红”可豁免。
+accepted plan 修订前的 coverage command 产生以下完整失败六元组：
+
+```text
+exact command:
+  python -m pytest -q tests/host
+    --ignore=tests/host/test_toolruntime_executor.py
+    --cov=dayu.host.durable.state
+    --cov=dayu.host.wait_adapter
+    --cov-branch
+    --cov-report=term-missing
+    --cov-report=json:workspace/tmp/r05-s1-coverage.json
+node:
+  tests/host/test_dispatch_scheduler.py::test_wake_queue_promotion_uses_tracked_async_promotion_task
+error:
+  HostApiError: Host execution is unavailable
+first stable frame:
+  dayu/host/_execution_health.py:258 in raise_if_scheduler_unavailable
+normalized fingerprint:
+  scheduler close 已提交私有 close gate 时，active worker clean EOF terminal closeout 同步 wake queue promotion，被 force health gate 拒绝
+validation HEAD:
+  f52b81f9f4abd37a65c35ea98955a416079e5d9e plus current uncommitted R05-S1 diff
+```
+
+该 session 的结果是 `1 failed, 1917 passed, 1 skipped, 5 deselected`；失败 session 中两个 owner 分别为 83% / 86%，但整个 session 不是绿色，不能冒充通过。
+
+Controller 读取 `HostDispatchScheduler.close()`、worker clean-EOF closeout、`EngineEventIngestor._with_terminal_promotion_retry(...)`、scheduler wake health gate 与失败测试，并独立运行 `workspace/tmp/test_r05_scheduler_close_probe.py`，结果 `1 passed`。确定性 probe 证明同一事件顺序：
+
+1. scheduler `close()` 先提交 `self._closed = True`；
+2. close 在取消并等待 promotion task 时让出 event loop；
+3. 已 active 的 worker 此时以 clean EOF 完成，Host 提交 terminal closeout；
+4. terminal closeout 同步调用 queue-promotion wake；
+5. scheduler 私有 close gate 以 `force=True` 拒绝 wake，异常从 active task 传播回 `close()`。
+
+因此 root cause 是 Host scheduler close 与 terminal promotion coordination 的线性化缺口，不是 R05 timeout transaction、测试 fixture、wait policy 或 coverage instrumentation 的错误。`tests/host/test_dispatch_scheduler.py` 对 `wait_adapter`、`WaitPoller`、`WaitObservation`、`WaitRecord` 及 R05 两个删除/复用 primitive 的 source scan 为零；`dayu/host/dispatch.py`、`dayu/host/engine_ingest.py` 与该测试文件相对 R05 plan base 均无本 slice diff。该失败不得称为 flake、inherited pass 或已修复；其产品 owner 超出 R05-S1 closed allowlist，当前 umbrella 不修复、不创建 issue，也不归入 Issue 175。
+
+§8 通过只额外排除该独立 owner test，把 coverage measurement 与无关 scheduler lifecycle owner 解耦；这不是一般失败豁免。修订后的候选 session 已由 Controller 取得 `1830 passed, 2 skipped, 5 deselected`、83% / 86% 及两个逐文件阈值通过证据，但 S1 仍须在 plan correction review 闭环后回 Controller 执行全部 functional、coverage、pyright、Ruff、scan 与 README-decision gates。
+
+plan-fix 探索性完整 `tests/host` coverage probe 另触发 15 个 `test_toolruntime_executor.py` process-backed `PicklingError`；其六元组登记在 plan-fix artifact，不能当作通过证据或 R05 inherited exemption。§8 保留对该无关文件的既有排除。Ruff 全量 167 是 required-gate 已知既有红线；两条 changed-file F401 明确在本 WU 修复，预期 residual 为 165，其余 residual 必须逐六元组匹配。任何测试新增失败都不是“因为旧测试也绿/红”可豁免。
 
 ## 13. Stop conditions
 
@@ -689,12 +733,24 @@ R05 的 required functional commands 与 §8 green coverage command 当前没有
 7. provider authoritative lost 或 explicit lifecycle terminal outcome 被误改为 retry。
 8. R04 12-field snapshot、typed modes、provider config ownership发生变化，或恢复 scene/name heuristic/code default。
 9. capacity、CAS、claim ownership、cancellation、close-drain、security/fencing 断言被删除、放宽或绕过。
-10. changed production file coverage <80%，pyright 新增错误，changed-file Ruff 非零，或 full Ruff residual 无法按六元组解释。
+10. 修订后的 R05 changed-owner coverage measurement 未整体绿色、两个实际 changed production files 任一逐文件 coverage <80%、pyright 新增错误、changed-file Ruff 非零、full Ruff residual 无法按六元组解释，或 required source / propagation / security scan 与 README decision 被删除、放宽或跳过。
 11. diff 出现 closed allowlist 外文件，或 `docs/host/design.md` 需要超出 §5.1 精确句子纠错的新产品 contract 裁决。
+12. 为绕过 scheduler close / terminal promotion coordination 缺口而尝试新增第三个 ignore、deselect、xfail、retry、failure exemption，或需要修改 `dayu/host/dispatch.py`、`dayu/host/engine_ingest.py` / scheduler owner tests；必须保留完整六元组与确定性 probe，停止交 Controller，不得称为 flake、inherited pass 或已修复。
 
 ## 14. Review handoff 与 completion evidence
 
-完整双路 plan re-review 要核对：
+本次 validation plan correction 是 accepted plan 的同一 R05 correction，不改变两 slices、产品 owner、产品 allowlist 或 semantic contract。correction 完成后下一步只回 Controller validation；不得自行进入 R05-S1 剩余 validation、R05-S2、code review、commit、aggregate gate、push 或 PR。
+
+Controller validation 与后续完整双路 plan-correction review 必须核对：
+
+- §7.1 exact owner / focused / aggregate functional matrices 是否原样保留，coverage measurement 是否没有替代任何功能节点；
+- §8 修订前后命令是否只增加 `tests/host/test_dispatch_scheduler.py` 排除，并保留 `tests/host/test_toolruntime_executor.py` 排除；是否没有其它 ignore / deselect / xfail / retry / failure exemption；
+- 修订后的 R05 changed-owner coverage measurement 是否要求整体绿色，`durable/state.py` 与 `wait_adapter.py` 是否仍分别执行 `--fail-under=80`；
+- §12 是否保留失败 session 的完整六元组、`1 failed, 1917 passed, 1 skipped, 5 deselected`、确定性 probe `1 passed`、同源 root cause 与 Controller 候选 session `1830 passed, 2 skipped, 5 deselected` / 83% / 86% 证据；
+- scheduler close / terminal promotion coordination 是否只作为非 R05 产品 residual owner boundary，当前不修、不创建 issue、不归入 Issue 175，也不被称为 flake、inherited pass 或已修复；
+- 当前七路径受保护 implementation/test/design diff digest 是否保持 `3439b542e4a4785aaff5be56d93c87e17065d13d0d370742475c3e9e595b0ba2`，correction 是否只修改计划与 correction artifact。
+
+原 accepted-plan 全文双路 review 要点继续保留：
 
 - 本 plan 是否严格映射 R05 manifest 与 Topic 5 final decision；
 - root cause 是否只落在 `WaitPoller` decision owner；
@@ -704,24 +760,26 @@ R05 的 required functional commands 与 §8 green coverage command 当前没有
 - branch matrix、exact nodes、coverage、Ruff registry、scans、public smoke 是否 code-generation-ready；
 - closed allowlist 与 stop conditions 是否足以阻止 R06+/Issue 175/callback/permission 扩域。
 
-本轮 second plan-fix 与 `docs/reviews/wu-semantic-ownership-01-r05-plan-rereview-fix-codex.md` 完成后停回 Controller validation。只有 Controller 接受后，AgentMiMo / AgentDS 才可再次 review 修订计划全文而非只看 `R05-PRR-F01` 局部 diff；本轮不得自行启动 re-review 或 implementation。
+本轮同一 R05-S1 validation plan correction 与 `docs/reviews/wu-semantic-ownership-01-r05-s1-validation-plan-correction-codex.md` 已完成，当前停回 Controller validation。只有 Controller 接受后，才可进入 AgentMiMo / AgentDS 双路完整 plan-correction review；review 必须覆盖修订后的完整 validation / gate-state contract，不能只看本次 stale 文本局部 diff。历史 `R05-PF-01` 至 `R05-PF-04` 与 `R05-PRR-F01` 保持已关闭，不得冒充当前 gate；本轮不得自行启动 review、恢复 R05-S1 validation 或进入 implementation。
 
 未来 implementation completion report 必须逐项提供：
 
 - slice base/end SHA 与 exact diff paths；
 - 新 owner tests 在 base 上的预期红、production 修改后的绿；
-- focused、aggregate、coverage、pyright、Ruff、diff-check 的 exact command/result；
+- focused、aggregate、修订后 R05 changed-owner coverage measurement、两个逐文件 coverage、pyright、Ruff、diff-check 的 exact command/result；coverage session 必须整体绿色；
 - full Ruff 六元组 residual diff；
 - source/propagation/security scan 结果；
 - README decision；
 - public smoke 完整关键证据；
 - `agent.py` no-diff 证明；
 - residual risks 与 deferred owners。
+- scheduler close / terminal promotion coordination 的完整六元组、确定性 probe 与非 R05 owner disposition；不得把它报告为已修复、inherited pass、flake、Issue 175 子项或 R05 completion。
 
 ## 15. Residual owners 与 blocking questions
 
 Residual owners 保持既有归属：
 
+- Host scheduler close / terminal promotion coordination：scheduler `close()` 先提交私有 close gate，在等待 promotion task cancellation 时允许 active worker clean EOF terminal closeout；closeout 同步 wake queue promotion 后被 force health gate 拒绝，异常传播回 `close()`。这是已由确定性 probe 复现的独立 Host lifecycle owner 缺口，不属于 R05 timeout transaction、测试 fixture、wait policy 或 coverage instrumentation。当前 umbrella 只在 coverage measurement 中与其解耦，不修改 scheduler 产品/测试、不创建新 issue、不归入 Issue 175；后续 destination 只能由 Controller / 用户另行裁决。
 - R05 explicit residual：`CANCELLED` wait 的 abandon observation 若一直 timeout 且 provider 从不返回 explicit lifecycle terminal outcome，当前 call order 不进入 `_handle_time_boundary(...)`，因此该 record 可能长期按 `backoff_max_delay_seconds` capped cadence 重试，并间歇占用有限 observation capacity。当前安全边界仅是 claim CAS、`max_outstanding_adapter_calls` cap、finite single-call timeout、late-publication fencing 与 backoff cap；它们限制单轮/并发资源，不等同于终止证据。
 - future Host cancel/abandon durable evidence policy：若产品需要在缺少 provider terminal outcome 时停止上述长期 retry，必须由 Host 另行定义 durable evidence、终止条件、资源 policy、schema/contract 与 owner tests；R05 不发明 max retry、abandon deadline、timeout terminal marker，也不把 `_handle_time_boundary(...)` 误当现有 CANCELLED 收口路径。
 - Issue 175：process isolation / process-backed containment；不由 R05 实现。
@@ -732,4 +790,4 @@ Residual owners 保持既有归属：
 
 当前 blocking questions：**无**。
 
-Controller 已完成 PF-03/PF-04 的 owner/allowlist 扩大裁决，PF-01 至 PF-04 保持关闭；当前下一动作是 Controller 对 second plan-fix 的 validation，接受后才进入完整双路 plan re-review。任何超出已裁决 `docs/host/design.md` 精确纠错，或超出 `durable/state.py` invalid primitive 与 §2.3 唯一 unused import 删除的新增 owner/allowlist 需求，仍必须停回 Controller。
+历史 `R05-PF-01` 至 `R05-PF-04` 与 `R05-PRR-F01` 均已关闭，其中 PF-03/PF-04 的 owner / allowlist 扩大裁决继续有效。当前下一动作是 Controller validation 本次同一 R05-S1 validation plan correction；Controller 接受后只进入 AgentMiMo / AgentDS 双路完整 plan-correction review。任何超出已裁决 `docs/host/design.md` 精确纠错，或超出 `durable/state.py` invalid primitive 与 §2.3 唯一 unused import 删除的新增 owner/allowlist 需求，仍必须停回 Controller。
