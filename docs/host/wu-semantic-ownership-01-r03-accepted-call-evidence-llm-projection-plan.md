@@ -6,15 +6,15 @@
 | --- | --- |
 | umbrella work unit | `WU-SEMANTIC-OWNERSHIP-01` |
 | remediation | `R03 — accepted call 语义与 opaque provenance 的单一 LLM 投影` |
-| 当前 gate | **plan gate only** |
+| 当前 gate | **R03-S1 plan correction only**；不是新 WU、新 slice 或 implementation continuation |
 | goal confirmation | 已由用户完成；本 gate 不重新提产品问题 |
 | 当前分支 | `phaseflow/host-issues-control` |
-| plan 取证基线 | `444bb33eaebba5f56d3cd211ced90e3b9d67a4fc` |
-| 当前 worktree | plan 写入前 clean |
-| 本 gate 唯一允许写入 | `docs/host/wu-semantic-ownership-01-r03-accepted-call-evidence-llm-projection-plan.md` |
-| 本 gate 明确禁止 | production、tests、README、design truth、control doc、prior artifact、commit、push、implementation |
-| 下一 gate | 对本计划做独立 adversarial plan review；review 接受前不得进入 implementation |
-| 状态 | `PLAN_READY_FOR_REVIEW`；不是 implementation authorization |
+| accepted plan commit | `8c6ae966` |
+| 当前 worktree | 有意保留未提交的 R03-S1 production/tests/README implementation diff 及 Controller artifacts；本 gate 不得删除、回滚、覆盖或继续实现 |
+| 本 gate 唯一允许写入 | 本 plan；新增 `docs/reviews/wu-semantic-ownership-01-r03-s1-plan-correction-codex.md` |
+| 本 gate 明确禁止 | control、production、tests、README、design truth、prior artifact、commit、push、implementation continuation |
+| 下一 gate | AgentMiMo / AgentDS 对完整修订计划并发 review，再由 Controller 裁决；接受前不得继续 R03-S1 implementation |
+| 状态 | `PLAN_CORRECTION_READY_FOR_DUAL_REVIEW`；不是 implementation authorization |
 
 本计划继续同一个 umbrella WU，不创建 feature、issue、子 WU 或新的授权框架。R02 只作为前序 gate 已完成且未侵入 R03 owner 的边界证据；R02 completion 与 completion controller validation 的最终结论为 `PASS`，但不向 R03 输入新的产品决定。
 
@@ -36,6 +36,14 @@
 12. `docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-completion.md` 与 `docs/reviews/wu-semantic-ownership-01-r02-web-owner-policy-completion-controller-validation.md`，仅核对 prior-gate boundary
 
 裁决优先级固定为：controller discussion 与已接受决定 > design truth > remediation plan > 当前直接代码/数据证据 > 原始 overdesign review 的候选证据。三份原始 overdesign review 不能覆盖 controller discussion。
+
+### 0.2 R03-S1 plan correction 输入与边界
+
+本次 correction gate 完整复核了 `AGENTS.md`、`docs/host/issues-implementation-control.md`、本 accepted plan、`docs/reviews/wu-semantic-ownership-01-r03-plan-rereview-controller-adjudication.md`、`docs/reviews/wu-semantic-ownership-01-r03-s1-plan-correction-controller-adjudication.md`、`docs/reviews/wu-semantic-ownership-01-r03-s1-implementation-codex.md` 和 `docs/host/design.md`，并以 `dayu/host/durable/run_transition.py`、`dayu/host/durable/state.py` 与 `tests/host/test_resolve_wait_command.py` 的当前源码作为 owner-level 直接证据。用户给定的 `dayu/host/design.md` 不存在；实际 Host design truth 路径为 `docs/host/design.md`，本 gate 只读取，不修改。
+
+Controller 裁决只纠正已有 R03-S1 的 owner allowlist 与 transition contract。当前未提交 implementation diff 及 prior artifacts 是本 gate 的受保护输入，不是本 gate 的可编辑产物。本 correction 不创建第四个 slice，不重开 S2/S3，不改变 Topic 3/4 或原 accepted plan 的产品裁决。
+
+Controller follow-up plan validation 又确认了一个 test-path 缺口：public `resolve_wait` 在调用 durable transition 前先由 `_tool_result_resolution_payload -> _wait_tool_call_requested_event` 构造 result payload，该上游 request-atom guard 已要求 awaiting/request row execution 与 `WaitRecord.execution_id` 一致。因此腐化 WaitRecord 后调用 public API 只能证明上游 guard，无法到达 `_invalid_waiting_resolution_precondition`。本计划将正常 public producer identity 与 lower durable transition corruption 拆分为两层 owner proof，不删除或放宽任一 guard。
 
 ## 1. 第一性原理判断、目标与成功条件
 
@@ -63,7 +71,8 @@
 4. prompt/tool schema/test prompt/Host-Engine-Tool renderer 在各自 owner 处完成逐文件人工审计，真实 schema 缺口只在 producer owner 修正；
 5. accepted-result projection 以 semantic query 或原始 canonical arguments 构造 query，以 result 内显式 `citation` 构造业务来源；缺 citation 时给出唯一业务中性 unavailable 文案；
 6. `OpaqueEvidenceRef` 只留在 EventLog envelope/audit/internal provenance，不进入共享 LLM material、RunInput、Memory、compactor readable material 或 LLM-ready Tool Trace summary；
-7. 任何 request link 缺失、错类型、错 identity 或 digest mismatch 都 fail closed，不走 legacy/fallback/compatibility 路径。
+7. wait-resolution `TOOL_RESULT_ACCEPTED` 的 `attempt_id/execution_id` 必须精确取自 suspended source Attempt，不得使用 resume Attempt identity、`None`、payload 字段或下游推断值；
+8. 任何 request link 缺失、错类型、错 identity、digest mismatch，或 `WaitRecord.execution_id` 与 suspended source `AttemptRow.execution_id` 不同源，都在写 result/resume/terminal facts 前 fail closed，不走 legacy/fallback/compatibility 路径。
 
 ### 1.3 完成判据
 
@@ -73,6 +82,7 @@ R03 只有同时满足下列条件才可完成：
 - ordinary/awaiting 的 `TOOL_CALL_REQUESTED` 使用同一 builder、同一字段集合、同一 digest/descriptor/query invariant；
 - `TOOL_AWAITING` payload 中不存在 `accepted_arguments`、`accepted_arguments_source_digest`、`normalized_arguments_digest` 或其它 arguments/digest 副本；
 - resume 只沿 `TOOL_AWAITING -> tool_call_requested_event_ref -> TOOL_CALL_REQUESTED` 读取 exact canonical arguments；
+- resume 与 terminal 两个 wait-resolution union 分支写入的 `TOOL_RESULT_ACCEPTED` 都使用 suspended source Attempt 的 durable execution id；`WaitRecord`/source Attempt execution 不同源时无 result/resume/terminal partial facts；
 - 删除 `llm_safe_replay_arguments`、`arguments_summary_unsafe`、递归 sensitive-key taxonomy、synthetic awaiting query、unknown `kind:id` source guessing 和 shared projection 中的 opaque refs；
 - `file_path`、上传文件路径、合法业务字段和 framework `scope_token` 不因字段名被删除或改写；
 - current production ToolDefinition/tool schema 没有让模型提交真实 credential；必要的 cursor/scope token 被明确说明为续读引用标签而不是业务事实；
@@ -101,6 +111,7 @@ R03 只有同时满足下列条件才可完成：
 | Host 已接受的原始 arguments identity | ToolRuntime accept boundary | canonical JSON + digest；交给 request-atom writer | redaction、字段名分类、safe/raw 双写 |
 | `TOOL_CALL_REQUESTED` durable atom | 新 `dayu/host/tool_call_request.py` | ordinary/awaiting 共用 writer；reader 严格验证 | 两个入口各写一套 payload |
 | waiting governance | `dayu/host/waiting.py` + `TOOL_AWAITING` | wait/adaptor/snapshot/external-job/link | 保存 arguments/digest，或从 wait id 猜 request id |
+| wait-resolution accepted-result execution identity | `dayu/host/durable/run_transition.py` | 从 suspended source `AttemptRow` 写 `TOOL_RESULT_ACCEPTED.attempt_id/execution_id`；transition 校验 `WaitRecord.execution_id` 同源 | 写 `None`、resume Attempt execution id、payload 值，或让消费者宽松比对/推断 |
 | query 的业务语义 | producer semantic query；缺失时 accepted projection 机械序列化 canonical args | 不做 key 分类 | synthetic “工具 X 请求参数”或下游 repair |
 | tool schema name/description/params/enums/errors | 具体 ToolDefinition/tool producer 文件 | 自足、业务可读、必要引用标签有说明 | Host 代替 producer 打 blacklist 补丁 |
 | accepted result LLM material | `accepted_result_projection.py` + `evidence.py` | 组合已验证 request、raw result、explicit citation | 从 opaque refs、日志、id、digest 猜业务事实 |
@@ -147,6 +158,9 @@ resolve_wait
   -> _wait_tool_call_requested_event
        从 wait_id 字符串派生 request event id
        从 TOOL_AWAITING 重复 digest 证明 request
+  -> durable.run_transition._waiting_tool_result_event_request
+       attempt_id = suspended source Attempt id
+       execution_id = None  # 当前 owner defect
   -> wait resolution TOOL_RESULT_ACCEPTED
 
 resume RunInput
@@ -155,6 +169,10 @@ resume RunInput
 ```
 
 这里同时存在正文被改写、digest 分裂、事件 id 猜测、重复 durable truth 和 fallback 掩盖 corruption。
+
+Controller 验证还提供了更直接的 execution-identity 证据：`resume_run_from_waiting_in_transaction` 和 `_terminal_run_from_waiting_in_transaction` 均已读取 suspended `source_attempt` 与 `wait_record`，但共用 `_waiting_tool_result_event_request` 将 result `execution_id` 硬编码为 `None`；另一方面，`_invalid_waiting_resolution_precondition` 已校验 run/attempt/wait 的 id 与状态，却未校验 `wait_record.execution_id == source_attempt.execution_id`。因此 root cause 是 durable transition writer 与其写前不变量缺失，不是 strict consumer equality 过强。
+
+同时，public call path 的上游 sequencing 是明确的：`DefaultHostResolveWaitService._resolve_resume/_resolve_failed/_resolve_lost` 在构造 typed transition input 时先求值 `_tool_result_resolution_payload`；该 helper 调用 `_wait_tool_call_requested_event`，并在返回 payload 前校验 `TOOL_AWAITING.execution_id == wait_record.execution_id` 且 `TOOL_CALL_REQUESTED.execution_id == wait_record.execution_id`。腐化 WaitRecord execution 后，此路径会先抛 `HostDurableError`，不会调用 durable transition，更不会返回 transition `INVALID_STATE`。因此 public corrupt-path test 不能代替 lower transition owner test；两层 guard 各自保留并由不同测试证明。
 
 ### 3.3 LLM projection 与 opaque source
 
@@ -204,6 +222,11 @@ LLM tool call
                        exact args / same digest / optional producer query
   -> ordinary execution result
      or TOOL_AWAITING(governance + explicit request event ref only)
+  -> ordinary TOOL_RESULT_ACCEPTED
+     or wait-resolution durable transition
+          source Attempt + WaitRecord exact execution equality
+          -> TOOL_RESULT_ACCEPTED(source Attempt attempt/execution identity)
+          -> resume Attempt facts | terminal Run facts
   -> TOOL_RESULT_ACCEPTED envelope(link to request atom; opaque refs internal)
   -> strict AcceptedToolResultProjection
        query = producer query | canonical accepted args
@@ -350,11 +373,15 @@ accepted_arguments_source_digest
 | normalized digest 与 arguments payload digest mismatch | fail closed |
 | semantic query descriptor/digest mismatch | fail closed |
 | accepted-result envelope 的 request ref/digest 与 atom 不一致 | fail closed |
+| `WaitRecord.execution_id` 与 suspended source `AttemptRow.execution_id` 不一致 | transition 返回 `INVALID_STATE`；在任何 append/state mutation 前终止，不写 result/resume/terminal facts |
+| wait-resolution `TOOL_RESULT_ACCEPTED` 使用 `None`、resume execution id 或非 source Attempt id | writer contract 违反；resume/terminal 两分支都必须写 suspended source Attempt execution id |
 | resume canonical args 不可读 | fail closed；删除 `_resume_wait_fallback_message` |
 | canonical `TOOL_RESULT_ACCEPTED` projection 后 `llm_material` 缺失 | RunInput、Memory、Compact、LLM-ready Tool Trace 均抛 `HostDurableError` |
 | Tool Trace 的 `TOOL_CALL_REQUESTED` row/atom 缺失或损坏 | `HostDurableError`；不输出 placeholder、limited signal 或 internal ref/digest |
 
 失败关闭必须发生在写 wait resolution/resume facts 或构造 LLM input 之前；不得生成“继续回答但不重建 tool call”的 compatibility system message。四个 LLM consumer 不得 catch 后跳过单条 evidence、继续构造部分输入、返回 fallback/limited signal 或改投 internal refs；沿现有上层 durable-error path 暴露失败，R03 不新增 consumer-specific recovery。
+
+wait-resolution 的 result fact 与触发 await 的 canonical request 同属 suspended source Attempt，因而 `TOOL_RESULT_ACCEPTED.attempt_id == source_attempt.attempt_id` 且 `TOOL_RESULT_ACCEPTED.execution_id == source_attempt.execution_id`。resume 分支后续新建 Attempt 的 `resume_execution_id` 是新一轮执行身份，不得回写到上一轮已接受 result fact。`accepted_result_projection.py::_request_row_matches_result` 继续要求 request/result `session/run/attempt/execution` 全部严格等值；不恢复 `result.execution_id is None` 兼容。
 
 ### 4.6 query/source/material contract
 
@@ -391,7 +418,7 @@ Topic 3 与 Topic 4 必须留在一个 R03：Topic 3 决定 accepted request/que
 
 ### 6.1 目标结果
 
-一个 transaction-safe、descriptor-capable、strict-digest request atom writer 同时服务 ordinary 和 awaiting；`TOOL_AWAITING` 只链接该 atom；resolve/resume 对断链或 digest corruption 失败关闭。
+一个 transaction-safe、descriptor-capable、strict-digest request atom writer 同时服务 ordinary 和 awaiting；`TOOL_AWAITING` 只链接该 atom；resolve/resume 对断链或 digest corruption 失败关闭。wait-resolution durable transition 还必须以 suspended source Attempt 的 exact durable execution id 写入 `TOOL_RESULT_ACCEPTED`，并在任何 result/resume/terminal fact 之前验证 `WaitRecord` 与 source Attempt execution 同源。
 
 ### 6.2 精确允许文件
 
@@ -404,6 +431,7 @@ Topic 3 与 Topic 4 必须留在一个 R03：Topic 3 决定 accepted request/que
 - `dayu/host/payload_resolution.py`
 - `dayu/host/accepted_result_projection.py`
 - `dayu/host/run_input.py`
+- `dayu/host/durable/run_transition.py`
 
 测试：
 
@@ -412,13 +440,19 @@ Topic 3 与 Topic 4 必须留在一个 R03：Topic 3 决定 accepted request/que
 - `tests/host/test_resolve_wait_command.py`
 - `tests/host/test_run_input_builder.py`
 - `tests/host/test_accepted_result_projection.py`
+- `tests/host/test_compact_material.py`
+- `tests/host/test_memory_projection.py`
+- `tests/host/test_tool_trace_projection.py`
+- `tests/host/test_tool_trace_queries.py`
 
 文档：
 
 - `dayu/host/README.md`
 - `tests/README.md`
 
-本 slice 不得修改其它 production/test/doc 文件。若直接证据要求扩出 allowlist，停止并回 plan review，不得顺手修改。
+上述四个新增 test path 是 Controller 已接受的 strict-consumer fixture 传播扩边；它们不新增 production 语义。本次 transition correction 的最小 owner-level 测试文件只是已在 allowlist 内的 `tests/host/test_resolve_wait_command.py`：该文件用 public `resolve_wait` 证明正常 resume/failed/lost producer 写入 source Attempt execution identity，并在同一真实 durable store fixture 上直接调用 resume/terminal transition 证明 lower mismatch invariant；不新建测试文件、不引入 fake writer 或 production test seam。
+
+本 slice 不得修改其它 production/test/doc 文件。若直接证据要求扩出上述经 Controller 纠正后的 exact allowlist，停止并回 plan review，不得顺手修改。
 
 ### 6.3 符号级改动
 
@@ -437,6 +471,14 @@ Topic 3 与 Topic 4 必须留在一个 R03：Topic 3 决定 accepted request/que
 7. `payload_resolution.py::tool_call_request_atoms` 新增 normalized/payload digest equality guard，并把“LLM-safe 参数”文案改成“Host 已接受的 exact canonical 参数”。
 8. `accepted_result_projection.py::_request_atoms_projection` 对 canonical envelope 的 missing/broken/unreadable/mismatch request link 抛 `HostDurableError`，不产 limited query。
 9. `run_input.py::_resume_wait_messages_from_current_start` 要求 strict projection 提供 exact arguments；删除 `_resume_wait_fallback_message` 与 safe/fallback docstring。
+10. `durable/run_transition.py::_invalid_waiting_resolution_precondition` 在现有 run/attempt/wait id 与状态校验中新增 `wait_record.execution_id == source_attempt.execution_id` 不变量。不一致时返回 `StateMutationStatus.INVALID_STATE`，且必须发生在 resume 分支的 `RESUME_REQUESTED` append、两分支的 `TOOL_RESULT_ACCEPTED` append、wait state mutation、新 Attempt/dispatch 写入和 terminal Run fact 之前。
+11. `durable/run_transition.py::_waiting_tool_result_event_request` 通过 typed 直接参数接收已校验的 suspended `source_attempt: AttemptRow`（或等价的明确 typed source execution 参数），并写入 `attempt_id=source_attempt.attempt_id`、`execution_id=source_attempt.execution_id`。`resume_run_from_waiting_in_transaction` 与 `_terminal_run_from_waiting_in_transaction` 必须共用该 owner writer；不从 `request.resume_execution_id`、`tool_result_payload`、`WaitRecord` 或 event link 反推，不留 `None` 兼容。
+
+本 correction 必须保留已落地的三项 S1 contract，不因 producer 缺口倒退：
+
+- `accepted_result_projection.py::_request_row_matches_result` 保持 request/result `session/run/attempt/execution` strict equality，不恢复 `result.execution_id is None` 放行；
+- `payload_resolution.py` 保持 descriptor arguments 与 semantic query 的冷热正文互斥 guard，descriptor shape 不得同时携带 inline copy；
+- `TOOL_AWAITING` 测试 fixture 保持 exact governance-only key set，只用真实 canonical request row/ref 建链，不恢复 accepted arguments、result material 或 legacy loose payload。
 
 ### 6.4 S1 tests 与反例
 
@@ -449,6 +491,13 @@ Topic 3 与 Topic 4 必须留在一个 R03：Topic 3 决定 accepted request/que
 - idempotent replay：同 key/same digest 返回既有 ack，不写第二组 facts；same-body existing request row 使用既有真实 sequence；different semantic digest 或 different-body event identity 冲突保持且无部分写入。
 - identity mapping：ordinary payload 的 `tool_identity_digest` 精确等于 `ToolAcceptCall.tool_identity_digest`，awaiting 精确等于 `ToolAwaitingAcceptCandidate.tool_identity_digest`；用与 schema digest 不同的 sentinel证明 builder 未重算或反推。
 - corruption matrix覆盖 §4.5，每个 case 断言无新 resolution/resume EventLog row、Run/Attempt 状态未被错误推进。
+- 在 `test_resolve_wait_completed_resumes_run_and_wakes_dispatch` 的 resume union 分支中，定位唯一 `TOOL_RESULT_ACCEPTED` row，断言其 `attempt_id == seeded.attempt_id` 且 `execution_id == seeded.execution_id`，同时断言新 resume Attempt 使用独立的 resume execution id，防止两轮 identity 混用。
+- 在 `test_resolve_wait_failed_and_lost_close_run_without_resume_attempt` 的 terminal union 分支中，对 failed/lost 的 `TOOL_RESULT_ACCEPTED` 分别断言 `attempt_id/execution_id` 精确等于各自 suspended source Attempt，且没有 resume Attempt/dispatch。
+- public resolve tests 只负责正常 producer identity：`test_resolve_wait_completed_resumes_run_and_wakes_dispatch` 证明 resume result，`test_resolve_wait_failed_and_lost_close_run_without_resume_attempt` 证明 failed/lost result；不通过腐化 WaitRecord 期待 public API 返回 transition `INVALID_STATE`。现有 public request-atom corruption tests 继续断言上游 `HostDurableError` 与 no mutation，但明确不把该证据计作 lower transition invariant coverage。
+- 在同一文件新增一个参数化 direct-transition owner test，以 `completed -> resume_run_from_waiting_in_transaction` 和 `failed -> fail_run_from_waiting_in_transaction` 代表 `ResumeRunFromWaitingInput | WaitingRunTerminalInput` 两个 union 分支。每个 case 先通过现有 `_seed_waiting_run` 建立正常 `WAITING` Run / `SUSPENDED` source Attempt / active WaitRecord；再用现有 `create_running_run_with_starting_attempt_in_transaction` 在同一 test database 建立一组 id 全部不同的辅助 Run/Attempt/dispatch，只用该辅助 Attempt 的 execution id 把目标 `WaitRecord.execution_id` 改为满足 SQLite foreign key 但与 source Attempt 不同的值。该腐化只制造 WaitRecord/source Attempt 语义不同源，不改 source Attempt、目标 Run 或 request atom identity，不关闭 foreign-key 约束。
+- 两个 case 都用 production `EventLogStore` 和 `HostTransactionRunner.run_write` 直接调用 transition，显式构造完整 typed `ResumeRunFromWaitingInput` / `WaitingRunTerminalInput`：所有 id/text/digest/status/worker 字段均合法，resume 使用独立非空 resume ids/execution，terminal 使用 `RunStatus.FAILED` + `WaitRecordStatus.FAILED`；`tool_result_payload` 可使用明确的 test-only JSON object，因为该 transition input 将 payload 当作 opaque `JsonValue`，此测试不重复 public result-payload owner。
+- 每个 direct call 都断言返回 `StateMutationStatus.INVALID_STATE`，不期待 `HostApiError`；返回的 `resume_requested_event/tool_result_event/run_event/attempt_started_event/dispatch_record` 均为 `None`。以腐化完成、transition 调用前的 durable snapshot 为 baseline，按稳定主键顺序读取并断言调用后的 EventLog、`host_runs`、`host_attempts`、`host_wait_records` 和 `host_attempt_dispatch_records` 全表 rows 完全相等；因而无新 `RESUME_REQUESTED`、`TOOL_RESULT_ACCEPTED`、`RUN_STARTED`、`ATTEMPT_STARTED`、`RUN_FAILED`/`RUN_LOST` 或任何其它 partial fact/state mutation。
+- 保留 strict consumer execution-mismatch 的 `HostDurableError`/no-publication 反例、descriptor arguments/query 冷热双份正文拒绝反例和 governance-only `TOOL_AWAITING` exact-key fixture；不改成 loose fixture、limited/fallback 或展示层容错。
 - 删除旧测试：`test_awaiting_accept_persists_only_llm_safe_replay_arguments`、legacy/abnormal awaiting fallback tests、`test_resume_wait_replays_only_llm_safe_arguments`；用 owner-contract tests 替换，不保留兼容分支倒逼生产。
 
 ### 6.5 S1 验证
@@ -460,16 +509,48 @@ pytest \
   tests/host/test_wait_awaiting_accept.py \
   tests/host/test_resolve_wait_command.py \
   tests/host/test_run_input_builder.py \
-  tests/host/test_accepted_result_projection.py -q
+  tests/host/test_accepted_result_projection.py \
+  tests/host/test_compact_material.py \
+  tests/host/test_memory_projection.py \
+  tests/host/test_tool_trace_projection.py \
+  tests/host/test_tool_trace_queries.py -q
 
 pytest tests/host -k 'tool_call_requested or awaiting_accept or replay_arguments or request_atom' -q
+pytest tests/host -q
+
+python -m pyright dayu/ tests/ utils/
+
+python -m ruff check \
+  dayu/host/tool_call_request.py \
+  dayu/host/tool_runtime.py \
+  dayu/host/waiting.py \
+  dayu/host/_event_payload.py \
+  dayu/host/payload_resolution.py \
+  dayu/host/accepted_result_projection.py \
+  dayu/host/run_input.py \
+  dayu/host/durable/run_transition.py \
+  tests/host/test_toolruntime_accept_barrier.py \
+  tests/host/test_wait_awaiting_accept.py \
+  tests/host/test_resolve_wait_command.py \
+  tests/host/test_run_input_builder.py \
+  tests/host/test_accepted_result_projection.py \
+  tests/host/test_compact_material.py \
+  tests/host/test_memory_projection.py \
+  tests/host/test_tool_trace_projection.py \
+  tests/host/test_tool_trace_queries.py
+
+pytest \
+  tests/host/test_resolve_wait_command.py \
+  tests/host/test_run_attempt_transitions.py \
+  --cov=dayu.host.durable.run_transition \
+  --cov-report=term-missing -q
 ```
 
-逐文件 coverage target：新增 `dayu/host/tool_call_request.py >= 95%`；其余每个修改 production file `>= 80%`。低于目标必须补 owner-level branch/corruption tests，不得 `pragma: no cover`、降低阈值或用 mock 固化旧 payload。
+逐文件 coverage target：新增 `dayu/host/tool_call_request.py >= 95%`；`dayu/host/payload_resolution.py >= 90%`、`dayu/host/accepted_result_projection.py >= 90%`；包括新扩边 `dayu/host/durable/run_transition.py` 在内的其余每个修改 production file `>= 80%`。`test_resolve_wait_command.py` 是本 correction 新行为的唯一必改 owner test；`test_run_attempt_transitions.py` 仅作为现有 no-diff transition regression/coverage suite 执行，不进入 edit allowlist。低于目标必须补 allowlist 内的 owner-level branch/corruption tests 或停止回 Controller，不得 `pragma: no cover`、降低阈值、用 package aggregate 代替单文件结果，或用 mock 固化旧 payload。
 
 ### 6.6 S1 完成/stop
 
-S1 handoff 必须包含 shared writer contract、old/new payload snapshots、corruption matrix、测试/coverage/pyright 结果和精确 diff。若 upstream 无法提供 exact canonical arguments、需修改 Engine tool-call contract、需兼容旧 waiting facts或需 schema migration，立即停止回 controller。
+S1 handoff 必须包含 shared writer contract、old/new payload snapshots、wait-resolution source execution identity 与 no-partial-facts proof、corruption matrix、测试/coverage/pyright/ruff 结果和精确 diff。若 upstream 无法提供 exact canonical arguments、durable source Attempt 无法提供 exact execution id、需使用 resume execution id 或 `None`、需放宽 strict consumer equality、需修改 Engine tool-call contract、需兼容旧 waiting facts或需 schema migration，立即停止回 Controller。在本 correction 经双路 review 与 Controller 接受前，当前 implementation diff 只得保留，不得继续实现、进入 code review、S2、S3 或 aggregate。
 
 ## 7. R03-S2 — 删除 blacklist repair，修正 LLM source owners
 
@@ -1071,6 +1152,7 @@ python -m pyright dayu/ tests/ utils/
 | `dayu/host/payload_resolution.py` | `>=90%` | inline/descriptor/digest corruption matrix |
 | `dayu/host/accepted_result_projection.py` | `>=90%` | request/query/citation/ref negative projection |
 | `dayu/host/run_input.py` | `>=80%` | ordinary/resume/material propagation |
+| `dayu/host/durable/run_transition.py` | `>=80%` | `test_resolve_wait_command.py` 的 resume/terminal/source-execution mismatch，加现有 no-diff `test_run_attempt_transitions.py` transition regression |
 | `dayu/host/tool_trace.py` | `>=80%` | request/result readable/internal separation |
 | `dayu/runtime/__init__.py` | `>=80%` | 仅 docstring 删除；现有 `tests/runtime/test_import_boundary.py` package import 覆盖，不豁免、不新增无关测试 |
 | `dayu/runtime/json_redaction.py`（删除） | N/A | deletion/source proof，不保留 dead module |
@@ -1105,7 +1187,9 @@ git diff --name-only "$R03_IMPLEMENTATION_BASE_SHA"...HEAD
 git status --short
 ```
 
-逐 slice 与 aggregate 都将 `git diff --name-only` 和本计划 exact allowlist 做集合比较。design/control/prior artifact、Issue #177/#178、authorization 文件有任何 diff 都是 hard stop。
+逐 slice 与 aggregate 都将 `git diff --name-only` 和本计划 exact allowlist 做集合比较。纠正后的 S1 implementation exact allowlist 由 §6.2 的 8 个 production path、9 个 test path 和 2 个 README path组成；其中 `dayu/host/durable/run_transition.py` 是唯一新增 production owner，`tests/host/test_resolve_wait_command.py` 是 transition correction 唯一必改 owner-level test file，四个 strict-consumer test path 保留 Controller 已接受的 test-only 扩边。
+
+本 **plan correction gate** 的 writable allowlist 另行收紧为本 plan 与新 correction artifact；必须对 correction 前已存在的所有 production/tests/README/control/prior-artifact dirty path 做内容摘要前后比对，证明本 gate 既没有删除/回滚/覆盖，也没有继续实现。design/control/prior artifact、Issue #177/#178、authorization 文件有任何由本 gate 引入的 diff 都是 hard stop。
 
 ### 13.5 propagation scans
 
@@ -1194,6 +1278,7 @@ README 只能在对应 implementation slice 的代码已经落地后更新当前
 | 非 Fins tools 当前可能无 explicit citation | 合法 source-unavailable，不从 URL/path/ref 猜 | 对应 tool producer；未来需 citation 时在 producer另行设计 |
 | internal Tool Trace 仍保存 ids/refs/digests | 允许 internal diagnostic；LLM-ready summary 与其分离 | durable Tool Trace owner |
 | EventLog envelope 仍保存 opaque refs | 这是 accepted internal provenance contract | evidence/audit owner |
+| WaitRecord/source Attempt execution 可被腐化为不同源 | durable transition 写前 strict equality；mismatch 无 result/resume/terminal partial facts | `dayu/host/durable/run_transition.py` |
 | real Web/provider/Fins smoke 依赖外部环境 | completion 必须真实通过；不能 skip/fake | controller 提供/确认 smoke 环境 |
 | Issue #177 continuation 尚未完整 wiring | 不在 R03；`fetch_more` schema修文案不改变该事实 | Issue #177 |
 | Issue #178 | 完全不进入 R03 | Issue #178 |
@@ -1205,11 +1290,13 @@ README 只能在对应 implementation slice 的代码已经落地后更新当前
 - schema owner 确实要求 LLM 提交 credential 且无法迁到 config/environment；
 - 需要 Host import Fins、发明 BusinessSource、解析 arbitrary citation/ref kind；
 - 需要兼容旧 DB/EventLog、双写 safe/raw、legacy fallback 或 migration；
+- wait-resolution result identity 无法从 suspended source Attempt 直接取得，或修复需要 `execution_id=None`、resume Attempt execution id、payload 推断或放宽 strict consumer equality；
+- `WaitRecord.execution_id` 与 source `AttemptRow.execution_id` 不同源时无法在任何 result/resume/terminal append 及 state mutation 前失败关闭；
 - 需要 Issue #177/#178、统一授权或新的第四 slice 才能继续；
 - 任何计划外 production/test/doc 文件成为必改；
 - real public-run smoke 只能靠 fake/scripted provider 或伪 awaiting result 才能通过。
 
-当前直接证据没有触发上述 stop；因此本计划可进入独立 plan review，但尚未授权 implementation。
+当前直接证据没有触发上述 stop；因此完整修订计划可进入 MiMo/DS 双路 review 和 Controller adjudication，但尚未授权 R03-S1 implementation continuation。
 
 ## 17. Plan gate 自检
 
@@ -1217,7 +1304,9 @@ README 只能在对应 implementation slice 的代码已经落地后更新当前
 - Topic 3/4 accepted decisions全部保留，没有引入 safe normalization、BusinessSource、compatibility 或 auth framework。
 - 只有 S1/S2/S3 三片，且解释了同一 R03 和最小三片原因。
 - 每片列出 exact production/test/doc allowlist、symbols、data flow、contracts、negative cases、dependencies、tests、coverage 与 stop。
+- S1 exact allowlist 已加入 durable result writer owner `dayu/host/durable/run_transition.py`；resume/terminal union 的 result identity、`WaitRecord`/source Attempt execution 同源前置条件与 mismatch no-partial-facts 均落在 owner boundary。
+- transition correction 只选用现有 `tests/host/test_resolve_wait_command.py`；public resume/failed/lost tests 只证正常 producer execution identity，completed/failed direct typed transition tests 才证 mismatch `INVALID_STATE` 与全表 no-partial-facts，上游 request-atom guard 不代替 lower invariant。strict consumer equality、descriptor 冷热互斥 guards 与 governance-only `TOOL_AWAITING` fixture 都显式保留。
 - prompt assets、production tool schemas、Host/Engine/Tool renderers、tests/smokes 和 R01 §11 已形成 manual per-file baseline：当前 37 个 prompt asset 全覆盖，114 个 executable-Python constructor scan path 均有逐文件 disposition，R01 §11 的 30 个 data row 全部消费；grep 仅作 gate。
 - compliant prompt/schema 已标 no-diff；只对直接证据确认的 `fetch_more`、Web `url`、Fins common ids 修 owner。
 - README、real smoke、completion artifact、residual owner 与 gate stop 已定义。
-- 本 artifact 不修改 production/tests/README/design/control/prior artifacts，不进入 implementation，不 commit/push。
+- 本 correction 不修改 production/tests/README/design/control/prior artifacts，不进入 implementation continuation、S2/S3、Issue #177/#178 或 authorization，不 commit/push。
