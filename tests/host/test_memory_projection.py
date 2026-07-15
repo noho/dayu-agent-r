@@ -303,6 +303,22 @@ def _event(
     )
 
 
+def _memory_tool_material(result_text: str) -> AcceptedToolEvidenceLLMMaterial:
+    """构造 Memory owner 测试使用的 typed accepted evidence material。
+
+    :param result_text: canonical result 测试文本。
+    :returns: typed LLM material。
+    :raises ValueError: 文本为空时由 material contract 抛出。
+    """
+
+    return AcceptedToolEvidenceLLMMaterial(
+        tool_name="memory_test_tool",
+        query_text="参数：{}",
+        source_text=ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
+        result_text=result_text,
+    )
+
+
 def _tool_awaiting_governance_payload(
     *,
     request_event_id: str,
@@ -882,6 +898,9 @@ def test_pre_compact_projection_only_builds_selected_recent_window() -> None:
                 "tool-1",
                 "TOOL_RESULT_ACCEPTED",
                 {"display_text": "10-K revenue table"},
+                accepted_tool_evidence=_memory_tool_material(
+                    canonical_json_dumps({"table": "10-K revenue"})
+                ),
             ),
         ),
         session_id=_SESSION_ID,
@@ -963,6 +982,9 @@ def test_tool_awaiting_presence_does_not_change_llm_facing_memory_semantics() ->
             "tool-result-1",
             "TOOL_RESULT_ACCEPTED",
             {"display_text": "下载工具返回：已保存 Circle 2024 10-K。"},
+            accepted_tool_evidence=_memory_tool_material(
+                canonical_json_dumps({"saved": "Circle 2024 10-K"})
+            ),
         ),
         _event(
             5,
@@ -1076,6 +1098,9 @@ def test_selected_recent_window_floor_protects_recent_run_groups() -> None:
                 "TOOL_RESULT_ACCEPTED",
                 {"display_text": "mid evidence"},
                 run_id="run-mid",
+                accepted_tool_evidence=_memory_tool_material(
+                    canonical_json_dumps({"evidence": "mid"})
+                ),
             ),
             _event(
                 6,
@@ -1098,6 +1123,9 @@ def test_selected_recent_window_floor_protects_recent_run_groups() -> None:
                 "TOOL_RESULT_ACCEPTED",
                 {"display_text": "new evidence"},
                 run_id="run-new",
+                accepted_tool_evidence=_memory_tool_material(
+                    canonical_json_dumps({"evidence": "new"})
+                ),
             ),
         ),
         session_id=_SESSION_ID,
@@ -1115,14 +1143,19 @@ def test_selected_recent_window_floor_protects_recent_run_groups() -> None:
         "run-new",
         "run-new",
     )
-    fallback_text = render_accepted_tool_evidence_for_llm(None)
+    mid_evidence_text = render_accepted_tool_evidence_for_llm(
+        _memory_tool_material(canonical_json_dumps({"evidence": "mid"}))
+    )
+    new_evidence_text = render_accepted_tool_evidence_for_llm(
+        _memory_tool_material(canonical_json_dumps({"evidence": "new"}))
+    )
     assert tuple(item.text for item in selected) == (
         "mid user",
         "mid answer",
-        fallback_text,
+        mid_evidence_text,
         "new user",
         "new answer",
-        fallback_text,
+        new_evidence_text,
     )
 
 
@@ -1703,36 +1736,34 @@ def test_accepted_tool_evidence_missing_projection_fields_fail_closed() -> None:
         source_refs=(),
     )
 
-    snapshot = build_conversation_memory_snapshot_from_events(
-        events=(
-            _event(
-                1,
-                event_id,
-                "TOOL_RESULT_ACCEPTED",
-                {
-                    "accepted_evidence_envelope": (
-                        accepted_evidence_envelope_to_json_value(envelope)
-                    ),
-                    "raw_tool_outcome": {
-                        "status": "ok",
-                        "text": "tool fact accepted",
+    with pytest.raises(
+        HostDurableError,
+        match="TOOL_RESULT_ACCEPTED memory LLM material is missing",
+    ):
+        build_conversation_memory_snapshot_from_events(
+            events=(
+                _event(
+                    1,
+                    event_id,
+                    "TOOL_RESULT_ACCEPTED",
+                    {
+                        "accepted_evidence_envelope": (
+                            accepted_evidence_envelope_to_json_value(envelope)
+                        ),
+                        "raw_tool_outcome": {
+                            "status": "ok",
+                            "text": "tool fact accepted",
+                        },
+                        "result_preview": "preview must not be read by memory",
                     },
-                    "result_preview": "preview must not be read by memory",
-                },
-                accepted_tool_evidence=None,
+                    accepted_tool_evidence=None,
+                ),
             ),
-        ),
-        session_id=_SESSION_ID,
-        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
-        policy=policy,
-        built_at=_NOW,
-    )
-
-    text = snapshot.trace_memory.selected_recent_window[0].text
-    assert text == render_accepted_tool_evidence_for_llm(None)
-    assert "lookup_mock_fact" not in text
-    assert "tool fact accepted" not in text
-    assert "preview must not be read" not in text
+            session_id=_SESSION_ID,
+            consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+            policy=policy,
+            built_at=_NOW,
+        )
 
 
 def test_accepted_tool_evidence_uses_projection_fields_without_payload_rebuild() -> None:
@@ -1763,34 +1794,33 @@ def test_accepted_tool_evidence_uses_projection_fields_without_payload_rebuild()
         policy=policy,
         built_at=_NOW,
     )
-    missing_fields_snapshot = build_conversation_memory_snapshot_from_events(
-        events=(
-            _event(
-                1,
-                "event-tool-result-missing-projection-memory",
-                "TOOL_RESULT_ACCEPTED",
-                payload,
-                accepted_tool_evidence=None,
+    with pytest.raises(
+        HostDurableError,
+        match="TOOL_RESULT_ACCEPTED memory LLM material is missing",
+    ):
+        build_conversation_memory_snapshot_from_events(
+            events=(
+                _event(
+                    1,
+                    "event-tool-result-missing-projection-memory",
+                    "TOOL_RESULT_ACCEPTED",
+                    payload,
+                    accepted_tool_evidence=None,
+                ),
             ),
-        ),
-        session_id=_SESSION_ID,
-        consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
-        policy=policy,
-        built_at=_NOW,
-    )
+            session_id=_SESSION_ID,
+            consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+            policy=policy,
+            built_at=_NOW,
+        )
 
     projected_text = projected_snapshot.trace_memory.selected_recent_window[0].text
-    missing_fields_text = (
-        missing_fields_snapshot.trace_memory.selected_recent_window[0].text
-    )
     assert "projection_tool" in projected_text
     assert "projection query" in projected_text
     assert "projection result" in projected_text
     assert "filing:projection" in projected_text
-    assert missing_fields_text == render_accepted_tool_evidence_for_llm(None)
     for forbidden in ("payload_tool_must_not_leak", "payload result must not leak"):
         assert forbidden not in projected_text
-        assert forbidden not in missing_fields_text
 
 
 def test_accepted_compact_limits_evidence_facts_and_records_budget_diagnostic() -> None:

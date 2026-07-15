@@ -38,7 +38,7 @@ from dayu.engine.contracts.engine_events import (
 from dayu.engine.contracts.agent_policy import AgentFallbackMode, AgentPolicy
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import AgentMessage, AgentMessageRole, UserMessage
-from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.runner_spec import RunnerCallOptions
 from dayu.host import (
     AttemptDispatchSnapshot,
     CompactorRunnerBaseline,
@@ -52,6 +52,7 @@ from dayu.host import (
 )
 from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
 from dayu.host.context_policy import context_budget_policy_from_threshold_tokens
+from dayu.host.durable.codec import canonical_json_dumps
 from dayu.host.durable.schema import RUNNER_CALL_INPUT_MANIFEST_SCHEMA_VERSION
 from dayu.runtime.config_loader import ConfigLoader
 from dayu.runtime.scene_prepare import (
@@ -108,6 +109,11 @@ _PUBLIC_REACTIVE_FINAL_CONTENT = "reactive recovery final answer"
 _PUBLIC_REACTIVE_WORKER_ID = "public-reactive-worker"
 _PUBLIC_FINAL_WORKER_ID = "public-final-worker"
 _LONG_CHAPTER_MARKER = "DAYU_LONG_CHAPTER_RAW_EVIDENCE_OPERATING_MARGIN_42"
+_R03_PUBLIC_CITATION: dict[str, JsonValue] = {
+    "document_id": "mock-annual-report-2025",
+    "source_type": "public_compact_smoke",
+    "unknown_future_member": {"page": 42, "section": "Operating margin"},
+}
 _SECOND_FACTOR_MARKER = "第二个因素=库存周转率"
 _DUPLICATE_PROMPT_SENTENCE = "DAYU_DUPLICATE_PROMPT_COMPACT_SEGMENT。"
 _RUN_REAL_COMPACTOR_SMOKE_ENV = "DAYU_RUN_REAL_COMPACTOR_SMOKE"
@@ -435,6 +441,14 @@ async def test_post_compaction_fact_reuse_uses_raw_accepted_tool_evidence(
         material_json, marker=_LONG_CHAPTER_MARKER
     )
     material_text = json.dumps(material_json, ensure_ascii=False, sort_keys=True)
+    evidence_material = material_json["evidence_material"]
+    assert isinstance(evidence_material, list)
+    assert len(evidence_material) >= 1
+    first_evidence = evidence_material[0]
+    assert isinstance(first_evidence, Mapping)
+    assert first_evidence["source_note"] == canonical_json_dumps(
+        _R03_PUBLIC_CITATION
+    )
     assert "result_preview" not in material_text
     assert "payload:" not in material_text
     assert "event-tool-result" not in material_text
@@ -1545,6 +1559,7 @@ class _LongChapterMockTool:
                 ok=True,
                 value={
                     "chapter": _long_chapter_tool_result(),
+                    "citation": _R03_PUBLIC_CITATION,
                 },
                 meta=None,
             )

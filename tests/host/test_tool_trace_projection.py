@@ -38,6 +38,7 @@ from dayu.host.durable.projection import (
     read_projection_failure,
 )
 from dayu.host.durable.schema import (
+    TABLE_EVENT_LOG,
     TABLE_HOST_ATTEMPTS,
     TABLE_HOST_RUNS,
     TABLE_HOST_TOOL_TRACE_HOT,
@@ -95,6 +96,15 @@ class _AcceptedTraceCorruption(StrEnum):
     )
     RESULT_EXECUTION_MISSING = "result_execution_missing"
     RESULT_EXECUTION_MISMATCH = "result_execution_mismatch"
+
+
+class _RequestedRowCorruption(StrEnum):
+    """direct TOOL_CALL_REQUESTED canonical row 损坏分类。"""
+
+    MISSING_ROW = "missing_row"
+    WRONG_EVENT_TYPE = "wrong_event_type"
+    STORAGE_CONFLICT = "storage_conflict"
+    DIGEST_MISMATCH = "digest_mismatch"
 
 
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
@@ -298,6 +308,7 @@ def _append_accepted_tool_result_event(
     tool_call_id: str,
     tool_name: str,
     additional_payload: Mapping[str, JsonValue],
+    include_raw_outcome: bool = True,
 ) -> EventLogRow:
     """原子追加 canonical request 与 accepted result 成功夹具。
 
@@ -306,6 +317,7 @@ def _append_accepted_tool_result_event(
     :param tool_call_id: tool call id。
     :param tool_name: 工具名。
     :param additional_payload: signal 等 result-owned 附加字段。
+    :param include_raw_outcome: 是否写入 canonical raw outcome。
     :returns: 数据库返回的真实 result row。
     :raises ValueError: request/envelope 基础字段非法时抛出。
     :raises HostDurableError: request、envelope 或 EventLog 写入失败时抛出。
@@ -318,6 +330,7 @@ def _append_accepted_tool_result_event(
             tool_call_id=tool_call_id,
             tool_name=tool_name,
             additional_payload=additional_payload,
+            include_raw_outcome=include_raw_outcome,
         )
     )
 
@@ -329,6 +342,7 @@ def _append_accepted_tool_result_in_transaction(
     tool_call_id: str,
     tool_name: str,
     additional_payload: Mapping[str, JsonValue],
+    include_raw_outcome: bool = True,
 ) -> EventLogRow:
     """在同一 transaction 内追加 canonical request/result pair。
 
@@ -337,6 +351,7 @@ def _append_accepted_tool_result_in_transaction(
     :param tool_call_id: tool call id。
     :param tool_name: 工具名。
     :param additional_payload: signal 等 result-owned 附加字段。
+    :param include_raw_outcome: 是否写入 canonical raw outcome。
     :returns: 数据库返回的真实 result row。
     :raises ValueError: request/envelope 基础字段非法时抛出。
     :raises HostDurableError: request、envelope 或 EventLog 写入失败时抛出。
@@ -392,9 +407,10 @@ def _append_accepted_tool_result_in_transaction(
             "accepted_evidence_envelope": (
                 accepted_evidence_envelope_to_json_value(envelope)
             ),
-            "raw_tool_outcome": raw_tool_outcome,
         }
     )
+    if include_raw_outcome:
+        result_payload["raw_tool_outcome"] = raw_tool_outcome
     return _append_tool_event_in_transaction(
         transaction,
         event_id=event_id,
@@ -567,6 +583,61 @@ def _append_broken_accepted_tool_result_in_transaction(
         payload_digest=None,
         execution_id=result_execution_id,
     )
+
+
+def _append_corrupt_tool_request_event(
+    transaction_runner: HostTransactionRunner,
+    *,
+    corruption: _RequestedRowCorruption,
+) -> EventLogRow:
+    """追加 direct Tool Trace request corruption fixture。
+
+    :param transaction_runner: Host durable transaction runner。
+    :param corruption: request row 损坏分类。
+    :returns: 已持久化的 request-like row。
+    :raises HostDurableError: EventLog 写入失败时抛出。
+    """
+
+    event_id = f"event-request-direct-{corruption.value}"
+
+    def operation(transaction: HostTransaction) -> EventLogRow:
+        """在单 transaction 中写入 request-like row。
+
+        :param transaction: Host transaction。
+        :returns: 已持久化 row。
+        """
+
+        request = build_tool_call_requested_event_request(
+            transaction,
+            atom=_accepted_request_atom(
+                event_id=event_id,
+                tool_call_id=f"tool-call-direct-{corruption.value}",
+                tool_name="lookup_filing",
+            ),
+            event_id=event_id,
+            occurred_at=_FIXED_NOW,
+            origin=ToolCallRequestEventOrigin.ORDINARY_ACCEPT,
+        )
+        if corruption is _RequestedRowCorruption.WRONG_EVENT_TYPE:
+            request = replace(request, event_type="TOOL_CALL_GOVERNED")
+        elif corruption in {
+            _RequestedRowCorruption.STORAGE_CONFLICT,
+            _RequestedRowCorruption.DIGEST_MISMATCH,
+        }:
+            assert isinstance(request.payload_json, Mapping)
+            payload = dict(cast(Mapping[str, JsonValue], request.payload_json))
+            if corruption is _RequestedRowCorruption.STORAGE_CONFLICT:
+                payload["arguments_storage_kind"] = (
+                    TOOL_CALL_ARGUMENTS_STORAGE_PAYLOAD_DESCRIPTOR
+                )
+            else:
+                payload["normalized_arguments_digest"] = sha256_digest_json(
+                    {"arguments": {"fixture": "corrupt"}}
+                )
+            request = replace(request, payload_json=payload)
+        return append_event(transaction, request).row
+
+    return transaction_runner.run_write(operation)
 
 
 def _run_trace_once(
@@ -753,7 +824,16 @@ def test_tool_trace_request_corruption_records_failure_without_result_trace(
         assert projection_result.failures == 1
         assert hot_row is None
         assert failure is not None
-        assert failure.failed_event_id == result_event.event_id
+        expected_failed_event_id = (
+            f"{result_event.event_id}-request"
+            if corruption
+            in {
+                _AcceptedTraceCorruption.ARGUMENTS_DESCRIPTOR_WITH_INLINE,
+                _AcceptedTraceCorruption.SEMANTIC_QUERY_DESCRIPTOR_WITH_INLINE,
+            }
+            else result_event.event_id
+        )
+        assert failure.failed_event_id == expected_failed_event_id
         assert failure.last_error_code == HostDurableError.__name__
         assert checkpoint is not None
         assert checkpoint.checkpoint_event_sequence < result_event.event_sequence
@@ -763,6 +843,99 @@ def test_tool_trace_request_corruption_records_failure_without_result_trace(
             else ()
         )
         assert result_event.event_id not in cold_event_ids
+
+
+@pytest.mark.parametrize("corruption", tuple(_RequestedRowCorruption))
+def test_tool_trace_direct_request_row_corruption_fails_closed(
+    tmp_path: Path,
+    corruption: _RequestedRowCorruption,
+) -> None:
+    """direct request missing/type/storage/digest corruption 均 fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :param corruption: direct request row 损坏分类。
+    :returns: ``None``。
+    :raises AssertionError: Tool Trace 发布 limited/placeholder summary 时抛出。
+    """
+
+    cold_path = tmp_path / "trace" / "direct-request-corruption.jsonl"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        row = _append_corrupt_tool_request_event(
+            store.transaction_runner,
+            corruption=corruption,
+        )
+        event = projection_event_view_from_row(row)
+        if corruption is _RequestedRowCorruption.WRONG_EVENT_TYPE:
+            event = replace(event, event_type="TOOL_CALL_REQUESTED")
+        if corruption is _RequestedRowCorruption.MISSING_ROW:
+            store.transaction_runner.run_write(
+                lambda transaction: transaction.execute(
+                    f"DELETE FROM {TABLE_EVENT_LOG} WHERE event_id = ?",
+                    (row.event_id,),
+                )
+            )
+        consumer = ToolTraceProjectionConsumer(
+            ToolTraceSinkOptions(cold_jsonl_path=cold_path)
+        )
+
+        with pytest.raises(HostDurableError):
+            store.transaction_runner.run_write(
+                lambda transaction: consumer.apply_event(transaction, event)
+            )
+        hot_row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(
+                transaction,
+                row.event_id,
+            )
+        )
+        assert hot_row is None
+
+    assert _json_lines(cold_path) == ()
+
+
+def test_tool_trace_canonical_result_without_llm_material_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """LLM-ready Tool Trace 拒绝缺 typed material 的 canonical result。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: Tool Trace 生成 fallback/limited result summary 时抛出。
+    """
+
+    cold_path = tmp_path / "trace" / "missing-llm-material.jsonl"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        result = _append_accepted_tool_result_event(
+            store.transaction_runner,
+            event_id="event-result-missing-llm-material",
+            tool_call_id="tool-call-missing-llm-material",
+            tool_name="lookup_filing",
+            additional_payload={},
+            include_raw_outcome=False,
+        )
+        consumer = ToolTraceProjectionConsumer(
+            ToolTraceSinkOptions(cold_jsonl_path=cold_path)
+        )
+
+        with pytest.raises(
+            HostDurableError,
+            match="TOOL_RESULT_ACCEPTED tool trace LLM material is missing",
+        ):
+            store.transaction_runner.run_write(
+                lambda transaction: consumer.apply_event(
+                    transaction,
+                    projection_event_view_from_row(result),
+                )
+            )
+        hot_row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(
+                transaction,
+                result.event_id,
+            )
+        )
+        assert hot_row is None
+
+    assert _json_lines(cold_path) == ()
 
 
 def test_tool_call_chain_projects_hot_rows_and_cold_lines(tmp_path: Path) -> None:
@@ -2067,10 +2240,10 @@ def test_tool_trace_rejects_non_object_summary_signal_fields(
             )
 
 
-def test_tool_trace_does_not_inline_large_tool_call_arguments(
+def test_tool_trace_resolves_large_tool_call_arguments_without_internal_refs(
     tmp_path: Path,
 ) -> None:
-    """Tool Trace 投影 TOOL_CALL_REQUESTED 时不展开大参数 descriptor。"""
+    """Tool Trace 严格解析 descriptor 并只展示 bounded exact 参数。"""
 
     cold_path = tmp_path / "trace" / "cold.jsonl"
     large_arguments: Mapping[str, JsonValue] = {
@@ -2102,7 +2275,9 @@ def test_tool_trace_does_not_inline_large_tool_call_arguments(
             "tool_schema_digest": "sha256:schema",
             "tool_identity_digest": "sha256:identity",
             "normalized_arguments_digest": arguments_digest,
-            "arguments_json_size_bytes": 2048,
+            "arguments_json_size_bytes": len(
+                canonical_json_dumps(arguments_json).encode("utf-8")
+            ),
             "arguments_storage_kind": "payload_descriptor",
             "arguments_inline_json": None,
             "arguments_payload_ref": "payload-tool-call-arguments-large",
@@ -2142,7 +2317,8 @@ def test_tool_trace_does_not_inline_large_tool_call_arguments(
         assert arguments_digest in line_text
         assert "payload-tool-call-arguments-large" not in readable_text
         assert arguments_digest not in readable_text
-        assert "x" * 128 not in line_text
+        assert "x" * 128 in readable_text
+        assert "arguments payload" not in readable_text
 
 
 def test_tool_trace_projects_runner_call_manifest_signal(tmp_path: Path) -> None:
@@ -2632,15 +2808,11 @@ def test_projection_rebuild_from_event_log_restores_hot_rows(
 
     cold_path = tmp_path / "trace" / "cold.jsonl"
     with open_host_durable_store(_options(tmp_path)) as store:
-        _append_tool_event(
+        _append_canonical_tool_request_event(
             store.transaction_runner,
             event_id="event-requested",
-            event_type="TOOL_CALL_REQUESTED",
-            payload={
-                "tool_call_id": "tool-call-1",
-                "tool_name": "lookup_filing",
-                "normalized_arguments_digest": "sha256:args",
-            },
+            tool_call_id="tool-call-1",
+            tool_name="lookup_filing",
         )
         catch_up_tool_trace_projection(
             store.transaction_runner,
@@ -2683,15 +2855,11 @@ def test_cold_jsonl_source_key_digest_conflict_records_failure_without_hot_row(
 
     cold_path = tmp_path / "trace" / "cold.jsonl"
     with open_host_durable_store(_options(tmp_path)) as store:
-        event = _append_tool_event(
+        event = _append_canonical_tool_request_event(
             store.transaction_runner,
             event_id="event-requested",
-            event_type="TOOL_CALL_REQUESTED",
-            payload={
-                "tool_call_id": "tool-call-1",
-                "tool_name": "lookup_filing",
-                "normalized_arguments_digest": "sha256:args",
-            },
+            tool_call_id="tool-call-1",
+            tool_name="lookup_filing",
         )
         catch_up_tool_trace_projection(
             store.transaction_runner,

@@ -423,6 +423,10 @@ def _tool_result_memory_payload_view(
         result_row,
         resolved_payload=event.payload,
     )
+    if projection.llm_material is None:
+        raise HostDurableError(
+            "TOOL_RESULT_ACCEPTED memory LLM material is missing"
+        )
     return _MemoryProjectionPayloadView(
         payload=event.payload,
         assistant_final_answer_text=None,

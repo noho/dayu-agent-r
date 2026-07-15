@@ -35,18 +35,8 @@ _FIELD_TOOL_CALL_REQUESTED_EVENT_REF = "tool_call_requested_event_ref"
 _FIELD_TOOL_NAME = "tool_name"
 _FIELD_TOOL_QUERY = "tool_query"
 _FIELD_TRUNCATION_APPLIED = "truncation_applied"
-ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT = "查询语义不可用；参数未安全展开。"
-"""Accepted tool result query 不可安全投影时的唯一 LLM-facing 文案。"""
-
-ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT = (
-    "业务来源不可用；工具结果未提供可安全展示的来源。"
-)
-"""Accepted tool result source 不可安全投影时的唯一 LLM-facing 文案。"""
-
-ACCEPTED_EVIDENCE_MATERIAL_UNAVAILABLE_TEXT = (
-    "工具证据不可用；缺少可安全展示的工具名称或工具结果。"
-)
-"""Accepted tool evidence material 缺失时的唯一 LLM-facing 整体文案。"""
+ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT = "该工具结果未提供业务来源。"
+"""Accepted tool result 未携带显式业务来源时的唯一 LLM-facing 文案。"""
 _ENVELOPE_FIELDS = frozenset(
     {
         _FIELD_EVIDENCE_ID,
@@ -133,8 +123,8 @@ class AcceptedToolEvidenceLLMMaterial:
     """Accepted tool evidence 的 LLM-facing material。
 
     :param tool_name: 工具名称。
-    :param query_text: 工具查询业务语义；不可安全投影时为 projection fallback。
-    :param source_text: 业务来源；不可安全投影时为 projection fallback。
+    :param query_text: producer query 或 exact canonical 参数投影。
+    :param source_text: producer 显式 citation 或业务中性 unavailable 文案。
     :param result_text: 工具结果 canonical 文本。
     """
 
@@ -166,16 +156,17 @@ class AcceptedToolEvidenceLLMMaterial:
 
 
 def render_accepted_tool_evidence_for_llm(
-    material: AcceptedToolEvidenceLLMMaterial | None,
+    material: AcceptedToolEvidenceLLMMaterial,
 ) -> str:
     """渲染 accepted tool evidence 的唯一 LLM-facing 四行文本。
 
-    :param material: accepted evidence LLM material；缺失时为 ``None``。
-    :returns: 业务可读 evidence 文本；缺失时返回整体 fallback。
+    :param material: accepted evidence LLM material。
+    :returns: 业务可读 evidence 文本。
+    :raises TypeError: material 类型非法时抛出。
     """
 
-    if material is None:
-        return ACCEPTED_EVIDENCE_MATERIAL_UNAVAILABLE_TEXT
+    if not isinstance(material, AcceptedToolEvidenceLLMMaterial):
+        raise TypeError("material must be AcceptedToolEvidenceLLMMaterial")
     return "\n".join(
         (
             f"工具名称：{material.tool_name}",
@@ -653,8 +644,6 @@ def _require_optional_sha256_digest(
 
 
 __all__ = [
-    "ACCEPTED_EVIDENCE_MATERIAL_UNAVAILABLE_TEXT",
-    "ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT",
     "ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT",
     "AcceptedEvidenceEnvelope",
     "AcceptedEvidenceProducerEventRefMismatchError",

@@ -7,7 +7,6 @@ projection，不是事实真源，也不导入 Engine / Service / UI / Fins。
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -23,6 +22,7 @@ from dayu.host.compaction import (
 )
 from dayu.host.context_events import CONTEXT_COMPACTED as _EVENT_TYPE_CONTEXT_COMPACTED
 from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.errors import HostDurableError
 from dayu.host.evidence import (
     AcceptedToolEvidenceLLMMaterial,
     render_accepted_tool_evidence_for_llm,
@@ -1696,10 +1696,16 @@ def _selected_evidence_text(event: MemoryProjectionEvent) -> str:
     """读取 LLM-facing recent evidence 文本。
 
     :param event: ``TOOL_RESULT_ACCEPTED`` projection event。
-    :returns: 工具结果的业务可读文本或无内部引用的 limited-signal 文本。
+    :returns: 工具结果的业务可读文本。
+    :raises HostDurableError: canonical accepted result 缺 typed material 时抛出。
     """
 
-    return render_accepted_tool_evidence_for_llm(event.accepted_tool_evidence)
+    material = event.accepted_tool_evidence
+    if material is None:
+        raise HostDurableError(
+            "TOOL_RESULT_ACCEPTED memory LLM material is missing"
+        )
+    return render_accepted_tool_evidence_for_llm(material)
 
 
 def _session_summary_from_accepted_event(

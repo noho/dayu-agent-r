@@ -18,8 +18,10 @@ from dayu.contracts.tool_execution import AsyncDirectToolExecutionCapability
 from dayu.contracts.tool_outcome import (
     TOOL_CANCELLED_REASON_HOST_CANCELLED,
     ToolCancelledOutcome,
+    ToolCompletedOutcome,
     ToolExecutionOutcome,
 )
+from dayu.contracts.tool_result import ToolResultSuccess
 from dayu.contracts.tool_schema import (
     ToolFunctionSchema,
     ToolParametersSchema,
@@ -52,6 +54,7 @@ from dayu.host.api import (
     OperationContext,
     RunStatus,
 )
+from dayu.host.accepted_tool_outcome import accepted_tool_outcome_json
 from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
 from dayu.host.durable.event_log import (
@@ -59,6 +62,7 @@ from dayu.host.durable.event_log import (
     EventLogAppendRequest,
     EventLogRow,
     EventLogStore,
+    read_event_by_id,
 )
 from dayu.host.durable.memory import (
     ConversationMemoryProjectionConsumer,
@@ -159,6 +163,7 @@ from dayu.host.run_input import (
     ToolSchemaSnapshot,
     _SYSTEM_ENVELOPE_FORBIDDEN_FRAGMENTS,
     _fallback_context_messages,
+    _memory_projection_event_from_row,
     _normalize_ordinary_run_messages,
     _resume_wait_messages_from_current_start,
     _resume_wait_tool_message_content,
@@ -213,6 +218,28 @@ _INPUT_DIGEST = sha256_digest_json({"input": "current"})
 _POLICY_REF = "policy-snapshot-p5-s2"
 _DIGEST_A = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 _DIGEST_B = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+_R03_CITATION_OBJECT: dict[str, JsonValue] = {
+    "document_id": "MSFT-10K-2025",
+    "source_type": "sec_filing",
+    "unknown_future_member": {"page": 42, "section": "Revenue"},
+}
+_R03_OPAQUE_SENTINEL_REFS = (
+    OpaqueEvidenceRef(
+        ref_kind="fliing-typo",
+        ref_id="opaque-should-never-reach-llm",
+        digest=None,
+    ),
+    OpaqueEvidenceRef(
+        ref_kind="eventlog",
+        ref_id="event-internal-only",
+        digest=None,
+    ),
+    OpaqueEvidenceRef(
+        ref_kind="eventlogg",
+        ref_id="event-typo-should-never-reach-llm",
+        digest=None,
+    ),
+)
 _RESUME_GUIDANCE_COMPLETED_INTRO = "上一轮被等待中断的外部工具步骤已经完成。"
 _RESUME_GUIDANCE_NO_REPEAT = (
     "这是同一次用户请求中已完成的工具结果。继续回答用户；不要为了"
@@ -1588,6 +1615,108 @@ def test_run_input_builder_accepted_tool_evidence_uses_raw_outcome_text(
         assert evidence_block.canonical_source_refs == (seeded_evidence.accepted_evidence_id,)
         assert evidence_block.payload_refs == (f"payload:{seeded_evidence.tool_result_event_id}",)
         assert evidence_block.tool_call_event_ref == seeded_evidence.tool_call_event_id
+
+
+def test_run_input_messages_use_explicit_citation_and_hide_opaque_refs(
+    tmp_path: Path,
+) -> None:
+    """实际 RunInput messages 只展示 exact citation，不展示 opaque refs。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: citation 丢失或任一 opaque sentinel 泄漏时抛出。
+    """
+
+    raw_outcome = accepted_tool_outcome_json(
+        ToolCompletedOutcome(
+            result=ToolResultSuccess(
+                ok=True,
+                value={
+                    "citation": _R03_CITATION_OBJECT,
+                    "summary": "Revenue is 100",
+                },
+                meta=None,
+            )
+        )
+    )
+    messages: tuple[AgentMessage, ...] = ()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_prior_accepted_tool_evidence_batch(
+            store.transaction_runner,
+            session_id=session_id,
+            count=1,
+            raw_outcome=raw_outcome,
+            semantic_query_text="Read MSFT FY2025 revenue",
+            source_refs=_R03_OPAQUE_SENTINEL_REFS,
+            locator_refs=tuple(reversed(_R03_OPAQUE_SENTINEL_REFS)),
+        )
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("current prompt after cited evidence"),
+        )
+        builder = create_no_tool_run_input_builder(
+            transaction_runner=store.transaction_runner,
+            policy_snapshot=_policy_snapshot(),
+        )
+
+        blocks = builder.build_material_blocks(_attempt_snapshot(seeded))
+        current_block = blocks[-1]
+        assert len(current_block.canonical_source_refs) == 1
+        messages = _fallback_context_messages(
+            fallback=_active_fallback(
+                selected_blocks=blocks,
+                current_input_ref=current_block.canonical_source_refs[0],
+            ),
+            material_blocks=blocks,
+        )
+
+    visible_text = "\n".join(
+        _message_content(message) for message in messages
+    )
+    assert canonical_json_dumps(_R03_CITATION_OBJECT) in visible_text
+    for ref in _R03_OPAQUE_SENTINEL_REFS:
+        assert ref.ref_kind not in visible_text
+        assert ref.ref_id not in visible_text
+
+
+def test_run_input_canonical_accepted_result_without_material_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """RunInput owner 拒绝缺 typed material 的 canonical accepted result。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: RunInput 跳过损坏 result 或构造 limited input 时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _append_prior_accepted_tool_evidence_batch(
+            store.transaction_runner,
+            session_id=session_id,
+            count=1,
+            include_raw_outcome=False,
+        )[0]
+        row = store.transaction_runner.run_read(
+            lambda transaction: read_event_by_id(
+                transaction,
+                seeded.tool_result_event_id,
+            )
+        )
+        assert row is not None
+
+        with pytest.raises(
+            HostDurableError,
+            match="TOOL_RESULT_ACCEPTED typed LLM material is missing",
+        ):
+            store.transaction_runner.run_read(
+                lambda transaction: _memory_projection_event_from_row(
+                    transaction,
+                    row,
+                )
+            )
 
 
 def test_recent_window_fallback_selection_is_stable_and_budget_bounded() -> None:
@@ -4458,6 +4587,9 @@ def _append_prior_accepted_tool_evidence_batch(
     run_id: str | None = None,
     raw_outcome: JsonValue | None = None,
     semantic_query_text: str | None = None,
+    source_refs: tuple[OpaqueEvidenceRef, ...] | None = None,
+    locator_refs: tuple[OpaqueEvidenceRef, ...] | None = None,
+    include_raw_outcome: bool = True,
 ) -> tuple[_SeededAcceptedEvidence, ...]:
     """追加当前输入之前的 accepted tool evidence 事件。
 
@@ -4467,6 +4599,9 @@ def _append_prior_accepted_tool_evidence_batch(
     :param run_id: 可选绑定 evidence 的 Host Run id；缺省按 ordinal 生成。
     :param raw_outcome: 可选覆盖 raw outcome；缺省时按 ordinal 生成。
     :param semantic_query_text: 可选覆盖 semantic query；缺省时按 ordinal 生成。
+    :param source_refs: 可选覆盖 envelope source refs。
+    :param locator_refs: 可选覆盖 envelope locator refs。
+    :param include_raw_outcome: 是否在 canonical result 中写入 raw outcome。
     :returns: 写入的 evidence 元数据。
     :raises ValueError: count 非正数时抛出。
     """
@@ -4491,6 +4626,9 @@ def _append_prior_accepted_tool_evidence_batch(
                     run_id=run_id,
                     raw_outcome=raw_outcome,
                     semantic_query_text=semantic_query_text,
+                    source_refs=source_refs,
+                    locator_refs=locator_refs,
+                    include_raw_outcome=include_raw_outcome,
                 )
             )
         return tuple(seeded)
@@ -4506,6 +4644,9 @@ def _append_prior_accepted_tool_evidence_tx(
     run_id: str | None,
     raw_outcome: JsonValue | None,
     semantic_query_text: str | None,
+    source_refs: tuple[OpaqueEvidenceRef, ...] | None,
+    locator_refs: tuple[OpaqueEvidenceRef, ...] | None,
+    include_raw_outcome: bool,
 ) -> _SeededAcceptedEvidence:
     """追加一组 prior TOOL_CALL_REQUESTED / TOOL_RESULT_ACCEPTED 事件。
 
@@ -4515,6 +4656,9 @@ def _append_prior_accepted_tool_evidence_tx(
     :param run_id: 可选绑定 evidence 的 Host Run id。
     :param raw_outcome: 可选 raw outcome。
     :param semantic_query_text: 可选 semantic query。
+    :param source_refs: 可选覆盖 envelope source refs。
+    :param locator_refs: 可选覆盖 envelope locator refs。
+    :param include_raw_outcome: 是否写入 raw outcome。
     :returns: 写入的 evidence 元数据。
     """
 
@@ -4584,20 +4728,35 @@ def _append_prior_accepted_tool_evidence_tx(
             truncation_applied=False,
         ),
         source_refs=(
-            OpaqueEvidenceRef(
-                ref_kind="tool_call_event",
-                ref_id=tool_call_event_id,
-                digest=None,
-            ),
+            (
+                OpaqueEvidenceRef(
+                    ref_kind="tool_call_event",
+                    ref_id=tool_call_event_id,
+                    digest=None,
+                ),
+            )
+            if source_refs is None
+            else source_refs
         ),
         locator_refs=(
-            OpaqueEvidenceRef(
-                ref_kind="filing",
-                ref_id=f"msft-fy2025-{ordinal:02d}",
-                digest=None,
-            ),
+            (
+                OpaqueEvidenceRef(
+                    ref_kind="filing",
+                    ref_id=f"msft-fy2025-{ordinal:02d}",
+                    digest=None,
+                ),
+            )
+            if locator_refs is None
+            else locator_refs
         ),
     )
+    result_payload: dict[str, JsonValue] = {
+        "accepted_evidence_envelope": (
+            accepted_evidence_envelope_to_json_value(envelope)
+        ),
+    }
+    if include_raw_outcome:
+        result_payload["raw_tool_outcome"] = actual_raw_outcome
     EventLogStore().append_event(
         transaction,
         _event_request(
@@ -4606,10 +4765,7 @@ def _append_prior_accepted_tool_evidence_tx(
             session_id=session_id,
             run_id=target_run_id,
             event_type="TOOL_RESULT_ACCEPTED",
-            payload={
-                "accepted_evidence_envelope": (accepted_evidence_envelope_to_json_value(envelope)),
-                "raw_tool_outcome": actual_raw_outcome,
-            },
+            payload=result_payload,
         ),
     )
     return _SeededAcceptedEvidence(

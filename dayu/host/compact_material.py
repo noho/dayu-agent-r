@@ -55,7 +55,6 @@ from dayu.host.durable.event_log import EventClass, EventLogRow, EventLogStore
 from dayu.host.durable.schema import TABLE_EVENT_LOG
 from dayu.host.durable.state import RunRow
 from dayu.host.durable.transaction import HostRow, HostTransaction
-from dayu.host.evidence import OpaqueEvidenceRef
 from dayu.host.evidence import AcceptedToolEvidenceLLMMaterial
 from dayu.host.evidence import render_accepted_tool_evidence_for_llm
 from dayu.host.memory import (
@@ -69,7 +68,6 @@ from dayu.host.memory import (
 )
 from dayu.host.payload_resolution import (
     event_payload_object,
-    event_payload_object_for_result_ref,
 )
 from dayu.host.terminal_payload import PayloadTextReadPolicy
 from dayu.host._terminal_answer import assistant_final_answer_continuity_text
@@ -194,7 +192,6 @@ class RunInputMaterialBlock:
     :param tool_call_event_ref: evidence block 对应 TOOL_CALL_REQUESTED ref。
     :param payload_refs: evidence payload / artifact refs。
     :param artifact_refs: evidence artifact refs。
-    :param source_locator_refs: evidence source locator refs。
     :param accepted_tool_evidence: accepted tool evidence 的 LLM-facing typed material。
     """
 
@@ -216,7 +213,6 @@ class RunInputMaterialBlock:
     tool_call_event_ref: str | None = None
     payload_refs: tuple[str, ...] = ()
     artifact_refs: tuple[str, ...] = ()
-    source_locator_refs: tuple[OpaqueEvidenceRef, ...] = ()
     accepted_tool_evidence: AcceptedToolEvidenceLLMMaterial | None = None
 
     def __post_init__(self) -> None:
@@ -260,10 +256,6 @@ class RunInputMaterialBlock:
         )
         _require_string_tuple(self.payload_refs, "RunInputMaterialBlock.payload_refs")
         _require_string_tuple(self.artifact_refs, "RunInputMaterialBlock.artifact_refs")
-        _require_opaque_evidence_ref_tuple(
-            self.source_locator_refs,
-            "RunInputMaterialBlock.source_locator_refs",
-        )
         if (
             self.accepted_tool_evidence is not None
             and not isinstance(
@@ -310,7 +302,6 @@ class RunInputMaterialBlock:
                 or self.tool_call_event_ref is not None
                 or len(self.payload_refs) > 0
                 or len(self.artifact_refs) > 0
-                or len(self.source_locator_refs) > 0
                 or self.accepted_tool_evidence is not None
             ):
                 raise ValueError("non-evidence block must not carry evidence provenance")
@@ -666,7 +657,6 @@ class InitialEvidenceMaterial:
     :param readable_source_text: LLM 可读来源文本。
     :param payload_refs: payload / artifact refs。
     :param artifact_refs: artifact refs。
-    :param source_locator_refs: source locator refs。
     """
 
     canonical_source_ref: str
@@ -679,7 +669,6 @@ class InitialEvidenceMaterial:
     readable_source_text: str
     payload_refs: tuple[str, ...]
     artifact_refs: tuple[str, ...] = ()
-    source_locator_refs: tuple[OpaqueEvidenceRef, ...] = ()
 
 
 def material_label(section: CompactMaterialSection, ordinal: int) -> PromptLocalMaterialLabel:
@@ -788,7 +777,6 @@ def run_input_material_block(
     tool_call_event_ref: str | None = None,
     payload_refs: tuple[str, ...] = (),
     artifact_refs: tuple[str, ...] = (),
-    source_locator_refs: tuple[OpaqueEvidenceRef, ...] = (),
     accepted_tool_evidence: AcceptedToolEvidenceLLMMaterial | None = None,
 ) -> RunInputMaterialBlock:
     """构造共享 ordinary input material block。
@@ -809,7 +797,6 @@ def run_input_material_block(
     :param tool_call_event_ref: evidence block 的 TOOL_CALL_REQUESTED ref。
     :param payload_refs: payload / artifact refs。
     :param artifact_refs: artifact refs。
-    :param source_locator_refs: source locator refs。
     :param accepted_tool_evidence: accepted tool evidence 的 LLM-facing typed material。
     :returns: RunInputMaterialBlock。
     :raises TypeError: 参数类型非法时抛出。
@@ -836,7 +823,6 @@ def run_input_material_block(
         tool_call_event_ref=tool_call_event_ref,
         payload_refs=payload_refs,
         artifact_refs=artifact_refs,
-        source_locator_refs=source_locator_refs,
         accepted_tool_evidence=accepted_tool_evidence,
     )
 
@@ -1579,7 +1565,7 @@ def _evidence_provenance(
                 tool_call_event_ref=material.tool_call_event_ref,
                 payload_refs=material.payload_refs,
                 artifact_refs=material.artifact_refs,
-                source_locator_refs=material.source_locator_refs,
+                source_locator_refs=(),
             )
         )
     return tuple(entries)
@@ -2594,7 +2580,6 @@ def _accepted_tool_evidence_delta_blocks(
             tool_result_event_ref=row.event_id,
             tool_call_event_ref=tool_call_event_ref,
             payload_refs=payload_refs,
-            source_locator_refs=projection.source_locator_refs,
             accepted_tool_evidence=projection.llm_material,
         ),
     )
@@ -2759,7 +2744,9 @@ def _pack_evidence_blocks(blocks: tuple[RunInputMaterialBlock, ...]) -> tuple[Co
     evidence_blocks = tuple(block for block in blocks if block.section is CompactMaterialSection.EVIDENCE_MATERIAL)
     for index, block in enumerate(evidence_blocks, start=_FIRST_ORDINAL):
         if block.accepted_tool_evidence is None:
-            raise ValueError("RunInputMaterialBlock.accepted_tool_evidence is required")
+            raise HostDurableError(
+                "RunInputMaterialBlock.accepted_tool_evidence is required"
+            )
         _require_non_empty_text(block.text, "evidence_text")
         material = block.accepted_tool_evidence
         result.append(
@@ -2835,7 +2822,7 @@ def _provenance_from_evidence_blocks(
                 tool_call_event_ref=source.tool_call_event_ref,
                 payload_refs=source.payload_refs,
                 artifact_refs=source.artifact_refs,
-                source_locator_refs=source.source_locator_refs,
+                source_locator_refs=(),
             )
         )
     return tuple(entries)
@@ -3203,22 +3190,6 @@ def _require_string_tuple(value: tuple[str, ...], field_name: str) -> None:
         raise TypeError(f"{field_name} must be tuple")
     for item in value:
         _require_non_empty_text(item, field_name)
-
-
-def _require_opaque_evidence_ref_tuple(value: tuple[OpaqueEvidenceRef, ...], field_name: str) -> None:
-    """校验 OpaqueEvidenceRef tuple。
-
-    :param value: 待校验 tuple。
-    :param field_name: 字段名。
-    :returns: ``None``。
-    :raises TypeError: 字段不是 tuple 或元素类型不正确时抛出。
-    """
-
-    if not isinstance(value, tuple):
-        raise TypeError(f"{field_name} must be tuple")
-    for item in value:
-        if not isinstance(item, OpaqueEvidenceRef):
-            raise TypeError(f"{field_name} items must be OpaqueEvidenceRef")
 
 
 def _require_optional_text(value: str | None, field_name: str) -> None:

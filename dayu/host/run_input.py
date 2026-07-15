@@ -2909,6 +2909,7 @@ def _fallback_message_from_material_block(block: RunInputMaterialBlock) -> Agent
 
     :param block: selected fallback material block。
     :returns: Agent message。
+    :raises HostDurableError: accepted evidence 缺 typed LLM material 时抛出。
     """
 
     if block.kind is CompactMaterialBlockKind.USER_INPUT:
@@ -2921,6 +2922,10 @@ def _fallback_message_from_material_block(block: RunInputMaterialBlock) -> Agent
             tool_calls=(),
         )
     if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE:
+        if block.accepted_tool_evidence is None:
+            raise HostDurableError(
+                "accepted tool evidence LLM material is missing"
+            )
         return SystemMessage(
             role=AgentMessageRole.SYSTEM,
             content=(
@@ -3136,6 +3141,13 @@ def _memory_projection_event_from_row(transaction: HostTransaction, row: EventLo
         if row.event_type == _EVENT_TYPE_TOOL_RESULT_ACCEPTED
         else None
     )
+    if (
+        accepted_tool_projection is not None
+        and accepted_tool_projection.llm_material is None
+    ):
+        raise HostDurableError(
+            "TOOL_RESULT_ACCEPTED typed LLM material is missing"
+        )
     return MemoryProjectionEvent(
         event_sequence=row.event_sequence,
         event_id=row.event_id,

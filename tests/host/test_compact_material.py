@@ -1349,7 +1349,6 @@ def test_evidence_labels_are_prompt_local_and_map_to_canonical_evidence() -> Non
         text="digest checked raw evidence",
         payload_refs=("payload:evidence-map",),
         artifact_refs=("artifact:evidence-map",),
-        source_locator_refs=(OpaqueEvidenceRef(ref_kind="locator", ref_id="evidence-map", digest=None),),
     )
     selection = select_compact_segment(
         trigger_source=CompactSegmentTrigger.PROACTIVE,
@@ -1376,23 +1375,19 @@ def test_evidence_labels_are_prompt_local_and_map_to_canonical_evidence() -> Non
     assert evidence_map["E1"].tool_call_event_ref == "tool-call:evidence-map"
     assert evidence_map["E1"].payload_refs == ("payload:evidence-map",)
     assert evidence_map["E1"].artifact_refs == ("artifact:evidence-map",)
-    assert evidence_map["E1"].source_locator_refs == (
-        OpaqueEvidenceRef(ref_kind="locator", ref_id="evidence-map", digest=None),
-    )
+    assert evidence_map["E1"].source_locator_refs == ()
 
 
 def test_single_large_evidence_block_stays_whole_with_same_provenance() -> None:
     """单个超大 evidence block 默认不拆分，并保留 canonical provenance。"""
 
     large_text = "A" * _LONG_EVIDENCE_TEXT_CHAR_COUNT
-    locator_ref = OpaqueEvidenceRef(ref_kind="locator", ref_id="large", digest=None)
     evidence = _evidence_block(
         "evidence-large",
         event_sequence=3,
         text=large_text,
         payload_refs=("payload:evidence-large",),
         artifact_refs=("artifact:evidence-large",),
-        source_locator_refs=(locator_ref,),
     )
     selection = select_compact_segment(
         trigger_source=CompactSegmentTrigger.REACTIVE,
@@ -1437,7 +1432,7 @@ def test_single_large_evidence_block_stays_whole_with_same_provenance() -> None:
     assert evidence_map["E1"].content_digest == evidence.content_digest
     assert evidence_map["E1"].payload_refs == ("payload:evidence-large",)
     assert evidence_map["E1"].artifact_refs == ("artifact:evidence-large",)
-    assert evidence_map["E1"].source_locator_refs == (locator_ref,)
+    assert evidence_map["E1"].source_locator_refs == ()
     assert evidence_map["E1"].chunk_parent_label is None
     assert evidence_map["E1"].chunk_ordinal is None
     vnext_input = conversation_compact_input_vnext_from_material_pack(pack)
@@ -2044,6 +2039,56 @@ def test_pre_dispatch_tool_result_without_envelope_fails_closed(
         with pytest.raises(
             HostDurableError,
             match="accepted result evidence envelope is missing",
+        ):
+            store.transaction_runner.run_read(
+                lambda transaction: build_pre_dispatch_compact_material_view(
+                    transaction,
+                    event_log,
+                    run=run,
+                    current_display_text="current user question",
+                )
+            )
+
+
+def test_pre_dispatch_canonical_result_without_llm_material_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """Compact owner 拒绝缺 raw outcome 的 canonical accepted result。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: Compact 跳过损坏 evidence 或生成 limited material 时抛出。
+    """
+
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入缺 raw outcome 的 canonical result 与当前输入。
+
+            :param transaction: Host transaction。
+            :returns: 当前 Run row。
+            """
+
+            _append_tool_result_event(
+                transaction,
+                event_log,
+                event_id="event-tool-result-no-llm-material",
+                include_raw_outcome=False,
+            )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-no-llm-material",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current user question"},
+            )
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+        with pytest.raises(
+            HostDurableError,
+            match="TOOL_RESULT_ACCEPTED raw_tool_outcome is missing",
         ):
             store.transaction_runner.run_read(
                 lambda transaction: build_pre_dispatch_compact_material_view(
@@ -2872,7 +2917,6 @@ def _evidence_block(
     text: str,
     payload_refs: tuple[str, ...] = ("payload:test",),
     artifact_refs: tuple[str, ...] = (),
-    source_locator_refs: tuple[OpaqueEvidenceRef, ...] = (),
     turn_group_id: str | None = "run:test",
 ) -> RunInputMaterialBlock:
     """构造 evidence material block。
@@ -2882,7 +2926,6 @@ def _evidence_block(
     :param text: raw evidence 文本。
     :param payload_refs: payload / artifact refs。
     :param artifact_refs: artifact refs。
-    :param source_locator_refs: source locator refs。
     :param turn_group_id: Host Run turn group id。
     :returns: RunInputMaterialBlock。
     """
@@ -2906,7 +2949,6 @@ def _evidence_block(
         tool_call_event_ref=f"tool-call:{block_id}",
         payload_refs=payload_refs,
         artifact_refs=artifact_refs,
-        source_locator_refs=source_locator_refs,
         accepted_tool_evidence=material,
     )
 
@@ -3297,6 +3339,7 @@ def _append_tool_result_event(
     run_id: str | None = None,
     source_refs: tuple[OpaqueEvidenceRef, ...] | None = None,
     append_request_atom_when_missing: bool = True,
+    include_raw_outcome: bool = True,
 ) -> EventLogRow:
     """追加带 accepted evidence envelope 的 TOOL_RESULT_ACCEPTED。
 
@@ -3310,6 +3353,7 @@ def _append_tool_result_event(
     :param source_refs: 可选覆盖 envelope source refs。
     :param append_request_atom_when_missing: request ref 未显式提供时，是否先写入
         identity 一致的 canonical request atom。
+    :param include_raw_outcome: 是否写入 canonical raw tool outcome。
     :returns: appended EventLog row。
     """
 
@@ -3338,19 +3382,23 @@ def _append_tool_result_event(
         normalized_arguments_digest=actual_arguments_digest,
         source_refs=source_refs,
     )
+    result_payload: dict[str, JsonValue] = {
+        "accepted_evidence_envelope": (
+            accepted_evidence_envelope_to_json_value(envelope)
+        ),
+    }
+    if include_raw_outcome:
+        result_payload["raw_tool_outcome"] = {
+            "kind": "completed",
+            "result": {"content": f"raw content {event_id}"},
+        }
     return _append_event(
         transaction,
         event_log,
         event_id=event_id,
         event_type="TOOL_RESULT_ACCEPTED",
         run_id=run_id,
-        payload={
-            "accepted_evidence_envelope": (accepted_evidence_envelope_to_json_value(envelope)),
-            "raw_tool_outcome": {
-                "kind": "completed",
-                "result": {"content": f"raw content {event_id}"},
-            },
-        },
+        payload=result_payload,
     )
 
 

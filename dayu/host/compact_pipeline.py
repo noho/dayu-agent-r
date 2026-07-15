@@ -55,7 +55,6 @@ from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_fallback import (
     FALLBACK_ACTION_DISPATCH,
     FALLBACK_ACTION_FAIL_CLOSED,
-    FALLBACK_ACTION_NOT_APPLICABLE,
     FALLBACK_POLICY_DECISION_RECENT_WINDOW,
     FALLBACK_POLICY_DECISION_SELECTION_FAILED,
     RecentWindowFallbackBudgetResult,
@@ -1093,6 +1092,7 @@ def _message_from_material_block(block: RunInputMaterialBlock) -> AgentMessage:
 
     :param block: selected raw-tail block。
     :returns: Agent message。
+    :raises HostDurableError: accepted evidence 缺 typed LLM material 时抛出。
     """
 
     if block.kind is CompactMaterialBlockKind.USER_INPUT:
@@ -1105,6 +1105,10 @@ def _message_from_material_block(block: RunInputMaterialBlock) -> AgentMessage:
             tool_calls=(),
         )
     if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE:
+        if block.accepted_tool_evidence is None:
+            raise HostDurableError(
+                "accepted tool evidence LLM material is missing"
+            )
         return SystemMessage(
             role=AgentMessageRole.SYSTEM,
             content=(

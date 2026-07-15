@@ -35,9 +35,11 @@ from dayu.host.durable.tool_trace import (
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.accepted_result_projection import (
+    AcceptedToolResultQueryState,
     AcceptedToolResultProjection,
     project_accepted_tool_result,
 )
+from dayu.host.payload_resolution import tool_call_request_atoms
 from dayu.host.lifecycle_events import (
     HOST_RUN_LIFECYCLE_EVENT_TYPES,
     event_type_values,
@@ -1084,12 +1086,18 @@ def _canonical_trace_summary_signals(
             partial_tool_call_signal=copied.partial_tool_call_signal,
         )
     if event.event_type == _EVENT_TYPE_TOOL_CALL_REQUESTED:
+        request_row = read_event_by_id(transaction, event.event_id)
+        if request_row is None:
+            raise HostDurableError("tool trace request atom row is missing")
         return _TraceSummarySignals(
             context_pressure=copied.context_pressure,
             tool_timing=copied.tool_timing,
             failure_metadata=copied.failure_metadata,
             partial_tool_call_signal=copied.partial_tool_call_signal,
-            tool_request=_tool_request_summary_from_payload(payload),
+            tool_request=_tool_request_summary_from_row(
+                transaction,
+                request_row,
+            ),
         )
     if event.event_type == _EVENT_TYPE_TOOL_RESULT_ACCEPTED:
         result_row = read_event_by_id(transaction, event.event_id)
@@ -1100,6 +1108,10 @@ def _canonical_trace_summary_signals(
             result_row,
             resolved_payload=payload,
         )
+        if projection.llm_material is None:
+            raise HostDurableError(
+                "TOOL_RESULT_ACCEPTED tool trace LLM material is missing"
+            )
         return _TraceSummarySignals(
             context_pressure=copied.context_pressure,
             tool_timing=copied.tool_timing,
@@ -1123,18 +1135,10 @@ def _tool_request_summary_from_tool_result(
     """
 
     arguments = _projection_arguments_object(projection)
-    arguments_summary_text = (
-        _arguments_summary_text(arguments)
-        if arguments is not None
-        else None
-    )
-    arguments_text = (
-        _bounded_json_text(
-            arguments,
-            max_chars=_TOOL_TRACE_ARGUMENTS_TEXT_MAX_CHARS,
-        )
-        if arguments is not None
-        else None
+    arguments_summary_text = _arguments_summary_text(arguments)
+    arguments_text = _bounded_json_text(
+        arguments,
+        max_chars=_TOOL_TRACE_ARGUMENTS_TEXT_MAX_CHARS,
     )
     return {
         _FIELD_SCHEMA_VERSION: _TOOL_TRACE_READABLE_SCHEMA_VERSION,
@@ -1169,34 +1173,43 @@ def _tool_request_summary_from_tool_result(
     }
 
 
-def _tool_request_summary_from_payload(
-    payload: Mapping[str, JsonValue],
+def _tool_request_summary_from_row(
+    transaction: HostTransaction,
+    request_row: EventLogRow,
 ) -> Mapping[str, JsonValue]:
-    """从 ``TOOL_CALL_REQUESTED`` payload 构造业务可读请求摘要。
+    """从 canonical ``TOOL_CALL_REQUESTED`` row 构造业务可读请求摘要。
 
-    :param payload: request atom payload。
+    :param transaction: 当前 Host transaction。
+    :param request_row: canonical request atom row。
     :returns: bounded exact request summary。
-    :raises HostDurableError: 已命名字段类型非法时抛出。
+    :raises HostDurableError: row class/type、正文 storage 或 digest 损坏时抛出。
     """
 
-    tool_name = _optional_text(payload, _FIELD_TOOL_NAME)
-    tool_call_id = _optional_text(payload, _FIELD_TOOL_CALL_ID)
-    arguments_json = _inline_arguments_json(payload)
-    arguments = _arguments_object(arguments_json)
-    arguments_text = (
-        _bounded_json_text(arguments, max_chars=_TOOL_TRACE_ARGUMENTS_TEXT_MAX_CHARS)
-        if arguments is not None
-        else None
+    if request_row.event_class is not EventClass.CANONICAL_FACT:
+        raise HostDurableError("tool trace request atom must be canonical fact")
+    atoms = tool_call_request_atoms(transaction, request_row)
+    arguments = _arguments_object(atoms.arguments_json)
+    arguments_text = _bounded_json_text(
+        arguments,
+        max_chars=_TOOL_TRACE_ARGUMENTS_TEXT_MAX_CHARS,
     )
-    arguments_summary_text = (
-        _arguments_summary_text(arguments)
-        if arguments is not None
-        else None
+    arguments_summary_text = _arguments_summary_text(arguments)
+    query_state = (
+        AcceptedToolResultQueryState.SEMANTIC_QUERY
+        if atoms.semantic_query_text is not None
+        else AcceptedToolResultQueryState.ARGUMENTS_SUMMARY
     )
-    query_text = _optional_text(payload, "semantic_query_text")
+    query_text = (
+        atoms.semantic_query_text
+        if atoms.semantic_query_text is not None
+        else _bounded_text(
+            f"参数：{canonical_json_dumps(atoms.arguments_json)}",
+            max_chars=_TOOL_TRACE_SUMMARY_TEXT_MAX_CHARS,
+        )
+    )
     summary_text = _join_summary_parts(
         (
-            f"tool={tool_name}" if tool_name is not None else None,
+            f"tool={atoms.tool_name}",
             query_text,
             arguments_summary_text,
         )
@@ -1204,8 +1217,13 @@ def _tool_request_summary_from_payload(
     return {
         _FIELD_SCHEMA_VERSION: _TOOL_TRACE_READABLE_SCHEMA_VERSION,
         "status": "available",
-        _FIELD_TOOL_NAME: tool_name,
-        _FIELD_TOOL_CALL_ID: tool_call_id,
+        "reason": (
+            None
+            if atoms.semantic_query_text is not None
+            else "semantic_query_missing"
+        ),
+        _FIELD_TOOL_NAME: atoms.tool_name,
+        _FIELD_TOOL_CALL_ID: atoms.tool_call_id,
         "summary_text": _bounded_text(
             summary_text,
             max_chars=_TOOL_TRACE_SUMMARY_TEXT_MAX_CHARS,
@@ -1214,6 +1232,7 @@ def _tool_request_summary_from_payload(
             query_text,
             max_chars=_TOOL_TRACE_SUMMARY_TEXT_MAX_CHARS,
         ),
+        "query_state": query_state.value,
         "arguments_summary_text": arguments_summary_text,
         "arguments": (
             arguments
@@ -1227,19 +1246,17 @@ def _tool_request_summary_from_payload(
 
 def _projection_arguments_object(
     projection: AcceptedToolResultProjection,
-) -> Mapping[str, JsonValue] | None:
+) -> Mapping[str, JsonValue]:
     """读取 projection 中已校验 request arguments 的展示对象。
 
     :param projection: accepted result 共享投影。
-    :returns: ``arguments`` 内层 JSON object；不可展示时为 ``None``。
+    :returns: ``arguments`` 内层 JSON object。
+    :raises HostDurableError: request arguments 缺失或不是 object 时抛出。
     """
 
     if projection.request_arguments_json is None:
-        return None
-    value = projection.request_arguments_json.get("arguments")
-    if isinstance(value, Mapping):
-        return value
-    return None
+        raise HostDurableError("tool trace request arguments are missing")
+    return _arguments_object(projection.request_arguments_json)
 
 
 def _tool_result_summary_from_projection(
@@ -1252,24 +1269,14 @@ def _tool_result_summary_from_projection(
     """
 
     result_status = projection.status.value
-    if projection.raw_outcome is None or projection.result_text is None:
-        return {
-            _FIELD_SCHEMA_VERSION: _TOOL_TRACE_READABLE_SCHEMA_VERSION,
-            "status": "limited_signal",
-            "reason": _join_summary_parts(projection.diagnostic_reasons),
-            "result_status": result_status,
-            "result_summary_text": "tool result details unavailable in tool trace",
-            "result_details": None,
-            "result_text": None,
-            "raw_outcome_digest": None,
-            _FIELD_OUTCOME_DIGEST: None,
-            _FIELD_PAYLOAD_REF: (
-                projection.payload_refs[0]
-                if len(projection.payload_refs) > 0
-                else None
-            ),
-            _FIELD_PAYLOAD_DIGEST: None,
-        }
+    if (
+        projection.llm_material is None
+        or projection.raw_outcome is None
+        or projection.result_text is None
+    ):
+        raise HostDurableError(
+            "TOOL_RESULT_ACCEPTED tool trace LLM material is missing"
+        )
     summary_text = _join_summary_parts(
         (
             f"status={result_status}" if result_status is not None else None,
@@ -1293,12 +1300,8 @@ def _tool_result_summary_from_projection(
             max_chars=_TOOL_TRACE_RESULT_TEXT_MAX_CHARS,
         ),
         "result_truncated": len(projection.result_text) > _TOOL_TRACE_RESULT_TEXT_MAX_CHARS,
-        "raw_outcome_digest": sha256_digest_json(projection.raw_outcome),
-        _FIELD_OUTCOME_DIGEST: None,
-        _FIELD_PAYLOAD_REF: (
-            projection.payload_refs[0] if len(projection.payload_refs) > 0 else None
-        ),
-        _FIELD_PAYLOAD_DIGEST: None,
+        "business_source_text": projection.source.text,
+        "business_source_state": projection.source.state.value,
     }
 
 
@@ -1729,39 +1732,17 @@ def _is_bare_sha256_hex(value: str) -> bool:
     return all(character in _LOWER_HEX_CHARS for character in value)
 
 
-def _inline_arguments_json(
-    payload: Mapping[str, JsonValue],
-) -> Mapping[str, JsonValue] | None:
-    """读取 inline tool call arguments JSON。
-
-    :param payload: ``TOOL_CALL_REQUESTED`` payload。
-    :returns: inline arguments JSON object；非 inline 时返回 ``None``。
-    :raises HostDurableError: inline 字段存在但不是 object 时抛出。
-    """
-
-    value = payload.get("arguments_inline_json")
-    if value is None:
-        return None
-    if not isinstance(value, Mapping):
-        raise HostDurableError("tool trace arguments_inline_json must be object")
-    return cast(Mapping[str, JsonValue], value)
-
-
 def _arguments_object(
-    arguments_json: Mapping[str, JsonValue] | None,
-) -> Mapping[str, JsonValue] | None:
+    arguments_json: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
     """从 arguments JSON 中读取实际工具参数 object。
 
     :param arguments_json: request atom 中的 arguments JSON。
-    :returns: 参数 object；缺失时返回 ``None``。
-    :raises HostDurableError: ``arguments`` 字段存在但不是 object 时抛出。
+    :returns: 参数 object。
+    :raises HostDurableError: ``arguments`` 字段缺失或不是 object 时抛出。
     """
 
-    if arguments_json is None:
-        return None
     value = arguments_json.get("arguments")
-    if value is None:
-        return None
     if not isinstance(value, Mapping):
         raise HostDurableError("tool trace arguments field must be object")
     return cast(Mapping[str, JsonValue], value)

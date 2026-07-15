@@ -19,7 +19,6 @@ from dayu.host.durable.event_log import EventClass, EventLogRow, read_event_by_i
 from dayu.host.durable.transaction import HostTransaction
 from dayu.host.evidence import (
     AcceptedEvidenceEnvelope,
-    OpaqueEvidenceRef,
     accepted_evidence_envelope_from_payload,
     accepted_tool_raw_outcome_text_from_payload,
     derive_accepted_evidence_id,
@@ -51,21 +50,9 @@ _FIELD_RAW_TOOL_OUTCOME = "raw_tool_outcome"
 _DIAGNOSTIC_ACCEPTED_STATUS_UNAVAILABLE = "accepted_status_unavailable"
 _DIAGNOSTIC_RESULT_PAYLOAD_UNAVAILABLE = "result_payload_unavailable"
 _DIAGNOSTIC_EVENT_PAYLOAD_UNAVAILABLE = "event_payload_unavailable"
-_READABLE_SOURCE_SEPARATOR = ", "
 _ARGUMENTS_SUMMARY_MAX_CHARS = 1200
 _RESULT_DETAILS_MAX_CHARS = 1200
 _TRUNCATED_SUFFIX = "...[truncated]"
-_INTERNAL_SOURCE_REF_KINDS = frozenset(
-    {
-        "tool_call_event",
-        "tool_result_event",
-        "event",
-        "eventlog",
-        "payload",
-        "artifact",
-        "digest",
-    }
-)
 
 
 class AcceptedToolResultStatus(StrEnum):
@@ -140,7 +127,6 @@ class AcceptedToolResultProjection:
     :param source: source 可读投影。
     :param llm_material: 可直接渲染给 LLM 的 typed evidence material。
     :param payload_refs: 可诊断 payload refs，不进入 LLM-facing source。
-    :param source_locator_refs: accepted evidence source locator refs。
     :param diagnostic_reasons: projection 降级或损坏原因。
     """
 
@@ -159,7 +145,6 @@ class AcceptedToolResultProjection:
     source: AcceptedToolResultSourceProjection
     llm_material: _AcceptedToolEvidenceLLMMaterial | None
     payload_refs: tuple[str, ...]
-    source_locator_refs: tuple[OpaqueEvidenceRef, ...]
     diagnostic_reasons: tuple[str, ...]
 
 
@@ -207,7 +192,7 @@ def project_accepted_tool_result(
         envelope,
     )
     query = _query_projection(request_atoms)
-    source = _source_projection(envelope, diagnostics)
+    source = _source_projection(raw_outcome, diagnostics)
     llm_material = _llm_material(
         tool_name=tool_name,
         query=query,
@@ -238,9 +223,6 @@ def project_accepted_tool_result(
         source=source,
         llm_material=llm_material,
         payload_refs=_payload_refs(result_row, envelope),
-        source_locator_refs=(
-            () if envelope is None else envelope.locator_refs
-        ),
         diagnostic_reasons=tuple(diagnostics),
     )
 
@@ -565,53 +547,55 @@ def _request_atoms_match_envelope(
 
 
 def _source_projection(
-    envelope: AcceptedEvidenceEnvelope | None,
+    raw_outcome: JsonValue | None,
     diagnostics: list[str],
 ) -> AcceptedToolResultSourceProjection:
     """构造 source 可读投影。
 
-    :param envelope: accepted evidence envelope。
+    只有 accepted completed-success outcome 的 ``result.value.citation`` object
+    属于 producer 显式业务来源。Host 机械渲染整个 citation object，不解释或
+    筛选业务字段，也不从 opaque provenance refs 猜测来源。
+
+    :param raw_outcome: 已完成 payload/digest 校验的 canonical raw outcome。
     :param diagnostics: projection 诊断列表，可追加 source 降级原因。
     :returns: source projection。
     """
 
-    if envelope is None:
+    citation = _explicit_citation(raw_outcome)
+    if citation is not None:
         return AcceptedToolResultSourceProjection(
-            text=_ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
-            state=AcceptedToolResultSourceState.UNAVAILABLE,
-            diagnostic_reason="accepted_evidence_envelope_missing",
+            text=canonical_json_dumps(citation),
+            state=AcceptedToolResultSourceState.AVAILABLE,
+            diagnostic_reason=None,
         )
-    visible_ref_items: list[str] = []
-    for ref in (*envelope.source_refs, *envelope.locator_refs):
-        ref_text = _readable_ref_text(ref)
-        if ref_text is not None:
-            visible_ref_items.append(ref_text)
-    visible_refs = tuple(visible_ref_items)
-    if len(visible_refs) == 0:
-        diagnostics.append("business_source_unavailable")
-        return AcceptedToolResultSourceProjection(
-            text=_ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
-            state=AcceptedToolResultSourceState.UNAVAILABLE,
-            diagnostic_reason="business_source_unavailable",
-        )
+    diagnostics.append("business_source_unavailable")
     return AcceptedToolResultSourceProjection(
-        text=_READABLE_SOURCE_SEPARATOR.join(visible_refs),
-        state=AcceptedToolResultSourceState.AVAILABLE,
-        diagnostic_reason=None,
+        text=_ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
+        state=AcceptedToolResultSourceState.UNAVAILABLE,
+        diagnostic_reason="business_source_unavailable",
     )
 
 
-def _readable_ref_text(ref: OpaqueEvidenceRef) -> str | None:
-    """把 opaque ref 转成业务 source 文本。
+def _explicit_citation(raw_outcome: JsonValue | None) -> Mapping[str, JsonValue] | None:
+    """读取 producer-owned 显式 citation object。
 
-    :param ref: opaque evidence ref。
-    :returns: 可读 source 文本；内部 provenance ref 返回 ``None``。
+    :param raw_outcome: accepted outcome canonical JSON atom。
+    :returns: 完整 citation object；shape 不匹配时返回 ``None``。
+    :raises Exception: 不主动抛出异常。
     """
 
-    normalized_kind = ref.ref_kind.strip().lower()
-    if normalized_kind in _INTERNAL_SOURCE_REF_KINDS:
+    if not isinstance(raw_outcome, Mapping) or raw_outcome.get("kind") != "completed":
         return None
-    return f"{ref.ref_kind}:{ref.ref_id}"
+    result = raw_outcome.get("result")
+    if not isinstance(result, Mapping) or result.get("ok") is not True:
+        return None
+    value = result.get("value")
+    if not isinstance(value, Mapping):
+        return None
+    citation = value.get("citation")
+    if not isinstance(citation, Mapping):
+        return None
+    return citation
 
 
 def _payload_refs(
