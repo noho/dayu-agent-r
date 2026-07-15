@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import fields
+from collections.abc import Mapping
+from dataclasses import fields, replace
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import cast
 
@@ -51,6 +53,7 @@ from dayu.host.durable.options import (
     PayloadStoragePolicy,
 )
 from dayu.host.durable.payload import (
+    PayloadDescriptor,
     PayloadStore,
     SQLitePayloadFormat,
     SQLitePayloadWriteRequest,
@@ -114,6 +117,15 @@ _OPAQUE_SENTINEL_REFS = (
         digest=None,
     ),
 )
+
+
+class _ColdResultDescriptorFailure(StrEnum):
+    """测试用 cold result descriptor 损坏分类。"""
+
+    REF_MISMATCH = "ref_mismatch"
+    DIGEST_MISMATCH = "digest_mismatch"
+    REF_MISSING = "ref_missing"
+    DIGEST_MISSING = "digest_missing"
 
 
 def _completed_outcome_json(value: JsonValue) -> JsonValue:
@@ -809,29 +821,41 @@ def test_projection_unavailable_source_uses_shared_llm_text_and_ignores_internal
     assert "sha256:internal" not in projection.source.text
 
 
-def test_projection_reads_descriptor_payload_and_reports_missing_descriptor(
+def test_projection_resolves_hot_payload_cold_result_and_keeps_inline_direct(
     tmp_path: Path,
 ) -> None:
-    """projection 覆盖 descriptor raw payload 与 result descriptor 缺失诊断。"""
+    """projection 区分已含 raw outcome 的 inline 与仅含 ref 的 hot payload。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: inline payload 被误跟随 descriptor，或 hot payload
+        未解析 cold result 时抛出。
+    """
 
     event_log = EventLogStore()
     descriptor_payload: JsonValue = {
         "kind": "completed",
         "result": {"ok": True, "summary": "descriptor result"},
     }
-    descriptor_projection: AcceptedToolResultProjection | None = None
-    missing_projection: AcceptedToolResultProjection | None = None
     with open_host_durable_store(_durable_options(tmp_path)) as store:
-        def seed_descriptor(transaction: HostTransaction) -> EventLogRow:
-            """写入 descriptor-backed accepted result。
+        def seed(
+            transaction: HostTransaction,
+        ) -> tuple[
+            EventLogRow,
+            Mapping[str, JsonValue],
+            EventLogRow,
+            Mapping[str, JsonValue],
+        ]:
+            """写入 producer-shaped hot/cold result 与普通 inline result。
 
             :param transaction: Host transaction。
-            :returns: accepted result row。
+            :returns: descriptor row/hot payload 与 inline row/payload。
+            :raises HostDurableError: durable payload 或 EventLog 写入失败时抛出。
             """
 
             arguments_json: JsonValue = {"arguments": {"ticker": "MSFT"}}
             arguments_digest = sha256_digest_json(arguments_json)
-            request = _append_tool_call_requested(
+            descriptor_request = _append_tool_call_requested(
                 transaction,
                 event_log,
                 event_id="event-request-descriptor",
@@ -839,56 +863,103 @@ def test_projection_reads_descriptor_payload_and_reports_missing_descriptor(
                 arguments_json=arguments_json,
                 semantic_query_text=None,
             )
-            payload_ref = "payload-accepted-result-descriptor"
-            envelope = _accepted_envelope(
-                event_id="event-result-descriptor",
-                tool_call_id="tool-call-descriptor",
-                request_event_ref=request.event_id,
-                normalized_arguments_digest=arguments_digest,
-                raw_tool_outcome=descriptor_payload,
-                source_refs=(),
-                payload_ref=payload_ref,
-                payload_digest=None,
+            descriptor_row, descriptor_hot_payload, _ = (
+                _append_hot_cold_tool_result(
+                    transaction,
+                    event_log,
+                    event_id="event-result-descriptor",
+                    tool_call_id="tool-call-descriptor",
+                    request_event_ref=descriptor_request.event_id,
+                    normalized_arguments_digest=arguments_digest,
+                    raw_tool_outcome=descriptor_payload,
+                    source_refs=(),
+                )
             )
-            payload: JsonValue = {
-                "tool_call_id": "tool-call-descriptor",
-                "tool_name": _TOOL_NAME,
-                "normalized_arguments_digest": arguments_digest,
-                "tool_fact_kind": "completed",
-                "accepted_evidence_envelope": accepted_evidence_envelope_to_json_value(
-                    envelope
-                ),
-                "raw_tool_outcome": descriptor_payload,
-            }
-            actual_digest = sha256_digest_json(payload)
-            PayloadStore().write_sqlite_payload(
-                transaction,
-                SQLitePayloadWriteRequest(
-                    payload_ref=payload_ref,
-                    payload_id="sqlite-accepted-result-descriptor",
-                    payload_format=SQLitePayloadFormat.CANONICAL_JSON,
-                    payload_json=payload,
-                    media_type="application/json",
-                    metadata={"kind": "accepted_result_test"},
-                    expected_digest=actual_digest,
-                ),
-            )
-            return _append_event(
+            inline_request = _append_tool_call_requested(
                 transaction,
                 event_log,
-                event_id="event-result-descriptor",
-                event_type="TOOL_RESULT_ACCEPTED",
-                payload={},
-                payload_ref=payload_ref,
-                payload_digest=actual_digest,
+                event_id="event-request-inline-resolved",
+                tool_call_id="tool-call-inline-resolved",
+                arguments_json=arguments_json,
+                semantic_query_text=None,
+            )
+            inline_row = _append_tool_result(
+                transaction,
+                event_log,
+                event_id="event-result-inline-resolved",
+                tool_call_id="tool-call-inline-resolved",
+                request_event_ref=inline_request.event_id,
+                normalized_arguments_digest=arguments_digest,
+                tool_fact_kind="completed",
+                raw_tool_outcome={
+                    "kind": "completed",
+                    "result": {"ok": True, "summary": "inline result"},
+                },
+                source_refs=(),
+            )
+            inline_payload = projection_event_view_from_row(inline_row).payload
+            return (
+                descriptor_row,
+                descriptor_hot_payload,
+                inline_row,
+                inline_payload,
             )
 
-        def seed_missing_descriptor(transaction: HostTransaction) -> EventLogRow:
-            """写入 request link 完整但 result descriptor 缺失的 accepted result。
+        (
+            descriptor_row,
+            descriptor_hot_payload,
+            inline_row,
+            inline_payload,
+        ) = store.transaction_runner.run_write(seed)
+        descriptor_projection = store.transaction_runner.run_read(
+            lambda transaction: project_accepted_tool_result(
+                transaction,
+                descriptor_row,
+                resolved_payload=descriptor_hot_payload,
+            )
+        )
+        inline_projection = store.transaction_runner.run_read(
+            lambda transaction: project_accepted_tool_result(
+                transaction,
+                inline_row,
+                resolved_payload=inline_payload,
+            )
+        )
+
+        assert descriptor_projection.result_details_text == "descriptor result"
+        assert descriptor_projection.status is AcceptedToolResultStatus.COMPLETED
+        assert descriptor_projection.llm_material is not None
+        assert descriptor_projection.llm_material.result_text == (
+            canonical_json_dumps(descriptor_payload)
+        )
+        assert inline_projection.result_details_text == "inline result"
+        assert inline_projection.status is AcceptedToolResultStatus.COMPLETED
+        assert inline_projection.llm_material is not None
+
+
+@pytest.mark.parametrize("failure", tuple(_ColdResultDescriptorFailure))
+def test_projection_hot_payload_cold_descriptor_corruption_fails_closed(
+    tmp_path: Path,
+    failure: _ColdResultDescriptorFailure,
+) -> None:
+    """hot payload 的 cold descriptor ref/digest 损坏或缺失时 fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :param failure: 单一 descriptor 损坏分类。
+    :returns: ``None``。
+    :raises AssertionError: shared projection 未拒绝损坏 descriptor 时抛出。
+    """
+
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        def seed(
+            transaction: HostTransaction,
+        ) -> tuple[EventLogRow, Mapping[str, JsonValue], PayloadDescriptor]:
+            """写入 producer-shaped hot/cold accepted result。
 
             :param transaction: Host transaction。
-            :returns: accepted result row。
-            :raises HostDurableError: durable append 失败时由 store 抛出。
+            :returns: result row、hot payload 与 cold descriptor。
+            :raises HostDurableError: durable payload 或 EventLog 写入失败时抛出。
             """
 
             arguments_json: JsonValue = {"arguments": {"ticker": "MSFT"}}
@@ -896,43 +967,49 @@ def test_projection_reads_descriptor_payload_and_reports_missing_descriptor(
             request = _append_tool_call_requested(
                 transaction,
                 event_log,
-                event_id="event-request-missing-descriptor",
-                tool_call_id="tool-call-missing-descriptor",
+                event_id=f"event-request-cold-{failure.value}",
+                tool_call_id=f"tool-call-cold-{failure.value}",
                 arguments_json=arguments_json,
-                semantic_query_text=None,
+                semantic_query_text="Read descriptor result",
             )
-            return _append_tool_result(
+            return _append_hot_cold_tool_result(
                 transaction,
                 event_log,
-                event_id="event-result-missing-descriptor",
-                tool_call_id="tool-call-missing-descriptor",
+                event_id=f"event-result-cold-{failure.value}",
+                tool_call_id=f"tool-call-cold-{failure.value}",
                 request_event_ref=request.event_id,
                 normalized_arguments_digest=arguments_digest,
-                tool_fact_kind="completed",
-                raw_tool_outcome={"kind": "completed", "result": {"ok": True}},
+                raw_tool_outcome=_completed_outcome_json(
+                    {"summary": "strict cold result"}
+                ),
                 source_refs=(),
-                payload_ref="payload-missing-descriptor",
-                payload_digest=sha256_digest_json({"missing": True}),
             )
 
-        descriptor_row = store.transaction_runner.run_write(seed_descriptor)
-        missing_row = store.transaction_runner.run_write(seed_missing_descriptor)
-        descriptor_projection = store.transaction_runner.run_read(
-            lambda transaction: project_accepted_tool_result(transaction, descriptor_row)
-        )
-        missing_projection = store.transaction_runner.run_read(
+        row, hot_payload, _ = store.transaction_runner.run_write(seed)
+        projected_row = row
+        if failure is _ColdResultDescriptorFailure.REF_MISMATCH:
+            projected_row = replace(row, payload_ref="payload-cold-ref-mismatch")
+        elif failure is _ColdResultDescriptorFailure.DIGEST_MISMATCH:
+            projected_row = replace(
+                row,
+                payload_digest=sha256_digest_json({"digest": "mismatch"}),
+            )
+        elif failure is _ColdResultDescriptorFailure.REF_MISSING:
+            projected_row = replace(row, payload_ref=None, payload_digest=None)
+        elif failure is _ColdResultDescriptorFailure.DIGEST_MISSING:
+            projected_row = replace(row, payload_digest=None)
+        projection = store.transaction_runner.run_read(
             lambda transaction: project_accepted_tool_result(
-                transaction, missing_row
+                transaction,
+                projected_row,
+                resolved_payload=hot_payload,
             )
         )
 
-    assert descriptor_projection is not None
-    assert missing_projection is not None
-    assert descriptor_projection.result_details_text == "descriptor result"
-    assert descriptor_projection.status is AcceptedToolResultStatus.COMPLETED
-    assert missing_projection.result_text is None
-    assert missing_projection.status is AcceptedToolResultStatus.LOST
-    assert "result_payload_unavailable" in missing_projection.diagnostic_reasons
+        assert projection.llm_material is None
+        assert projection.result_text is None
+        assert projection.status is AcceptedToolResultStatus.LOST
+        assert "result_payload_unavailable" in projection.diagnostic_reasons
 
 
 def test_projection_missing_event_payload_fails_closed(
@@ -1084,11 +1161,14 @@ def test_same_accepted_result_has_equivalent_consumer_projection(
     compact_view: PreDispatchCompactMaterialView | None = None
     current_row: EventLogRow | None = None
     with open_host_durable_store(_durable_options(tmp_path)) as store:
-        def seed(transaction: HostTransaction) -> tuple[EventLogRow, EventLogRow]:
-            """写入跨消费者等价性测试 facts。
+        def seed(
+            transaction: HostTransaction,
+        ) -> tuple[EventLogRow, Mapping[str, JsonValue], EventLogRow]:
+            """写入 hot/cold 跨消费者等价性测试 facts。
 
             :param transaction: Host transaction。
-            :returns: accepted result row 与 current input row。
+            :returns: accepted result row、hot payload 与 current input row。
+            :raises HostDurableError: descriptor 或 EventLog 写入失败时抛出。
             """
 
             arguments_json: JsonValue = {"arguments": {"ticker": "MSFT"}}
@@ -1101,14 +1181,13 @@ def test_same_accepted_result_has_equivalent_consumer_projection(
                 arguments_json=arguments_json,
                 semantic_query_text="Read MSFT FY2025 revenue",
             )
-            result = _append_tool_result(
+            result, hot_payload, _ = _append_hot_cold_tool_result(
                 transaction,
                 event_log,
                 event_id="event-result-cross-consumer",
                 tool_call_id="tool-call-cross-consumer",
                 request_event_ref=request.event_id,
                 normalized_arguments_digest=arguments_digest,
-                tool_fact_kind="completed",
                 raw_tool_outcome=_completed_outcome_json(
                     {
                         "citation": _CITATION_OBJECT,
@@ -1124,11 +1203,15 @@ def test_same_accepted_result_has_equivalent_consumer_projection(
                 event_type="USER_INPUT_ACCEPTED",
                 payload={"display_text": "current question"},
             )
-            return result, current
+            return result, hot_payload, current
 
-        result_row, current_row = store.transaction_runner.run_write(seed)
+        result_row, hot_payload, current_row = store.transaction_runner.run_write(seed)
         projection = store.transaction_runner.run_read(
-            lambda transaction: project_accepted_tool_result(transaction, result_row)
+            lambda transaction: project_accepted_tool_result(
+                transaction,
+                result_row,
+                resolved_payload=hot_payload,
+            )
         )
         consumer = ToolTraceProjectionConsumer(
             ToolTraceSinkOptions(cold_jsonl_path=tmp_path / "trace.jsonl")
@@ -1359,6 +1442,90 @@ def _append_tool_call_requested(
             "semantic_query_digest": semantic_query_digest,
         },
     )
+
+
+def _append_hot_cold_tool_result(
+    transaction: HostTransaction,
+    event_log: EventLogStore,
+    *,
+    event_id: str,
+    tool_call_id: str,
+    request_event_ref: str,
+    normalized_arguments_digest: str,
+    raw_tool_outcome: JsonValue,
+    source_refs: tuple[OpaqueEvidenceRef, ...],
+) -> tuple[EventLogRow, Mapping[str, JsonValue], PayloadDescriptor]:
+    """按 ToolRuntime 大结果 shape 写入 hot EventLog 与 cold result payload。
+
+    该 helper 复用生产 descriptor/EventLog primitive：cold payload 包含完整
+    ``raw_tool_outcome``，hot payload 只包含同一 envelope 与 descriptor pair。
+
+    :param transaction: Host transaction。
+    :param event_log: EventLog store。
+    :param event_id: accepted result event id。
+    :param tool_call_id: 工具调用 id。
+    :param request_event_ref: canonical request atom event ref。
+    :param normalized_arguments_digest: request 参数 digest。
+    :param raw_tool_outcome: 完整 raw outcome JSON。
+    :param source_refs: accepted evidence source refs。
+    :returns: result row、hot payload 与 cold payload descriptor。
+    :raises HostDurableError: descriptor 或 EventLog 写入失败时抛出。
+    """
+
+    payload_ref = f"payload-{event_id}"
+    envelope = _accepted_envelope(
+        event_id=event_id,
+        tool_call_id=tool_call_id,
+        request_event_ref=request_event_ref,
+        normalized_arguments_digest=normalized_arguments_digest,
+        raw_tool_outcome=raw_tool_outcome,
+        source_refs=source_refs,
+        payload_ref=payload_ref,
+        payload_digest=None,
+    )
+    envelope_json = accepted_evidence_envelope_to_json_value(envelope)
+    cold_payload: Mapping[str, JsonValue] = {
+        "tool_call_id": tool_call_id,
+        "tool_name": _TOOL_NAME,
+        "normalized_arguments_digest": normalized_arguments_digest,
+        "tool_fact_kind": "completed",
+        "accepted_evidence_envelope": envelope_json,
+        "payload_ref": None,
+        "raw_tool_outcome": raw_tool_outcome,
+    }
+    descriptor = PayloadStore().write_sqlite_payload(
+        transaction,
+        SQLitePayloadWriteRequest(
+            payload_ref=payload_ref,
+            payload_id=f"sqlite-{event_id}",
+            payload_format=SQLitePayloadFormat.CANONICAL_JSON,
+            payload_json=cold_payload,
+            media_type="application/json",
+            metadata={"kind": "accepted_result_test"},
+            expected_digest=None,
+        ),
+    )
+    hot_payload: Mapping[str, JsonValue] = {
+        "tool_call_id": tool_call_id,
+        "tool_name": _TOOL_NAME,
+        "normalized_arguments_digest": normalized_arguments_digest,
+        "tool_fact_kind": "completed",
+        "accepted_evidence_envelope": envelope_json,
+        "payload_ref": {
+            "payload_ref": descriptor.payload_ref,
+            "payload_digest": descriptor.payload_digest,
+        },
+    }
+    row = _append_event(
+        transaction,
+        event_log,
+        event_id=event_id,
+        event_type="TOOL_RESULT_ACCEPTED",
+        payload=hot_payload,
+        payload_ref=descriptor.payload_ref,
+        payload_digest=descriptor.payload_digest,
+    )
+    return (row, hot_payload, descriptor)
 
 
 def _append_tool_result(

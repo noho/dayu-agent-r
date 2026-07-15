@@ -13,6 +13,7 @@ from typing import cast
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.host.accepted_result_projection import project_accepted_tool_result
 from dayu.host.api import EnsureSessionRequest, HostPayloadRef
 from dayu.host.queue_policy import RunQueuePolicy
 from dayu.host._event_payload import payload_object
@@ -1036,6 +1037,13 @@ def test_tool_result_accepted_large_payload_uses_sqlite_payload_descriptor(
             "payload_ref": row.payload_ref,
             "payload_digest": row.payload_digest,
         }
+        projection = store.transaction_runner.run_read(
+            lambda transaction: project_accepted_tool_result(
+                transaction,
+                row,
+                resolved_payload=inline_payload,
+            )
+        )
 
         cold_payload = _read_event_payload(store.transaction_runner, row)
         envelope = accepted_evidence_envelope_from_json_value(
@@ -1050,6 +1058,11 @@ def test_tool_result_accepted_large_payload_uses_sqlite_payload_descriptor(
         assert envelope.result_ref.outcome_digest == _required_result(
             candidate
         ).outcome_digest
+        assert projection.raw_outcome == _required_result(candidate).raw_tool_outcome
+        assert projection.llm_material is not None
+        assert projection.llm_material.result_text == canonical_json_dumps(
+            _required_result(candidate).raw_tool_outcome
+        )
 
 
 def test_accept_rejects_missing_payload_descriptor_before_writing_events(

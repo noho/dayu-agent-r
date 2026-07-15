@@ -12,6 +12,9 @@ from typing import NamedTuple
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.contracts.tool_outcome import ToolCompletedOutcome
+from dayu.contracts.tool_result import ToolResultSuccess
+from dayu.host.accepted_tool_outcome import accepted_tool_outcome_json
 from dayu.host.api import RunStatus
 from dayu.host.queue_policy import RunQueuePolicy
 from dayu.host.evidence import (
@@ -1701,6 +1704,105 @@ def test_pre_dispatch_evidence_uses_full_tool_call_query_atom(tmp_path: Path) ->
         )
 
 
+def test_pre_dispatch_evidence_preserves_shared_renderer_exact_whitespace(
+    tmp_path: Path,
+) -> None:
+    """pre-dispatch evidence block 保留 shared renderer 的连续空白。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: typed accepted outcome 经真实 projection 后的 renderer
+        文本被 ordinary normalization 改写时抛出。
+    """
+
+    repeated_whitespace_material = "first  result   keeps producer spacing"
+    raw_tool_outcome = accepted_tool_outcome_json(
+        ToolCompletedOutcome(
+            result=ToolResultSuccess(
+                ok=True,
+                value={
+                    "citation": {
+                        "url": "https://example.com/official-source",
+                    },
+                    "results": [
+                        {
+                            "content": repeated_whitespace_material,
+                        },
+                    ],
+                },
+                meta=None,
+            )
+        )
+    )
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+
+        def seed(transaction: HostTransaction) -> RunRow:
+            """写入 typed accepted outcome、request atom 与当前输入。
+
+            :param transaction: Host write transaction。
+            :returns: 当前 Run row。
+            :raises HostDurableError: EventLog 写入失败时抛出。
+            """
+
+            request = _append_tool_call_requested_event(
+                transaction,
+                event_log,
+                event_id="event-tool-call-renderer-whitespace",
+                tool_call_id="tool-call-renderer-whitespace",
+                semantic_query_text="Read official search results",
+            )
+            result = _append_tool_result_event(
+                transaction,
+                event_log,
+                event_id="event-tool-result-renderer-whitespace",
+                tool_call_requested_event_ref=request.event_id,
+                tool_call_id="tool-call-renderer-whitespace",
+                normalized_arguments_digest=sha256_digest_json(
+                    {"arguments": {"ticker": "MSFT"}}
+                ),
+                raw_tool_outcome=raw_tool_outcome,
+            )
+            current = _append_event(
+                transaction,
+                event_log,
+                event_id="event-current-renderer-whitespace",
+                event_type="USER_INPUT_ACCEPTED",
+                payload={"display_text": "current user question"},
+            )
+            assert (
+                request.event_sequence
+                < result.event_sequence
+                < current.event_sequence
+            )
+            return _run_row(current)
+
+        run = store.transaction_runner.run_write(seed)
+        view = store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                event_log,
+                run=run,
+                current_display_text="current user question",
+            )
+        )
+
+        evidence_blocks = tuple(
+            block
+            for block in view.material_blocks
+            if block.kind is CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE
+        )
+        assert len(evidence_blocks) == 1
+        block = evidence_blocks[0]
+        assert block.accepted_tool_evidence is not None
+        expected_text = render_accepted_tool_evidence_for_llm(
+            block.accepted_tool_evidence
+        )
+        assert repeated_whitespace_material in expected_text
+        assert normalized_material_text(expected_text) != expected_text
+        assert block.text == expected_text
+
+
 def test_pre_dispatch_evidence_query_text_is_not_truncated(tmp_path: Path) -> None:
     """pre-dispatch evidence query 只规范化，不按旧 1200 字符截断。"""
 
@@ -3340,6 +3442,7 @@ def _append_tool_result_event(
     source_refs: tuple[OpaqueEvidenceRef, ...] | None = None,
     append_request_atom_when_missing: bool = True,
     include_raw_outcome: bool = True,
+    raw_tool_outcome: JsonValue | None = None,
 ) -> EventLogRow:
     """追加带 accepted evidence envelope 的 TOOL_RESULT_ACCEPTED。
 
@@ -3354,7 +3457,9 @@ def _append_tool_result_event(
     :param append_request_atom_when_missing: request ref 未显式提供时，是否先写入
         identity 一致的 canonical request atom。
     :param include_raw_outcome: 是否写入 canonical raw tool outcome。
+    :param raw_tool_outcome: 可选覆盖 canonical raw tool outcome。
     :returns: appended EventLog row。
+    :raises HostDurableError: EventLog append 失败时抛出。
     """
 
     actual_tool_call_id = (
@@ -3388,10 +3493,14 @@ def _append_tool_result_event(
         ),
     }
     if include_raw_outcome:
-        result_payload["raw_tool_outcome"] = {
-            "kind": "completed",
-            "result": {"content": f"raw content {event_id}"},
-        }
+        result_payload["raw_tool_outcome"] = (
+            {
+                "kind": "completed",
+                "result": {"content": f"raw content {event_id}"},
+            }
+            if raw_tool_outcome is None
+            else raw_tool_outcome
+        )
     return _append_event(
         transaction,
         event_log,

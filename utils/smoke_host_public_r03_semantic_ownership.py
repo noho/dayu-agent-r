@@ -56,7 +56,7 @@ from dayu.host.compact_material import (
 from dayu.host.compaction import CompactSegmentTrigger
 from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
-from dayu.host.durable.event_log import EventLogRow, EventLogStore
+from dayu.host.durable.event_log import EventClass, EventLogRow, EventLogStore
 from dayu.host.durable.memory import read_latest_memory_snapshot
 from dayu.host.durable.options import (
     HostDurableStoreOptions,
@@ -853,17 +853,17 @@ def _projection_observation_in_transaction(
         )
         if row.session_id == session_id
     )
-    request_rows = tuple(
-        row for row in rows if row.event_type == _EVENT_TYPE_TOOL_CALL_REQUESTED
+    awaiting_rows = _canonical_fact_rows(
+        rows,
+        event_type=_EVENT_TYPE_TOOL_AWAITING,
     )
-    awaiting_rows = tuple(
-        row for row in rows if row.event_type == _EVENT_TYPE_TOOL_AWAITING
+    result_rows = _canonical_fact_rows(
+        rows,
+        event_type=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
     )
-    result_rows = tuple(
-        row for row in rows if row.event_type == _EVENT_TYPE_TOOL_RESULT_ACCEPTED
-    )
-    request_atoms = tuple(
-        (row, tool_call_request_atoms(transaction, row)) for row in request_rows
+    request_atoms = _strict_accepted_request_atoms(
+        transaction,
+        rows,
     )
     _validate_required_request_atoms(
         args,
@@ -943,6 +943,58 @@ def _projection_observation_in_transaction(
         projection_source_texts=tuple(
             projection.source.text for projection in projections
         ),
+    )
+
+
+def _strict_accepted_request_atoms(
+    transaction: HostTransaction,
+    rows: Sequence[EventLogRow],
+) -> tuple[tuple[EventLogRow, ToolCallRequestAtoms], ...]:
+    """只解析 canonical accepted ``TOOL_CALL_REQUESTED`` request atoms。
+
+    Engine preview 与 Host canonical fact 可以共享同一 event type；只有
+    ``EventClass.CANONICAL_FACT`` 是 accepted request atom 的 typed owner
+    discriminator。preview 不得按 id 前缀或字段 presence 猜测，也不得进入
+    strict canonical parser。
+
+    :param transaction: 当前 Host read transaction。
+    :param rows: 同一 Session 的 EventLog rows。
+    :returns: canonical request row 与 strict parsed atoms。
+    :raises HostDurableError: canonical request atom 缺失或损坏时由 strict parser
+        抛出。
+    """
+
+    return tuple(
+        (row, tool_call_request_atoms(transaction, row))
+        for row in _canonical_fact_rows(
+            rows,
+            event_type=_EVENT_TYPE_TOOL_CALL_REQUESTED,
+        )
+    )
+
+
+def _canonical_fact_rows(
+    rows: Sequence[EventLogRow],
+    *,
+    event_type: str,
+) -> tuple[EventLogRow, ...]:
+    """按 typed EventClass 收集指定类型的 canonical facts。
+
+    Engine activity preview 可以与 Host canonical fact 共享 event type；只有
+    ``EventClass.CANONICAL_FACT`` 承诺 strict Host semantic contract。调用方不得
+    按 source、event id 或 payload 字段 presence 猜测 row 语义。
+
+    :param rows: 同一 Session 的 EventLog rows。
+    :param event_type: 需要收集的 EventLog event type。
+    :returns: 保持 durable sequence 顺序的 canonical fact rows。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return tuple(
+        row
+        for row in rows
+        if row.event_class is EventClass.CANONICAL_FACT
+        and row.event_type == event_type
     )
 
 

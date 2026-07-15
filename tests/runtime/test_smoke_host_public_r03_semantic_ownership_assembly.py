@@ -5,21 +5,53 @@ from __future__ import annotations
 import inspect
 import pathlib
 from dataclasses import replace
+from datetime import UTC, datetime
 
 import pytest
 
 from dayu.contracts.json_value import JsonValue
-from dayu.host.durable.codec import sha256_digest_json
+from dayu.contracts.tool_outcome import ToolCompletedOutcome
+from dayu.contracts.tool_result import ToolResultSuccess
+from dayu.host.accepted_tool_outcome import accepted_tool_outcome_json
+from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
+from dayu.host.durable.connection import open_host_durable_store
+from dayu.host.durable.event_log import (
+    EventClass,
+    EventLogAppendRequest,
+    EventLogRow,
+    EventLogStore,
+)
+from dayu.host.durable.options import (
+    HostDurableStoreOptions,
+    HostSQLiteStoragePolicy,
+    PayloadStoragePolicy,
+)
+from dayu.host.durable.transaction import HostTransaction
+from dayu.host.evidence import (
+    AcceptedEvidenceEnvelope,
+    AcceptedEvidenceResultRef,
+    AcceptedEvidenceToolQuery,
+    accepted_evidence_envelope_to_json_value,
+    derive_accepted_evidence_id,
+)
 from dayu.host.payload_resolution import ToolCallRequestAtoms
+from dayu.host.tool_call_request import (
+    AcceptedToolCallRequestAtomInput,
+    ToolCallRequestEventOrigin,
+    build_tool_call_requested_event_request,
+)
 from utils.smoke_host_public_r03_semantic_ownership import (
     AwaitingRequestIdentity,
     FinsAwaitingTool,
     SmokeArgs,
     _OPAQUE_SENTINELS,
+    _accepted_projection,
+    _canonical_fact_rows,
     _expected_required_tool_calls,
     _forbidden_awaiting_duplicate_fields,
     _round_specs,
     _safe_summary_text,
+    _strict_accepted_request_atoms,
     _validate_required_request_atoms,
     _validate_tool_awaiting_payload_contract,
     _workspace_retention_summary,
@@ -239,6 +271,295 @@ def test_expected_exact_arguments_cover_every_awaiting_variant(
     _validate_required_request_atoms(args, strict_atoms)
 
 
+def test_strict_diagnostic_collection_ignores_engine_previews(
+    tmp_path: pathlib.Path,
+) -> None:
+    """同名 Engine preview 不进入 strict request/result semantic 集。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: preview 被 strict parser/projection 消费，或 canonical
+        request/result 未按 exact owner contract 校验时抛出。
+    """
+
+    event_log = EventLogStore()
+    accepted_arguments: dict[str, JsonValue] = {
+        "file_path": str(tmp_path / "report.txt")
+    }
+    arguments_json: dict[str, JsonValue] = {
+        "arguments": accepted_arguments,
+    }
+    arguments_digest = sha256_digest_json(arguments_json)
+    semantic_input_digest = sha256_digest_json({"semantic": "read report"})
+    raw_tool_outcome = accepted_tool_outcome_json(
+        ToolCompletedOutcome(
+            result=ToolResultSuccess(
+                ok=True,
+                value={"summary": "diagnostic projection result"},
+                meta=None,
+            )
+        )
+    )
+    with open_host_durable_store(_diagnostic_options(tmp_path)) as store:
+        def seed(
+            transaction: HostTransaction,
+        ) -> tuple[
+            EventLogRow,
+            EventLogRow,
+            EventLogRow,
+            EventLogRow,
+            EventLogRow,
+            EventLogRow,
+        ]:
+            """写入 request/awaiting/result 的 preview 与 canonical rows。
+
+            :param transaction: Host write transaction。
+            :returns: 三组 preview/canonical rows。
+            :raises HostDurableError: EventLog、request atom 或 evidence 写入失败时
+                抛出。
+            """
+
+            preview_request = event_log.append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id="event-engine-request-preview",
+                    event_class=EventClass.PREVIEW,
+                    session_id="session-smoke-diagnostic",
+                    run_id="run-smoke-diagnostic",
+                    attempt_id="attempt-smoke-diagnostic",
+                    execution_id="execution-smoke-diagnostic",
+                    event_type="TOOL_CALL_REQUESTED",
+                    occurred_at=datetime(2026, 7, 15, tzinfo=UTC),
+                    actor="host.engine_ingest",
+                    source="host.engine_ingest",
+                    client_request_id=None,
+                    idempotency_key="preview-request",
+                    policy_decision=None,
+                    reason=None,
+                    payload_json={
+                        "tool_call_id": "tool-call-smoke-diagnostic",
+                        "tool_name": "read_file",
+                        "argument_key_count": 1,
+                    },
+                    payload_ref=None,
+                    payload_digest=None,
+                ),
+            ).row
+            canonical_request = event_log.append_event(
+                transaction,
+                build_tool_call_requested_event_request(
+                    transaction,
+                    atom=AcceptedToolCallRequestAtomInput(
+                        session_id="session-smoke-diagnostic",
+                        run_id="run-smoke-diagnostic",
+                        attempt_id="attempt-smoke-diagnostic",
+                        execution_id="execution-smoke-diagnostic",
+                        iteration_id="iteration-smoke-diagnostic",
+                        tool_call_id="tool-call-smoke-diagnostic",
+                        tool_name="read_file",
+                        tool_schema_digest=sha256_digest_json(
+                            {"schema": "read_file"}
+                        ),
+                        tool_identity_digest=sha256_digest_json(
+                            {"identity": "read_file"}
+                        ),
+                        accepted_arguments=accepted_arguments,
+                        normalized_arguments_digest=arguments_digest,
+                        tool_fact_kind="completed",
+                        accept_idempotency_key="accepted-request",
+                        semantic_input_digest=semantic_input_digest,
+                        semantic_query_text="Read the selected report",
+                    ),
+                    event_id="event-canonical-request",
+                    occurred_at=datetime(2026, 7, 15, tzinfo=UTC),
+                    origin=ToolCallRequestEventOrigin.ORDINARY_ACCEPT,
+                ),
+            ).row
+            canonical_awaiting = event_log.append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id="event-canonical-awaiting",
+                    event_class=EventClass.CANONICAL_FACT,
+                    session_id="session-smoke-diagnostic",
+                    run_id="run-smoke-diagnostic",
+                    attempt_id="attempt-smoke-diagnostic",
+                    execution_id="execution-smoke-diagnostic",
+                    event_type="TOOL_AWAITING",
+                    occurred_at=datetime(2026, 7, 15, tzinfo=UTC),
+                    actor="host.tool_runtime",
+                    source="host.tool_runtime.awaiting_accept",
+                    client_request_id=None,
+                    idempotency_key="canonical-awaiting",
+                    policy_decision=None,
+                    reason=None,
+                    payload_json={
+                        "tool_call_id": "tool-call-smoke-diagnostic",
+                        "tool_name": "read_file",
+                    },
+                    payload_ref=None,
+                    payload_digest=None,
+                ),
+            ).row
+            preview_awaiting = event_log.append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id="event-engine-awaiting-preview",
+                    event_class=EventClass.PREVIEW,
+                    session_id="session-smoke-diagnostic",
+                    run_id="run-smoke-diagnostic",
+                    attempt_id="attempt-smoke-diagnostic",
+                    execution_id="execution-smoke-diagnostic",
+                    event_type="TOOL_AWAITING",
+                    occurred_at=datetime(2026, 7, 15, tzinfo=UTC),
+                    actor="host.engine_ingest",
+                    source="host.engine_ingest",
+                    client_request_id=None,
+                    idempotency_key="preview-awaiting",
+                    policy_decision=None,
+                    reason=None,
+                    payload_json={
+                        "tool_call_id": "tool-call-smoke-diagnostic",
+                        "tool_name": "read_file",
+                    },
+                    payload_ref=None,
+                    payload_digest=None,
+                ),
+            ).row
+            result_event_id = "event-canonical-result"
+            envelope = AcceptedEvidenceEnvelope(
+                evidence_id=derive_accepted_evidence_id(result_event_id),
+                producer_event_ref=result_event_id,
+                tool_name="read_file",
+                tool_call_id="tool-call-smoke-diagnostic",
+                tool_query=AcceptedEvidenceToolQuery(
+                    tool_call_requested_event_ref=canonical_request.event_id,
+                    normalized_arguments_digest=arguments_digest,
+                    semantic_input_digest=semantic_input_digest,
+                ),
+                result_ref=AcceptedEvidenceResultRef(
+                    payload_ref=None,
+                    payload_digest=None,
+                    outcome_digest=sha256_digest_json(raw_tool_outcome),
+                    truncation_applied=False,
+                ),
+                source_refs=(),
+                locator_refs=(),
+            )
+            canonical_result = event_log.append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id=result_event_id,
+                    event_class=EventClass.CANONICAL_FACT,
+                    session_id="session-smoke-diagnostic",
+                    run_id="run-smoke-diagnostic",
+                    attempt_id="attempt-smoke-diagnostic",
+                    execution_id="execution-smoke-diagnostic",
+                    event_type="TOOL_RESULT_ACCEPTED",
+                    occurred_at=datetime(2026, 7, 15, tzinfo=UTC),
+                    actor="host.tool_runtime",
+                    source="host.tool_runtime.accept",
+                    client_request_id=None,
+                    idempotency_key="canonical-result",
+                    policy_decision=None,
+                    reason=None,
+                    payload_json={
+                        "tool_call_id": "tool-call-smoke-diagnostic",
+                        "tool_name": "read_file",
+                        "normalized_arguments_digest": arguments_digest,
+                        "tool_fact_kind": "completed",
+                        "accepted_evidence_envelope": (
+                            accepted_evidence_envelope_to_json_value(envelope)
+                        ),
+                        "raw_tool_outcome": raw_tool_outcome,
+                    },
+                    payload_ref=None,
+                    payload_digest=None,
+                ),
+            ).row
+            preview_result = event_log.append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id="event-engine-result-preview",
+                    event_class=EventClass.PREVIEW,
+                    session_id="session-smoke-diagnostic",
+                    run_id="run-smoke-diagnostic",
+                    attempt_id="attempt-smoke-diagnostic",
+                    execution_id="execution-smoke-diagnostic",
+                    event_type="TOOL_RESULT_ACCEPTED",
+                    occurred_at=datetime(2026, 7, 15, tzinfo=UTC),
+                    actor="host.engine_ingest",
+                    source="host.engine_ingest",
+                    client_request_id=None,
+                    idempotency_key="preview-result",
+                    policy_decision=None,
+                    reason=None,
+                    payload_json={
+                        "tool_call_id": "tool-call-smoke-diagnostic",
+                        "tool_name": "read_file",
+                        "has_result": True,
+                    },
+                    payload_ref=None,
+                    payload_digest=None,
+                ),
+            ).row
+            return (
+                preview_request,
+                canonical_request,
+                preview_awaiting,
+                canonical_awaiting,
+                preview_result,
+                canonical_result,
+            )
+
+        (
+            preview_request,
+            canonical_request,
+            preview_awaiting,
+            canonical_awaiting,
+            preview_result,
+            canonical_result,
+        ) = store.transaction_runner.run_write(seed)
+        strict_rows = store.transaction_runner.run_read(
+            lambda transaction: _strict_accepted_request_atoms(
+                transaction,
+                (preview_request, canonical_request),
+            )
+        )
+        awaiting_rows = _canonical_fact_rows(
+            (preview_awaiting, canonical_awaiting),
+            event_type="TOOL_AWAITING",
+        )
+        result_rows = _canonical_fact_rows(
+            (preview_result, canonical_result),
+            event_type="TOOL_RESULT_ACCEPTED",
+        )
+        result_projections = store.transaction_runner.run_read(
+            lambda transaction: tuple(
+                _accepted_projection(transaction, row) for row in result_rows
+            )
+        )
+
+        assert len(strict_rows) == 1
+        parsed_row, atoms = strict_rows[0]
+        assert parsed_row.event_id == canonical_request.event_id
+        assert parsed_row.event_class is EventClass.CANONICAL_FACT
+        assert atoms.arguments_json == arguments_json
+        assert atoms.normalized_arguments_digest == arguments_digest
+        assert atoms.arguments_payload_digest == arguments_digest
+        assert tuple(row.event_id for row in awaiting_rows) == (
+            canonical_awaiting.event_id,
+        )
+        assert tuple(row.event_id for row in result_rows) == (
+            canonical_result.event_id,
+        )
+        assert len(result_projections) == 1
+        projection = result_projections[0]
+        assert projection.llm_material is not None
+        assert projection.llm_material.result_text == canonical_json_dumps(
+            raw_tool_outcome
+        )
+
+
 @pytest.mark.parametrize("awaiting_tool", tuple(FinsAwaitingTool))
 def test_tool_awaiting_contract_accepts_only_request_link_for_all_variants(
     awaiting_tool: FinsAwaitingTool,
@@ -401,6 +722,27 @@ def _valid_awaiting_payload(
         },
         "semantic_input_digest": "sha256:" + "a" * 64,
     }
+
+
+def _diagnostic_options(tmp_path: pathlib.Path) -> HostDurableStoreOptions:
+    """构造 smoke diagnostic 测试使用的 durable store 配置。
+
+    :param tmp_path: pytest 提供的临时目录。
+    :returns: 指向临时 SQLite 与 artifact 目录的 durable store 配置。
+    :raises ValueError: 当底层配置拒绝无效存储参数时抛出。
+    """
+
+    return HostDurableStoreOptions(
+        db_path=tmp_path / "diagnostic.sqlite3",
+        payload_policy=PayloadStoragePolicy(artifact_root=tmp_path / "artifacts"),
+        sqlite_policy=HostSQLiteStoragePolicy(
+            busy_timeout_seconds=0.25,
+            write_busy_retry_count=3,
+            write_retry_initial_delay_seconds=0.001,
+            write_retry_backoff_multiplier=1.2,
+            write_retry_max_delay_seconds=0.01,
+        ),
+    )
 
 
 def _args(tmp_path: pathlib.Path) -> SmokeArgs:

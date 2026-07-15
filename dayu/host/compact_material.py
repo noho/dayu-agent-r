@@ -784,7 +784,8 @@ def run_input_material_block(
     :param block_id: ordinary material list 稳定 block id。
     :param section: compact section owner。
     :param kind: material kind。
-    :param text: 原始或已规范化文本。
+    :param text: ordinary material 的原始文本，或 typed accepted evidence 的唯一
+        renderer exact 文本。
     :param canonical_source_refs: canonical source refs。
     :param event_sequence: 来源 EventLog sequence；stable block 可为 ``None``。
     :param turn_group_id: Host admitted user Run id；stable semantic block 可为 ``None``。
@@ -803,15 +804,19 @@ def run_input_material_block(
     :raises ValueError: 参数值非法时抛出。
     """
 
-    normalized = normalized_material_text(text)
+    material_text = (
+        text
+        if accepted_tool_evidence is not None
+        else normalized_material_text(text)
+    )
     return RunInputMaterialBlock(
         block_id=block_id,
         section=section,
         kind=kind,
-        text=normalized,
-        size_units=len(normalized),
+        text=material_text,
+        size_units=len(material_text),
         canonical_source_refs=canonical_source_refs,
-        content_digest=_text_digest(normalized),
+        content_digest=_text_digest(material_text),
         event_sequence=event_sequence,
         turn_group_id=turn_group_id,
         event_sub_index=event_sub_index,

@@ -176,7 +176,6 @@ def project_accepted_tool_result(
         result_row,
         envelope,
         payload,
-        resolved_payload_available=resolved_payload is not None,
     )
     diagnostics = [*payload_diagnostics, *result_diagnostics]
     tool_name = _projection_tool_name(payload, envelope)
@@ -283,8 +282,6 @@ def _result_payload(
     result_row: EventLogRow,
     envelope: AcceptedEvidenceEnvelope | None,
     fallback_payload: Mapping[str, JsonValue],
-    *,
-    resolved_payload_available: bool,
 ) -> tuple[Mapping[str, JsonValue] | None, tuple[str, ...]]:
     """读取 envelope 指向的 digest-checked result payload。
 
@@ -292,13 +289,10 @@ def _result_payload(
     :param result_row: accepted result row。
     :param envelope: accepted evidence envelope。
     :param fallback_payload: EventLog payload。
-    :param resolved_payload_available: fallback payload 是否已由调用方校验。
     :returns: result payload 与读取诊断。
     """
 
-    if resolved_payload_available:
-        if envelope is None:
-            return fallback_payload, ("accepted_evidence_envelope_missing",)
+    if fallback_payload.get(_FIELD_RAW_TOOL_OUTCOME) is not None:
         return fallback_payload, ()
     if envelope is None:
         return fallback_payload, ("accepted_evidence_envelope_missing",)
