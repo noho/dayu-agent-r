@@ -69,6 +69,12 @@ from dayu.host.durable.state import (
     WorkerKind,
 )
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.evidence import (
+    AcceptedEvidenceEnvelope,
+    AcceptedEvidenceResultRef,
+    AcceptedEvidenceToolQuery,
+    accepted_evidence_envelope_to_json_value,
+)
 from dayu.host.api import AttemptDispatchSnapshot, AttemptStatus, RunStatus
 from dayu.host.queue_policy import RunQueuePolicy
 from dayu.host.run_input import (
@@ -84,6 +90,11 @@ from dayu.host.run_input import (
 from dayu.host.tool_trace import (
     ToolTraceSinkOptions,
     catch_up_tool_trace_projection,
+)
+from dayu.host.tool_call_request import (
+    AcceptedToolCallRequestAtomInput,
+    ToolCallRequestEventOrigin,
+    build_tool_call_requested_event_request,
 )
 from tests.host.fake_cancellation import ControllableCancellationToken
 
@@ -135,7 +146,7 @@ def _append_event(
     event_class: EventClass = EventClass.CANONICAL_FACT,
     payload_ref: str | None = None,
     payload_digest: str | None = None,
-) -> None:
+) -> EventLogRow:
     """追加 Tool Trace query 测试 EventLog row。
 
     :param transaction_runner: Host durable transaction runner。
@@ -146,10 +157,10 @@ def _append_event(
     :param event_class: EventLog class。
     :param payload_ref: 可选 source descriptor ref。
     :param payload_digest: 可选 source descriptor digest。
-    :returns: ``None``。
+    :returns: 数据库返回的真实 EventLog row。
     """
 
-    transaction_runner.run_write(
+    return transaction_runner.run_write(
         lambda transaction: append_event(
             transaction,
             EventLogAppendRequest(
@@ -171,7 +182,146 @@ def _append_event(
                 payload_ref=payload_ref,
                 payload_digest=payload_digest,
             ),
-        )
+        ).row
+    )
+
+
+def _canonical_request_atom(
+    *,
+    event_id: str,
+    tool_call_id: str,
+    tool_name: str,
+    accepted_arguments: Mapping[str, JsonValue],
+) -> AcceptedToolCallRequestAtomInput:
+    """构造 identity/digest 同源的 canonical request atom 输入。
+
+    :param event_id: request event id。
+    :param tool_call_id: tool call id。
+    :param tool_name: 工具名。
+    :param accepted_arguments: Host 已接受的精确工具参数。
+    :returns: 可交给共享 writer 的 accepted request atom。
+    :raises ValueError: 构造的 request atom 字段违反基础约束时抛出。
+    """
+
+    return AcceptedToolCallRequestAtomInput(
+        session_id="session-1",
+        run_id="run-1",
+        attempt_id="attempt-1",
+        execution_id="execution-1",
+        iteration_id="iteration-1",
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        tool_schema_digest=sha256_digest_json({"tool_schema": tool_name}),
+        tool_identity_digest=sha256_digest_json(
+            {"tool_name": tool_name, "tool_call_id": tool_call_id}
+        ),
+        accepted_arguments=accepted_arguments,
+        normalized_arguments_digest=sha256_digest_json(
+            {"arguments": accepted_arguments}
+        ),
+        tool_fact_kind="completed",
+        accept_idempotency_key=f"accept:{event_id}",
+        semantic_input_digest=sha256_digest_json(
+            {"semantic_input": f"query fixture {event_id}"}
+        ),
+        semantic_query_text=f"查询 query fixture {event_id}",
+    )
+
+
+def _append_canonical_tool_request(
+    transaction_runner: HostTransactionRunner,
+    *,
+    event_id: str,
+    atom: AcceptedToolCallRequestAtomInput,
+) -> EventLogRow:
+    """通过共享 writer 追加 canonical ``TOOL_CALL_REQUESTED``。
+
+    :param transaction_runner: Host durable transaction runner。
+    :param event_id: request event id。
+    :param atom: 已接受的 request atom。
+    :returns: 数据库返回的真实 request row。
+    :raises ValueError: request atom 基础字段非法时抛出。
+    :raises HostDurableError: request atom 或 EventLog 写入失败时抛出。
+    """
+
+    return transaction_runner.run_write(
+        lambda transaction: append_event(
+            transaction,
+            build_tool_call_requested_event_request(
+                transaction,
+                atom=atom,
+                event_id=event_id,
+                occurred_at=_FIXED_NOW,
+                origin=ToolCallRequestEventOrigin.ORDINARY_ACCEPT,
+            ),
+        ).row
+    )
+
+
+def _append_accepted_tool_result(
+    transaction_runner: HostTransactionRunner,
+    *,
+    event_id: str,
+    request: EventLogRow,
+    atom: AcceptedToolCallRequestAtomInput,
+    additional_payload: Mapping[str, JsonValue],
+    raw_tool_outcome: JsonValue,
+    result_payload_ref: str | None = None,
+    result_payload_digest: str | None = None,
+) -> EventLogRow:
+    """追加与 canonical request identity/digest 同源的 accepted result。
+
+    :param transaction_runner: Host durable transaction runner。
+    :param event_id: result event id。
+    :param request: 对应的 canonical request row。
+    :param atom: request row 使用的 accepted atom。
+    :param additional_payload: signal、诊断或 payload ref 等 result 字段。
+    :param raw_tool_outcome: accepted raw tool outcome。
+    :param result_payload_ref: 可选 result payload descriptor ref。
+    :param result_payload_digest: 可选 result payload descriptor digest。
+    :returns: 数据库返回的真实 result row。
+    :raises ValueError: envelope 基础字段非法时抛出。
+    :raises HostDurableError: envelope 或 EventLog 写入失败时抛出。
+    """
+
+    envelope = AcceptedEvidenceEnvelope(
+        evidence_id=f"evidence:{event_id}",
+        producer_event_ref=event_id,
+        tool_name=atom.tool_name,
+        tool_call_id=atom.tool_call_id,
+        tool_query=AcceptedEvidenceToolQuery(
+            tool_call_requested_event_ref=request.event_id,
+            normalized_arguments_digest=atom.normalized_arguments_digest,
+            semantic_input_digest=atom.semantic_input_digest,
+        ),
+        result_ref=AcceptedEvidenceResultRef(
+            payload_ref=result_payload_ref,
+            payload_digest=result_payload_digest,
+            outcome_digest=sha256_digest_json(raw_tool_outcome),
+            truncation_applied=False,
+        ),
+        source_refs=(),
+        locator_refs=(),
+    )
+    payload: dict[str, JsonValue] = dict(additional_payload)
+    payload.update(
+        {
+            "tool_call_id": atom.tool_call_id,
+            "tool_name": atom.tool_name,
+            "normalized_arguments_digest": atom.normalized_arguments_digest,
+            "semantic_input_digest": atom.semantic_input_digest,
+            "outcome_digest": sha256_digest_json(raw_tool_outcome),
+            "accepted_evidence_envelope": (
+                accepted_evidence_envelope_to_json_value(envelope)
+            ),
+            "raw_tool_outcome": raw_tool_outcome,
+        }
+    )
+    return _append_event(
+        transaction_runner,
+        event_id=event_id,
+        event_type="TOOL_RESULT_ACCEPTED",
+        payload=payload,
     )
 
 
@@ -909,33 +1059,38 @@ def _assert_trace_summary_signals(
 def test_query_helpers_return_rows_ordered_by_event_sequence(
     tmp_path: Path,
 ) -> None:
-    """run/tool_call/provider/diagnostic 查询按 event_sequence ASC 分页。"""
+    """run/tool_call/provider/diagnostic 查询按 event_sequence ASC 分页。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: canonical request/result 未按真实 sequence 查询时抛出。
+    """
 
     signal_objects = _query_signal_objects()
     with open_host_durable_store(_options(tmp_path)) as store:
-        _append_event(
+        atom = _canonical_request_atom(
+            event_id="event-1",
+            tool_call_id="tool-call-1",
+            tool_name="lookup_filing",
+            accepted_arguments={"ticker": "AAPL"},
+        )
+        request = _append_canonical_tool_request(
             store.transaction_runner,
             event_id="event-1",
-            event_type="TOOL_CALL_REQUESTED",
-            payload={
-                "tool_call_id": "tool-call-1",
-                "tool_name": "lookup_filing",
-                "normalized_arguments_digest": "sha256:args-1",
-            },
+            atom=atom,
         )
-        _append_event(
+        _append_accepted_tool_result(
             store.transaction_runner,
             event_id="event-2",
-            event_type="TOOL_RESULT_ACCEPTED",
-            payload={
-                "tool_call_id": "tool-call-1",
-                "tool_name": "lookup_filing",
-                "outcome_digest": "sha256:outcome",
+            request=request,
+            atom=atom,
+            additional_payload={
                 "diagnostic_refs": [{"ref_id": "diag-shared"}],
                 _FIELD_CONTEXT_PRESSURE: signal_objects[_FIELD_CONTEXT_PRESSURE],
                 _FIELD_TOOL_TIMING: signal_objects[_FIELD_TOOL_TIMING],
                 _FIELD_FAILURE_METADATA: signal_objects[_FIELD_FAILURE_METADATA],
             },
+            raw_tool_outcome={"kind": "completed", "result": {"status": "ok"}},
         )
         _append_event(
             store.transaction_runner,
@@ -1688,7 +1843,6 @@ def test_runner_call_projection_resolver_fails_closed_for_digest_mismatch(
     """projection descriptor digest 与 manifest 期望不一致时 resolver fail closed。"""
 
     projection_payload: Mapping[str, JsonValue] = {"messages": []}
-    projection_digest = sha256_digest_json(projection_payload)
     wrong_projection_digest = sha256_digest_json({"projection": "wrong"})
     manifest_payload = _full_runner_call_manifest(
         manifest_id="runner-call-manifest:projection-digest-mismatch",
@@ -1814,7 +1968,12 @@ def test_runner_call_projection_resolver_fails_closed_for_non_object_payload(
 def test_tool_trace_row_resolver_reads_args_result_and_final_answer(
     tmp_path: Path,
 ) -> None:
-    """row resolver 能读取工具参数、工具结果 payload 与 terminal final answer。"""
+    """row resolver 能读取工具参数、工具结果 payload 与 terminal final answer。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 任一 canonical descriptor payload 无法恢复时抛出。
+    """
 
     result_payload: Mapping[str, JsonValue] = {
         "llm_facing_payload": {"current_time": "2026-07-07 19:18:11"}
@@ -1841,32 +2000,35 @@ def test_tool_trace_row_resolver_reads_args_result_and_final_answer(
                 ),
             )
         )
-        _append_event(
+        accepted_arguments: Mapping[str, JsonValue] = {
+            "timezone": "Asia/Shanghai"
+        }
+        atom = _canonical_request_atom(
+            event_id="event-tool-call",
+            tool_call_id="call-time",
+            tool_name="get_current_time",
+            accepted_arguments=accepted_arguments,
+        )
+        request = _append_canonical_tool_request(
             store.transaction_runner,
             event_id="event-tool-call",
-            event_type="TOOL_CALL_REQUESTED",
-            payload={
-                "tool_call_id": "call-time",
-                "tool_name": "get_current_time",
-                "arguments_inline_json": {"timezone": "Asia/Shanghai"},
-                "normalized_arguments_digest": sha256_digest_json(
-                    {"arguments": {"timezone": "Asia/Shanghai"}}
-                ),
-            },
+            atom=atom,
         )
-        _append_event(
+        _append_accepted_tool_result(
             store.transaction_runner,
             event_id="event-tool-result",
-            event_type="TOOL_RESULT_ACCEPTED",
-            payload={
-                "tool_call_id": "call-time",
-                "tool_name": "get_current_time",
+            request=request,
+            atom=atom,
+            additional_payload={
                 "payload_ref": {
                     "payload_ref": "payload-tool-result",
                     "payload_digest": result_digest,
                 },
                 "payload_digest": result_digest,
             },
+            raw_tool_outcome={"kind": "completed", "result": result_payload},
+            result_payload_ref="payload-tool-result",
+            result_payload_digest=result_digest,
         )
         _append_event(
             store.transaction_runner,
@@ -1902,7 +2064,7 @@ def test_tool_trace_row_resolver_reads_args_result_and_final_answer(
         )
 
         assert resolved_args.source_event_payload["arguments_inline_json"] == {
-            "timezone": "Asia/Shanghai"
+            "arguments": {"timezone": "Asia/Shanghai"}
         }
         assert resolved_result.descriptor_payload is not None
         assert resolved_result.descriptor_payload.payload == result_payload

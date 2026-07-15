@@ -32,7 +32,6 @@ from dayu.host.durable.event_log import (
 )
 from dayu.host.queue_policy import RunQueuePolicy
 from dayu.host.evidence import (
-    ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT,
     ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT,
     render_accepted_tool_evidence_for_llm,
 )
@@ -198,13 +197,12 @@ def test_projection_falls_back_to_arguments_when_semantic_query_is_absent(
     assert projection.source.text == ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT
 
 
-def test_projection_missing_request_atom_returns_limited_signal(
+def test_projection_missing_request_atom_fails_closed(
     tmp_path: Path,
 ) -> None:
-    """request atom 缺失时 query 降级由 projection owner 统一给出。"""
+    """canonical request atom 缺失时共享 projection 抛 durable error。"""
 
     event_log = EventLogStore()
-    projection: AcceptedToolResultProjection | None = None
     with open_host_durable_store(_durable_options(tmp_path)) as store:
         row = store.transaction_runner.run_write(
             lambda transaction: _append_tool_result(
@@ -219,24 +217,18 @@ def test_projection_missing_request_atom_returns_limited_signal(
                 source_refs=(),
             )
         )
-        projection = store.transaction_runner.run_read(
-            lambda transaction: project_accepted_tool_result(transaction, row)
-        )
-
-    assert projection is not None
-    assert projection.query.state is AcceptedToolResultQueryState.LIMITED_SIGNAL
-    assert projection.query.text == ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT
-    assert projection.status is AcceptedToolResultStatus.CANCELLED
-    assert "request_atom_unavailable" in projection.diagnostic_reasons
+        with pytest.raises(HostDurableError, match="request atom is missing"):
+            store.transaction_runner.run_read(
+                lambda transaction: project_accepted_tool_result(transaction, row)
+            )
 
 
-def test_projection_missing_envelope_returns_shared_unavailable_source_text(
+def test_projection_missing_envelope_fails_closed(
     tmp_path: Path,
 ) -> None:
-    """accepted evidence envelope 缺失时 source 文本仍由 projection owner 提供。"""
+    """accepted evidence envelope 缺失时共享 projection fail closed。"""
 
     event_log = EventLogStore()
-    projection: AcceptedToolResultProjection | None = None
     with open_host_durable_store(_durable_options(tmp_path)) as store:
         row = store.transaction_runner.run_write(
             lambda transaction: _append_event(
@@ -255,21 +247,10 @@ def test_projection_missing_envelope_returns_shared_unavailable_source_text(
                 },
             )
         )
-        projection = store.transaction_runner.run_read(
-            lambda transaction: project_accepted_tool_result(transaction, row)
-        )
-
-    assert projection is not None
-    assert projection.source.state is AcceptedToolResultSourceState.UNAVAILABLE
-    assert projection.source.diagnostic_reason == "accepted_evidence_envelope_missing"
-    assert projection.source.text == ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT
-    assert projection.llm_material is not None
-    assert render_accepted_tool_evidence_for_llm(projection.llm_material) == (
-        "工具名称：fins.search\n"
-        f"查询语义：{ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT}\n"
-        f"业务来源：{ACCEPTED_EVIDENCE_SOURCE_UNAVAILABLE_TEXT}\n"
-        '工具结果：{"kind":"completed","result":{"ok":true}}'
-    )
+        with pytest.raises(HostDurableError, match="evidence envelope is missing"):
+            store.transaction_runner.run_read(
+                lambda transaction: project_accepted_tool_result(transaction, row)
+            )
 
 
 def test_projection_missing_material_uses_owner_fallback() -> None:
@@ -280,13 +261,12 @@ def test_projection_missing_material_uses_owner_fallback() -> None:
     )
 
 
-def test_projection_malformed_optional_payload_text_and_status_handling(
+def test_projection_missing_envelope_and_blank_status_handling(
     tmp_path: Path,
 ) -> None:
-    """非状态 optional text fail closed；状态字段不可用时投影 unknown。"""
+    """缺 envelope fail closed；canonical request 完整时空状态映射 unknown。"""
 
     event_log = EventLogStore()
-    projection: AcceptedToolResultProjection | None = None
     blank_status_projection: AcceptedToolResultProjection | None = None
     with open_host_durable_store(_durable_options(tmp_path)) as store:
         wrong_type_row = store.transaction_runner.run_write(
@@ -302,30 +282,14 @@ def test_projection_malformed_optional_payload_text_and_status_handling(
             )
         )
         blank_status_row = store.transaction_runner.run_write(
-            lambda transaction: _append_event(
+            lambda transaction: _append_tool_result_with_request(
                 transaction,
                 event_log,
                 event_id="event-result-blank-status",
-                event_type="TOOL_RESULT_ACCEPTED",
-                payload={
-                    "tool_name": _TOOL_NAME,
-                    "tool_call_id": "tool-call-blank-status",
-                    "resolution_kind": " ",
-                    "raw_tool_outcome": {"kind": "completed"},
-                },
-            )
-        )
-        null_tool_name_row = store.transaction_runner.run_write(
-            lambda transaction: _append_event(
-                transaction,
-                event_log,
-                event_id="event-result-null-tool-name",
-                event_type="TOOL_RESULT_ACCEPTED",
-                payload={
-                    "tool_name": None,
-                    "tool_call_id": "tool-call-null-tool-name",
-                    "raw_tool_outcome": {"kind": "completed"},
-                },
+                tool_call_id="tool-call-blank-status",
+                tool_fact_kind=" ",
+                raw_tool_outcome={"kind": "completed"},
+                source_refs=(),
             )
         )
 
@@ -342,23 +306,13 @@ def test_projection_malformed_optional_payload_text_and_status_handling(
                 blank_status_row,
             )
         )
-        projection = store.transaction_runner.run_read(
-            lambda transaction: project_accepted_tool_result(
-                transaction,
-                null_tool_name_row,
-            )
-        )
 
-    assert projection is not None
     assert blank_status_projection is not None
-    assert projection.tool_name is None
-    assert projection.llm_material is None
     assert blank_status_projection.status is AcceptedToolResultStatus.UNKNOWN
     assert (
         "accepted_status_unavailable"
         in blank_status_projection.diagnostic_reasons
     )
-    assert "accepted_status_unavailable" in projection.diagnostic_reasons
 
 
 def test_accepted_evidence_producer_mismatch_is_typed_exception(
@@ -417,26 +371,22 @@ def test_projection_maps_governed_error_and_unknown_status(tmp_path: Path) -> No
     unknown_projection: AcceptedToolResultProjection | None = None
     with open_host_durable_store(_durable_options(tmp_path)) as store:
         governed = store.transaction_runner.run_write(
-            lambda transaction: _append_tool_result(
+            lambda transaction: _append_tool_result_with_request(
                 transaction,
                 event_log,
                 event_id="event-result-governed",
                 tool_call_id="tool-call-governed",
-                request_event_ref=None,
-                normalized_arguments_digest=_DIGEST,
                 tool_fact_kind="governed_error",
                 raw_tool_outcome={"kind": "failed", "result": {"ok": False}},
                 source_refs=(),
             )
         )
         unknown = store.transaction_runner.run_write(
-            lambda transaction: _append_tool_result(
+            lambda transaction: _append_tool_result_with_request(
                 transaction,
                 event_log,
                 event_id="event-result-unknown",
                 tool_call_id="tool-call-unknown",
-                request_event_ref=None,
-                normalized_arguments_digest=_DIGEST,
                 tool_fact_kind="unexpected-status",
                 raw_tool_outcome={"kind": "completed", "result": {"ok": True}},
                 source_refs=(),
@@ -456,11 +406,10 @@ def test_projection_maps_governed_error_and_unknown_status(tmp_path: Path) -> No
     assert "accepted_status_unavailable" in unknown_projection.diagnostic_reasons
 
 
-def test_projection_identity_mismatch_returns_limited_signal(tmp_path: Path) -> None:
-    """request atom 身份不匹配时 query fail closed 为 limited signal。"""
+def test_projection_identity_mismatch_fails_closed(tmp_path: Path) -> None:
+    """request atom 与 envelope 工具身份不匹配时抛 durable error。"""
 
     event_log = EventLogStore()
-    projection: AcceptedToolResultProjection | None = None
     with open_host_durable_store(_durable_options(tmp_path)) as store:
         def seed(transaction: HostTransaction) -> EventLogRow:
             """写入 tool_call_id 不一致的 request / accepted result。
@@ -492,15 +441,70 @@ def test_projection_identity_mismatch_returns_limited_signal(tmp_path: Path) -> 
             )
 
         row = store.transaction_runner.run_write(seed)
-        projection = store.transaction_runner.run_read(
-            lambda transaction: project_accepted_tool_result(transaction, row)
-        )
+        with pytest.raises(HostDurableError, match="envelope mismatch"):
+            store.transaction_runner.run_read(
+                lambda transaction: project_accepted_tool_result(transaction, row)
+            )
 
-    assert projection is not None
-    assert projection.query.state is AcceptedToolResultQueryState.LIMITED_SIGNAL
-    assert projection.query.text == ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT
-    assert projection.query.diagnostic_reason == "request_atom_identity_mismatch"
-    assert "request query must not leak" not in projection.query.text
+
+@pytest.mark.parametrize(
+    "result_execution_id",
+    (None, "execution-other"),
+    ids=("missing", "mismatch"),
+)
+def test_projection_result_execution_identity_mismatch_fails_closed(
+    tmp_path: Path,
+    result_execution_id: str | None,
+) -> None:
+    """accepted result execution 缺失或漂移时严格身份校验 fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :param result_execution_id: 缺失或与 canonical request 不同的 execution id。
+    :returns: ``None``。
+    :raises AssertionError: 不同源 result 被接受或异常类型不正确时抛出。
+    """
+
+    event_log = EventLogStore()
+    with open_host_durable_store(_durable_options(tmp_path)) as store:
+        def seed(transaction: HostTransaction) -> EventLogRow:
+            """写入 execution 不同源的 request / accepted result。
+
+            :param transaction: Host transaction。
+            :returns: accepted result row。
+            :raises HostDurableError: durable append 失败时由 store 抛出。
+            """
+
+            arguments_json: JsonValue = {"arguments": {"ticker": "MSFT"}}
+            arguments_digest = sha256_digest_json(arguments_json)
+            request = _append_tool_call_requested(
+                transaction,
+                event_log,
+                event_id=f"event-request-execution-{result_execution_id}",
+                tool_call_id="tool-call-execution-mismatch",
+                arguments_json=arguments_json,
+                semantic_query_text=None,
+            )
+            return _append_tool_result(
+                transaction,
+                event_log,
+                event_id=f"event-result-execution-{result_execution_id}",
+                tool_call_id="tool-call-execution-mismatch",
+                request_event_ref=request.event_id,
+                normalized_arguments_digest=arguments_digest,
+                tool_fact_kind="completed",
+                raw_tool_outcome={"kind": "completed", "result": {"ok": True}},
+                source_refs=(),
+                execution_id=result_execution_id,
+            )
+
+        row = store.transaction_runner.run_write(seed)
+        with pytest.raises(
+            HostDurableError,
+            match="accepted result request atom identity mismatch",
+        ):
+            store.transaction_runner.run_read(
+                lambda transaction: project_accepted_tool_result(transaction, row)
+            )
 
 
 def test_projection_wait_resolution_status_takes_priority(tmp_path: Path) -> None:
@@ -510,13 +514,11 @@ def test_projection_wait_resolution_status_takes_priority(tmp_path: Path) -> Non
     projection: AcceptedToolResultProjection | None = None
     with open_host_durable_store(_durable_options(tmp_path)) as store:
         row = store.transaction_runner.run_write(
-            lambda transaction: _append_tool_result(
+            lambda transaction: _append_tool_result_with_request(
                 transaction,
                 event_log,
                 event_id="event-result-wait-resolution",
                 tool_call_id="tool-call-wait-resolution",
-                request_event_ref=None,
-                normalized_arguments_digest=_DIGEST,
                 tool_fact_kind="completed",
                 resolution_kind="cancelled",
                 raw_tool_outcome={"kind": "completed", "result": {"ok": True}},
@@ -538,13 +540,11 @@ def test_projection_filters_internal_source_refs(tmp_path: Path) -> None:
     projection: AcceptedToolResultProjection | None = None
     with open_host_durable_store(_durable_options(tmp_path)) as store:
         row = store.transaction_runner.run_write(
-            lambda transaction: _append_tool_result(
+            lambda transaction: _append_tool_result_with_request(
                 transaction,
                 event_log,
                 event_id="event-result-source-filter",
                 tool_call_id="tool-call-source-filter",
-                request_event_ref=None,
-                normalized_arguments_digest=_DIGEST,
                 tool_fact_kind="completed",
                 raw_tool_outcome={"kind": "completed", "result": {"ok": True}},
                 source_refs=(
@@ -572,13 +572,11 @@ def test_projection_unavailable_source_uses_shared_llm_text_and_filters_internal
     projection: AcceptedToolResultProjection | None = None
     with open_host_durable_store(_durable_options(tmp_path)) as store:
         row = store.transaction_runner.run_write(
-            lambda transaction: _append_tool_result(
+            lambda transaction: _append_tool_result_with_request(
                 transaction,
                 event_log,
                 event_id="event-result-source-unavailable",
                 tool_call_id="tool-call-source-unavailable",
-                request_event_ref=None,
-                normalized_arguments_digest=_DIGEST,
                 tool_fact_kind="completed",
                 raw_tool_outcome={"kind": "completed", "result": {"ok": True}},
                 source_refs=(
@@ -605,7 +603,7 @@ def test_projection_unavailable_source_uses_shared_llm_text_and_filters_internal
 def test_projection_reads_descriptor_payload_and_reports_missing_descriptor(
     tmp_path: Path,
 ) -> None:
-    """projection 覆盖 descriptor raw payload 与 descriptor 缺失诊断。"""
+    """projection 覆盖 descriptor raw payload 与 result descriptor 缺失诊断。"""
 
     event_log = EventLogStore()
     descriptor_payload: JsonValue = {
@@ -622,12 +620,22 @@ def test_projection_reads_descriptor_payload_and_reports_missing_descriptor(
             :returns: accepted result row。
             """
 
+            arguments_json: JsonValue = {"arguments": {"ticker": "MSFT"}}
+            arguments_digest = sha256_digest_json(arguments_json)
+            request = _append_tool_call_requested(
+                transaction,
+                event_log,
+                event_id="event-request-descriptor",
+                tool_call_id="tool-call-descriptor",
+                arguments_json=arguments_json,
+                semantic_query_text=None,
+            )
             payload_ref = "payload-accepted-result-descriptor"
             envelope = _accepted_envelope(
                 event_id="event-result-descriptor",
                 tool_call_id="tool-call-descriptor",
-                request_event_ref=None,
-                normalized_arguments_digest=_DIGEST,
+                request_event_ref=request.event_id,
+                normalized_arguments_digest=arguments_digest,
                 raw_tool_outcome=descriptor_payload,
                 source_refs=(),
                 payload_ref=payload_ref,
@@ -636,7 +644,7 @@ def test_projection_reads_descriptor_payload_and_reports_missing_descriptor(
             payload: JsonValue = {
                 "tool_call_id": "tool-call-descriptor",
                 "tool_name": _TOOL_NAME,
-                "normalized_arguments_digest": _DIGEST,
+                "normalized_arguments_digest": arguments_digest,
                 "tool_fact_kind": "completed",
                 "accepted_evidence_envelope": accepted_evidence_envelope_to_json_value(
                     envelope
@@ -666,27 +674,47 @@ def test_projection_reads_descriptor_payload_and_reports_missing_descriptor(
                 payload_digest=actual_digest,
             )
 
-        descriptor_row = store.transaction_runner.run_write(seed_descriptor)
-        missing_row = store.transaction_runner.run_write(
-            lambda transaction: _append_tool_result(
+        def seed_missing_descriptor(transaction: HostTransaction) -> EventLogRow:
+            """写入 request link 完整但 result descriptor 缺失的 accepted result。
+
+            :param transaction: Host transaction。
+            :returns: accepted result row。
+            :raises HostDurableError: durable append 失败时由 store 抛出。
+            """
+
+            arguments_json: JsonValue = {"arguments": {"ticker": "MSFT"}}
+            arguments_digest = sha256_digest_json(arguments_json)
+            request = _append_tool_call_requested(
+                transaction,
+                event_log,
+                event_id="event-request-missing-descriptor",
+                tool_call_id="tool-call-missing-descriptor",
+                arguments_json=arguments_json,
+                semantic_query_text=None,
+            )
+            return _append_tool_result(
                 transaction,
                 event_log,
                 event_id="event-result-missing-descriptor",
                 tool_call_id="tool-call-missing-descriptor",
-                request_event_ref=None,
-                normalized_arguments_digest=_DIGEST,
+                request_event_ref=request.event_id,
+                normalized_arguments_digest=arguments_digest,
                 tool_fact_kind="completed",
                 raw_tool_outcome={"kind": "completed", "result": {"ok": True}},
                 source_refs=(),
                 payload_ref="payload-missing-descriptor",
                 payload_digest=sha256_digest_json({"missing": True}),
             )
-        )
+
+        descriptor_row = store.transaction_runner.run_write(seed_descriptor)
+        missing_row = store.transaction_runner.run_write(seed_missing_descriptor)
         descriptor_projection = store.transaction_runner.run_read(
             lambda transaction: project_accepted_tool_result(transaction, descriptor_row)
         )
         missing_projection = store.transaction_runner.run_read(
-            lambda transaction: project_accepted_tool_result(transaction, missing_row)
+            lambda transaction: project_accepted_tool_result(
+                transaction, missing_row
+            )
         )
 
     assert descriptor_projection is not None
@@ -698,13 +726,12 @@ def test_projection_reads_descriptor_payload_and_reports_missing_descriptor(
     assert "result_payload_unavailable" in missing_projection.diagnostic_reasons
 
 
-def test_projection_missing_event_payload_maps_lost_with_diagnostic(
+def test_projection_missing_event_payload_fails_closed(
     tmp_path: Path,
 ) -> None:
-    """EventLog payload 不可读时映射 lost 并保留 event payload 诊断。"""
+    """EventLog payload 不可读导致 canonical envelope 缺失时 fail closed。"""
 
     event_log = EventLogStore()
-    projection: AcceptedToolResultProjection | None = None
     with open_host_durable_store(_durable_options(tmp_path)) as store:
         def seed(transaction: HostTransaction) -> EventLogRow:
             """写入 payload JSON 非 object 的 accepted result event。
@@ -739,13 +766,10 @@ def test_projection_missing_event_payload_maps_lost_with_diagnostic(
             )
 
         row = store.transaction_runner.run_write(seed)
-        projection = store.transaction_runner.run_read(
-            lambda transaction: project_accepted_tool_result(transaction, row)
-        )
-
-    assert projection is not None
-    assert projection.status is AcceptedToolResultStatus.LOST
-    assert "event_payload_unavailable" in projection.diagnostic_reasons
+        with pytest.raises(HostDurableError, match="evidence envelope is missing"):
+            store.transaction_runner.run_read(
+                lambda transaction: project_accepted_tool_result(transaction, row)
+            )
 
 
 def test_projection_unsafe_argument_keys_return_limited_signal(tmp_path: Path) -> None:
@@ -805,13 +829,11 @@ def test_projection_maps_raw_result_ok_false_and_extracts_details(
     projection: AcceptedToolResultProjection | None = None
     with open_host_durable_store(_durable_options(tmp_path)) as store:
         row = store.transaction_runner.run_write(
-            lambda transaction: _append_tool_result(
+            lambda transaction: _append_tool_result_with_request(
                 transaction,
                 event_log,
                 event_id="event-result-raw-ok-false",
                 tool_call_id="tool-call-raw-ok-false",
-                request_event_ref=None,
-                normalized_arguments_digest=_DIGEST,
                 tool_fact_kind=None,
                 raw_tool_outcome={
                     "result": {"ok": False},
@@ -1012,7 +1034,7 @@ def _append_tool_call_requested(
     :param event_log: EventLog store。
     :param event_id: event id。
     :param tool_call_id: tool call id。
-    :param arguments_json: LLM-safe request arguments JSON。
+    :param arguments_json: exact canonical request arguments JSON。
     :param semantic_query_text: 可选 semantic query 文本。
     :returns: appended EventLog row。
     """
@@ -1066,6 +1088,7 @@ def _append_tool_result(
     resolution_kind: str | None = None,
     payload_ref: str | None = None,
     payload_digest: str | None = None,
+    execution_id: str | None = _EXECUTION_ID,
 ) -> EventLogRow:
     """追加测试用 ``TOOL_RESULT_ACCEPTED`` canonical fact。
 
@@ -1081,7 +1104,9 @@ def _append_tool_result(
     :param resolution_kind: 可选 wait resolution kind。
     :param payload_ref: 可选 raw result payload descriptor ref。
     :param payload_digest: 可选 raw result payload digest。
+    :param execution_id: accepted result execution id。
     :returns: appended EventLog row。
+    :raises HostDurableError: durable append 失败时由 store 抛出。
     """
 
     envelope = _accepted_envelope(
@@ -1113,6 +1138,56 @@ def _append_tool_result(
         event_id=event_id,
         event_type="TOOL_RESULT_ACCEPTED",
         payload=payload,
+        execution_id=execution_id,
+    )
+
+
+def _append_tool_result_with_request(
+    transaction: HostTransaction,
+    event_log: EventLogStore,
+    *,
+    event_id: str,
+    tool_call_id: str,
+    tool_fact_kind: str | None,
+    raw_tool_outcome: JsonValue,
+    source_refs: tuple[OpaqueEvidenceRef, ...],
+    resolution_kind: str | None = None,
+) -> EventLogRow:
+    """追加同源 canonical request atom 与 accepted result。
+
+    :param transaction: Host transaction。
+    :param event_log: EventLog store。
+    :param event_id: accepted result event id。
+    :param tool_call_id: tool call id。
+    :param tool_fact_kind: 可选 durable tool fact kind。
+    :param raw_tool_outcome: raw outcome JSON。
+    :param source_refs: source refs。
+    :param resolution_kind: 可选 wait resolution kind。
+    :returns: appended accepted result row。
+    :raises HostDurableError: append durable fact 失败时由 store 抛出。
+    """
+
+    arguments_json: JsonValue = {"arguments": {"ticker": "MSFT"}}
+    arguments_digest = sha256_digest_json(arguments_json)
+    request = _append_tool_call_requested(
+        transaction,
+        event_log,
+        event_id=f"event-request-for-{event_id}",
+        tool_call_id=tool_call_id,
+        arguments_json=arguments_json,
+        semantic_query_text=None,
+    )
+    return _append_tool_result(
+        transaction,
+        event_log,
+        event_id=event_id,
+        tool_call_id=tool_call_id,
+        request_event_ref=request.event_id,
+        normalized_arguments_digest=arguments_digest,
+        tool_fact_kind=tool_fact_kind,
+        raw_tool_outcome=raw_tool_outcome,
+        source_refs=source_refs,
+        resolution_kind=resolution_kind,
     )
 
 
@@ -1170,6 +1245,7 @@ def _append_event(
     payload: JsonValue,
     payload_ref: str | None = None,
     payload_digest: str | None = None,
+    execution_id: str | None = _EXECUTION_ID,
 ) -> EventLogRow:
     """追加测试用 canonical EventLog row。
 
@@ -1180,7 +1256,9 @@ def _append_event(
     :param payload: payload JSON。
     :param payload_ref: 可选 payload descriptor ref。
     :param payload_digest: 可选 payload descriptor digest。
+    :param execution_id: EventLog execution id。
     :returns: appended EventLog row。
+    :raises HostDurableError: durable append 失败时由 store 抛出。
     """
 
     return event_log.append_event(
@@ -1191,7 +1269,7 @@ def _append_event(
             session_id=_SESSION_ID,
             run_id=_RUN_ID,
             attempt_id=_ATTEMPT_ID,
-            execution_id=_EXECUTION_ID,
+            execution_id=execution_id,
             event_type=event_type,
             occurred_at=datetime(2026, 7, 9, tzinfo=UTC),
             actor="test",

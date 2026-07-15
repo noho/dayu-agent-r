@@ -17,10 +17,6 @@ from dayu.host.api import HostPayloadRef, WaitProviderStatusRef
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import EventLogRow
 from dayu.host.durable.state import ExternalJobRef, WaitSnapshotRef
-from dayu.runtime.json_redaction import redact_sensitive_json_fields
-
-_PAYLOAD_FIELD_ACCEPTED_ARGUMENTS = "accepted_arguments"
-_PAYLOAD_FIELD_ACCEPTED_ARGUMENTS_SOURCE_DIGEST = "accepted_arguments_source_digest"
 
 
 def tool_awaiting_payload(
@@ -33,8 +29,7 @@ def tool_awaiting_payload(
     wait_id: str,
     tool_call_id: str,
     tool_name: str,
-    normalized_arguments_digest: str,
-    accepted_arguments: Mapping[str, JsonValue],
+    tool_call_requested_event_ref: Mapping[str, JsonValue],
     await_spec: ToolAwaitSpec,
     adapter_key: str,
     resume_policy: str,
@@ -53,9 +48,8 @@ def tool_awaiting_payload(
     :param wait_id: Host wait record id。
     :param tool_call_id: 工具调用 id。
     :param tool_name: 工具名。
-    :param normalized_arguments_digest: 规范化参数 digest。
-    :param accepted_arguments: 已接受的工具调用参数；payload 只保存 LLM-safe replay
-        投影，原始参数只通过 digest 与 ``normalized_arguments_digest`` 关联。
+    :param tool_call_requested_event_ref: 同事务已写入的 canonical request row
+        引用，包含真实 event id 与 sequence。
     :param await_spec: 工具等待规约。
     :param adapter_key: Host 选择的等待适配器键。
     :param resume_policy: wait resume policy 文本。
@@ -75,11 +69,7 @@ def tool_awaiting_payload(
         "wait_id": wait_id,
         "tool_call_id": tool_call_id,
         "tool_name": tool_name,
-        "normalized_arguments_digest": normalized_arguments_digest,
-        _PAYLOAD_FIELD_ACCEPTED_ARGUMENTS: llm_safe_replay_arguments(
-            accepted_arguments
-        ),
-        _PAYLOAD_FIELD_ACCEPTED_ARGUMENTS_SOURCE_DIGEST: normalized_arguments_digest,
+        "tool_call_requested_event_ref": dict(tool_call_requested_event_ref),
         "await_spec": _await_spec_json(await_spec),
         "adapter_key": adapter_key,
         "resume_policy": resume_policy,
@@ -115,22 +105,6 @@ def run_waiting_payload(
         "wait_id": wait_id,
         "tool_awaiting_event_ref": dict(tool_awaiting_event_ref),
     }
-
-
-def llm_safe_replay_arguments(
-    arguments: Mapping[str, JsonValue],
-) -> Mapping[str, JsonValue]:
-    """把工具参数投影为可用于 LLM replay 的安全参数。
-
-    :param arguments: Host 已接受的原始工具参数。
-    :returns: 字段名命中敏感片段时已递归脱敏的参数 object。
-    :raises HostDurableError: 脱敏 helper 返回非 object 时抛出。
-    """
-
-    redacted = redact_sensitive_json_fields(arguments)
-    if not isinstance(redacted, Mapping):
-        raise HostDurableError("accepted arguments replay projection must be object")
-    return dict(redacted)
 
 
 def attempt_suspended_payload(

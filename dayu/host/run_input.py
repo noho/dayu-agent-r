@@ -156,9 +156,7 @@ from dayu.host.memory import (
     SelectedRecentWindowItem,
     SelectedRecentWindowRole,
     build_inline_delta_repair_diagnostic,
-    build_memory_budget_diagnostic,
     digest_memory_projection_policy,
-    estimate_memory_size_units,
     memory_snapshot_with_cursor_and_diagnostics,
     project_conversation_memory_event,
 )
@@ -168,8 +166,6 @@ _EVENT_TYPE_USER_INPUT_ACCEPTED = "USER_INPUT_ACCEPTED"
 _EVENT_TYPE_RUN_ACCEPTED = "RUN_ACCEPTED"
 _EVENT_TYPE_RUN_STARTED = "RUN_STARTED"
 _EVENT_TYPE_RUN_SUCCEEDED = "RUN_SUCCEEDED"
-_EVENT_TYPE_TOOL_CALL_REQUESTED = "TOOL_CALL_REQUESTED"
-_EVENT_TYPE_TOOL_AWAITING = "TOOL_AWAITING"
 _EVENT_TYPE_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
 _EVENT_TYPE_RUNNER_CALL_INPUT_ASSEMBLED = "RUNNER_CALL_INPUT_ASSEMBLED"
 _PAYLOAD_FIELD_DISPLAY_TEXT = "display_text"
@@ -180,9 +176,6 @@ _PAYLOAD_FIELD_TOOL_RESULT_EVENT_REF = "tool_result_event_ref"
 _PAYLOAD_FIELD_EVENT_ID = "event_id"
 _PAYLOAD_FIELD_TOOL_CALL_ID = "tool_call_id"
 _PAYLOAD_FIELD_TOOL_NAME = "tool_name"
-_PAYLOAD_FIELD_ACCEPTED_ARGUMENTS = "accepted_arguments"
-_PAYLOAD_FIELD_ACCEPTED_ARGUMENTS_SOURCE_DIGEST = "accepted_arguments_source_digest"
-_PAYLOAD_FIELD_WAIT_CREATED_EVENT_REF = "wait_created_event_ref"
 _PAYLOAD_FIELD_ARGUMENTS = "arguments"
 _PAYLOAD_FIELD_COMPACT_ARTIFACT_REF = "compact_artifact_ref"
 _PAYLOAD_FIELD_COMPACT_ARTIFACT_DIGEST = "compact_artifact_digest"
@@ -199,7 +192,6 @@ _SYSTEM_SECTION_PRIOR_ANSWER_ANCHORS = "Prior Answer Anchors"
 _SYSTEM_SECTION_OPEN_FOLLOWUP_CONTEXT = "Open Follow-up Context"
 _SYSTEM_SECTION_REFERENCE_CONTINUITY = "Reference Continuity"
 _SYSTEM_SECTION_RECENT_EVIDENCE = "Recent Evidence"
-_SYSTEM_SECTION_RESUME_GUIDANCE = "Resume Guidance"
 _SYSTEM_ENVELOPE_SECTION_ORDER = (
     _SYSTEM_SECTION_TASK_INSTRUCTIONS,
     _SYSTEM_SECTION_EXECUTION_GUIDANCE,
@@ -209,12 +201,10 @@ _SYSTEM_ENVELOPE_SECTION_ORDER = (
     _SYSTEM_SECTION_OPEN_FOLLOWUP_CONTEXT,
     _SYSTEM_SECTION_REFERENCE_CONTINUITY,
     _SYSTEM_SECTION_RECENT_EVIDENCE,
-    _SYSTEM_SECTION_RESUME_GUIDANCE,
 )
 _EXECUTION_GUIDANCE_PREFIX = "Execution guidance:"
 _RECENT_EVIDENCE_PREFIX = "Recent evidence:"
 _ACCEPTED_TOOL_EVIDENCE_PREFIX = "Accepted tool evidence:"
-_RESUME_GUIDANCE_PREFIX = "恢复上下文："
 _MEMORY_SESSION_SUMMARY_HEADER = "Session Summary Memory:"
 _MEMORY_EVIDENCE_FACT_HEADER = "Evidence / Fact Memory:"
 _MEMORY_ANSWER_ANCHOR_HEADER = "Answer Anchor Memory:"
@@ -2629,12 +2619,6 @@ def _system_envelope_section_and_body(content: str) -> tuple[str, str]:
             prefix=_ACCEPTED_TOOL_EVIDENCE_PREFIX,
             section=_SYSTEM_SECTION_RECENT_EVIDENCE,
         )
-    if content.startswith(_RESUME_GUIDANCE_PREFIX):
-        return _stripped_prefixed_system_body(
-            content,
-            prefix=_RESUME_GUIDANCE_PREFIX,
-            section=_SYSTEM_SECTION_RESUME_GUIDANCE,
-        )
     return (_SYSTEM_SECTION_TASK_INSTRUCTIONS, content)
 
 
@@ -3487,8 +3471,6 @@ def _resume_wait_messages_from_current_start(
     accepted_arguments = _resume_wait_accepted_arguments(
         projection=projection,
     )
-    if accepted_arguments is None:
-        return (_resume_wait_fallback_message(payload, projection),)
     tool_call_id = _required_payload_text(payload, field_name=_PAYLOAD_FIELD_TOOL_CALL_ID)
     tool_name = _required_payload_text(payload, field_name=_PAYLOAD_FIELD_TOOL_NAME)
     return (
@@ -3514,45 +3496,19 @@ def _resume_wait_messages_from_current_start(
     )
 
 
-def _resume_wait_fallback_message(
-    payload: Mapping[str, JsonValue],
-    projection: AcceptedToolResultProjection,
-) -> SystemMessage:
-    """构造缺少工具参数时的 resume system guidance。
-
-    :param payload: ``TOOL_RESULT_ACCEPTED`` payload。
-    :param projection: accepted result 共享投影。
-    :returns: 自解释 resume guidance system message。
-    """
-
-    result_text = _resume_wait_tool_message_content(payload)
-    content = "\n".join(
-        (
-            _RESUME_GUIDANCE_PREFIX,
-            "上一轮被等待中断的外部工具步骤已经完成。",
-            f"完成的工具：{_required_payload_text(payload, field_name=_PAYLOAD_FIELD_TOOL_NAME)}",
-            f"完成状态：{projection.status.value}",
-            f"工具结果：{result_text}",
-            ("这是同一次用户请求中已完成的工具结果。继续回答用户；不要为了" "同一次请求再次启动相同下载、上传或处理。"),
-        )
-    )
-    return SystemMessage(role=AgentMessageRole.SYSTEM, content=content)
-
-
 def _resume_wait_accepted_arguments(
     *,
     projection: AcceptedToolResultProjection,
-) -> Mapping[str, JsonValue] | None:
-    """读取 resume 等待工具调用的 LLM-safe request atom 参数。
+) -> Mapping[str, JsonValue]:
+    """读取 resume 等待工具调用的 exact canonical request atom 参数。
 
     :param projection: accepted result 共享投影。
-    :returns: LLM-safe replay 工具参数；缺少 accepted evidence envelope 或 request
-        atom 时返回 ``None``。
-    :raises HostDurableError: request arguments 结构非法时抛出。
+    :returns: Host 已接受的精确工具参数。
+    :raises HostDurableError: canonical request arguments 缺失或结构非法时抛出。
     """
 
     if projection.request_arguments_json is None:
-        return None
+        raise HostDurableError("resume wait request arguments are missing")
     value = projection.request_arguments_json.get(_PAYLOAD_FIELD_ARGUMENTS)
     if not isinstance(value, Mapping):
         raise HostDurableError("resume wait request arguments must be object")
@@ -3675,24 +3631,6 @@ def _event_id_from_payload_ref(payload: Mapping[str, JsonValue], *, field_name: 
     if not isinstance(event_id, str) or event_id.strip() == "":
         raise HostDurableError(f"payload field {field_name}.event_id is invalid")
     return event_id
-
-
-def _optional_event_id_from_payload_ref(payload: Mapping[str, JsonValue], *, field_name: str) -> str | None:
-    """从可选 payload event ref 中读取 event_id。
-
-    resume wait 的旧事实可能没有 wait 创建事件引用；该缺失只表示无法安全重建
-    assistant tool call，应由调用方降级到 fallback guidance。字段一旦存在则必须
-    是结构合法的 event ref，避免掩盖 schema 编码错误。
-
-    :param payload: payload 映射。
-    :param field_name: event ref 字段名。
-    :returns: event_id；字段缺失时返回 ``None``。
-    :raises HostDurableError: 字段存在但结构非法时抛出。
-    """
-
-    if field_name not in payload or payload.get(field_name) is None:
-        return None
-    return _event_id_from_payload_ref(payload, field_name=field_name)
 
 
 def _validate_tool_mode_snapshot(

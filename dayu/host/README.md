@@ -379,7 +379,7 @@ worker clean EOF、stream error 与 worker crash 不是 EngineEvent。它们通�
 
 ### ToolRuntime
 
-ToolRuntime 把 construction-time `HostToolingOptions` 中的业务工具 bundle 与 Host framework tools 组合成 effective tool bundle，并向 Engine 提供受治理的 `ToolExecutor`。工具结果只有通过 Host accept barrier 后才会返回给 Engine；side-effect / paid tool 必须携带工具幂等键；attempt-local duplicate governance、run-scoped truncation cursor 和 optional `fetch_more` 都在 ToolRuntime 内治理。
+ToolRuntime 把 construction-time `HostToolingOptions` 中的业务工具 bundle 与 Host framework tools 组合成 effective tool bundle，并向 Engine 提供受治理的 `ToolExecutor`。工具结果只有通过 Host accept barrier 后才会返回给 Engine；side-effect / paid tool 必须携带工具幂等键；attempt-local duplicate governance、run-scoped truncation cursor 和 optional `fetch_more` 都在 ToolRuntime 内治理。普通结果与 awaiting 接受路径共用同一个 canonical `TOOL_CALL_REQUESTED` writer contract：writer 只构造 request atom，调用方 append 后必须使用 EventLog 返回的真实 row / sequence。request atom 保存 Host 已接受的精确参数与同源 digest；`TOOL_AWAITING` 只保存等待治理字段和精确 `{event_id,event_sequence}` request link，不复制参数或 digest。
 
 ToolRuntime 默认从 effective `ToolDefinition.execution` 选择执行 capsule：`async_direct` 直接运行 async callable，`thread_backed` 只表示可取消 wrapper awaitable、不承诺停止 OS thread，`process_backed` 通过可序列化 target factory 构造子进程目标。process-backed 子进程只返回 `dayu.contracts` 定义的 JSON 信封，Host capsule 将 `completed` / `failed` 信封映射为工具 outcome；failed 信封的 `hint` 会映射到结构化 `ToolResultFailure.hint`，不拼入 `message`。取消和超时仍由父进程 Host 治理独占处理。execution capability 与 process-backed 信封字段不进入 Engine-facing `ToolSchema` 或 LLM-facing schema。
 
@@ -405,7 +405,7 @@ Conversation Memory 是 Session-level projection / read model，只消费 commit
 
 ### Outbox、audit 与 tool trace
 
-Outbox 从 terminal facts 派生离线 terminal notification item；audit JSONL 记录操作流水和 destructive purge 诊断；tool trace 记录工具执行 hot rows 与诊断，并投影 context pressure、tool timing、failure metadata、runner-call manifest refs / digests 等只读结构化 signal。Tool Trace 在缺少 provider request id 但存在 client correlation id 时仍保留该诊断关联字段，不把客户端关联 id 伪装成 provider request id。Tool Trace 查询层提供 resolver，可从 refs/digests 按需恢复 runner input projection、selected tool schema snapshot、工具参数、工具结果 payload 和 terminal final answer；resolver 逐层验证调用方、descriptor、SQLite row 或 artifact 实际 bytes 的 ref / digest / size，并只接受 canonical JSON object。runner-call projector metadata summary 在查询时只从 full-manifest owner 返回的 typed validated manifest 重建，不从 hot arrays、raw strings 或只通过 bytes digest 的未校验 JSON 推断。hot row 与 cold JSONL 会保存 bounded、脱敏、业务可读的工具请求 / 结果摘要，但不内联大明文。`TOOL_CALL_REQUESTED` 摘要来自 request atom；`TOOL_RESULT_ACCEPTED` 摘要通过 accepted evidence envelope 回到同源 request atom，并从 raw tool outcome 派生结果 details。compact material 同样要求该 envelope 显式指向 identity 一致的 canonical call event，缺失、错类型或错 identity 都 fail closed；作为 strict consumer，它在宽松 accepted-result projection 前先经 durable resolver 解析 accepted result，descriptor、row、artifact 或 canonical bytes 损坏不能被降级为无 evidence。它们都不能反向驱动 Run / Attempt 状态，也不能从 `TOOL_AWAITING` 或 wait / poll 治理状态推断 LLM-facing 业务语义。
+Outbox 从 terminal facts 派生离线 terminal notification item；audit JSONL 记录操作流水和 destructive purge 诊断；tool trace 记录工具执行 hot rows 与诊断，并投影 context pressure、tool timing、failure metadata、runner-call manifest refs / digests 等只读结构化 signal。Tool Trace 在缺少 provider request id 但存在 client correlation id 时仍保留该诊断关联字段，不把客户端关联 id 伪装成 provider request id。Tool Trace 查询层提供 resolver，可从 refs/digests 按需恢复 runner input projection、selected tool schema snapshot、工具参数、工具结果 payload 和 terminal final answer；resolver 逐层验证调用方、descriptor、SQLite row 或 artifact 实际 bytes 的 ref / digest / size，并只接受 canonical JSON object。runner-call projector metadata summary 在查询时只从 full-manifest owner 返回的 typed validated manifest 重建，不从 hot arrays、raw strings 或只通过 bytes digest 的未校验 JSON 推断。hot row 与 cold JSONL 会保存 bounded、脱敏、业务可读的工具请求 / 结果摘要，但不内联大明文。`TOOL_CALL_REQUESTED` 摘要来自 request atom；`TOOL_RESULT_ACCEPTED` 摘要通过 accepted evidence envelope 回到同源 request atom，并从 raw tool outcome 派生结果 details。Tool Trace、Conversation Memory、RunInputBuilder 与 compact material 都把该 canonical request material 视为严格前置条件：envelope、request link、row、identity 或 request atom shape / digest 缺失或漂移时统一抛出 `HostDurableError`，不得 skip、fallback 或发布 limited evidence。它们都不能反向驱动 Run / Attempt 状态，也不能从 `TOOL_AWAITING` 或 wait / poll 治理状态推断 LLM-facing 业务语义。
 
 `PROVIDER_DIAGNOSTIC` 是非致命诊断，只能作为 Read API `provider_diagnostic` / `info` activity 与 Tool Trace diagnostic 展示，不写 failure metadata，不进入 Outbox terminal item、Conversation Memory、final answer、accepted evidence material、compact material 或 LLM-facing prompt messages。fatal `PROVIDER_PROTOCOL_ERROR` 在 Read API 中使用独立 `provider_protocol_error` activity kind，避免 UI / Service 从 provider diagnostic kind 反推致命错误。
 
@@ -597,16 +597,18 @@ Admission 是所有 Run 输入的 durable 入口。它在事务内判断 Session
 
 ### Resume
 
-resume 只来自 `resolve_wait`，不是旧 Agent / Runner 的继续执行。长事务工具返回 `ToolAwaitingOutcome` 后，ToolRuntime 先进入 Host awaiting accept path；Host 在单个 durable transaction 内写入 LLM-safe `TOOL_CALL_REQUESTED` request atom、`TOOL_AWAITING`、`RUN_WAITING`、`ATTEMPT_SUSPENDED`，创建 wait record，并把 Run / Attempt 推进到 `WAITING` / `SUSPENDED`。
+resume 只来自 `resolve_wait`，不是旧 Agent / Runner 的继续执行。长事务工具返回 `ToolAwaitingOutcome` 后，ToolRuntime 先进入 Host awaiting accept path；Host 在单个 durable transaction 内写入 canonical `TOOL_CALL_REQUESTED` request atom、只含治理字段与显式 request link 的 `TOOL_AWAITING`、`RUN_WAITING`、`ATTEMPT_SUSPENDED`，创建 wait record，并把 Run / Attempt 推进到 `WAITING` / `SUSPENDED`。
 
 外部长事务完成后，调用方通过 `resolve_wait(wait_id, request)` 把结果交回 Host：
+
+wait resolution transition 在任何事实或状态写入前，要求 active WaitRecord 的 execution identity 与挂起的 source Attempt 完全一致；`TOOL_RESULT_ACCEPTED` 始终归属该 source Attempt / execution，不借用新建 resume Attempt 的 identity，也不留空 identity。
 
 - completed 或 tool-cancelled outcome 会关闭 wait record，写入 wait resolution 对应的 tool result facts，追加 `RESUME_REQUESTED`，再为同一 Run 创建新的 resume Attempt / execution / dispatch record。
 - failed outcome 使 Run 进入 `FAILED`。
 - lost outcome 使 Run 进入 `LOST`。
 - 已 cancel、已 terminal、已 resolved / failed / lost 的 late result 不会恢复 Run；Host 只返回幂等结果、冲突或 `WAIT_LATE_RESULT_REJECTED` 诊断。
 
-resume Attempt 的 runner input 会把当前用户请求、使用 LLM-safe replay 参数重建的工具调用、以及已完成工具结果按模型工具协议重建为 LLM-facing 消息；replay 参数来自 `TOOL_RESULT_ACCEPTED` accepted evidence envelope 指向的 `TOOL_CALL_REQUESTED` request atom，并用原始参数 digest 关联 accepted truth。无法安全恢复 replay 参数时只投影自解释的恢复说明，不伪造工具调用。
+resume Attempt 的 runner input 会把当前用户请求、使用 exact canonical replay 参数重建的工具调用、以及已完成工具结果按模型工具协议重建为 LLM-facing 消息；replay identity 与参数只来自 `TOOL_RESULT_ACCEPTED` accepted evidence envelope 指向的 `TOOL_CALL_REQUESTED` request atom，并要求 arguments payload digest、normalized arguments digest 与 envelope identity 同源。canonical request material 缺失、错链或 digest 漂移时抛出 `HostDurableError`，不投影恢复说明或伪造工具调用。
 
 因此 wait-resume 的稳定边界是“新 Attempt 恢复同一 Run”，不是恢复旧 Engine 生成器、旧 Runner HTTP stream 或旧工具调用栈。
 

@@ -57,7 +57,6 @@ from dayu.host.durable.state import (
     cancel_waiting_run_row,
     cancel_running_attempt_row,
     cancel_starting_dispatch_record_row,
-    cancel_queued_run_row,
     cancel_running_run_row,
     cancel_starting_attempt_row,
     insert_attempt,
@@ -1787,7 +1786,12 @@ def resume_run_from_waiting_in_transaction(
         transaction, _resume_requested_event_request(request, run)
     ).row
     tool_result = event_log_store.append_event(
-        transaction, _waiting_tool_result_event_request(request, run)
+        transaction,
+        _waiting_tool_result_event_request(
+            request=request,
+            run=run,
+            source_attempt=source_attempt,
+        ),
     ).row
     terminal_at = format_utc_timestamp(request.occurred_at)
     wait_result = mark_wait_record_resolved_row(
@@ -1944,7 +1948,12 @@ def _terminal_run_from_waiting_in_transaction(
         raise HostDurableError("terminal waiting precondition narrowing failed")
 
     tool_result = event_log_store.append_event(
-        transaction, _waiting_tool_result_event_request(request, run)
+        transaction,
+        _waiting_tool_result_event_request(
+            request=request,
+            run=run,
+            source_attempt=source_attempt,
+        ),
     ).row
     terminal_at = format_utc_timestamp(request.occurred_at)
     if expected_wait_status is WaitRecordStatus.FAILED:
@@ -3735,13 +3744,16 @@ def _resume_requested_event_request(
 
 
 def _waiting_tool_result_event_request(
+    *,
     request: ResumeRunFromWaitingInput | WaitingRunTerminalInput,
     run: RunRow,
+    source_attempt: AttemptRow,
 ) -> EventLogAppendRequest:
     """构造 wait resolution ``TOOL_RESULT_ACCEPTED`` EventLog append request。
 
     :param request: resume 或 terminal waiting 输入。
     :param run: 目标 Run row。
+    :param source_attempt: 产生等待并已挂起的源 Attempt row。
     :returns: EventLog append request。
     """
 
@@ -3750,8 +3762,8 @@ def _waiting_tool_result_event_request(
         event_class=EventClass.CANONICAL_FACT,
         session_id=run.session_id,
         run_id=run.run_id,
-        attempt_id=request.suspended_attempt_id,
-        execution_id=None,
+        attempt_id=source_attempt.attempt_id,
+        execution_id=source_attempt.execution_id,
         event_type=_EVENT_TYPE_TOOL_RESULT_ACCEPTED,
         occurred_at=request.occurred_at,
         actor=request.actor,
@@ -5348,6 +5360,7 @@ def _invalid_waiting_resolution_precondition(
         or source_attempt.status != AttemptStatus.SUSPENDED
         or wait_record.run_id != run.run_id
         or wait_record.attempt_id != source_attempt.attempt_id
+        or wait_record.execution_id != source_attempt.execution_id
         or wait_record.status != WaitRecordStatus.WAITING
         or len(active_waits) != 1
         or active_waits[0].wait_id != wait_record.wait_id

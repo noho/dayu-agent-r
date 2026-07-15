@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -79,6 +78,7 @@ from dayu.host.durable.options import (
 from dayu.host.durable.schema import (
     TABLE_EVENT_LOG,
     TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
+    TOOL_CALL_SEMANTIC_QUERY_STORAGE_ABSENT,
     TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT,
 )
 from dayu.host.durable.payload import (
@@ -179,13 +179,10 @@ from dayu.host.evidence import (
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
     ConversationMemorySnapshotVNext,
-    MemoryClaimStatus,
     MemoryDiagnosticReason,
-    MemoryIncludedReason,
     MemoryProjectionEvent,
     MemoryProjectionPolicy,
     MemoryRepairReason,
-    MemorySizeUnits,
     MemorySnapshotCursor,
     SelectedRecentWindowRole,
     build_conversation_memory_snapshot_from_events,
@@ -622,10 +619,10 @@ def test_runner_call_manifest_classifies_resume_from_typed_start_reason(
         )
 
 
-def test_resume_wait_legacy_message_appends_shared_duplicate_result_guidance(
+def test_resume_wait_missing_canonical_evidence_fails_closed(
     tmp_path: Path,
 ) -> None:
-    """旧 wait result 缺工具参数时使用自解释 system guidance。"""
+    """resume accepted result 缺 envelope/request atom 时必须 fail closed。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
@@ -637,7 +634,6 @@ def test_resume_wait_legacy_message_appends_shared_duplicate_result_guidance(
         _append_resume_wait_projection_events(
             store.transaction_runner,
             seeded,
-            include_accepted_arguments=False,
             include_request_atom=False,
             include_accepted_evidence_envelope=False,
         )
@@ -650,7 +646,7 @@ def test_resume_wait_legacy_message_appends_shared_duplicate_result_guidance(
         )
 
         def operation(transaction: HostTransaction) -> tuple[AgentMessage, ...]:
-            """构造 legacy resume wait guidance。
+            """尝试从缺失 canonical evidence 的 result 构造 resume messages。
 
             :param transaction: Host durable transaction。
             :returns: resume wait messages。
@@ -661,34 +657,12 @@ def test_resume_wait_legacy_message_appends_shared_duplicate_result_guidance(
                 replace(current_facts, run_started_event=resume_started),
             )
 
-        messages = store.transaction_runner.run_read(operation)
-
-        assert len(messages) == 1
-        message = messages[0]
-        assert isinstance(message, SystemMessage)
-        _assert_resume_guidance_semantics(
-            message.content,
-            tool_name="fake_tool",
-            status="completed",
-            result_text='{"answer": 42}',
-        )
+        with pytest.raises(HostDurableError, match="evidence envelope is missing"):
+            store.transaction_runner.run_read(operation)
 
 
-@pytest.mark.parametrize(
-    ("wait_created_ref_case", "include_source_digest"),
-    (
-        ("missing", True),
-        ("missing_event", True),
-        ("wrong_event_type", True),
-        ("valid", False),
-    ),
-)
-def test_resume_wait_abnormal_awaiting_event_falls_back_to_guidance(
-    tmp_path: Path,
-    wait_created_ref_case: Literal["valid", "missing", "missing_event", "wrong_event_type"],
-    include_source_digest: bool,
-) -> None:
-    """旧/异常 awaiting 事实不能让 resume input 整体失败。"""
+def test_resume_wait_missing_request_atom_fails_closed(tmp_path: Path) -> None:
+    """resume envelope 指向的 canonical request row 缺失时 fail closed。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
@@ -700,10 +674,7 @@ def test_resume_wait_abnormal_awaiting_event_falls_back_to_guidance(
         _append_resume_wait_projection_events(
             store.transaction_runner,
             seeded,
-            wait_created_ref_case=wait_created_ref_case,
-            include_accepted_arguments_source_digest=include_source_digest,
             include_request_atom=False,
-            include_accepted_evidence_envelope=False,
         )
         current_facts = DurableCurrentRunFactProvider(store.transaction_runner).load_current_run_facts(
             _attempt_snapshot(seeded)
@@ -714,7 +685,7 @@ def test_resume_wait_abnormal_awaiting_event_falls_back_to_guidance(
         )
 
         def operation(transaction: HostTransaction) -> tuple[AgentMessage, ...]:
-            """构造异常 awaiting 引用下的 resume wait guidance。
+            """尝试从断链 request atom 构造 resume wait messages。
 
             :param transaction: Host durable transaction。
             :returns: resume wait messages。
@@ -725,17 +696,8 @@ def test_resume_wait_abnormal_awaiting_event_falls_back_to_guidance(
                 replace(current_facts, run_started_event=resume_started),
             )
 
-        messages = store.transaction_runner.run_read(operation)
-
-        assert len(messages) == 1
-        message = messages[0]
-        assert isinstance(message, SystemMessage)
-        _assert_resume_guidance_semantics(
-            message.content,
-            tool_name="fake_tool",
-            status="completed",
-            result_text='{"answer": 42}',
-        )
+        with pytest.raises(HostDurableError, match="request atom is missing"):
+            store.transaction_runner.run_read(operation)
 
 
 def test_resume_wait_rejects_digest_mismatch_after_new_arguments_fields(
@@ -775,16 +737,8 @@ def test_resume_wait_rejects_digest_mismatch_after_new_arguments_fields(
                 replace(current_facts, run_started_event=resume_started),
             )
 
-        messages = store.transaction_runner.run_read(operation)
-
-        assert len(messages) == 1
-        assert isinstance(messages[0], SystemMessage)
-        _assert_resume_guidance_semantics(
-            messages[0].content,
-            tool_name="fake_tool",
-            status="completed",
-            result_text='{"answer": 42}',
-        )
+        with pytest.raises(HostDurableError, match="payload digest must match"):
+            store.transaction_runner.run_read(operation)
 
 
 def test_resume_wait_completed_tool_content_wraps_non_object_value(
@@ -853,8 +807,8 @@ def test_resume_wait_cancelled_tool_content_consumes_canonical_raw_outcome() -> 
     )
 
 
-def test_resume_wait_replays_only_llm_safe_arguments(tmp_path: Path) -> None:
-    """resume 重建 assistant tool call 时只使用脱敏 replay 参数。"""
+def test_resume_wait_replays_exact_canonical_arguments(tmp_path: Path) -> None:
+    """resume assistant tool call 只从 canonical request row 恢复 exact 参数。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
@@ -867,11 +821,9 @@ def test_resume_wait_replays_only_llm_safe_arguments(tmp_path: Path) -> None:
             store.transaction_runner,
             seeded,
             accepted_arguments={
-                "token": "<redacted>",
-                "api_key": "<redacted>",
-                "password": "<redacted>",
+                "file_path": "/research/input/annual-report.pdf",
+                "scope_token": "scope-business-value",
                 "nested": {
-                    "secret": "<redacted>",
                     "query": "business query",
                 },
             },
@@ -885,7 +837,7 @@ def test_resume_wait_replays_only_llm_safe_arguments(tmp_path: Path) -> None:
         )
 
         def operation(transaction: HostTransaction) -> tuple[AgentMessage, ...]:
-            """构造脱敏 replay 参数的 resume wait messages。
+            """构造 exact canonical 参数的 resume wait messages。
 
             :param transaction: Host durable transaction。
             :returns: resume wait messages。
@@ -902,19 +854,12 @@ def test_resume_wait_replays_only_llm_safe_arguments(tmp_path: Path) -> None:
         assert isinstance(assistant, AssistantMessage)
         replay_arguments = assistant.tool_calls[0].arguments
         assert replay_arguments == {
-            "token": "<redacted>",
-            "api_key": "<redacted>",
-            "password": "<redacted>",
+            "file_path": "/research/input/annual-report.pdf",
+            "scope_token": "scope-business-value",
             "nested": {
-                "secret": "<redacted>",
                 "query": "business query",
             },
         }
-        replay_text = json.dumps(replay_arguments, ensure_ascii=False)
-        assert "token-raw-value" not in replay_text
-        assert "api-key-raw-value" not in replay_text
-        assert "password-raw-value" not in replay_text
-        assert "secret-raw-value" not in replay_text
 
 
 def test_build_is_deterministic_for_same_eventlog_and_policy(
@@ -4676,6 +4621,114 @@ def _append_prior_accepted_tool_evidence_tx(
     )
 
 
+def _append_canonical_tool_result_for_memory(
+    transaction: HostTransaction,
+    *,
+    session_id: str,
+    run_id: str,
+    request_event_id: str,
+    result_event_id: str,
+    tool_call_id: str,
+    tool_name: str,
+    result_summary: str,
+) -> None:
+    """追加 memory fixture 使用的同源 request/result canonical facts。
+
+    :param transaction: Host transaction。
+    :param session_id: Session id。
+    :param run_id: Run id。
+    :param request_event_id: request atom event id。
+    :param result_event_id: accepted result event id。
+    :param tool_call_id: tool call id。
+    :param tool_name: 工具名。
+    :param result_summary: 工具结果业务摘要。
+    :returns: ``None``。
+    :raises HostDurableError: durable append 失败时由 store 抛出。
+    """
+
+    arguments_json: dict[str, JsonValue] = {
+        "arguments": {"query": result_summary}
+    }
+    arguments_digest = sha256_digest_json(arguments_json)
+    semantic_query = f"查询：{result_summary}"
+    semantic_query_digest = sha256_digest_json(
+        {"semantic_query_text": semantic_query}
+    )
+    event_log = EventLogStore()
+    event_log.append_event(
+        transaction,
+        _event_request(
+            event_id=request_event_id,
+            event_class=EventClass.CANONICAL_FACT,
+            session_id=session_id,
+            run_id=run_id,
+            event_type="TOOL_CALL_REQUESTED",
+            payload={
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "normalized_arguments_digest": arguments_digest,
+                "arguments_payload_digest": arguments_digest,
+                "arguments_storage_kind": TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
+                "arguments_inline_json": arguments_json,
+                "arguments_payload_ref": None,
+                "arguments_json_size_bytes": len(
+                    canonical_json_dumps(arguments_json).encode("utf-8")
+                ),
+                "semantic_input_digest": semantic_query_digest,
+                "semantic_query_storage_kind": (
+                    TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT
+                ),
+                "semantic_query_text": semantic_query,
+                "semantic_query_payload_ref": None,
+                "semantic_query_digest": semantic_query_digest,
+            },
+        ),
+    )
+    raw_outcome: JsonValue = {
+        "kind": "completed",
+        "result": {"ok": True, "summary": result_summary},
+    }
+    envelope = AcceptedEvidenceEnvelope(
+        evidence_id=f"evidence:{result_event_id}",
+        producer_event_ref=result_event_id,
+        tool_name=tool_name,
+        tool_call_id=tool_call_id,
+        tool_query=AcceptedEvidenceToolQuery(
+            tool_call_requested_event_ref=request_event_id,
+            normalized_arguments_digest=arguments_digest,
+            semantic_input_digest=semantic_query_digest,
+        ),
+        result_ref=AcceptedEvidenceResultRef(
+            payload_ref=None,
+            payload_digest=None,
+            outcome_digest=sha256_digest_json(raw_outcome),
+            truncation_applied=False,
+        ),
+        source_refs=(),
+        locator_refs=(),
+    )
+    event_log.append_event(
+        transaction,
+        _event_request(
+            event_id=result_event_id,
+            event_class=EventClass.CANONICAL_FACT,
+            session_id=session_id,
+            run_id=run_id,
+            event_type="TOOL_RESULT_ACCEPTED",
+            payload={
+                "tool_name": tool_name,
+                "tool_call_id": tool_call_id,
+                "tool_fact_kind": "completed",
+                "normalized_arguments_digest": arguments_digest,
+                "accepted_evidence_envelope": (
+                    accepted_evidence_envelope_to_json_value(envelope)
+                ),
+                "raw_tool_outcome": raw_outcome,
+            },
+        ),
+    )
+
+
 def _append_rich_memory_source_events(transaction_runner: HostTransactionRunner, session_id: str) -> None:
     """追加 rich snapshot item 需要引用的 EventLog rows。
 
@@ -4691,23 +4744,15 @@ def _append_rich_memory_source_events(transaction_runner: HostTransactionRunner,
         :returns: ``None``。
         """
 
-        EventLogStore().append_event(
+        _append_canonical_tool_result_for_memory(
             transaction,
-            _event_request(
-                event_id="event-memory-tool",
-                event_class=EventClass.CANONICAL_FACT,
-                session_id=session_id,
-                run_id="run-memory",
-                event_type="TOOL_RESULT_ACCEPTED",
-                payload={
-                    "tool_name": "filing.lookup",
-                    "tool_call_id": "call-memory",
-                    "tool_fact_kind": "completed",
-                    "fact_summary": "tool verified revenue increased",
-                    "outcome_digest": _DIGEST_A,
-                    "payload_digest": _DIGEST_B,
-                },
-            ),
+            session_id=session_id,
+            run_id="run-memory",
+            request_event_id="event-memory-tool-request",
+            result_event_id="event-memory-tool",
+            tool_call_id="call-memory",
+            tool_name="filing.lookup",
+            result_summary="tool verified revenue increased",
         )
         EventLogStore().append_event(
             transaction,
@@ -4814,22 +4859,15 @@ def _append_compacted_gross_margin_facts(transaction_runner: HostTransactionRunn
         :returns: ``None``。
         """
 
-        EventLogStore().append_event(
+        _append_canonical_tool_result_for_memory(
             transaction,
-            _event_request(
-                event_id="event-memory-gross-tool",
-                event_class=EventClass.CANONICAL_FACT,
-                session_id=session_id,
-                run_id="run-memory-gross",
-                event_type="TOOL_RESULT_ACCEPTED",
-                payload={
-                    "tool_name": "filing.lookup",
-                    "tool_call_id": "call-memory-gross",
-                    "tool_fact_kind": "completed",
-                    "outcome_digest": _DIGEST_A,
-                    "payload_digest": _DIGEST_B,
-                },
-            ),
+            session_id=session_id,
+            run_id="run-memory-gross",
+            request_event_id="event-memory-gross-tool-request",
+            result_event_id="event-memory-gross-tool",
+            tool_call_id="call-memory-gross",
+            tool_name="filing.lookup",
+            result_summary="收入与毛利已由工具确认",
         )
         EventLogStore().append_event(
             transaction,
@@ -5597,10 +5635,6 @@ def _append_resume_wait_projection_events(
     transaction_runner: HostTransactionRunner,
     seeded: _SeededRun,
     *,
-    include_accepted_arguments: bool = True,
-    include_accepted_arguments_source_digest: bool = True,
-    accepted_arguments_source_digest: str | None = None,
-    wait_created_ref_case: Literal["valid", "missing", "missing_event", "wrong_event_type"] = "valid",
     completed_value: JsonValue | None = None,
     accepted_arguments: Mapping[str, JsonValue] | None = None,
     include_request_atom: bool = True,
@@ -5611,12 +5645,8 @@ def _append_resume_wait_projection_events(
 
     :param transaction_runner: Host transaction runner。
     :param seeded: 当前测试 Run 引用。
-    :param include_accepted_arguments: 是否写入新 awaiting 参数事实。
-    :param include_accepted_arguments_source_digest: 是否写入 replay 参数来源 digest。
-    :param accepted_arguments_source_digest: 覆盖 replay 参数来源 digest。
-    :param wait_created_ref_case: wait 创建事件引用 case。
     :param completed_value: completed result value；``None`` 表示使用默认 object。
-    :param accepted_arguments: 覆盖写入 awaiting payload 的 LLM replay 参数。
+    :param accepted_arguments: 覆盖写入 request atom 的 exact canonical 参数。
     :param include_request_atom: 是否写入新 ``TOOL_CALL_REQUESTED`` request atom。
     :param include_accepted_evidence_envelope: 是否在 result payload 写入 accepted evidence envelope。
     :param request_normalized_arguments_digest: 覆盖 request atom 的参数 digest。
@@ -5631,15 +5661,16 @@ def _append_resume_wait_projection_events(
         """
 
         event_log = EventLogStore()
-        normalized_arguments_digest = sha256_digest_json({"arguments": {"ticker": "V"}})
         request_arguments = accepted_arguments or {"ticker": "V"}
         request_arguments_json: dict[str, JsonValue] = {"arguments": dict(request_arguments)}
         request_arguments_digest = sha256_digest_json(request_arguments_json)
-        request_semantic_query = "工具 fake_tool 请求参数：" f"{canonical_json_dumps(dict(request_arguments))}"
-        request_semantic_query_digest = sha256_digest_json({"semantic_query_text": request_semantic_query})
+        normalized_arguments_digest = (
+            request_normalized_arguments_digest or request_arguments_digest
+        )
         request_event_id = "event-tool-call-requested-resume"
+        request_row: EventLogRow | None = None
         if include_request_atom:
-            event_log.append_event(
+            request_row = event_log.append_event(
                 transaction,
                 EventLogAppendRequest(
                     event_id=request_event_id,
@@ -5657,38 +5688,65 @@ def _append_resume_wait_projection_events(
                     policy_decision=None,
                     reason=None,
                     payload_json={
+                        "session_id": seeded.session_id,
+                        "run_id": seeded.run_id,
+                        "attempt_id": seeded.attempt_id,
+                        "execution_id": seeded.execution_id,
+                        "iteration_id": "iteration-resume-private",
                         "tool_call_id": "tool-call-private",
                         "tool_name": "fake_tool",
-                        "normalized_arguments_digest": (
-                            request_normalized_arguments_digest or normalized_arguments_digest
-                        ),
+                        "tool_schema_digest": _DIGEST_B,
+                        "tool_identity_digest": _DIGEST_A,
+                        "normalized_arguments_digest": normalized_arguments_digest,
                         "arguments_json_size_bytes": len(canonical_json_dumps(request_arguments_json).encode("utf-8")),
                         "arguments_storage_kind": TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
                         "arguments_inline_json": request_arguments_json,
                         "arguments_payload_ref": None,
                         "arguments_payload_digest": request_arguments_digest,
+                        "tool_fact_kind": "awaiting",
+                        "accept_idempotency_key": "request-resume",
                         "semantic_input_digest": _DIGEST_A,
-                        "semantic_query_storage_kind": (TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT),
-                        "semantic_query_text": request_semantic_query,
+                        "semantic_query_storage_kind": TOOL_CALL_SEMANTIC_QUERY_STORAGE_ABSENT,
+                        "semantic_query_text": None,
                         "semantic_query_payload_ref": None,
-                        "semantic_query_digest": request_semantic_query_digest,
+                        "semantic_query_digest": None,
                     },
                     payload_ref=None,
                     payload_digest=None,
                 ),
-            )
+            ).row
         wait_payload: dict[str, JsonValue] = {
+            "session_id": seeded.session_id,
+            "run_id": seeded.run_id,
+            "attempt_id": seeded.attempt_id,
+            "execution_id": seeded.execution_id,
+            "iteration_id": "iteration-resume-private",
             "wait_id": "wait-resume-private",
             "tool_call_id": "tool-call-private",
             "tool_name": "fake_tool",
-            "normalized_arguments_digest": normalized_arguments_digest,
+            "tool_call_requested_event_ref": (
+                {
+                    "event_id": request_row.event_id,
+                    "event_sequence": request_row.event_sequence,
+                }
+                if request_row is not None
+                else {
+                    "event_id": request_event_id,
+                    "event_sequence": 999,
+                }
+            ),
+            "await_spec": {
+                "await_kind": "external_job",
+                "deadline": None,
+                "resume_token": "resume-private",
+            },
+            "adapter_key": "poll:fake-tool",
+            "resume_policy": "poll",
+            "snapshot_ref": None,
+            "external_job_ref": None,
+            "accept_idempotency_key": "awaiting-resume",
+            "semantic_input_digest": _DIGEST_A,
         }
-        if include_accepted_arguments:
-            wait_payload["accepted_arguments"] = accepted_arguments or {"ticker": "V"}
-        if include_accepted_arguments_source_digest:
-            wait_payload["accepted_arguments_source_digest"] = (
-                accepted_arguments_source_digest or normalized_arguments_digest
-            )
         tool_awaiting = event_log.append_event(
             transaction,
             EventLogAppendRequest(
@@ -5698,7 +5756,7 @@ def _append_resume_wait_projection_events(
                 run_id=seeded.run_id,
                 attempt_id=seeded.attempt_id,
                 execution_id=seeded.execution_id,
-                event_type="RUN_WAITING" if wait_created_ref_case == "wrong_event_type" else "TOOL_AWAITING",
+                event_type="TOOL_AWAITING",
                 occurred_at=_NOW,
                 actor="host",
                 source="pytest",
@@ -5752,16 +5810,10 @@ def _append_resume_wait_projection_events(
                     locator_refs=(),
                 )
             )
-        if wait_created_ref_case == "valid" or wait_created_ref_case == "wrong_event_type":
-            tool_result_payload["wait_created_event_ref"] = {
-                "event_id": tool_awaiting.event_id,
-                "event_sequence": tool_awaiting.event_sequence,
-            }
-        elif wait_created_ref_case == "missing_event":
-            tool_result_payload["wait_created_event_ref"] = {
-                "event_id": "event-tool-awaiting-missing",
-                "event_sequence": 999,
-            }
+        tool_result_payload["wait_created_event_ref"] = {
+            "event_id": tool_awaiting.event_id,
+            "event_sequence": tool_awaiting.event_sequence,
+        }
         tool_result = event_log.append_event(
             transaction,
             EventLogAppendRequest(

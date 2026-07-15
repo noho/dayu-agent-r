@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 import pytest
 
@@ -57,16 +57,27 @@ from dayu.host.durable.liveness import HostInstanceIdentity, register_current_in
 from dayu.host.durable.run_transition import (
     AcceptWorkerRunningInput,
     CreateRunningRunInput,
+    ResumeRunFromWaitingInput,
+    WaitingRunTerminalInput,
     accept_worker_running_in_transaction,
     create_running_run_with_starting_attempt_in_transaction,
+    fail_run_from_waiting_in_transaction,
+    resume_run_from_waiting_in_transaction,
 )
-from dayu.host.durable.schema import TABLE_EVENT_LOG, TABLE_HOST_WAIT_RECORDS
+from dayu.host.durable.schema import (
+    TABLE_EVENT_LOG,
+    TABLE_HOST_ATTEMPTS,
+    TABLE_HOST_ATTEMPT_DISPATCH_RECORDS,
+    TABLE_HOST_RUNS,
+    TABLE_HOST_WAIT_RECORDS,
+)
 from dayu.host.durable.session_lifecycle import ensure_session
 from dayu.host.durable.state import (
     DispatchRecordStatus,
     DispatchRecordRow,
     RunStartReason,
     RunRow,
+    StateMutationStatus,
     WaitRecordRow,
     WaitRecordStatus,
     WaitResumePolicy,
@@ -76,7 +87,7 @@ from dayu.host.durable.state import (
     read_dispatch_record_by_attempt_id,
     read_wait_record_by_id,
 )
-from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
+from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
 from dayu.host.admission import create_host_admission_service
 from dayu.host.accepted_tool_outcome import (
     accepted_tool_outcome_digest,
@@ -149,6 +160,17 @@ class _CountingEventLogStore(EventLogStore):
         return super().read_event_by_id(transaction, event_id)
 
 
+@dataclass(frozen=True, slots=True)
+class _ResolutionTables:
+    """wait-resolution 写入边界涉及的 durable 全表快照。"""
+
+    events: tuple[HostRow, ...]
+    runs: tuple[HostRow, ...]
+    attempts: tuple[HostRow, ...]
+    wait_records: tuple[HostRow, ...]
+    dispatch_records: tuple[HostRow, ...]
+
+
 def test_resolve_wait_completed_resumes_run_and_wakes_dispatch(
     tmp_path: Path,
 ) -> None:
@@ -176,6 +198,10 @@ def test_resolve_wait_completed_resumes_run_and_wakes_dispatch(
             "RUN_STARTED",
             "ATTEMPT_STARTED",
         ]
+        tool_result = events[-3]
+        assert tool_result.attempt_id == seeded.attempt_id
+        assert tool_result.execution_id == seeded.execution_id
+        assert dispatch_record.execution_id != seeded.execution_id
         assert events[-2].reason_json == '{"start_reason":"resume"}'
         request_for_resume = _build_resume_request(
             host._transaction_runner(), seeded.session_id, snapshot.current_attempt_id
@@ -334,7 +360,7 @@ def test_resolve_wait_committed_tool_result_direct_catchup_without_fact(
         assert len(recent_evidence) == 1
         evidence_text = recent_evidence[0].text
         assert "工具名称：long_tool" in evidence_text
-        assert '工具 long_tool 请求参数：{"name":"long_tool"}' in evidence_text
+        assert '查询语义：参数：{"arguments":{"name":"long_tool"}}' in evidence_text
         assert '"answer":42' in evidence_text
         assert "原始工具响应不可用" not in evidence_text
         assert "TOOL_AWAITING" not in evidence_text
@@ -392,6 +418,7 @@ def test_resolve_wait_rejects_request_atom_arguments_digest_mismatch(
     try:
         seeded = _seed_waiting_run(host)
         _rewrite_wait_request_atom_digest(host._transaction_runner(), seeded.wait_id)
+        before_events = _events(host._transaction_runner())
 
         with pytest.raises(HostApiError) as exc_info:
             resolve_wait(
@@ -400,7 +427,51 @@ def test_resolve_wait_rejects_request_atom_arguments_digest_mismatch(
                 _completed_request("resolve-request-digest-mismatch"),
             )
         assert isinstance(exc_info.value.__cause__, HostDurableError)
-        assert "arguments digest mismatch" in str(exc_info.value.__cause__)
+        assert "payload digest must match normalized digest" in str(
+            exc_info.value.__cause__
+        )
+        assert _events(host._transaction_runner()) == before_events
+        assert get_run(host, seeded.run_id).status is RunStatus.WAITING
+        assert _read_wait(host._transaction_runner(), seeded.wait_id).status is (
+            WaitRecordStatus.WAITING
+        )
+    finally:
+        host.close()
+
+
+@pytest.mark.parametrize(
+    "link_case",
+    ("missing", "wrong_shape", "missing_row", "wrong_type", "sequence_mismatch"),
+)
+def test_resolve_wait_rejects_broken_awaiting_request_link_without_mutation(
+    tmp_path: Path,
+    link_case: str,
+) -> None:
+    """awaiting 显式 request ref 缺失或损坏时不写 resolution/resume facts。"""
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        _rewrite_wait_awaiting_request_link(
+            host._transaction_runner(),
+            seeded.wait_id,
+            link_case=link_case,
+        )
+        before_events = _events(host._transaction_runner())
+
+        with pytest.raises(HostApiError) as exc_info:
+            resolve_wait(
+                host,
+                seeded.wait_id,
+                _completed_request(f"resolve-broken-link-{link_case}"),
+            )
+
+        assert isinstance(exc_info.value.__cause__, HostDurableError)
+        assert _events(host._transaction_runner()) == before_events
+        assert get_run(host, seeded.run_id).status is RunStatus.WAITING
+        assert _read_wait(host._transaction_runner(), seeded.wait_id).status is (
+            WaitRecordStatus.WAITING
+        )
     finally:
         host.close()
 
@@ -503,12 +574,14 @@ def test_resolve_wait_failed_and_lost_close_run_without_resume_attempt(
     lost_host = create_host_command_handle(_options(tmp_path / "lost"))
     try:
         failed_seeded = _seed_waiting_run(failed_host)
+        failed_before = _read_resolution_tables(failed_host._transaction_runner())
         failed = resolve_wait(
             failed_host,
             failed_seeded.wait_id,
             _failed_request("resolve-failed", hint="retry after provider recovery"),
         )
         lost_seeded = _seed_waiting_run(lost_host)
+        lost_before = _read_resolution_tables(lost_host._transaction_runner())
         lost = resolve_wait(
             lost_host,
             lost_seeded.wait_id,
@@ -517,6 +590,8 @@ def test_resolve_wait_failed_and_lost_close_run_without_resume_attempt(
 
         failed_wait = _read_wait(failed_host._transaction_runner(), failed_seeded.wait_id)
         lost_wait = _read_wait(lost_host._transaction_runner(), lost_seeded.wait_id)
+        failed_after = _read_resolution_tables(failed_host._transaction_runner())
+        lost_after = _read_resolution_tables(lost_host._transaction_runner())
         assert failed.status is RunStatus.FAILED
         assert failed.current_attempt_id == failed_seeded.attempt_id
         assert failed_wait.status is WaitRecordStatus.FAILED
@@ -527,6 +602,30 @@ def test_resolve_wait_failed_and_lost_close_run_without_resume_attempt(
             _events(failed_host._transaction_runner()), "RUN_FAILED"
         )
         lost_run_lost = _single_event(_events(lost_host._transaction_runner()), "RUN_LOST")
+        failed_tool_result = _single_event(
+            _events(failed_host._transaction_runner()), "TOOL_RESULT_ACCEPTED"
+        )
+        lost_tool_result = _single_event(
+            _events(lost_host._transaction_runner()), "TOOL_RESULT_ACCEPTED"
+        )
+        assert failed_tool_result.attempt_id == failed_seeded.attempt_id
+        assert failed_tool_result.execution_id == failed_seeded.execution_id
+        assert lost_tool_result.attempt_id == lost_seeded.attempt_id
+        assert lost_tool_result.execution_id == lost_seeded.execution_id
+        assert len(failed_after.attempts) == len(failed_before.attempts)
+        assert len(failed_after.dispatch_records) == len(
+            failed_before.dispatch_records
+        )
+        assert len(lost_after.attempts) == len(lost_before.attempts)
+        assert len(lost_after.dispatch_records) == len(lost_before.dispatch_records)
+        assert all(
+            event.get("event_type") != "RESUME_REQUESTED"
+            for event in failed_after.events
+        )
+        assert all(
+            event.get("event_type") != "RESUME_REQUESTED"
+            for event in lost_after.events
+        )
         failed_payload = cast(
             Mapping[str, JsonValue], json.loads(failed_run_failed.payload_json)
         )
@@ -540,6 +639,122 @@ def test_resolve_wait_failed_and_lost_close_run_without_resume_attempt(
     finally:
         failed_host.close()
         lost_host.close()
+
+
+@pytest.mark.parametrize("transition_kind", ("completed", "failed"))
+def test_waiting_resolution_transition_rejects_execution_identity_mismatch(
+    tmp_path: Path,
+    transition_kind: Literal["completed", "failed"],
+) -> None:
+    """WaitRecord 与源 Attempt execution 不同源时 transition 不产生任何写入。
+
+    :param tmp_path: pytest 临时目录。
+    :param transition_kind: direct resume 或 terminal transition 分支。
+    :returns: ``None``。
+    :raises AssertionError: transition 未 fail closed 或 durable 表发生变化时抛出。
+    """
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        auxiliary_execution_id = _seed_auxiliary_starting_attempt(
+            host._transaction_runner()
+        )
+        _rewrite_wait_execution_id(
+            host._transaction_runner(),
+            wait_id=seeded.wait_id,
+            execution_id=auxiliary_execution_id,
+        )
+        before = _read_resolution_tables(host._transaction_runner())
+
+        if transition_kind == "completed":
+            result = host._transaction_runner().run_write(
+                lambda transaction: resume_run_from_waiting_in_transaction(
+                    transaction,
+                    EventLogStore(),
+                    _direct_resume_transition_input(seeded),
+                )
+            )
+        else:
+            result = host._transaction_runner().run_write(
+                lambda transaction: fail_run_from_waiting_in_transaction(
+                    transaction,
+                    EventLogStore(),
+                    _direct_failed_transition_input(seeded),
+                )
+            )
+
+        after = _read_resolution_tables(host._transaction_runner())
+        assert result.status is StateMutationStatus.INVALID_STATE
+        assert result.resume_requested_event is None
+        assert result.tool_result_event is None
+        assert result.run_event is None
+        assert result.attempt_started_event is None
+        assert result.dispatch_record is None
+        assert after == before
+    finally:
+        host.close()
+
+
+@pytest.mark.parametrize("precondition_kind", ("missing_run", "missing_wait"))
+def test_waiting_resolution_transition_returns_not_found_without_mutation(
+    tmp_path: Path,
+    precondition_kind: Literal["missing_run", "missing_wait"],
+) -> None:
+    """waiting-resolution owner 缺少 durable 主体时不产生任何写入。
+
+    :param tmp_path: pytest 临时目录。
+    :param precondition_kind: 缺失目标 Run 或 WaitRecord 的 direct transition 分支。
+    :returns: ``None``。
+    :raises AssertionError: transition 未返回 NOT_FOUND 或 durable 表发生变化时抛出。
+    """
+
+    host = create_host_command_handle(_options(tmp_path))
+    try:
+        seeded = _seed_waiting_run(host)
+        before = _read_resolution_tables(host._transaction_runner())
+
+        if precondition_kind == "missing_run":
+            resume_request = replace(
+                _direct_resume_transition_input(seeded),
+                run_id="run-resolve-missing",
+            )
+            result = host._transaction_runner().run_write(
+                lambda transaction: resume_run_from_waiting_in_transaction(
+                    transaction,
+                    EventLogStore(),
+                    resume_request,
+                )
+            )
+            assert result.run is None
+            assert result.attempt is not None
+            assert result.wait_record is not None
+        else:
+            terminal_request = replace(
+                _direct_failed_transition_input(seeded),
+                wait_id="wait-resolve-missing",
+            )
+            result = host._transaction_runner().run_write(
+                lambda transaction: fail_run_from_waiting_in_transaction(
+                    transaction,
+                    EventLogStore(),
+                    terminal_request,
+                )
+            )
+            assert result.run is not None
+            assert result.attempt is not None
+            assert result.wait_record is None
+
+        after = _read_resolution_tables(host._transaction_runner())
+        assert result.status is StateMutationStatus.NOT_FOUND
+        assert result.resume_requested_event is None
+        assert result.tool_result_event is None
+        assert result.run_event is None
+        assert result.attempt_started_event is None
+        assert result.dispatch_record is None
+        assert after == before
+    finally:
+        host.close()
 
 
 def test_resolve_wait_lost_same_key_replays_terminal_snapshot(
@@ -858,6 +1073,76 @@ def _lost_request(idempotency_key: str) -> ResolveWaitRequest:
     )
 
 
+def _direct_resume_transition_input(
+    seeded: _SeededWaitingRun,
+) -> ResumeRunFromWaitingInput:
+    """构造 direct owner contract 测试使用的完整 resume transition 输入。
+
+    :param seeded: 目标 waiting Run 引用。
+    :returns: typed resume transition 输入。
+    """
+
+    resolution_digest = sha256_digest_json(
+        {"resolution": "direct-resume-execution-mismatch"}
+    )
+    return ResumeRunFromWaitingInput(
+        wait_id=seeded.wait_id,
+        run_id=seeded.run_id,
+        suspended_attempt_id=seeded.attempt_id,
+        resume_attempt_id="attempt-resolve-direct-resume",
+        resume_execution_id="execution-resolve-direct-resume",
+        resume_dispatch_record_id="dispatch-resolve-direct-resume",
+        resume_requested_event_id="event-resume-requested-direct-mismatch",
+        tool_result_event_id="event-tool-result-direct-resume-mismatch",
+        run_started_event_id="event-run-started-direct-resume-mismatch",
+        attempt_started_event_id="event-attempt-started-direct-resume-mismatch",
+        occurred_at=_OBSERVED,
+        actor="tester",
+        source="pytest",
+        resolution_idempotency_key="resolve-direct-resume-mismatch",
+        resolution_digest=resolution_digest,
+        resume_requested_payload={"reason": "wait_resolved"},
+        tool_result_payload={"result": "completed"},
+        tool_result_payload_ref=None,
+        tool_result_payload_digest=None,
+        worker_kind=WorkerKind.LOCAL,
+        owner_host_instance_id=None,
+    )
+
+
+def _direct_failed_transition_input(
+    seeded: _SeededWaitingRun,
+) -> WaitingRunTerminalInput:
+    """构造 direct owner contract 测试使用的完整 failed transition 输入。
+
+    :param seeded: 目标 waiting Run 引用。
+    :returns: typed terminal transition 输入。
+    """
+
+    resolution_digest = sha256_digest_json(
+        {"resolution": "direct-failed-execution-mismatch"}
+    )
+    return WaitingRunTerminalInput(
+        wait_id=seeded.wait_id,
+        run_id=seeded.run_id,
+        suspended_attempt_id=seeded.attempt_id,
+        tool_result_event_id="event-tool-result-direct-failed-mismatch",
+        run_terminal_event_id="event-run-failed-direct-mismatch",
+        run_terminal_status=RunStatus.FAILED,
+        wait_terminal_status=WaitRecordStatus.FAILED,
+        occurred_at=_OBSERVED,
+        actor="tester",
+        source="pytest",
+        reason="wait_failed",
+        message="provider failed",
+        resolution_idempotency_key="resolve-direct-failed-mismatch",
+        resolution_digest=resolution_digest,
+        tool_result_payload={"result": "failed"},
+        tool_result_payload_ref=None,
+        tool_result_payload_digest=None,
+    )
+
+
 def _cancelled_request(idempotency_key: str) -> ResolveWaitRequest:
     """构造工具级 cancelled resolve wait request。
 
@@ -916,6 +1201,106 @@ def _rewrite_wait_request_atom_digest(
             """,
             (canonical_json_dumps(payload), event_id),
         )
+
+    transaction_runner.run_write(_operation)
+
+
+def _rewrite_wait_awaiting_request_link(
+    transaction_runner: HostTransactionRunner,
+    wait_id: str,
+    *,
+    link_case: str,
+) -> None:
+    """把 ``TOOL_AWAITING`` 的显式 request ref 改成指定损坏形态。
+
+    :param transaction_runner: Host transaction runner。
+    :param wait_id: wait id。
+    :param link_case: missing/wrong_shape/missing_row/wrong_type/sequence_mismatch。
+    :returns: ``None``。
+    :raises ValueError: link_case 不受支持时抛出。
+    """
+
+    def _operation(transaction: HostTransaction) -> None:
+        """更新 awaiting canonical payload。
+
+        :param transaction: Host transaction。
+        :returns: ``None``。
+        :raises ValueError: link_case 不受支持时抛出。
+        """
+
+        wait_record = read_wait_record_by_id(transaction, wait_id)
+        assert wait_record is not None
+        awaiting = EventLogStore().read_event_by_id(
+            transaction, wait_record.created_event_id
+        )
+        assert awaiting is not None
+        payload = json.loads(awaiting.payload_json)
+        assert isinstance(payload, dict)
+        current_ref = payload.get("tool_call_requested_event_ref")
+        assert isinstance(current_ref, dict)
+        current_event_id = current_ref.get("event_id")
+        current_sequence = current_ref.get("event_sequence")
+        assert isinstance(current_event_id, str)
+        assert isinstance(current_sequence, int)
+        if link_case == "missing":
+            payload.pop("tool_call_requested_event_ref")
+        elif link_case == "wrong_shape":
+            payload["tool_call_requested_event_ref"] = {
+                "event_id": current_event_id
+            }
+        elif link_case == "missing_row":
+            payload["tool_call_requested_event_ref"] = {
+                "event_id": "event-request-missing",
+                "event_sequence": 999,
+            }
+        elif link_case == "wrong_type":
+            payload["tool_call_requested_event_ref"] = {
+                "event_id": awaiting.event_id,
+                "event_sequence": awaiting.event_sequence,
+            }
+        elif link_case == "sequence_mismatch":
+            payload["tool_call_requested_event_ref"] = {
+                "event_id": current_event_id,
+                "event_sequence": current_sequence + 100,
+            }
+        else:
+            raise ValueError("unsupported link_case")
+        transaction.execute(
+            f"UPDATE {TABLE_EVENT_LOG} SET payload_json = ? WHERE event_id = ?",
+            (canonical_json_dumps(payload), awaiting.event_id),
+        )
+
+    transaction_runner.run_write(_operation)
+
+
+def _rewrite_wait_execution_id(
+    transaction_runner: HostTransactionRunner,
+    *,
+    wait_id: str,
+    execution_id: str,
+) -> None:
+    """把目标 WaitRecord execution 改为另一条 FK-valid Attempt execution。
+
+    :param transaction_runner: Host transaction runner。
+    :param wait_id: 目标 wait id。
+    :param execution_id: 辅助 Attempt 的 execution id。
+    :returns: ``None``。
+    :raises AssertionError: 目标 wait row 不唯一时抛出。
+    """
+
+    def _operation(transaction: HostTransaction) -> None:
+        """执行 WaitRecord execution 腐化。
+
+        :param transaction: 当前 Host transaction。
+        :returns: ``None``。
+        :raises AssertionError: 目标 wait row 不唯一时抛出。
+        """
+
+        result = transaction.execute(
+            f"UPDATE {TABLE_HOST_WAIT_RECORDS} SET execution_id = ? WHERE wait_id = ?",
+            (execution_id, wait_id),
+        )
+        assert result.rowcount == 1
 
     transaction_runner.run_write(_operation)
 
@@ -980,6 +1365,89 @@ def _seed_waiting_run(host: HostCommandHandle) -> _SeededWaitingRun:
         dispatch_record_id=base.dispatch_record_id,
         wait_id=candidate.wait_id,
     )
+
+
+def _seed_auxiliary_starting_attempt(
+    transaction_runner: HostTransactionRunner,
+) -> str:
+    """在独立 Run 中创建供 FK-valid mismatch 使用的辅助 Attempt。
+
+    :param transaction_runner: Host transaction runner。
+    :returns: 辅助 Attempt 的 execution id。
+    :raises AssertionError: 辅助 Run/Attempt 未创建成功时抛出。
+    """
+
+    session_id = ensure_session(
+        transaction_runner,
+        EnsureSessionRequest(
+            scope="workspace",
+            slot_key="resolve-auxiliary",
+            metadata=(),
+        ),
+    ).snapshot.session_id
+    execution_id = "execution-resolve-auxiliary"
+
+    def _operation(transaction: HostTransaction) -> None:
+        """创建辅助 Run、Attempt 与 dispatch record。
+
+        :param transaction: 当前 Host transaction。
+        :returns: ``None``。
+        :raises AssertionError: durable transition 未成功时抛出。
+        """
+
+        input_event = EventLogStore().append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id="event-input-resolve-auxiliary",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id="run-resolve-auxiliary",
+                attempt_id=None,
+                execution_id=None,
+                event_type="USER_INPUT_ACCEPTED",
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                client_request_id="client-resolve-auxiliary",
+                idempotency_key="idem-resolve-auxiliary-input",
+                policy_decision=None,
+                reason=None,
+                payload_json={"display_text": "auxiliary"},
+                payload_ref=None,
+                payload_digest=None,
+            ),
+        ).row
+        result = create_running_run_with_starting_attempt_in_transaction(
+            transaction,
+            EventLogStore(),
+            CreateRunningRunInput(
+                session_id=session_id,
+                run_id="run-resolve-auxiliary",
+                client_request_id="client-resolve-auxiliary",
+                input_event_id=input_event.event_id,
+                input_event_sequence=input_event.event_sequence,
+                run_accepted_event_id="event-run-accepted-resolve-auxiliary",
+                run_started_event_id="event-run-started-resolve-auxiliary",
+                attempt_started_event_id="event-attempt-started-resolve-auxiliary",
+                attempt_id="attempt-resolve-auxiliary",
+                execution_id=execution_id,
+                dispatch_record_id="dispatch-resolve-auxiliary",
+                occurred_at=_NOW,
+                actor="tester",
+                source="pytest",
+                idempotency_key="idem-resolve-auxiliary",
+                execution_target="target-resolve-auxiliary",
+                queue_policy=RunQueuePolicy.QUEUE,
+                start_reason=RunStartReason.INITIAL,
+                worker_kind=WorkerKind.LOCAL,
+                owner_host_instance_id=None,
+                call_context_digest=_CALL_CONTEXT_DIGEST,
+            ),
+        )
+        assert result.status is StateMutationStatus.UPDATED
+
+    transaction_runner.run_write(_operation)
+    return execution_id
 
 
 def _seed_active_run(
@@ -1173,6 +1641,46 @@ def _read_resolution_state(
         )
 
     return transaction_runner.run_read(_operation)
+
+
+def _read_resolution_tables(
+    transaction_runner: HostTransactionRunner,
+) -> _ResolutionTables:
+    """读取 wait-resolution owner 涉及的五张 durable 全表。
+
+    :param transaction_runner: Host transaction runner。
+    :returns: 按稳定主键排序的 durable 全表快照。
+    """
+
+    return transaction_runner.run_read(_read_resolution_tables_in_transaction)
+
+
+def _read_resolution_tables_in_transaction(
+    transaction: HostTransaction,
+) -> _ResolutionTables:
+    """在当前 transaction 内读取 wait-resolution durable 全表。
+
+    :param transaction: 当前 Host transaction。
+    :returns: 按稳定主键排序的 durable 全表快照。
+    """
+
+    return _ResolutionTables(
+        events=transaction.fetchall(
+            f"SELECT * FROM {TABLE_EVENT_LOG} ORDER BY event_sequence"
+        ),
+        runs=transaction.fetchall(f"SELECT * FROM {TABLE_HOST_RUNS} ORDER BY run_id"),
+        attempts=transaction.fetchall(
+            f"SELECT * FROM {TABLE_HOST_ATTEMPTS} ORDER BY attempt_id"
+        ),
+        wait_records=transaction.fetchall(
+            f"SELECT * FROM {TABLE_HOST_WAIT_RECORDS} ORDER BY wait_id"
+        ),
+        dispatch_records=transaction.fetchall(
+            "SELECT * "
+            f"FROM {TABLE_HOST_ATTEMPT_DISPATCH_RECORDS} "
+            "ORDER BY dispatch_record_id"
+        ),
+    )
 
 
 def _read_wait(

@@ -136,7 +136,7 @@ class AcceptedToolResultProjection:
     :param tool_call_id: 工具调用 id。
     :param tool_call_requested_event_ref: 可选 ``TOOL_CALL_REQUESTED`` event ref。
     :param query: query 可读投影。
-    :param request_arguments_json: 已校验的 LLM-safe request 参数 JSON。
+    :param request_arguments_json: 已校验的 exact canonical request 参数 JSON。
     :param status: 统一工具结果状态。
     :param raw_outcome: raw outcome JSON；不可用时为 ``None``。
     :param result_text: canonical raw outcome 文本；不可用时为 ``None``。
@@ -209,9 +209,8 @@ def project_accepted_tool_result(
         transaction,
         result_row,
         envelope,
-        diagnostics,
     )
-    query = _query_projection(request_atoms, payload, diagnostics)
+    query = _query_projection(request_atoms, diagnostics)
     source = _source_projection(envelope, diagnostics)
     llm_material = _llm_material(
         tool_name=tool_name,
@@ -235,9 +234,7 @@ def project_accepted_tool_result(
             else envelope.tool_query.tool_call_requested_event_ref
         ),
         query=query,
-        request_arguments_json=(
-            request_atoms.arguments_json if request_atoms is not None else None
-        ),
+        request_arguments_json=request_atoms.arguments_json,
         status=status,
         raw_outcome=raw_outcome,
         result_text=result_text,
@@ -479,58 +476,44 @@ def _request_atoms_projection(
     transaction: HostTransaction,
     result_row: EventLogRow,
     envelope: AcceptedEvidenceEnvelope | None,
-    diagnostics: list[str],
-) -> ToolCallRequestAtoms | None:
+) -> ToolCallRequestAtoms:
     """读取并校验 accepted result 指向的 request atom。
 
     :param transaction: 当前 Host transaction。
     :param result_row: accepted result row。
     :param envelope: accepted evidence envelope。
-    :param diagnostics: projection 诊断列表，可追加 request 降级原因。
-    :returns: 已校验 request atom；不可用时为 ``None``。
+    :returns: 已严格校验的 request atom。
+    :raises HostDurableError: envelope、request link、row、identity 或 atom 正文
+        缺失/损坏时抛出。
     """
 
     if envelope is None:
-        diagnostics.append("accepted_evidence_envelope_missing")
-        return None
+        raise HostDurableError("accepted result evidence envelope is missing")
     requested_event_ref = envelope.tool_query.tool_call_requested_event_ref
     if requested_event_ref is None:
-        diagnostics.append("request_atom_unavailable")
-        return None
+        raise HostDurableError("tool_call_requested_event_ref is missing")
     request_row = read_event_by_id(transaction, requested_event_ref)
     if request_row is None:
-        diagnostics.append("request_atom_unavailable")
-        return None
+        raise HostDurableError("accepted result request atom is missing")
     if not _request_row_matches_result(request_row, result_row):
-        diagnostics.append("request_atom_identity_mismatch")
-        return None
-    try:
-        atoms = tool_call_request_atoms(transaction, request_row)
-    except HostDurableError:
-        diagnostics.append("request_atom_unreadable")
-        return None
+        raise HostDurableError("accepted result request atom identity mismatch")
+    atoms = tool_call_request_atoms(transaction, request_row)
     if not _request_atoms_match_envelope(atoms, envelope):
-        diagnostics.append("request_atom_identity_mismatch")
-        return None
+        raise HostDurableError("accepted result request atom envelope mismatch")
     return atoms
 
 
 def _query_projection(
-    atoms: ToolCallRequestAtoms | None,
-    payload: Mapping[str, JsonValue],
+    atoms: ToolCallRequestAtoms,
     diagnostics: list[str],
 ) -> AcceptedToolResultQueryProjection:
     """构造 query 可读投影。
 
     :param atoms: 已校验 request atom。
-    :param payload: accepted result payload。
     :param diagnostics: projection 诊断列表。
     :returns: query projection。
     """
 
-    if atoms is None:
-        reason = diagnostics[-1] if len(diagnostics) > 0 else "request_atom_unavailable"
-        return _request_unavailable_query(reason)
     if atoms.semantic_query_text is not None:
         return AcceptedToolResultQueryProjection(
             text=atoms.semantic_query_text,
@@ -590,16 +573,6 @@ def _limited_query(reason: str) -> AcceptedToolResultQueryProjection:
     )
 
 
-def _request_unavailable_query(reason: str) -> AcceptedToolResultQueryProjection:
-    """在 request atom 不可用时构造 query 降级投影。
-
-    :param reason: 降级原因。
-    :returns: query projection。
-    """
-
-    return _limited_query(reason)
-
-
 def _request_row_matches_result(
     request_row: EventLogRow, result_row: EventLogRow
 ) -> bool:
@@ -607,7 +580,7 @@ def _request_row_matches_result(
 
     :param request_row: ``TOOL_CALL_REQUESTED`` row。
     :param result_row: ``TOOL_RESULT_ACCEPTED`` row。
-    :returns: 同一 session/run/attempt 且 execution 兼容时返回 ``True``。
+    :returns: 同一 session/run/attempt/execution 时返回 ``True``。
     """
 
     return (
@@ -616,10 +589,7 @@ def _request_row_matches_result(
         and request_row.session_id == result_row.session_id
         and request_row.run_id == result_row.run_id
         and request_row.attempt_id == result_row.attempt_id
-        and (
-            request_row.execution_id == result_row.execution_id
-            or result_row.execution_id is None
-        )
+        and request_row.execution_id == result_row.execution_id
     )
 
 
@@ -638,6 +608,8 @@ def _request_atoms_match_envelope(
         and atoms.tool_name == envelope.tool_name
         and atoms.normalized_arguments_digest
         == envelope.tool_query.normalized_arguments_digest
+        and atoms.semantic_input_digest
+        == envelope.tool_query.semantic_input_digest
     )
 
 

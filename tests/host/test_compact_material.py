@@ -2004,10 +2004,15 @@ def test_pre_dispatch_evidence_uses_projection_unavailable_source(
     assert "event-internal" not in visible_text
 
 
-def test_pre_dispatch_tool_result_without_envelope_yields_no_evidence_block(
+def test_pre_dispatch_tool_result_without_envelope_fails_closed(
     tmp_path: Path,
 ) -> None:
-    """TOOL_RESULT_ACCEPTED 无 accepted evidence envelope 时不生成 evidence block。"""
+    """TOOL_RESULT_ACCEPTED 缺 accepted evidence envelope 时 fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 缺失 envelope 未触发 durable error 时抛出。
+    """
 
     event_log = EventLogStore()
     with open_host_durable_store(_durable_options(tmp_path)) as store:
@@ -2036,16 +2041,18 @@ def test_pre_dispatch_tool_result_without_envelope_yields_no_evidence_block(
             return _run_row(current)
 
         run = store.transaction_runner.run_write(seed)
-        view = store.transaction_runner.run_read(
-            lambda transaction: build_pre_dispatch_compact_material_view(
-                transaction,
-                event_log,
-                run=run,
-                current_display_text="current user question",
+        with pytest.raises(
+            HostDurableError,
+            match="accepted result evidence envelope is missing",
+        ):
+            store.transaction_runner.run_read(
+                lambda transaction: build_pre_dispatch_compact_material_view(
+                    transaction,
+                    event_log,
+                    run=run,
+                    current_display_text="current user question",
+                )
             )
-        )
-
-        assert view.material_blocks == ()
 
 
 def test_pre_dispatch_evidence_missing_request_atom_fails_closed(
@@ -2140,7 +2147,7 @@ def test_pre_dispatch_evidence_request_ref_to_result_event_fails_closed(
         run = store.transaction_runner.run_write(seed)
         with pytest.raises(
             HostDurableError,
-            match="request provenance is invalid",
+            match="accepted result request atom identity mismatch",
         ):
             store.transaction_runner.run_read(
                 lambda transaction: build_pre_dispatch_compact_material_view(
@@ -2204,7 +2211,7 @@ def test_pre_dispatch_evidence_request_identity_mismatch_fails_closed(
         run = store.transaction_runner.run_write(seed)
         with pytest.raises(
             HostDurableError,
-            match="request provenance is invalid",
+            match="accepted result request atom identity mismatch",
         ):
             store.transaction_runner.run_read(
                 lambda transaction: build_pre_dispatch_compact_material_view(

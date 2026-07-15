@@ -12,6 +12,8 @@ from typing import cast
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.contracts.tool_await import ToolAwaitKind, ToolAwaitSpec
+from dayu.host._event_payload import tool_awaiting_payload
 from dayu.host.compact_payload import parse_context_compacted_semantic_payload
 from dayu.host.compaction import (
     CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
@@ -62,7 +64,10 @@ from dayu.host.durable.payload import (
     SQLitePayloadFormat,
     SQLitePayloadWriteRequest,
 )
-from dayu.host.durable.projection import read_projection_checkpoint
+from dayu.host.durable.projection import (
+    read_projection_checkpoint,
+    read_projection_failure,
+)
 from dayu.host.durable.schema import (
     TABLE_HOST_MEMORY_ITEMS,
     TABLE_HOST_MEMORY_SNAPSHOTS,
@@ -117,6 +122,26 @@ _FAIL_SAFE_LIMITED_QUERY_TEXT = ACCEPTED_EVIDENCE_QUERY_UNAVAILABLE_TEXT
 _COMPACT_ARTIFACT_DIGEST = (
     "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 )
+_TOOL_AWAITING_GOVERNANCE_KEYS = frozenset(
+    (
+        "session_id",
+        "run_id",
+        "attempt_id",
+        "execution_id",
+        "iteration_id",
+        "wait_id",
+        "tool_call_id",
+        "tool_name",
+        "tool_call_requested_event_ref",
+        "await_spec",
+        "adapter_key",
+        "resume_policy",
+        "snapshot_ref",
+        "external_job_ref",
+        "accept_idempotency_key",
+        "semantic_input_digest",
+    )
+)
 
 _REQUIRED_MEMORY_POLICY_FIELD_NAMES = frozenset(
     (
@@ -164,8 +189,8 @@ _REQUIRED_MEMORY_SNAPSHOT_FIELD_NAMES = frozenset(
 
 
 @dataclass(frozen=True, slots=True)
-class _ToolQueryFailSafeCase:
-    """工具 evidence query fail-safe 分支测试参数。
+class _BrokenToolQueryCase:
+    """工具 evidence query strict failure 分支测试参数。
 
     :param append_request: 是否写入 request row。
     :param request_session_id: request row session id。
@@ -278,6 +303,51 @@ def _event(
         assistant_final_answer_text=assistant_final_answer_text,
         accepted_tool_evidence=accepted_tool_evidence,
     )
+
+
+def _tool_awaiting_governance_payload(
+    *,
+    request_event_id: str,
+    request_event_sequence: int,
+) -> dict[str, JsonValue]:
+    """构造当前 fresh-schema 的 governance-only ``TOOL_AWAITING`` payload。
+
+    :param request_event_id: 已 append canonical request row 的 event id。
+    :param request_event_sequence: 已 append canonical request row 的真实 sequence。
+    :returns: exact 16-key、只含治理字段与 request link 的 payload。
+    :raises AssertionError: production owner 返回非 object 或 key set 漂移时抛出。
+    """
+
+    payload = tool_awaiting_payload(
+        session_id=_SESSION_ID,
+        run_id=_RUN_ID,
+        attempt_id=_ATTEMPT_ID,
+        execution_id=_EXECUTION_ID,
+        iteration_id="iteration-awaiting-memory",
+        wait_id="wait-awaiting-memory",
+        tool_call_id="tool-call-awaiting-memory",
+        tool_name="start_fins_download",
+        tool_call_requested_event_ref={
+            "event_id": request_event_id,
+            "event_sequence": request_event_sequence,
+        },
+        await_spec=ToolAwaitSpec(
+            await_kind=ToolAwaitKind.EXTERNAL_JOB,
+            deadline=None,
+            resume_token="external-job-awaiting-memory",
+        ),
+        adapter_key="poll:start-fins-download",
+        resume_policy="poll",
+        snapshot_ref=None,
+        external_job_ref=None,
+        accept_idempotency_key="accept-awaiting-memory",
+        semantic_input_digest=sha256_digest_json(
+            {"semantic_input": "awaiting-memory"}
+        ),
+    )
+    assert isinstance(payload, Mapping)
+    assert set(payload) == _TOOL_AWAITING_GOVERNANCE_KEYS
+    return dict(payload)
 
 
 def _llm_facing_memory_text_view(
@@ -571,13 +641,13 @@ def _append_tool_request_and_result_events(
     )
 
 
-def _fail_safe_request_payload(
-    case: _ToolQueryFailSafeCase,
+def _broken_request_payload(
+    case: _BrokenToolQueryCase,
     *,
     arguments_json: Mapping[str, JsonValue],
     semantic_input_digest: str,
 ) -> dict[str, JsonValue]:
-    """按 fail-safe case 构造 request payload。
+    """按 strict failure case 构造 request payload。
 
     :param case: fail-safe case。
     :param arguments_json: accepted arguments canonical JSON。
@@ -596,18 +666,72 @@ def _fail_safe_request_payload(
         )
     if case.request_payload_kind == _REQUEST_PAYLOAD_KIND_INVALID:
         return {"tool_call_id": case.request_tool_call_id}
-    raise ValueError("unknown fail-safe request payload kind")
+    raise ValueError("unknown broken request payload kind")
 
 
-def _project_tool_query_fail_safe_case(
+def _assert_memory_projection_fails_closed(
+    store: HostDurableStore,
+    *,
+    policy: MemoryProjectionPolicy,
+    result_event_id: str,
+) -> None:
+    """断言 strict consumer 记录 HostDurableError 且不发布 snapshot。
+
+    :param store: 已写入损坏 request/result facts 的 durable store。
+    :param policy: memory projection policy。
+    :param result_event_id: 应当失败的 ``TOOL_RESULT_ACCEPTED`` event id。
+    :returns: ``None``。
+    :raises AssertionError: consumer 未失败、错误类型不符或仍发布 memory 时抛出。
+    """
+
+    consumer = ConversationMemoryProjectionConsumer(policy)
+    result = ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
+        consumer.consumer_id,
+        limit=10,
+    )
+    latest = store.transaction_runner.run_read(
+        lambda transaction: read_latest_memory_snapshot(
+            transaction,
+            session_id=_SESSION_ID,
+            consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+            policy_digest=digest_memory_projection_policy(policy),
+        )
+    )
+    failure = store.transaction_runner.run_read(
+        lambda transaction: read_projection_failure(
+            transaction,
+            CONVERSATION_MEMORY_CONSUMER_ID,
+        )
+    )
+    item_count = store.transaction_runner.run_read(_memory_item_count)
+    checkpoint = store.transaction_runner.run_read(
+        lambda transaction: read_projection_checkpoint(
+            transaction,
+            CONVERSATION_MEMORY_CONSUMER_ID,
+        )
+    )
+
+    assert result.failures == 1
+    assert result.events_applied == 0
+    assert latest is None
+    assert item_count == 0
+    assert failure is not None
+    assert failure.failed_event_id == result_event_id
+    assert failure.last_error_code == HostDurableError.__name__
+    assert checkpoint is not None
+    assert checkpoint.checkpoint_event_sequence < failure.failed_event_sequence
+
+
+def _assert_tool_query_projection_fails_closed(
     tmp_path: Path,
-    case: _ToolQueryFailSafeCase,
-) -> str:
-    """运行单个工具 query fail-safe projection case 并返回 memory 文本。
+    case: _BrokenToolQueryCase,
+) -> None:
+    """断言损坏 request/result provenance 不发布 memory snapshot。
 
     :param tmp_path: pytest 临时目录。
-    :param case: fail-safe case。
-    :returns: selected recent window 中的工具 evidence 文本。
+    :param case: strict failure case。
+    :returns: ``None``。
+    :raises AssertionError: consumer 未以 HostDurableError 失败或仍发布 snapshot 时抛出。
     """
 
     policy = _policy()
@@ -627,7 +751,7 @@ def _project_tool_query_fail_safe_case(
                 transaction,
                 request_event_id=request_event_id,
                 result_event_id=result_event_id,
-                request_payload=_fail_safe_request_payload(
+                request_payload=_broken_request_payload(
                     case,
                     arguments_json=arguments_json,
                     semantic_input_digest=semantic_input_digest,
@@ -647,22 +771,11 @@ def _project_tool_query_fail_safe_case(
                 request_event_type=case.request_event_type,
             )
         )
-        consumer = ConversationMemoryProjectionConsumer(policy)
-        ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
-            consumer.consumer_id,
-            limit=10,
+        _assert_memory_projection_fails_closed(
+            store,
+            policy=policy,
+            result_event_id=result_event_id,
         )
-        latest = store.transaction_runner.run_read(
-            lambda transaction: read_latest_memory_snapshot(
-                transaction,
-                session_id=_SESSION_ID,
-                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
-                policy_digest=digest_memory_projection_policy(policy),
-            )
-        )
-        assert latest is not None
-        return latest.snapshot.trace_memory.selected_recent_window[0].text
-    raise AssertionError("tool query fail-safe projection did not return memory text")
 
 
 def _fact(claim_text: str) -> EvidenceBackedFactCandidateVNext:
@@ -798,21 +911,17 @@ def test_tool_awaiting_does_not_project_llm_facing_memory() -> None:
     """TOOL_AWAITING 不应形成 awaiting 专属 LLM-facing memory。"""
 
     policy = _policy()
-    arguments = {"ticker": "CRCL"}
-    arguments_digest = sha256_digest_json({"arguments": arguments})
     snapshot = build_conversation_memory_snapshot_from_events(
         events=(
             _event(1, "user-1", "USER_INPUT_ACCEPTED", {"display_text": "下载Circle财报"}),
             _event(
-                2,
+                3,
                 "awaiting-1",
                 "TOOL_AWAITING",
-                {
-                    "tool_name": "start_fins_download",
-                    "accepted_arguments": arguments,
-                    "accepted_arguments_source_digest": arguments_digest,
-                    "normalized_arguments_digest": arguments_digest,
-                },
+                _tool_awaiting_governance_payload(
+                    request_event_id="tool-request-awaiting-1",
+                    request_event_sequence=2,
+                ),
             ),
         ),
         session_id=_SESSION_ID,
@@ -852,33 +961,29 @@ def test_tool_awaiting_presence_does_not_change_llm_facing_memory_semantics() ->
     ordinary_events = (
         _event(1, "user-1", "USER_INPUT_ACCEPTED", {"display_text": "下载Circle财报"}),
         _event(
-            3,
+            4,
             "tool-result-1",
             "TOOL_RESULT_ACCEPTED",
             {"display_text": "下载工具返回：已保存 Circle 2024 10-K。"},
         ),
         _event(
-            4,
+            5,
             "run-1",
             "RUN_SUCCEEDED",
             {"final_answer": "Circle 财报已保存。"},
             assistant_final_answer_text="Circle 财报已保存。",
         ),
     )
-    arguments = {"ticker": "CRCL"}
-    arguments_digest = sha256_digest_json({"arguments": arguments})
     with_awaiting_events = (
         ordinary_events[0],
         _event(
-            2,
+            3,
             "awaiting-1",
             "TOOL_AWAITING",
-            {
-                "tool_name": "start_fins_download",
-                "accepted_arguments": arguments,
-                "accepted_arguments_source_digest": arguments_digest,
-                "normalized_arguments_digest": arguments_digest,
-            },
+            _tool_awaiting_governance_payload(
+                request_event_id="tool-request-awaiting-1",
+                request_event_sequence=2,
+            ),
         ),
         ordinary_events[1],
         ordinary_events[2],
@@ -2304,13 +2409,21 @@ def test_projection_consumer_uses_limited_query_without_semantic_query(
         (_RUN_ID, _ATTEMPT_ID, "execution-other"),
     ),
 )
-def test_projection_consumer_fails_safe_on_request_result_execution_mismatch(
+def test_projection_consumer_fails_closed_on_request_result_execution_mismatch(
     tmp_path: Path,
     request_run_id: str,
     request_attempt_id: str,
     request_execution_id: str,
 ) -> None:
-    """request/result 执行上下文错配时不回读 request query。"""
+    """request/result 执行上下文错配时以 HostDurableError 停止投影。
+
+    :param tmp_path: pytest 临时目录。
+    :param request_run_id: request row Run id。
+    :param request_attempt_id: request row Attempt id。
+    :param request_execution_id: request row execution id。
+    :returns: ``None``。
+    :raises AssertionError: consumer 未失败或仍发布 snapshot 时抛出。
+    """
 
     policy = _policy()
     tool_call_id = "tool-call-execution-mismatch-memory"
@@ -2347,37 +2460,22 @@ def test_projection_consumer_fails_safe_on_request_result_execution_mismatch(
                 request_execution_id=request_execution_id,
             )
         )
-        consumer = ConversationMemoryProjectionConsumer(policy)
-        ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
-            consumer.consumer_id,
-            limit=10,
-        )
-        latest = store.transaction_runner.run_read(
-            lambda transaction: read_latest_memory_snapshot(
-                transaction,
-                session_id=_SESSION_ID,
-                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
-                policy_digest=digest_memory_projection_policy(policy),
-            )
+        _assert_memory_projection_fails_closed(
+            store,
+            policy=policy,
+            result_event_id=result_event_id,
         )
 
-        assert latest is not None
-        text = latest.snapshot.trace_memory.selected_recent_window[0].text
-        assert _FAIL_SAFE_LIMITED_QUERY_TEXT in text
-        assert '"total":0' in text
-        assert query_text not in text
-        assert request_event_id not in text
-        assert result_event_id not in text
-        assert tool_call_id not in text
-        assert "run-other" not in text
-        assert "attempt-other" not in text
-        assert "execution-other" not in text
 
-
-def test_projection_consumer_fails_safe_when_requested_event_ref_missing(
+def test_projection_consumer_fails_closed_when_requested_event_ref_missing(
     tmp_path: Path,
 ) -> None:
-    """result envelope 缺少 request ref 时不合成内部引用文本。"""
+    """result envelope 缺 request ref 时以 HostDurableError 停止投影。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: consumer 未失败或仍发布 snapshot 时抛出。
+    """
 
     policy = _policy()
     tool_call_id = "tool-call-missing-request-ref-memory"
@@ -2410,66 +2508,50 @@ def test_projection_consumer_fails_safe_when_requested_event_ref_missing(
                 ),
             )
         )
-        consumer = ConversationMemoryProjectionConsumer(policy)
-        ProjectionRunner(store.transaction_runner, (consumer,)).run_once(
-            consumer.consumer_id,
-            limit=10,
+        _assert_memory_projection_fails_closed(
+            store,
+            policy=policy,
+            result_event_id=result_event_id,
         )
-        latest = store.transaction_runner.run_read(
-            lambda transaction: read_latest_memory_snapshot(
-                transaction,
-                session_id=_SESSION_ID,
-                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
-                policy_digest=digest_memory_projection_policy(policy),
-            )
-        )
-
-        assert latest is not None
-        text = latest.snapshot.trace_memory.selected_recent_window[0].text
-        assert _FAIL_SAFE_LIMITED_QUERY_TEXT in text
-        assert "缺失 ref 时不应读取这个 query" not in text
-        assert request_event_id not in text
-        assert result_event_id not in text
-        assert tool_call_id not in text
 
 
 @pytest.mark.parametrize(
     "case",
     (
         pytest.param(
-            _ToolQueryFailSafeCase(append_request=False),
+            _BrokenToolQueryCase(append_request=False),
             id="requested-event-row-missing",
         ),
         pytest.param(
-            _ToolQueryFailSafeCase(request_session_id="session-other"),
+            _BrokenToolQueryCase(request_session_id="session-other"),
             id="request-session-mismatch",
         ),
         pytest.param(
-            _ToolQueryFailSafeCase(request_event_class=EventClass.DIAGNOSTIC),
+            _BrokenToolQueryCase(request_event_class=EventClass.DIAGNOSTIC),
             id="request-event-class-not-canonical",
         ),
         pytest.param(
-            _ToolQueryFailSafeCase(request_event_type="TOOL_CALL_GOVERNED"),
+            _BrokenToolQueryCase(request_event_type="TOOL_CALL_GOVERNED"),
             id="request-event-type-mismatch",
         ),
         pytest.param(
-            _ToolQueryFailSafeCase(
+            _BrokenToolQueryCase(
                 request_payload_kind=_REQUEST_PAYLOAD_KIND_INVALID,
             ),
             id="request-atoms-unreadable",
         ),
         pytest.param(
-            _ToolQueryFailSafeCase(
+            _BrokenToolQueryCase(
                 envelope_tool_call_id="tool-call-envelope-mismatch-memory",
             ),
             id="tool-call-id-mismatch",
         ),
         pytest.param(
-            _ToolQueryFailSafeCase(envelope_tool_name="lookup_documents"),
+            _BrokenToolQueryCase(envelope_tool_name="lookup_documents"),
             id="tool-name-mismatch",
         ),
         pytest.param(
-            _ToolQueryFailSafeCase(
+            _BrokenToolQueryCase(
                 envelope_arguments_digest=sha256_digest_json(
                     {"arguments": {"ticker": "MSFT"}}
                 ),
@@ -2478,33 +2560,19 @@ def test_projection_consumer_fails_safe_when_requested_event_ref_missing(
         ),
     ),
 )
-def test_projection_consumer_fails_safe_for_request_query_source_mismatch(
+def test_projection_consumer_fails_closed_for_request_query_source_mismatch(
     tmp_path: Path,
-    case: _ToolQueryFailSafeCase,
+    case: _BrokenToolQueryCase,
 ) -> None:
-    """request query 来源不可校验时统一降级且保留 raw outcome。"""
+    """request query 来源不可校验时以 HostDurableError 停止投影。
 
-    text = _project_tool_query_fail_safe_case(tmp_path, case)
+    :param tmp_path: pytest 临时目录。
+    :param case: request row/link/identity/digest 损坏分类。
+    :returns: ``None``。
+    :raises AssertionError: consumer 未失败或仍发布 snapshot 时抛出。
+    """
 
-    assert _FAIL_SAFE_LIMITED_QUERY_TEXT in text
-    assert "raw outcome retained" in text
-    assert _FAIL_SAFE_QUERY_TEXT not in text
-    forbidden_fragments = (
-        "event-tool-call-requested-query-fail-safe-memory",
-        "event-tool-result-query-fail-safe-memory",
-        case.request_tool_call_id,
-        case.envelope_tool_call_id,
-        "sha256:",
-        "payload",
-        "artifact",
-        "wait",
-        "awaiting",
-        "abandoned",
-        "poll",
-        "cancel",
-    )
-    for fragment in forbidden_fragments:
-        assert fragment not in text
+    _assert_tool_query_projection_fails_closed(tmp_path, case)
 
 
 def test_projection_consumer_uses_limited_query_for_unsafe_argument_fallback(

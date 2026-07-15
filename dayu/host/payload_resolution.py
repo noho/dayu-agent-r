@@ -35,9 +35,9 @@ class ToolCallRequestAtoms:
 
     :param tool_call_id: 工具调用 id。
     :param tool_name: 工具名。
-    :param arguments_json: 可安全进入 LLM replay 的参数 JSON 投影。
+    :param arguments_json: Host 已接受的 exact canonical 参数 JSON。
     :param normalized_arguments_digest: 参数 canonical digest。
-    :param arguments_payload_digest: 安全参数 JSON 投影 digest。
+    :param arguments_payload_digest: exact canonical 参数 JSON digest。
     :param semantic_input_digest: Host accept semantic input digest。
     :param semantic_query_text: 可选业务可读 semantic query。
     :param semantic_query_digest: semantic query digest；缺失时为 ``None``。
@@ -48,7 +48,7 @@ class ToolCallRequestAtoms:
     arguments_json: Mapping[str, JsonValue]
     normalized_arguments_digest: str
     arguments_payload_digest: str
-    semantic_input_digest: str | None
+    semantic_input_digest: str
     semantic_query_text: str | None
     semantic_query_digest: str | None
 
@@ -132,6 +132,10 @@ def tool_call_request_atoms(
     tool_name = _required_text(payload, "tool_name")
     normalized_digest = _required_text(payload, "normalized_arguments_digest")
     arguments_payload_digest = _required_text(payload, "arguments_payload_digest")
+    if arguments_payload_digest != normalized_digest:
+        raise HostDurableError(
+            "tool call arguments payload digest must match normalized digest"
+        )
     arguments_json = _read_arguments_json(
         transaction,
         payload,
@@ -149,7 +153,7 @@ def tool_call_request_atoms(
         arguments_json=arguments_json,
         normalized_arguments_digest=normalized_digest,
         arguments_payload_digest=arguments_payload_digest,
-        semantic_input_digest=_optional_text(payload, "semantic_input_digest"),
+        semantic_input_digest=_required_text(payload, "semantic_input_digest"),
         semantic_query_text=semantic_query_text,
         semantic_query_digest=semantic_query_digest,
     )
@@ -227,6 +231,10 @@ def _read_arguments_json(
             raise HostDurableError("tool call inline arguments must be object")
         arguments_json = cast(Mapping[str, JsonValue], value)
     elif storage_kind == TOOL_CALL_ARGUMENTS_STORAGE_PAYLOAD_DESCRIPTOR:
+        if payload.get("arguments_inline_json") is not None:
+            raise HostDurableError(
+                "descriptor tool call arguments must not carry inline JSON"
+            )
         payload_ref = _required_text(payload, "arguments_payload_ref")
         _validate_descriptor_kind(
             transaction,
@@ -242,8 +250,9 @@ def _read_arguments_json(
         )
     else:
         raise HostDurableError("tool call arguments storage kind is invalid")
-    if _FIELD_ARGUMENTS not in arguments_json:
-        raise HostDurableError("tool call arguments JSON missing arguments field")
+    accepted_arguments = arguments_json.get(_FIELD_ARGUMENTS)
+    if not isinstance(accepted_arguments, Mapping):
+        raise HostDurableError("tool call arguments JSON arguments must be object")
     if _payload_size_bytes(arguments_json) != _required_int(
         payload, "arguments_json_size_bytes"
     ):
@@ -278,6 +287,10 @@ def _read_semantic_query(
             raise HostDurableError("inline semantic query must not carry payload ref")
         query_text = _required_text(payload, "semantic_query_text")
     elif storage_kind == TOOL_CALL_SEMANTIC_QUERY_STORAGE_PAYLOAD_DESCRIPTOR:
+        if payload.get("semantic_query_text") is not None:
+            raise HostDurableError(
+                "descriptor semantic query must not carry inline text"
+            )
         payload_ref = _required_text(payload, "semantic_query_payload_ref")
         _validate_descriptor_kind(
             transaction,
@@ -345,23 +358,6 @@ def _required_text(payload: Mapping[str, JsonValue], field_name: str) -> str:
     if isinstance(value, str) and value.strip() != "":
         return value
     raise HostDurableError(f"{field_name} must be non-empty text")
-
-
-def _optional_text(payload: Mapping[str, JsonValue], field_name: str) -> str | None:
-    """读取 JSON object 中的可选非空文本字段。
-
-    :param payload: JSON object。
-    :param field_name: 字段名。
-    :returns: 文本值或 ``None``。
-    :raises HostDurableError: 字段存在但不是非空文本时抛出。
-    """
-
-    value = payload.get(field_name)
-    if value is None:
-        return None
-    if isinstance(value, str) and value.strip() != "":
-        return value
-    raise HostDurableError(f"{field_name} must be non-empty text when provided")
 
 
 def _required_int(payload: Mapping[str, JsonValue], field_name: str) -> int:

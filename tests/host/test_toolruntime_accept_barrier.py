@@ -66,6 +66,11 @@ from dayu.host.memory import (
 )
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.projection import ProjectionCatchupPort
+from dayu.host.tool_call_request import (
+    AcceptedToolCallRequestAtomInput,
+    ToolCallRequestEventOrigin,
+    build_tool_call_requested_event_request,
+)
 from dayu.host.tool_runtime import (
     DefaultHostToolFactAcceptPort,
     DuplicateDecisionKind,
@@ -243,7 +248,25 @@ def test_tool_call_requested_carries_inline_arguments_atom(
 
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_active_run(store.transaction_runner)
-        candidate = _completed_candidate(seeded, tool_call_id="tool-call-args-inline")
+        base = _completed_candidate(seeded, tool_call_id="tool-call-args-inline")
+        accepted_arguments: Mapping[str, JsonValue] = {
+            "file_path": "/research/input/annual-report.pdf",
+            "scope_token": "scope-business-value",
+        }
+        tool_identity_digest = sha256_digest_json(
+            {"identity": "ordinary-owner-sentinel"}
+        )
+        candidate = replace(
+            base,
+            call=replace(
+                base.call,
+                accepted_arguments=accepted_arguments,
+                normalized_arguments_digest=sha256_digest_json(
+                    {"arguments": accepted_arguments}
+                ),
+                tool_identity_digest=tool_identity_digest,
+            ),
+        )
         accept_port = DefaultHostToolFactAcceptPort(
             transaction_runner=store.transaction_runner
         )
@@ -256,17 +279,291 @@ def test_tool_call_requested_carries_inline_arguments_atom(
         )
 
         assert isinstance(result, ToolFactAcceptedAck)
+        assert set(payload) == {
+            "session_id",
+            "run_id",
+            "attempt_id",
+            "execution_id",
+            "iteration_id",
+            "tool_call_id",
+            "tool_name",
+            "tool_schema_digest",
+            "tool_identity_digest",
+            "normalized_arguments_digest",
+            "arguments_json_size_bytes",
+            "arguments_storage_kind",
+            "arguments_inline_json",
+            "arguments_payload_ref",
+            "arguments_payload_digest",
+            "tool_fact_kind",
+            "accept_idempotency_key",
+            "semantic_input_digest",
+            "semantic_query_storage_kind",
+            "semantic_query_text",
+            "semantic_query_payload_ref",
+            "semantic_query_digest",
+        }
         assert payload["arguments_storage_kind"] == "inline_json"
         assert payload["arguments_inline_json"] == {
-            "arguments": {"ticker": "MSFT"}
+            "arguments": accepted_arguments
         }
         assert payload["arguments_payload_ref"] is None
         assert payload["arguments_payload_digest"] == (
             candidate.call.normalized_arguments_digest
         )
         assert payload["semantic_query_storage_kind"] == "absent"
-        assert atoms.arguments_json == {"arguments": {"ticker": "MSFT"}}
+        assert payload["tool_identity_digest"] == tool_identity_digest
+        assert requested.actor == "host.tool_runtime"
+        assert requested.source == "host.tool_runtime.accept"
+        assert atoms.arguments_json == {"arguments": accepted_arguments}
         assert atoms.semantic_query_text is None
+
+
+def test_shared_request_writer_same_body_reuses_real_event_row(
+    tmp_path: Path,
+) -> None:
+    """shared writer 不预测 sequence，同 body 重放返回既有真实 row。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _completed_candidate(
+            seeded, tool_call_id="tool-call-shared-writer-replay"
+        )
+        accepted_arguments = candidate.call.accepted_arguments
+        assert accepted_arguments is not None
+        atom = AcceptedToolCallRequestAtomInput(
+            session_id=candidate.identity.session_id,
+            run_id=candidate.identity.run_id,
+            attempt_id=candidate.identity.attempt_id,
+            execution_id=candidate.identity.execution_id,
+            iteration_id=candidate.call.iteration_id,
+            tool_call_id=candidate.call.tool_call_id,
+            tool_name=candidate.call.tool_name,
+            tool_schema_digest=candidate.call.tool_schema_digest,
+            tool_identity_digest=candidate.call.tool_identity_digest,
+            accepted_arguments=accepted_arguments,
+            normalized_arguments_digest=candidate.call.normalized_arguments_digest,
+            tool_fact_kind=candidate.tool_fact_kind.value,
+            accept_idempotency_key=candidate.idempotency.accept_idempotency_key,
+            semantic_input_digest=candidate.idempotency.semantic_input_digest,
+            semantic_query_text=candidate.call.semantic_query_text,
+        )
+
+        def operation(
+            transaction: HostTransaction,
+        ) -> tuple[EventLogRow, bool, EventLogRow, bool]:
+            """在同一 transaction 两次 append 同一 request body。
+
+            :param transaction: Host transaction。
+            :returns: 两次 append 的 row 与 inserted 标志。
+            :raises HostDurableError: request 构造或 append 失败时由 owner 抛出。
+            """
+
+            request = build_tool_call_requested_event_request(
+                transaction,
+                atom=atom,
+                event_id="event-tool-call-requested-shared-writer-replay",
+                occurred_at=_NOW,
+                origin=ToolCallRequestEventOrigin.ORDINARY_ACCEPT,
+            )
+            first = EventLogStore().append_event(transaction, request)
+            second = EventLogStore().append_event(transaction, request)
+            return first.row, first.inserted, second.row, second.inserted
+
+        first_row, first_inserted, second_row, second_inserted = (
+            store.transaction_runner.run_write(operation)
+        )
+
+        assert first_inserted is True
+        assert second_inserted is False
+        assert second_row == first_row
+        assert second_row.event_sequence == first_row.event_sequence
+        assert second_row.event_sequence > 0
+
+
+def test_tool_call_request_atoms_reject_normalized_payload_digest_mismatch(
+    tmp_path: Path,
+) -> None:
+    """strict reader 拒绝 normalized digest 与 arguments payload digest 漂移。"""
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _completed_candidate(
+            seeded, tool_call_id="tool-call-normalized-digest-mismatch"
+        )
+        result = DefaultHostToolFactAcceptPort(
+            transaction_runner=store.transaction_runner
+        ).accept_tool_fact(candidate)
+        requested = _tool_requested_events(store.transaction_runner)[0]
+        malformed_payload = dict(payload_object(requested))
+        malformed_payload["normalized_arguments_digest"] = sha256_digest_json(
+            {"arguments": {"ticker": "AAPL"}}
+        )
+        malformed_requested = replace(
+            requested,
+            payload_json=canonical_json_dumps(malformed_payload),
+        )
+
+        assert isinstance(result, ToolFactAcceptedAck)
+        with pytest.raises(HostDurableError, match="must match normalized digest"):
+            store.transaction_runner.run_read(
+                lambda transaction: tool_call_request_atoms(
+                    transaction, malformed_requested
+                )
+            )
+
+
+def test_tool_call_request_atoms_reject_wrong_event_type(tmp_path: Path) -> None:
+    """strict reader 拒绝非 ``TOOL_CALL_REQUESTED`` canonical row。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 错误 event type 未被拒绝时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _completed_candidate(
+            seeded, tool_call_id="tool-call-wrong-request-event-type"
+        )
+        result = DefaultHostToolFactAcceptPort(
+            transaction_runner=store.transaction_runner
+        ).accept_tool_fact(candidate)
+        requested = _tool_requested_events(store.transaction_runner)[0]
+
+        assert isinstance(result, ToolFactAcceptedAck)
+        with pytest.raises(HostDurableError, match="event type mismatch"):
+            store.transaction_runner.run_read(
+                lambda transaction: tool_call_request_atoms(
+                    transaction,
+                    replace(requested, event_type="TOOL_RESULT_ACCEPTED"),
+                )
+            )
+
+
+def test_event_payload_object_rejects_descriptor_without_digest(
+    tmp_path: Path,
+) -> None:
+    """EventLog descriptor payload 缺 digest 时 fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 缺 digest 的 descriptor row 未被拒绝时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _completed_candidate(
+            seeded, tool_call_id="tool-call-descriptor-missing-digest"
+        )
+        result = DefaultHostToolFactAcceptPort(
+            transaction_runner=store.transaction_runner
+        ).accept_tool_fact(candidate)
+        requested = _tool_requested_events(store.transaction_runner)[0]
+
+        assert isinstance(result, ToolFactAcceptedAck)
+        with pytest.raises(HostDurableError, match="payload digest is missing"):
+            store.transaction_runner.run_read(
+                lambda transaction: event_payload_object(
+                    transaction,
+                    replace(
+                        requested,
+                        payload_ref="payload:missing-digest",
+                        payload_digest=None,
+                    ),
+                    payload_label="tool call request",
+                )
+            )
+
+
+@pytest.mark.parametrize(
+    ("payload_patch", "error_match"),
+    (
+        (
+            {
+                "arguments_inline_json": {"arguments": {"ticker": "WRONG"}},
+                "arguments_json_size_bytes": len(
+                    canonical_json_dumps(
+                        {"arguments": {"ticker": "WRONG"}}
+                    ).encode("utf-8")
+                ),
+            },
+            "arguments payload digest mismatch",
+        ),
+        ({"arguments_inline_json": []}, "inline arguments must be object"),
+        ({"arguments_storage_kind": "invalid"}, "storage kind is invalid"),
+        (
+            {"arguments_inline_json": {"arguments": "not-an-object"}},
+            "arguments JSON arguments must be object",
+        ),
+        ({"arguments_json_size_bytes": 0}, "arguments size mismatch"),
+        (
+            {"arguments_json_size_bytes": True},
+            "arguments_json_size_bytes must be non-negative integer",
+        ),
+        ({"semantic_query_text": "unexpected"}, "must not carry text"),
+        (
+            {"semantic_query_payload_ref": "payload:unexpected-query"},
+            "must not carry payload ref",
+        ),
+        (
+            {"semantic_query_digest": sha256_digest_json({"query": "unexpected"})},
+            "must not carry digest",
+        ),
+        (
+            {
+                "semantic_query_storage_kind": "invalid",
+                "semantic_query_digest": sha256_digest_json({"query": "invalid"}),
+            },
+            "semantic query storage kind is invalid",
+        ),
+        (
+            {
+                "semantic_query_storage_kind": "inline_text",
+                "semantic_query_text": "lookup filing",
+                "semantic_query_digest": sha256_digest_json({"query": "wrong"}),
+            },
+            "semantic query digest mismatch",
+        ),
+    ),
+)
+def test_tool_call_request_atoms_reject_malformed_inline_atom(
+    tmp_path: Path,
+    payload_patch: Mapping[str, JsonValue],
+    error_match: str,
+) -> None:
+    """strict reader 对 inline request atom 的 shape/digest corruption fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :param payload_patch: 注入 canonical request payload 的畸形字段。
+    :param error_match: 期望 durable error 文本。
+    :returns: ``None``。
+    :raises AssertionError: 畸形 atom 未被对应 owner guard 拒绝时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        candidate = _completed_candidate(
+            seeded, tool_call_id="tool-call-malformed-inline-atom"
+        )
+        result = DefaultHostToolFactAcceptPort(
+            transaction_runner=store.transaction_runner
+        ).accept_tool_fact(candidate)
+        requested = _tool_requested_events(store.transaction_runner)[0]
+        malformed_payload = dict(payload_object(requested))
+        malformed_payload.update(payload_patch)
+        malformed_requested = replace(
+            requested,
+            payload_json=canonical_json_dumps(malformed_payload),
+        )
+
+        assert isinstance(result, ToolFactAcceptedAck)
+        with pytest.raises(HostDurableError, match=error_match):
+            store.transaction_runner.run_read(
+                lambda transaction: tool_call_request_atoms(
+                    transaction, malformed_requested
+                )
+            )
 
 
 def test_tool_call_requested_large_arguments_use_payload_descriptor(
@@ -323,6 +620,63 @@ def test_tool_call_requested_large_arguments_use_payload_descriptor(
         )
         assert atoms.arguments_json == {"arguments": large_arguments}
         assert canonical_json_dumps(large_arguments) not in requested.payload_json
+
+
+def test_tool_call_request_atoms_reject_descriptor_arguments_inline_copy(
+    tmp_path: Path,
+) -> None:
+    """reader 拒绝 descriptor arguments 同时携带非空 inline JSON。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 畸形冷热双份正文未以 durable error 拒绝时抛出。
+    """
+
+    with open_host_durable_store(
+        _options(tmp_path, payload_inline_threshold_bytes=4096)
+    ) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        base = _completed_candidate(
+            seeded, tool_call_id="tool-call-args-descriptor-stale-inline"
+        )
+        large_arguments: Mapping[str, JsonValue] = {
+            "ticker": "MSFT",
+            "query": "x" * 8192,
+        }
+        candidate = replace(
+            base,
+            call=replace(
+                base.call,
+                accepted_arguments=large_arguments,
+                normalized_arguments_digest=sha256_digest_json(
+                    {"arguments": large_arguments}
+                ),
+            ),
+        )
+        result = DefaultHostToolFactAcceptPort(
+            transaction_runner=store.transaction_runner
+        ).accept_tool_fact(candidate)
+        requested = _tool_requested_events(store.transaction_runner)[0]
+        malformed_payload = dict(payload_object(requested))
+        malformed_payload["arguments_inline_json"] = {
+            "arguments": {"ticker": "STALE"}
+        }
+        malformed_requested = replace(
+            requested,
+            payload_json=canonical_json_dumps(malformed_payload),
+        )
+
+        assert isinstance(result, ToolFactAcceptedAck)
+        assert malformed_payload["arguments_storage_kind"] == "payload_descriptor"
+        with pytest.raises(
+            HostDurableError,
+            match="descriptor tool call arguments must not carry inline JSON",
+        ):
+            store.transaction_runner.run_read(
+                lambda transaction: tool_call_request_atoms(
+                    transaction, malformed_requested
+                )
+            )
 
 
 def test_tool_call_request_atoms_reject_missing_descriptor_kind(
@@ -549,6 +903,54 @@ def test_tool_call_requested_semantic_query_inline_and_descriptor(
         assert descriptor_payload["semantic_query_text"] is None
         assert descriptor_atoms.semantic_query_text == descriptor_query
         assert descriptor_query not in requested_events[1].payload_json
+
+
+def test_tool_call_request_atoms_reject_descriptor_semantic_query_inline_copy(
+    tmp_path: Path,
+) -> None:
+    """reader 拒绝 descriptor semantic query 同时携带非空 inline text。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 畸形冷热双份 query 未以 durable error 拒绝时抛出。
+    """
+
+    with open_host_durable_store(
+        _options(tmp_path, payload_inline_threshold_bytes=4096)
+    ) as store:
+        seeded = _seed_active_run(store.transaction_runner)
+        base = _completed_candidate(
+            seeded, tool_call_id="tool-call-query-descriptor-stale-inline"
+        )
+        descriptor_query = "readable query " + ("x" * 8192)
+        candidate = replace(
+            base,
+            call=replace(base.call, semantic_query_text=descriptor_query),
+        )
+        result = DefaultHostToolFactAcceptPort(
+            transaction_runner=store.transaction_runner
+        ).accept_tool_fact(candidate)
+        requested = _tool_requested_events(store.transaction_runner)[0]
+        malformed_payload = dict(payload_object(requested))
+        malformed_payload["semantic_query_text"] = "stale inline query"
+        malformed_requested = replace(
+            requested,
+            payload_json=canonical_json_dumps(malformed_payload),
+        )
+
+        assert isinstance(result, ToolFactAcceptedAck)
+        assert malformed_payload["semantic_query_storage_kind"] == (
+            "payload_descriptor"
+        )
+        with pytest.raises(
+            HostDurableError,
+            match="descriptor semantic query must not carry inline text",
+        ):
+            store.transaction_runner.run_read(
+                lambda transaction: tool_call_request_atoms(
+                    transaction, malformed_requested
+                )
+            )
 
 
 def test_tool_call_request_atoms_reject_inline_semantic_query_payload_ref(
