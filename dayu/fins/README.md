@@ -98,11 +98,13 @@ source document meta 中的 `source_provider` 是来源提供方真源，当前�
 
 `SourceDocumentRepositoryProtocol.get_source_revision(...)` 是 read cache freshness 的仓储真源。revision 由会影响 processor 输入的 canonical source meta 与文件身份/内容字段确定性计算；read runtime 的 processor cache 和 source meta cache 都绑定该 typed revision，复用前必须重新比较。revision 不一致时两类缓存一起失效；processor 构建或独立 meta 读取期间 revision 改变时，本次读取以 `source_changed_during_read` 失败关闭，不返回混合版本结果，也不在 owner 内自动重试。
 
-source document acknowledgement 由 source repository 持有：完成态 source meta 或 `stage_source_document(...)` 写入的 `ingest_complete=false` staging meta 都表示该 source 已被仓储承认。`DocumentBlobRepositoryProtocol.store_file(SourceHandle, ...)` 只能在 source meta 已存在后写入 blob；下载与上传 pipeline 在首次 blob 写入前必须通过 source repository staging 或既有完成态 meta 获得承认。
+storage mutation authority 由显式 `BatchToken(transaction_id, ticker)` 承载。只有 `BatchingRepositoryProtocol` 提供 `begin_batch(...)`、`commit_batch(...)` 与 `rollback_batch(...)` lifecycle；source、blob、processed、company 与 filing maintenance 的所有 mutation 都要求 keyword-only `batch=`，并由 shared repository set 的同一 storage core 校验 token 仍开放且 ticker 匹配。异步 task、线程或 callback 不从上下文推断 authority；需要回调写文件时，每次 invocation 都显式接收并传递同一个 token。
 
-batch/staging owner 由 storage batch token 持有：同 ticker 活动 batch 会绑定创建它的 owner token 与本地执行 scope，只有持有该 token 的 owner 可以读写 staging、提交或回滚。其它 task / thread / repository facade 不得加入同一 staging；需要让 source 与 blob 在同一替换事务中协作时，调用方必须使用共享 repository set 或显式注入共享 core 的仓储实例。
+source publication 使用 blob-first、complete-source commit：producer 可以先在 caller-owned batch 中按 identity handle 写入全部 blob，published read 在 commit 前仍看不到该 source；随后 producer 只执行一次 final source create/update，完整提供 meta、files、primary、provenance 与 manifest 所需事实。commit validator 是完整 source 的资格 owner，拒绝缺失、悬空、重复、false completion、非法 provenance、symlink 或 containment escape；不存在 acknowledgement、半完成 source 或 stable re-entry 契约。
 
-download / upload overwrite 是单目标替换语义，不是 ticker 级清空语义。下载路径不得在发现本轮有效目标 document_id 之前清空 ticker 的全部 filings；空结果、失败或取消不得删除非目标旧文档。上传覆盖路径先完成文件校验、Docling 转换和取消检查，再在 source storage owner batch 内 reset 目标文档、写入 staging/blob 和最终 meta；失败或取消通过 rollback 保留旧文档。
+文件系统实现对同 ticker writer 使用覆盖整个 transaction 的互斥锁，避免两个 writer 形成交错 staging；published read 不读取 staging，也不被长 staging / validator 阶段阻塞。commit 与 recovery 的物理目录切换另由短时 publication guard 保护，published meta、manifest、blob、processed 与 `LocalFileSource.open()` 在在线 rename 窗口只能观察完整 old 或完整 new。journal 只保存可校验的最小相对事实；进程崩溃后 fresh repository 会在相同锁序下恢复到完整 old/new，并清理未提交 staging。
+
+download / upload overwrite 是单目标替换语义，不是 ticker 级清空语义。下载路径不得在发现本轮有效目标 document_id 之前清空 ticker 的全部 filings；空结果、失败或取消不得删除非目标旧文档。上传覆盖路径先完成文件校验、Docling 转换和取消检查，再由顶层 caller 开启短 batch，在其中 reset 目标文档、blob-first 写入文件并发布一次完整 source；commit 前失败或取消只 rollback 一次并保留旧文档，commit 开始后 caller 不再二次 rollback。
 
 `FilingMaintenanceRepositoryProtocol` 持有 SEC 下载拒绝注册表。注册表条目使用 `DownloadRejectionEntry` typed contract，包含 document id、拒绝原因、分类、SEC form、filing date 和下载版本；文件系统仓储读取非法 registry 时失败关闭，保存时只通过 typed entry 序列化，SEC 下载、SC13 过滤和下载诊断只消费该 typed registry。
 
@@ -462,9 +464,9 @@ Fins workspace 规则固定如下：
 
 Storage 是财报文件系统的唯一访问边界。仓储协议按职责拆分为 company meta、source document、processed document、blob、filing maintenance 与 batching，避免把所有能力塞进单个宽仓储。文件系统实现通过 shared repository set 复用路径、锁和批处理事务语义。
 
-source repository 拥有 source document acknowledgement 与 provenance；blob repository 拥有最终文件写入边界，并在 `SourceHandle` 写入时拒绝未被 source repository 承认的 source。pipeline 可以请求 staging，但不能绕过 `stage_source_document(...)` 自行发明第二份 staging 真源。
+source repository 拥有完整 source meta、manifest 与 provenance；blob repository 拥有文件对象；processed、company 与 filing maintenance repository 分别拥有各自业务事实。它们只消费 caller 显式传入的 required `batch=`，不拥有 lifecycle，也不通过另一个 repository 的存在性确认 mutation authority。producer 先写全部 blob，再一次发布完整 source；public read 永远只读 published tree。
 
-batching repository 拥有同 ticker staging / commit / rollback 的 owner token 语义；source repository 也暴露同一 storage core 的 batch 操作，供单文档 download / upload 替换把 reset、blob 写入、final meta 与 processed reprocess 标记收束到一个 owner 边界。非 owner 读写活动 batch staging 会 fail fast，不回退到下游 retry 或展示层补偿。
+batching repository 是 begin / commit / rollback 的唯一 lifecycle owner。production composition root 为 batching、source、blob、processed、company 与 filing maintenance wrappers 注入同一个 repository set/core；top-level publication unit 决定短 transaction 边界并显式传播 token。writer mutex、短时 publication swap guard、complete-source validator 与 crash recovery 都由 storage core 统一执行，非 owner 或跨 core token fail fast，不回退到 retry、展示层或兼容 facade。
 
 ### Downloaders 与 CN/HK report selection
 
@@ -756,7 +758,7 @@ Read tools 的 schema、错误和结果字段必须面向 LLM 自解释。工具
 
 Direct stream 不创建 durable job record；调用方关闭 async iterator、取消 task 或传入 cancellation token 时，runtime 通过 operation-scoped cancellation state / checker 做合作式取消。Awaiting tools 不等待长事务完成，只 prepare 并注册 process-local observation handle，返回 `ToolAwaitingOutcome(EXTERNAL_JOB)`；Host awaiting accept ack durable 成立后，ToolRuntime 通过 Service Fins activation adapter 调用 `activate_observation(handle)` 提交后台执行。Host wait cancel 通过 Service wait adapter 调用 `cancel_observation(handle)` / `abandon_observation(handle)`。Legacy `start_*` job helpers 仍可创建 durable `queued` job record 并通过 `request_cancel(job_id)` 合作式取消，但 Service direct 和 awaiting tools 不消费该路径。
 
-Runtime producer 在进入 download / preprocess / upload 业务执行前检查取消，避免已取消 observation 再启动后续长事务。SEC 下载在公司解析、submissions / history 拉取、filing 选择、Browse EDGAR 补选、index / headers / candidate 文件收集、单 filing 文件列表、HTTP 限流 / 退避、HEAD / GET、文件循环和落盘前后检查取消；取消命中后停止后续 SEC 请求和文件处理，不把用户取消记为 failed file / failed filing。CN/HK 下载在 discovery、候选选择、overwrite 清理、单 filing asset 下载、PDF bytes 读取、PDF / Docling blob 写入、staging source 写入、Docling convert 前后和最终 source commit 前检查取消；取消命中后产出 cancelled summary，已经完成的原子落盘保持一致，不再启动后续耗时步骤。
+Runtime producer 在进入 download / preprocess / upload 业务执行前检查取消，避免已取消 observation 再启动后续长事务。SEC 下载在公司解析、submissions / history 拉取、filing 选择、Browse EDGAR 补选、index / headers / candidate 文件收集、单 filing 文件列表、HTTP 限流 / 退避、HEAD / GET、文件循环和落盘前后检查取消；取消命中后停止后续 SEC 请求和文件处理，不把用户取消记为 failed file / failed filing。CN/HK 下载在 discovery、候选选择、overwrite 清理、单 filing asset 下载、PDF bytes 读取、Docling convert、batch 内 blob-first 写入和完整 source 最终发布前后检查取消；取消命中后产出 cancelled summary，已经完成的原子落盘保持一致，不再启动后续耗时步骤。
 
 CN/HK Docling convert 当前通过 `asyncio.to_thread(...)` 调用同步第三方转换函数。转换线程运行期间不能观察 operation cancellation checker；当前可保证的是进入 convert 前、convert 返回后、写入 Docling blob 前后的合作式 checkpoint。需要在转换过程本身做到强中断时，应把 convert 隔离到 process-backed / subprocess 边界并配置 timeout，由父进程治理 terminate / kill；线程内同步第三方调用不能伪装成可强制取消。
 

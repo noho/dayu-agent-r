@@ -23,7 +23,7 @@ from io import BytesIO
 from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Lock, Thread
-from typing import TYPE_CHECKING, Final, Protocol, assert_never, cast, get_args
+from typing import Final, Protocol, assert_never, cast, get_args
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
@@ -82,6 +82,7 @@ from dayu.fins.ingestion.observation_handle import (
     FinsObservationStatus,
 )
 from dayu.fins.storage import (
+    BatchingRepositoryProtocol,
     DocumentBlobRepositoryProtocol,
     FilingMaintenanceRepositoryProtocol,
     ProcessedDocumentRepositoryProtocol,
@@ -106,6 +107,9 @@ _MAX_TEXT_CHARS: Final[int] = 240
 _MAX_TUPLE_ITEMS: Final[int] = 100
 _MAX_PREPROCESS_DOCUMENTS: Final[int] = 50
 _EMPTY_SUMMARY: Final[dict[str, JsonValue]] = {}
+_ROLLBACK_FAILURE_NOTE_PREFIX: Final[str] = (
+    "rollback_batch failed; recovery evidence retained"
+)
 _NORMALIZED_MARKET_VALUES: Final[frozenset[NormalizedTickerMarket]] = frozenset(
     cast(tuple[NormalizedTickerMarket, ...], get_args(NormalizedTickerMarket))
 )
@@ -137,6 +141,38 @@ _KEY_DOCUMENT_ID: Final[str] = "document_id"
 _KEY_MESSAGE: Final[str] = "message"
 _KEY_PAYLOAD: Final[str] = "payload"
 _KEY_EMITTED_AT: Final[str] = "emitted_at"
+
+
+def _rollback_batch_before_commit(
+    batching_repository: BatchingRepositoryProtocol,
+    batch: BatchToken,
+) -> None:
+    """回滚 commit 前 batch，并在双失败时保留 operation 主异常。
+
+    Args:
+        batching_repository: batch lifecycle 唯一仓储。
+        batch: 尚未进入 commit 的 open batch capability。
+
+    Returns:
+        rollback 成功时不返回业务值。
+
+    Raises:
+        BaseException: rollback 失败且已有 operation/cancellation 异常时，重新抛出
+            原异常并把 rollback 异常设为 cause；没有原异常时抛出 rollback 异常。
+    """
+
+    operation_error = sys.exception()
+    try:
+        batching_repository.rollback_batch(batch)
+    except BaseException as rollback_error:
+        if operation_error is not None:
+            operation_error.add_note(
+                f"{_ROLLBACK_FAILURE_NOTE_PREFIX}: {rollback_error}"
+            )
+            raise operation_error from rollback_error
+        raise
+
+
 _JOB_EVENT_SIDECAR_KIND: Final[str] = "fins_ingestion_job_event"
 _JOB_EVENT_SIDECAR_ROW_SKIPPED_LOG_EVENT: Final[
     str
@@ -2041,6 +2077,7 @@ class FsFinsIngestionJobStore:
 class FinsIngestionRuntime:
     """Fins 下载、预处理与上传 job 运行时基础入口。"""
 
+    batching_repository: BatchingRepositoryProtocol
     source_repository: SourceDocumentRepositoryProtocol
     blob_repository: DocumentBlobRepositoryProtocol
     filing_maintenance_repository: FilingMaintenanceRepositoryProtocol
@@ -2058,6 +2095,7 @@ class FinsIngestionRuntime:
     def create(
         cls,
         *,
+        batching_repository: BatchingRepositoryProtocol,
         source_repository: SourceDocumentRepositoryProtocol,
         blob_repository: DocumentBlobRepositoryProtocol,
         filing_maintenance_repository: FilingMaintenanceRepositoryProtocol,
@@ -2071,6 +2109,7 @@ class FinsIngestionRuntime:
         """创建 ingestion runtime。
 
         Args:
+            batching_repository: batch lifecycle 唯一仓储协议实现。
             source_repository: 源文档仓储协议实现。
             blob_repository: 文档文件对象仓储协议实现。
             filing_maintenance_repository: filing 维护治理仓储协议实现。
@@ -2089,6 +2128,7 @@ class FinsIngestionRuntime:
         """
 
         return cls(
+            batching_repository=batching_repository,
             source_repository=source_repository,
             blob_repository=blob_repository,
             filing_maintenance_repository=filing_maintenance_repository,
@@ -2496,7 +2536,7 @@ class FinsIngestionRuntime:
                 handle.handle_id,
                 lambda: self._run_direct_stream_producer(context, producer),
             )
-        except Exception as exc:
+        except Exception:
             with self._observation_lock:
                 failed_record = self._observations.get(handle.handle_id)
                 if failed_record is not None:
@@ -3788,40 +3828,48 @@ class FinsIngestionRuntime:
             primary_document=primary_document,
             meta=_download_document_meta(document.meta),
         )
-        token: BatchToken = self.source_repository.begin_batch(ticker)
+        token = self.batching_repository.begin_batch(ticker)
         commit_started = False
         try:
             if source_exists:
-                self.source_repository.reset_source_document(ticker, document_id, document.source_kind)
-            self.source_repository.create_source_document(create_request, document.source_kind)
-            handle = self.source_repository.get_source_handle(ticker, document_id, document.source_kind)
+                self.source_repository.reset_source_document(
+                    ticker,
+                    document_id,
+                    document.source_kind,
+                    batch=token,
+                )
+            handle = SourceHandle(
+                ticker=ticker,
+                document_id=document_id,
+                source_kind=document.source_kind.value,
+            )
             file_metas = tuple(
-                self._store_downloaded_file(handle=handle, downloaded_file=downloaded_file)
+                self._store_downloaded_file(
+                    handle=handle,
+                    downloaded_file=downloaded_file,
+                    batch=token,
+                )
                 for downloaded_file in document.files
             )
-            self.source_repository.update_source_document(
+            self.source_repository.create_source_document(
                 replace(create_request, files=list(file_metas)),
                 document.source_kind,
+                batch=token,
             )
             if rebuild_processed:
-                _mark_processed_reprocess_required_if_present(self.processed_repository, ticker, document_id)
+                _mark_processed_reprocess_required_if_present(
+                    self.processed_repository,
+                    ticker,
+                    document_id,
+                    batch=token,
+                )
             # commit_batch 调用开始即由 storage owner 消费 token；提交失败后
             # caller 不得尝试二次 rollback。
             commit_started = True
-            self.source_repository.commit_batch(token)
+            self.batching_repository.commit_batch(token)
         finally:
             if not commit_started:
-                operation_error = sys.exception()
-                try:
-                    self.source_repository.rollback_batch(token)
-                except Exception as rollback_error:
-                    if operation_error is not None:
-                        operation_error.add_note(
-                            "rollback_batch failed; recovery evidence retained: "
-                            f"{rollback_error}"
-                        )
-                        raise operation_error from rollback_error
-                    raise
+                _rollback_batch_before_commit(self.batching_repository, token)
         return True
 
     def _store_downloaded_file(
@@ -3829,12 +3877,14 @@ class FinsIngestionRuntime:
         *,
         handle: SourceHandle | ProcessedHandle,
         downloaded_file: FinsDownloadedFile,
+        batch: BatchToken,
     ) -> FileObjectMeta:
         """通过 blob 仓储保存单个下载文件。
 
         Args:
             handle: source 或 processed 文档句柄。
             downloaded_file: adapter 返回的文件。
+            batch: caller 显式传入的 batch capability。
 
         Returns:
             文件对象元数据。
@@ -3848,6 +3898,7 @@ class FinsIngestionRuntime:
             handle,
             _bounded_text(downloaded_file.filename, "filename"),
             BytesIO(downloaded_file.content),
+            batch=batch,
             content_type=_optional_bounded_text(downloaded_file.content_type, "content_type", reject_path_separators=False),
             metadata=_bounded_metadata(downloaded_file.metadata),
         )
@@ -3873,16 +3924,20 @@ class FinsIngestionRuntime:
         """
 
         document_id = _bounded_text(artifact.document_id, "rejected_document_id", reject_path_separators=False)
-        file_entries = tuple(
-            self._store_rejected_file_entry(
-                ticker=ticker,
-                document_id=document_id,
-                downloaded_file=downloaded_file,
+        batch = self.batching_repository.begin_batch(ticker)
+        commit_started = False
+        try:
+            file_entries = tuple(
+                self._store_rejected_file_entry(
+                    ticker=ticker,
+                    document_id=document_id,
+                    downloaded_file=downloaded_file,
+                    batch=batch,
+                )
+                for downloaded_file in artifact.files
             )
-            for downloaded_file in artifact.files
-        )
-        self.filing_maintenance_repository.upsert_rejected_filing_artifact(
-            RejectedFilingArtifactUpsertRequest(
+            self.filing_maintenance_repository.upsert_rejected_filing_artifact(
+                RejectedFilingArtifactUpsertRequest(
                 ticker=ticker,
                 document_id=document_id,
                 internal_document_id=_bounded_text(
@@ -3927,18 +3982,28 @@ class FinsIngestionRuntime:
                 amended=artifact.amended,
                 has_xbrl=artifact.has_xbrl,
                 ingest_method=_DOWNLOAD_INGEST_METHOD,
+                ),
+                batch=batch,
             )
-        )
-        registry = self.filing_maintenance_repository.load_download_rejection_registry(ticker)
-        registry[document_id] = DownloadRejectionEntry(
-            document_id=document_id,
-            reason=artifact.rejection_reason,
-            category=artifact.rejection_category,
-            form_type=artifact.form_type,
-            filing_date=artifact.filing_date,
-            download_version=_DOWNLOAD_REJECTION_CLASSIFICATION_VERSION,
-        )
-        self.filing_maintenance_repository.save_download_rejection_registry(ticker, registry)
+            registry = self.filing_maintenance_repository.load_download_rejection_registry(ticker)
+            registry[document_id] = DownloadRejectionEntry(
+                document_id=document_id,
+                reason=artifact.rejection_reason,
+                category=artifact.rejection_category,
+                form_type=artifact.form_type,
+                filing_date=artifact.filing_date,
+                download_version=_DOWNLOAD_REJECTION_CLASSIFICATION_VERSION,
+            )
+            self.filing_maintenance_repository.save_download_rejection_registry(
+                ticker,
+                registry,
+                batch=batch,
+            )
+            commit_started = True
+            self.batching_repository.commit_batch(batch)
+        finally:
+            if not commit_started:
+                _rollback_batch_before_commit(self.batching_repository, batch)
 
     def _store_rejected_file_entry(
         self,
@@ -3946,6 +4011,7 @@ class FinsIngestionRuntime:
         ticker: str,
         document_id: str,
         downloaded_file: FinsDownloadedFile,
+        batch: BatchToken,
     ) -> SourceFileEntry:
         """保存 rejected artifact 文件并转换为 SourceFileEntry。
 
@@ -3953,6 +4019,7 @@ class FinsIngestionRuntime:
             ticker: 标准化 ticker。
             document_id: rejected artifact 文档 ID。
             downloaded_file: adapter 返回的文件。
+            batch: caller 显式传入的 batch capability。
 
         Returns:
             rejected artifact 元数据中的文件条目。
@@ -3968,6 +4035,7 @@ class FinsIngestionRuntime:
             document_id,
             filename,
             BytesIO(downloaded_file.content),
+            batch=batch,
             content_type=_optional_bounded_text(downloaded_file.content_type, "content_type", reject_path_separators=False),
             metadata=_bounded_metadata(downloaded_file.metadata),
         )
@@ -4023,7 +4091,7 @@ class FinsIngestionRuntime:
             meta = self.source_repository.get_source_meta(ticker, document_id, source_kind)
             if bool(meta.get("is_deleted", False)):
                 continue
-            if not bool(meta.get("ingest_complete", True)):
+            if meta.get("ingest_complete") is not True:
                 continue
             form_type = _optional_bounded_text(_optional_text_from_meta(meta, "form_type"), "form_type")
             if requested_forms and _normalize_form_value(form_type) not in requested_forms:
@@ -4082,8 +4150,11 @@ class FinsIngestionRuntime:
             parser_version=processor.get_parser_version(),
         )
 
-        if _processed_exists(self.processed_repository, ticker, document_id):
-            self.processed_repository.update_processed(
+        batch = self.batching_repository.begin_batch(ticker)
+        commit_started = False
+        try:
+            if _processed_exists(self.processed_repository, ticker, document_id):
+                self.processed_repository.update_processed(
                 ProcessedUpdateRequest(
                     ticker=ticker,
                     document_id=document_id,
@@ -4094,11 +4165,12 @@ class FinsIngestionRuntime:
                     sections=sections,
                     tables=tables,
                     financials=None,
+                    ),
+                    batch=batch,
                 )
-            )
-            return "processed"
-        self.processed_repository.create_processed(
-            ProcessedCreateRequest(
+            else:
+                self.processed_repository.create_processed(
+                    ProcessedCreateRequest(
                 ticker=ticker,
                 document_id=document_id,
                 internal_document_id=_internal_document_id(source_meta, document_id),
@@ -4108,8 +4180,14 @@ class FinsIngestionRuntime:
                 sections=sections,
                 tables=tables,
                 financials=None,
-            )
-        )
+                    ),
+                    batch=batch,
+                )
+            commit_started = True
+            self.batching_repository.commit_batch(batch)
+        finally:
+            if not commit_started:
+                _rollback_batch_before_commit(self.batching_repository, batch)
         return "processed"
 
     def _save_succeeded(
@@ -5474,6 +5552,8 @@ def _mark_processed_reprocess_required_if_present(
     repository: ProcessedDocumentRepositoryProtocol,
     ticker: str,
     document_id: str,
+    *,
+    batch: BatchToken,
 ) -> None:
     """若 processed 文档存在，则标记需要重处理。
 
@@ -5481,6 +5561,7 @@ def _mark_processed_reprocess_required_if_present(
         repository: processed 仓储协议。
         ticker: 标准化 ticker。
         document_id: 文档 ID。
+        batch: caller 显式传入的 batch capability。
 
     Returns:
         无。
@@ -5492,7 +5573,7 @@ def _mark_processed_reprocess_required_if_present(
 
     if not _processed_exists(repository, ticker, document_id):
         return
-    repository.mark_processed_reprocess_required(ticker, document_id, True)
+    repository.mark_processed_reprocess_required(ticker, document_id, True, batch=batch)
 
 
 def mark_downloaded_processed_rebuild_required(
@@ -5500,6 +5581,7 @@ def mark_downloaded_processed_rebuild_required(
     *,
     ticker: str,
     summary: FinsDownloadResultSummary,
+    batch: BatchToken,
 ) -> None:
     """按下载摘要标记已写入文档的 processed 产物需要重处理。
 
@@ -5507,6 +5589,7 @@ def mark_downloaded_processed_rebuild_required(
         repository: processed 仓储协议。
         ticker: 标准化 ticker。
         summary: 下载 adapter 持久化摘要。
+        batch: caller 显式传入的 batch capability。
 
     Returns:
         无。
@@ -5517,7 +5600,12 @@ def mark_downloaded_processed_rebuild_required(
     """
 
     for document_id in summary.written_document_ids:
-        _mark_processed_reprocess_required_if_present(repository, ticker, document_id)
+        _mark_processed_reprocess_required_if_present(
+            repository,
+            ticker,
+            document_id,
+            batch=batch,
+        )
 
 
 def _download_document_meta(meta: Mapping[str, JsonValue]) -> DocumentMeta:

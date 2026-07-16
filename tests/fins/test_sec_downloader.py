@@ -7,7 +7,6 @@ from dayu.contracts.json_value import JsonValue
 import asyncio
 import hashlib
 from collections.abc import Awaitable, Callable
-from io import BytesIO
 from io import StringIO
 from itertools import repeat
 from pathlib import Path
@@ -50,10 +49,11 @@ from dayu.fins.downloaders.sec_downloader import (
     pick_form_document_files,
     pick_taxonomy_files,
 )
-from dayu.fins.domain.document_models import FileObjectMeta
+from dayu.fins.domain.document_models import BatchToken, FileObjectMeta
 from dayu.fins._converters import optional_int
 
 _RunResult = TypeVar("_RunResult")
+_TEST_BATCH = BatchToken(transaction_id="sec-downloader-test", ticker="AAPL")
 
 
 class StoreStub:
@@ -64,9 +64,10 @@ class StoreStub:
 
         self.calls: list[tuple[str, bytes]] = []
 
-    def __call__(self, filename: str, stream: BinaryIO) -> FileObjectMeta:
+    def __call__(self, filename: str, stream: BinaryIO, *, batch: BatchToken) -> FileObjectMeta:
         """存储回调实现。"""
 
+        assert batch == _TEST_BATCH
         payload = stream.read()
         self.calls.append((filename, payload))
         return FileObjectMeta(uri=f"mem://{filename}", size=len(payload))
@@ -743,6 +744,7 @@ def test_download_files_stream_304_downloaded_and_failed(
             remote_files=descriptors,
             overwrite=False,
             store_file=store_stub,
+            batch=_TEST_BATCH,
             existing_files={
                 "a.htm": {"http_etag": '"etag-a"', "http_last_modified": "Mon, 01 Jan 2025 00:00:00 GMT"}
             },
@@ -802,6 +804,7 @@ def test_download_files_stream_cancel_stops_without_failed_event(tmp_path: Path)
             remote_files=descriptors,
             overwrite=False,
             store_file=store_stub,
+            batch=_TEST_BATCH,
             cancellation_checker=_cancel_after_first_check,
         ):
             events.append(event)
@@ -875,6 +878,7 @@ def test_download_files_stream_http_error_with_overwrite_false(
             remote_files=descriptors,
             overwrite=False,
             store_file=store_stub,
+            batch=_TEST_BATCH,
             existing_files=None,
         ):
             events.append(event)
@@ -919,6 +923,7 @@ def test_download_files_aggregates_results(tmp_path: Path, monkeypatch: pytest.M
             remote_files=[descriptor],
             overwrite=False,
             store_file=store_stub,
+            batch=_TEST_BATCH,
             existing_files={"sample.htm": {"etag": '"old"'}},
         )
     )
@@ -1126,6 +1131,7 @@ def test_download_files_stream_overwrite_with_failure(tmp_path: Path, monkeypatc
             remote_files=descriptors,
             overwrite=True,
             store_file=store_stub,
+            batch=_TEST_BATCH,
             existing_files=None,
         ):
             events.append(event)
@@ -1203,6 +1209,7 @@ def test_download_files_stream_zero_byte_overwrite_false(
             remote_files=descriptors,
             overwrite=False,
             store_file=store_stub,
+            batch=_TEST_BATCH,
             existing_files=None,
         ):
             events.append(event)
@@ -1279,6 +1286,7 @@ def test_download_files_stream_zero_byte_overwrite_true(
             remote_files=descriptors,
             overwrite=True,
             store_file=store_stub,
+            batch=_TEST_BATCH,
             existing_files=None,
         ):
             events.append(event)
@@ -1367,6 +1375,7 @@ def test_download_files_stream_zero_byte_primary_aborts_remaining(
             remote_files=descriptors,
             overwrite=True,
             store_file=store_stub,
+            batch=_TEST_BATCH,
             existing_files=None,
             primary_document="futu-20201231x20f.htm",
         ):
@@ -1430,6 +1439,7 @@ def test_download_files_aggregates_skipped_and_failed(tmp_path: Path, monkeypatc
             remote_files=[],
             overwrite=False,
             store_file=StoreStub(),
+            batch=_TEST_BATCH,
             existing_files=None,
         )
     )

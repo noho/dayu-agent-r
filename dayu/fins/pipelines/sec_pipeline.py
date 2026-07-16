@@ -14,18 +14,23 @@ import asyncio
 import datetime as dt
 from pathlib import Path
 from collections.abc import Mapping
-from typing import AsyncIterator, BinaryIO, Callable, Coroutine, Final, Optional, TypeAlias, TypedDict, cast
+from typing import AsyncIterator, Callable, Coroutine, Final, Optional, TypeAlias, TypedDict, cast
 
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins._log import Log
-from dayu.fins.domain.document_models import CompanyMeta, DownloadRejectionRegistry, FileObjectMeta, SourceHandle
+from dayu.fins.domain.document_models import (
+    BatchToken,
+    CompanyMeta,
+    DownloadRejectionRegistry,
+    SourceHandle,
+)
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.downloaders.sec_downloader import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_SLEEP_SECONDS,
-    DownloaderEvent,
     RemoteFileDescriptor,
     SecDownloader,
+    StoreDownloadedFile,
 )
 from dayu.fins.ingestion_runtime import (
     FinsDownloadProgressEvent,
@@ -54,8 +59,6 @@ from dayu.fins.pipelines.sec_download_event_mapping import (
     DownloadFileResult,
     build_download_filing_event_payload,
     build_file_result_from_downloader_event,
-    map_file_status_to_event_type,
-    normalize_download_file_result,
     summarize_failed_download_file_reasons,
 )
 from dayu.fins.pipelines.sec_download_filing_workflow import (
@@ -64,9 +67,7 @@ from dayu.fins.pipelines.sec_download_filing_workflow import (
 )
 from dayu.fins.pipelines.sec_download_persistence import (
     build_file_entries as _build_file_entries_impl,
-    build_rejected_store_file as _build_rejected_store_file_impl,
     build_store_file as _build_store_file_impl,
-    mark_processed_reprocess_required as _mark_processed_reprocess_required_impl,
     persist_rejected_filing_artifact as _persist_rejected_filing_artifact_impl,
 )
 from dayu.fins.pipelines.sec_download_state import (
@@ -105,7 +106,6 @@ from dayu.fins.pipelines.sec_form_utils import (
 )
 from dayu.fins.pipelines.sec_rebuild_workflow import (
     SecRebuildWorkflowHost as _SecRebuildWorkflowHost,
-    overwrite_rebuilt_meta as _overwrite_rebuilt_meta_impl,
     rebuild_download_artifacts as _rebuild_download_artifacts_impl,
 )
 from dayu.fins.pipelines.sec_safe_meta_access import (
@@ -132,9 +132,11 @@ from dayu.fins.pipelines.sec_upload_workflow import (
 from dayu.fins.pipelines.upload_filing_events import UploadFilingEvent
 from dayu.fins.pipelines.upload_material_events import UploadMaterialEvent
 from dayu.fins.storage import (
+    BatchingRepositoryProtocol,
     CompanyMetaRepositoryProtocol,
     DocumentBlobRepositoryProtocol,
     FilingMaintenanceRepositoryProtocol,
+    FsBatchingRepository,
     FsCompanyMetaRepository,
     FsDocumentBlobRepository,
     FsFilingMaintenanceRepository,
@@ -144,7 +146,6 @@ from dayu.fins.storage import (
     SourceDocumentRepositoryProtocol,
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
-from dayu.fins.ticker_normalization import normalize_ticker
 
 SEC_PIPELINE_DOWNLOAD_VERSION: Final[str] = "sec_pipeline_download_v1.2.0"
 SEC_DOWNLOAD_SOURCE: Final[str] = "sec"
@@ -475,6 +476,7 @@ class SecPipeline:
         processed_repository: ProcessedDocumentRepositoryProtocol | None = None,
         blob_repository: DocumentBlobRepositoryProtocol | None = None,
         filing_maintenance_repository: FilingMaintenanceRepositoryProtocol | None = None,
+        batching_repository: BatchingRepositoryProtocol | None = None,
         user_agent: Optional[str] = None,
         sleep_seconds: float = DEFAULT_SLEEP_SECONDS,
         max_retries: int = DEFAULT_MAX_RETRIES,
@@ -490,6 +492,7 @@ class SecPipeline:
             processed_repository: 可选 processed 文档仓储。
             blob_repository: 可选文件对象仓储。
             filing_maintenance_repository: 可选 filing 维护仓储。
+            batching_repository: 可选 batch lifecycle 仓储。
             user_agent: SEC User-Agent。
             sleep_seconds: SEC 请求间隔秒数。
             max_retries: SEC 下载重试次数。
@@ -507,6 +510,10 @@ class SecPipeline:
         self._workspace_root = (workspace_root or Path.cwd()).resolve()
         self._downloader = downloader or SecDownloader(workspace_root=self._workspace_root)
         repository_set = build_fs_repository_set(workspace_root=self._workspace_root)
+        self._batching_repository = batching_repository or FsBatchingRepository(
+            self._workspace_root,
+            repository_set=repository_set,
+        )
         self._company_repository = company_repository or FsCompanyMetaRepository(
             self._workspace_root,
             repository_set=repository_set,
@@ -978,7 +985,6 @@ class SecPipeline:
             split_form_input=split_form_input,
             parse_date=parse_date,
             parse_sec_form=parse_sec_pipeline_form,
-            overwrite_rebuilt_meta=_overwrite_rebuilt_meta_impl,
         )
 
     def _log_filing_download_result(self, ticker: str, filing_result: dict[str, JsonValue]) -> None:
@@ -1059,9 +1065,7 @@ class SecPipeline:
             record_rejection=_record_rejection,
             build_download_filing_event_payload=build_download_filing_event_payload,
             build_file_result_from_downloader_event=build_file_result_from_downloader_event,
-            normalize_download_file_result=normalize_download_file_result,
             summarize_failed_download_file_reasons=summarize_failed_download_file_reasons,
-            map_file_status_to_event_type=map_file_status_to_event_type,
             has_same_file_name_set=lambda remote_files, existing_files: _has_same_file_name_set(
                 remote_files=remote_files,
                 existing_files=existing_files,
@@ -1383,8 +1387,6 @@ class SecPipeline:
 
         if overwrite or previous_meta is None:
             return None
-        if not bool(previous_meta.get("ingest_complete", False)):
-            return None
         if not has_current_download_version(previous_meta, SEC_PIPELINE_DOWNLOAD_VERSION):
             return None
         previous_fingerprint = str(previous_meta.get("source_fingerprint", "")).strip()
@@ -1413,8 +1415,6 @@ class SecPipeline:
         """
 
         if overwrite or previous_meta is None:
-            return None
-        if not bool(previous_meta.get("ingest_complete", False)):
             return None
         if not has_current_download_version(previous_meta, SEC_PIPELINE_DOWNLOAD_VERSION):
             return None
@@ -1551,11 +1551,17 @@ class SecPipeline:
 
         return _build_file_entries_impl(file_results=file_results, previous_files=previous_files)
 
-    def _build_store_file(self, source_handle: SourceHandle) -> Callable[[str, BinaryIO], FileObjectMeta]:
+    def _build_store_file(
+        self,
+        source_handle: SourceHandle,
+        *,
+        payload_sink: dict[str, bytes] | None,
+    ) -> StoreDownloadedFile:
         """构建 source 文件写入回调。
 
         Args:
             source_handle: 源文档句柄。
+            payload_sink: 可选单 filing payload 映射；不携带 batch authority。
 
         Returns:
             文件写入回调。
@@ -1564,31 +1570,10 @@ class SecPipeline:
             无。
         """
 
-        return _build_store_file_impl(self._blob_repository, source_handle)
-
-    def _build_rejected_store_file(
-        self,
-        *,
-        ticker: str,
-        document_id: str,
-    ) -> Callable[[str, BinaryIO], FileObjectMeta]:
-        """构建 rejected filing 文件写入回调。
-
-        Args:
-            ticker: 股票代码。
-            document_id: rejected artifact 文档 ID。
-
-        Returns:
-            文件写入回调。
-
-        Raises:
-            无。
-        """
-
-        return _build_rejected_store_file_impl(
-            self._filing_maintenance_repository,
-            ticker=ticker,
-            document_id=document_id,
+        return _build_store_file_impl(
+            self._blob_repository,
+            source_handle,
+            payload_sink,
         )
 
     async def _persist_rejected_filing_artifact(
@@ -1626,12 +1611,6 @@ class SecPipeline:
             无。底层错误会转换为失败原因。
         """
 
-        download_stream_func = getattr(self._downloader, "download_files_stream", None)
-        normalized_download_stream = (
-            cast(Callable[..., AsyncIterator[DownloaderEvent]], download_stream_func)
-            if callable(download_stream_func)
-            else None
-        )
         return await _persist_rejected_filing_artifact_impl(
             ticker=ticker,
             cik=cik,
@@ -1643,33 +1622,12 @@ class SecPipeline:
             selected_primary_document=selected_primary_document,
             source_fingerprint=source_fingerprint,
             classification_version=SEC_PIPELINE_DOWNLOAD_VERSION,
+            batching_repository=self._batching_repository,
             filing_maintenance_repository=self._filing_maintenance_repository,
-            download_files_stream=normalized_download_stream,
-            download_files=self._downloader.download_files,
+            download_files_stream=self._downloader.download_files_stream,
             build_file_result_from_downloader_event=build_file_result_from_downloader_event,
-            normalize_download_file_result=normalize_download_file_result,
             summarize_failed_download_file_reasons=summarize_failed_download_file_reasons,
             cancellation_checker=cancel_checker,
-        )
-
-    def _mark_processed_reprocess_required(self, ticker: str, document_id: str) -> None:
-        """标记 processed 产物需要重处理。
-
-        Args:
-            ticker: 股票代码。
-            document_id: 文档 ID。
-
-        Returns:
-            无。
-
-        Raises:
-            OSError: 仓储写入失败时由底层抛出。
-        """
-
-        _mark_processed_reprocess_required_impl(
-            self._processed_repository,
-            ticker=ticker,
-            document_id=document_id,
         )
 
     async def _precheck_6k_filter(
@@ -1756,6 +1714,8 @@ class SecPipeline:
         company_id: str,
         company_name: str,
         ticker_aliases: Optional[list[str]] = None,
+        *,
+        batch: BatchToken,
     ) -> None:
         """写入公司元数据。
 
@@ -1764,6 +1724,7 @@ class SecPipeline:
             company_id: 公司 ID。
             company_name: 公司名称。
             ticker_aliases: 可选 ticker alias。
+            batch: caller 显式传入的 batch capability。
 
         Returns:
             无。
@@ -1778,6 +1739,7 @@ class SecPipeline:
             company_id=company_id,
             company_name=company_name,
             ticker_aliases=ticker_aliases,
+            batch=batch,
         )
 
     def _build_result(self, action: str, **payload: JsonValue) -> dict[str, JsonValue]:
@@ -1862,11 +1824,20 @@ class SecDownloadAdapter(FinsSourceDownloadAdapter):
         )
         persisted_summary = _summary_from_pipeline_result(result)
         if request.rebuild_processed:
-            mark_downloaded_processed_rebuild_required(
-                self._pipeline._processed_repository,
-                ticker=request.normalized_ticker.canonical,
-                summary=persisted_summary,
+            batch = self._pipeline._batching_repository.begin_batch(
+                request.normalized_ticker.canonical
             )
+            try:
+                mark_downloaded_processed_rebuild_required(
+                    self._pipeline._processed_repository,
+                    ticker=request.normalized_ticker.canonical,
+                    summary=persisted_summary,
+                    batch=batch,
+                )
+            except BaseException:
+                self._pipeline._batching_repository.rollback_batch(batch)
+                raise
+            self._pipeline._batching_repository.commit_batch(batch)
         return FinsSourceDownloadAdapterResult(
             discovered_count=persisted_summary.discovered_count,
             persisted_summary=persisted_summary,
@@ -1970,6 +1941,7 @@ def build_sec_download_adapter(
     *,
     workspace_root: Path,
     processor_registry: ProcessorRegistry,
+    batching_repository: BatchingRepositoryProtocol,
     company_repository: CompanyMetaRepositoryProtocol,
     source_repository: SourceDocumentRepositoryProtocol,
     processed_repository: ProcessedDocumentRepositoryProtocol,
@@ -1984,6 +1956,7 @@ def build_sec_download_adapter(
     Args:
         workspace_root: Fins 工作区根目录。
         processor_registry: 文档处理器注册表。
+        batching_repository: batch lifecycle 仓储。
         company_repository: 公司元数据仓储。
         source_repository: 源文档仓储。
         processed_repository: processed 仓储。
@@ -2003,6 +1976,7 @@ def build_sec_download_adapter(
     pipeline = SecPipeline(
         processor_registry=processor_registry,
         workspace_root=workspace_root,
+        batching_repository=batching_repository,
         company_repository=company_repository,
         source_repository=source_repository,
         processed_repository=processed_repository,
@@ -2018,8 +1992,10 @@ def build_sec_download_adapter(
 def _cleanup_stale_filing_dirs(
     repository: FilingMaintenanceRepositoryProtocol,
     ticker: str,
-    form_windows: dict[str, JsonValue],
+    form_windows: dict[str, dt.date],
     filing_results: list[dict[str, JsonValue]],
+    *,
+    batch: BatchToken,
 ) -> int:
     """删除 filings 目录中多余的文档目录。
 
@@ -2028,6 +2004,7 @@ def _cleanup_stale_filing_dirs(
         ticker: 股票代码。
         form_windows: form 到开始日期映射。
         filing_results: 本次下载 filing 结果。
+        batch: caller 显式传入的 batch capability。
 
     Returns:
         被清理的目录数量。
@@ -2047,6 +2024,7 @@ def _cleanup_stale_filing_dirs(
         ticker,
         active_form_types=set(form_windows.keys()),
         valid_document_ids=valid_doc_ids,
+        batch=batch,
     )
 
 

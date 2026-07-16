@@ -10,6 +10,7 @@ from dayu.contracts.json_value import JsonValue
 from dayu.fins._log import Log
 
 from dayu.fins.domain.document_models import (
+    BatchToken,
     DownloadRejectionEntry,
     DownloadRejectionRegistry,
     FileObjectMeta,
@@ -18,7 +19,7 @@ from dayu.fins.domain.document_models import (
     now_iso8601,
 )
 
-from ._fs_storage_infra import _FsStorageInfra
+from ._fs_storage_infra import _ActiveBatchState, _FsStorageInfra
 from ._fs_storage_utils import (
     _REJECTED_FILINGS_DIRNAME,
     _SOURCE_META_FILENAME,
@@ -36,7 +37,7 @@ class _FsMaintenanceMixin(_FsStorageInfra):
     # ========== 下载拒绝注册表 ==========
 
     def load_download_rejection_registry(self, ticker: str) -> DownloadRejectionRegistry:
-        """读取下载拒绝注册表。
+        """从 published tree 读取下载拒绝注册表。
 
         Args:
             ticker: 股票代码。
@@ -47,9 +48,34 @@ class _FsMaintenanceMixin(_FsStorageInfra):
         Raises:
             OSError: 底层读取失败时抛出。
             ValueError: registry JSON 或条目字段非法时抛出。
+            RuntimeFileLockError: publication guard 获取或释放失败时抛出。
         """
 
-        path = self._download_rejections_path_for_read(_normalize_ticker(ticker))
+        normalized_ticker = _normalize_ticker(ticker)
+        guard_token = self._acquire_publication_guard(normalized_ticker)
+        try:
+            return self._load_download_rejection_registry_unguarded(normalized_ticker)
+        finally:
+            self._release_lock_token(guard_token)
+
+    def _load_download_rejection_registry_unguarded(
+        self,
+        normalized_ticker: str,
+    ) -> DownloadRejectionRegistry:
+        """在 caller 已持 publication guard 时读取拒绝注册表。
+
+        Args:
+            normalized_ticker: 已规范化 ticker。
+
+        Returns:
+            下载拒绝注册表。
+
+        Raises:
+            OSError: 文件读取失败时抛出。
+            ValueError: registry 内容非法时抛出。
+        """
+
+        path = self._download_rejections_path_for_read(normalized_ticker)
         if not path.exists():
             return {}
         data = _read_json_object(path)
@@ -69,47 +95,50 @@ class _FsMaintenanceMixin(_FsStorageInfra):
         self,
         ticker: str,
         registry: DownloadRejectionRegistry,
+        *,
+        batch: BatchToken,
     ) -> None:
         """保存下载拒绝注册表。
 
         Args:
             ticker: 股票代码。
             registry: `document_id -> DownloadRejectionEntry` 映射。
+            batch: 显式 transaction capability；必须属于同一 core、ticker 且仍为 open。
 
         Returns:
             无。
 
         Raises:
+            ValueError: capability、ticker 或 registry 内容非法时抛出。
             OSError: 写入失败时抛出。
         """
 
-        self._execute_with_auto_batch(
-            ticker,
-            self._save_download_rejection_registry_impl,
-            ticker,
-            registry,
-        )
+        state = self._resolve_active_batch(batch, ticker)
+        self._save_download_rejection_registry_impl(ticker, registry, state)
 
     def _save_download_rejection_registry_impl(
         self,
         ticker: str,
         registry: DownloadRejectionRegistry,
+        state: _ActiveBatchState,
     ) -> None:
         """执行下载拒绝注册表持久化（内部实现）。
 
         Args:
             ticker: 股票代码。
             registry: `document_id -> DownloadRejectionEntry` 映射。
+            state: 已解析的内部 transaction state。
 
         Returns:
             无。
 
         Raises:
+            ValueError: capability 或请求字段非法时抛出。
             OSError: 写入失败时抛出。
         """
 
         normalized_ticker = _normalize_ticker(ticker)
-        path = self._download_rejections_path(normalized_ticker)
+        path = self._download_rejections_path(normalized_ticker, state)
         payload: dict[str, dict[str, str]] = {}
         for document_id, entry in registry.items():
             normalized_document_id = _normalize_document_id(document_id)
@@ -129,6 +158,7 @@ class _FsMaintenanceMixin(_FsStorageInfra):
         filename: str,
         data: BinaryIO,
         *,
+        batch: BatchToken,
         content_type: Optional[str] = None,
         metadata: Optional[dict[str, str]] = None,
     ) -> FileObjectMeta:
@@ -139,6 +169,7 @@ class _FsMaintenanceMixin(_FsStorageInfra):
             document_id: rejected filing 文档 ID。
             filename: 文件名。
             data: 文件字节流。
+            batch: 显式 transaction capability。
             content_type: 可选内容类型。
             metadata: 可选扩展元数据。
 
@@ -151,11 +182,12 @@ class _FsMaintenanceMixin(_FsStorageInfra):
         """
 
         normalized_ticker = _normalize_ticker(ticker)
+        state = self._resolve_active_batch(batch, normalized_ticker)
         normalized_document_id = _normalize_document_id(document_id)
         normalized_filename = str(filename).strip()
         if not normalized_filename:
             raise ValueError("filename 不能为空")
-        file_store = self._build_file_store(normalized_ticker)
+        file_store = self._build_file_store(normalized_ticker, state)
         return file_store.put_object(
             f"{normalized_ticker}/filings/{_REJECTED_FILINGS_DIRNAME}/{normalized_document_id}/{normalized_filename}",
             data,
@@ -166,33 +198,36 @@ class _FsMaintenanceMixin(_FsStorageInfra):
     def upsert_rejected_filing_artifact(
         self,
         req: RejectedFilingArtifactUpsertRequest,
+        *,
+        batch: BatchToken,
     ) -> RejectedFilingArtifact:
         """写入或更新 rejected filing artifact。
 
         Args:
             req: artifact 写入请求。
+            batch: 显式 transaction capability；必须属于同一 core、ticker 且仍为 open。
 
         Returns:
             写回后的 artifact。
 
         Raises:
+            ValueError: capability 或请求字段非法时抛出。
             OSError: 写入失败时抛出。
         """
 
-        return self._execute_with_auto_batch(
-            req.ticker,
-            self._upsert_rejected_filing_artifact_impl,
-            req,
-        )
+        state = self._resolve_active_batch(batch, req.ticker)
+        return self._upsert_rejected_filing_artifact_impl(req, state)
 
     def _upsert_rejected_filing_artifact_impl(
         self,
         req: RejectedFilingArtifactUpsertRequest,
+        state: _ActiveBatchState,
     ) -> RejectedFilingArtifact:
         """执行 rejected filing artifact 写入。
 
         Args:
             req: artifact 写入请求。
+            state: 已解析的内部 transaction state。
 
         Returns:
             写回后的 artifact。
@@ -203,7 +238,11 @@ class _FsMaintenanceMixin(_FsStorageInfra):
 
         normalized_ticker = _normalize_ticker(req.ticker)
         normalized_document_id = _normalize_document_id(req.document_id)
-        meta_path = self._rejected_filing_meta_path(normalized_ticker, normalized_document_id)
+        meta_path = self._rejected_filing_meta_path(
+            normalized_ticker,
+            normalized_document_id,
+            state,
+        )
         now = now_iso8601()
         previous_meta = _read_json_object(meta_path) if meta_path.exists() else {}
         artifact = RejectedFilingArtifact(
@@ -240,7 +279,7 @@ class _FsMaintenanceMixin(_FsStorageInfra):
         ticker: str,
         document_id: str,
     ) -> RejectedFilingArtifact:
-        """读取 rejected filing artifact。
+        """从 published tree 读取 rejected filing artifact。
 
         Args:
             ticker: 股票代码。
@@ -252,10 +291,40 @@ class _FsMaintenanceMixin(_FsStorageInfra):
         Raises:
             FileNotFoundError: meta 不存在时抛出。
             ValueError: meta 内容非法时抛出。
+            RuntimeFileLockError: publication guard 获取或释放失败时抛出。
+            OSError: published meta 读取失败时抛出。
         """
 
         normalized_ticker = _normalize_ticker(ticker)
         normalized_document_id = _normalize_document_id(document_id)
+        guard_token = self._acquire_publication_guard(normalized_ticker)
+        try:
+            return self._get_rejected_filing_artifact_unguarded(
+                normalized_ticker,
+                normalized_document_id,
+            )
+        finally:
+            self._release_lock_token(guard_token)
+
+    def _get_rejected_filing_artifact_unguarded(
+        self,
+        normalized_ticker: str,
+        normalized_document_id: str,
+    ) -> RejectedFilingArtifact:
+        """在 caller 已持 publication guard 时读取 rejected artifact。
+
+        Args:
+            normalized_ticker: 已规范化 ticker。
+            normalized_document_id: 已规范化文档 ID。
+
+        Returns:
+            rejected filing artifact。
+
+        Raises:
+            FileNotFoundError: meta 不存在时抛出。
+            ValueError: meta 内容非法时抛出。
+        """
+
         meta = _read_json_object(
             self._rejected_filing_meta_path_for_read(normalized_ticker, normalized_document_id)
         )
@@ -265,7 +334,7 @@ class _FsMaintenanceMixin(_FsStorageInfra):
         self,
         ticker: str,
     ) -> list[RejectedFilingArtifact]:
-        """列出某个 ticker 下的 rejected filing artifacts。
+        """从 published tree 列出某个 ticker 的 rejected filing artifacts。
 
         Args:
             ticker: 股票代码。
@@ -274,24 +343,36 @@ class _FsMaintenanceMixin(_FsStorageInfra):
             artifact 列表，按 document_id 升序。
 
         Raises:
+            RuntimeFileLockError: publication guard 获取或释放失败时抛出。
             OSError: 读取目录失败时抛出。
         """
 
         normalized_ticker = _normalize_ticker(ticker)
-        result: list[RejectedFilingArtifact] = []
-        for document_id in _list_directory_names(self._rejected_filings_root_for_read(normalized_ticker)):
-            try:
-                result.append(self.get_rejected_filing_artifact(normalized_ticker, document_id))
-            except (FileNotFoundError, ValueError) as exc:
-                Log.warn(
-                    (
-                        "跳过损坏的 rejected filing artifact: "
-                        f"ticker={normalized_ticker} document_id={document_id} error={exc}"
-                    ),
-                    module=self.MODULE,
-                )
-                continue
-        return result
+        guard_token = self._acquire_publication_guard(normalized_ticker)
+        try:
+            result: list[RejectedFilingArtifact] = []
+            for document_id in _list_directory_names(
+                self._rejected_filings_root_for_read(normalized_ticker)
+            ):
+                try:
+                    result.append(
+                        self._get_rejected_filing_artifact_unguarded(
+                            normalized_ticker,
+                            document_id,
+                        )
+                    )
+                except (FileNotFoundError, ValueError) as exc:
+                    Log.warn(
+                        (
+                            "跳过损坏的 rejected filing artifact: "
+                            f"ticker={normalized_ticker} document_id={document_id} error={exc}"
+                        ),
+                        module=self.MODULE,
+                    )
+                    continue
+            return result
+        finally:
+            self._release_lock_token(guard_token)
 
     def read_rejected_filing_file_bytes(
         self,
@@ -299,7 +380,7 @@ class _FsMaintenanceMixin(_FsStorageInfra):
         document_id: str,
         filename: str,
     ) -> bytes:
-        """读取 rejected filing 的文件内容。
+        """从 published tree 读取 rejected filing 文件内容。
 
         Args:
             ticker: 股票代码。
@@ -312,12 +393,49 @@ class _FsMaintenanceMixin(_FsStorageInfra):
         Raises:
             FileNotFoundError: 文件不存在时抛出。
             IsADirectoryError: 目标是目录时抛出。
+            ValueError: ticker、document ID 或文件名非法时抛出。
+            RuntimeFileLockError: publication guard 获取或释放失败时抛出。
             OSError: 读取失败时抛出。
         """
 
+        normalized_ticker = _normalize_ticker(ticker)
+        normalized_document_id = _normalize_document_id(document_id)
+        guard_token = self._acquire_publication_guard(normalized_ticker)
+        try:
+            return self._read_rejected_filing_file_bytes_unguarded(
+                normalized_ticker,
+                normalized_document_id,
+                filename,
+            )
+        finally:
+            self._release_lock_token(guard_token)
+
+    def _read_rejected_filing_file_bytes_unguarded(
+        self,
+        normalized_ticker: str,
+        normalized_document_id: str,
+        filename: str,
+    ) -> bytes:
+        """在 caller 已持 publication guard 时读取 rejected filing 文件内容。
+
+        Args:
+            normalized_ticker: 已规范化 ticker。
+            normalized_document_id: 已规范化文档 ID。
+            filename: 待校验并读取的文件名。
+
+        Returns:
+            文件二进制内容。
+
+        Raises:
+            FileNotFoundError: 文件不存在时抛出。
+            IsADirectoryError: 目标是目录时抛出。
+            ValueError: 文件名非法或路径越界时抛出。
+            OSError: 路径解析或文件读取失败时抛出。
+        """
+
         path = self._rejected_filing_file_path_for_read(
-            _normalize_ticker(ticker),
-            _normalize_document_id(document_id),
+            normalized_ticker,
+            normalized_document_id,
             filename,
         )
         if not path.exists():
@@ -328,30 +446,30 @@ class _FsMaintenanceMixin(_FsStorageInfra):
 
     # ========== filing 目录清理 ==========
 
-    def clear_filing_documents(self, ticker: str) -> None:
+    def clear_filing_documents(self, ticker: str, *, batch: BatchToken) -> None:
         """清空某个 ticker 下的 filings 目录内容。
 
         Args:
             ticker: 股票代码。
+            batch: 显式 transaction capability；必须属于同一 core、ticker 且仍为 open。
 
         Returns:
             无。
 
         Raises:
+            ValueError: capability 或 ticker 非法时抛出。
             OSError: 清理失败时抛出。
         """
 
-        self._execute_with_auto_batch(
-            ticker,
-            self._clear_filing_documents_impl,
-            ticker,
-        )
+        state = self._resolve_active_batch(batch, ticker)
+        self._clear_filing_documents_impl(ticker, state)
 
-    def _clear_filing_documents_impl(self, ticker: str) -> None:
+    def _clear_filing_documents_impl(self, ticker: str, state: _ActiveBatchState) -> None:
         """执行 filings 目录清理（内部实现）。
 
         Args:
             ticker: 股票代码。
+            state: 已解析的内部 transaction state。
 
         Returns:
             无。
@@ -361,7 +479,7 @@ class _FsMaintenanceMixin(_FsStorageInfra):
         """
 
         normalized_ticker = _normalize_ticker(ticker)
-        filings_dir = self._ticker_dir_for_write(normalized_ticker) / "filings"
+        filings_dir = self._ticker_dir_for_write(normalized_ticker, state) / "filings"
         if not filings_dir.exists():
             return
         for child in filings_dir.iterdir():
@@ -374,6 +492,7 @@ class _FsMaintenanceMixin(_FsStorageInfra):
         self,
         ticker: str,
         *,
+        batch: BatchToken,
         active_form_types: set[str],
         valid_document_ids: set[str],
     ) -> int:
@@ -381,6 +500,7 @@ class _FsMaintenanceMixin(_FsStorageInfra):
 
         Args:
             ticker: 股票代码。
+            batch: 显式 transaction capability；必须属于同一 core、ticker 且仍为 open。
             active_form_types: 本轮下载窗口覆盖的 form_type 集合。
             valid_document_ids: 本轮仍应保留的 document_id 集合。
 
@@ -392,12 +512,12 @@ class _FsMaintenanceMixin(_FsStorageInfra):
             ValueError: 元数据或 manifest 内容非法时抛出。
         """
 
-        return self._execute_with_auto_batch(
-            ticker,
-            self._cleanup_stale_filing_documents_impl,
+        state = self._resolve_active_batch(batch, ticker)
+        return self._cleanup_stale_filing_documents_impl(
             ticker,
             active_form_types,
             valid_document_ids,
+            state,
         )
 
     def _cleanup_stale_filing_documents_impl(
@@ -405,6 +525,7 @@ class _FsMaintenanceMixin(_FsStorageInfra):
         ticker: str,
         active_form_types: set[str],
         valid_document_ids: set[str],
+        state: _ActiveBatchState,
     ) -> int:
         """执行窗口内过期 filing 清理（内部实现）。
 
@@ -412,6 +533,7 @@ class _FsMaintenanceMixin(_FsStorageInfra):
             ticker: 股票代码。
             active_form_types: 本轮下载窗口覆盖的 form_type 集合。
             valid_document_ids: 本轮仍应保留的 document_id 集合。
+            state: 已解析的内部 transaction state。
 
         Returns:
             实际清理的文档数量。
@@ -425,7 +547,7 @@ class _FsMaintenanceMixin(_FsStorageInfra):
         normalized_valid_document_ids = {
             _normalize_document_id(document_id) for document_id in valid_document_ids
         }
-        filings_dir = self._ticker_dir_for_write(normalized_ticker) / "filings"
+        filings_dir = self._ticker_dir_for_write(normalized_ticker, state) / "filings"
         if not filings_dir.exists() or not active_form_types:
             return 0
 
@@ -452,7 +574,7 @@ class _FsMaintenanceMixin(_FsStorageInfra):
 
         stale_document_ids.sort()
         self._remove_manifest_items(
-            self._filing_manifest_path(normalized_ticker),
+            self._filing_manifest_path(normalized_ticker, state),
             normalized_ticker,
             stale_document_ids,
         )

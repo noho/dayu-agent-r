@@ -22,9 +22,11 @@ from dayu.documents.processors.base import (
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.documents.processors.source import Source
 from dayu.fins.domain.document_models import (
+    BatchToken,
     CompanyMeta,
     DocumentMeta,
     FinsSourceProvider,
+    SourceHandle,
     SourceDocumentUpsertRequest,
     now_iso8601,
 )
@@ -34,7 +36,9 @@ from dayu.fins.domain.financial_result_contract import (
 )
 from dayu.fins.domain.xbrl_result_contract import XbrlQueryExecutionError
 from dayu.fins.storage import (
+    FsBatchingRepository,
     FsCompanyMetaRepository,
+    FsDocumentBlobRepository,
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
 )
@@ -515,6 +519,14 @@ class _CountingSourceRepository(FsSourceDocumentRepository):
         """
 
         super().__init__(workspace_root, repository_set=repository_set)
+        self._batching_repository = FsBatchingRepository(
+            workspace_root,
+            repository_set=repository_set,
+        )
+        self._blob_repository = FsDocumentBlobRepository(
+            workspace_root,
+            repository_set=repository_set,
+        )
         self.get_source_meta_calls = 0
         self.get_source_meta_calls_by_kind: dict[SourceKind, int] = {}
 
@@ -687,12 +699,16 @@ def test_read_runtime_source_meta_cache_is_partitioned_by_source_kind(tmp_path: 
     """
 
     runtime, source_repository = _build_runtime_with_source_documents(tmp_path, source_meta_cache_max_entries=4)
+    batch = source_repository._batching_repository.begin_batch("AAPL")
     _create_source_document(
         source_repository=source_repository,
+        blob_repository=source_repository._blob_repository,
+        batch=batch,
         document_id="doc-1",
         source_kind=SourceKind.MATERIAL,
         form_type="EX-99",
     )
+    source_repository._batching_repository.commit_batch(batch)
 
     filing_meta = runtime._get_source_meta_cached_by_kind("AAPL", "doc-1", SourceKind.FILING)
     material_meta = runtime._get_source_meta_cached_by_kind("AAPL", "doc-1", SourceKind.MATERIAL)
@@ -954,7 +970,10 @@ def _build_runtime_with_source_documents(
     repository_set = build_fs_repository_set(workspace_root=workspace_root)
     company_repository = FsCompanyMetaRepository(workspace_root, repository_set=repository_set)
     source_repository = _CountingSourceRepository(workspace_root, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
     processed_repository = FsProcessedDocumentRepository(workspace_root, repository_set=repository_set)
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    batch = batching_repository.begin_batch("AAPL")
     company_repository.upsert_company_meta(
         CompanyMeta(
             company_id="0000320193",
@@ -964,15 +983,19 @@ def _build_runtime_with_source_documents(
             resolver_version="test",
             updated_at=now_iso8601(),
             ticker_aliases=[],
-        )
+        ),
+        batch=batch,
     )
     for index in range(1, 4):
         _create_source_document(
             source_repository=source_repository,
+            blob_repository=blob_repository,
+            batch=batch,
             document_id=f"doc-{index}",
             source_kind=SourceKind.FILING,
             form_type="10-K",
         )
+    batching_repository.commit_batch(batch)
     runtime = FinsReadRuntime(
         company_repository=company_repository,
         source_repository=source_repository,
@@ -986,6 +1009,8 @@ def _build_runtime_with_source_documents(
 def _create_source_document(
     *,
     source_repository: FsSourceDocumentRepository,
+    blob_repository: FsDocumentBlobRepository,
+    batch: BatchToken,
     document_id: str,
     source_kind: SourceKind,
     form_type: str,
@@ -994,6 +1019,8 @@ def _create_source_document(
 
     Args:
         source_repository: source 仓储。
+        blob_repository: blob 仓储。
+        batch: 显式 transaction capability。
         document_id: 文档 ID。
         source_kind: 来源类型。
         form_type: 表单类型。
@@ -1015,15 +1042,26 @@ def _create_source_document(
         "report_date": "2024-09-28",
         "amended": False,
     }
+    filename = f"{document_id}.txt"
+    file_meta = blob_repository.store_file(
+        SourceHandle("AAPL", document_id, source_kind.value),
+        filename,
+        BytesIO(document_id.encode("utf-8")),
+        batch=batch,
+        content_type="text/plain",
+    )
     source_repository.create_source_document(
         SourceDocumentUpsertRequest(
             ticker="AAPL",
             document_id=document_id,
             internal_document_id=document_id,
             form_type=form_type,
+            primary_document=filename,
+            files=[file_meta],
             meta=meta,
         ),
         source_kind,
+        batch=batch,
     )
 
 

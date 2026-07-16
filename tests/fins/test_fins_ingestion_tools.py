@@ -1590,6 +1590,7 @@ def _runtime_with_executor(
 
     base_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
     return FinsIngestionRuntime.create(
+        batching_repository=base_runtime.batching_repository,
         source_repository=base_runtime.source_repository,
         blob_repository=base_runtime.blob_repository,
         filing_maintenance_repository=base_runtime.filing_maintenance_repository,

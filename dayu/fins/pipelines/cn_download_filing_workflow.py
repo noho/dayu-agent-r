@@ -33,12 +33,12 @@ from dayu.fins.pipelines.cn_download_source_upsert import (
     build_content_fingerprint,
     build_remote_fingerprint,
     commit_cn_filing_source_document,
-    update_cn_staging_source_document,
 )
-from dayu.fins.pipelines.cn_download_staging import has_blob_file, inspect_staged_blobs
+from dayu.fins.pipelines.cn_download_staging import has_blob_file
 from dayu.fins.pipelines.cn_form_utils import build_cn_filing_ids
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.storage import (
+    BatchingRepositoryProtocol,
     DocumentBlobRepositoryProtocol,
     ProcessedDocumentRepositoryProtocol,
     SourceDocumentRepositoryProtocol,
@@ -83,6 +83,7 @@ def _download_report_pdf_with_gate(
 
 async def run_cn_download_single_filing_stream(
     *,
+    batching_repository: BatchingRepositoryProtocol,
     source_repository: SourceDocumentRepositoryProtocol,
     blob_repository: DocumentBlobRepositoryProtocol,
     processed_repository: ProcessedDocumentRepositoryProtocol,
@@ -99,6 +100,7 @@ async def run_cn_download_single_filing_stream(
     """执行单个 CN/HK filing 下载阶段机。
 
     Args:
+        batching_repository: batch lifecycle 唯一仓储。
         source_repository: source 文档仓储。
         blob_repository: 文件对象仓储。
         processed_repository: processed 文档仓储。
@@ -160,75 +162,57 @@ async def run_cn_download_single_filing_stream(
         if previous_meta is not None
         else None
     )
-    reusable_pdf = None
-    if existing_handle is not None:
-        reusable_pdf = _resolve_reusable_pdf(
-            blob_repository=blob_repository,
-            handle=existing_handle,
-            pdf_filename=pdf_filename,
-            docling_filename=docling_filename,
-            previous_meta=previous_meta,
-            remote_fingerprint=remote_fingerprint,
-            overwrite=overwrite,
+    yield DownloadEvent(
+        event_type=DownloadEventType.FILE_DOWNLOAD_STARTED,
+        ticker=ticker,
+        document_id=document_id,
+        payload={
+            "name": pdf_filename,
+            "stage": "pdf_download_started",
+        },
+    )
+    try:
+        asset = await asyncio.to_thread(
+            _download_report_pdf_with_gate,
+            discovery_client=discovery_client,
+            pdf_download_gate=pdf_download_gate,
+            candidate=candidate,
+            cancel_checker=cancel_checker,
         )
-    if reusable_pdf is None:
+    except CnDownloadCancelledError:
+        raise
+    except Exception as exc:
         yield DownloadEvent(
-            event_type=DownloadEventType.FILE_DOWNLOAD_STARTED,
+            event_type=DownloadEventType.FILE_FAILED,
             ticker=ticker,
             document_id=document_id,
             payload={
                 "name": pdf_filename,
-                "stage": "pdf_download_started",
+                "stage": "pdf_download_failed",
+                "status": "failed",
+                "reason_code": "pdf_download_failed",
+                "reason_message": str(exc),
             },
         )
-        try:
-            asset = await asyncio.to_thread(
-                _download_report_pdf_with_gate,
-                discovery_client=discovery_client,
-                pdf_download_gate=pdf_download_gate,
-                candidate=candidate,
-                cancel_checker=cancel_checker,
-            )
-        except CnDownloadCancelledError:
-            raise
-        except Exception as exc:
-            yield DownloadEvent(
-                event_type=DownloadEventType.FILE_FAILED,
-                ticker=ticker,
-                document_id=document_id,
-                payload={
-                    "name": pdf_filename,
-                    "stage": "pdf_download_failed",
-                    "status": "failed",
-                    "reason_code": "pdf_download_failed",
-                    "reason_message": str(exc),
-                },
-            )
-            failed = _build_filing_result(
-                document_id=document_id,
-                status="failed",
-                candidate=candidate,
-                reason_code="pdf_download_failed",
-                reason_message=str(exc),
-                downloaded_files=0,
-                skipped_files=0,
-            )
-            yield DownloadEvent(
-                event_type=DownloadEventType.FILING_FAILED,
-                ticker=ticker,
-                document_id=document_id,
-                payload=_filing_event_payload(failed),
-            )
-            return
-        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
-        pdf_bytes = asset.pdf_bytes
-        pdf_sha256 = asset.sha256
-        reused_pdf = False
-    else:
-        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
-        pdf_bytes = reusable_pdf
-        pdf_sha256 = _read_required_text(previous_meta, "staging_pdf_sha256")
-        reused_pdf = True
+        failed = _build_filing_result(
+            document_id=document_id,
+            status="failed",
+            candidate=candidate,
+            reason_code="pdf_download_failed",
+            reason_message=str(exc),
+            downloaded_files=0,
+            skipped_files=0,
+        )
+        yield DownloadEvent(
+            event_type=DownloadEventType.FILING_FAILED,
+            ticker=ticker,
+            document_id=document_id,
+            payload=_filing_event_payload(failed),
+        )
+        return
+    _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
+    pdf_bytes = asset.pdf_bytes
+    pdf_sha256 = asset.sha256
 
     can_skip_by_pdf_sha = existing_handle is not None and _can_skip_by_pdf_sha(
         previous_meta=previous_meta,
@@ -244,6 +228,7 @@ async def run_cn_download_single_filing_stream(
         file_entries = _read_file_entries(previous_meta)
         source_fingerprint = _read_required_text(previous_meta, "source_fingerprint")
         _commit_cn_filing_metadata_batch(
+            batching_repository=batching_repository,
             source_repository=source_repository,
             processed_repository=processed_repository,
             ticker=ticker,
@@ -285,9 +270,9 @@ async def run_cn_download_single_filing_stream(
         payload={
             "name": pdf_filename,
             "stage": "pdf_downloaded",
-            "status": "skipped" if reused_pdf else "downloaded",
-            "reused": reused_pdf,
-            "reason_code": "local_pdf_reused" if reused_pdf else None,
+            "status": "downloaded",
+            "reused": False,
+            "reason_code": None,
         },
     )
 
@@ -299,7 +284,6 @@ async def run_cn_download_single_filing_stream(
             handle=existing_handle,
             docling_filename=docling_filename,
             previous_meta=previous_meta,
-            remote_fingerprint=remote_fingerprint,
             pdf_sha256=pdf_sha256,
             overwrite=overwrite,
         )
@@ -319,7 +303,7 @@ async def run_cn_download_single_filing_stream(
             Log.info(
                 f"开始 Docling 转换: ticker={ticker} document_id={document_id} "
                 f"form={candidate.fiscal_period} filing_date={candidate.filing_date} "
-                f"source_file={pdf_filename} reused_pdf={reused_pdf}",
+                f"source_file={pdf_filename}",
                 module=module,
             )
             docling_json_bytes = await asyncio.to_thread(
@@ -336,8 +320,8 @@ async def run_cn_download_single_filing_stream(
                 candidate=candidate,
                 reason_code="docling_convert_failed",
                 reason_message=str(exc),
-                downloaded_files=0 if reused_pdf else 1,
-                skipped_files=1 if reused_pdf else 0,
+                downloaded_files=1,
+                skipped_files=0,
             )
             yield DownloadEvent(
                 event_type=DownloadEventType.FILING_FAILED,
@@ -360,6 +344,7 @@ async def run_cn_download_single_filing_stream(
     )
     _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
     _commit_cn_filing_assets_batch(
+        batching_repository=batching_repository,
         source_repository=source_repository,
         blob_repository=blob_repository,
         processed_repository=processed_repository,
@@ -387,10 +372,10 @@ async def run_cn_download_single_filing_stream(
         candidate=candidate,
         reason_code="download_committed",
         reason_message="PDF 与 Docling JSON 已完成落盘并提交 source meta",
-        downloaded_files=(0 if reused_pdf else 1) + (0 if reused_docling else 1),
-        skipped_files=(1 if reused_pdf else 0) + (1 if reused_docling else 0),
+        downloaded_files=1 + (0 if reused_docling else 1),
+        skipped_files=1 if reused_docling else 0,
     )
-    downloaded["reused_pdf"] = reused_pdf
+    downloaded["reused_pdf"] = False
     downloaded["reused_docling"] = reused_docling
     downloaded["converted"] = converted
     yield DownloadEvent(
@@ -403,6 +388,7 @@ async def run_cn_download_single_filing_stream(
 
 def _commit_cn_filing_assets_batch(
     *,
+    batching_repository: BatchingRepositoryProtocol,
     source_repository: SourceDocumentRepositoryProtocol,
     blob_repository: DocumentBlobRepositoryProtocol,
     processed_repository: ProcessedDocumentRepositoryProtocol,
@@ -427,6 +413,7 @@ def _commit_cn_filing_assets_batch(
     """在一个 caller-owned batch 内提交 CN/HK filing 的全部持久态。
 
     Args:
+        batching_repository: batch lifecycle 唯一仓储。
         source_repository: source 文档仓储及 batch owner 入口。
         blob_repository: PDF 与 Docling blob 仓储。
         processed_repository: processed marker 仓储。
@@ -457,7 +444,7 @@ def _commit_cn_filing_assets_batch(
         RuntimeError: batch/token owner 契约不成立时抛出。
     """
 
-    token = source_repository.begin_batch(ticker)
+    token = batching_repository.begin_batch(ticker)
     commit_started = False
     try:
         _raise_if_cancelled(
@@ -467,26 +454,22 @@ def _commit_cn_filing_assets_batch(
             cancel_checker=cancel_checker,
         )
         if source_meta_exists:
-            source_repository.reset_source_document(ticker, document_id, SourceKind.FILING)
+            source_repository.reset_source_document(
+                ticker,
+                document_id,
+                SourceKind.FILING,
+                batch=token,
+            )
             _raise_if_cancelled(
                 module=module,
                 ticker=ticker,
                 document_id=document_id,
                 cancel_checker=cancel_checker,
             )
-        update_cn_staging_source_document(
-            source_repository=source_repository,
+        handle = SourceHandle(
             ticker=ticker,
             document_id=document_id,
-            internal_document_id=internal_document_id,
-            form_type=form_type,
-            primary_document=pdf_filename,
-            file_entries=[],
-            candidate=candidate,
-            profile=profile,
-            pdf_sha256=pdf_sha256,
-            remote_fingerprint=remote_fingerprint,
-            previous_meta_exists=False,
+            source_kind=SourceKind.FILING.value,
         )
         _raise_if_cancelled(
             module=module,
@@ -494,11 +477,11 @@ def _commit_cn_filing_assets_batch(
             document_id=document_id,
             cancel_checker=cancel_checker,
         )
-        handle = source_repository.get_source_handle(ticker, document_id, SourceKind.FILING)
         pdf_meta = blob_repository.store_file(
             handle,
             pdf_filename,
             BytesIO(pdf_bytes),
+            batch=token,
             content_type=_PDF_CONTENT_TYPE,
             metadata={"source": _SOURCE_LABEL_ORIGINAL},
         )
@@ -512,6 +495,7 @@ def _commit_cn_filing_assets_batch(
             handle,
             docling_filename,
             BytesIO(docling_json_bytes),
+            batch=token,
             content_type=_JSON_CONTENT_TYPE,
             metadata={"source": _SOURCE_LABEL_DOCLING, "pdf_sha256": pdf_sha256},
         )
@@ -548,7 +532,8 @@ def _commit_cn_filing_assets_batch(
             remote_fingerprint=remote_fingerprint,
             source_fingerprint=source_fingerprint,
             previous_completed_meta=previous_completed_meta,
-            source_meta_exists=True,
+            source_meta_exists=False,
+            batch=token,
         )
         _raise_if_cancelled(
             module=module,
@@ -558,11 +543,11 @@ def _commit_cn_filing_assets_batch(
         )
         # commit_batch 开始后 token 由 storage owner 消费，caller 不再回滚。
         commit_started = True
-        source_repository.commit_batch(token)
+        batching_repository.commit_batch(token)
     finally:
         if not commit_started:
             _rollback_cn_batch_preserving_primary(
-                source_repository=source_repository,
+                batching_repository=batching_repository,
                 token=token,
                 operation_error=sys.exception(),
             )
@@ -570,6 +555,7 @@ def _commit_cn_filing_assets_batch(
 
 def _commit_cn_filing_metadata_batch(
     *,
+    batching_repository: BatchingRepositoryProtocol,
     source_repository: SourceDocumentRepositoryProtocol,
     processed_repository: ProcessedDocumentRepositoryProtocol,
     ticker: str,
@@ -590,6 +576,7 @@ def _commit_cn_filing_metadata_batch(
     """在 caller-owned batch 内提交 PDF-SHA skip 的最终 meta 与 marker。
 
     Args:
+        batching_repository: batch lifecycle 唯一仓储。
         source_repository: source 文档仓储及 batch owner 入口。
         processed_repository: processed marker 仓储。
         ticker: 已归一化 ticker。
@@ -616,7 +603,7 @@ def _commit_cn_filing_metadata_batch(
         RuntimeError: batch/token owner 契约不成立时抛出。
     """
 
-    token = source_repository.begin_batch(ticker)
+    token = batching_repository.begin_batch(ticker)
     commit_started = False
     try:
         _raise_if_cancelled(
@@ -641,6 +628,7 @@ def _commit_cn_filing_metadata_batch(
             source_fingerprint=source_fingerprint,
             previous_completed_meta=previous_completed_meta,
             source_meta_exists=True,
+            batch=token,
         )
         _raise_if_cancelled(
             module=module,
@@ -649,11 +637,11 @@ def _commit_cn_filing_metadata_batch(
             cancel_checker=cancel_checker,
         )
         commit_started = True
-        source_repository.commit_batch(token)
+        batching_repository.commit_batch(token)
     finally:
         if not commit_started:
             _rollback_cn_batch_preserving_primary(
-                source_repository=source_repository,
+                batching_repository=batching_repository,
                 token=token,
                 operation_error=sys.exception(),
             )
@@ -661,14 +649,14 @@ def _commit_cn_filing_metadata_batch(
 
 def _rollback_cn_batch_preserving_primary(
     *,
-    source_repository: SourceDocumentRepositoryProtocol,
+    batching_repository: BatchingRepositoryProtocol,
     token: BatchToken,
     operation_error: BaseException | None,
 ) -> None:
     """回滚未进入 commit 的 batch，并保留 operation/rollback 双错误。
 
     Args:
-        source_repository: 持有 token 的 source 仓储。
+        batching_repository: 持有 token 的 batching 仓储。
         token: 尚未交给 ``commit_batch`` 的 caller-owned token。
         operation_error: 当前正在传播的业务异常或取消异常；正常 return 时为
             ``None``。
@@ -682,7 +670,7 @@ def _rollback_cn_batch_preserving_primary(
     """
 
     try:
-        source_repository.rollback_batch(token)
+        batching_repository.rollback_batch(token)
     except Exception as rollback_error:
         if operation_error is not None:
             operation_error.add_note(
@@ -758,38 +746,7 @@ def _resolve_previous_completed_meta(
 
     if overwrite or previous_meta is None:
         return None
-    if previous_meta.get("ingest_complete") is not True:
-        return None
     return previous_meta
-
-
-def _resolve_reusable_pdf(
-    *,
-    blob_repository: DocumentBlobRepositoryProtocol,
-    handle: SourceHandle,
-    pdf_filename: str,
-    docling_filename: str,
-    previous_meta: JsonObject | None,
-    remote_fingerprint: str,
-    overwrite: bool,
-) -> bytes | None:
-    """判断中间态 PDF 是否可复用。"""
-
-    if overwrite or previous_meta is None:
-        return None
-    if previous_meta.get("ingest_complete") is not False:
-        return None
-    if previous_meta.get("staging_remote_fingerprint") != remote_fingerprint:
-        return None
-    expected_sha = _optional_text(previous_meta.get("staging_pdf_sha256"))
-    staged = inspect_staged_blobs(
-        blob_repository=blob_repository,
-        handle=handle,
-        pdf_filename=pdf_filename,
-        docling_filename=docling_filename,
-        expected_pdf_sha256=expected_sha,
-    )
-    return staged.pdf_bytes if staged.pdf_sha256_matched else None
 
 
 def _resolve_reusable_docling(
@@ -798,7 +755,6 @@ def _resolve_reusable_docling(
     handle: SourceHandle,
     docling_filename: str,
     previous_meta: JsonObject | None,
-    remote_fingerprint: str,
     pdf_sha256: str,
     overwrite: bool,
 ) -> bytes | None:
@@ -809,7 +765,6 @@ def _resolve_reusable_docling(
         handle: source document 句柄。
         docling_filename: Docling JSON 文件名。
         previous_meta: 当前 source meta。
-        remote_fingerprint: 当前候选远端 fingerprint。
         pdf_sha256: 当前 PDF 字节 SHA-256。
         overwrite: 是否强制覆盖。
 
@@ -822,11 +777,7 @@ def _resolve_reusable_docling(
 
     if overwrite or previous_meta is None:
         return None
-    if previous_meta.get("ingest_complete") is not False:
-        return None
-    if previous_meta.get("staging_remote_fingerprint") != remote_fingerprint:
-        return None
-    if previous_meta.get("staging_pdf_sha256") != pdf_sha256:
+    if previous_meta.get("pdf_sha256") != pdf_sha256:
         return None
     try:
         return blob_repository.read_file_bytes(handle, docling_filename)

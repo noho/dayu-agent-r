@@ -39,6 +39,7 @@ from dayu.fins.pipelines.cn_pipeline import (
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.storage import (
+    FsBatchingRepository,
     FsCompanyMetaRepository,
     FsDocumentBlobRepository,
     FsFilingMaintenanceRepository,
@@ -329,6 +330,7 @@ class _RuntimeRepositorySet:
     """runtime 测试用仓储集合。"""
 
     workspace_root: Path
+    batching_repository: FsBatchingRepository
     company_repository: FsCompanyMetaRepository
     source_repository: FsSourceDocumentRepository
     processed_repository: FsProcessedDocumentRepository
@@ -477,6 +479,7 @@ def test_cn_hk_adapter_factories_use_source_specific_downloader_defaults(
 
     cn_adapter = cn_pipeline_module.build_cn_download_adapter(
         workspace_root=repositories.workspace_root,
+        batching_repository=repositories.batching_repository,
         company_repository=repositories.company_repository,
         source_repository=repositories.source_repository,
         processed_repository=repositories.processed_repository,
@@ -485,6 +488,7 @@ def test_cn_hk_adapter_factories_use_source_specific_downloader_defaults(
     )
     hk_adapter = cn_pipeline_module.build_hk_download_adapter(
         workspace_root=repositories.workspace_root,
+        batching_repository=repositories.batching_repository,
         company_repository=repositories.company_repository,
         source_repository=repositories.source_repository,
         processed_repository=repositories.processed_repository,
@@ -550,6 +554,7 @@ def test_cn_hk_adapter_marks_processed_rebuild_for_written_documents(
     document_id = "fil_cn_rebuild"
     filing_payload: dict[str, JsonValue] = {"document_id": document_id, "status": "downloaded"}
     pipeline.result_filings = [filing_payload]
+    setup_batch = pipeline.batching_repository.begin_batch(ticker)
     pipeline.processed_repository.create_processed(
         ProcessedCreateRequest(
             ticker=ticker,
@@ -560,8 +565,10 @@ def test_cn_hk_adapter_marks_processed_rebuild_for_written_documents(
             meta={"reprocess_required": False},
             sections=[],
             tables=[],
-        )
+        ),
+        batch=setup_batch,
     )
+    pipeline.batching_repository.commit_batch(setup_batch)
     adapter = CnDownloadAdapter(pipeline=pipeline, source=source, market=market)
 
     adapter.download(
@@ -623,6 +630,7 @@ def _build_runtime_with_cn_hk_adapters(
     )
     pipeline = CnPipeline(
         workspace_root=repositories.workspace_root,
+        batching_repository=repositories.batching_repository,
         company_repository=repositories.company_repository,
         source_repository=repositories.source_repository,
         processed_repository=repositories.processed_repository,
@@ -633,6 +641,7 @@ def _build_runtime_with_cn_hk_adapters(
         convert_pdf_to_docling_json=converter,
     )
     runtime = FinsIngestionRuntime.create(
+        batching_repository=repositories.batching_repository,
         source_repository=repositories.source_repository,
         blob_repository=repositories.blob_repository,
         filing_maintenance_repository=repositories.filing_maintenance_repository,
@@ -683,6 +692,7 @@ def _build_runtime_repositories(tmp_path: Path) -> _RuntimeRepositorySet:
     repository_set = build_fs_repository_set(workspace_root=workspace_root)
     return _RuntimeRepositorySet(
         workspace_root=workspace_root,
+        batching_repository=FsBatchingRepository(workspace_root, repository_set=repository_set),
         company_repository=FsCompanyMetaRepository(workspace_root, repository_set=repository_set),
         source_repository=FsSourceDocumentRepository(workspace_root, repository_set=repository_set),
         processed_repository=FsProcessedDocumentRepository(workspace_root, repository_set=repository_set),

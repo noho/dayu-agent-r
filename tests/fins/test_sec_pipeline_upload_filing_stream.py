@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from dayu.contracts.json_value import JsonValue
-from dayu.fins.domain.document_models import CompanyMeta, CompanyMetaInventoryEntry, now_iso8601
+from dayu.fins.domain.document_models import BatchToken, CompanyMeta, CompanyMetaInventoryEntry, now_iso8601
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.pipelines.sec_pipeline import SecPipeline
 from dayu.fins.pipelines.upload_filing_events import UploadFilingEventType
@@ -67,7 +67,7 @@ class _SpyCompanyMetaRepository:
 
         raise FileNotFoundError(ticker)
 
-    def upsert_company_meta(self, meta: CompanyMeta) -> None:
+    def upsert_company_meta(self, meta: CompanyMeta, *, batch: BatchToken) -> None:
         """记录一次 company meta 写入。
 
         Args:
@@ -80,6 +80,7 @@ class _SpyCompanyMetaRepository:
             无。
         """
 
+        del batch
         self.writes.append(meta)
 
     def resolve_existing_ticker(self, ticker_candidates: list[str]) -> str | None:
@@ -139,6 +140,7 @@ def _seed_sec_upload_company_meta(
         OSError: 仓储写入失败时抛出。
     """
 
+    batch = pipeline._batching_repository.begin_batch("AAPL")
     pipeline._company_repository.upsert_company_meta(
         CompanyMeta(
             company_id="AAPL_US",
@@ -148,8 +150,10 @@ def _seed_sec_upload_company_meta(
             resolver_version=resolver_version,
             updated_at=now_iso8601(),
             ticker_aliases=ticker_aliases,
-        )
+        ),
+        batch=batch,
     )
+    pipeline._batching_repository.commit_batch(batch)
 
 
 @pytest.mark.parametrize(
@@ -208,6 +212,7 @@ def test_upload_company_meta_invalid_ticker_alias_fails_before_repository_write(
             company_id=None,
             company_name="Apple Inc.",
             ticker_aliases=["AAPL", "Apple Inc."],
+            batch=BatchToken(transaction_id="invalid-alias", ticker="AAPL"),
         )
 
     assert repository.writes == []

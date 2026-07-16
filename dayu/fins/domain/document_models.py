@@ -18,7 +18,6 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
-from pathlib import Path
 from typing import Any, Literal, Optional, TypeAlias
 
 from dayu.contracts.json_value import JsonValue
@@ -414,33 +413,15 @@ class DocumentEntry:
 
 @dataclass(frozen=True)
 class BatchToken:
-    """批处理事务 token。
+    """批处理事务显式 capability。
 
     Attributes:
-        token_id: 批处理唯一标识。
-        owner_token: 持有该 batch 的调用 owner token。
-        owner_scope_id: 创建 batch 的本地执行 scope 标识。
+        transaction_id: storage 生成的不透明事务标识。
         ticker: 对应股票代码。
-        target_ticker_dir: 正式 `portfolio/{ticker}` 目录。
-        staging_root_dir: 批处理暂存根目录。
-        staging_ticker_dir: 批处理暂存目录。
-        backup_dir: 提交阶段的备份目录。
-        journal_path: 事务 journal 路径。
-        ticker_lock_path: ticker 事务锁路径。
-        created_at: token 创建时间（ISO8601）。
     """
 
-    token_id: str
-    owner_token: str
-    owner_scope_id: str
+    transaction_id: str
     ticker: str
-    target_ticker_dir: Path
-    staging_root_dir: Path
-    staging_ticker_dir: Path
-    backup_dir: Path
-    journal_path: Path
-    ticker_lock_path: Path
-    created_at: str
 
 
 @dataclass(frozen=True)
@@ -920,19 +901,64 @@ class FilingManifestItem:
 
     document_id: str
     internal_document_id: str
+    ingest_method: FinsIngestMethod
+    source_provider: FinsSourceProvider
+    ingest_complete: bool
     form_type: Optional[str] = None
     fiscal_year: Optional[int] = None
     fiscal_period: Optional[str] = None
     report_date: Optional[str] = None
     filing_date: Optional[str] = None
     amended: bool = False
-    ingest_method: FinsIngestMethod = FinsIngestMethod.DOWNLOAD
-    ingest_complete: bool = True
     is_deleted: bool = False
     deleted_at: Optional[str] = None
     document_version: str = "v1"
     source_fingerprint: str = ""
     has_xbrl: Optional[bool] = None
+
+    @classmethod
+    def from_source_meta(
+        cls,
+        meta: Mapping[str, JsonValue],
+    ) -> "FilingManifestItem":
+        """从完整 filing source meta 构建唯一 manifest 投影。
+
+        Args:
+            meta: storage owner 已补齐身份与完成态的 source meta。
+
+        Returns:
+            与 source meta 同源的 filing manifest 项目。
+
+        Raises:
+            KeyError: meta 缺少必需身份或 provenance 字段时抛出。
+            ValueError: 身份、provenance 或字段类型非法时抛出。
+        """
+
+        provenance = SourceDocumentProvenance.from_meta(meta, SourceKind.FILING)
+        document_id = meta["document_id"]
+        internal_document_id = meta["internal_document_id"]
+        if not isinstance(document_id, str) or not document_id.strip():
+            raise ValueError("document_id 必须为非空字符串")
+        if not isinstance(internal_document_id, str) or not internal_document_id.strip():
+            raise ValueError("internal_document_id 必须为非空字符串")
+        return cls(
+            document_id=document_id,
+            internal_document_id=internal_document_id,
+            ingest_method=provenance.ingest_method,
+            source_provider=provenance.source_provider,
+            ingest_complete=provenance.ingest_complete,
+            form_type=_optional_str(meta.get("form_type")),
+            fiscal_year=_optional_int(meta.get("fiscal_year")),
+            fiscal_period=_optional_str(meta.get("fiscal_period")),
+            report_date=_optional_str(meta.get("report_date")),
+            filing_date=_optional_str(meta.get("filing_date")),
+            amended=meta.get("amended") is True,
+            is_deleted=meta.get("is_deleted") is True,
+            deleted_at=_optional_str(meta.get("deleted_at")),
+            document_version=_optional_str(meta.get("document_version")) or "v1",
+            source_fingerprint=_optional_str(meta.get("source_fingerprint")) or "",
+            has_xbrl=_optional_bool(meta.get("has_xbrl")),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """将对象转换为 manifest 字典。
@@ -949,6 +975,7 @@ class FilingManifestItem:
 
         payload = asdict(self)
         payload["ingest_method"] = self.ingest_method.to_storage_value()
+        payload["source_provider"] = self.source_provider.to_storage_value()
         return payload
 
 
@@ -958,15 +985,58 @@ class MaterialManifestItem:
 
     document_id: str
     internal_document_id: str
+    ingest_method: FinsIngestMethod
+    source_provider: FinsSourceProvider
+    ingest_complete: bool
     form_type: Optional[str] = None
     material_name: Optional[str] = None
     filing_date: Optional[str] = None
     report_date: Optional[str] = None
-    ingest_complete: bool = True
     is_deleted: bool = False
     deleted_at: Optional[str] = None
     document_version: str = "v1"
     source_fingerprint: str = ""
+
+    @classmethod
+    def from_source_meta(
+        cls,
+        meta: Mapping[str, JsonValue],
+    ) -> "MaterialManifestItem":
+        """从完整 material source meta 构建唯一 manifest 投影。
+
+        Args:
+            meta: storage owner 已补齐身份与完成态的 source meta。
+
+        Returns:
+            与 source meta 同源的 material manifest 项目。
+
+        Raises:
+            KeyError: meta 缺少必需身份或 provenance 字段时抛出。
+            ValueError: 身份、provenance 或字段类型非法时抛出。
+        """
+
+        provenance = SourceDocumentProvenance.from_meta(meta, SourceKind.MATERIAL)
+        document_id = meta["document_id"]
+        internal_document_id = meta["internal_document_id"]
+        if not isinstance(document_id, str) or not document_id.strip():
+            raise ValueError("document_id 必须为非空字符串")
+        if not isinstance(internal_document_id, str) or not internal_document_id.strip():
+            raise ValueError("internal_document_id 必须为非空字符串")
+        return cls(
+            document_id=document_id,
+            internal_document_id=internal_document_id,
+            ingest_method=provenance.ingest_method,
+            source_provider=provenance.source_provider,
+            ingest_complete=provenance.ingest_complete,
+            form_type=_optional_str(meta.get("form_type")),
+            material_name=_optional_str(meta.get("material_name")),
+            filing_date=_optional_str(meta.get("filing_date")),
+            report_date=_optional_str(meta.get("report_date")),
+            is_deleted=meta.get("is_deleted") is True,
+            deleted_at=_optional_str(meta.get("deleted_at")),
+            document_version=_optional_str(meta.get("document_version")) or "v1",
+            source_fingerprint=_optional_str(meta.get("source_fingerprint")) or "",
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """将对象转换为 manifest 字典。
@@ -981,7 +1051,10 @@ class MaterialManifestItem:
             无。
         """
 
-        return asdict(self)
+        payload = asdict(self)
+        payload["ingest_method"] = self.ingest_method.to_storage_value()
+        payload["source_provider"] = self.source_provider.to_storage_value()
+        return payload
 
 
 @dataclass(frozen=True)
@@ -1078,3 +1151,39 @@ def _optional_str(value: Any) -> Optional[str]:
         return None
     normalized = str(value).strip()
     return normalized or None
+
+
+def _optional_int(value: JsonValue) -> int | None:
+    """将 JSON 值收窄为可选整数。
+
+    Args:
+        value: 原始 JSON 值。
+
+    Returns:
+        非布尔整数；其它值返回 ``None``。
+
+    Raises:
+        无。
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _optional_bool(value: JsonValue) -> bool | None:
+    """将 JSON 值收窄为可选布尔值。
+
+    Args:
+        value: 原始 JSON 值。
+
+    Returns:
+        布尔值；其它值返回 ``None``。
+
+    Raises:
+        无。
+    """
+
+    if not isinstance(value, bool):
+        return None
+    return value

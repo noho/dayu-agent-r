@@ -6,10 +6,11 @@ from dayu.contracts.json_value import JsonValue
 
 import json
 import logging
+import datetime as dt
 from collections.abc import AsyncIterator, Callable, Mapping
 from io import BytesIO
 from pathlib import Path
-from typing import BinaryIO, Optional, cast
+from typing import Optional, cast
 
 import pytest
 
@@ -19,14 +20,27 @@ from dayu.fins.downloaders.sec_downloader import (
     RemoteFileDescriptor,
     Sc13PartyRoles,
     SecDownloader,
+    StoreDownloadedFile,
     build_source_fingerprint,
 )
-from dayu.fins.domain.document_models import DownloadRejectionEntry, FileObjectMeta, ProcessedCreateRequest
+from dayu.fins.domain.document_models import (
+    BatchToken,
+    DownloadRejectionEntry,
+    FileObjectMeta,
+    FilingUpdateRequest,
+    FinsSourceProvider,
+    ProcessedCreateRequest,
+    SourceDocumentUpsertRequest,
+    SourceFileEntry,
+    SourceHandle,
+)
 from dayu.fins.ingestion_runtime import FinsSourceDownloadAdapterRequest
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.pipelines import sec_download_filing_workflow as _sec_download_filing_workflow
+from dayu.fins.pipelines import sec_download_state as _sec_download_state
 from dayu.fins.pipelines import sec_6k_primary_document_repair as _sec_6k_primary_repair
 from dayu.fins.pipelines import sec_pipeline
+from dayu.fins.pipelines import sec_rebuild_workflow as _sec_rebuild_workflow
 from dayu.fins.pipelines.sec_6k_rules import _extract_head_text
 from dayu.fins.processors.source_text import FinsSourceDecodeError
 from dayu.fins.domain.filing_semantics import (
@@ -45,7 +59,15 @@ from dayu.fins.pipelines.sec_pipeline import (
     SecPipeline as _SecPipeline,
 )
 from dayu.fins.pipelines.sec_sc13_filtering import SC13_FORMS as _SC13_FORMS, SC13_RETRY_MAX as _SC13_RETRY_MAX
-from dayu.fins.storage import FsFilingMaintenanceRepository, FsProcessedDocumentRepository, SourceDocumentRepositoryProtocol
+from dayu.fins.storage import (
+    FsBatchingRepository,
+    FsDocumentBlobRepository,
+    FsFilingMaintenanceRepository,
+    FsProcessedDocumentRepository,
+    FsSourceDocumentRepository,
+    SourceDocumentRepositoryProtocol,
+)
+from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 from dayu.fins.ticker_normalization import normalize_ticker
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 
@@ -57,6 +79,121 @@ class _NeverCancelled:
         """始终返回未取消。"""
 
         return False
+
+
+class _RollbackOutcomeBatchingRepository(FsBatchingRepository):
+    """记录 SEC rebuild rollback，并可在真实 rollback 后注入次级失败。"""
+
+    def __init__(
+        self,
+        workspace_root: Path,
+        repository_set: _FsRepositorySet,
+        rollback_error: BaseException | None,
+    ) -> None:
+        """初始化 rollback 结果仓储。
+
+        Args:
+            workspace_root: 测试工作区根目录。
+            repository_set: 与 source/processed wrapper 共享的 repository set。
+            rollback_error: 真实 rollback 后需要抛出的次级异常；`None` 表示成功。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: 仓储初始化失败时抛出。
+        """
+
+        super().__init__(workspace_root, repository_set=repository_set)
+        self.rollback_error = rollback_error
+        self.rollback_calls = 0
+
+    def rollback_batch(self, batch: BatchToken) -> None:
+        """执行并记录一次真实 rollback，随后按配置抛出次级异常。
+
+        Args:
+            batch: 当前 shared core 登记的 open batch capability。
+
+        Returns:
+            未配置次级异常时不返回业务值。
+
+        Raises:
+            BaseException: 配置的 rollback 次级异常。
+            OSError: 真实 rollback 失败时抛出。
+            ValueError: batch capability 非法时抛出。
+        """
+
+        self.rollback_calls += 1
+        super().rollback_batch(batch)
+        if self.rollback_error is not None:
+            raise self.rollback_error
+
+
+class _RebuildUpdateFailure:
+    """在 SEC rebuild source update owner 边界抛出指定异常。"""
+
+    def __init__(self, operation_error: BaseException) -> None:
+        """保存需要原样抛出的 operation/cancellation 异常。
+
+        Args:
+            operation_error: source update 时抛出的主异常。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.operation_error = operation_error
+
+    def __call__(
+        self,
+        request: FilingUpdateRequest,
+        source_kind: SourceKind,
+        *,
+        batch: BatchToken,
+    ) -> None:
+        """接收真实 rebuild mutation 输入后抛出预置主异常。
+
+        Args:
+            request: SEC rebuild 构造的完整 filing update 请求。
+            source_kind: filing source kind。
+            batch: caller-owned batch capability。
+
+        Returns:
+            不返回；始终抛出预置异常。
+
+        Raises:
+            BaseException: 初始化时提供的 operation/cancellation 异常。
+        """
+
+        del request, source_kind, batch
+        raise self.operation_error
+
+
+def _sec_rebuild_previous_meta() -> dict[str, JsonValue]:
+    """返回触发 SEC rebuild mutation 的最小完成态 meta。
+
+    Args:
+        无。
+
+    Returns:
+        包含 form、日期、fingerprint 与单文件 manifest 的 source meta。
+
+    Raises:
+        无。
+    """
+
+    return {
+        "internal_document_id": "0000000000-25-000001",
+        "form_type": "10-K",
+        "filing_date": "2025-02-01",
+        "report_date": "2024-12-31",
+        "primary_document": "report.htm",
+        "source_fingerprint": "published-fingerprint",
+        "files": [{"name": "report.htm"}],
+    }
 
 
 def test_sec_6k_preview_rejects_invalid_utf8() -> None:
@@ -96,7 +233,12 @@ class _RecordingSecPipelineForAdapter:
             OSError: processed 仓储初始化失败时抛出。
         """
 
-        self._processed_repository = FsProcessedDocumentRepository(workspace_root)
+        repository_set = build_fs_repository_set(workspace_root=workspace_root)
+        self._batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
+        self._processed_repository = FsProcessedDocumentRepository(
+            workspace_root,
+            repository_set=repository_set,
+        )
         self.document_id = document_id
         self.recorded_rebuild_values: list[bool] = []
 
@@ -372,7 +514,9 @@ class StubDownloader:
         self,
         remote_files: list[RemoteFileDescriptor],
         overwrite: bool,
-        store_file: Callable[[str, BinaryIO], FileObjectMeta],
+        store_file: StoreDownloadedFile,
+        *,
+        batch: BatchToken,
         existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
         primary_document: Optional[str] = None,
         cancellation_checker: Optional[Callable[[], bool]] = None,
@@ -401,13 +545,86 @@ class StubDownloader:
             name = str(item.get("name", ""))
             payload = self._content_by_name.get(name, f"dummy:{name}".encode("utf-8"))
             if item.get("status") == "downloaded":
-                file_meta = store_file(name, BytesIO(payload))
+                file_meta = store_file(name, BytesIO(payload), batch=batch)
                 enriched = dict(item)
                 enriched["file_meta"] = file_meta
                 results.append(enriched)
             else:
                 results.append(item)
         return results
+
+    async def download_files_stream(
+        self,
+        remote_files: list[RemoteFileDescriptor],
+        overwrite: bool,
+        store_file: StoreDownloadedFile,
+        *,
+        batch: BatchToken,
+        existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
+        primary_document: Optional[str] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> AsyncIterator[DownloaderEvent]:
+        """按真实 downloader callback contract 投影固定文件结果。
+
+        Args:
+            remote_files: 远端文件列表。
+            overwrite: 是否覆盖。
+            store_file: invocation-time 显式接收 batch 的存储回调。
+            batch: caller-owned batch capability。
+            existing_files: 既有文件映射。
+            primary_document: 主文档文件名。
+            cancellation_checker: 可选取消检查器。
+
+        Yields:
+            每个文件的 started 与终态事件。
+
+        Raises:
+            OSError: store callback 失败时传播。
+        """
+
+        results = self.download_files(
+            remote_files,
+            overwrite,
+            store_file,
+            batch=batch,
+            existing_files=existing_files,
+            primary_document=primary_document,
+            cancellation_checker=cancellation_checker,
+        )
+        for item in results:
+            name = str(item.get("name", ""))
+            source_url = str(item.get("source_url", ""))
+            yield DownloaderEvent(
+                event_type="file_download_started",
+                name=name,
+                source_url=source_url,
+                http_etag=str(item.get("http_etag") or "") or None,
+                http_last_modified=str(item.get("http_last_modified") or "") or None,
+                http_status=None,
+            )
+            status = str(item.get("status", "failed"))
+            raw_file_meta = item.get("file_meta")
+            file_meta = raw_file_meta if isinstance(raw_file_meta, FileObjectMeta) else None
+            raw_http_status = item.get("http_status")
+            http_status = raw_http_status if isinstance(raw_http_status, int) and not isinstance(raw_http_status, bool) else None
+            if status == "downloaded":
+                event_type = "file_downloaded"
+            elif status == "skipped":
+                event_type = "file_skipped"
+            else:
+                event_type = "file_failed"
+            yield DownloaderEvent(
+                event_type=event_type,
+                name=name,
+                source_url=source_url,
+                http_etag=str(item.get("http_etag") or "") or None,
+                http_last_modified=str(item.get("http_last_modified") or "") or None,
+                http_status=http_status,
+                file_meta=file_meta,
+                reason_code=str(item.get("reason_code") or "") or None,
+                reason_message=str(item.get("reason_message") or "") or None,
+                error=str(item.get("error") or "") or None,
+            )
 
     def fetch_file_bytes(
         self,
@@ -520,7 +737,9 @@ class StreamStubDownloader(StubDownloader):
         self,
         remote_files: list[RemoteFileDescriptor],
         overwrite: bool,
-        store_file: Callable[[str, BinaryIO], FileObjectMeta],
+        store_file: StoreDownloadedFile,
+        *,
+        batch: BatchToken,
         existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
         primary_document: Optional[str] = None,
         cancellation_checker: Optional[Callable[[], bool]] = None,
@@ -559,7 +778,7 @@ class StreamStubDownloader(StubDownloader):
             )
             if item.get("status") == "downloaded":
                 payload = self._content_by_name.get(name, f"dummy:{name}".encode("utf-8"))
-                file_meta = store_file(name, BytesIO(payload))
+                file_meta = store_file(name, BytesIO(payload), batch=batch)
                 yield DownloaderEvent(
                     event_type="file_downloaded",
                     name=name,
@@ -785,6 +1004,197 @@ def _make_descriptor(etag: str) -> RemoteFileDescriptor:
     )
 
 
+def _seed_complete_sec_source(
+    *,
+    workspace_root: Path,
+    ticker: str = "AAPL",
+    document_id: str = "fil_0000000000-25-000001",
+    source_fingerprint: str = "seed-fingerprint",
+    download_version: str | None = SEC_PIPELINE_DOWNLOAD_VERSION,
+    http_etag: str = "etag-before",
+) -> Path:
+    """通过真实 public contract 写入可供 SEC flow 读取的完整 source。
+
+    Args:
+        workspace_root: Fins 工作区根目录。
+        ticker: 事务绑定 ticker。
+        document_id: source 文档 ID。
+        source_fingerprint: 已发布 source fingerprint。
+        download_version: 可选下载版本；``None`` 表示字段缺失。
+        http_etag: 已发布文件的 HTTP ETag。
+
+    Returns:
+        已发布 source meta 路径。
+
+    Raises:
+        OSError: blob、source 或 commit 失败时抛出。
+        ValueError: fixture 字段违反 public contract 时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    filename = "sample-10k.htm"
+    batch = batching_repository.begin_batch(ticker)
+    try:
+        file_meta = blob_repository.store_file(
+            SourceHandle(
+                ticker=ticker,
+                document_id=document_id,
+                source_kind=SourceKind.FILING.value,
+            ),
+            filename,
+            BytesIO(b"<html>seed</html>"),
+            batch=batch,
+            content_type="text/html",
+        )
+        meta: dict[str, JsonValue] = {
+            "accession_number": document_id.removeprefix("fil_"),
+            "ingest_method": "download",
+            "source_provider": FinsSourceProvider.SEC_EDGAR.to_storage_value(),
+            "company_id": "320193",
+            "document_version": "v1",
+            "source_fingerprint": source_fingerprint,
+            "filing_date": "2025-02-01",
+            "report_date": "2024-12-31",
+            "fiscal_year": 2024,
+            "fiscal_period": "FY",
+            "amended": False,
+        }
+        if download_version is not None:
+            meta["download_version"] = download_version
+        source_repository.create_source_document(
+            SourceDocumentUpsertRequest(
+                ticker=ticker,
+                document_id=document_id,
+                internal_document_id=document_id.removeprefix("fil_"),
+                form_type="10-K",
+                primary_document=filename,
+                meta=meta,
+                file_entries=[
+                    SourceFileEntry(
+                        name=filename,
+                        uri=file_meta.uri,
+                        etag=file_meta.etag,
+                        last_modified=file_meta.last_modified,
+                        size=file_meta.size,
+                        content_type=file_meta.content_type,
+                        sha256=file_meta.sha256,
+                        source_url="https://example.com/sample-10k.htm",
+                        http_etag=http_etag,
+                        http_last_modified="Mon, 01 Jan 2025 00:00:00 GMT",
+                    ).to_dict()
+                ],
+            ),
+            SourceKind.FILING,
+            batch=batch,
+        )
+    except BaseException:
+        batching_repository.rollback_batch(batch)
+        raise
+    batching_repository.commit_batch(batch)
+    return workspace_root / "portfolio" / ticker / "filings" / document_id / "meta.json"
+
+
+def _seed_complete_6k_source_and_processed(
+    *,
+    workspace_root: Path,
+    ticker: str,
+    document_id: str,
+) -> None:
+    """通过同一真实 batch 写入完整 6-K source、两个 HTML blob 与 processed。
+
+    Args:
+        workspace_root: Fins 工作区根目录。
+        ticker: 事务绑定 ticker。
+        document_id: 6-K source 文档 ID。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: blob/source/processed 或 commit 写入失败时抛出。
+        ValueError: fixture 违反 complete publication contract 时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    processed_repository = FsProcessedDocumentRepository(
+        workspace_root,
+        repository_set=repository_set,
+    )
+    source_handle = SourceHandle(
+        ticker=ticker,
+        document_id=document_id,
+        source_kind=SourceKind.FILING.value,
+    )
+    file_entries: list[dict[str, JsonValue]] = []
+    batch = batching_repository.begin_batch(ticker)
+    try:
+        for filename in ("form6-k.htm", "ex99-1.htm"):
+            file_meta = blob_repository.store_file(
+                source_handle,
+                filename,
+                BytesIO(f"<html>{filename}</html>".encode("utf-8")),
+                batch=batch,
+                content_type="text/html",
+            )
+            file_entries.append(
+                SourceFileEntry(
+                    name=filename,
+                    uri=file_meta.uri,
+                    etag=file_meta.etag,
+                    last_modified=file_meta.last_modified,
+                    size=file_meta.size,
+                    content_type=file_meta.content_type,
+                    sha256=file_meta.sha256,
+                    source_url=f"https://example.com/{filename}",
+                ).to_dict()
+            )
+        source_repository.create_source_document(
+            SourceDocumentUpsertRequest(
+                ticker=ticker,
+                document_id=document_id,
+                internal_document_id=document_id.removeprefix("fil_"),
+                form_type="6-K",
+                primary_document="form6-k.htm",
+                meta={
+                    "accession_number": document_id.removeprefix("fil_"),
+                    "ingest_method": "download",
+                    "source_provider": FinsSourceProvider.SEC_EDGAR.to_storage_value(),
+                    "company_id": "320193",
+                    "document_version": "v1",
+                    "source_fingerprint": "six-k-seed",
+                    "filing_date": "2025-02-01",
+                    "report_date": "2024-12-31",
+                },
+                file_entries=file_entries,
+            ),
+            SourceKind.FILING,
+            batch=batch,
+        )
+        processed_repository.create_processed(
+            ProcessedCreateRequest(
+                ticker=ticker,
+                document_id=document_id,
+                internal_document_id=document_id.removeprefix("fil_"),
+                source_kind=SourceKind.FILING.value,
+                form_type="6-K",
+                meta={"reprocess_required": False},
+                sections=[],
+                tables=[],
+            ),
+            batch=batch,
+        )
+    except BaseException:
+        batching_repository.rollback_batch(batch)
+        raise
+    batching_repository.commit_batch(batch)
+
+
 def test_sec_pipeline_download_writes_meta_and_manifest(tmp_path: Path) -> None:
     """验证下载成功后写 meta 与 manifest。
 
@@ -888,82 +1298,66 @@ def test_sec_pipeline_rebuild_local_meta_manifest_without_redownload(tmp_path: P
 
     ticker = "AAPL"
     document_id = "fil_0000000000-25-000001"
-    document_dir = tmp_path / "portfolio" / ticker / "filings" / document_id
-    document_dir.mkdir(parents=True, exist_ok=True)
-    (document_dir / "sample-10k.htm").write_text("<html>sample</html>", encoding="utf-8")
-
-    meta_path = document_dir / "meta.json"
-    meta_path.write_text(
-        json.dumps(
-            {
-                "document_id": document_id,
-                "internal_document_id": "0000000000-25-000001",
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching_repository = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    source_repository = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    processed_repository = FsProcessedDocumentRepository(tmp_path, repository_set=repository_set)
+    batch = batching_repository.begin_batch(ticker)
+    file_meta = blob_repository.store_file(
+        SourceHandle(
+            ticker=ticker,
+            document_id=document_id,
+            source_kind=SourceKind.FILING.value,
+        ),
+        "sample-10k.htm",
+        BytesIO(b"<html>sample</html>"),
+        batch=batch,
+        content_type="text/html",
+    )
+    source_repository.create_source_document(
+        SourceDocumentUpsertRequest(
+            ticker=ticker,
+            document_id=document_id,
+            internal_document_id="0000000000-25-000001",
+            form_type="10-K",
+            primary_document="sample-10k.htm",
+            meta={
                 "accession_number": "0000000000-25-000001",
                 "ingest_method": "download",
-                "ticker": ticker,
+                "source_provider": FinsSourceProvider.SEC_EDGAR.to_storage_value(),
                 "company_id": "320193",
-                "form_type": "10-K",
                 "fiscal_year": 2024,
                 "fiscal_period": "FY",
-                "report_kind": None,
                 "report_date": "2024-12-31",
                 "filing_date": "2025-02-01",
                 "first_ingested_at": "2025-02-02T00:00:00+00:00",
-                "ingest_complete": True,
-                "is_deleted": False,
-                "deleted_at": None,
                 "document_version": "v7",
-                "source_fingerprint": "fingerprint_fixed",
+                "source_fingerprint": "",
                 "amended": False,
                 "download_version": "legacy_download_version",
-                "legacy_field_to_remove": "legacy",
-                "created_at": "2025-02-02T00:00:00+00:00",
-                "updated_at": "2025-02-02T00:00:00+00:00",
-                "files": [
-                    {
-                        "name": "sample-10k.htm",
-                        "uri": f"local://{ticker}/filings/{document_id}/sample-10k.htm",
-                        "etag": "etag-v1",
-                        "last_modified": "Mon, 01 Jan 2025 00:00:00 GMT",
-                        "size": 100,
-                        "content_type": "text/html",
-                        "sha256": "dummy_sha256",
-                        "source_url": "https://example.com/sample-10k.htm",
-                        "http_etag": "etag-v1",
-                        "http_last_modified": "Mon, 01 Jan 2025 00:00:00 GMT",
-                        "ingested_at": "2025-02-02T00:00:00+00:00",
-                    }
-                ],
             },
-            ensure_ascii=False,
-            indent=2,
+            files=[file_meta],
         ),
-        encoding="utf-8",
+        SourceKind.FILING,
+        batch=batch,
     )
-
-    # 预置一个旧 manifest，验证重建后可被覆盖为最新字段集合。
+    processed_repository.create_processed(
+        ProcessedCreateRequest(
+            ticker=ticker,
+            document_id=document_id,
+            internal_document_id="0000000000-25-000001",
+            source_kind=SourceKind.FILING.value,
+            form_type="10-K",
+            meta={"reprocess_required": False},
+            sections=[],
+            tables=[],
+        ),
+        batch=batch,
+    )
+    batching_repository.commit_batch(batch)
+    meta_path = tmp_path / "portfolio" / ticker / "filings" / document_id / "meta.json"
     manifest_path = tmp_path / "portfolio" / ticker / "filings" / "filing_manifest.json"
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(
-        json.dumps(
-            {
-                "ticker": ticker,
-                "updated_at": "2025-02-02T00:00:00+00:00",
-                "documents": [
-                    {
-                        "document_id": document_id,
-                        "internal_document_id": "legacy_internal",
-                        "form_type": "10-Q",
-                        "document_version": "v1",
-                        "source_fingerprint": "legacy_fp",
-                    }
-                ],
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
 
     downloader = RebuildOnlyDownloader()
     pipeline = SecPipeline(
@@ -982,9 +1376,11 @@ def test_sec_pipeline_rebuild_local_meta_manifest_without_redownload(tmp_path: P
 
     rebuilt_meta = json.loads(meta_path.read_text(encoding="utf-8"))
     assert rebuilt_meta["document_version"] == "v7"
-    assert rebuilt_meta["source_fingerprint"] == "fingerprint_fixed"
+    assert isinstance(rebuilt_meta["source_fingerprint"], str)
+    assert rebuilt_meta["source_fingerprint"]
     assert rebuilt_meta["download_version"] == SEC_PIPELINE_DOWNLOAD_VERSION
-    assert "legacy_field_to_remove" not in rebuilt_meta
+    rebuilt_processed_meta = processed_repository.get_processed_meta(ticker, document_id)
+    assert rebuilt_processed_meta["reprocess_required"] is True
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert len(manifest["documents"]) == 1
@@ -992,6 +1388,256 @@ def test_sec_pipeline_rebuild_local_meta_manifest_without_redownload(tmp_path: P
     assert manifest["documents"][0]["document_version"] == "v7"
     assert manifest["documents"][0]["form_type"] == "10-K"
     assert manifest["documents"][0]["ingest_method"] == "download"
+
+
+@pytest.mark.parametrize(
+    "cancellation_type",
+    (KeyboardInterrupt, SystemExit),
+    ids=("keyboard_interrupt", "system_exit"),
+)
+def test_sec_rebuild_rolls_back_once_and_reraises_cancellation_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cancellation_type: type[KeyboardInterrupt] | type[SystemExit],
+) -> None:
+    """SEC rebuild commit 前取消必须 rollback 一次并原样传播。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+        cancellation_type: 本 case 注入的取消异常类型。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 取消 identity 被替换、未传播或 rollback 次数不为一时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching_repository = _RollbackOutcomeBatchingRepository(
+        tmp_path,
+        repository_set,
+        None,
+    )
+    source_repository = FsSourceDocumentRepository(
+        tmp_path,
+        repository_set=repository_set,
+    )
+    processed_repository = FsProcessedDocumentRepository(
+        tmp_path,
+        repository_set=repository_set,
+    )
+    cancellation = cancellation_type("injected rebuild cancellation")
+    monkeypatch.setattr(
+        source_repository,
+        "update_source_document",
+        _RebuildUpdateFailure(cancellation),
+    )
+
+    with pytest.raises(cancellation_type) as exc_info:
+        _sec_rebuild_workflow.rebuild_single_local_filing(
+            batching_repository=batching_repository,
+            source_repository=source_repository,
+            processed_repository=processed_repository,
+            ticker="AAPL",
+            document_id="fil_0000000000-25-000001",
+            previous_meta=_sec_rebuild_previous_meta(),
+            company_meta=None,
+            pipeline_download_version=SEC_PIPELINE_DOWNLOAD_VERSION,
+        )
+
+    assert exc_info.value is cancellation
+    assert exc_info.value.__cause__ is None
+    assert batching_repository.rollback_calls == 1
+
+
+def test_sec_rebuild_operation_and_rollback_failure_preserve_primary_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SEC rebuild 双失败必须以 operation 为主、rollback 为 cause并只回滚一次。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 主异常 identity、cause、note 或 rollback 次数漂移时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    operation_error = OSError("injected rebuild operation failure")
+    rollback_error = RuntimeError("injected rebuild rollback failure")
+    batching_repository = _RollbackOutcomeBatchingRepository(
+        tmp_path,
+        repository_set,
+        rollback_error,
+    )
+    source_repository = FsSourceDocumentRepository(
+        tmp_path,
+        repository_set=repository_set,
+    )
+    processed_repository = FsProcessedDocumentRepository(
+        tmp_path,
+        repository_set=repository_set,
+    )
+    monkeypatch.setattr(
+        source_repository,
+        "update_source_document",
+        _RebuildUpdateFailure(operation_error),
+    )
+
+    with pytest.raises(OSError) as exc_info:
+        _sec_rebuild_workflow.rebuild_single_local_filing(
+            batching_repository=batching_repository,
+            source_repository=source_repository,
+            processed_repository=processed_repository,
+            ticker="AAPL",
+            document_id="fil_0000000000-25-000001",
+            previous_meta=_sec_rebuild_previous_meta(),
+            company_meta=None,
+            pipeline_download_version=SEC_PIPELINE_DOWNLOAD_VERSION,
+        )
+
+    assert exc_info.value is operation_error
+    assert exc_info.value.__cause__ is rollback_error
+    assert exc_info.value.__notes__ == [
+        "rollback_batch failed; recovery evidence retained: "
+        "injected rebuild rollback failure"
+    ]
+    assert batching_repository.rollback_calls == 1
+
+
+def test_sec_rebuild_ordinary_failure_with_successful_rollback_returns_failed_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SEC rebuild ordinary operation 失败且 rollback 成功时应保留既有 failed result。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: ordinary failure 被抛出、结果分类漂移或 rollback 次数不为一时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    operation_error = OSError("injected ordinary rebuild failure")
+    batching_repository = _RollbackOutcomeBatchingRepository(
+        tmp_path,
+        repository_set,
+        None,
+    )
+    source_repository = FsSourceDocumentRepository(
+        tmp_path,
+        repository_set=repository_set,
+    )
+    processed_repository = FsProcessedDocumentRepository(
+        tmp_path,
+        repository_set=repository_set,
+    )
+    monkeypatch.setattr(
+        source_repository,
+        "update_source_document",
+        _RebuildUpdateFailure(operation_error),
+    )
+
+    result = _sec_rebuild_workflow.rebuild_single_local_filing(
+        batching_repository=batching_repository,
+        source_repository=source_repository,
+        processed_repository=processed_repository,
+        ticker="AAPL",
+        document_id="fil_0000000000-25-000001",
+        previous_meta=_sec_rebuild_previous_meta(),
+        company_meta=None,
+        pipeline_download_version=SEC_PIPELINE_DOWNLOAD_VERSION,
+    )
+
+    assert result["status"] == "failed"
+    assert result["reason_code"] == "rebuild_write_failed"
+    assert result["error"] == "injected ordinary rebuild failure"
+    assert operation_error.__cause__ is None
+    assert batching_repository.rollback_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("meta", "target_forms", "start_bound", "end_bound", "expected"),
+    [
+        ({"filing_date": "2025-02-01"}, {"10-K"}, None, None, False),
+        ({"form_type": "invalid", "filing_date": "2025-02-01"}, {"10-K"}, None, None, False),
+        ({"form_type": "10-Q", "filing_date": "2025-02-01"}, {"10-K"}, None, None, False),
+        ({"form_type": "10-K"}, {"10-K"}, dt.date(2025, 1, 1), None, False),
+        (
+            {"form_type": "10-K", "filing_date": "not-a-date"},
+            {"10-K"},
+            dt.date(2025, 1, 1),
+            None,
+            False,
+        ),
+        (
+            {"form_type": "10-K", "filing_date": "2024-12-31"},
+            {"10-K"},
+            dt.date(2025, 1, 1),
+            None,
+            False,
+        ),
+        (
+            {"form_type": "10-K", "filing_date": "2025-02-01"},
+            {"10-K"},
+            None,
+            dt.date(2025, 1, 31),
+            False,
+        ),
+        (
+            {"form_type": "10-K", "filing_date": "2025-02-01"},
+            {"10-K"},
+            dt.date(2025, 1, 1),
+            dt.date(2025, 2, 28),
+            True,
+        ),
+    ],
+)
+def test_sec_rebuild_filter_contract(
+    meta: dict[str, JsonValue],
+    target_forms: set[str] | None,
+    start_bound: dt.date | None,
+    end_bound: dt.date | None,
+    expected: bool,
+) -> None:
+    """SEC rebuild filter owner 对缺失、非法和边界日期应 fail closed。"""
+
+    assert (
+        _sec_rebuild_workflow.passes_rebuild_filters(
+            meta=meta,
+            target_forms=target_forms,
+            start_bound=start_bound,
+            end_bound=end_bound,
+            parse_sec_form=parse_sec_form_type,
+            parse_date=sec_pipeline.parse_date,
+        )
+        is expected
+    )
+
+
+def test_sec_rebuild_state_preserves_published_fingerprint() -> None:
+    """rebuild state owner 应保留既有指纹，且缺席 meta 不得命中当前版本。"""
+
+    assert _sec_download_state.has_current_download_version(None, SEC_PIPELINE_DOWNLOAD_VERSION) is False
+    assert (
+        _sec_download_state._resolve_rebuild_source_fingerprint(
+            previous_meta={"source_fingerprint": "published-fingerprint"},
+            file_entries=[],
+        )
+        == "published-fingerprint"
+    )
 
 
 def test_sec_pipeline_download_prefers_dei_fiscal_when_available(
@@ -1062,21 +1708,9 @@ def test_sec_pipeline_skip_when_meta_matches(tmp_path: Path) -> None:
 
     remote_files = [_make_descriptor("etag-same")]
     fingerprint = build_source_fingerprint(remote_files)
-    document_dir = tmp_path / "portfolio" / "AAPL" / "filings" / "fil_0000000000-25-000001"
-    document_dir.mkdir(parents=True, exist_ok=True)
-    meta_path = document_dir / "meta.json"
-    meta_path.write_text(
-        json.dumps(
-            {
-                "document_version": "v1",
-                "source_fingerprint": fingerprint,
-                "download_version": SEC_PIPELINE_DOWNLOAD_VERSION,
-                "ingest_complete": True,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
+    _seed_complete_sec_source(
+        workspace_root=tmp_path,
+        source_fingerprint=fingerprint,
     )
     downloader = StubDownloader(
         submissions=_build_submissions(),
@@ -1103,32 +1737,10 @@ def test_sec_pipeline_skip_with_etag_gzip_variant_without_re_download(tmp_path: 
     """验证 ETag `-gzip` 变体不应触发重复下载。"""
 
     remote_files = [_make_descriptor("etag-same-gzip")]
-    document_dir = tmp_path / "portfolio" / "AAPL" / "filings" / "fil_0000000000-25-000001"
-    document_dir.mkdir(parents=True, exist_ok=True)
-    meta_path = document_dir / "meta.json"
-    meta_path.write_text(
-        json.dumps(
-            {
-                "document_version": "v1",
-                "source_fingerprint": "legacy-fp",
-                "download_version": SEC_PIPELINE_DOWNLOAD_VERSION,
-                "ingest_complete": True,
-                "files": [
-                    {
-                        "name": "sample-10k.htm",
-                        "uri": "local://AAPL/sample-10k.htm",
-                        "etag": "blob-etag",
-                        "last_modified": "2026-03-03T00:00:00+00:00",
-                        "size": 100,
-                        "http_etag": "\"etag-same\"",
-                        "http_last_modified": "Mon, 01 Jan 2025 00:00:00 GMT",
-                    }
-                ],
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
+    _seed_complete_sec_source(
+        workspace_root=tmp_path,
+        source_fingerprint="legacy-fp",
+        http_etag='"etag-same"',
     )
     downloader = StubDownloader(
         submissions=_build_submissions(),
@@ -1188,31 +1800,10 @@ def test_sec_pipeline_all_files_not_modified_respects_download_version(
     """
 
     remote_files = [_make_descriptor("etag-same")]
-    document_dir = tmp_path / "portfolio" / "AAPL" / "filings" / "fil_0000000000-25-000001"
-    document_dir.mkdir(parents=True, exist_ok=True)
-    meta_path = document_dir / "meta.json"
-    original_meta = {
-        "document_version": "v1",
-        "source_fingerprint": "",
-        "ingest_complete": True,
-        "updated_at": "2026-03-03T00:00:00+00:00",
-        "files": [
-            {
-                "name": "sample-10k.htm",
-                "uri": "local://AAPL/sample-10k.htm",
-                "etag": "blob-etag",
-                "last_modified": "2026-03-03T00:00:00+00:00",
-                "size": 100,
-                "http_etag": "etag-before",
-                "http_last_modified": "Mon, 01 Jan 2025 00:00:00 GMT",
-            }
-        ],
-    }
-    if existing_download_version is not None:
-        original_meta["download_version"] = existing_download_version
-    meta_path.write_text(
-        json.dumps(original_meta, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    meta_path = _seed_complete_sec_source(
+        workspace_root=tmp_path,
+        source_fingerprint="",
+        download_version=existing_download_version,
     )
     before_text = meta_path.read_text(encoding="utf-8")
     downloader = StubDownloader(
@@ -1313,29 +1904,30 @@ def test_sec_pipeline_remote_change_marks_reprocess(tmp_path: Path) -> None:
 
     remote_files_v1 = [_make_descriptor("etag-v1")]
     fingerprint_v1 = build_source_fingerprint(remote_files_v1)
-    document_dir = tmp_path / "portfolio" / "AAPL" / "filings" / "fil_0000000000-25-000001"
-    document_dir.mkdir(parents=True, exist_ok=True)
-    meta_path = document_dir / "meta.json"
-    meta_path.write_text(
-        json.dumps(
-            {
-                "document_version": "v1",
-                "source_fingerprint": fingerprint_v1,
-                "download_version": SEC_PIPELINE_DOWNLOAD_VERSION,
-                "ingest_complete": True,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
+    meta_path = _seed_complete_sec_source(
+        workspace_root=tmp_path,
+        source_fingerprint=fingerprint_v1,
     )
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching_repository = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    processed_repository = FsProcessedDocumentRepository(tmp_path, repository_set=repository_set)
+    processed_batch = batching_repository.begin_batch("AAPL")
+    processed_repository.create_processed(
+        ProcessedCreateRequest(
+            ticker="AAPL",
+            document_id="fil_0000000000-25-000001",
+            internal_document_id="0000000000-25-000001",
+            source_kind=SourceKind.FILING.value,
+            form_type="10-K",
+            meta={"reprocess_required": False},
+            sections=[],
+            tables=[],
+        ),
+        batch=processed_batch,
+    )
+    batching_repository.commit_batch(processed_batch)
     processed_meta_path = (
         tmp_path / "portfolio" / "AAPL" / "processed" / "fil_0000000000-25-000001" / "tool_snapshot_meta.json"
-    )
-    processed_meta_path.parent.mkdir(parents=True, exist_ok=True)
-    processed_meta_path.write_text(
-        json.dumps({"reprocess_required": False}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
     )
 
     remote_files_v2 = [_make_descriptor("etag-v2")]
@@ -1380,21 +1972,23 @@ def test_sec_pipeline_remote_change_marks_reprocess(tmp_path: Path) -> None:
 def test_sec_cleanup_stale_filing_dirs_keeps_existing_docs_when_result_empty(tmp_path: Path) -> None:
     """本轮没有有效目标 document_id 时不得清理旧 filing。"""
 
-    document_dir = tmp_path / "portfolio" / "AAPL" / "filings" / "fil_old"
-    document_dir.mkdir(parents=True, exist_ok=True)
-    meta_path = document_dir / "meta.json"
-    meta_path.write_text(
-        json.dumps({"document_id": "fil_old", "form_type": "10-K"}, ensure_ascii=False),
-        encoding="utf-8",
+    meta_path = _seed_complete_sec_source(
+        workspace_root=tmp_path,
+        document_id="fil_old",
     )
-    repository = FsFilingMaintenanceRepository(tmp_path)
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching_repository = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    repository = FsFilingMaintenanceRepository(tmp_path, repository_set=repository_set)
+    batch = batching_repository.begin_batch("AAPL")
 
     cleaned = sec_pipeline._cleanup_stale_filing_dirs(
         repository,
         "AAPL",
-        {"10-K": "2024-01-01"},
+        {"10-K": dt.date(2024, 1, 1)},
         [],
+        batch=batch,
     )
+    batching_repository.commit_batch(batch)
 
     assert cleaned == 0
     assert meta_path.exists()
@@ -1748,6 +2342,7 @@ def test_sec_adapter_marks_processed_rebuild_for_written_documents(tmp_path: Pat
 
     document_id = "fil_sec_rebuild"
     pipeline = _RecordingSecPipelineForAdapter(tmp_path, document_id)
+    batch = pipeline._batching_repository.begin_batch("AAPL")
     pipeline._processed_repository.create_processed(
         ProcessedCreateRequest(
             ticker="AAPL",
@@ -1758,8 +2353,10 @@ def test_sec_adapter_marks_processed_rebuild_for_written_documents(tmp_path: Pat
             meta={"reprocess_required": False},
             sections=[],
             tables=[],
-        )
+        ),
+        batch=batch,
     )
+    pipeline._batching_repository.commit_batch(batch)
     adapter = sec_pipeline.SecDownloadAdapter(pipeline=cast(sec_pipeline.SecPipeline, pipeline))
 
     adapter.download(
@@ -2050,23 +2647,23 @@ def test_sec_pipeline_repairs_cover_primary_when_attachment_has_core_statements(
         ),
     }
 
-    def _fake_assess_active_6k_candidate(
+    def _fake_assess_prepared_6k_candidate(
         *,
-        source_repository: SourceDocumentRepositoryProtocol,
-        ticker: str,
-        document_id: str,
+        temporary_root: Path,
+        position: int,
         filename: str,
+        payload: bytes,
         primary_document: str,
     ) -> _sec_6k_primary_repair.SixKPrimaryCandidateAssessment:
         """返回固定候选评估结果。"""
 
-        del source_repository, ticker, document_id, primary_document
+        del temporary_root, position, payload, primary_document
         return assessment_by_filename[filename]
 
     monkeypatch.setattr(
         _sec_6k_primary_repair,
-        "_assess_active_6k_candidate",
-        _fake_assess_active_6k_candidate,
+        "_assess_prepared_6k_candidate",
+        _fake_assess_prepared_6k_candidate,
     )
 
     pipeline = SecPipeline(
@@ -2082,11 +2679,11 @@ def test_sec_pipeline_repairs_cover_primary_when_attachment_has_core_statements(
     assert meta["primary_document"] == "ex99-1.htm"
 
 
-def test_sec_pipeline_keeps_provisional_primary_when_reconcile_raises(
+def test_sec_pipeline_rolls_back_when_prepared_primary_selection_raises(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """验证 6-K reconcile 抛异常时会保留预筛选主文件并继续下载。"""
+    """6-K publication 前选文失败必须回滚，不能发布 provisional primary。"""
 
     remote_files = [
         RemoteFileDescriptor(
@@ -2138,22 +2735,22 @@ def test_sec_pipeline_keeps_provisional_primary_when_reconcile_raises(
         },
     )
 
-    def _raise_reconcile(
+    def _raise_prepared_selection(
         *,
-        source_repository: SourceDocumentRepositoryProtocol,
         ticker: str,
         document_id: str,
-        mark_processed_reprocess_required: Callable[[str, str], None],
-    ) -> None:
-        """模拟 reconcile 内部异常。"""
+        meta: dict[str, JsonValue],
+        candidate_payloads: dict[str, bytes],
+    ) -> _sec_6k_primary_repair.SixKPrimaryReconcileOutcome | None:
+        """模拟 publication 前 6-K 选文异常。"""
 
-        del source_repository, ticker, document_id, mark_processed_reprocess_required
+        del ticker, document_id, meta, candidate_payloads
         raise RuntimeError("boom")
 
     monkeypatch.setattr(
         _sec_download_filing_workflow,
-        "reconcile_active_6k_primary_document",
-        _raise_reconcile,
+        "select_prepared_6k_primary_document",
+        _raise_prepared_selection,
     )
 
     pipeline = SecPipeline(
@@ -2161,12 +2758,75 @@ def test_sec_pipeline_keeps_provisional_primary_when_reconcile_raises(
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
     )
-    result = pipeline.download(ticker="TCOM", overwrite=False)
+    with pytest.raises(RuntimeError, match="boom"):
+        pipeline.download(ticker="TCOM", overwrite=False)
 
-    assert result["summary"]["downloaded"] == 1
     meta_path = tmp_path / "portfolio" / "TCOM" / "filings" / "fil_0000000000-25-000101" / "meta.json"
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    assert meta["primary_document"] == "d123dex991.htm"
+    assert not meta_path.exists()
+
+
+def test_standalone_6k_reconcile_publishes_source_and_processed_together(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """standalone 6-K owner 必须共享 core，并在同批次发布主文件与 marker。"""
+
+    ticker = "TCOM"
+    document_id = "fil_0000000000-25-000101"
+    _seed_complete_6k_source_and_processed(
+        workspace_root=tmp_path,
+        ticker=ticker,
+        document_id=document_id,
+    )
+    assessments = {
+        "form6-k.htm": _sec_6k_primary_repair.SixKPrimaryCandidateAssessment(
+            filename="form6-k.htm",
+            income_row_count=0,
+            balance_sheet_row_count=0,
+            filename_priority=3,
+        ),
+        "ex99-1.htm": _sec_6k_primary_repair.SixKPrimaryCandidateAssessment(
+            filename="ex99-1.htm",
+            income_row_count=20,
+            balance_sheet_row_count=30,
+            filename_priority=0,
+        ),
+    }
+
+    def _assess_active_candidate(
+        *,
+        source_repository: SourceDocumentRepositoryProtocol,
+        ticker: str,
+        document_id: str,
+        filename: str,
+        primary_document: str,
+    ) -> _sec_6k_primary_repair.SixKPrimaryCandidateAssessment:
+        """保留真实 batch/publication，只稳定处理器评估结果。"""
+
+        del source_repository, ticker, document_id, primary_document
+        return assessments[filename]
+
+    monkeypatch.setattr(
+        _sec_6k_primary_repair,
+        "_assess_active_6k_candidate",
+        _assess_active_candidate,
+    )
+
+    report = _sec_6k_primary_repair.reconcile_active_6k_primary_documents(
+        workspace_root=tmp_path,
+        target_tickers=[ticker, ticker.lower()],
+        target_document_ids=[document_id],
+    )
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source_repository = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    processed_repository = FsProcessedDocumentRepository(tmp_path, repository_set=repository_set)
+    published_meta = source_repository.get_source_meta(ticker, document_id, SourceKind.FILING)
+    processed_meta = processed_repository.get_processed_meta(ticker, document_id)
+    assert len(report.updated) == 1
+    assert report.updated[0].selected_primary_document == "ex99-1.htm"
+    assert published_meta["primary_document"] == "ex99-1.htm"
+    assert processed_meta["reprocess_required"] is True
 
 
 def test_sec_form_domain_parser_accepts_supported_aliases() -> None:
@@ -2340,16 +3000,25 @@ def test_sec_pipeline_sc13_direction_keeps_aapl_like_records(tmp_path: Path) -> 
             "files": [],
         }
     }
-    remote_files = [_make_descriptor("etag-v1")]
+    remote_files = [
+        RemoteFileDescriptor(
+            name="sc13g-1.htm",
+            source_url="https://example.com/sc13g-1.htm",
+            http_etag="etag-v1",
+            http_last_modified="Mon, 01 Jan 2025 00:00:00 GMT",
+            remote_size=100,
+            http_status=200,
+        )
+    ]
     downloader = StubDownloader(
         submissions=submissions,
         remote_files=remote_files,
         download_results=[
             {
-                "name": "sample-10k.htm",
+                "name": "sc13g-1.htm",
                 "status": "downloaded",
-                "path": "sample-10k.htm",
-                "source_url": "https://example.com/sample-10k.htm",
+                "path": "sc13g-1.htm",
+                "source_url": "https://example.com/sc13g-1.htm",
                 "http_etag": "etag-v1",
                 "http_last_modified": "Mon, 01 Jan 2025 00:00:00 GMT",
             }

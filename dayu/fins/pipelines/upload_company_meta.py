@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Final
 
 from dayu.fins._log import Log
-from dayu.fins.domain.document_models import CompanyMeta, now_iso8601
+from dayu.fins.domain.document_models import BatchToken, CompanyMeta, now_iso8601
 from dayu.fins.storage import CompanyMetaRepositoryProtocol
 from dayu.fins.ticker_normalization import normalize_ticker, ticker_to_company_id, try_normalize_ticker
 
@@ -26,6 +26,7 @@ def upsert_company_meta_for_upload(
     company_id: str | None,
     company_name: str | None,
     ticker_aliases: list[str] | None = None,
+    batch: BatchToken,
 ) -> None:
     """在上传链路中按规则写入公司级元数据。
 
@@ -36,6 +37,7 @@ def upsert_company_meta_for_upload(
         company_id: 兼容既有调用方的可选字段；上传链路不会把它作为身份真源。
         company_name: 公司名称。
         ticker_aliases: 可选 ticker alias 列表。
+        batch: caller 显式传入的 batch capability。
 
     Returns:
         无。
@@ -80,7 +82,8 @@ def upsert_company_meta_for_upload(
             resolver_version=RESOLVER_VERSION,
             updated_at=now_iso8601(),
             ticker_aliases=normalized_ticker_aliases,
-        )
+        ),
+        batch=batch,
     )
 
 

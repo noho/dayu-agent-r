@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import io
 import json
+import multiprocessing
 import os
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, fields
+from multiprocessing.connection import Connection
 from pathlib import Path
+from threading import Event
 from typing import BinaryIO, Literal
+from unittest.mock import patch
 
 import pytest
 
@@ -16,15 +22,26 @@ import dayu.fins.storage._fs_storage_utils as storage_utils_module
 import dayu.fins.storage.local_file_store as local_file_store_module
 from dayu.fins.domain.document_models import (
     BatchToken,
+    CompanyMeta,
+    DocumentQuery,
     FileObjectMeta,
     ProcessedCreateRequest,
+    ProcessedDeleteRequest,
     ProcessedHandle,
+    ProcessedUpdateRequest,
+    RejectedFilingArtifactUpsertRequest,
+    SourceFileEntry,
+    SourceDocumentStateChangeRequest,
     SourceDocumentUpsertRequest,
     SourceHandle,
+    now_iso8601,
 )
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.storage import (
+    FsBatchingRepository,
+    FsCompanyMetaRepository,
     FsDocumentBlobRepository,
+    FsFilingMaintenanceRepository,
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
     LocalFileStore,
@@ -34,6 +51,7 @@ from dayu.fins.storage._fs_storage_core import FsStorageCore
 from dayu.fins.storage._fs_storage_infra import (
     _PHASE_BACKED_UP_TARGET,
     _PHASE_COMMITTED,
+    _PHASE_ROLLED_BACK,
     _PHASE_STARTED,
     _PHASE_SWAPPED_TARGET,
 )
@@ -45,6 +63,7 @@ from dayu.fins.storage._fs_storage_utils import (
     _normalize_object_key,
     _normalize_ticker,
 )
+from dayu.runtime.filelock import RuntimeFileLockError, RuntimeFileLockToken
 
 _Normalizer = Callable[[str], str]
 _CommitFailurePoint = Literal[
@@ -55,6 +74,692 @@ _CommitFailurePoint = Literal[
     "committed_journal",
 ]
 _ReplaceTargetKind = Literal["directory", "broken_symlink"]
+_PublicationBarrier = Literal["target_to_backup", "staging_to_target"]
+
+
+@dataclass(frozen=True)
+class _BatchPaths:
+    """测试侧从 storage-owned active state 取得的 transaction 物理路径快照。"""
+
+    target_ticker_dir: Path
+    staging_root_dir: Path
+    staging_ticker_dir: Path
+    backup_dir: Path
+    journal_path: Path
+
+
+class _PublicationGuardAcquireSignal:
+    """在真实 public reader 获取 publication guard 前向父进程发信号。"""
+
+    def __init__(
+        self,
+        connection: Connection,
+        acquire: Callable[[str], RuntimeFileLockToken],
+    ) -> None:
+        """初始化 acquire 包装器。
+
+        Args:
+            connection: 与父进程通信的 pipe 连接。
+            acquire: storage core 的真实 blocking publication guard acquire。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self._connection = connection
+        self._acquire = acquire
+
+    def __call__(self, ticker: str) -> RuntimeFileLockToken:
+        """报告真实 acquire 调用点后进入原 blocking acquire。
+
+        Args:
+            ticker: public reader 即将读取的 ticker。
+
+        Returns:
+            真实 storage acquire 返回的 publication lock token。
+
+        Raises:
+            OSError: pipe 发信号失败时抛出。
+            RuntimeFileLockError: 真实 publication guard 获取失败时抛出。
+        """
+
+        self._connection.send_bytes(b"publication_acquire_entered")
+        return self._acquire(ticker)
+
+
+def test_batch_token_fields_and_minimal_journal_are_closed_owner_contract(tmp_path: Path) -> None:
+    """public token 只含 opaque identity；journal 只持 recovery 最小事实。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: public capability 或 journal 泄漏 internal locator 时抛出。
+    """
+
+    assert tuple(field.name for field in fields(BatchToken)) == ("transaction_id", "ticker")
+    core = _build_core(tmp_path)
+    batch = core.begin_batch("AAPL")
+    state = _only_active_batch_state(core)
+    journal = json.loads(state.journal_path.read_text(encoding="utf-8"))
+
+    assert journal == {
+        "transaction_id": batch.transaction_id,
+        "ticker": "AAPL",
+        "phase": _PHASE_STARTED,
+    }
+    core.rollback_batch(batch)
+
+
+def test_batch_registry_rejects_unknown_altered_closed_ticker_and_cross_core_tokens(
+    tmp_path: Path,
+) -> None:
+    """只有当前 core registry 中 canonical open capability 才能授权 mutation。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任一伪造、错 scope、跨 core 或已关闭 token 被接受时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    source = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    batch = batching.begin_batch("AAPL")
+    request = _source_request("registry-owner")
+
+    with pytest.raises(ValueError, match="未在当前 storage core 登记"):
+        source.create_source_document(
+            request,
+            SourceKind.FILING,
+            batch=BatchToken(transaction_id="unknown", ticker="AAPL"),
+        )
+    with pytest.raises(ValueError, match="canonical capability 不匹配"):
+        source.create_source_document(
+            request,
+            SourceKind.FILING,
+            batch=BatchToken(transaction_id=batch.transaction_id, ticker="MSFT"),
+        )
+    with pytest.raises(ValueError, match="ticker 与 mutation scope 不匹配"):
+        source.create_source_document(
+            _source_request("wrong-ticker", ticker="MSFT"),
+            SourceKind.FILING,
+            batch=batch,
+        )
+
+    independent_set = build_fs_repository_set(workspace_root=workspace_root)
+    independent_source = FsSourceDocumentRepository(
+        workspace_root,
+        repository_set=independent_set,
+    )
+    with pytest.raises(ValueError, match="未在当前 storage core 登记"):
+        independent_source.create_source_document(
+            request,
+            SourceKind.FILING,
+            batch=batch,
+        )
+
+    batching.rollback_batch(batch)
+    with pytest.raises(ValueError, match="未在当前 storage core 登记"):
+        source.create_source_document(request, SourceKind.FILING, batch=batch)
+
+
+def test_writer_and_publication_lock_tokens_do_not_authorize_mutation(tmp_path: Path) -> None:
+    """writer mutex 与 publication guard 都只是互斥机制，不是 mutation authority。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 仅持物理锁即可绕过 active registry 时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    core = repository_set.core
+    source = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    writer_token = core._acquire_ticker_lock("AAPL")
+    publication_token = core._acquire_publication_guard("AAPL")
+    try:
+        with pytest.raises(ValueError, match="未在当前 storage core 登记"):
+            source.create_source_document(
+                _source_request("lock-is-not-authority"),
+                SourceKind.FILING,
+                batch=BatchToken(transaction_id="unregistered", ticker="AAPL"),
+            )
+    finally:
+        core._release_lock_token(publication_token)
+        core._release_lock_token(writer_token)
+
+
+def test_company_owner_reads_only_published_meta_inventory_and_aliases(tmp_path: Path) -> None:
+    """company owner 应从 guarded published meta 统一提供 get/inventory/alias 语义。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: company public read 之间的 published 事实不一致时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    company = FsCompanyMetaRepository(workspace_root, repository_set=repository_set)
+    batches = {
+        ticker: batching.begin_batch(ticker)
+        for ticker in ("AAPL", "MSFT", "DUP1", "DUP2")
+    }
+    for ticker, aliases in (
+        ("AAPL", ["APPLE"]),
+        ("MSFT", ["MICROSOFT"]),
+        ("DUP1", ["DUPLICATE"]),
+        ("DUP2", ["DUPLICATE"]),
+    ):
+        company.upsert_company_meta(
+            CompanyMeta(
+                company_id=f"company-{ticker}",
+                company_name=f"{ticker} Inc.",
+                ticker=ticker,
+                market="US",
+                resolver_version="test",
+                updated_at=now_iso8601(),
+                ticker_aliases=aliases,
+            ),
+            batch=batches[ticker],
+        )
+    for batch in batches.values():
+        batching.commit_batch(batch)
+
+    assert company.get_company_meta("aapl").company_name == "AAPL Inc."
+    assert company.resolve_existing_ticker(["aapl"]) == "AAPL"
+    assert company.resolve_existing_ticker(["apple"]) == "AAPL"
+    assert company.resolve_existing_ticker(["not-listed"]) is None
+    with pytest.raises(ValueError, match="命中多个公司目录"):
+        company.resolve_existing_ticker(["duplicate"])
+    with pytest.raises(FileNotFoundError):
+        company.get_company_meta("NOT-LISTED")
+
+    (repository_set.core.portfolio_root / ".hidden").mkdir()
+    (repository_set.core.portfolio_root / "MISSING").mkdir()
+    invalid_dir = repository_set.core.portfolio_root / "INVALID"
+    invalid_dir.mkdir()
+    (invalid_dir / "meta.json").write_text("{}", encoding="utf-8")
+
+    status_by_name = {
+        item.directory_name: item.status
+        for item in company.scan_company_meta_inventory()
+    }
+    assert status_by_name["AAPL"] == "available"
+    assert status_by_name["MISSING"] == "missing_meta"
+    assert status_by_name["INVALID"] == "invalid_meta"
+    assert status_by_name[".hidden"] == "hidden_directory"
+
+
+def test_processed_owner_public_crud_mark_list_delete_and_clear(tmp_path: Path) -> None:
+    """processed owner 的 mutation/read 组合应共享显式 transaction 与 published 事实。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: processed CRUD、mark、list 或 clear 状态不一致时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    processed = FsProcessedDocumentRepository(workspace_root, repository_set=repository_set)
+    create_batch = batching.begin_batch("AAPL")
+    for document_id in ("processed-one", "processed-two"):
+        processed.create_processed(
+            ProcessedCreateRequest(
+                ticker="AAPL",
+                document_id=document_id,
+                internal_document_id=document_id,
+                source_kind=SourceKind.FILING.value,
+                form_type="10-K",
+                meta={"fiscal_year": 2024, "fiscal_period": "FY"},
+                sections=[],
+                tables=[],
+            ),
+            batch=create_batch,
+        )
+    batching.commit_batch(create_batch)
+
+    assert processed.get_processed_handle("AAPL", "processed-one") == ProcessedHandle(
+        ticker="AAPL",
+        document_id="processed-one",
+    )
+    assert processed.get_processed_meta("AAPL", "processed-one")["document_id"] == (
+        "processed-one"
+    )
+    assert [
+        item.document_id
+        for item in processed.list_processed_documents("AAPL", DocumentQuery(form_type="10-K"))
+    ] == ["processed-one", "processed-two"]
+
+    unchanged_meta = processed.get_processed_meta("AAPL", "processed-one")
+    no_op_batch = batching.begin_batch("AAPL")
+    assert (
+        repository_set.core.mark_processed_reprocess_required(
+            "AAPL",
+            "processed-one",
+            False,
+            batch=no_op_batch,
+        )
+        is None
+    )
+    batching.commit_batch(no_op_batch)
+    assert processed.get_processed_meta("AAPL", "processed-one") == unchanged_meta
+
+    update_batch = batching.begin_batch("AAPL")
+    processed.update_processed(
+        ProcessedUpdateRequest(
+            ticker="AAPL",
+            document_id="processed-one",
+            internal_document_id="processed-one",
+            source_kind=SourceKind.FILING.value,
+            form_type="10-Q",
+            meta={"fiscal_year": 2025, "fiscal_period": "Q1"},
+            sections=[{"section_id": "part-1"}],
+            tables=[],
+        ),
+        batch=update_batch,
+    )
+    assert (
+        repository_set.core.mark_processed_reprocess_required(
+            "AAPL",
+            "processed-one",
+            True,
+            batch=update_batch,
+        )
+        is None
+    )
+    assert (
+        repository_set.core.mark_processed_reprocess_required(
+            "AAPL",
+            "missing",
+            True,
+            batch=update_batch,
+        )
+        is None
+    )
+    assert (
+        repository_set.core._mark_processed_reprocess_required_impl(
+            "AAPL",
+            "processed-two",
+            _only_active_batch_state(repository_set.core),
+        )
+        is None
+    )
+    batching.commit_batch(update_batch)
+    assert processed.get_processed_meta("AAPL", "processed-one")["reprocess_required"] is True
+    assert processed.get_processed_meta("AAPL", "processed-two")["reprocess_required"] is True
+    with pytest.raises(FileNotFoundError):
+        processed.get_processed_meta("AAPL", "missing")
+
+    delete_batch = batching.begin_batch("AAPL")
+    processed.delete_processed(
+        ProcessedDeleteRequest(ticker="AAPL", document_id="processed-one"),
+        batch=delete_batch,
+    )
+    batching.commit_batch(delete_batch)
+    with pytest.raises(FileNotFoundError):
+        processed.get_processed_meta("AAPL", "processed-one")
+
+    tool_meta_path = repository_set.core._processed_meta_path_for_read("AAPL", "processed-two")
+    legacy_meta_path = tool_meta_path.with_name("meta.json")
+    legacy_meta_path.write_text(
+        json.dumps({"document_id": "legacy-meta-must-not-be-read"}),
+        encoding="utf-8",
+    )
+    assert processed.get_processed_meta("AAPL", "processed-two")["document_id"] == (
+        "processed-two"
+    )
+    tool_meta_path.unlink()
+    with pytest.raises(FileNotFoundError, match="tool_snapshot_meta.json"):
+        processed.get_processed_meta("AAPL", "processed-two")
+
+    clear_batch = batching.begin_batch("AAPL")
+    processed.clear_processed_documents("AAPL", batch=clear_batch)
+    batching.commit_batch(clear_batch)
+    assert processed.list_processed_documents("AAPL", DocumentQuery()) == []
+
+
+def test_maintenance_owner_artifact_reads_cleanup_and_clear_are_guarded(tmp_path: Path) -> None:
+    """maintenance owner 应显式写 staging，并从 published tree 组合读取 artifact。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: artifact、stale cleanup 或 filing clear 状态错误时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    source = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    maintenance = FsFilingMaintenanceRepository(workspace_root, repository_set=repository_set)
+    batch = batching.begin_batch("AAPL")
+    for document_id in ("fil_keep", "fil_stale"):
+        _create_complete_source(
+            source,
+            blob,
+            batch=batch,
+            document_id=document_id,
+        )
+    file_meta = maintenance.store_rejected_filing_file(
+        "AAPL",
+        "fil_rejected",
+        "rejected.htm",
+        io.BytesIO(b"rejected payload"),
+        batch=batch,
+        content_type="text/html",
+    )
+    request = RejectedFilingArtifactUpsertRequest(
+        ticker="AAPL",
+        document_id="fil_rejected",
+        internal_document_id="fil_rejected",
+        accession_number="0000320193-25-000001",
+        company_id="0000320193",
+        form_type="10-K",
+        filing_date="2025-01-02",
+        report_date="2024-12-31",
+        primary_document="rejected.htm",
+        selected_primary_document="rejected.htm",
+        rejection_reason="policy",
+        rejection_category="test",
+        classification_version="v1",
+        source_fingerprint="fingerprint",
+        files=[
+            SourceFileEntry(
+                name="rejected.htm",
+                uri=file_meta.uri,
+                size=file_meta.size,
+                content_type=file_meta.content_type,
+                sha256=file_meta.sha256,
+            )
+        ],
+    )
+    first_artifact = maintenance.upsert_rejected_filing_artifact(request, batch=batch)
+    second_artifact = maintenance.upsert_rejected_filing_artifact(request, batch=batch)
+    assert second_artifact.created_at == first_artifact.created_at
+    batching.commit_batch(batch)
+
+    assert maintenance.get_rejected_filing_artifact("AAPL", "fil_rejected").document_id == (
+        "fil_rejected"
+    )
+    assert [
+        artifact.document_id
+        for artifact in maintenance.list_rejected_filing_artifacts("AAPL")
+    ] == ["fil_rejected"]
+    assert maintenance.read_rejected_filing_file_bytes(
+        "AAPL",
+        "fil_rejected",
+        "rejected.htm",
+    ) == b"rejected payload"
+    with pytest.raises(FileNotFoundError, match="rejected filing 文件不存在"):
+        maintenance.read_rejected_filing_file_bytes(
+            "AAPL",
+            "fil_rejected",
+            "missing.htm",
+        )
+    directory_path = repository_set.core._rejected_filing_file_path_for_read(
+        "AAPL",
+        "fil_rejected",
+        "directory-entry",
+    )
+    directory_path.mkdir()
+    with pytest.raises(IsADirectoryError, match="目标是目录"):
+        maintenance.read_rejected_filing_file_bytes(
+            "AAPL",
+            "fil_rejected",
+            "directory-entry",
+        )
+
+    corrupt_dir = (
+        repository_set.core.portfolio_root
+        / "AAPL"
+        / "filings"
+        / ".rejections"
+        / "fil_corrupt"
+    )
+    corrupt_dir.mkdir()
+    assert [
+        artifact.document_id
+        for artifact in maintenance.list_rejected_filing_artifacts("AAPL")
+    ] == ["fil_rejected"]
+
+    cleanup_batch = batching.begin_batch("AAPL")
+    assert maintenance.cleanup_stale_filing_documents(
+        "AAPL",
+        batch=cleanup_batch,
+        active_form_types={"10-K"},
+        valid_document_ids={"fil_keep"},
+    ) == 1
+    batching.commit_batch(cleanup_batch)
+    assert source.list_source_document_ids("AAPL", SourceKind.FILING) == ["fil_keep"]
+
+    clear_batch = batching.begin_batch("AAPL")
+    maintenance.clear_filing_documents("AAPL", batch=clear_batch)
+    batching.commit_batch(clear_batch)
+    assert source.list_source_document_ids("AAPL", SourceKind.FILING) == []
+
+
+def test_maintenance_public_file_read_delegates_to_unguarded_helper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """maintenance public read 应规范化 identity 后只委托 private unguarded helper。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: public entry 未按精确参数委托 helper 时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    maintenance = FsFilingMaintenanceRepository(workspace_root, repository_set=repository_set)
+    calls: list[tuple[str, str, str]] = []
+
+    def _read_rejected_filing_file_bytes_unguarded(
+        normalized_ticker: str,
+        normalized_document_id: str,
+        filename: str,
+    ) -> bytes:
+        """记录 public entry 向 private helper 的委托参数。
+
+        Args:
+            normalized_ticker: 已规范化 ticker。
+            normalized_document_id: 已规范化文档 ID。
+            filename: 原始文件名。
+
+        Returns:
+            固定测试字节。
+
+        Raises:
+            无。
+        """
+
+        calls.append((normalized_ticker, normalized_document_id, filename))
+        return b"delegated"
+
+    monkeypatch.setattr(
+        repository_set.core,
+        "_read_rejected_filing_file_bytes_unguarded",
+        _read_rejected_filing_file_bytes_unguarded,
+    )
+
+    assert maintenance.read_rejected_filing_file_bytes(
+        " aapl ",
+        " fil_rejected ",
+        "rejected.htm",
+    ) == b"delegated"
+    assert calls == [("AAPL", "fil_rejected", "rejected.htm")]
+
+
+def test_source_owner_material_update_delete_restore_replace_and_reset(tmp_path: Path) -> None:
+    """source owner 的 material lifecycle 必须全部消费同一显式 transaction state。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: material mutation 或 published projection 不一致时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    source = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    create_batch = batching.begin_batch("AAPL")
+    handle = SourceHandle("AAPL", "material-owner", SourceKind.MATERIAL.value)
+    file_meta = blob.store_file(
+        handle,
+        "material-owner.txt",
+        io.BytesIO(b"material"),
+        batch=create_batch,
+    )
+    created_handle = source.create_source_document(
+        SourceDocumentUpsertRequest(
+            ticker="AAPL",
+            document_id="material-owner",
+            internal_document_id="material-owner",
+            form_type="EX-99",
+            primary_document="material-owner.txt",
+            meta={
+                "ingest_method": "upload",
+                "source_provider": "user_upload",
+                "material_name": "Investor presentation",
+            },
+            files=[file_meta],
+        ),
+        SourceKind.MATERIAL,
+        batch=create_batch,
+    )
+    assert created_handle.primary_file_uri == file_meta.uri
+    batching.commit_batch(create_batch)
+    assert repository_set.core.get_document_meta("AAPL", "material-owner")[
+        "material_name"
+    ] == "Investor presentation"
+
+    update_batch = batching.begin_batch("AAPL")
+    source.update_source_document(
+        SourceDocumentUpsertRequest(
+            ticker="AAPL",
+            document_id="material-owner",
+            internal_document_id="material-owner",
+            form_type="EX-99.1",
+            primary_document="material-owner.txt",
+            meta={
+                "ingest_method": "upload",
+                "source_provider": "user_upload",
+                "material_name": "Updated presentation",
+            },
+        ),
+        SourceKind.MATERIAL,
+        batch=update_batch,
+    )
+    state_change = SourceDocumentStateChangeRequest(
+        ticker="AAPL",
+        document_id="material-owner",
+        source_kind=SourceKind.MATERIAL.value,
+    )
+    source.delete_source_document(state_change, batch=update_batch)
+    source.restore_source_document(state_change, batch=update_batch)
+    replacement_meta = source.get_source_meta(
+        "AAPL",
+        "material-owner",
+        SourceKind.MATERIAL,
+    )
+    replacement_meta.update(
+        {
+            "form_type": "EX-99.1",
+            "material_name": "Replaced presentation",
+            "is_deleted": False,
+        }
+    )
+    source.replace_source_meta(
+        "AAPL",
+        "material-owner",
+        SourceKind.MATERIAL,
+        replacement_meta,
+        batch=update_batch,
+    )
+    batching.commit_batch(update_batch)
+    assert source.get_source_meta("AAPL", "material-owner", SourceKind.MATERIAL)[
+        "material_name"
+    ] == "Replaced presentation"
+
+    reset_batch = batching.begin_batch("AAPL")
+    source.reset_source_document(
+        "AAPL",
+        "material-owner",
+        SourceKind.MATERIAL,
+        batch=reset_batch,
+    )
+    batching.commit_batch(reset_batch)
+    with pytest.raises(FileNotFoundError):
+        source.get_source_meta("AAPL", "material-owner", SourceKind.MATERIAL)
+
+
+def test_primary_uri_owner_requires_exact_explicit_primary_name() -> None:
+    """主文件 URI owner 只允许显式主文件名精确命中。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 缺失或错误主文件名仍投影第一文件 URI 时抛出。
+    """
+
+    file_payloads = [
+        {"name": "first.txt", "uri": "local://AAPL/materials/doc/first.txt"},
+        {"name": "primary.txt", "uri": "local://AAPL/materials/doc/primary.txt"},
+    ]
+
+    assert (
+        storage_utils_module._resolve_primary_uri(file_payloads, "primary.txt")
+        == "local://AAPL/materials/doc/primary.txt"
+    )
+    assert storage_utils_module._resolve_primary_uri(file_payloads, "missing.txt") is None
+    assert storage_utils_module._resolve_primary_uri(file_payloads, None) is None
 
 
 @pytest.mark.parametrize(
@@ -243,29 +948,34 @@ def test_valid_dot_hyphen_identity_and_object_key_round_trip(tmp_path: Path) -> 
 
 
 @pytest.mark.parametrize(
-    "handle",
+    ("handle", "expects_store"),
     (
-        SourceHandle(ticker="AAPL", document_id="missing-source", source_kind=SourceKind.FILING.value),
-        ProcessedHandle(ticker="AAPL", document_id="missing-processed"),
+        (
+            SourceHandle(ticker="AAPL", document_id="blob-first", source_kind=SourceKind.FILING.value),
+            True,
+        ),
+        (ProcessedHandle(ticker="AAPL", document_id="missing-processed"), False),
     ),
 )
-def test_store_file_requires_source_or_processed_meta_before_file_store_call(
+def test_store_file_allows_blob_first_source_but_requires_processed_meta(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     handle: SourceHandle | ProcessedHandle,
+    expects_store: bool,
 ) -> None:
-    """两类 handle 不存在时 store_file 都不得调用 FileStore。
+    """source handle 不需 meta ack；processed handle 仍由其自身 meta 授权目录。
 
     Args:
         tmp_path: pytest 临时目录。
         monkeypatch: pytest monkeypatch fixture。
         handle: 不存在的 source/processed handle。
+        expects_store: 当前 handle 是否应进入 FileStore。
 
     Returns:
         无。
 
     Raises:
-        AssertionError: FileStore 被调用或异常类型错误时由 pytest 抛出。
+        AssertionError: blob-first 或 processed meta contract 错误时由 pytest 抛出。
     """
 
     file_store = LocalFileStore(tmp_path / "objects")
@@ -306,11 +1016,32 @@ def test_store_file_requires_source_or_processed_meta_before_file_store_call(
         tmp_path / "workspace",
         repository_set=repository_set,
     )
+    batching_repository = FsBatchingRepository(
+        tmp_path / "workspace",
+        repository_set=repository_set,
+    )
+    batch = batching_repository.begin_batch(handle.ticker)
 
-    with pytest.raises(FileNotFoundError):
-        blob_repository.store_file(handle, "report.md", io.BytesIO(b"payload"))
+    try:
+        if expects_store:
+            blob_repository.store_file(
+                handle,
+                "report.md",
+                io.BytesIO(b"payload"),
+                batch=batch,
+            )
+        else:
+            with pytest.raises(FileNotFoundError):
+                blob_repository.store_file(
+                    handle,
+                    "report.md",
+                    io.BytesIO(b"payload"),
+                    batch=batch,
+                )
+    finally:
+        batching_repository.rollback_batch(batch)
 
-    assert put_keys == []
+    assert put_keys == (["AAPL/filings/blob-first/report.md"] if expects_store else [])
 
 
 def test_existing_source_and_processed_handles_share_blob_contract(tmp_path: Path) -> None:
@@ -331,56 +1062,68 @@ def test_existing_source_and_processed_handles_share_blob_contract(tmp_path: Pat
     source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
     processed_repository = FsProcessedDocumentRepository(workspace_root, repository_set=repository_set)
     blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
     source_request = SourceDocumentUpsertRequest(
         ticker="AAPL",
         document_id="annual-report",
         internal_document_id="annual-report",
         form_type="10-K",
         primary_document="report.md",
-        meta={"ingest_method": "upload", "ingest_complete": True},
+        meta={
+            "ingest_method": "upload",
+            "source_provider": "user_upload",
+        },
     )
-    source_repository.create_source_document(source_request, SourceKind.FILING)
-    processed_repository.create_processed(
-        ProcessedCreateRequest(
-            ticker="AAPL",
-            document_id="annual-report",
-            internal_document_id="annual-report",
-            source_kind=SourceKind.FILING.value,
-            form_type="10-K",
-            meta={},
-            sections=[],
-            tables=[],
+    batch = batching_repository.begin_batch("AAPL")
+    source_handle = SourceHandle(
+        ticker="AAPL",
+        document_id="annual-report",
+        source_kind=SourceKind.FILING.value,
+    )
+    processed_handle = ProcessedHandle(ticker="AAPL", document_id="annual-report")
+    try:
+        processed_repository.create_processed(
+            ProcessedCreateRequest(
+                ticker="AAPL",
+                document_id="annual-report",
+                internal_document_id="annual-report",
+                source_kind=SourceKind.FILING.value,
+                form_type="10-K",
+                meta={},
+                sections=[],
+                tables=[],
+            ),
+            batch=batch,
         )
-    )
-    source_handle = source_repository.get_source_handle(
-        "AAPL",
-        "annual-report",
-        SourceKind.FILING,
-    )
-    processed_handle = processed_repository.get_processed_handle("AAPL", "annual-report")
-
-    source_file_meta = blob_repository.store_file(
-        source_handle,
-        "report.md",
-        io.BytesIO(b"source"),
-    )
-    blob_repository.store_file(
-        processed_handle,
-        "analysis.json",
-        io.BytesIO(b"processed"),
-    )
-    source_repository.update_source_document(
-        SourceDocumentUpsertRequest(
-            ticker="AAPL",
-            document_id="annual-report",
-            internal_document_id="annual-report",
-            form_type="10-K",
-            primary_document="report.md",
-            meta={"ingest_method": "upload", "ingest_complete": True},
-            files=[source_file_meta],
-        ),
-        SourceKind.FILING,
-    )
+        source_file_meta = blob_repository.store_file(
+            source_handle,
+            "report.md",
+            io.BytesIO(b"source"),
+            batch=batch,
+        )
+        blob_repository.store_file(
+            processed_handle,
+            "analysis.json",
+            io.BytesIO(b"processed"),
+            batch=batch,
+        )
+        source_repository.create_source_document(
+            SourceDocumentUpsertRequest(
+                ticker=source_request.ticker,
+                document_id=source_request.document_id,
+                internal_document_id=source_request.internal_document_id,
+                form_type=source_request.form_type,
+                primary_document=source_request.primary_document,
+                meta=source_request.meta,
+                files=[source_file_meta],
+            ),
+            SourceKind.FILING,
+            batch=batch,
+        )
+    except Exception:
+        batching_repository.rollback_batch(batch)
+        raise
+    batching_repository.commit_batch(batch)
 
     assert blob_repository.read_file_bytes(source_handle, "report.md") == b"source"
     assert blob_repository.read_file_bytes(processed_handle, "analysis.json") == b"processed"
@@ -389,7 +1132,9 @@ def test_existing_source_and_processed_handles_share_blob_contract(tmp_path: Pat
         "report.md",
     ]
     assert blob_repository.list_files(source_handle) == [source_file_meta]
-    blob_repository.delete_entry(processed_handle, "analysis.json")
+    delete_batch = batching_repository.begin_batch("AAPL")
+    blob_repository.delete_entry(processed_handle, "analysis.json", batch=delete_batch)
+    batching_repository.commit_batch(delete_batch)
     with pytest.raises(FileNotFoundError):
         blob_repository.read_file_bytes(processed_handle, "analysis.json")
 
@@ -429,7 +1174,7 @@ def test_each_precommit_failure_restores_original_observable_state(
         AssertionError: rollback后的物理状态或token生命周期错误时由pytest抛出。
     """
 
-    core, token = _begin_mutated_batch(tmp_path, old_target_exists=old_target_exists)
+    core, batch, paths = _begin_mutated_batch(tmp_path, old_target_exists=old_target_exists)
     original_replace = core._replace_directory
     original_write_journal = core._write_batch_journal
     injected_error = OSError(f"injected {failure_point}")
@@ -448,17 +1193,20 @@ def test_each_precommit_failure_restores_original_observable_state(
             OSError: 命中指定phase path时抛出。
         """
 
-        if failure_point == "backup_rename" and source == token.target_ticker_dir:
+        if failure_point == "backup_rename" and source == paths.target_ticker_dir:
             raise injected_error
-        if failure_point == "staging_rename" and source == token.staging_ticker_dir:
+        if failure_point == "staging_rename" and source == paths.staging_ticker_dir:
             raise injected_error
         original_replace(source, target)
 
-    def _write_journal(current_token: BatchToken, phase: str) -> None:
+    def _write_journal(
+        current_state: storage_infra_module._ActiveBatchState,
+        phase: str,
+    ) -> None:
         """按phase语义注入journal失败。
 
         Args:
-            current_token: 当前batch token。
+            current_state: 当前内部 transaction state。
             phase: 待写入phase。
 
         Returns:
@@ -477,23 +1225,23 @@ def test_each_precommit_failure_restores_original_observable_state(
         }
         if phase == phase_by_failure[failure_point]:
             raise injected_error
-        original_write_journal(current_token, phase)
+        original_write_journal(current_state, phase)
 
     monkeypatch.setattr(core, "_replace_directory", _replace_directory)
     monkeypatch.setattr(core, "_write_batch_journal", _write_journal)
 
     with pytest.raises(OSError) as exc_info:
-        core.commit_batch(token)
+        core.commit_batch(batch)
 
     assert exc_info.value is injected_error
     if old_target_exists:
-        assert (token.target_ticker_dir / "state.txt").read_text(encoding="utf-8") == "old"
+        assert (paths.target_ticker_dir / "state.txt").read_text(encoding="utf-8") == "old"
     else:
-        assert not token.target_ticker_dir.exists()
-    assert not token.staging_root_dir.exists()
-    assert not token.backup_dir.exists()
+        assert not paths.target_ticker_dir.exists()
+    assert not paths.staging_root_dir.exists()
+    assert not paths.backup_dir.exists()
     with pytest.raises(ValueError, match="无效的 batch token"):
-        core.rollback_batch(token)
+        core.rollback_batch(batch)
 
 
 def test_commit_and_rollback_failure_preserve_primary_cause_and_recovery_evidence(
@@ -513,7 +1261,7 @@ def test_commit_and_rollback_failure_preserve_primary_cause_and_recovery_evidenc
         AssertionError: 异常chain或evidence被覆盖/清理时由pytest抛出。
     """
 
-    core, token = _begin_mutated_batch(tmp_path, old_target_exists=True)
+    core, batch, paths = _begin_mutated_batch(tmp_path, old_target_exists=True)
     original_replace = core._replace_directory
     original_write_journal = core._write_batch_journal
     commit_error = OSError("injected swapped journal failure")
@@ -533,15 +1281,18 @@ def test_commit_and_rollback_failure_preserve_primary_cause_and_recovery_evidenc
             OSError: 命中target到staging撤回时抛出。
         """
 
-        if source == token.target_ticker_dir and target == token.staging_ticker_dir:
+        if source == paths.target_ticker_dir and target == paths.staging_ticker_dir:
             raise rollback_error
         original_replace(source, target)
 
-    def _write_journal(current_token: BatchToken, phase: str) -> None:
+    def _write_journal(
+        current_state: storage_infra_module._ActiveBatchState,
+        phase: str,
+    ) -> None:
         """在SWAPPED_TARGET journal写入时注入primary failure。
 
         Args:
-            current_token: 当前batch token。
+            current_state: 当前内部 transaction state。
             phase: 待写入phase。
 
         Returns:
@@ -553,23 +1304,283 @@ def test_commit_and_rollback_failure_preserve_primary_cause_and_recovery_evidenc
 
         if phase == _PHASE_SWAPPED_TARGET:
             raise commit_error
-        original_write_journal(current_token, phase)
+        original_write_journal(current_state, phase)
 
     monkeypatch.setattr(core, "_replace_directory", _replace_directory)
     monkeypatch.setattr(core, "_write_batch_journal", _write_journal)
 
     with pytest.raises(OSError) as exc_info:
-        core.commit_batch(token)
+        core.commit_batch(batch)
 
     assert exc_info.value is commit_error
     assert exc_info.value.__cause__ is rollback_error
     assert any("recovery evidence retained" in note for note in exc_info.value.__notes__)
-    assert token.journal_path.exists()
-    assert token.backup_dir.exists()
-    assert token.staging_root_dir.exists()
-    assert (token.target_ticker_dir / "state.txt").read_text(encoding="utf-8") == "new"
+    assert paths.journal_path.exists()
+    assert paths.backup_dir.exists()
+    assert paths.staging_root_dir.exists()
+    assert (paths.target_ticker_dir / "state.txt").read_text(encoding="utf-8") == "new"
     with pytest.raises(ValueError, match="无效的 batch token"):
-        core.rollback_batch(token)
+        core.rollback_batch(batch)
+
+
+def test_commit_primary_failure_survives_writer_release_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """commit 主失败与 writer release 双失败时必须保留 commit 主因并消费 capability。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: writer release failure 覆盖主因或 registry 未进入终态时抛出。
+    """
+
+    core, batch, paths = _begin_mutated_batch(tmp_path, old_target_exists=True)
+    state = _only_active_batch_state(core)
+    original_replace = core._replace_directory
+    original_release = core._release_lock_token
+    commit_error = OSError("injected commit primary failure")
+    release_error = RuntimeError("injected writer release failure")
+
+    def _replace_directory(source: Path, target: Path) -> None:
+        """在 target-to-backup rename 注入 commit 主失败。
+
+        Args:
+            source: rename 源目录。
+            target: rename 目标目录。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: 命中 commit 第一个 rename 时抛出。
+        """
+
+        if source == paths.target_ticker_dir and target == paths.backup_dir:
+            raise commit_error
+        original_replace(source, target)
+
+    def _release_lock_token(token: RuntimeFileLockToken) -> None:
+        """只在 terminal writer token release 注入次级失败。
+
+        Args:
+            token: 待释放的 runtime 文件锁 token。
+
+        Returns:
+            无。
+
+        Raises:
+            RuntimeError: token 是当前 transaction writer token 时抛出。
+        """
+
+        if token is state.writer_lock_token:
+            raise release_error
+        original_release(token)
+
+    monkeypatch.setattr(core, "_replace_directory", _replace_directory)
+    monkeypatch.setattr(core, "_release_lock_token", _release_lock_token)
+
+    try:
+        with pytest.raises(OSError) as exc_info:
+            core.commit_batch(batch)
+
+        assert exc_info.value is commit_error
+        assert any("writer mutex release failed" in note for note in exc_info.value.__notes__)
+        assert batch.transaction_id not in core._active_batches
+        assert "AAPL" not in core._active_transaction_by_ticker
+    finally:
+        original_release(state.writer_lock_token)
+
+
+def test_commit_batch_publication_release_failure_preserves_committed_truth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """COMMITTED 后 publication release 主失败必须抛出且不得回滚新 published tree。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: post-commit 主因被覆盖、durable tree 回滚或 capability 未终态时抛出。
+    """
+
+    core, batch, paths = _begin_mutated_batch(tmp_path, old_target_exists=True)
+    state = _only_active_batch_state(core)
+    original_release = core._release_lock_token
+    publication_release_error = RuntimeFileLockError(
+        "injected publication guard release failure"
+    )
+    cleanup_error = RuntimeError("injected post-commit cleanup failure")
+    writer_release_error = RuntimeError("injected writer release failure")
+    publication_token: RuntimeFileLockToken | None = None
+    rollback_called = False
+
+    def _release_lock_token(token: RuntimeFileLockToken) -> None:
+        """按真实 terminal 顺序注入 publication 与 writer release failure。
+
+        Args:
+            token: 待释放的 runtime 文件锁 token。
+
+        Returns:
+            无。
+
+        Raises:
+            RuntimeFileLockError: publication guard token 释放时抛出。
+            RuntimeError: writer token 释放时抛出。
+        """
+
+        nonlocal publication_token
+        if token is state.writer_lock_token:
+            raise writer_release_error
+        publication_token = token
+        raise publication_release_error
+
+    def _cleanup_committed_batch(
+        current_state: storage_infra_module._ActiveBatchState,
+    ) -> None:
+        """在 publication release 主失败后注入 cleanup 次级失败。
+
+        Args:
+            current_state: 已进入 COMMITTED 的 internal transaction state。
+
+        Returns:
+            无。
+
+        Raises:
+            RuntimeError: 始终抛出注入的 cleanup failure。
+        """
+
+        assert current_state is state
+        raise cleanup_error
+
+    def _rollback_precommit_batch(
+        current_state: storage_infra_module._ActiveBatchState,
+    ) -> None:
+        """记录错误实现是否误入 pre-commit rollback。
+
+        Args:
+            current_state: 被错误交给 rollback 的 internal transaction state。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        nonlocal rollback_called
+        assert current_state is state
+        rollback_called = True
+
+    monkeypatch.setattr(core, "_release_lock_token", _release_lock_token)
+    monkeypatch.setattr(core, "_cleanup_committed_batch", _cleanup_committed_batch)
+    monkeypatch.setattr(core, "_rollback_precommit_batch", _rollback_precommit_batch)
+
+    try:
+        with pytest.raises(RuntimeFileLockError) as exc_info:
+            core.commit_batch(batch)
+
+        assert exc_info.value is publication_release_error
+        assert any("post-commit cleanup failed" in note for note in exc_info.value.__notes__)
+        assert any("writer mutex release failed" in note for note in exc_info.value.__notes__)
+        assert not rollback_called
+        assert state.phase == _PHASE_COMMITTED
+        assert (paths.target_ticker_dir / "state.txt").read_text(encoding="utf-8") == "new"
+        assert batch.transaction_id not in core._active_batches
+        assert "AAPL" not in core._active_transaction_by_ticker
+        with pytest.raises(ValueError, match="未在当前 storage core 登记"):
+            core.commit_batch(batch)
+    finally:
+        if publication_token is not None:
+            original_release(publication_token)
+        original_release(state.writer_lock_token)
+
+
+def test_rollback_journal_failure_survives_writer_release_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """rollback journal 主失败与 writer release 双失败时必须保留 journal 主因。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: writer release failure 覆盖 journal 主因或 registry 未消费时抛出。
+    """
+
+    core, batch, _paths = _begin_mutated_batch(tmp_path, old_target_exists=True)
+    state = _only_active_batch_state(core)
+    original_write_journal = core._write_batch_journal
+    original_release = core._release_lock_token
+    rollback_error = OSError("injected rollback journal failure")
+    release_error = RuntimeError("injected writer release failure")
+
+    def _write_batch_journal(
+        current_state: storage_infra_module._ActiveBatchState,
+        phase: str,
+    ) -> None:
+        """在 ROLLED_BACK journal 写入注入 rollback 主失败。
+
+        Args:
+            current_state: 当前 internal transaction state。
+            phase: 待写入的 journal phase。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: phase 是 ROLLED_BACK 时抛出。
+        """
+
+        if phase == _PHASE_ROLLED_BACK:
+            raise rollback_error
+        original_write_journal(current_state, phase)
+
+    def _release_lock_token(token: RuntimeFileLockToken) -> None:
+        """只在 terminal writer token release 注入次级失败。
+
+        Args:
+            token: 待释放的 runtime 文件锁 token。
+
+        Returns:
+            无。
+
+        Raises:
+            RuntimeError: token 是当前 transaction writer token 时抛出。
+        """
+
+        if token is state.writer_lock_token:
+            raise release_error
+        original_release(token)
+
+    monkeypatch.setattr(core, "_write_batch_journal", _write_batch_journal)
+    monkeypatch.setattr(core, "_release_lock_token", _release_lock_token)
+
+    try:
+        with pytest.raises(OSError) as exc_info:
+            core.rollback_batch(batch)
+
+        assert exc_info.value is rollback_error
+        assert any("writer mutex release failed" in note for note in exc_info.value.__notes__)
+        assert batch.transaction_id not in core._active_batches
+        assert "AAPL" not in core._active_transaction_by_ticker
+    finally:
+        original_release(state.writer_lock_token)
 
 
 @pytest.mark.parametrize(
@@ -591,14 +1602,18 @@ def test_orphan_recovery_follows_journal_commit_point(tmp_path: Path, phase: str
     """
 
     core = _build_core(tmp_path)
-    token = _seed_orphan_batch(core, token_id=f"token-{phase}", phase=phase, old_target_exists=True)
+    paths = _seed_orphan_batch(
+        core,
+        phase=phase,
+        old_target_exists=True,
+    )
 
     core.recover_orphan_batches()
 
     expected = "new" if phase == _PHASE_COMMITTED else "old"
-    assert (token.target_ticker_dir / "state.txt").read_text(encoding="utf-8") == expected
-    assert not token.backup_dir.exists()
-    assert not token.staging_root_dir.exists()
+    assert (paths.target_ticker_dir / "state.txt").read_text(encoding="utf-8") == expected
+    assert not paths.backup_dir.exists()
+    assert not paths.staging_root_dir.exists()
 
 
 def test_swapped_target_recovery_without_old_target_deletes_new_target(tmp_path: Path) -> None:
@@ -615,17 +1630,218 @@ def test_swapped_target_recovery_without_old_target_deletes_new_target(tmp_path:
     """
 
     core = _build_core(tmp_path)
-    token = _seed_orphan_batch(
+    paths = _seed_orphan_batch(
         core,
-        token_id="token-swapped-absent",
         phase=_PHASE_SWAPPED_TARGET,
         old_target_exists=False,
     )
 
     core.recover_orphan_batches()
 
-    assert not token.target_ticker_dir.exists()
-    assert not token.staging_root_dir.exists()
+    assert not paths.target_ticker_dir.exists()
+    assert not paths.staging_root_dir.exists()
+
+
+def test_recovery_rejects_nonminimal_journal_fields_without_touching_evidence(
+    tmp_path: Path,
+) -> None:
+    """recovery journal 字段必须闭集，额外 lock/layout 字段应 fail closed。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非最小 journal 被消费或 recovery evidence 被改动时抛出。
+    """
+
+    core = _build_core(tmp_path)
+    paths = _seed_orphan_batch(
+        core,
+        phase=_PHASE_STARTED,
+        old_target_exists=True,
+    )
+    journal = json.loads(paths.journal_path.read_text(encoding="utf-8"))
+    journal["publication_lock"] = "AAPL.publication.lock"
+    storage_utils_module._write_json(paths.journal_path, journal)
+
+    actions = core.recover_orphan_batches()
+
+    assert actions == (
+        f"skip batch transaction={paths.staging_root_dir.name} reason=invalid_journal_fields",
+    )
+    assert paths.staging_root_dir.exists()
+    assert (paths.target_ticker_dir / "state.txt").read_text(encoding="utf-8") == "old"
+
+
+@pytest.mark.parametrize("raw_journal", ("{", "", "[]"))
+def test_unparseable_journal_preserves_evidence_and_later_orphan_recovers(
+    tmp_path: Path,
+    raw_journal: str,
+) -> None:
+    """不可解析或非 object journal 应保留 evidence，并继续同轮合法 recovery。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        raw_journal: 截断、空或非 object 的 transaction journal 文本。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: malformed evidence 被消费或后续合法 orphan 未恢复时抛出。
+        OSError: fixture 文件读写或 recovery 失败时抛出。
+    """
+
+    core = _build_core(tmp_path)
+    invalid_transaction_dir = core.batch_root / "000-unparseable-journal"
+    invalid_transaction_dir.mkdir(parents=True)
+    invalid_journal_path = invalid_transaction_dir / "transaction.json"
+    invalid_journal_path.write_text(raw_journal, encoding="utf-8")
+    valid_paths = _seed_orphan_batch(
+        core,
+        phase=_PHASE_BACKED_UP_TARGET,
+        old_target_exists=True,
+    )
+
+    actions = core.recover_orphan_batches()
+
+    assert (
+        f"skip batch transaction={invalid_transaction_dir.name} reason=unparseable_journal"
+        in actions
+    )
+    assert any(
+        action.startswith(
+            f"restore backup ticker=AAPL transaction={valid_paths.staging_root_dir.name}"
+        )
+        for action in actions
+    )
+    assert invalid_transaction_dir.is_dir()
+    assert invalid_journal_path.read_text(encoding="utf-8") == raw_journal
+    assert (valid_paths.target_ticker_dir / "state.txt").read_text(encoding="utf-8") == "old"
+    assert not valid_paths.staging_root_dir.exists()
+
+
+def test_invalid_journal_ticker_preserves_evidence_and_later_orphan_recovers(
+    tmp_path: Path,
+) -> None:
+    """非法 journal ticker 应保留自身 evidence，且不阻断同轮后续合法 batch recovery。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法 evidence 被消费、published tree 被误写或合法 orphan 未恢复时抛出。
+    """
+
+    core = _build_core(tmp_path)
+    protected_target = core.portfolio_root / "MSFT"
+    _write_state(protected_target, "published")
+    invalid_transaction_dir = core.batch_root / "000-invalid-journal"
+    invalid_transaction_dir.mkdir(parents=True)
+    storage_utils_module._write_json(
+        invalid_transaction_dir / "transaction.json",
+        {
+            "transaction_id": invalid_transaction_dir.name,
+            "ticker": "../MSFT",
+            "phase": _PHASE_STARTED,
+        },
+    )
+    valid_paths = _seed_orphan_batch(
+        core,
+        phase=_PHASE_BACKED_UP_TARGET,
+        old_target_exists=True,
+    )
+
+    actions = core.recover_orphan_batches()
+
+    assert (
+        f"skip batch transaction={invalid_transaction_dir.name} reason=invalid_journal_ticker"
+        in actions
+    )
+    assert any(
+        action.startswith(
+            f"restore backup ticker=AAPL transaction={valid_paths.staging_root_dir.name}"
+        )
+        for action in actions
+    )
+    assert invalid_transaction_dir.exists()
+    assert (protected_target / "state.txt").read_text(encoding="utf-8") == "published"
+    assert (valid_paths.target_ticker_dir / "state.txt").read_text(encoding="utf-8") == "old"
+    assert not valid_paths.staging_root_dir.exists()
+
+
+def test_invalid_orphan_backup_ticker_preserves_evidence_and_later_backup_recovers(
+    tmp_path: Path,
+) -> None:
+    """非法 backup ticker 应保留目录，且不阻断同轮后续合法 orphan backup recovery。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法 backup 被消费、published tree 被误写或合法 backup 未恢复时抛出。
+    """
+
+    core = _build_core(tmp_path)
+    protected_target = core.portfolio_root / "AAPL"
+    _write_state(protected_target, "published")
+    # 完整目录名是跨平台合法单路径组件；parser 得到的 ticker 为 ``..``，normalizer 必然拒绝。
+    invalid_backup = core.backup_root / "...bak.000-invalid-backup"
+    valid_backup = core.backup_root / "MSFT.bak.999-valid-backup"
+    _write_state(invalid_backup, "invalid")
+    _write_state(valid_backup, "valid")
+
+    actions = core.recover_orphan_batches()
+
+    assert (
+        f"preserve backup directory={invalid_backup.name} reason=invalid_backup_ticker"
+        in actions
+    )
+    assert "restore backup ticker=MSFT transaction=999-valid-backup" in actions
+    assert invalid_backup.exists()
+    assert (invalid_backup / "state.txt").read_text(encoding="utf-8") == "invalid"
+    assert (protected_target / "state.txt").read_text(encoding="utf-8") == "published"
+    assert not valid_backup.exists()
+    assert (core.portfolio_root / "MSFT" / "state.txt").read_text(encoding="utf-8") == "valid"
+
+
+def test_recovery_rejects_symlinked_transaction_directory_without_escape(tmp_path: Path) -> None:
+    """recovery 不得跟随 batch root 下的 transaction symlink 访问外部目录。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: recovery 跟随 symlink 或改写外部 sentinel 时抛出。
+        OSError: 测试环境无法创建 symlink 时抛出。
+    """
+
+    core = _build_core(tmp_path)
+    outside = tmp_path / "outside-transaction"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("outside", encoding="utf-8")
+    (core.batch_root / "symlinked-transaction").symlink_to(
+        outside,
+        target_is_directory=True,
+    )
+
+    core.recover_orphan_batches()
+
+    assert sentinel.read_text(encoding="utf-8") == "outside"
+    assert (core.batch_root / "symlinked-transaction").is_symlink()
 
 
 def test_postcommit_cleanup_failure_returns_success_and_recovery_cleans_evidence(
@@ -645,7 +1861,7 @@ def test_postcommit_cleanup_failure_returns_success_and_recovery_cleans_evidence
         AssertionError: commit返回、target或后续recovery行为错误时由pytest抛出。
     """
 
-    core, token = _begin_mutated_batch(tmp_path, old_target_exists=True)
+    core, batch, paths = _begin_mutated_batch(tmp_path, old_target_exists=True)
     original_remove = core._remove_directory
     cleanup_error = OSError("injected committed backup cleanup failure")
 
@@ -662,26 +1878,74 @@ def test_postcommit_cleanup_failure_returns_success_and_recovery_cleans_evidence
             OSError: path为本batch backup时抛出。
         """
 
-        if path == token.backup_dir:
+        if path == paths.backup_dir:
             raise cleanup_error
         original_remove(path)
 
     monkeypatch.setattr(core, "_remove_directory", _remove_directory)
 
-    core.commit_batch(token)
+    core.commit_batch(batch)
 
-    assert (token.target_ticker_dir / "state.txt").read_text(encoding="utf-8") == "new"
-    assert token.backup_dir.exists()
-    assert token.journal_path.exists()
-    journal = json.loads(token.journal_path.read_text(encoding="utf-8"))
+    assert (paths.target_ticker_dir / "state.txt").read_text(encoding="utf-8") == "new"
+    assert paths.backup_dir.exists()
+    assert paths.journal_path.exists()
+    journal = json.loads(paths.journal_path.read_text(encoding="utf-8"))
     assert journal["phase"] == _PHASE_COMMITTED
     monkeypatch.setattr(core, "_remove_directory", original_remove)
 
     core.recover_orphan_batches()
 
-    assert (token.target_ticker_dir / "state.txt").read_text(encoding="utf-8") == "new"
-    assert not token.backup_dir.exists()
-    assert not token.staging_root_dir.exists()
+    assert (paths.target_ticker_dir / "state.txt").read_text(encoding="utf-8") == "new"
+    assert not paths.backup_dir.exists()
+    assert not paths.staging_root_dir.exists()
+
+
+def test_commit_cleanup_exception_still_consumes_token_and_releases_writer_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """commit 已成功后即使 cleanup helper 异常也必须关闭 registry 与 writer mutex。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: cleanup 异常留下 active capability 或 writer lock 时抛出。
+    """
+
+    core, batch, _paths = _begin_mutated_batch(tmp_path, old_target_exists=True)
+    cleanup_error = RuntimeError("injected cleanup helper failure")
+
+    def _raise_cleanup(current_state: storage_infra_module._ActiveBatchState) -> None:
+        """模拟已 commit 后的非文件系统 cleanup 异常。
+
+        Args:
+            current_state: 已提交的内部 transaction state。
+
+        Returns:
+            无。
+
+        Raises:
+            RuntimeError: 始终抛出测试异常。
+        """
+
+        del current_state
+        raise cleanup_error
+
+    monkeypatch.setattr(core, "_cleanup_committed_batch", _raise_cleanup)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        core.commit_batch(batch)
+
+    assert exc_info.value is cleanup_error
+    with pytest.raises(ValueError, match="未在当前 storage core 登记"):
+        core.rollback_batch(batch)
+    replacement_batch = core.begin_batch("AAPL")
+    core.rollback_batch(replacement_batch)
 
 
 def test_committed_journal_write_syncs_parent_directory(
@@ -701,7 +1965,7 @@ def test_committed_journal_write_syncs_parent_directory(
         AssertionError: COMMITTED未触发parent directory sync时由pytest抛出。
     """
 
-    core, token = _begin_mutated_batch(tmp_path, old_target_exists=True)
+    core, batch, paths = _begin_mutated_batch(tmp_path, old_target_exists=True)
     original_sync = storage_utils_module._fsync_directory
     original_write_journal = core._write_batch_journal
     synced_paths: list[Path] = []
@@ -723,11 +1987,14 @@ def test_committed_journal_write_syncs_parent_directory(
         synced_paths.append(path)
         original_sync(path)
 
-    def _record_journal(current_token: BatchToken, phase: str) -> None:
+    def _record_journal(
+        current_state: storage_infra_module._ActiveBatchState,
+        phase: str,
+    ) -> None:
         """记录每个phase写入后最新directory sync。
 
         Args:
-            current_token: 当前batch token。
+            current_state: 当前内部 transaction state。
             phase: 待写入phase。
 
         Returns:
@@ -738,16 +2005,16 @@ def test_committed_journal_write_syncs_parent_directory(
         """
 
         before = len(synced_paths)
-        original_write_journal(current_token, phase)
+        original_write_journal(current_state, phase)
         if phase == _PHASE_COMMITTED:
             committed_sync_paths.extend(synced_paths[before:])
 
     monkeypatch.setattr(storage_utils_module, "_fsync_directory", _record_sync)
     monkeypatch.setattr(core, "_write_batch_journal", _record_journal)
 
-    core.commit_batch(token)
+    core.commit_batch(batch)
 
-    assert token.journal_path.parent in committed_sync_paths
+    assert paths.journal_path.parent in committed_sync_paths
 
 
 def test_commit_critical_directory_renames_sync_both_parents(
@@ -767,7 +2034,7 @@ def test_commit_critical_directory_renames_sync_both_parents(
         AssertionError: 任一关键rename父目录未刷新时由pytest抛出。
     """
 
-    core, token = _begin_mutated_batch(tmp_path, old_target_exists=True)
+    core, batch, paths = _begin_mutated_batch(tmp_path, old_target_exists=True)
     original_sync = storage_infra_module._fsync_directory
     synced_paths: list[Path] = []
 
@@ -789,11 +2056,430 @@ def test_commit_critical_directory_renames_sync_both_parents(
 
     monkeypatch.setattr(storage_infra_module, "_fsync_directory", _record_sync)
 
-    core.commit_batch(token)
+    core.commit_batch(batch)
 
-    assert token.target_ticker_dir.parent in synced_paths
-    assert token.backup_dir.parent in synced_paths
-    assert token.staging_ticker_dir.parent in synced_paths
+    assert paths.target_ticker_dir.parent in synced_paths
+    assert paths.backup_dir.parent in synced_paths
+    assert paths.staging_ticker_dir.parent in synced_paths
+
+
+def test_concurrent_published_read_ignores_long_writer_staging_and_sees_old(
+    tmp_path: Path,
+) -> None:
+    """长 staging 只持 writer mutex；独立进程 published reader 应立即读到 old。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: reader 被 writer mutex 阻塞或看见 staging 时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    source = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    initial_batch = batching.begin_batch("AAPL")
+    _create_complete_source(
+        source,
+        blob,
+        batch=initial_batch,
+        document_id="published-old",
+    )
+    batching.commit_batch(initial_batch)
+    active_batch = batching.begin_batch("AAPL")
+    _create_complete_source(
+        source,
+        blob,
+        batch=active_batch,
+        document_id="staged-new",
+    )
+
+    assert source.list_source_document_ids("AAPL", SourceKind.FILING) == ["published-old"]
+    context = multiprocessing.get_context("spawn")
+    parent_connection, child_connection = context.Pipe(duplex=True)
+    process = context.Process(
+        target=_read_source_ids_in_process,
+        args=(str(workspace_root), child_connection),
+    )
+    process.start()
+    child_connection.close()
+    try:
+        assert parent_connection.poll(5)
+        assert parent_connection.recv_bytes() == b"publication_acquire_entered"
+        assert parent_connection.poll(2)
+        assert parent_connection.recv_bytes() == b"published-old"
+    finally:
+        process.join(timeout=5)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        parent_connection.close()
+        batching.rollback_batch(active_batch)
+    assert process.exitcode == 0
+
+
+def test_complete_source_validator_barrier_does_not_hold_publication_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """长 validator barrier 期间 published reader 应及时读取 old 完整 source。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: validator 错误持有 publication guard 或 reader 看到 staging 时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    core = repository_set.core
+    batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    source = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    old_batch = batching.begin_batch("AAPL")
+    _create_complete_source(
+        source,
+        blob,
+        batch=old_batch,
+        document_id="old_source",
+    )
+    batching.commit_batch(old_batch)
+    new_batch = batching.begin_batch("AAPL")
+    _create_complete_source(
+        source,
+        blob,
+        batch=new_batch,
+        document_id="new_source",
+    )
+    original_validator = core._validate_complete_source_tree
+    validator_entered = Event()
+    allow_validator = Event()
+
+    def _blocked_validator(state: storage_infra_module._ActiveBatchState) -> None:
+        """在真实 validator 调用前建立长时间测试 barrier。
+
+        Args:
+            state: 当前 storage-owned active batch state。
+
+        Returns:
+            无。
+
+        Raises:
+            TimeoutError: 测试未及时释放 barrier 时抛出。
+            ValueError: 真实 validator 拒绝 staged tree 时抛出。
+            OSError: 真实 validator I/O 失败时抛出。
+        """
+
+        validator_entered.set()
+        if not allow_validator.wait(timeout=5):
+            raise TimeoutError("complete source validator barrier 未释放")
+        original_validator(state)
+
+    monkeypatch.setattr(core, "_validate_complete_source_tree", _blocked_validator)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        commit_future = executor.submit(batching.commit_batch, new_batch)
+        assert validator_entered.wait(timeout=5)
+        read_future = executor.submit(
+            source.list_source_document_ids,
+            "AAPL",
+            SourceKind.FILING,
+        )
+        assert read_future.result(timeout=1) == ["old_source"]
+        allow_validator.set()
+        commit_future.result(timeout=5)
+
+    assert source.list_source_document_ids("AAPL", SourceKind.FILING) == [
+        "new_source",
+        "old_source",
+    ]
+
+
+def test_complete_source_rollback_and_precommit_recovery_keep_source_absent(
+    tmp_path: Path,
+) -> None:
+    """caller rollback 与 STARTED orphan recovery 都不得发布半个或完整 staging source。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: rollback/recovery 后 source 或 blob 变得可见时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    core = repository_set.core
+    batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    source = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    rollback_batch = batching.begin_batch("AAPL")
+    rollback_handle = _create_complete_source(
+        source,
+        blob,
+        batch=rollback_batch,
+        document_id="rolled_back_source",
+    )
+    batching.rollback_batch(rollback_batch)
+    with pytest.raises(FileNotFoundError):
+        source.get_source_meta("AAPL", "rolled_back_source", SourceKind.FILING)
+    with pytest.raises(FileNotFoundError):
+        blob.read_file_bytes(rollback_handle, "rolled_back_source.txt")
+
+    orphan_batch = batching.begin_batch("AAPL")
+    orphan_handle = _create_complete_source(
+        source,
+        blob,
+        batch=orphan_batch,
+        document_id="orphan_source",
+    )
+    state = _only_active_batch_state(core)
+    core._close_active_batch(state)
+    actions = core.recover_orphan_batches()
+    fresh_source = FsSourceDocumentRepository(workspace_root)
+    fresh_blob = FsDocumentBlobRepository(workspace_root)
+
+    assert any(
+        "cleanup batch ticker=AAPL" in action and "phase=started" in action
+        for action in actions
+    )
+    with pytest.raises(FileNotFoundError):
+        fresh_source.get_source_meta("AAPL", "orphan_source", SourceKind.FILING)
+    with pytest.raises(FileNotFoundError):
+        fresh_blob.read_file_bytes(orphan_handle, "orphan_source.txt")
+
+
+@pytest.mark.parametrize("barrier", ("target_to_backup", "staging_to_target"))
+def test_concurrent_reader_blocks_at_each_publication_rename_barrier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    barrier: _PublicationBarrier,
+) -> None:
+    """两个 physical rename barrier 内 reader 都应等待 publication guard 后只见 new。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+        barrier: target->backup 或 staging->target 注入点。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 独立进程未共享 guard、进入 missing window 或终态错误时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    core = repository_set.core
+    batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    source = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    initial_batch = batching.begin_batch("AAPL")
+    _create_complete_source(
+        source,
+        blob,
+        batch=initial_batch,
+        document_id="published-old",
+    )
+    batching.commit_batch(initial_batch)
+    active_batch = batching.begin_batch("AAPL")
+    _create_complete_source(
+        source,
+        blob,
+        batch=active_batch,
+        document_id="published-new",
+    )
+    paths = _active_batch_paths(core)
+    original_replace = core._replace_directory
+    rename_entered = Event()
+    allow_rename = Event()
+
+    def _block_selected_rename(source_path: Path, target_path: Path) -> None:
+        """在指定 publication rename 前建立真实在线 reader barrier。
+
+        Args:
+            source_path: rename 源目录。
+            target_path: rename 目标目录。
+
+        Returns:
+            无。
+
+        Raises:
+            TimeoutError: 测试未及时释放 rename barrier 时抛出。
+            OSError: 真实 rename 失败时抛出。
+        """
+
+        selected = (
+            barrier == "target_to_backup" and source_path == paths.target_ticker_dir
+        ) or (
+            barrier == "staging_to_target" and source_path == paths.staging_ticker_dir
+        )
+        if selected:
+            rename_entered.set()
+            if not allow_rename.wait(timeout=5):
+                raise TimeoutError("publication rename barrier 未释放")
+        original_replace(source_path, target_path)
+
+    monkeypatch.setattr(core, "_replace_directory", _block_selected_rename)
+    context = multiprocessing.get_context("spawn")
+    parent_connection, child_connection = context.Pipe(duplex=True)
+    process = context.Process(
+        target=_read_source_ids_in_process,
+        args=(str(workspace_root), child_connection),
+    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        commit_future = executor.submit(batching.commit_batch, active_batch)
+        assert rename_entered.wait(timeout=5)
+        process.start()
+        child_connection.close()
+        try:
+            assert parent_connection.poll(5)
+            assert parent_connection.recv_bytes() == b"publication_acquire_entered"
+            with pytest.raises(RuntimeError, match="已存在跨进程活动 batch"):
+                core._acquire_lock_token(
+                    core._publication_lock_path("AAPL"),
+                    blocking=False,
+                )
+            allow_rename.set()
+            commit_future.result(timeout=5)
+            assert parent_connection.poll(5)
+            assert parent_connection.recv_bytes() == b"published-new\0published-old"
+        finally:
+            allow_rename.set()
+            process.join(timeout=5)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+            parent_connection.close()
+    assert process.exitcode == 0
+
+
+def test_batch_explicit_staged_xbrl_read_is_separate_from_published_read(tmp_path: Path) -> None:
+    """staged XBRL 读取必须显式 batch；默认 published 读取不得看见 staging。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: staged/published read scope 混淆时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    source = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    batch = batching.begin_batch("AAPL")
+    handle = SourceHandle(
+        ticker="AAPL",
+        document_id="staged-xbrl",
+        source_kind=SourceKind.FILING.value,
+    )
+    blob.store_file(
+        handle,
+        "instance.xml",
+        io.BytesIO(b"<xbrl />"),
+        batch=batch,
+        content_type="application/xml",
+    )
+
+    assert source.has_staged_filing_xbrl_instance("AAPL", "staged-xbrl", batch=batch)
+    with pytest.raises(FileNotFoundError):
+        source.has_filing_xbrl_instance("AAPL", "staged-xbrl")
+    batching.rollback_batch(batch)
+
+
+def test_concurrent_composed_source_read_and_delayed_open_do_not_self_deadlock(
+    tmp_path: Path,
+) -> None:
+    """outer/private read graph 与 delayed opener 应各只在自己的短窗获取一次 guard。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: public-to-public 嵌套锁或 opener 未释放 guard 时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    core = repository_set.core
+    batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    source = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    batch = batching.begin_batch("AAPL")
+    request = _source_request("composed-read")
+    handle = SourceHandle(
+        ticker="AAPL",
+        document_id="composed-read",
+        source_kind=SourceKind.FILING.value,
+    )
+    file_meta = blob.store_file(
+        handle,
+        "composed-read.txt",
+        io.BytesIO(b"stable descriptor"),
+        batch=batch,
+        content_type="text/plain",
+    )
+    source.create_source_document(
+        SourceDocumentUpsertRequest(
+            ticker=request.ticker,
+            document_id=request.document_id,
+            internal_document_id=request.internal_document_id,
+            form_type=request.form_type,
+            primary_document=request.primary_document,
+            meta=request.meta,
+            files=[file_meta],
+        ),
+        SourceKind.FILING,
+        batch=batch,
+    )
+    batching.commit_batch(batch)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        read_future = executor.submit(_read_primary_source_bytes, source)
+        assert read_future.result(timeout=5) == b"stable descriptor"
+
+    delayed_source = source.get_primary_source("AAPL", "composed-read", SourceKind.FILING)
+    stream = delayed_source.open()
+    try:
+        publication_token = core._acquire_lock_token(
+            core._publication_lock_path("AAPL"),
+            blocking=False,
+        )
+        core._release_lock_token(publication_token)
+        assert stream.read() == b"stable descriptor"
+    finally:
+        stream.close()
+
+    published_path = _local_path_from_uri(core.portfolio_root, file_meta.uri)
+    published_path.unlink()
+    with pytest.raises(FileNotFoundError):
+        delayed_source.open()
+    publication_token = core._acquire_lock_token(
+        core._publication_lock_path("AAPL"),
+        blocking=False,
+    )
+    core._release_lock_token(publication_token)
 
 
 @pytest.mark.parametrize("target_kind", ("directory", "broken_symlink"))
@@ -1036,6 +2722,144 @@ def test_local_file_store_rejects_symlink_key_escape(tmp_path: Path) -> None:
     assert tuple(outside_root.iterdir()) == ()
 
 
+def _source_request(document_id: str, *, ticker: str = "AAPL") -> SourceDocumentUpsertRequest:
+    """构造 storage owner tests 使用的最小 source mutation 请求。
+
+    Args:
+        document_id: source document ID。
+        ticker: transaction ticker。
+
+    Returns:
+        具备稳定主文件 identity 的 source upsert 请求。
+
+    Raises:
+        无。
+    """
+
+    return SourceDocumentUpsertRequest(
+        ticker=ticker,
+        document_id=document_id,
+        internal_document_id=document_id,
+        form_type="10-K",
+        primary_document=f"{document_id}.txt",
+        meta={
+            "ingest_method": "upload",
+            "source_provider": "user_upload",
+        },
+    )
+
+
+def _create_complete_source(
+    source_repository: FsSourceDocumentRepository,
+    blob_repository: FsDocumentBlobRepository,
+    *,
+    batch: BatchToken,
+    document_id: str,
+    source_kind: SourceKind = SourceKind.FILING,
+    ticker: str = "AAPL",
+    payload: bytes | None = None,
+) -> SourceHandle:
+    """通过 blob-first + 单次 final source mutation 构造完整 source。
+
+    Args:
+        source_repository: source 业务事实仓储。
+        blob_repository: 与 source 仓储共享 core 的 blob 仓储。
+        batch: 当前显式 transaction capability。
+        document_id: source 文档 ID。
+        source_kind: filing 或 material。
+        ticker: transaction ticker。
+        payload: 可选测试文件内容。
+
+    Returns:
+        完整 source 的业务 handle。
+
+    Raises:
+        OSError: blob 或 final source staging 写入失败时抛出。
+        ValueError: identity 或完整 source 输入非法时抛出。
+    """
+
+    filename = f"{document_id}.txt"
+    handle = SourceHandle(
+        ticker=ticker,
+        document_id=document_id,
+        source_kind=source_kind.value,
+    )
+    file_meta = blob_repository.store_file(
+        handle,
+        filename,
+        io.BytesIO(payload if payload is not None else document_id.encode("utf-8")),
+        batch=batch,
+        content_type="text/plain",
+    )
+    source_repository.create_source_document(
+        SourceDocumentUpsertRequest(
+            ticker=ticker,
+            document_id=document_id,
+            internal_document_id=document_id,
+            form_type="10-K" if source_kind is SourceKind.FILING else "EX-99",
+            primary_document=filename,
+            meta={
+                "ingest_method": "upload",
+                "source_provider": "user_upload",
+            },
+            files=[file_meta],
+        ),
+        source_kind,
+        batch=batch,
+    )
+    return handle
+
+
+def _read_source_ids_in_process(workspace_root: str, connection: Connection) -> None:
+    """在独立进程通过独立 repository core 读取 published source IDs。
+
+    Args:
+        workspace_root: 共享 workspace 的绝对路径字符串。
+        connection: 向父进程报告 barrier 与读取结果的连接。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: repository 初始化、publication lock 或 pipe 写入失败时抛出。
+    """
+
+    try:
+        repository_set = build_fs_repository_set(workspace_root=Path(workspace_root))
+        repository = FsSourceDocumentRepository(
+            Path(workspace_root),
+            repository_set=repository_set,
+        )
+        core = repository_set.core
+        signalling_acquire = _PublicationGuardAcquireSignal(
+            connection,
+            core._acquire_publication_guard,
+        )
+        with patch.object(core, "_acquire_publication_guard", signalling_acquire):
+            document_ids = repository.list_source_document_ids("AAPL", SourceKind.FILING)
+        connection.send_bytes("\0".join(document_ids).encode("utf-8"))
+    finally:
+        connection.close()
+
+
+def _read_primary_source_bytes(repository: FsSourceDocumentRepository) -> bytes:
+    """执行 composed primary-source public read 并消费 delayed opener。
+
+    Args:
+        repository: source repository。
+
+    Returns:
+        主文件字节。
+
+    Raises:
+        OSError: public read、文件打开或读取失败时抛出。
+    """
+
+    source = repository.get_primary_source("AAPL", "composed-read", SourceKind.FILING)
+    with source.open() as stream:
+        return stream.read()
+
+
 def _build_core(tmp_path: Path) -> FsStorageCore:
     """构造测试用shared filesystem storage core。
 
@@ -1056,7 +2880,7 @@ def _begin_mutated_batch(
     tmp_path: Path,
     *,
     old_target_exists: bool,
-) -> tuple[FsStorageCore, BatchToken]:
+) -> tuple[FsStorageCore, BatchToken, _BatchPaths]:
     """构造包含new staging内容的active batch。
 
     Args:
@@ -1064,7 +2888,7 @@ def _begin_mutated_batch(
         old_target_exists: 是否先创建旧正式target。
 
     Returns:
-        storage core与active token。
+        storage core、active public token 与 storage owner state 中的物理路径。
 
     Raises:
         OSError: 目录或文件准备失败时抛出。
@@ -1075,28 +2899,27 @@ def _begin_mutated_batch(
     if old_target_exists:
         target_dir.mkdir(parents=True)
         (target_dir / "state.txt").write_text("old", encoding="utf-8")
-    token = core.begin_batch("AAPL")
-    (token.staging_ticker_dir / "state.txt").write_text("new", encoding="utf-8")
-    return core, token
+    batch = core.begin_batch("AAPL")
+    paths = _active_batch_paths(core)
+    (paths.staging_ticker_dir / "state.txt").write_text("new", encoding="utf-8")
+    return core, batch, paths
 
 
 def _seed_orphan_batch(
     core: FsStorageCore,
     *,
-    token_id: str,
     phase: str,
     old_target_exists: bool,
-) -> BatchToken:
+) -> _BatchPaths:
     """按指定phase构造真实orphan目录与journal。
 
     Args:
         core: storage owner core。
-        token_id: 测试token id。
         phase: journal phase。
         old_target_exists: 提交前是否有旧target。
 
     Returns:
-        描述本次orphan物理路径的batch token。
+        描述本次 orphan 物理路径的测试路径对象。
 
     Raises:
         OSError: 测试目录或journal写入失败时抛出。
@@ -1104,37 +2927,61 @@ def _seed_orphan_batch(
 
     ticker = "AAPL"
     target_dir = core.portfolio_root / ticker
-    staging_root_dir = core.batch_root / token_id
-    staging_ticker_dir = staging_root_dir / ticker
-    backup_dir = core.backup_root / f"{ticker}.bak.{token_id}"
-    token = BatchToken(
-        token_id=token_id,
-        owner_token=f"owner-{token_id}",
-        owner_scope_id="test-scope",
-        ticker=ticker,
-        target_ticker_dir=target_dir,
-        staging_root_dir=staging_root_dir,
-        staging_ticker_dir=staging_ticker_dir,
-        backup_dir=backup_dir,
-        journal_path=staging_root_dir / "transaction.json",
-        ticker_lock_path=core.dayu_root / "batch_locks" / f"{ticker}.lock",
-        created_at="2026-07-12T00:00:00+00:00",
+    if old_target_exists:
+        _write_state(target_dir, "old")
+    core.begin_batch(ticker)
+    state = _only_active_batch_state(core)
+    paths = _active_batch_paths(core)
+    _write_state(paths.staging_ticker_dir, "new")
+    if phase in {_PHASE_BACKED_UP_TARGET, _PHASE_SWAPPED_TARGET, _PHASE_COMMITTED}:
+        if old_target_exists:
+            core._replace_directory(paths.target_ticker_dir, paths.backup_dir)
+    if phase in {_PHASE_SWAPPED_TARGET, _PHASE_COMMITTED}:
+        core._replace_directory(paths.staging_ticker_dir, paths.target_ticker_dir)
+    core._write_batch_journal(state, phase)
+    core._close_active_batch(state)
+    return paths
+
+
+def _only_active_batch_state(core: FsStorageCore) -> storage_infra_module._ActiveBatchState:
+    """取得测试 core 唯一的 storage-owned active state。
+
+    Args:
+        core: storage core。
+
+    Returns:
+        唯一 active transaction 的内部 owner state。
+
+    Raises:
+        AssertionError: active state 数量不是一时抛出。
+    """
+
+    states = tuple(core._active_batches.values())
+    assert len(states) == 1
+    return states[0]
+
+
+def _active_batch_paths(core: FsStorageCore) -> _BatchPaths:
+    """从 storage owner state 读取 failure-injection 所需物理路径。
+
+    Args:
+        core: storage core。
+
+    Returns:
+        唯一 active transaction 的内部物理路径快照。
+
+    Raises:
+        AssertionError: active state 数量不是一时抛出。
+    """
+
+    state = _only_active_batch_state(core)
+    return _BatchPaths(
+        target_ticker_dir=state.target_ticker_dir,
+        staging_root_dir=state.staging_root_dir,
+        staging_ticker_dir=state.staging_ticker_dir,
+        backup_dir=state.backup_dir,
+        journal_path=state.journal_path,
     )
-    staging_root_dir.mkdir(parents=True, exist_ok=True)
-    if phase == _PHASE_STARTED:
-        if old_target_exists:
-            _write_state(target_dir, "old")
-        _write_state(staging_ticker_dir, "new")
-    elif phase == _PHASE_BACKED_UP_TARGET:
-        if old_target_exists:
-            _write_state(backup_dir, "old")
-        _write_state(staging_ticker_dir, "new")
-    else:
-        if old_target_exists:
-            _write_state(backup_dir, "old")
-        _write_state(target_dir, "new")
-    core._write_batch_journal(token, phase)
-    return token
 
 
 def _write_state(directory: Path, value: str) -> None:

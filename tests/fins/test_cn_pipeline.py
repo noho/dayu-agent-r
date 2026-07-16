@@ -265,6 +265,7 @@ def _seed_cn_upload_company_meta(
         OSError: 仓储写入失败时抛出。
     """
 
+    batch = pipeline.batching_repository.begin_batch("600519")
     pipeline._company_repository.upsert_company_meta(
         CompanyMeta(
             company_id="600519_CN",
@@ -274,8 +275,10 @@ def _seed_cn_upload_company_meta(
             resolver_version=resolver_version,
             updated_at=now_iso8601(),
             ticker_aliases=ticker_aliases,
-        )
+        ),
+        batch=batch,
     )
+    pipeline.batching_repository.commit_batch(batch)
 
 
 def test_download_runs_cn_workflow_with_injected_discovery_client(tmp_path: Path) -> None:

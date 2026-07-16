@@ -9,10 +9,11 @@ import json
 import pickle
 import time
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from threading import Event, Lock
-from typing import Final, cast
+from typing import Final, Literal, cast
 
 import pytest
 
@@ -50,6 +51,7 @@ from dayu.documents.processors.base import (
 )
 from dayu.documents.processors.source import Source
 from dayu.fins.domain.document_models import (
+    BatchToken,
     CompanyMeta,
     DocumentMeta,
     DocumentSummary,
@@ -74,6 +76,7 @@ from dayu.fins.storage import (
     FsSourceDocumentRepository,
 )
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
+from dayu.fins.storage._fs_storage_core import FsStorageCore
 from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.tools.fins_limits import FinsToolLimits
 from dayu.fins.tools.error_contract import ErrorCode
@@ -144,6 +147,30 @@ _HOST_GOVERNANCE_FORBIDDEN_TERMS: Final[tuple[str, ...]] = (
     "sha256-secret",
     "token-secret",
 )
+_CompleteSourceFailureCase = Literal[
+    "missing_meta",
+    "empty_files",
+    "duplicate_files",
+    "dangling_file",
+    "missing_primary",
+    "invalid_ingest_method",
+    "invalid_provider",
+    "false_completion",
+    "ticker_mismatch",
+    "document_mismatch",
+    "source_kind_mismatch",
+    "uri_mismatch",
+    "size_mismatch",
+    "sha_mismatch",
+    "symlink_file_escape",
+    "filename_escape",
+    "unmanifested_file",
+    "missing_manifest",
+    "dangling_manifest",
+    "manifest_projection_mismatch",
+    "duplicate_manifest_identity",
+    "manifest_ticker_mismatch",
+]
 
 
 class _OpenCancellationToken:
@@ -861,7 +888,6 @@ def test_storage_repositories_list_and_read_fixture_documents(tmp_path: Path) ->
         "source_fingerprint",
         "form_type",
         "primary_document",
-        "ingest_complete",
         "is_deleted",
         "files.name",
         "files.uri",
@@ -892,11 +918,32 @@ def test_source_revision_changes_for_every_processor_input_field(
     workspace_root = tmp_path / f"revision-{changed_field.replace('.', '-')}"
     repository_set = build_fs_repository_set(workspace_root=workspace_root)
     repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
-    _create_source_revision_document(repository)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    create_batch = batching.begin_batch("AAPL")
+    _create_source_revision_document(
+        repository,
+        blob_repository,
+        batch=create_batch,
+    )
+    batching.commit_batch(create_batch)
     before = repository.get_source_revision("AAPL", "revision-doc", SourceKind.FILING)
     meta = repository.get_source_meta("AAPL", "revision-doc", SourceKind.FILING)
-    _mutate_source_revision_meta(meta, changed_field)
-    repository.replace_source_meta("AAPL", "revision-doc", SourceKind.FILING, meta)
+    replace_batch = batching.begin_batch("AAPL")
+    _mutate_source_revision_meta(
+        meta,
+        changed_field,
+        blob_repository=blob_repository,
+        batch=replace_batch,
+    )
+    repository.replace_source_meta(
+        "AAPL",
+        "revision-doc",
+        SourceKind.FILING,
+        meta,
+        batch=replace_batch,
+    )
+    batching.commit_batch(replace_batch)
 
     assert repository.get_source_revision("AAPL", "revision-doc", SourceKind.FILING) != before
 
@@ -917,14 +964,30 @@ def test_source_revision_is_stable_for_json_key_and_file_order(tmp_path: Path) -
     workspace_root = tmp_path / "revision-order"
     repository_set = build_fs_repository_set(workspace_root=workspace_root)
     repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
-    _create_source_revision_document(repository)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    create_batch = batching.begin_batch("AAPL")
+    _create_source_revision_document(
+        repository,
+        blob_repository,
+        batch=create_batch,
+    )
+    batching.commit_batch(create_batch)
     before = repository.get_source_revision("AAPL", "revision-doc", SourceKind.FILING)
     meta = repository.get_source_meta("AAPL", "revision-doc", SourceKind.FILING)
     files = meta["files"]
     assert isinstance(files, list)
     meta["files"] = list(reversed(files))
     reordered = dict(reversed(list(meta.items())))
-    repository.replace_source_meta("AAPL", "revision-doc", SourceKind.FILING, reordered)
+    replace_batch = batching.begin_batch("AAPL")
+    repository.replace_source_meta(
+        "AAPL",
+        "revision-doc",
+        SourceKind.FILING,
+        reordered,
+        batch=replace_batch,
+    )
+    batching.commit_batch(replace_batch)
 
     assert repository.get_source_revision("AAPL", "revision-doc", SourceKind.FILING) == before
 
@@ -945,23 +1008,54 @@ def test_source_revision_fails_closed_for_missing_or_invalid_fields(tmp_path: Pa
     workspace_root = tmp_path / "revision-invalid"
     repository_set = build_fs_repository_set(workspace_root=workspace_root)
     repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
-    _create_source_revision_document(repository)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    create_batch = batching.begin_batch("AAPL")
+    _create_source_revision_document(
+        repository,
+        blob_repository,
+        batch=create_batch,
+    )
+    batching.commit_batch(create_batch)
     meta = repository.get_source_meta("AAPL", "revision-doc", SourceKind.FILING)
     meta.pop("document_version")
-    repository.replace_source_meta("AAPL", "revision-doc", SourceKind.FILING, meta)
+    invalid_batch = batching.begin_batch("AAPL")
+    repository.replace_source_meta(
+        "AAPL",
+        "revision-doc",
+        SourceKind.FILING,
+        meta,
+        batch=invalid_batch,
+    )
+    batching.commit_batch(invalid_batch)
     with pytest.raises(KeyError, match="document_version"):
         repository.get_source_revision("AAPL", "revision-doc", SourceKind.FILING)
 
-    _create_source_revision_document(repository, replace_existing=True)
+    recreate_batch = batching.begin_batch("AAPL")
+    _create_source_revision_document(
+        repository,
+        blob_repository,
+        batch=recreate_batch,
+        replace_existing=True,
+    )
+    batching.commit_batch(recreate_batch)
     invalid_file_meta = repository.get_source_meta("AAPL", "revision-doc", SourceKind.FILING)
     files = invalid_file_meta["files"]
     assert isinstance(files, list)
     first_file = files[0]
     assert isinstance(first_file, dict)
     first_file["size"] = True
-    repository.replace_source_meta("AAPL", "revision-doc", SourceKind.FILING, invalid_file_meta)
+    invalid_file_batch = batching.begin_batch("AAPL")
+    repository.replace_source_meta(
+        "AAPL",
+        "revision-doc",
+        SourceKind.FILING,
+        invalid_file_meta,
+        batch=invalid_file_batch,
+    )
     with pytest.raises(ValueError, match="file.size"):
-        repository.get_source_revision("AAPL", "revision-doc", SourceKind.FILING)
+        batching.commit_batch(invalid_file_batch)
+    assert repository.get_source_revision("AAPL", "revision-doc", SourceKind.FILING)
 
 
 def test_document_summary_decode_rejects_invalid_fiscal_period_and_quality() -> None:
@@ -999,14 +1093,32 @@ def test_document_summary_decode_rejects_invalid_fiscal_period_and_quality() -> 
 
 
 def test_source_repository_projects_source_document_provenance(tmp_path: Path) -> None:
-    """source repository 应从 meta 投影 provider 与 ingest method 真源。"""
+    """source repository 应从 meta 投影 provider 与 ingest method 真源。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: provenance 投影与 source meta 不一致时抛出。
+    """
 
     workspace_root = tmp_path / "fins-provenance-workspace"
     repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
     source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    batches = {
+        ticker: batching_repository.begin_batch(ticker)
+        for ticker in ("AAPL", "600519", "0700")
+    }
 
     _create_source_document_for_provenance(
         source_repository=source_repository,
+        blob_repository=blob_repository,
+        batch=batches["AAPL"],
         ticker="AAPL",
         document_id="fil_sec",
         source_kind=SourceKind.FILING,
@@ -1015,6 +1127,8 @@ def test_source_repository_projects_source_document_provenance(tmp_path: Path) -
     )
     _create_source_document_for_provenance(
         source_repository=source_repository,
+        blob_repository=blob_repository,
+        batch=batches["600519"],
         ticker="600519",
         document_id="fil_cninfo",
         source_kind=SourceKind.FILING,
@@ -1023,6 +1137,8 @@ def test_source_repository_projects_source_document_provenance(tmp_path: Path) -
     )
     _create_source_document_for_provenance(
         source_repository=source_repository,
+        blob_repository=blob_repository,
+        batch=batches["0700"],
         ticker="0700",
         document_id="fil_hkexnews",
         source_kind=SourceKind.FILING,
@@ -1031,12 +1147,16 @@ def test_source_repository_projects_source_document_provenance(tmp_path: Path) -
     )
     _create_source_document_for_provenance(
         source_repository=source_repository,
+        blob_repository=blob_repository,
+        batch=batches["AAPL"],
         ticker="AAPL",
         document_id="upload_10k",
         source_kind=SourceKind.FILING,
         ingest_method="upload",
         source_provider=FinsSourceProvider.USER_UPLOAD.to_storage_value(),
     )
+    for batch in batches.values():
+        batching_repository.commit_batch(batch)
 
     assert source_repository.get_source_document_provenance(
         "AAPL",
@@ -1060,214 +1180,493 @@ def test_source_repository_projects_source_document_provenance(tmp_path: Path) -
     ).source_provider is FinsSourceProvider.USER_UPLOAD
 
 
-def test_source_repository_fails_closed_for_missing_or_invalid_completed_provider(tmp_path: Path) -> None:
-    """完成态 source document 缺失或非法 provenance 字段时应失败关闭。"""
+def test_source_repository_requires_typed_provenance_and_owns_completion(tmp_path: Path) -> None:
+    """final source 在 owner boundary 要求 typed provenance并固定完成态为真。
 
-    workspace_root = tmp_path / "fins-invalid-provenance-workspace"
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法 provenance 未被拒绝或 completion 未固定为真时抛出。
+    """
+
+    workspace_root = tmp_path / "fins-provenance-boundary-workspace"
     repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
     source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
 
+    invalid_batch = batching_repository.begin_batch("AAPL")
+    with pytest.raises(KeyError, match="source_provider"):
+        _create_source_document_for_provenance(
+            source_repository=source_repository,
+            blob_repository=blob_repository,
+            batch=invalid_batch,
+            ticker="AAPL",
+            document_id="missing_provider",
+            source_kind=SourceKind.FILING,
+            ingest_method="download",
+            source_provider=None,
+        )
+    with pytest.raises(ValueError, match="source_provider 非法"):
+        _create_source_document_for_provenance(
+            source_repository=source_repository,
+            blob_repository=blob_repository,
+            batch=invalid_batch,
+            ticker="AAPL",
+            document_id="invalid_provider",
+            source_kind=SourceKind.FILING,
+            ingest_method="download",
+            source_provider="unknown_provider",
+        )
+    batching_repository.rollback_batch(invalid_batch)
+
+    valid_batch = batching_repository.begin_batch("AAPL")
     _create_source_document_for_provenance(
         source_repository=source_repository,
+        blob_repository=blob_repository,
+        batch=valid_batch,
         ticker="AAPL",
-        document_id="missing_provider",
-        source_kind=SourceKind.FILING,
-        ingest_method="download",
-        source_provider=None,
-    )
-    _create_source_document_for_provenance(
-        source_repository=source_repository,
-        ticker="AAPL",
-        document_id="invalid_provider",
-        source_kind=SourceKind.FILING,
-        ingest_method="download",
-        source_provider="unknown_provider",
-    )
-    _create_source_document_for_provenance(
-        source_repository=source_repository,
-        ticker="AAPL",
-        document_id="missing_ingest_complete",
+        document_id="complete_source",
         source_kind=SourceKind.FILING,
         ingest_method="download",
         source_provider=FinsSourceProvider.SEC_EDGAR.to_storage_value(),
     )
-    missing_ingest_meta = source_repository.get_source_meta(
-        "AAPL",
-        "missing_ingest_complete",
-        SourceKind.FILING,
-    )
-    missing_ingest_meta.pop("ingest_complete")
-    source_repository.replace_source_meta(
-        "AAPL",
-        "missing_ingest_complete",
-        SourceKind.FILING,
-        missing_ingest_meta,
-    )
-
-    with pytest.raises(KeyError):
-        source_repository.get_source_document_provenance("AAPL", "missing_provider", SourceKind.FILING)
-    with pytest.raises(ValueError, match="source_provider 非法"):
-        source_repository.get_source_document_provenance("AAPL", "invalid_provider", SourceKind.FILING)
-    with pytest.raises(KeyError):
-        source_repository.get_source_document_provenance("AAPL", "missing_ingest_complete", SourceKind.FILING)
+    batching_repository.commit_batch(valid_batch)
+    meta = source_repository.get_source_meta("AAPL", "complete_source", SourceKind.FILING)
+    assert meta["ingest_complete"] is True
+    assert meta["source_kind"] == SourceKind.FILING.value
 
 
-def test_stage_source_document_requires_existing_stable_fields_on_retry(tmp_path: Path) -> None:
-    """重复 staging 不能通过省略既有 stable 字段掩盖冲突。"""
+def test_blob_first_staging_remains_unpublished_until_complete_source_commit(tmp_path: Path) -> None:
+    """SourceHandle 可先写 blob，但 published read 只在完整 source commit 后可见。
 
-    workspace_root = tmp_path / "fins-staging-conflict-workspace"
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: blob 在完整 source commit 前可见或 commit 后不可见时抛出。
+    """
+
+    workspace_root = tmp_path / "fins-blob-first-workspace"
     repository_set = build_fs_repository_set(workspace_root=workspace_root)
-    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
-    first_request = SourceDocumentUpsertRequest(
-        ticker="AAPL",
-        document_id="fil_staging",
-        internal_document_id="fil_staging",
-        form_type="10-K",
-        meta={
-            "ingest_method": "download",
-            "source_provider": "sec_edgar",
-            "source_fingerprint": "fingerprint-v1",
-            "company_id": "0000320193",
-            "ingest_complete": False,
-        },
-    )
-    matching_request = SourceDocumentUpsertRequest(
-        ticker="AAPL",
-        document_id="fil_staging",
-        internal_document_id="fil_staging",
-        form_type="10-K",
-        meta={
-            "ingest_method": "download",
-            "source_provider": "sec_edgar",
-            "source_fingerprint": "fingerprint-v1",
-            "company_id": "0000320193",
-            "ingest_complete": False,
-        },
-    )
-    omitted_fingerprint_request = SourceDocumentUpsertRequest(
-        ticker="AAPL",
-        document_id="fil_staging",
-        internal_document_id="fil_staging",
-        form_type="10-K",
-        meta={
-            "ingest_method": "download",
-            "source_provider": "sec_edgar",
-            "company_id": "0000320193",
-            "ingest_complete": False,
-        },
-    )
-
-    first_handle = source_repository.stage_source_document(first_request, SourceKind.FILING)
-    matching_handle = source_repository.stage_source_document(matching_request, SourceKind.FILING)
-
-    assert matching_handle == first_handle
-    with pytest.raises(FileExistsError, match="稳定字段冲突"):
-        source_repository.stage_source_document(omitted_fingerprint_request, SourceKind.FILING)
-
-
-def test_stage_source_document_lifecycle_and_blob_acknowledgement(tmp_path: Path) -> None:
-    """source staging 是 SourceHandle blob 写入的唯一前置承认事实。"""
-
-    workspace_root = tmp_path / "fins-staging-ack-workspace"
-    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
     source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
     blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
-    request = SourceDocumentUpsertRequest(
+    batch = batching_repository.begin_batch("AAPL")
+    handle = SourceHandle(
         ticker="AAPL",
-        document_id="fil_ack",
-        internal_document_id="fil_ack",
-        form_type="10-K",
-        meta={
-            "ingest_method": "download",
-            "source_provider": "sec_edgar",
-            "source_fingerprint": "fingerprint-v1",
-            "company_id": "0000320193",
-            "ingest_complete": False,
-        },
+        document_id="fil_blob_first",
+        source_kind=SourceKind.FILING.value,
     )
-    missing_handle = SourceHandle(ticker="AAPL", document_id="fil_missing", source_kind=SourceKind.FILING.value)
+    file_meta = blob_repository.store_file(
+        handle,
+        "filing.htm",
+        io.BytesIO(b"payload"),
+        batch=batch,
+        content_type="text/html",
+    )
 
     with pytest.raises(FileNotFoundError):
-        blob_repository.store_file(missing_handle, "orphan.htm", io.BytesIO(b"orphan"))
-    assert blob_repository.list_entries(missing_handle) == []
-
-    first_handle = source_repository.stage_source_document(request, SourceKind.FILING)
-    matching_handle = source_repository.stage_source_document(request, SourceKind.FILING)
-    staged_meta = source_repository.get_source_meta("AAPL", "fil_ack", SourceKind.FILING)
-    file_meta = blob_repository.store_file(first_handle, "filing.htm", io.BytesIO(b"payload"))
-
-    assert first_handle == SourceHandle(ticker="AAPL", document_id="fil_ack", source_kind=SourceKind.FILING.value)
-    assert matching_handle == first_handle
-    assert staged_meta["ingest_complete"] is False
-    assert staged_meta["files"] == []
-    assert blob_repository.read_file_bytes(first_handle, "filing.htm") == b"payload"
-    with pytest.raises(FileExistsError, match="稳定字段冲突"):
-        source_repository.create_source_document(
-            SourceDocumentUpsertRequest(
-                ticker="AAPL",
-                document_id="fil_ack",
-                internal_document_id="fil_ack",
-                form_type="10-K",
-                primary_document="filing.htm",
-                file_entries=[
-                    {
-                        "name": "filing.htm",
-                        "uri": file_meta.uri,
-                        "size": file_meta.size,
-                        "content_type": file_meta.content_type,
-                        "sha256": file_meta.sha256,
-                    }
-                ],
-                meta={
-                    "ingest_method": "download",
-                    "source_provider": "sec_edgar",
-                    "source_fingerprint": "fingerprint-v2",
-                    "company_id": "0000320193",
-                    "ingest_complete": True,
-                },
-            ),
-            SourceKind.FILING,
-        )
+        source_repository.get_source_meta("AAPL", "fil_blob_first", SourceKind.FILING)
+    with pytest.raises(FileNotFoundError):
+        blob_repository.read_file_bytes(handle, "filing.htm")
+    assert source_repository.list_source_document_ids("AAPL", SourceKind.FILING) == []
 
     source_repository.create_source_document(
         SourceDocumentUpsertRequest(
             ticker="AAPL",
-            document_id="fil_ack",
-            internal_document_id="fil_ack",
+            document_id="fil_blob_first",
+            internal_document_id="fil_blob_first",
             form_type="10-K",
             primary_document="filing.htm",
-            file_entries=[
-                {
-                    "name": "filing.htm",
-                    "uri": file_meta.uri,
-                    "size": file_meta.size,
-                    "content_type": file_meta.content_type,
-                    "sha256": file_meta.sha256,
-                }
-            ],
+            files=[file_meta],
             meta={
                 "ingest_method": "download",
                 "source_provider": "sec_edgar",
                 "source_fingerprint": "fingerprint-v1",
-                "company_id": "0000320193",
-                "ingest_complete": True,
             },
         ),
         SourceKind.FILING,
+        batch=batch,
     )
-    completed_meta = source_repository.get_source_meta("AAPL", "fil_ack", SourceKind.FILING)
+    batching_repository.commit_batch(batch)
 
-    assert completed_meta["ingest_complete"] is True
-    assert completed_meta["files"][0]["name"] == "filing.htm"
-    with pytest.raises(FileExistsError, match="完成态"):
-        source_repository.stage_source_document(request, SourceKind.FILING)
+    completed_meta = source_repository.get_source_meta("AAPL", "fil_blob_first", SourceKind.FILING)
+    provenance = source_repository.get_source_document_provenance(
+        "AAPL",
+        "fil_blob_first",
+        SourceKind.FILING,
+        meta=completed_meta,
+    )
+    manifest = json.loads(
+        (workspace_root / "portfolio" / "AAPL" / "filings" / "filing_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert completed_meta["primary_document"] == "filing.htm"
+    assert completed_meta["files"][0]["uri"] == file_meta.uri
+    assert provenance.ingest_complete is True
+    assert provenance.source_provider is FinsSourceProvider.SEC_EDGAR
+    assert manifest["documents"][0]["source_provider"] == "sec_edgar"
+    assert manifest["documents"][0]["ingest_complete"] is True
+    assert blob_repository.read_file_bytes(handle, "filing.htm") == b"payload"
+
+
+@pytest.mark.parametrize("has_published_old", (False, True))
+def test_invalid_primary_never_projects_first_file_and_commit_preserves_published_state(
+    tmp_path: Path,
+    has_published_old: bool,
+) -> None:
+    """错误 primary 不得猜第一文件，commit 必须消费 token 并保留 old/absent。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        has_published_old: 是否先发布一个完整旧 source。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 错误 primary 被投影或非法 transaction 改变 published state 时抛出。
+    """
+
+    workspace_root = tmp_path / ("with-old" if has_published_old else "without-old")
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+
+    if has_published_old:
+        old_batch = batching_repository.begin_batch("AAPL")
+        _create_source_document_for_provenance(
+            source_repository=source_repository,
+            blob_repository=blob_repository,
+            batch=old_batch,
+            ticker="AAPL",
+            document_id="old_source",
+            source_kind=SourceKind.FILING,
+            ingest_method="upload",
+            source_provider="user_upload",
+        )
+        batching_repository.commit_batch(old_batch)
+
+    invalid_batch = batching_repository.begin_batch("AAPL")
+    invalid_handle = SourceHandle("AAPL", "invalid_primary", SourceKind.FILING.value)
+    first_file = blob_repository.store_file(
+        invalid_handle,
+        "first.htm",
+        io.BytesIO(b"first"),
+        batch=invalid_batch,
+    )
+    second_file = blob_repository.store_file(
+        invalid_handle,
+        "second.htm",
+        io.BytesIO(b"second"),
+        batch=invalid_batch,
+    )
+    projected_handle = source_repository.create_source_document(
+        SourceDocumentUpsertRequest(
+            ticker="AAPL",
+            document_id="invalid_primary",
+            internal_document_id="invalid_primary",
+            form_type="10-K",
+            primary_document="missing.htm",
+            meta={
+                "ingest_method": "download",
+                "source_provider": "sec_edgar",
+            },
+            files=[first_file, second_file],
+        ),
+        SourceKind.FILING,
+        batch=invalid_batch,
+    )
+
+    assert projected_handle.primary_file_uri is None
+    with pytest.raises(ValueError, match="primary_document 未精确命中 files"):
+        batching_repository.commit_batch(invalid_batch)
+    with pytest.raises(ValueError, match="未在当前 storage core 登记"):
+        batching_repository.rollback_batch(invalid_batch)
+
+    expected_ids = ["old_source"] if has_published_old else []
+    assert source_repository.list_source_document_ids("AAPL", SourceKind.FILING) == expected_ids
+    if has_published_old:
+        old_handle = source_repository.get_source_handle("AAPL", "old_source", SourceKind.FILING)
+        assert blob_repository.read_file_bytes(old_handle, "old_source.txt") == b"old_source"
+    with pytest.raises(FileNotFoundError):
+        source_repository.get_source_meta("AAPL", "invalid_primary", SourceKind.FILING)
+    with pytest.raises(FileNotFoundError):
+        blob_repository.read_file_bytes(invalid_handle, "first.htm")
+
+
+def test_final_source_rejects_false_completion_without_publication(tmp_path: Path) -> None:
+    """producer 显式 false completion 必须在 source owner boundary fail closed。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: false completion 被接受或 published tree 被改写时抛出。
+    """
+
+    workspace_root = tmp_path / "fins-false-completion-workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    batch = batching_repository.begin_batch("AAPL")
+    handle = SourceHandle("AAPL", "false_completion", SourceKind.FILING.value)
+    file_meta = blob_repository.store_file(
+        handle,
+        "report.htm",
+        io.BytesIO(b"payload"),
+        batch=batch,
+    )
+    with pytest.raises(ValueError, match="ingest_complete 必须为 true"):
+        source_repository.create_source_document(
+            SourceDocumentUpsertRequest(
+                ticker="AAPL",
+                document_id="false_completion",
+                internal_document_id="false_completion",
+                primary_document="report.htm",
+                meta={
+                    "ingest_method": "download",
+                    "source_provider": "sec_edgar",
+                    "ingest_complete": False,
+                },
+                files=[file_meta],
+            ),
+            SourceKind.FILING,
+            batch=batch,
+        )
+    batching_repository.rollback_batch(batch)
+    with pytest.raises(FileNotFoundError):
+        source_repository.get_source_meta("AAPL", "false_completion", SourceKind.FILING)
+
+
+def test_complete_filing_and_material_commit_share_one_source_truth(tmp_path: Path) -> None:
+    """filing/material commit 后 meta、blob、primary、provenance 与 manifest 必须同源。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任一 source kind 的完成态投影不同源时抛出。
+    """
+
+    workspace_root = tmp_path / "complete-source-kinds-workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    batch = batching_repository.begin_batch("AAPL")
+    for document_id, source_kind in (
+        ("fil_complete", SourceKind.FILING),
+        ("mat_complete", SourceKind.MATERIAL),
+    ):
+        _create_source_document_for_provenance(
+            source_repository=source_repository,
+            blob_repository=blob_repository,
+            batch=batch,
+            ticker="AAPL",
+            document_id=document_id,
+            source_kind=source_kind,
+            ingest_method="upload",
+            source_provider="user_upload",
+        )
+    batching_repository.commit_batch(batch)
+
+    for document_id, source_kind in (
+        ("fil_complete", SourceKind.FILING),
+        ("mat_complete", SourceKind.MATERIAL),
+    ):
+        handle = source_repository.get_source_handle("AAPL", document_id, source_kind)
+        meta = source_repository.get_source_meta("AAPL", document_id, source_kind)
+        primary = source_repository.get_primary_file("AAPL", document_id, source_kind)
+        provenance = source_repository.get_source_document_provenance(
+            "AAPL",
+            document_id,
+            source_kind,
+            meta=meta,
+        )
+        assert primary.uri == meta["files"][0]["uri"]
+        assert blob_repository.read_file_bytes(handle, f"{document_id}.txt") == document_id.encode()
+        assert provenance.source_provider is FinsSourceProvider.USER_UPLOAD
+        assert provenance.ingest_complete is True
+
+    filing_manifest = json.loads(
+        (workspace_root / "portfolio" / "AAPL" / "filings" / "filing_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    material_manifest = json.loads(
+        (
+            workspace_root
+            / "portfolio"
+            / "AAPL"
+            / "materials"
+            / "material_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert filing_manifest["documents"][0]["source_provider"] == "user_upload"
+    assert filing_manifest["documents"][0]["ingest_method"] == "upload"
+    assert material_manifest["documents"][0]["source_provider"] == "user_upload"
+    assert material_manifest["documents"][0]["ingest_method"] == "upload"
+
+
+@pytest.mark.parametrize(
+    "failure_case",
+    (
+        "missing_meta",
+        "empty_files",
+        "duplicate_files",
+        "dangling_file",
+        "missing_primary",
+        "invalid_ingest_method",
+        "invalid_provider",
+        "false_completion",
+        "ticker_mismatch",
+        "document_mismatch",
+        "source_kind_mismatch",
+        "uri_mismatch",
+        "size_mismatch",
+        "sha_mismatch",
+        "symlink_file_escape",
+        "filename_escape",
+        "unmanifested_file",
+        "missing_manifest",
+        "dangling_manifest",
+        "manifest_projection_mismatch",
+        "duplicate_manifest_identity",
+        "manifest_ticker_mismatch",
+    ),
+)
+def test_complete_source_validator_consumes_token_and_preserves_old(
+    tmp_path: Path,
+    failure_case: _CompleteSourceFailureCase,
+) -> None:
+    """validator 每个 failure grid 都必须在 swap 前失败、消费 token并保留 old。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        failure_case: 当前注入的单一完整性破坏类型。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法 staged tree 被发布、token 未消费或 old 改变时抛出。
+    """
+
+    workspace_root = tmp_path / failure_case
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    old_batch = batching_repository.begin_batch("AAPL")
+    _create_source_document_for_provenance(
+        source_repository=source_repository,
+        blob_repository=blob_repository,
+        batch=old_batch,
+        ticker="AAPL",
+        document_id="old_source",
+        source_kind=SourceKind.FILING,
+        ingest_method="upload",
+        source_provider="user_upload",
+    )
+    batching_repository.commit_batch(old_batch)
+
+    invalid_batch = batching_repository.begin_batch("AAPL")
+    _create_source_document_for_provenance(
+        source_repository=source_repository,
+        blob_repository=blob_repository,
+        batch=invalid_batch,
+        ticker="AAPL",
+        document_id="new_source",
+        source_kind=SourceKind.FILING,
+        ingest_method="download",
+        source_provider="sec_edgar",
+    )
+    _corrupt_staged_complete_source(
+        repository_set.core,
+        failure_case=failure_case,
+    )
+
+    with pytest.raises(ValueError):
+        batching_repository.commit_batch(invalid_batch)
+    with pytest.raises(ValueError, match="未在当前 storage core 登记"):
+        batching_repository.rollback_batch(invalid_batch)
+    assert source_repository.list_source_document_ids("AAPL", SourceKind.FILING) == ["old_source"]
+    old_handle = source_repository.get_source_handle("AAPL", "old_source", SourceKind.FILING)
+    assert blob_repository.read_file_bytes(old_handle, "old_source.txt") == b"old_source"
+    with pytest.raises(FileNotFoundError):
+        source_repository.get_source_meta("AAPL", "new_source", SourceKind.FILING)
+
+
+def test_blob_only_commit_failure_keeps_new_source_absent(tmp_path: Path) -> None:
+    """old-absent transaction 只有 blob 没有 final meta 时 commit 必须失败且保持 absent。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: blob-only transaction 被发布或留下可见 source 时抛出。
+    """
+
+    workspace_root = tmp_path / "blob-only-absent-workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    batch = batching_repository.begin_batch("AAPL")
+    handle = SourceHandle("AAPL", "blob_only", SourceKind.FILING.value)
+    blob_repository.store_file(
+        handle,
+        "blob_only.txt",
+        io.BytesIO(b"blob-only"),
+        batch=batch,
+    )
+
+    with pytest.raises(ValueError, match="缺少 manifest"):
+        batching_repository.commit_batch(batch)
+    with pytest.raises(FileNotFoundError):
+        source_repository.get_source_meta("AAPL", "blob_only", SourceKind.FILING)
+    with pytest.raises(FileNotFoundError):
+        blob_repository.read_file_bytes(handle, "blob_only.txt")
 
 
 def test_download_rejection_registry_roundtrips_typed_entries(tmp_path: Path) -> None:
-    """下载拒绝注册表应通过 typed entry 读写并持久化 document_id。"""
+    """下载拒绝注册表应通过 typed entry 读写并持久化 document_id。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: maintenance registry roundtrip 丢失业务事实时抛出。
+    """
 
     workspace_root = tmp_path / "fins-download-rejection-workspace"
-    repository = FsFilingMaintenanceRepository(workspace_root)
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    repository = FsFilingMaintenanceRepository(workspace_root, repository_set=repository_set)
     entry = DownloadRejectionEntry(
         document_id="fil_0000000000-25-000101",
         reason="6k_filtered",
@@ -1277,7 +1676,13 @@ def test_download_rejection_registry_roundtrips_typed_entries(tmp_path: Path) ->
         download_version="sec-download-v1",
     )
 
-    repository.save_download_rejection_registry("aapl", {entry.document_id: entry})
+    batch = batching.begin_batch("AAPL")
+    repository.save_download_rejection_registry(
+        "aapl",
+        {entry.document_id: entry},
+        batch=batch,
+    )
+    batching.commit_batch(batch)
     loaded = repository.load_download_rejection_registry("AAPL")
     raw_path = workspace_root / "portfolio" / "AAPL" / "filings" / "_download_rejections.json"
     raw_payload = json.loads(raw_path.read_text(encoding="utf-8"))
@@ -1316,9 +1721,22 @@ def test_download_rejection_registry_fails_closed_on_malformed_entry(tmp_path: P
 
 
 def test_download_rejection_registry_rejects_mismatched_storage_key(tmp_path: Path) -> None:
-    """下载拒绝注册表保存时必须拒绝 key 与 entry document_id 冲突。"""
+    """下载拒绝注册表保存时必须拒绝 key 与 entry document_id 冲突。
 
-    repository = FsFilingMaintenanceRepository(tmp_path / "fins-download-rejection-key-workspace")
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 冲突 identity 未被 storage owner 拒绝时抛出。
+    """
+
+    workspace_root = tmp_path / "fins-download-rejection-key-workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    repository = FsFilingMaintenanceRepository(workspace_root, repository_set=repository_set)
     entry = DownloadRejectionEntry(
         document_id="fil_0000000000-25-000101",
         reason="6k_filtered",
@@ -1328,15 +1746,34 @@ def test_download_rejection_registry_rejects_mismatched_storage_key(tmp_path: Pa
         download_version="sec-download-v1",
     )
 
-    with pytest.raises(ValueError, match="document_id 不一致"):
-        repository.save_download_rejection_registry("AAPL", {"fil_other": entry})
+    batch = batching.begin_batch("AAPL")
+    try:
+        with pytest.raises(ValueError, match="document_id 不一致"):
+            repository.save_download_rejection_registry(
+                "AAPL",
+                {"fil_other": entry},
+                batch=batch,
+            )
+    finally:
+        batching.rollback_batch(batch)
 
 
 def test_storage_document_id_must_be_single_path_component(tmp_path: Path) -> None:
-    """storage owner 必须统一拒绝带路径组件的 document_id。"""
+    """storage owner 必须统一拒绝带路径组件的 document_id。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非单路径组件 document ID 穿过 owner boundary 时抛出。
+    """
 
     workspace_root = tmp_path / "fins-document-id-owner-workspace"
     repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
     source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
     processed_repository = FsProcessedDocumentRepository(workspace_root, repository_set=repository_set)
     blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
@@ -1367,9 +1804,10 @@ def test_storage_document_id_must_be_single_path_component(tmp_path: Path) -> No
         tables=[],
     )
     invalid_document_id = "../MSFT/filings/fil_safe"
+    batch = batching_repository.begin_batch("AAPL")
 
-    source_repository.create_source_document(source_request, SourceKind.FILING)
-    processed_repository.create_processed(processed_request)
+    source_repository.create_source_document(source_request, SourceKind.FILING, batch=batch)
+    processed_repository.create_processed(processed_request, batch=batch)
 
     invalid_handle = SourceHandle(
         ticker="AAPL",
@@ -1386,6 +1824,7 @@ def test_storage_document_id_must_be_single_path_component(tmp_path: Path) -> No
                 meta={"ingest_method": "download"},
             ),
             SourceKind.FILING,
+            batch=batch,
         )
     with pytest.raises(ValueError, match="document_id"):
         source_repository.get_source_meta("AAPL", invalid_document_id, SourceKind.FILING)
@@ -1395,7 +1834,8 @@ def test_storage_document_id_must_be_single_path_component(tmp_path: Path) -> No
                 ticker="AAPL",
                 document_id=invalid_document_id,
                 source_kind=SourceKind.FILING.value,
-            )
+            ),
+            batch=batch,
         )
     with pytest.raises(ValueError, match="document_id"):
         blob_repository.list_entries(invalid_handle)
@@ -1406,13 +1846,15 @@ def test_storage_document_id_must_be_single_path_component(tmp_path: Path) -> No
                 document_id=invalid_document_id,
                 internal_document_id="fil_bad",
                 source_kind=SourceKind.FILING.value,
-            )
+            ),
+            batch=batch,
         )
     with pytest.raises(ValueError, match="document_id"):
         processed_repository.get_processed_meta("AAPL", invalid_document_id)
     with pytest.raises(ValueError, match="document_id"):
         processed_repository.delete_processed(
-            ProcessedDeleteRequest(ticker="AAPL", document_id=invalid_document_id)
+            ProcessedDeleteRequest(ticker="AAPL", document_id=invalid_document_id),
+            batch=batch,
         )
     with pytest.raises(ValueError, match="document_id"):
         filing_repository.store_rejected_filing_file(
@@ -1420,6 +1862,7 @@ def test_storage_document_id_must_be_single_path_component(tmp_path: Path) -> No
             invalid_document_id,
             "rejected.htm",
             io.BytesIO(b"payload"),
+            batch=batch,
         )
     with pytest.raises(ValueError, match="document_id"):
         filing_repository.save_download_rejection_registry(
@@ -1434,7 +1877,9 @@ def test_storage_document_id_must_be_single_path_component(tmp_path: Path) -> No
                     download_version="test",
                 )
             },
+            batch=batch,
         )
+    batching_repository.rollback_batch(batch)
 
 
 def test_read_runtime_citation_projects_provider_owned_source_types(tmp_path: Path) -> None:
@@ -1455,13 +1900,26 @@ def test_read_runtime_citation_projects_provider_owned_source_types(tmp_path: Pa
 
 
 def test_read_runtime_citation_reuses_single_cached_source_meta_read(tmp_path: Path) -> None:
-    """citation 构建不应为 provenance 对同一 source meta 做重复读取。"""
+    """citation 构建不应为 provenance 对同一 source meta 做重复读取。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: citation 重复读取 meta 或 provider 投影错误时抛出。
+    """
 
     workspace_root = tmp_path / "fins-citation-cache-workspace"
     repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
     company_repository = FsCompanyMetaRepository(workspace_root, repository_set=repository_set)
     source_repository = _CountingSourceRepository(workspace_root, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
     processed_repository = FsProcessedDocumentRepository(workspace_root, repository_set=repository_set)
+    batch = batching_repository.begin_batch("AAPL")
     company_repository.upsert_company_meta(
         CompanyMeta(
             company_id="0000320193",
@@ -1471,16 +1929,20 @@ def test_read_runtime_citation_reuses_single_cached_source_meta_read(tmp_path: P
             resolver_version="test",
             updated_at=now_iso8601(),
             ticker_aliases=[],
-        )
+        ),
+        batch=batch,
     )
     _create_source_document_for_provenance(
         source_repository=source_repository,
+        blob_repository=blob_repository,
+        batch=batch,
         ticker="AAPL",
         document_id="fil_sec",
         source_kind=SourceKind.FILING,
         ingest_method="download",
         source_provider=FinsSourceProvider.SEC_EDGAR.to_storage_value(),
     )
+    batching_repository.commit_batch(batch)
     runtime = FinsReadRuntime(
         company_repository=company_repository,
         source_repository=source_repository,
@@ -1493,15 +1955,33 @@ def test_read_runtime_citation_reuses_single_cached_source_meta_read(tmp_path: P
     assert source_repository.get_source_meta_calls == 1
 
 
-def test_read_runtime_citation_rejects_incomplete_source_meta(tmp_path: Path) -> None:
-    """read runtime citation 不得投影未完成 staging source meta。"""
+def test_read_runtime_citation_inventory_uses_complete_published_sources(tmp_path: Path) -> None:
+    """read runtime citation inventory 只消费 storage 已发布的完整 sources。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: inventory 未消费预期已发布 source 时抛出。
+    """
 
     runtime = _build_read_runtime_with_provenance_documents(tmp_path)
     documents = runtime._collect_source_documents_by_kind("AAPL", SourceKind.FILING)
 
-    assert "fil_incomplete" not in {str(item["document_id"]) for item in documents}
-    with pytest.raises(FileNotFoundError, match="尚未完成入库"):
-        runtime._build_citation(ticker="AAPL", document_id="fil_incomplete")
+    assert {str(item["document_id"]) for item in documents} == {
+        "fil_sec",
+        "fil_user_upload",
+    }
+    for document_id in ("fil_sec", "fil_user_upload"):
+        meta = runtime._source_repository.get_source_meta(
+            "AAPL",
+            document_id,
+            SourceKind.FILING,
+        )
+        assert meta["ingest_complete"] is True
 
 
 def test_citation_to_dict_omits_none_source_provider() -> None:
@@ -2405,55 +2885,175 @@ def test_same_ticker_batch_fails_fast_across_independent_repository_cores(tmp_pa
     second_repository.rollback_batch(second_token)
 
 
-def test_same_ticker_active_batch_rejects_non_owner_task_on_shared_core(tmp_path: Path) -> None:
-    """同 core 的活动 batch 不允许其它执行 owner 加入 staging。"""
-
-    workspace_root = tmp_path / "fins-workspace"
-    repository_set = build_fs_repository_set(workspace_root=workspace_root)
-    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
-    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
-    token = batching_repository.begin_batch("AAPL")
-
-    try:
-        asyncio.run(_attempt_non_owner_source_create(source_repository))
-    finally:
-        batching_repository.rollback_batch(token)
-
-    assert source_repository.list_source_document_ids("AAPL", SourceKind.FILING) == []
-
-
-async def _attempt_non_owner_source_create(source_repository: FsSourceDocumentRepository) -> None:
-    """在另一个 asyncio task 中尝试写入同 ticker source document。
+def test_explicit_batch_allows_child_task_mutation_on_shared_core(tmp_path: Path) -> None:
+    """显式 capability 应允许 child task 解析同一 core 的 active transaction。
 
     Args:
-        source_repository: 共享同一 storage core 的 source repository。
+        tmp_path: pytest 临时目录。
 
     Returns:
         无。
 
     Raises:
-        AssertionError: 未按预期拒绝非 owner 写入时由 pytest 抛出。
+        AssertionError: child task 无法用显式 capability 发布完整 source 时抛出。
     """
 
-    with pytest.raises(RuntimeError, match="ticker=AAPL 活动 batch 属于其他 owner"):
-        source_repository.create_source_document(
-            SourceDocumentUpsertRequest(
-                ticker="AAPL",
-                document_id="aapl-non-owner",
-                internal_document_id="aapl-non-owner",
-                form_type="10-K",
-                primary_document="aapl-non-owner.md",
-                meta={
-                    "fiscal_year": 2024,
-                    "fiscal_period": "FY",
-                    "filing_date": "2024-11-01",
-                    "report_date": "2024-09-28",
-                    "amended": False,
-                    "ingest_method": "upload",
-                },
-            ),
-            SourceKind.FILING,
+    workspace_root = tmp_path / "fins-workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    token = batching_repository.begin_batch("AAPL")
+
+    try:
+        asyncio.run(
+            _create_source_in_child_task(
+                source_repository,
+                blob_repository,
+                token,
+            )
         )
+    except Exception:
+        batching_repository.rollback_batch(token)
+        raise
+    batching_repository.commit_batch(token)
+
+    assert source_repository.list_source_document_ids("AAPL", SourceKind.FILING) == [
+        "aapl-child-task"
+    ]
+
+
+async def _create_source_in_child_task(
+    source_repository: FsSourceDocumentRepository,
+    blob_repository: FsDocumentBlobRepository,
+    batch: BatchToken,
+) -> None:
+    """在 child asyncio task 中使用显式 capability 写 source document。
+
+    Args:
+        source_repository: 共享同一 storage core 的 source repository。
+        blob_repository: 共享同一 storage core 的 blob repository。
+        batch: 调用方显式传入的 transaction capability。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: source 写入失败时抛出。
+    """
+
+    task = asyncio.create_task(
+        _create_child_task_source(source_repository, blob_repository, batch)
+    )
+    await task
+
+
+async def _create_child_task_source(
+    source_repository: FsSourceDocumentRepository,
+    blob_repository: FsDocumentBlobRepository,
+    batch: BatchToken,
+) -> None:
+    """在独立 task 中执行显式 transaction mutation。
+
+    Args:
+        source_repository: 共享同一 storage core 的 source repository。
+        blob_repository: 共享同一 storage core 的 blob repository。
+        batch: 调用方显式传入的 transaction capability。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: source 写入失败时抛出。
+    """
+
+    await asyncio.sleep(0)
+    file_meta = blob_repository.store_file(
+        SourceHandle("AAPL", "aapl-child-task", SourceKind.FILING.value),
+        "aapl-child-task.md",
+        io.BytesIO(b"child task source"),
+        batch=batch,
+        content_type="text/markdown",
+    )
+    source_repository.create_source_document(
+        SourceDocumentUpsertRequest(
+            ticker="AAPL",
+            document_id="aapl-child-task",
+            internal_document_id="aapl-child-task",
+            form_type="10-K",
+            primary_document="aapl-child-task.md",
+            files=[file_meta],
+            meta={
+                "fiscal_year": 2024,
+                "fiscal_period": "FY",
+                "filing_date": "2024-11-01",
+                "report_date": "2024-09-28",
+                "amended": False,
+                "ingest_method": "upload",
+                "source_provider": FinsSourceProvider.USER_UPLOAD.to_storage_value(),
+            },
+        ),
+        SourceKind.FILING,
+        batch=batch,
+    )
+
+
+def test_explicit_batch_allows_worker_thread_mutation_on_shared_core(tmp_path: Path) -> None:
+    """显式 capability 应允许 worker thread 解析同一 core 的 active transaction。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: worker thread 无法用显式 capability 发布完整 source 时抛出。
+    """
+
+    workspace_root = tmp_path / "fins-workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    token = batching_repository.begin_batch("AAPL")
+    file_meta = blob_repository.store_file(
+        SourceHandle("AAPL", "aapl-worker-thread", SourceKind.FILING.value),
+        "aapl-worker-thread.md",
+        io.BytesIO(b"worker thread source"),
+        batch=token,
+        content_type="text/markdown",
+    )
+    request = SourceDocumentUpsertRequest(
+        ticker="AAPL",
+        document_id="aapl-worker-thread",
+        internal_document_id="aapl-worker-thread",
+        form_type="10-K",
+        primary_document="aapl-worker-thread.md",
+        files=[file_meta],
+        meta={
+            "ingest_method": "upload",
+            "source_provider": FinsSourceProvider.USER_UPLOAD.to_storage_value(),
+        },
+    )
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                source_repository.create_source_document,
+                request,
+                SourceKind.FILING,
+                batch=token,
+            )
+            future.result(timeout=5)
+    except Exception:
+        batching_repository.rollback_batch(token)
+        raise
+    batching_repository.commit_batch(token)
+
+    assert source_repository.list_source_document_ids("AAPL", SourceKind.FILING) == [
+        "aapl-worker-thread"
+    ]
 
 
 def test_fins_workspace_root_must_be_explicit_absolute_path() -> None:
@@ -2518,19 +3118,20 @@ def _build_fins_workspace(tmp_path: Path) -> Path:
     company_repository = FsCompanyMetaRepository(workspace_root, repository_set=repository_set)
     source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
     blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
-    company_repository.upsert_company_meta(
-        CompanyMeta(
-            company_id="0000320193",
-            company_name="Apple Inc.",
-            ticker="AAPL",
-            market="US",
-            resolver_version="test",
-            updated_at=now_iso8601(),
-            ticker_aliases=["APPLE"],
-        )
-    )
     token = batching_repository.begin_batch("AAPL")
     try:
+        company_repository.upsert_company_meta(
+            CompanyMeta(
+                company_id="0000320193",
+                company_name="Apple Inc.",
+                ticker="AAPL",
+                market="US",
+                resolver_version="test",
+                updated_at=now_iso8601(),
+                ticker_aliases=["APPLE"],
+            ),
+            batch=token,
+        )
         source_repository.create_source_document(
             SourceDocumentUpsertRequest(
                 ticker="AAPL",
@@ -2549,12 +3150,18 @@ def _build_fins_workspace(tmp_path: Path) -> Path:
                 },
             ),
             SourceKind.FILING,
+            batch=token,
         )
-        handle = source_repository.get_source_handle("AAPL", "aapl-2024-10k", SourceKind.FILING)
+        handle = SourceHandle(
+            ticker="AAPL",
+            document_id="aapl-2024-10k",
+            source_kind=SourceKind.FILING.value,
+        )
         file_meta = blob_repository.store_file(
             handle,
             "aapl-2024-10k.md",
             io.BytesIO(_fixture_markdown().encode("utf-8")),
+            batch=token,
             content_type="text/markdown",
         )
         source_repository.update_source_document(
@@ -2576,23 +3183,28 @@ def _build_fins_workspace(tmp_path: Path) -> Path:
                 files=[file_meta],
             ),
             SourceKind.FILING,
+            batch=token,
         )
-        batching_repository.commit_batch(token)
     except Exception:
         batching_repository.rollback_batch(token)
         raise
+    batching_repository.commit_batch(token)
     return workspace_root
 
 
 def _create_source_revision_document(
     repository: FsSourceDocumentRepository,
+    blob_repository: FsDocumentBlobRepository,
     *,
+    batch: BatchToken,
     replace_existing: bool = False,
 ) -> None:
     """创建 canonical source revision 测试文档。
 
     Args:
         repository: source repository。
+        blob_repository: 与 source repository 共享 core 的 blob repository。
+        batch: 显式 transaction capability。
         replace_existing: 是否先重置同 ID 文档。
 
     Returns:
@@ -2603,7 +3215,31 @@ def _create_source_revision_document(
     """
 
     if replace_existing:
-        repository.reset_source_document("AAPL", "revision-doc", SourceKind.FILING)
+        repository.reset_source_document(
+            "AAPL",
+            "revision-doc",
+            SourceKind.FILING,
+            batch=batch,
+        )
+    handle = SourceHandle(
+        ticker="AAPL",
+        document_id="revision-doc",
+        source_kind=SourceKind.FILING.value,
+    )
+    primary_file = blob_repository.store_file(
+        handle,
+        "primary.html",
+        io.BytesIO(b"p" * 100),
+        batch=batch,
+        content_type="text/html",
+    )
+    exhibit_file = blob_repository.store_file(
+        handle,
+        "exhibit.html",
+        io.BytesIO(b"e" * 50),
+        batch=batch,
+        content_type="text/html",
+    )
     repository.create_source_document(
         SourceDocumentUpsertRequest(
             ticker="AAPL",
@@ -2619,37 +3255,27 @@ def _create_source_revision_document(
                 "document_version": "v1",
                 "source_fingerprint": "fingerprint-v1",
             },
-            file_entries=[
-                {
-                    "name": "primary.html",
-                    "uri": "local://AAPL/filings/revision-doc/primary.html",
-                    "etag": "etag-primary",
-                    "last_modified": "2025-01-01T00:00:00Z",
-                    "size": 100,
-                    "sha256": "a" * 64,
-                    "content_type": "text/html",
-                },
-                {
-                    "name": "exhibit.html",
-                    "uri": "local://AAPL/filings/revision-doc/exhibit.html",
-                    "etag": None,
-                    "last_modified": None,
-                    "size": 50,
-                    "sha256": "b" * 64,
-                    "content_type": "text/html",
-                },
-            ],
+            files=[primary_file, exhibit_file],
         ),
         SourceKind.FILING,
+        batch=batch,
     )
 
 
-def _mutate_source_revision_meta(meta: DocumentMeta, changed_field: str) -> None:
+def _mutate_source_revision_meta(
+    meta: DocumentMeta,
+    changed_field: str,
+    *,
+    blob_repository: FsDocumentBlobRepository,
+    batch: BatchToken,
+) -> None:
     """修改一个 canonical revision 字段。
 
     Args:
         meta: 待修改 source meta。
         changed_field: 顶层字段或 ``files.<field>``。
+        blob_repository: 用于保持 physical file 与 files manifest 同源的仓储。
+        batch: 当前显式 transaction capability。
 
     Returns:
         无。
@@ -2663,50 +3289,89 @@ def _mutate_source_revision_meta(meta: DocumentMeta, changed_field: str) -> None
         "source_fingerprint": "fingerprint-v2",
         "form_type": "10-Q",
         "primary_document": "exhibit.html",
-        "ingest_complete": False,
         "is_deleted": True,
     }
     if changed_field in top_level_values:
         meta[changed_field] = top_level_values[changed_field]
         return
     file_values: dict[str, JsonValue] = {
-        "name": "renamed.html",
-        "uri": "local://AAPL/filings/revision-doc/renamed.html",
         "etag": "etag-v2",
         "last_modified": "2025-01-02T00:00:00Z",
-        "size": 101,
-        "sha256": "c" * 64,
         "content_type": "application/xhtml+xml",
     }
     field_name = changed_field.removeprefix("files.")
-    if field_name not in file_values:
-        raise ValueError(f"未知 revision 测试字段: {changed_field}")
     files = meta["files"]
     if not isinstance(files, list) or not files or not isinstance(files[0], dict):
         raise ValueError("revision 测试 fixture files 非法")
+    if field_name in {"name", "uri"}:
+        handle = SourceHandle(
+            ticker="AAPL",
+            document_id="revision-doc",
+            source_kind=SourceKind.FILING.value,
+        )
+        replacement = blob_repository.store_file(
+            handle,
+            "renamed.html",
+            io.BytesIO(b"p" * 100),
+            batch=batch,
+            content_type="text/html",
+        )
+        blob_repository.delete_entry(handle, "primary.html", batch=batch)
+        files[0] = {
+            "name": "renamed.html",
+            "uri": replacement.uri,
+            "etag": replacement.etag,
+            "last_modified": replacement.last_modified,
+            "size": replacement.size,
+            "content_type": replacement.content_type,
+            "sha256": replacement.sha256,
+            "ingested_at": now_iso8601(),
+        }
+        meta["primary_document"] = "renamed.html"
+        return
+    if field_name in {"size", "sha256"}:
+        handle = SourceHandle(
+            ticker="AAPL",
+            document_id="revision-doc",
+            source_kind=SourceKind.FILING.value,
+        )
+        replacement = blob_repository.store_file(
+            handle,
+            "primary.html",
+            io.BytesIO(b"q" * 101),
+            batch=batch,
+            content_type="text/html",
+        )
+        files[0]["size"] = replacement.size
+        files[0]["sha256"] = replacement.sha256
+        return
+    if field_name not in file_values:
+        raise ValueError(f"未知 revision 测试字段: {changed_field}")
     files[0][field_name] = file_values[field_name]
 
 
 def _create_source_document_for_provenance(
     *,
     source_repository: FsSourceDocumentRepository,
+    blob_repository: FsDocumentBlobRepository,
+    batch: BatchToken,
     ticker: str,
     document_id: str,
     source_kind: SourceKind,
     ingest_method: str,
     source_provider: str | None,
-    ingest_complete: bool | None = True,
 ) -> None:
     """创建用于 provenance 测试的 source document。
 
     Args:
         source_repository: source 文档仓储。
+        blob_repository: 与 source 仓储共享 core 的 blob 仓储。
+        batch: 显式 transaction capability。
         ticker: 股票代码。
         document_id: 文档 ID。
         source_kind: 来源类型。
         ingest_method: ingest method 仓储值。
         source_provider: provider 仓储值；为 None 时故意不写入。
-        ingest_complete: 是否写入完成态标记；为 None 时故意不写入。
 
     Returns:
         无。
@@ -2723,20 +3388,133 @@ def _create_source_document_for_provenance(
         "report_date": "2024-09-28",
         "amended": False,
     }
-    if ingest_complete is not None:
-        meta["ingest_complete"] = ingest_complete
     if source_provider is not None:
         meta["source_provider"] = source_provider
+    filename = f"{document_id}.txt"
+    handle = SourceHandle(
+        ticker=ticker,
+        document_id=document_id,
+        source_kind=source_kind.value,
+    )
+    file_meta = blob_repository.store_file(
+        handle,
+        filename,
+        io.BytesIO(document_id.encode("utf-8")),
+        batch=batch,
+        content_type="text/plain",
+    )
     source_repository.create_source_document(
         SourceDocumentUpsertRequest(
             ticker=ticker,
             document_id=document_id,
             internal_document_id=document_id,
             form_type="10-K",
+            primary_document=filename,
             meta=meta,
+            files=[file_meta],
         ),
         source_kind,
+        batch=batch,
     )
+
+
+def _corrupt_staged_complete_source(
+    core: FsStorageCore,
+    *,
+    failure_case: _CompleteSourceFailureCase,
+) -> None:
+    """在 owner test 中只破坏一格 staged complete-source fact。
+
+    Args:
+        core: 当前测试唯一 shared storage core。
+        failure_case: 要注入的完整性破坏类型。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: active batch 或测试 fixture 结构不符合预期时抛出。
+        OSError: staged fixture 修改失败时抛出。
+    """
+
+    states = tuple(core._active_batches.values())
+    assert len(states) == 1
+    source_dir = states[0].staging_ticker_dir / "filings" / "new_source"
+    meta_path = source_dir / "meta.json"
+    manifest_path = source_dir.parent / "filing_manifest.json"
+    physical_path = source_dir / "new_source.txt"
+    meta = cast(dict[str, JsonValue], json.loads(meta_path.read_text(encoding="utf-8")))
+    manifest = cast(
+        dict[str, JsonValue],
+        json.loads(manifest_path.read_text(encoding="utf-8")),
+    )
+    raw_files = meta["files"]
+    raw_documents = manifest["documents"]
+    assert isinstance(raw_files, list) and raw_files and isinstance(raw_files[0], dict)
+    assert isinstance(raw_documents, list) and len(raw_documents) == 2
+    file_item = raw_files[0]
+    manifest_item = next(
+        item
+        for item in raw_documents
+        if isinstance(item, dict) and item.get("document_id") == "new_source"
+    )
+
+    if failure_case == "missing_meta":
+        meta_path.unlink()
+        return
+    if failure_case == "empty_files":
+        meta["files"] = []
+    elif failure_case == "duplicate_files":
+        raw_files.append(dict(file_item))
+    elif failure_case == "dangling_file":
+        physical_path.unlink()
+    elif failure_case == "missing_primary":
+        meta.pop("primary_document")
+    elif failure_case == "invalid_ingest_method":
+        meta["ingest_method"] = "side_load"
+    elif failure_case == "invalid_provider":
+        meta["source_provider"] = "unknown_provider"
+    elif failure_case == "false_completion":
+        meta["ingest_complete"] = False
+    elif failure_case == "ticker_mismatch":
+        meta["ticker"] = "MSFT"
+    elif failure_case == "document_mismatch":
+        meta["document_id"] = "other_source"
+    elif failure_case == "source_kind_mismatch":
+        meta["source_kind"] = SourceKind.MATERIAL.value
+    elif failure_case == "uri_mismatch":
+        file_item["uri"] = "local://AAPL/filings/new_source/other.txt"
+    elif failure_case == "size_mismatch":
+        file_item["size"] = 999
+    elif failure_case == "sha_mismatch":
+        file_item["sha256"] = "0" * 64
+    elif failure_case == "symlink_file_escape":
+        physical_path.unlink()
+        outside_file = core.workspace_root / "outside-source.txt"
+        outside_file.write_bytes(b"outside")
+        physical_path.symlink_to(outside_file)
+    elif failure_case == "filename_escape":
+        file_item["name"] = "../escape.txt"
+    elif failure_case == "unmanifested_file":
+        (source_dir / "extra.txt").write_bytes(b"extra")
+    elif failure_case == "missing_manifest":
+        manifest_path.unlink()
+        return
+    elif failure_case == "dangling_manifest":
+        dangling_item = dict(manifest_item)
+        dangling_item["document_id"] = "ghost_source"
+        raw_documents.append(dangling_item)
+    elif failure_case == "manifest_projection_mismatch":
+        manifest_item["source_provider"] = "user_upload"
+    elif failure_case == "duplicate_manifest_identity":
+        raw_documents.append(dict(manifest_item))
+    elif failure_case == "manifest_ticker_mismatch":
+        manifest["ticker"] = "MSFT"
+    else:
+        raise AssertionError(f"未处理的 complete source failure case: {failure_case}")
+
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
 
 
 def _build_read_runtime_with_provenance_documents(tmp_path: Path) -> FinsReadRuntime:
@@ -2754,9 +3532,15 @@ def _build_read_runtime_with_provenance_documents(tmp_path: Path) -> FinsReadRun
 
     workspace_root = tmp_path / "fins-citation-provenance-workspace"
     repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
     company_repository = FsCompanyMetaRepository(workspace_root, repository_set=repository_set)
     source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
     processed_repository = FsProcessedDocumentRepository(workspace_root, repository_set=repository_set)
+    batches = {
+        ticker: batching_repository.begin_batch(ticker)
+        for ticker in ("AAPL", "600519", "0700")
+    }
     for ticker, company_id, market in (
         ("AAPL", "0000320193", "US"),
         ("600519", "600519_CNINFO", "CN"),
@@ -2771,11 +3555,14 @@ def _build_read_runtime_with_provenance_documents(tmp_path: Path) -> FinsReadRun
                 resolver_version="test",
                 updated_at=now_iso8601(),
                 ticker_aliases=[],
-            )
+            ),
+            batch=batches[ticker],
         )
 
     _create_source_document_for_provenance(
         source_repository=source_repository,
+        blob_repository=blob_repository,
+        batch=batches["AAPL"],
         ticker="AAPL",
         document_id="fil_sec",
         source_kind=SourceKind.FILING,
@@ -2784,6 +3571,8 @@ def _build_read_runtime_with_provenance_documents(tmp_path: Path) -> FinsReadRun
     )
     _create_source_document_for_provenance(
         source_repository=source_repository,
+        blob_repository=blob_repository,
+        batch=batches["600519"],
         ticker="600519",
         document_id="fil_cninfo",
         source_kind=SourceKind.FILING,
@@ -2792,6 +3581,8 @@ def _build_read_runtime_with_provenance_documents(tmp_path: Path) -> FinsReadRun
     )
     _create_source_document_for_provenance(
         source_repository=source_repository,
+        blob_repository=blob_repository,
+        batch=batches["0700"],
         ticker="0700",
         document_id="fil_hkexnews",
         source_kind=SourceKind.FILING,
@@ -2800,6 +3591,8 @@ def _build_read_runtime_with_provenance_documents(tmp_path: Path) -> FinsReadRun
     )
     _create_source_document_for_provenance(
         source_repository=source_repository,
+        blob_repository=blob_repository,
+        batch=batches["AAPL"],
         ticker="AAPL",
         document_id="fil_user_upload",
         source_kind=SourceKind.FILING,
@@ -2808,21 +3601,16 @@ def _build_read_runtime_with_provenance_documents(tmp_path: Path) -> FinsReadRun
     )
     _create_source_document_for_provenance(
         source_repository=source_repository,
+        blob_repository=blob_repository,
+        batch=batches["AAPL"],
         ticker="AAPL",
         document_id="mat_user_upload",
         source_kind=SourceKind.MATERIAL,
         ingest_method="upload",
         source_provider=FinsSourceProvider.USER_UPLOAD.to_storage_value(),
     )
-    _create_source_document_for_provenance(
-        source_repository=source_repository,
-        ticker="AAPL",
-        document_id="fil_incomplete",
-        source_kind=SourceKind.FILING,
-        ingest_method="download",
-        source_provider=FinsSourceProvider.SEC_EDGAR.to_storage_value(),
-        ingest_complete=False,
-    )
+    for batch in batches.values():
+        batching_repository.commit_batch(batch)
     return FinsReadRuntime(
         company_repository=company_repository,
         source_repository=source_repository,
@@ -2850,46 +3638,33 @@ def _build_fins_financial_html_workspace(tmp_path: Path) -> Path:
     company_repository = FsCompanyMetaRepository(workspace_root, repository_set=repository_set)
     source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
     blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
-    company_repository.upsert_company_meta(
-        CompanyMeta(
-            company_id="0000320193",
-            company_name="Apple Inc.",
-            ticker="AAPL",
-            market="US",
-            resolver_version="test",
-            updated_at=now_iso8601(),
-            ticker_aliases=[],
-        )
-    )
     token = batching_repository.begin_batch("AAPL")
     try:
-        source_repository.create_source_document(
-            SourceDocumentUpsertRequest(
+        company_repository.upsert_company_meta(
+            CompanyMeta(
+                company_id="0000320193",
+                company_name="Apple Inc.",
                 ticker="AAPL",
-                document_id=_FINANCIAL_HTML_DOCUMENT_ID,
-                internal_document_id=_FINANCIAL_HTML_DOCUMENT_ID,
-                form_type="10-K",
-                primary_document=_FINANCIAL_HTML_PRIMARY_DOCUMENT,
-                meta={
-                    "fiscal_year": 2024,
-                    "fiscal_period": "FY",
-                    "filing_date": "2024-11-01",
-                    "report_date": "2024-09-28",
-                    "amended": False,
-                    "ingest_method": "upload",
-                    "source_provider": "user_upload",
-                },
+                market="US",
+                resolver_version="test",
+                updated_at=now_iso8601(),
+                ticker_aliases=[],
             ),
-            SourceKind.FILING,
+            batch=token,
         )
-        handle = source_repository.get_source_handle("AAPL", _FINANCIAL_HTML_DOCUMENT_ID, SourceKind.FILING)
+        handle = SourceHandle(
+            ticker="AAPL",
+            document_id=_FINANCIAL_HTML_DOCUMENT_ID,
+            source_kind=SourceKind.FILING.value,
+        )
         file_meta = blob_repository.store_file(
             handle,
             _FINANCIAL_HTML_PRIMARY_DOCUMENT,
             io.BytesIO(_fixture_financial_html().encode("utf-8")),
+            batch=token,
             content_type="text/html",
         )
-        source_repository.update_source_document(
+        source_repository.create_source_document(
             SourceDocumentUpsertRequest(
                 ticker="AAPL",
                 document_id=_FINANCIAL_HTML_DOCUMENT_ID,
@@ -2908,11 +3683,12 @@ def _build_fins_financial_html_workspace(tmp_path: Path) -> Path:
                 files=[file_meta],
             ),
             SourceKind.FILING,
+            batch=token,
         )
-        batching_repository.commit_batch(token)
     except Exception:
         batching_repository.rollback_batch(token)
         raise
+    batching_repository.commit_batch(token)
     return workspace_root
 
 
@@ -2952,23 +3728,13 @@ def _build_fins_aapl_xbrl_workspace(tmp_path: Path) -> Path:
                 resolver_version="test",
                 updated_at=now_iso8601(),
                 ticker_aliases=["APPLE"],
-            )
-        )
-        source_repository.create_source_document(
-            SourceDocumentUpsertRequest(
-                ticker="AAPL",
-                document_id=_AAPL_XBRL_DOCUMENT_ID,
-                internal_document_id=internal_document_id,
-                form_type=form_type,
-                primary_document=primary_document,
-                meta=source_meta,
             ),
-            SourceKind.FILING,
+            batch=token,
         )
-        handle = source_repository.get_source_handle(
-            "AAPL",
-            _AAPL_XBRL_DOCUMENT_ID,
-            SourceKind.FILING,
+        handle = SourceHandle(
+            ticker="AAPL",
+            document_id=_AAPL_XBRL_DOCUMENT_ID,
+            source_kind=SourceKind.FILING.value,
         )
         file_metas = []
         for file_path in _aapl_xbrl_fixture_files():
@@ -2978,10 +3744,11 @@ def _build_fins_aapl_xbrl_workspace(tmp_path: Path) -> Path:
                         handle,
                         file_path.name,
                         stream,
+                        batch=token,
                         content_type=_fixture_content_type(file_path),
                     )
                 )
-        source_repository.update_source_document(
+        source_repository.create_source_document(
             SourceDocumentUpsertRequest(
                 ticker="AAPL",
                 document_id=_AAPL_XBRL_DOCUMENT_ID,
@@ -2992,11 +3759,12 @@ def _build_fins_aapl_xbrl_workspace(tmp_path: Path) -> Path:
                 files=file_metas,
             ),
             SourceKind.FILING,
+            batch=token,
         )
-        batching_repository.commit_batch(token)
     except Exception:
         batching_repository.rollback_batch(token)
         raise
+    batching_repository.commit_batch(token)
     return workspace_root
 
 

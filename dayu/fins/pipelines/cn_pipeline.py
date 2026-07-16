@@ -55,6 +55,7 @@ from dayu.fins.pipelines.cn_download_workflow import run_cn_download_stream_impl
 from dayu.fins.pipelines.docling_upload_service import (
     DoclingUploadService,
     UploadCancellationChecker,
+    UploadOperationResult,
     build_cn_filing_ids,
     build_material_ids,
     derive_report_kind,
@@ -71,9 +72,11 @@ from dayu.fins.pipelines.upload_progress_helpers import (
     map_upload_file_event_to_material_event_type as _map_upload_file_event_to_material_event_type,
 )
 from dayu.fins.storage import (
+    BatchingRepositoryProtocol,
     CompanyMetaRepositoryProtocol,
     DocumentBlobRepositoryProtocol,
     FilingMaintenanceRepositoryProtocol,
+    FsBatchingRepository,
     FsCompanyMetaRepository,
     FsDocumentBlobRepository,
     FsFilingMaintenanceRepository,
@@ -336,6 +339,7 @@ class CnPipeline:
         hk_discovery_client: CnReportDiscoveryClientProtocol | None = None,
         pdf_download_gate: CnDownloadPdfGateProtocol | None = None,
         convert_pdf_to_docling_json: PdfToDoclingJsonBytes | None = None,
+        batching_repository: BatchingRepositoryProtocol | None = None,
         company_repository: CompanyMetaRepositoryProtocol | None = None,
         source_repository: SourceDocumentRepositoryProtocol | None = None,
         processed_repository: ProcessedDocumentRepositoryProtocol | None = None,
@@ -353,6 +357,7 @@ class CnPipeline:
             hk_discovery_client: 可选披露易 discovery client。
             pdf_download_gate: 可选 PDF 下载段 gate。
             convert_pdf_to_docling_json: 可选 PDF 到 Docling JSON bytes 转换函数。
+            batching_repository: 可选 batch lifecycle 仓储。
             company_repository: 可选公司元数据仓储。
             source_repository: 可选源文档仓储。
             processed_repository: 可选 processed 文档仓储。
@@ -371,6 +376,10 @@ class CnPipeline:
 
         self._workspace_root = (workspace_root or Path.cwd()).resolve()
         repository_set = build_fs_repository_set(workspace_root=self._workspace_root)
+        self._batching_repository = batching_repository or FsBatchingRepository(
+            self._workspace_root,
+            repository_set=repository_set,
+        )
         self._company_repository = company_repository or FsCompanyMetaRepository(
             self._workspace_root,
             repository_set=repository_set,
@@ -412,6 +421,22 @@ class CnPipeline:
             source_repository=self._source_repository,
             blob_repository=self._blob_repository,
         )
+
+    @property
+    def batching_repository(self) -> BatchingRepositoryProtocol:
+        """返回 batch lifecycle 唯一仓储。
+
+        Args:
+            无。
+
+        Returns:
+            与各业务仓储共享同一 core 的 batching 仓储。
+
+        Raises:
+            无。
+        """
+
+        return self._batching_repository
 
     @property
     def company_meta_repository(self) -> CompanyMetaRepositoryProtocol:
@@ -841,15 +866,22 @@ class CnPipeline:
             },
         )
         try:
-            upsert_company_meta_for_upload(
-                repository=self._company_repository,
-                ticker=normalized_ticker,
-                action=resolved_action,
-                company_id=company_id,
-                company_name=company_name,
-                ticker_aliases=ticker_aliases,
-            )
-            upload_result = self._upload_service.execute_upload(
+            company_batch = self._batching_repository.begin_batch(normalized_ticker)
+            try:
+                upsert_company_meta_for_upload(
+                    repository=self._company_repository,
+                    ticker=normalized_ticker,
+                    action=resolved_action,
+                    company_id=company_id,
+                    company_name=company_name,
+                    ticker_aliases=ticker_aliases,
+                    batch=company_batch,
+                )
+            except BaseException:
+                self._batching_repository.rollback_batch(company_batch)
+                raise
+            self._batching_repository.commit_batch(company_batch)
+            prepared_upload = self._upload_service.prepare_upload(
                 ticker=normalized_ticker,
                 source_kind=SourceKind.FILING,
                 action=resolved_action,
@@ -870,6 +902,22 @@ class CnPipeline:
                     "amended": amended,
                 },
             )
+            if isinstance(prepared_upload, UploadOperationResult):
+                upload_result = prepared_upload
+            else:
+                document_batch = self._batching_repository.begin_batch(normalized_ticker)
+                try:
+                    upload_result = self._upload_service.publish_prepared_upload(
+                        prepared_upload,
+                        batch=document_batch,
+                    )
+                except BaseException:
+                    self._batching_repository.rollback_batch(document_batch)
+                    raise
+                if upload_result.status == "cancelled":
+                    self._batching_repository.rollback_batch(document_batch)
+                else:
+                    self._batching_repository.commit_batch(document_batch)
             for file_event in upload_result.file_events:
                 yield UploadFilingEvent(
                     event_type=_map_upload_file_event_to_filing_event_type(file_event),
@@ -1094,15 +1142,22 @@ class CnPipeline:
             },
         )
         try:
-            upsert_company_meta_for_upload(
-                repository=self._company_repository,
-                ticker=normalized_ticker,
-                action=resolved_action,
-                company_id=company_id,
-                company_name=company_name,
-                ticker_aliases=ticker_aliases,
-            )
-            upload_result = self._upload_service.execute_upload(
+            company_batch = self._batching_repository.begin_batch(normalized_ticker)
+            try:
+                upsert_company_meta_for_upload(
+                    repository=self._company_repository,
+                    ticker=normalized_ticker,
+                    action=resolved_action,
+                    company_id=company_id,
+                    company_name=company_name,
+                    ticker_aliases=ticker_aliases,
+                    batch=company_batch,
+                )
+            except BaseException:
+                self._batching_repository.rollback_batch(company_batch)
+                raise
+            self._batching_repository.commit_batch(company_batch)
+            prepared_upload = self._upload_service.prepare_upload(
                 ticker=normalized_ticker,
                 source_kind=SourceKind.MATERIAL,
                 action=resolved_action,
@@ -1122,6 +1177,22 @@ class CnPipeline:
                     "report_date": report_date,
                 },
             )
+            if isinstance(prepared_upload, UploadOperationResult):
+                upload_result = prepared_upload
+            else:
+                document_batch = self._batching_repository.begin_batch(normalized_ticker)
+                try:
+                    upload_result = self._upload_service.publish_prepared_upload(
+                        prepared_upload,
+                        batch=document_batch,
+                    )
+                except BaseException:
+                    self._batching_repository.rollback_batch(document_batch)
+                    raise
+                if upload_result.status == "cancelled":
+                    self._batching_repository.rollback_batch(document_batch)
+                else:
+                    self._batching_repository.commit_batch(document_batch)
             for file_event in upload_result.file_events:
                 yield UploadMaterialEvent(
                     event_type=_map_upload_file_event_to_material_event_type(file_event),
@@ -1310,11 +1381,20 @@ class CnDownloadAdapter(FinsSourceDownloadAdapter):
         )
         persisted_summary = _summary_from_pipeline_result(result)
         if request.rebuild_processed:
-            mark_downloaded_processed_rebuild_required(
-                self._pipeline.processed_repository,
-                ticker=request.normalized_ticker.canonical,
-                summary=persisted_summary,
+            batch = self._pipeline.batching_repository.begin_batch(
+                request.normalized_ticker.canonical
             )
+            try:
+                mark_downloaded_processed_rebuild_required(
+                    self._pipeline.processed_repository,
+                    ticker=request.normalized_ticker.canonical,
+                    summary=persisted_summary,
+                    batch=batch,
+                )
+            except BaseException:
+                self._pipeline.batching_repository.rollback_batch(batch)
+                raise
+            self._pipeline.batching_repository.commit_batch(batch)
         return FinsSourceDownloadAdapterResult(
             discovered_count=_summary_int(result, "total"),
             persisted_summary=persisted_summary,
@@ -1492,6 +1572,7 @@ def _json_text_list(values: list[str] | None) -> list[JsonValue]:
 def build_cn_download_adapter(
     *,
     workspace_root: Path,
+    batching_repository: BatchingRepositoryProtocol,
     company_repository: CompanyMetaRepositoryProtocol,
     source_repository: SourceDocumentRepositoryProtocol,
     processed_repository: ProcessedDocumentRepositoryProtocol,
@@ -1505,6 +1586,7 @@ def build_cn_download_adapter(
 
     Args:
         workspace_root: Fins 工作区根目录。
+        batching_repository: batch lifecycle 仓储。
         company_repository: 公司元数据仓储。
         source_repository: 源文档仓储。
         processed_repository: processed 仓储。
@@ -1523,6 +1605,7 @@ def build_cn_download_adapter(
 
     pipeline = CnPipeline(
         workspace_root=workspace_root,
+        batching_repository=batching_repository,
         company_repository=company_repository,
         source_repository=source_repository,
         processed_repository=processed_repository,
@@ -1538,6 +1621,7 @@ def build_cn_download_adapter(
 def build_hk_download_adapter(
     *,
     workspace_root: Path,
+    batching_repository: BatchingRepositoryProtocol,
     company_repository: CompanyMetaRepositoryProtocol,
     source_repository: SourceDocumentRepositoryProtocol,
     processed_repository: ProcessedDocumentRepositoryProtocol,
@@ -1551,6 +1635,7 @@ def build_hk_download_adapter(
 
     Args:
         workspace_root: Fins 工作区根目录。
+        batching_repository: batch lifecycle 仓储。
         company_repository: 公司元数据仓储。
         source_repository: 源文档仓储。
         processed_repository: processed 仓储。
@@ -1569,6 +1654,7 @@ def build_hk_download_adapter(
 
     pipeline = CnPipeline(
         workspace_root=workspace_root,
+        batching_repository=batching_repository,
         company_repository=company_repository,
         source_repository=source_repository,
         processed_repository=processed_repository,

@@ -7,7 +7,7 @@ from dayu.contracts.json_value import JsonValue
 from collections.abc import Sequence
 from typing import Optional
 
-from dayu.fins.domain.document_models import CompanyMeta, now_iso8601
+from dayu.fins.domain.document_models import BatchToken, CompanyMeta, now_iso8601
 from dayu.fins.storage import CompanyMetaRepositoryProtocol
 from dayu.fins.ticker_normalization import try_normalize_ticker
 
@@ -137,8 +137,25 @@ def upsert_company_meta(
     company_id: str,
     company_name: str,
     ticker_aliases: Optional[list[str]] = None,
+    batch: BatchToken,
 ) -> None:
-    """写入 SEC 公司级元数据。"""
+    """写入 SEC 公司级元数据。
+
+    Args:
+        repository: 公司元数据仓储。
+        ticker: 股票代码。
+        company_id: 公司 ID。
+        company_name: 公司名称。
+        ticker_aliases: 可选 ticker alias。
+        batch: caller 显式传入的 batch capability。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: 仓储写入失败时抛出。
+        ValueError: batch capability 非法时抛出。
+    """
 
     repository.upsert_company_meta(
         CompanyMeta(
@@ -152,7 +169,8 @@ def upsert_company_meta(
                 primary_ticker=ticker,
                 raw_aliases=ticker_aliases,
             ),
-        )
+        ),
+        batch=batch,
     )
 
 

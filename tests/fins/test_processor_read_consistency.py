@@ -29,6 +29,7 @@ from dayu.fins.domain.document_models import (
     CompanyMeta,
     DocumentMeta,
     FinsSourceProvider,
+    SourceHandle,
     SourceDocumentStateChangeRequest,
     SourceDocumentUpsertRequest,
     now_iso8601,
@@ -52,7 +53,9 @@ from dayu.fins.processors.source_text import (
 from dayu.fins.processors.ten_q_processor import TenQFormProcessor
 from dayu.fins.processors.ten_k_processor import TenKFormProcessor
 from dayu.fins.storage import (
+    FsBatchingRepository,
     FsCompanyMetaRepository,
+    FsDocumentBlobRepository,
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
 )
@@ -475,6 +478,14 @@ class _RevisionProbeRepository(FsSourceDocumentRepository):
         """
 
         super().__init__(workspace_root, repository_set=repository_set)
+        self._batching_repository = FsBatchingRepository(
+            workspace_root,
+            repository_set=repository_set,
+        )
+        self._blob_repository = FsDocumentBlobRepository(
+            workspace_root,
+            repository_set=repository_set,
+        )
         self.payload = b"version-one"
         self.get_source_meta_calls = 0
         self.mutate_on_next_meta_read = False
@@ -791,6 +802,8 @@ def _build_runtime(tmp_path: Path) -> tuple[FinsReadRuntime, _RevisionProbeRepos
     source_repository = _RevisionProbeRepository(workspace_root, repository_set=repository_set)
     processed_repository = FsProcessedDocumentRepository(workspace_root, repository_set=repository_set)
     registry = _CountingProcessorRegistry()
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    batch = batching_repository.begin_batch("AAPL")
     company_repository.upsert_company_meta(
         CompanyMeta(
             company_id="0000320193",
@@ -800,7 +813,8 @@ def _build_runtime(tmp_path: Path) -> tuple[FinsReadRuntime, _RevisionProbeRepos
             resolver_version="test",
             updated_at=now_iso8601(),
             ticker_aliases=[],
-        )
+        ),
+        batch=batch,
     )
     source_repository.create_source_document(
         SourceDocumentUpsertRequest(
@@ -808,6 +822,16 @@ def _build_runtime(tmp_path: Path) -> tuple[FinsReadRuntime, _RevisionProbeRepos
             document_id="doc-1",
             internal_document_id="doc-1",
             form_type="10-K",
+            primary_document="doc-1.txt",
+            files=[
+                source_repository._blob_repository.store_file(
+                    SourceHandle("AAPL", "doc-1", SourceKind.FILING.value),
+                    "doc-1.txt",
+                    BytesIO(b"version-one"),
+                    batch=batch,
+                    content_type="text/plain",
+                )
+            ],
             meta={
                 "ingest_method": "download",
                 "source_provider": FinsSourceProvider.SEC_EDGAR.to_storage_value(),
@@ -819,7 +843,9 @@ def _build_runtime(tmp_path: Path) -> tuple[FinsReadRuntime, _RevisionProbeRepos
             },
         ),
         SourceKind.FILING,
+        batch=batch,
     )
+    batching_repository.commit_batch(batch)
     runtime = FinsReadRuntime(
         company_repository=company_repository,
         source_repository=source_repository,
@@ -830,7 +856,7 @@ def _build_runtime(tmp_path: Path) -> tuple[FinsReadRuntime, _RevisionProbeRepos
 
 
 def _update_source(
-    repository: FsSourceDocumentRepository,
+    repository: _RevisionProbeRepository,
     *,
     fingerprint: str,
     form_type: str = "10-K",
@@ -851,16 +877,23 @@ def _update_source(
         OSError: source meta 更新失败时抛出。
     """
 
-    repository.update_source_document(
-        SourceDocumentUpsertRequest(
-            ticker="AAPL",
-            document_id=document_id,
-            internal_document_id=document_id,
-            form_type=form_type,
-            meta={"source_fingerprint": fingerprint},
-        ),
-        SourceKind.FILING,
-    )
+    batch = repository._batching_repository.begin_batch("AAPL")
+    try:
+        repository.update_source_document(
+            SourceDocumentUpsertRequest(
+                ticker="AAPL",
+                document_id=document_id,
+                internal_document_id=document_id,
+                form_type=form_type,
+                meta={"source_fingerprint": fingerprint},
+            ),
+            SourceKind.FILING,
+            batch=batch,
+        )
+    except Exception:
+        repository._batching_repository.rollback_batch(batch)
+        raise
+    repository._batching_repository.commit_batch(batch)
 
 
 def _mutate_existing_ten_q_sections(
@@ -1353,12 +1386,22 @@ def test_cross_document_diagnosis_does_not_reuse_stale_cached_processor(tmp_path
     """
 
     runtime, repository, _registry = _build_runtime(tmp_path)
+    create_batch = repository._batching_repository.begin_batch("AAPL")
+    file_meta = repository._blob_repository.store_file(
+        SourceHandle("AAPL", "doc-2", SourceKind.FILING.value),
+        "doc-2.txt",
+        BytesIO(b"version-one"),
+        batch=create_batch,
+        content_type="text/plain",
+    )
     repository.create_source_document(
         SourceDocumentUpsertRequest(
             ticker="AAPL",
             document_id="doc-2",
             internal_document_id="doc-2",
             form_type="10-K",
+            primary_document="doc-2.txt",
+            files=[file_meta],
             meta={
                 "ingest_method": "download",
                 "source_provider": FinsSourceProvider.SEC_EDGAR.to_storage_value(),
@@ -1368,7 +1411,9 @@ def test_cross_document_diagnosis_does_not_reuse_stale_cached_processor(tmp_path
             },
         ),
         SourceKind.FILING,
+        batch=create_batch,
     )
+    repository._batching_repository.commit_batch(create_batch)
     runtime._get_or_create_processor(ticker="AAPL", document_id="doc-2")
     _update_source(repository, fingerprint="doc-2-revision-two", document_id="doc-2")
 
@@ -1473,9 +1518,12 @@ def test_cached_processor_is_not_returned_after_source_deleted(tmp_path: Path) -
 
     runtime, repository, _registry = _build_runtime(tmp_path)
     runtime._get_or_create_processor(ticker="AAPL", document_id="doc-1")
+    delete_batch = repository._batching_repository.begin_batch("AAPL")
     repository.delete_source_document(
-        SourceDocumentStateChangeRequest("AAPL", "doc-1", SourceKind.FILING.value)
+        SourceDocumentStateChangeRequest("AAPL", "doc-1", SourceKind.FILING.value),
+        batch=delete_batch,
     )
+    repository._batching_repository.commit_batch(delete_batch)
 
     with pytest.raises(FileNotFoundError):
         runtime._get_or_create_processor(ticker="AAPL", document_id="doc-1")

@@ -407,14 +407,13 @@ def _resolve_primary_uri(file_payloads: list[dict[str, Any]], primary_name: Opti
         无。
     """
 
-    if not file_payloads:
+    if not primary_name:
         return None
-    if primary_name:
-        for item in file_payloads:
-            name = str(item.get("name") or _infer_filename_from_uri(item.get("uri", ""))).strip()
-            if name == primary_name:
-                return str(item.get("uri"))
-    return str(file_payloads[0].get("uri"))
+    for item in file_payloads:
+        name = str(item.get("name") or _infer_filename_from_uri(item.get("uri", ""))).strip()
+        if name == primary_name:
+            return str(item.get("uri"))
+    return None
 
 
 def _file_object_meta_from_dict(payload: dict[str, Any]) -> FileObjectMeta:

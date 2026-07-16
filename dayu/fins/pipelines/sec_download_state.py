@@ -11,7 +11,12 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Final, Optional
 
-from dayu.fins.domain.document_models import DownloadRejectionEntry, DownloadRejectionRegistry, now_iso8601
+from dayu.fins.domain.document_models import (
+    BatchToken,
+    DownloadRejectionEntry,
+    DownloadRejectionRegistry,
+    now_iso8601,
+)
 from dayu.fins.downloaders.sec_downloader import (
     BrowseEdgarFiling,
     RemoteFileDescriptor,
@@ -93,6 +98,8 @@ def _save_rejection_registry(
     repository: FilingMaintenanceRepositoryProtocol,
     ticker: str,
     registry: DownloadRejectionRegistry,
+    *,
+    batch: BatchToken,
 ) -> None:
     """持久化拒绝注册表。
 
@@ -100,6 +107,7 @@ def _save_rejection_registry(
         repository: filing 维护治理仓储。
         ticker: 股票代码。
         registry: document_id 到 typed 拒绝记录的映射。
+        batch: caller 显式传入的 batch capability。
 
     Returns:
         无。
@@ -108,7 +116,7 @@ def _save_rejection_registry(
         无。
     """
 
-    repository.save_download_rejection_registry(ticker, registry)
+    repository.save_download_rejection_registry(ticker, registry, batch=batch)
 
 
 def _is_rejected(
@@ -326,7 +334,7 @@ def _browse_edgar_filings_to_dicts(entries: list[BrowseEdgarFiling]) -> list[Jso
             "filing_date": entry.filing_date,
             "accession_number": entry.accession_number,
             "cik": entry.cik,
-            "index_url": getattr(entry, "index_url", ""),
+            "index_url": entry.index_url,
         }
         for entry in entries
     ]

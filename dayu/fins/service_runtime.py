@@ -25,9 +25,11 @@ from dayu.fins.ingestion_runtime import (
 )
 from dayu.fins.processors.registry import build_fins_processor_registry
 from dayu.fins.storage import (
+    BatchingRepositoryProtocol,
     CompanyMetaRepositoryProtocol,
     DocumentBlobRepositoryProtocol,
     FilingMaintenanceRepositoryProtocol,
+    FsBatchingRepository,
     FsCompanyMetaRepository,
     FsDocumentBlobRepository,
     FsFilingMaintenanceRepository,
@@ -302,6 +304,7 @@ class DefaultFinsRuntime:
     """
 
     workspace_root: Path
+    batching_repository: BatchingRepositoryProtocol
     company_repository: CompanyMetaRepositoryProtocol
     source_repository: SourceDocumentRepositoryProtocol
     blob_repository: DocumentBlobRepositoryProtocol
@@ -347,6 +350,10 @@ class DefaultFinsRuntime:
         repository_set = build_fs_repository_set(workspace_root=workspace_root)
         return cls(
             workspace_root=workspace_root,
+            batching_repository=FsBatchingRepository(
+                workspace_root,
+                repository_set=repository_set,
+            ),
             company_repository=FsCompanyMetaRepository(
                 workspace_root,
                 repository_set=repository_set,
@@ -448,6 +455,7 @@ class DefaultFinsRuntime:
             sec_download_adapter = build_sec_download_adapter(
                 workspace_root=self.workspace_root,
                 processor_registry=self.processor_registry,
+                batching_repository=self.batching_repository,
                 company_repository=self.company_repository,
                 source_repository=self.source_repository,
                 processed_repository=self.processed_repository,
@@ -456,6 +464,7 @@ class DefaultFinsRuntime:
             )
             cn_download_adapter = build_cn_download_adapter(
                 workspace_root=self.workspace_root,
+                batching_repository=self.batching_repository,
                 company_repository=self.company_repository,
                 source_repository=self.source_repository,
                 processed_repository=self.processed_repository,
@@ -464,6 +473,7 @@ class DefaultFinsRuntime:
             )
             hk_download_adapter = build_hk_download_adapter(
                 workspace_root=self.workspace_root,
+                batching_repository=self.batching_repository,
                 company_repository=self.company_repository,
                 source_repository=self.source_repository,
                 processed_repository=self.processed_repository,
@@ -475,6 +485,7 @@ class DefaultFinsRuntime:
             sec_upload_pipeline = SecPipeline(
                 workspace_root=self.workspace_root,
                 processor_registry=self.processor_registry,
+                batching_repository=self.batching_repository,
                 company_repository=self.company_repository,
                 source_repository=self.source_repository,
                 processed_repository=self.processed_repository,
@@ -483,6 +494,7 @@ class DefaultFinsRuntime:
             )
             cn_upload_pipeline = CnPipeline(
                 workspace_root=self.workspace_root,
+                batching_repository=self.batching_repository,
                 company_repository=self.company_repository,
                 source_repository=self.source_repository,
                 processed_repository=self.processed_repository,
@@ -494,6 +506,7 @@ class DefaultFinsRuntime:
                 cn_pipeline=cn_upload_pipeline,
             )
             runtime = FinsIngestionRuntime.create(
+                batching_repository=self.batching_repository,
                 source_repository=self.source_repository,
                 blob_repository=self.blob_repository,
                 filing_maintenance_repository=self.filing_maintenance_repository,

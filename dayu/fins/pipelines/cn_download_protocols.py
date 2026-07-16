@@ -32,6 +32,7 @@ from dayu.fins.pipelines.cn_download_models import (
     DownloadedReportAsset,
 )
 from dayu.fins.storage import (
+    BatchingRepositoryProtocol,
     CompanyMetaRepositoryProtocol,
     DocumentBlobRepositoryProtocol,
     FilingMaintenanceRepositoryProtocol,
@@ -139,6 +140,12 @@ class CnDownloadWorkflowHost(Protocol):
     其它横切（取消、日志）由 workflow 层显式接收 ``cancel_checker`` 等参数
     管理，不放进 host。
     """
+
+    @property
+    def batching_repository(self) -> BatchingRepositoryProtocol:
+        """batch lifecycle 唯一仓储。"""
+
+        ...
 
     @property
     def company_meta_repository(self) -> CompanyMetaRepositoryProtocol:

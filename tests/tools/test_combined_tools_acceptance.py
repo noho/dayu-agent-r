@@ -33,7 +33,9 @@ from dayu.contracts.tool_schema import ToolTruncateSpec
 from dayu.contracts.tool_source import ToolBundleSourceRef
 from dayu.fins.domain.document_models import (
     CompanyMeta,
+    FinsSourceProvider,
     SourceDocumentUpsertRequest,
+    SourceHandle,
     now_iso8601,
 )
 from dayu.fins.domain.enums import SourceKind
@@ -833,6 +835,7 @@ def _build_fins_workspace(tmp_path: Path) -> Path:
     company_repository = FsCompanyMetaRepository(workspace_root, repository_set=repository_set)
     source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
     blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    company_batch = batching_repository.begin_batch("AAPL")
     company_repository.upsert_company_meta(
         CompanyMeta(
             company_id="0000320193",
@@ -842,10 +845,24 @@ def _build_fins_workspace(tmp_path: Path) -> Path:
             resolver_version="combined-test",
             updated_at=now_iso8601(),
             ticker_aliases=["APPLE"],
-        )
+        ),
+        batch=company_batch,
     )
+    batching_repository.commit_batch(company_batch)
     token = batching_repository.begin_batch("AAPL")
     try:
+        handle = SourceHandle(
+            ticker="AAPL",
+            document_id="aapl-2024-10k",
+            source_kind=SourceKind.FILING.value,
+        )
+        file_meta = blob_repository.store_file(
+            handle,
+            "aapl-2024-10k.md",
+            io.BytesIO(_fins_fixture_markdown().encode("utf-8")),
+            batch=token,
+            content_type="text/markdown",
+        )
         source_repository.create_source_document(
             SourceDocumentUpsertRequest(
                 ticker="AAPL",
@@ -860,40 +877,17 @@ def _build_fins_workspace(tmp_path: Path) -> Path:
                     "report_date": "2024-09-28",
                     "amended": False,
                     "ingest_method": "upload",
-                },
-            ),
-            SourceKind.FILING,
-        )
-        handle = source_repository.get_source_handle("AAPL", "aapl-2024-10k", SourceKind.FILING)
-        file_meta = blob_repository.store_file(
-            handle,
-            "aapl-2024-10k.md",
-            io.BytesIO(_fins_fixture_markdown().encode("utf-8")),
-            content_type="text/markdown",
-        )
-        source_repository.update_source_document(
-            SourceDocumentUpsertRequest(
-                ticker="AAPL",
-                document_id="aapl-2024-10k",
-                internal_document_id="aapl-2024-10k",
-                form_type="10-K",
-                primary_document="aapl-2024-10k.md",
-                meta={
-                    "fiscal_year": 2024,
-                    "fiscal_period": "FY",
-                    "filing_date": "2024-11-01",
-                    "report_date": "2024-09-28",
-                    "amended": False,
-                    "ingest_method": "upload",
+                    "source_provider": FinsSourceProvider.USER_UPLOAD.to_storage_value(),
                 },
                 files=[file_meta],
             ),
             SourceKind.FILING,
+            batch=token,
         )
-        batching_repository.commit_batch(token)
-    except Exception:
+    except BaseException:
         batching_repository.rollback_batch(token)
         raise
+    batching_repository.commit_batch(token)
     return workspace_root
 
 

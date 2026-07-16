@@ -51,13 +51,17 @@ from dayu.fins.ingestion_events import (
     FinsIngestionJobEventType,
 )
 from dayu.fins.ingestion.observation_handle import (
-    FinsObservationHandle,
     FinsObservationStatus,
 )
 from dayu.fins.domain.document_models import (
     BatchToken,
     CompanyMeta,
+    FinsSourceProvider,
+    FinsIngestMethod,
+    ProcessedCreateRequest,
+    RejectedFilingArtifactUpsertRequest,
     SourceDocumentUpsertRequest,
+    SourceHandle,
     now_iso8601,
 )
 from dayu.fins.ingestion_runtime import (
@@ -88,6 +92,8 @@ from dayu.fins.pipelines.cn_pipeline import CnDownloadAdapter
 from dayu.fins.pipelines.sec_pipeline import SecDownloadAdapter
 from dayu.fins.service_runtime import DefaultFinsRuntime, ProductionFinsUploadRunner
 from dayu.fins.storage import (
+    BatchingRepositoryProtocol,
+    DocumentBlobRepositoryProtocol,
     FsBatchingRepository,
     FsCompanyMetaRepository,
     FsDocumentBlobRepository,
@@ -101,26 +107,155 @@ from dayu.fins.ticker_normalization import NormalizedTicker
 from dayu.fins.tools.read_runtime import FinsReadRuntime
 
 
-class _CommitFailingDownloadSourceRepository(FsSourceDocumentRepository):
+class _CommitFailingDownloadBatchingRepository(FsBatchingRepository):
     """模拟 storage 消费 token 后抛出 generic download commit 异常。"""
 
     def __init__(self, workspace_root: Path, repository_set: _FsRepositorySet) -> None:
-        """初始化 commit failure source spy。"""
+        """初始化 commit failure batching spy。"""
 
         super().__init__(workspace_root, repository_set=repository_set)
         self.caller_rollback_calls = 0
 
-    def commit_batch(self, token: BatchToken) -> None:
+    def commit_batch(self, batch: BatchToken) -> None:
         """由 storage owner 回滚并消费 token 后抛出 commit 主异常。"""
 
-        FsSourceDocumentRepository.rollback_batch(self, token)
+        FsBatchingRepository.rollback_batch(self, batch)
         raise OSError("forced generic commit failure")
 
-    def rollback_batch(self, token: BatchToken) -> None:
+    def rollback_batch(self, batch: BatchToken) -> None:
         """记录不应发生的 caller 二次 rollback。"""
 
         self.caller_rollback_calls += 1
-        super().rollback_batch(token)
+        super().rollback_batch(batch)
+
+
+class _RollbackFailingIngestionBatchingRepository(FsBatchingRepository):
+    """执行真实 ingestion rollback 后注入指定次级失败并记录调用次数。"""
+
+    def __init__(
+        self,
+        workspace_root: Path,
+        repository_set: _FsRepositorySet,
+        rollback_error: BaseException,
+    ) -> None:
+        """初始化 rollback failure batching spy。
+
+        Args:
+            workspace_root: 测试工作区根目录。
+            repository_set: 与 ingestion repositories 共享的 repository set。
+            rollback_error: 真实 rollback 完成后抛出的次级异常。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: 仓储初始化失败时抛出。
+        """
+
+        super().__init__(workspace_root, repository_set=repository_set)
+        self.rollback_error = rollback_error
+        self.rollback_calls = 0
+
+    def rollback_batch(self, batch: BatchToken) -> None:
+        """执行并记录真实 rollback，随后抛出预置次级异常。
+
+        Args:
+            batch: 当前 shared core 登记的 open batch capability。
+
+        Returns:
+            不返回；始终抛出预置异常。
+
+        Raises:
+            BaseException: 初始化时提供的 rollback 次级异常。
+            OSError: 真实 rollback 失败时抛出。
+            ValueError: batch capability 非法时抛出。
+        """
+
+        self.rollback_calls += 1
+        super().rollback_batch(batch)
+        raise self.rollback_error
+
+
+class _RejectedArtifactUpsertFailure:
+    """在 rejected artifact owner mutation 边界抛出指定 operation 异常。"""
+
+    def __init__(self, operation_error: BaseException) -> None:
+        """保存需要原样抛出的 operation 异常。
+
+        Args:
+            operation_error: rejected artifact upsert 时抛出的主异常。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.operation_error = operation_error
+
+    def __call__(
+        self,
+        request: RejectedFilingArtifactUpsertRequest,
+        *,
+        batch: BatchToken,
+    ) -> None:
+        """接收真实 mutation 输入后抛出预置 operation 异常。
+
+        Args:
+            request: rejected filing artifact upsert 请求。
+            batch: caller-owned batch capability。
+
+        Returns:
+            不返回；始终抛出预置异常。
+
+        Raises:
+            BaseException: 初始化时提供的 operation 异常。
+        """
+
+        del request, batch
+        raise self.operation_error
+
+
+class _ProcessedCreateFailure:
+    """在 preprocess processed-create owner 边界抛出指定 operation 异常。"""
+
+    def __init__(self, operation_error: BaseException) -> None:
+        """保存需要原样抛出的 operation 异常。
+
+        Args:
+            operation_error: processed create 时抛出的主异常。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.operation_error = operation_error
+
+    def __call__(
+        self,
+        request: ProcessedCreateRequest,
+        *,
+        batch: BatchToken,
+    ) -> None:
+        """接收真实 preprocess mutation 输入后抛出预置 operation 异常。
+
+        Args:
+            request: processed create 请求。
+            batch: caller-owned batch capability。
+
+        Returns:
+            不返回；始终抛出预置异常。
+
+        Raises:
+            BaseException: 初始化时提供的 operation 异常。
+        """
+
+        del request, batch
+        raise self.operation_error
 
 
 def test_direct_event_text_helper_owns_result_titles_and_failure_messages() -> None:
@@ -384,6 +519,8 @@ class _FakeDownloadAdapter(FinsSourceDownloadAdapter):
                 "fiscal_year": 2024,
                 "fiscal_period": "FY",
                 "amended": False,
+                "ingest_method": FinsIngestMethod.DOWNLOAD.to_storage_value(),
+                "source_provider": FinsSourceProvider.SEC_EDGAR.to_storage_value(),
             },
             files=(
                 FinsDownloadedFile(
@@ -596,20 +733,26 @@ class _BlockingArtifactUploadRunner(FinsUploadRunner):
     def __init__(
         self,
         *,
+        batching_repository: BatchingRepositoryProtocol,
         source_repository: SourceDocumentRepositoryProtocol,
+        blob_repository: DocumentBlobRepositoryProtocol,
         document_id: str,
     ) -> None:
         """初始化 runner。
 
         Args:
+            batching_repository: batch lifecycle 唯一仓储。
             source_repository: Fins 源文档仓储协议实现。
+            blob_repository: Fins blob 仓储协议实现。
             document_id: 测试写入的源文档 id。
 
         Returns:
             无。
         """
 
+        self.batching_repository = batching_repository
         self.source_repository = source_repository
+        self.blob_repository = blob_repository
         self.document_id = document_id
         self.artifact_written = Event()
         self.allow_finish = Event()
@@ -637,13 +780,27 @@ class _BlockingArtifactUploadRunner(FinsUploadRunner):
         """
 
         self.requests = self.requests + (request,)
-        self.source_repository.create_source_document(
-            SourceDocumentUpsertRequest(
+        batch = self.batching_repository.begin_batch(request.ticker)
+        try:
+            filename = f"{self.document_id}.md"
+            file_meta = self.blob_repository.store_file(
+                SourceHandle(
+                    ticker=request.ticker,
+                    document_id=self.document_id,
+                    source_kind=SourceKind.FILING.value,
+                ),
+                filename,
+                io.BytesIO(b"# observed upload fixture"),
+                batch=batch,
+                content_type="text/markdown",
+            )
+            self.source_repository.create_source_document(
+                SourceDocumentUpsertRequest(
                 ticker=request.ticker,
                 document_id=self.document_id,
                 internal_document_id=self.document_id,
                 form_type="10-K",
-                primary_document=f"{self.document_id}.md",
+                primary_document=filename,
                 meta={
                     "fiscal_year": 2024,
                     "fiscal_period": "FY",
@@ -651,10 +808,17 @@ class _BlockingArtifactUploadRunner(FinsUploadRunner):
                     "report_date": "2024-09-28",
                     "amended": False,
                     "ingest_method": "upload",
+                    "source_provider": FinsSourceProvider.USER_UPLOAD.to_storage_value(),
                 },
-            ),
-            SourceKind.FILING,
-        )
+                files=[file_meta],
+                ),
+                SourceKind.FILING,
+                batch=batch,
+            )
+        except BaseException:
+            self.batching_repository.rollback_batch(batch)
+            raise
+        self.batching_repository.commit_batch(batch)
         self.artifact_written.set()
         self.allow_finish.wait(timeout=1.0)
         self.cancellation_checks = self.cancellation_checks + (cancellation_checker(),)
@@ -1268,7 +1432,11 @@ def test_store_downloaded_document_create_failure_leaves_document_absent(tmp_pat
         internal_document_id="aapl-new-10k",
         form_type="10-K",
         primary_document="aapl-new-10k.md",
-        meta={"form_type": "10-K"},
+        meta={
+            "form_type": "10-K",
+            "ingest_method": FinsIngestMethod.DOWNLOAD.to_storage_value(),
+            "source_provider": FinsSourceProvider.SEC_EDGAR.to_storage_value(),
+        },
         files=(FinsDownloadedFile(filename="", content=b"broken"),),
     )
 
@@ -1293,9 +1461,11 @@ def test_store_downloaded_document_commit_failure_does_not_caller_rollback(tmp_p
 
     workspace_root = tmp_path / "fins-workspace"
     repository_set = build_fs_repository_set(workspace_root=workspace_root)
-    source_repository = _CommitFailingDownloadSourceRepository(workspace_root, repository_set)
+    batching_repository = _CommitFailingDownloadBatchingRepository(workspace_root, repository_set)
+    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
     default_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
     runtime = ingestion_runtime.FinsIngestionRuntime.create(
+        batching_repository=batching_repository,
         source_repository=source_repository,
         blob_repository=FsDocumentBlobRepository(workspace_root, repository_set=repository_set),
         filing_maintenance_repository=FsFilingMaintenanceRepository(
@@ -1316,7 +1486,11 @@ def test_store_downloaded_document_commit_failure_does_not_caller_rollback(tmp_p
         internal_document_id="aapl-commit-failed",
         form_type="10-K",
         primary_document="report.md",
-        meta={"form_type": "10-K"},
+        meta={
+            "form_type": "10-K",
+            "ingest_method": FinsIngestMethod.DOWNLOAD.to_storage_value(),
+            "source_provider": FinsSourceProvider.SEC_EDGAR.to_storage_value(),
+        },
         files=(FinsDownloadedFile(filename="report.md", content=b"report"),),
     )
 
@@ -1328,13 +1502,130 @@ def test_store_downloaded_document_commit_failure_does_not_caller_rollback(tmp_p
             rebuild_processed=False,
         )
 
-    assert source_repository.caller_rollback_calls == 0
+    assert batching_repository.caller_rollback_calls == 0
     with pytest.raises(FileNotFoundError):
         source_repository.get_source_meta(
             "AAPL",
             "aapl-commit-failed",
             SourceKind.FILING,
         )
+
+
+def test_store_rejected_artifact_double_failure_preserves_operation_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """rejected artifact 双失败必须以 operation 为主、rollback 为 cause且仅回滚一次。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 主异常 identity、cause、note 或 rollback 次数漂移时抛出。
+    """
+
+    workspace_root = tmp_path / "fins-workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    operation_error = OSError("injected rejected artifact operation failure")
+    rollback_error = RuntimeError("injected rejected artifact rollback failure")
+    batching_repository = _RollbackFailingIngestionBatchingRepository(
+        workspace_root,
+        repository_set,
+        rollback_error,
+    )
+    runtime = _build_ingestion_runtime_with_repository_set(
+        workspace_root,
+        repository_set=repository_set,
+        batching_repository=batching_repository,
+    )
+    monkeypatch.setattr(
+        runtime.filing_maintenance_repository,
+        "upsert_rejected_filing_artifact",
+        _RejectedArtifactUpsertFailure(operation_error),
+    )
+    artifact = FinsRejectedFilingDownloadArtifact(
+        document_id="fil-rejected",
+        internal_document_id="rejected-internal",
+        accession_number="0000000000-25-000001",
+        company_id="0000320193",
+        form_type="8-K",
+        filing_date="2025-02-01",
+        report_date=None,
+        primary_document="rejected.htm",
+        selected_primary_document="rejected.htm",
+        rejection_reason="不属于请求范围",
+        rejection_category="form_filter",
+        source_fingerprint="rejected-fingerprint",
+    )
+
+    with pytest.raises(OSError) as exc_info:
+        runtime._store_rejected_filing_artifact(ticker="AAPL", artifact=artifact)
+
+    assert exc_info.value is operation_error
+    assert exc_info.value.__cause__ is rollback_error
+    assert exc_info.value.__notes__ == [
+        "rollback_batch failed; recovery evidence retained: "
+        "injected rejected artifact rollback failure"
+    ]
+    assert batching_repository.rollback_calls == 1
+
+
+def test_preprocess_double_failure_preserves_operation_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """preprocess 双失败必须以 operation 为主、rollback 为 cause且仅回滚一次。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 主异常 identity、cause、note 或 rollback 次数漂移时抛出。
+    """
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    operation_error = OSError("injected preprocess operation failure")
+    rollback_error = RuntimeError("injected preprocess rollback failure")
+    batching_repository = _RollbackFailingIngestionBatchingRepository(
+        workspace_root,
+        repository_set,
+        rollback_error,
+    )
+    runtime = _build_ingestion_runtime_with_repository_set(
+        workspace_root,
+        repository_set=repository_set,
+        batching_repository=batching_repository,
+    )
+    monkeypatch.setattr(
+        runtime.processed_repository,
+        "create_processed",
+        _ProcessedCreateFailure(operation_error),
+    )
+
+    with pytest.raises(OSError) as exc_info:
+        runtime._preprocess_one_document(
+            ticker="AAPL",
+            document_id="aapl-2024-10k",
+            source_kind=SourceKind.FILING,
+            rebuild_processed=False,
+        )
+
+    assert exc_info.value is operation_error
+    assert exc_info.value.__cause__ is rollback_error
+    assert exc_info.value.__notes__ == [
+        "rollback_batch failed; recovery evidence retained: "
+        "injected preprocess rollback failure"
+    ]
+    assert batching_repository.rollback_calls == 1
 
 
 def test_start_download_allows_sec_amended_form_type(tmp_path: Path) -> None:
@@ -2681,10 +2972,13 @@ def test_abandon_submitted_observation_cancels_and_keeps_storage_artifacts(
     executor = _HoldingExecutor()
     document_id = "aapl-observed-upload"
     runner = _BlockingArtifactUploadRunner(
+        batching_repository=default_runtime.batching_repository,
         source_repository=default_runtime.source_repository,
+        blob_repository=default_runtime.blob_repository,
         document_id=document_id,
     )
     runtime = ingestion_runtime.FinsIngestionRuntime.create(
+        batching_repository=default_runtime.batching_repository,
         source_repository=default_runtime.source_repository,
         blob_repository=default_runtime.blob_repository,
         filing_maintenance_repository=default_runtime.filing_maintenance_repository,
@@ -3509,6 +3803,69 @@ def test_start_preprocess_whole_ticker_applies_limit_after_form_filter(tmp_path:
     assert record.result_summary["processed_document_ids"] == ["aapl-2024-10k"]
 
 
+def test_preprocess_selection_rejects_missing_completion_and_keeps_complete_source(
+    tmp_path: Path,
+) -> None:
+    """预处理选择应拒绝缺失完成事实的 source，并保留显式完成态 source。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 缺失完成事实的 source 被选择，或完成态 source 未被保留时抛出。
+        OSError: fixture 文件读写失败时抛出。
+    """
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    _add_unmatched_source_documents(workspace_root=workspace_root, count=1)
+    incomplete_document_id = "aapl-2024-10q-00"
+    incomplete_meta_path = (
+        workspace_root
+        / "portfolio"
+        / "AAPL"
+        / "filings"
+        / incomplete_document_id
+        / "meta.json"
+    )
+    incomplete_meta = cast(
+        dict[str, JsonValue],
+        json.loads(incomplete_meta_path.read_text(encoding="utf-8")),
+    )
+    assert incomplete_meta.pop("ingest_complete") is True
+    incomplete_meta_path.write_text(
+        json.dumps(incomplete_meta, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    ingestion = runtime.get_ingestion_runtime()
+    complete_meta = runtime.source_repository.get_source_meta(
+        "AAPL",
+        "aapl-2024-10k",
+        SourceKind.FILING,
+    )
+    corrupted_meta = runtime.source_repository.get_source_meta(
+        "AAPL",
+        incomplete_document_id,
+        SourceKind.FILING,
+    )
+
+    assert complete_meta["ingest_complete"] is True
+    assert "ingest_complete" not in corrupted_meta
+
+    selected_document_ids = ingestion._select_preprocess_documents(
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        document_ids=("aapl-2024-10k", incomplete_document_id),
+        form_types=(),
+    )
+
+    assert selected_document_ids == ("aapl-2024-10k",)
+
+
 def test_start_preprocess_skips_existing_processed_document_without_rebuild(tmp_path: Path) -> None:
     """rebuild_processed=False 时已有 processed 文档应被跳过。"""
 
@@ -3586,6 +3943,7 @@ def test_claim_running_preserves_cancel_between_read_and_running_write(
     executor = _HoldingExecutor()
     job_store = _ClaimRaceJobStore()
     ingestion = ingestion_runtime.FinsIngestionRuntime.create(
+        batching_repository=default_runtime.batching_repository,
         source_repository=default_runtime.source_repository,
         blob_repository=default_runtime.blob_repository,
         filing_maintenance_repository=default_runtime.filing_maintenance_repository,
@@ -3817,6 +4175,7 @@ def test_start_preprocess_unsupported_document_records_not_supported_summary(tmp
     workspace_root = _build_fins_workspace(tmp_path)
     default_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
     ingestion = ingestion_runtime.FinsIngestionRuntime.create(
+        batching_repository=default_runtime.batching_repository,
         source_repository=default_runtime.source_repository,
         blob_repository=default_runtime.blob_repository,
         filing_maintenance_repository=default_runtime.filing_maintenance_repository,
@@ -4010,6 +4369,7 @@ def _build_ingestion_runtime(
 
     default_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
     return ingestion_runtime.FinsIngestionRuntime.create(
+        batching_repository=default_runtime.batching_repository,
         source_repository=default_runtime.source_repository,
         blob_repository=default_runtime.blob_repository,
         filing_maintenance_repository=default_runtime.filing_maintenance_repository,
@@ -4019,6 +4379,51 @@ def _build_ingestion_runtime(
         executor=executor,
         download_adapters=download_adapters,
         upload_runner=upload_runner,
+    )
+
+
+def _build_ingestion_runtime_with_repository_set(
+    workspace_root: Path,
+    *,
+    repository_set: _FsRepositorySet,
+    batching_repository: BatchingRepositoryProtocol,
+) -> ingestion_runtime.FinsIngestionRuntime:
+    """用显式 shared repository set 构造 owner-failure ingestion runtime。
+
+    Args:
+        workspace_root: Fins workspace root。
+        repository_set: 所有 mutation wrapper 共用的 repository set。
+        batching_repository: 注入 rollback 行为的 batch lifecycle 仓储。
+
+    Returns:
+        与 batching repository 共享同一 storage core 的 ingestion runtime。
+
+    Raises:
+        OSError: 仓储、processor registry 或 job store 初始化失败时抛出。
+    """
+
+    default_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    return ingestion_runtime.FinsIngestionRuntime.create(
+        batching_repository=batching_repository,
+        source_repository=FsSourceDocumentRepository(
+            workspace_root,
+            repository_set=repository_set,
+        ),
+        blob_repository=FsDocumentBlobRepository(
+            workspace_root,
+            repository_set=repository_set,
+        ),
+        filing_maintenance_repository=FsFilingMaintenanceRepository(
+            workspace_root,
+            repository_set=repository_set,
+        ),
+        processed_repository=FsProcessedDocumentRepository(
+            workspace_root,
+            repository_set=repository_set,
+        ),
+        processor_registry=default_runtime.processor_registry,
+        job_store=default_runtime.ingestion_job_store,
+        executor=_HoldingExecutor(),
     )
 
 
@@ -4044,17 +4449,31 @@ def _add_unmatched_source_documents(
     repository_set = build_fs_repository_set(workspace_root=workspace_root)
     batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
     source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
     token = batching_repository.begin_batch("AAPL")
     try:
         for index in range(count):
             document_id = f"aapl-2024-10q-{index:02d}"
+            filename = f"{document_id}.md"
+            handle = SourceHandle(
+                ticker="AAPL",
+                document_id=document_id,
+                source_kind=SourceKind.FILING.value,
+            )
+            file_meta = blob_repository.store_file(
+                handle,
+                filename,
+                io.BytesIO(b"# Unmatched fixture"),
+                batch=token,
+                content_type="text/markdown",
+            )
             source_repository.create_source_document(
                 SourceDocumentUpsertRequest(
                     ticker="AAPL",
                     document_id=document_id,
                     internal_document_id=document_id,
                     form_type="10-Q",
-                    primary_document=f"{document_id}.md",
+                    primary_document=filename,
                     meta={
                         "fiscal_year": 2024,
                         "fiscal_period": "Q",
@@ -4062,14 +4481,17 @@ def _add_unmatched_source_documents(
                         "report_date": "2024-06-29",
                         "amended": False,
                         "ingest_method": "upload",
+                        "source_provider": FinsSourceProvider.USER_UPLOAD.to_storage_value(),
                     },
+                    files=[file_meta],
                 ),
                 SourceKind.FILING,
+                batch=token,
             )
-        batching_repository.commit_batch(token)
-    except Exception:
+    except BaseException:
         batching_repository.rollback_batch(token)
         raise
+    batching_repository.commit_batch(token)
 
 
 def _wait_terminal(
@@ -4171,6 +4593,7 @@ def _build_fins_workspace(
     company_repository = FsCompanyMetaRepository(workspace_root, repository_set=repository_set)
     source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
     blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    company_batch = batching_repository.begin_batch("AAPL")
     company_repository.upsert_company_meta(
         CompanyMeta(
             company_id="0000320193",
@@ -4180,10 +4603,24 @@ def _build_fins_workspace(
             resolver_version="test",
             updated_at=now_iso8601(),
             ticker_aliases=["APPLE"],
-        )
+        ),
+        batch=company_batch,
     )
+    batching_repository.commit_batch(company_batch)
     token = batching_repository.begin_batch("AAPL")
     try:
+        handle = SourceHandle(
+            ticker="AAPL",
+            document_id="aapl-2024-10k",
+            source_kind=SourceKind.FILING.value,
+        )
+        file_meta = blob_repository.store_file(
+            handle,
+            "aapl-2024-10k.md",
+            io.BytesIO(_fixture_markdown().encode("utf-8")),
+            batch=token,
+            content_type=content_type,
+        )
         source_repository.create_source_document(
             SourceDocumentUpsertRequest(
                 ticker="AAPL",
@@ -4198,40 +4635,17 @@ def _build_fins_workspace(
                     "report_date": "2024-09-28",
                     "amended": False,
                     "ingest_method": "upload",
-                },
-            ),
-            SourceKind.FILING,
-        )
-        handle = source_repository.get_source_handle("AAPL", "aapl-2024-10k", SourceKind.FILING)
-        file_meta = blob_repository.store_file(
-            handle,
-            "aapl-2024-10k.md",
-            io.BytesIO(_fixture_markdown().encode("utf-8")),
-            content_type=content_type,
-        )
-        source_repository.update_source_document(
-            SourceDocumentUpsertRequest(
-                ticker="AAPL",
-                document_id="aapl-2024-10k",
-                internal_document_id="aapl-2024-10k",
-                form_type="10-K",
-                primary_document="aapl-2024-10k.md",
-                meta={
-                    "fiscal_year": 2024,
-                    "fiscal_period": "FY",
-                    "filing_date": "2024-11-01",
-                    "report_date": "2024-09-28",
-                    "amended": False,
-                    "ingest_method": "upload",
+                    "source_provider": FinsSourceProvider.USER_UPLOAD.to_storage_value(),
                 },
                 files=[file_meta],
             ),
             SourceKind.FILING,
+            batch=token,
         )
-        batching_repository.commit_batch(token)
-    except Exception:
+    except BaseException:
         batching_repository.rollback_batch(token)
         raise
+    batching_repository.commit_batch(token)
     return workspace_root
 
 
