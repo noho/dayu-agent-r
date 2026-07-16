@@ -2,23 +2,24 @@
 
 该模块是财报工具与底层仓储/处理器之间的中间调用层，职责包括：
 - 参数校验与标准化。
-- `document_id -> source_kind -> source -> processor` 路由。
+- storage snapshot 到 processor 的同版路由。
 - 统一能力降级（`not_supported`）。
-- 仅做进程内 LRU 缓存：Processor 按 `ticker + document_id`，source meta 按来源维度隔离；两者复用前校验 storage revision。
+- 仅做进程内 LRU 缓存，并通过 borrow/retire 生命周期保护 snapshot 资源。
 """
 
 from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
 from threading import Lock, RLock
+from types import TracebackType
 from typing import Any, Final, Literal, NoReturn, Optional, Protocol, TypedDict, runtime_checkable
+from weakref import WeakValueDictionary
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.fins._log import Log
-from dayu.fins.domain.document_models import FinsSourceProvider, SourceDocumentRevision
+from dayu.fins.domain.document_models import FinsSourceProvider
 from dayu.fins.domain.financial_result_contract import (
     FinancialStatementResult as ProcessorFinancialStatementResult,
     validate_financial_statement_result_payload,
@@ -50,6 +51,10 @@ from dayu.fins.storage import (
     ProcessedDocumentRepositoryProtocol,
     SourceDocumentRepositoryProtocol,
 )
+from dayu.fins.storage.repository_protocols import (
+    SourceSnapshotConsistencyError,
+    SourceSnapshotProtocol,
+)
 from .bm25f_scorer import BM25FSectionIndex, build_section_bm25f_index
 from .section_semantic import (
     build_section_path,
@@ -59,9 +64,7 @@ from .cache import ProcessorCacheKey, ProcessorLRUCache
 
 # 从拆分模块导入（FinsReadRuntime 直接使用）
 from .search_models import (
-    QueryDiagnosis,
     SectionSemanticProfile,
-    SEARCH_MODE_AUTO,
     _SEARCH_RANKING_VERSION,
 )
 from .search_engine import (
@@ -150,9 +153,6 @@ _FILING_SOURCE_TYPES_BY_PROVIDER: Final[dict[FinsSourceProvider, SourceType]] = 
 }
 """filing citation source_type 的 provider 派生规则。"""
 
-_SOURCE_META_CACHE_DEFAULT_MAX_ENTRIES: Final[int] = 512
-"""source meta 实例缓存默认容量。"""
-
 _RECOMMENDED_DOCUMENT_KEYS: Final[tuple[str, ...]] = (
     "latest_document_id",
     "recommended_for_company_overview_document_id",
@@ -189,34 +189,301 @@ class _SourceDocumentMeta(TypedDict):
     ingest_complete: bool
 
 
-@dataclass(frozen=True)
-class _CachedSourceDocumentMeta:
-    """source meta 缓存值。
-
-    Attributes:
-        meta: 已收窄的 source meta。
-        source_kind: meta 对应的 source kind。
-        revision: meta 构建时对应的 storage source revision。
-    """
-
-    meta: _SourceDocumentMeta
-    source_kind: SourceKind
-    revision: SourceDocumentRevision
-
-
-@dataclass(frozen=True)
 class _CachedProcessor:
-    """processor 缓存值。
+    """持有同版 processor、source meta 与 snapshot 资源的私有缓存条目。"""
 
-    Attributes:
-        processor: 已构建的文档处理器。
-        source_kind: processor 输入对应的 source kind。
-        revision: processor 构建时对应的 storage source revision。
-    """
+    def __init__(
+        self,
+        *,
+        processor: DocumentProcessor,
+        source_meta: _SourceDocumentMeta,
+        snapshot: SourceSnapshotProtocol,
+    ) -> None:
+        """初始化 live 缓存条目。
 
-    processor: DocumentProcessor
-    source_kind: SourceKind
-    revision: SourceDocumentRevision
+        Args:
+            processor: 从 ``snapshot`` 主文件构建的处理器。
+            source_meta: 从同一 ``snapshot`` 解析的 read-side meta 投影。
+            snapshot: 条目独占的 full storage snapshot 资源。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.processor = processor
+        self.source_meta = source_meta
+        self.snapshot = snapshot
+        self._active_borrows = 0
+        self._retired = False
+        self._closed = False
+        self._closing = False
+        self._lock = RLock()
+
+    def matches(self, snapshot: SourceSnapshotProtocol) -> bool:
+        """判断条目是否与候选 snapshot 属于同一 source publication。
+
+        Args:
+            snapshot: 待比较的 light 或 full snapshot。
+
+        Returns:
+            source kind 与 opaque revision 均相等时返回 ``True``。
+
+        Raises:
+            RuntimeError: 任一 snapshot 已关闭时抛出。
+        """
+
+        with self._lock:
+            if self._retired or self._closed:
+                return False
+            return (
+                self.snapshot.source_kind is snapshot.source_kind
+                and self.snapshot.revision == snapshot.revision
+            )
+
+    def try_acquire_borrow(self) -> bool:
+        """尝试为 live 条目增加一个 active borrow。
+
+        Args:
+            无。
+
+        Returns:
+            成功借用返回 ``True``；条目已 retired/closed 时返回 ``False``。
+
+        Raises:
+            无。
+        """
+
+        with self._lock:
+            if self._retired or self._closed:
+                return False
+            self._active_borrows += 1
+            return True
+
+    def release_borrow(self) -> bool:
+        """释放一个 active borrow，并判断是否应执行延迟 close。
+
+        Args:
+            无。
+
+        Returns:
+            retired 条目最后一个 borrow 释放且可开始 close 时返回 ``True``。
+
+        Raises:
+            RuntimeError: borrow 计数下溢时抛出。
+        """
+
+        with self._lock:
+            if self._active_borrows <= 0:
+                raise RuntimeError("processor cache borrow 计数下溢")
+            self._active_borrows -= 1
+            return self._begin_close_if_ready()
+
+    def retire(self) -> bool:
+        """把条目标记为不可再借用，并判断是否可立即 close。
+
+        Args:
+            无。
+
+        Returns:
+            当前无 active borrow 且可开始 close 时返回 ``True``。
+
+        Raises:
+            无。
+        """
+
+        with self._lock:
+            self._retired = True
+            return self._begin_close_if_ready()
+
+    def retry_close(self) -> bool:
+        """尝试重新取得失败 cleanup 的 close authority。
+
+        Args:
+            无。
+
+        Returns:
+            条目 retired、无 active borrow 且尚未 closed 时返回 ``True``。
+
+        Raises:
+            无。
+        """
+
+        with self._lock:
+            return self._begin_close_if_ready()
+
+    def finish_close(self, *, succeeded: bool) -> None:
+        """记录一次 snapshot close 的结果。
+
+        Args:
+            succeeded: snapshot 私有 cleanup 是否成功。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        with self._lock:
+            self._closing = False
+            if succeeded:
+                self._closed = True
+
+    @property
+    def closed(self) -> bool:
+        """返回条目资源是否已经成功关闭。
+
+        Args:
+            无。
+
+        Returns:
+            snapshot cleanup 已成功完成时返回 ``True``。
+
+        Raises:
+            无。
+        """
+
+        with self._lock:
+            return self._closed
+
+    def _begin_close_if_ready(self) -> bool:
+        """在持锁状态下判定并占有一次 snapshot close authority。
+
+        Args:
+            无。
+
+        Returns:
+            当前调用取得 close authority 时返回 ``True``。
+
+        Raises:
+            无。
+        """
+
+        if (
+            not self._retired
+            or self._active_borrows != 0
+            or self._closed
+            or self._closing
+        ):
+            return False
+        self._closing = True
+        return True
+
+
+class _ProcessorBorrow:
+    """一次 read 调用对 cached processor/snapshot 的私有 active borrow。"""
+
+    def __init__(self, *, runtime: FinsReadRuntime, entry: _CachedProcessor) -> None:
+        """初始化已取得计数的 borrow。
+
+        Args:
+            runtime: borrow release 与 cleanup 的 owner runtime。
+            entry: 已成功增加 active borrow 的缓存条目。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self._runtime = runtime
+        self._entry = entry
+        self._released = False
+
+    def __enter__(self) -> _ProcessorBorrow:
+        """进入 borrow scope 并返回自身。
+
+        Args:
+            无。
+
+        Returns:
+            当前已取得 active count 的 borrow。
+
+        Raises:
+            无。
+        """
+
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> Literal[False]:
+        """退出 borrow scope，并在 retired 最后借用处释放 snapshot。
+
+        Args:
+            exc_type: scope 内活动异常类型。
+            exc: scope 内活动异常。
+            traceback: scope 内活动异常 traceback。
+
+        Returns:
+            始终返回 ``False``，不压制活动异常。
+
+        Raises:
+            RuntimeError: borrow 被重复释放时抛出。
+            OSError: 无活动异常且 snapshot cleanup 失败时抛出。
+        """
+
+        del exc_type, traceback
+        if self._released:
+            raise RuntimeError("processor borrow 已释放")
+        self._released = True
+        self._runtime._release_processor_borrow(self._entry, active_error=exc)
+        return False
+
+    @property
+    def processor(self) -> DocumentProcessor:
+        """返回 borrow scope 内的 processor。
+
+        Args:
+            无。
+
+        Returns:
+            与当前 snapshot 同版的 processor。
+
+        Raises:
+            无。
+        """
+
+        return self._entry.processor
+
+    @property
+    def source_meta(self) -> _SourceDocumentMeta:
+        """返回与 processor 同版的 source meta。
+
+        Args:
+            无。
+
+        Returns:
+            当前 cache entry 持有的 typed source meta。
+
+        Raises:
+            无。
+        """
+
+        return self._entry.source_meta
+
+    @property
+    def snapshot(self) -> SourceSnapshotProtocol:
+        """返回与 processor 同版且仍受 borrow 保护的 snapshot。
+
+        Args:
+            无。
+
+        Returns:
+            当前 active borrow 对应的 full storage snapshot。
+
+        Raises:
+            无。
+        """
+
+        return self._entry.snapshot
 
 
 class _SourceDocumentSummary(TypedDict):
@@ -401,36 +668,6 @@ def _read_bool_meta_field(raw_meta: Mapping[str, JsonValue], *, field_name: str,
     raise ValueError(f"source meta 字段 {field_name} 必须为 bool")
 
 
-def _source_document_meta_to_storage_payload(meta: _SourceDocumentMeta) -> dict[str, JsonValue]:
-    """把 read runtime meta 投影转换为 storage provenance 可消费的 JSON。
-
-    Args:
-        meta: read runtime typed meta 投影。
-
-    Returns:
-        可传给 storage provenance helper 的 JSON 对象。
-
-    Raises:
-        RuntimeError: 转换失败时抛出。
-    """
-
-    return {
-        "form_type": meta["form_type"],
-        "material_name": meta["material_name"],
-        "fiscal_year": meta["fiscal_year"],
-        "fiscal_period": meta["fiscal_period"],
-        "report_date": meta["report_date"],
-        "filing_date": meta["filing_date"],
-        "amended": meta["amended"],
-        "internal_document_id": meta["internal_document_id"],
-        "accession_number": meta["accession_number"],
-        "ingest_method": meta["ingest_method"],
-        "source_provider": meta["source_provider"],
-        "is_deleted": meta["is_deleted"],
-        "ingest_complete": meta["ingest_complete"],
-    }
-
-
 def _source_document_recency_sort_key(
     item: _SourceDocumentSummary,
 ) -> tuple[int, str, str, int, int, str]:
@@ -548,7 +785,8 @@ class FinsReadRuntime:
     设计约束：
     - 不依赖 `processed/*.json` 产物。
     - 所有读取均通过实时 Processor 能力完成。
-    - processor/meta 缓存条目绑定 storage-owned source revision，revision 不一致时同步失效。
+    - processor 缓存条目独占一个 storage-owned full snapshot。
+    - active borrow 完成前，replacement/eviction/close 不得释放其 snapshot。
     """
 
     MODULE = "FINS.READ_RUNTIME"
@@ -561,7 +799,6 @@ class FinsReadRuntime:
         processed_repository: ProcessedDocumentRepositoryProtocol,
         processor_registry: ProcessorRegistry,
         processor_cache_max_entries: int = 128,
-        source_meta_cache_max_entries: int = _SOURCE_META_CACHE_DEFAULT_MAX_ENTRIES,
     ) -> None:
         """初始化服务。
 
@@ -571,7 +808,6 @@ class FinsReadRuntime:
             processed_repository: processed 文档仓储实现。
             processor_registry: 处理器注册表。
             processor_cache_max_entries: Processor LRU 缓存容量。
-            source_meta_cache_max_entries: source meta LRU 缓存容量。
 
         Returns:
             无。
@@ -582,8 +818,6 @@ class FinsReadRuntime:
 
         if processor_cache_max_entries <= 0:
             raise ValueError("processor_cache_max_entries must be greater than 0")
-        if source_meta_cache_max_entries <= 0:
-            raise ValueError("source_meta_cache_max_entries must be greater than 0")
         self._company_repository = company_repository
         self._source_repository = source_repository
         self._processed_repository = processed_repository
@@ -591,11 +825,12 @@ class FinsReadRuntime:
         self._processor_cache: ProcessorLRUCache[_CachedProcessor] = ProcessorLRUCache(
             max_entries=processor_cache_max_entries,
         )
-        self._meta_cache: ProcessorLRUCache[_CachedSourceDocumentMeta] = ProcessorLRUCache(
-            max_entries=source_meta_cache_max_entries,
-        )
-        self._creation_locks: dict[ProcessorCacheKey, Lock] = {}
+        self._creation_locks: WeakValueDictionary[ProcessorCacheKey, Lock] = WeakValueDictionary()
         self._creation_locks_guard = RLock()
+        self._lifecycle_lock = RLock()
+        self._retired_entries: set[_CachedProcessor] = set()
+        self._pending_snapshots: list[SourceSnapshotProtocol] = []
+        self._closed = False
 
     def list_documents(
         self,
@@ -624,6 +859,7 @@ class FinsReadRuntime:
             RuntimeError: 仓储读取失败时抛出。
         """
 
+        self._ensure_open()
         _raise_if_fins_cancelled(cancellation_token)
         normalized_ticker = self._resolve_canonical_ticker(
             ticker=ticker,
@@ -750,33 +986,27 @@ class FinsReadRuntime:
             cancellation_token=cancellation_token,
         )
         _raise_if_fins_cancelled(cancellation_token)
-        processor = self._get_or_create_processor(
+        with self._borrow_processor(
             ticker=normalized_ticker,
             document_id=normalized_document_id,
             cancellation_token=cancellation_token,
-        )
-        _raise_if_fins_cancelled(cancellation_token)
-        sections_raw: list[SectionSummary] = processor.list_sections()
-        _raise_if_fins_cancelled(cancellation_token)
-        form_type = self._resolve_document_form_type(
-            ticker=normalized_ticker,
-            document_id=normalized_document_id,
-        )
-        enriched_sections = self._enrich_sections_with_semantic(
-            sections_raw,
-            form_type,
-            cancellation_token=cancellation_token,
-        )
-        citation = self._build_citation(
-            ticker=normalized_ticker,
-            document_id=normalized_document_id,
-        )
-        return {
-            "ticker": normalized_ticker,
-            "document_id": normalized_document_id,
-            "sections": enriched_sections,
-            "citation": citation,
-        }
+        ) as borrow:
+            _raise_if_fins_cancelled(cancellation_token)
+            sections_raw: list[SectionSummary] = borrow.processor.list_sections()
+            _raise_if_fins_cancelled(cancellation_token)
+            form_type = self._resolve_document_form_type(borrow=borrow)
+            enriched_sections = self._enrich_sections_with_semantic(
+                sections_raw,
+                form_type,
+                cancellation_token=cancellation_token,
+            )
+            citation = self._build_citation(borrow=borrow)
+            return {
+                "ticker": normalized_ticker,
+                "document_id": normalized_document_id,
+                "sections": enriched_sections,
+                "citation": citation,
+            }
 
     def read_section(
         self,
@@ -815,11 +1045,46 @@ class FinsReadRuntime:
             empty_error=FinsReadArgumentError("read_section", "ref", ref, "Argument must not be empty"),
         )
         _raise_if_fins_cancelled(cancellation_token)
-        processor = self._get_or_create_processor(
+        with self._borrow_processor(
             ticker=normalized_ticker,
             document_id=normalized_document_id,
             cancellation_token=cancellation_token,
-        )
+        ) as borrow:
+            return self._read_section_with_borrow(
+                borrow=borrow,
+                normalized_ticker=normalized_ticker,
+                normalized_document_id=normalized_document_id,
+                normalized_ref=normalized_ref,
+                cancellation_token=cancellation_token,
+            )
+
+    def _read_section_with_borrow(
+        self,
+        *,
+        borrow: _ProcessorBorrow,
+        normalized_ticker: str,
+        normalized_document_id: str,
+        normalized_ref: str,
+        cancellation_token: CancellationToken | None,
+    ) -> SectionContentResult:
+        """在一个 active processor/snapshot borrow 内完成章节读取与 citation。
+
+        Args:
+            borrow: 当前 read 调用的 active borrow。
+            normalized_ticker: 标准化 ticker。
+            normalized_document_id: 标准化文档 ID。
+            normalized_ref: 已校验章节 ref。
+            cancellation_token: Host 注入的取消观察令牌。
+
+        Returns:
+            章节正文结果。
+
+        Raises:
+            FinsReadArgumentError: ref 不属于当前文档时抛出。
+            FinsReadCancelledError: 调用被取消时抛出。
+        """
+
+        processor = borrow.processor
         try:
             _raise_if_fins_cancelled(cancellation_token)
             section_raw: SectionContent = processor.read_section(normalized_ref)
@@ -854,10 +1119,7 @@ class FinsReadRuntime:
             section_raw.get("content_word_count") or section_raw.get("word_count") or len(content.split())
         )
         # 语义增强：解析 item/topic/path
-        form_type = self._resolve_document_form_type(
-            ticker=normalized_ticker,
-            document_id=normalized_document_id,
-        )
+        form_type = self._resolve_document_form_type(borrow=borrow)
         title = section_raw.get("title")
         # read_section 没有直接的 parent_ref 上下文，从 list_sections 获取
         parent_ref = section_raw.get("parent_ref")
@@ -891,9 +1153,6 @@ class FinsReadRuntime:
         parent_titles: list[str] = []
         if parent_title:
             parent_titles.append(parent_title)
-        # path 计算保留供内部诊断与未来评估，但不输出给 LLM——
-        # item + topic + title 已充分表达语义位置，path 是冗余拼合，
-        # 与 get_document_sections 去 path 的 T1 决策保持一致。
         _path = build_section_path(
             form_type=form_type,
             item_number=item_number,
@@ -904,8 +1163,7 @@ class FinsReadRuntime:
         del _path  # 显式丢弃，静默 linter unused-variable 警告
         item_label = f"Item {item_number}" if item_number else None
         citation = self._build_citation(
-            ticker=normalized_ticker,
-            document_id=normalized_document_id,
+            borrow=borrow,
             item=item_label,
             heading=str(title) if title else None,
         )
@@ -984,16 +1242,60 @@ class FinsReadRuntime:
         resolved_mode = _resolve_search_mode(mode)
 
         _raise_if_fins_cancelled(cancellation_token)
-        processor = self._get_or_create_processor(
+        with self._borrow_processor(
             ticker=normalized_ticker,
             document_id=normalized_document_id,
             cancellation_token=cancellation_token,
-        )
+        ) as borrow:
+            return self._search_document_with_borrow(
+                borrow=borrow,
+                normalized_ticker=normalized_ticker,
+                normalized_document_id=normalized_document_id,
+                resolved_queries=resolved_queries,
+                original_queries=original_queries,
+                normalized_within_ref=normalized_within_ref,
+                resolved_mode=resolved_mode,
+                display_budget=display_budget,
+                cancellation_token=cancellation_token,
+            )
+
+    def _search_document_with_borrow(
+        self,
+        *,
+        borrow: _ProcessorBorrow,
+        normalized_ticker: str,
+        normalized_document_id: str,
+        resolved_queries: list[str],
+        original_queries: list[str],
+        normalized_within_ref: Optional[str],
+        resolved_mode: str,
+        display_budget: Optional[int],
+        cancellation_token: CancellationToken | None,
+    ) -> SearchDocumentResult:
+        """在一个 active borrow 内完成单/多查询搜索与 citation 构造。
+
+        Args:
+            borrow: 当前 read 调用的 active borrow。
+            normalized_ticker: 标准化 ticker。
+            normalized_document_id: 标准化文档 ID。
+            resolved_queries: 已校验查询数组。
+            original_queries: 原始查询数组。
+            normalized_within_ref: 可选章节范围。
+            resolved_mode: 搜索模式。
+            display_budget: 可选展示预算。
+            cancellation_token: Host 注入的取消观察令牌。
+
+        Returns:
+            搜索结果。
+
+        Raises:
+            FinsReadBusinessError: 搜索索引构建失败时抛出。
+            FinsReadCancelledError: 调用被取消时抛出。
+        """
+
+        processor = borrow.processor
         # 预构建证据化所需的 form_type / ref_to_topic
-        form_type = self._resolve_document_form_type(
-            ticker=normalized_ticker,
-            document_id=normalized_document_id,
-        )
+        form_type = self._resolve_document_form_type(borrow=borrow)
         try:
             _raise_if_fins_cancelled(cancellation_token)
             all_secs = processor.list_sections()
@@ -1036,6 +1338,7 @@ class FinsReadRuntime:
                 original_queries=original_queries,
                 normalized_within_ref=normalized_within_ref,
                 resolved_mode=resolved_mode,
+                borrow=borrow,
                 processor=processor,
                 form_type=form_type,
                 ref_to_topic=ref_to_topic,
@@ -1133,8 +1436,7 @@ class FinsReadRuntime:
             "total_matches": len(matches),
             "diagnostics": diagnostics,
             "citation": self._build_citation(
-                ticker=normalized_ticker,
-                document_id=normalized_document_id,
+                borrow=borrow,
             ),
         }
         if hint:
@@ -1150,6 +1452,7 @@ class FinsReadRuntime:
         original_queries: list[str],
         normalized_within_ref: Optional[str],
         resolved_mode: str,
+        borrow: _ProcessorBorrow,
         processor: "DocumentProcessor",
         form_type: Optional[str],
         ref_to_topic: dict[str, Optional[str]],
@@ -1170,6 +1473,7 @@ class FinsReadRuntime:
             original_queries: 翻译前的原始查询列表，用于中文无结果 hint 检测。
             normalized_within_ref: 可选章节范围。
             resolved_mode: 搜索模式。
+            borrow: 当前 read 调用的 active borrow。
             processor: 文档处理器。
             form_type: 文档 form_type。
             ref_to_topic: ref → topic 映射。
@@ -1282,8 +1586,7 @@ class FinsReadRuntime:
             "total_matches": len(matches),
             "diagnostics": diagnostics,
             "citation": self._build_citation(
-                ticker=normalized_ticker,
-                document_id=normalized_document_id,
+                borrow=borrow,
             ),
         }
         if hint:
@@ -1316,6 +1619,7 @@ class FinsReadRuntime:
             FinsReadBusinessError: ticker 未收录于当前工作区时抛出。
         """
 
+        self._ensure_open()
         _raise_if_fins_cancelled(cancellation_token)
         normalized_ticker, normalized_document_id = self._normalize_document_identity(
             ticker=ticker,
@@ -1326,11 +1630,48 @@ class FinsReadRuntime:
         normalized_within_ref = normalize_optional_text(within_section_ref)
 
         _raise_if_fins_cancelled(cancellation_token)
-        processor = self._get_or_create_processor(
+        with self._borrow_processor(
             ticker=normalized_ticker,
             document_id=normalized_document_id,
             cancellation_token=cancellation_token,
-        )
+        ) as borrow:
+            return self._list_tables_with_borrow(
+                borrow=borrow,
+                normalized_ticker=normalized_ticker,
+                normalized_document_id=normalized_document_id,
+                financial_only=financial_only,
+                normalized_within_ref=normalized_within_ref,
+                cancellation_token=cancellation_token,
+            )
+
+    def _list_tables_with_borrow(
+        self,
+        *,
+        borrow: _ProcessorBorrow,
+        normalized_ticker: str,
+        normalized_document_id: str,
+        financial_only: bool,
+        normalized_within_ref: Optional[str],
+        cancellation_token: CancellationToken | None,
+    ) -> TablesListResult:
+        """在一个 active borrow 内完成表格列表与 citation 构造。
+
+        Args:
+            borrow: 当前 read 调用的 active borrow。
+            normalized_ticker: 标准化 ticker。
+            normalized_document_id: 标准化文档 ID。
+            financial_only: 是否只返回财务表格。
+            normalized_within_ref: 可选章节范围。
+            cancellation_token: Host 注入的取消观察令牌。
+
+        Returns:
+            表格列表结果。
+
+        Raises:
+            FinsReadCancelledError: 调用被取消时抛出。
+        """
+
+        processor = borrow.processor
         _raise_if_fins_cancelled(cancellation_token)
         tables_raw: list[TableSummary] = processor.list_tables()
 
@@ -1387,8 +1728,7 @@ class FinsReadRuntime:
             "total": len(filtered_tables),
             "financial_count": financial_count,
             "citation": self._build_citation(
-                ticker=normalized_ticker,
-                document_id=normalized_document_id,
+                borrow=borrow,
             ),
         }
 
@@ -1429,11 +1769,46 @@ class FinsReadRuntime:
             empty_error=FinsReadArgumentError("get_table", "table_ref", table_ref, "Argument must not be empty"),
         )
         _raise_if_fins_cancelled(cancellation_token)
-        processor = self._get_or_create_processor(
+        with self._borrow_processor(
             ticker=normalized_ticker,
             document_id=normalized_document_id,
             cancellation_token=cancellation_token,
-        )
+        ) as borrow:
+            return self._get_table_with_borrow(
+                borrow=borrow,
+                normalized_ticker=normalized_ticker,
+                normalized_document_id=normalized_document_id,
+                normalized_table_ref=normalized_table_ref,
+                cancellation_token=cancellation_token,
+            )
+
+    def _get_table_with_borrow(
+        self,
+        *,
+        borrow: _ProcessorBorrow,
+        normalized_ticker: str,
+        normalized_document_id: str,
+        normalized_table_ref: str,
+        cancellation_token: CancellationToken | None,
+    ) -> TableDetailResult:
+        """在一个 active borrow 内完成表格读取与 citation 构造。
+
+        Args:
+            borrow: 当前 read 调用的 active borrow。
+            normalized_ticker: 标准化 ticker。
+            normalized_document_id: 标准化文档 ID。
+            normalized_table_ref: 已校验表格 ref。
+            cancellation_token: Host 注入的取消观察令牌。
+
+        Returns:
+            表格详情结果。
+
+        Raises:
+            FinsReadArgumentError: table ref 不属于当前文档时抛出。
+            FinsReadCancelledError: 调用被取消时抛出。
+        """
+
+        processor = borrow.processor
         try:
             _raise_if_fins_cancelled(cancellation_token)
             table_raw: TableContent = processor.read_table(normalized_table_ref)
@@ -1485,8 +1860,7 @@ class FinsReadRuntime:
             "is_financial": bool(table_raw.get("is_financial", False)),
             "table_type": _normalize_table_type(table_raw.get("table_type")),
             "citation": self._build_citation(
-                ticker=normalized_ticker,
-                document_id=normalized_document_id,
+                borrow=borrow,
             ),
         }
         # 条件字段：省略 null 值减少序列化噪声
@@ -1538,11 +1912,45 @@ class FinsReadRuntime:
             )
 
         _raise_if_fins_cancelled(cancellation_token)
-        processor = self._get_or_create_processor(
+        with self._borrow_processor(
             ticker=normalized_ticker,
             document_id=normalized_document_id,
             cancellation_token=cancellation_token,
-        )
+        ) as borrow:
+            return self._get_page_content_with_borrow(
+                borrow=borrow,
+                normalized_ticker=normalized_ticker,
+                normalized_document_id=normalized_document_id,
+                page_no=page_no,
+                cancellation_token=cancellation_token,
+            )
+
+    def _get_page_content_with_borrow(
+        self,
+        *,
+        borrow: _ProcessorBorrow,
+        normalized_ticker: str,
+        normalized_document_id: str,
+        page_no: int,
+        cancellation_token: CancellationToken | None,
+    ) -> PageContentResult | NotSupportedResult:
+        """在一个 active borrow 内完成分页读取与 citation 构造。
+
+        Args:
+            borrow: 当前 read 调用的 active borrow。
+            normalized_ticker: 标准化 ticker。
+            normalized_document_id: 标准化文档 ID。
+            page_no: 目标页码。
+            cancellation_token: Host 注入的取消观察令牌。
+
+        Returns:
+            页面内容或不支持结果。
+
+        Raises:
+            FinsReadCancelledError: 调用被取消时抛出。
+        """
+
+        processor = borrow.processor
         if not isinstance(processor, _PageContentReadProcessor):
             return _build_not_supported_result(
                 ticker=normalized_ticker,
@@ -1566,8 +1974,7 @@ class FinsReadRuntime:
             "total_items": int(page_payload.get("total_items", 0) or 0),
             "supported": bool(page_payload.get("supported", True)),
             "citation": self._build_citation(
-                ticker=normalized_ticker,
-                document_id=normalized_document_id,
+                borrow=borrow,
             ),
         }
         return result
@@ -1616,11 +2023,46 @@ class FinsReadRuntime:
         )
 
         _raise_if_fins_cancelled(cancellation_token)
-        processor = self._get_or_create_processor(
+        with self._borrow_processor(
             ticker=normalized_ticker,
             document_id=normalized_document_id,
             cancellation_token=cancellation_token,
-        )
+        ) as borrow:
+            return self._get_financial_statement_with_borrow(
+                borrow=borrow,
+                normalized_ticker=normalized_ticker,
+                normalized_document_id=normalized_document_id,
+                normalized_statement_type=normalized_statement_type,
+                cancellation_token=cancellation_token,
+            )
+
+    def _get_financial_statement_with_borrow(
+        self,
+        *,
+        borrow: _ProcessorBorrow,
+        normalized_ticker: str,
+        normalized_document_id: str,
+        normalized_statement_type: str,
+        cancellation_token: CancellationToken | None,
+    ) -> FinancialStatementResult | NotSupportedResult:
+        """在一个 active borrow 内完成财务报表读取与 citation 构造。
+
+        Args:
+            borrow: 当前 read 调用的 active borrow。
+            normalized_ticker: 标准化 ticker。
+            normalized_document_id: 标准化文档 ID。
+            normalized_statement_type: 已校验报表类型。
+            cancellation_token: Host 注入的取消观察令牌。
+
+        Returns:
+            财务报表或不支持结果。
+
+        Raises:
+            FinsReadCancelledError: 调用被取消时抛出。
+            ValueError: processor 返回无效财务报表 payload 时抛出。
+        """
+
+        processor = borrow.processor
         if not isinstance(processor, _FinancialStatementReadProcessor):
             return _build_not_supported_result(
                 ticker=normalized_ticker,
@@ -1635,8 +2077,7 @@ class FinsReadRuntime:
         )
         _raise_if_fins_cancelled(cancellation_token)
         citation = self._build_citation(
-            ticker=normalized_ticker,
-            document_id=normalized_document_id,
+            borrow=borrow,
         )
         for _row in statement_payload["rows"]:
             _raise_if_fins_cancelled(cancellation_token)
@@ -1714,16 +2155,65 @@ class FinsReadRuntime:
                 normalized_concepts.append(item)
 
         _raise_if_fins_cancelled(cancellation_token)
-        form_type = self._resolve_document_form_type(
-            ticker=normalized_ticker,
-            document_id=normalized_document_id,
-        )
-        _raise_if_fins_cancelled(cancellation_token)
-        processor = self._get_or_create_processor(
+        with self._borrow_processor(
             ticker=normalized_ticker,
             document_id=normalized_document_id,
             cancellation_token=cancellation_token,
-        )
+        ) as borrow:
+            return self._query_xbrl_facts_with_borrow(
+                borrow=borrow,
+                normalized_ticker=normalized_ticker,
+                normalized_document_id=normalized_document_id,
+                normalized_concepts=normalized_concepts,
+                statement_type=statement_type,
+                period_end=period_end,
+                fiscal_year=fiscal_year,
+                fiscal_period=fiscal_period,
+                min_value=min_value,
+                max_value=max_value,
+                cancellation_token=cancellation_token,
+            )
+
+    def _query_xbrl_facts_with_borrow(
+        self,
+        *,
+        borrow: _ProcessorBorrow,
+        normalized_ticker: str,
+        normalized_document_id: str,
+        normalized_concepts: list[str],
+        statement_type: Optional[str],
+        period_end: Optional[str],
+        fiscal_year: Optional[int],
+        fiscal_period: Optional[str],
+        min_value: Optional[float],
+        max_value: Optional[float],
+        cancellation_token: CancellationToken | None,
+    ) -> XbrlQueryResult | NotSupportedResult:
+        """在一个 active borrow 内完成 XBRL 查询与 citation 构造。
+
+        Args:
+            borrow: 当前 read 调用的 active borrow。
+            normalized_ticker: 标准化 ticker。
+            normalized_document_id: 标准化文档 ID。
+            normalized_concepts: 已校验 concept 数组。
+            statement_type: 可选报表类型。
+            period_end: 可选期末日期。
+            fiscal_year: 可选财年。
+            fiscal_period: 可选财期。
+            min_value: 可选最小值。
+            max_value: 可选最大值。
+            cancellation_token: Host 注入的取消观察令牌。
+
+        Returns:
+            XBRL 查询或不支持结果。
+
+        Raises:
+            FinsReadBusinessError: processor XBRL 查询执行失败时抛出。
+            FinsReadCancelledError: 调用被取消时抛出。
+        """
+
+        processor = borrow.processor
+        form_type = self._resolve_document_form_type(borrow=borrow)
         taxonomy = _resolve_processor_taxonomy(processor)
         resolved_concepts = (
             normalized_concepts
@@ -1803,8 +2293,7 @@ class FinsReadRuntime:
             "data_quality": normalized_payload["data_quality"],
             "reason": normalized_payload["reason"],
             "citation": self._build_citation(
-                ticker=normalized_ticker,
-                document_id=normalized_document_id,
+                borrow=borrow,
             ),
         }
         return result
@@ -1952,17 +2441,34 @@ class FinsReadRuntime:
         """
 
         _raise_if_fins_cancelled(cancellation_token)
-        direct_meta = self._get_document_meta_cached(ticker, raw_document_id)
-        if direct_meta is not None:
+        try:
+            direct_snapshot = self._read_source_snapshot(
+                ticker=ticker,
+                document_id=raw_document_id,
+                source_kind=None,
+                materialize_files=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            self._close_unowned_snapshot(direct_snapshot, active_error=None)
             return raw_document_id
 
         normalized_alias = re.sub(r"\s+", "", raw_document_id).strip()
-        for source_kind in (SourceKind.FILING, SourceKind.MATERIAL):
+        matched_documents: dict[str, str] = {}
+        for source_kind in SourceKind:
             _raise_if_fins_cancelled(cancellation_token)
             for candidate_document_id in self._source_repository.list_source_document_ids(ticker, source_kind):
                 _raise_if_fins_cancelled(cancellation_token)
-                candidate_meta = self._get_document_meta_cached(ticker, candidate_document_id)
-                if not candidate_meta:
+                try:
+                    candidate_meta = _parse_source_document_meta(
+                        self._source_repository.get_source_meta(
+                            ticker,
+                            candidate_document_id,
+                            source_kind,
+                        )
+                    )
+                except FileNotFoundError:
                     continue
                 alias_fields = self._build_document_identity_aliases(
                     candidate_document_id=candidate_document_id,
@@ -1971,13 +2477,24 @@ class FinsReadRuntime:
                 if normalized_alias not in alias_fields:
                     continue
                 matched_field = alias_fields[normalized_alias]
-                if matched_field != "document_id":
-                    Log.debug(
-                        f"文档标识已归一化: tool={tool_name} ticker={ticker} raw={raw_document_id!r} "
-                        f"matched_field={matched_field} canonical={candidate_document_id!r}",
-                        module=self.MODULE,
-                    )
-                return candidate_document_id
+                matched_documents[candidate_document_id] = matched_field
+
+        if len(matched_documents) > 1:
+            raise FinsReadArgumentError(
+                tool_name,
+                "document_id",
+                raw_document_id,
+                "document_id alias matches multiple documents; use an exact list_documents document_id",
+            )
+        if matched_documents:
+            candidate_document_id, matched_field = next(iter(matched_documents.items()))
+            if matched_field != "document_id":
+                Log.debug(
+                    f"文档标识已归一化: tool={tool_name} ticker={ticker} raw={raw_document_id!r} "
+                    f"matched_field={matched_field} canonical={candidate_document_id!r}",
+                    module=self.MODULE,
+                )
+            return candidate_document_id
 
         Log.debug(
             f"文档标识未命中归一化映射: tool={tool_name} ticker={ticker} raw={raw_document_id!r}",
@@ -2083,7 +2600,9 @@ class FinsReadRuntime:
         for document_id in document_ids:
             _raise_if_fins_cancelled(cancellation_token)
             try:
-                meta = self._get_source_meta_cached_by_kind(ticker, document_id, source_kind)
+                meta = _parse_source_document_meta(
+                    self._source_repository.get_source_meta(ticker, document_id, source_kind)
+                )
             except FileNotFoundError:
                 continue
             if meta.get("is_deleted", False):
@@ -2115,36 +2634,34 @@ class FinsReadRuntime:
     def _build_citation(
         self,
         *,
-        ticker: str,
-        document_id: str,
+        borrow: _ProcessorBorrow,
         item: Optional[str] = None,
         heading: Optional[str] = None,
     ) -> dict[str, Any]:
-        """构建统一 citation 对象。
-
-        从 meta.json 读取文档元数据，构建可序列化的 citation 字典。
-        同一 (ticker, document_id) 的 meta 读取会被 _get_document_meta_cached 缓存。
+        """从当前 processor borrow 的同版 snapshot 构建 citation。
 
         Args:
-            ticker: 标准化股票代码。
-            document_id: 标准化文档 ID。
+            borrow: 当前 read 调用持有的 processor/snapshot borrow。
             item: 可选 Item 编号（如 "Item 1A"）。
             heading: 可选章节标题。
 
         Returns:
             citation 字典（值为 None 的键已移除）。
+
+        Raises:
+            FileNotFoundError: snapshot provenance 表示 source 尚未完成时抛出。
+            RuntimeError: borrow 对应 snapshot 已关闭时抛出。
         """
-        source_kind = self._resolve_source_kind(ticker=ticker, document_id=document_id)
-        meta = self._get_source_meta_cached_by_kind(ticker, document_id, source_kind)
-        provenance = self._source_repository.get_source_document_provenance(
-            ticker,
-            document_id,
-            source_kind,
-            meta=_source_document_meta_to_storage_payload(meta),
-        )
+
+        snapshot = borrow.snapshot
+        meta = borrow.source_meta
+        provenance = snapshot.provenance
         if not provenance.ingest_complete:
-            raise FileNotFoundError(f"source document 尚未完成入库: ticker={ticker}, document_id={document_id}")
-        if source_kind is SourceKind.MATERIAL:
+            raise FileNotFoundError(
+                f"source document 尚未完成入库: ticker={snapshot.ticker}, "
+                f"document_id={snapshot.document_id}"
+            )
+        if snapshot.source_kind is SourceKind.MATERIAL:
             source_type = SourceType.SUPPLEMENTARY.value
         else:
             source_type = _FILING_SOURCE_TYPES_BY_PROVIDER[provenance.source_provider].value
@@ -2156,8 +2673,8 @@ class FinsReadRuntime:
 
         citation = Citation(
             source_type=source_type,
-            document_id=document_id,
-            ticker=ticker,
+            document_id=snapshot.document_id,
+            ticker=snapshot.ticker,
             form_type=form_type,
             filing_date=meta["filing_date"],
             accession_no=accession_no,
@@ -2168,108 +2685,6 @@ class FinsReadRuntime:
             heading=heading,
         )
         return citation.to_dict()
-
-    def _get_source_meta_cached_by_kind(
-        self,
-        ticker: str,
-        document_id: str,
-        source_kind: SourceKind,
-    ) -> _SourceDocumentMeta:
-        """按已知 source kind 读取并缓存 source meta。
-
-        Args:
-            ticker: 标准化股票代码。
-            document_id: 标准化文档 ID。
-            source_kind: 已解析的 source kind 路由键。
-
-        Returns:
-            source meta 字典。
-
-        Raises:
-            FileNotFoundError: source meta 不存在时抛出。
-            FinsReadBusinessError: meta 读取期间 source revision 变化时抛出。
-        """
-
-        cache_key = ProcessorCacheKey(ticker=ticker, document_id=document_id, source_kind=source_kind.value)
-        creation_key = ProcessorCacheKey(ticker=ticker, document_id=document_id)
-        lock = self._get_creation_lock(creation_key)
-        with lock:
-            try:
-                revision_before = self._source_repository.get_source_revision(ticker, document_id, source_kind)
-            except Exception:
-                self._evict_source_kind_caches(
-                    ticker=ticker,
-                    document_id=document_id,
-                    source_kind=source_kind,
-                )
-                raise
-
-            cached = self._meta_cache.get(cache_key)
-            cached_processor = self._processor_cache.peek(creation_key)
-            processor_is_stale = (
-                cached_processor is not None
-                and cached_processor.source_kind is source_kind
-                and cached_processor.revision != revision_before
-            )
-            if processor_is_stale or (
-                cached is not None
-                and (cached.source_kind is not source_kind or cached.revision != revision_before)
-            ):
-                self._evict_source_kind_caches(
-                    ticker=ticker,
-                    document_id=document_id,
-                    source_kind=source_kind,
-                )
-                cached = None
-            if cached is not None:
-                return cached.meta
-
-            raw_meta = self._source_repository.get_source_meta(ticker, document_id, source_kind)
-            meta = _parse_source_document_meta(raw_meta)
-            try:
-                revision_after = self._source_repository.get_source_revision(ticker, document_id, source_kind)
-            except Exception as exc:
-                self._evict_source_kind_caches(
-                    ticker=ticker,
-                    document_id=document_id,
-                    source_kind=source_kind,
-                )
-                self._raise_source_changed_during_read(cause=exc)
-            if revision_before != revision_after:
-                self._evict_source_kind_caches(
-                    ticker=ticker,
-                    document_id=document_id,
-                    source_kind=source_kind,
-                )
-                self._raise_source_changed_during_read()
-            self._meta_cache.put(
-                cache_key,
-                _CachedSourceDocumentMeta(
-                    meta=meta,
-                    source_kind=source_kind,
-                    revision=revision_after,
-                ),
-            )
-            return meta
-
-    def _get_document_meta_cached(self, ticker: str, document_id: str) -> _SourceDocumentMeta | None:
-        """读取文档元数据（带实例级缓存）。
-
-        同一 FinsReadRuntime 实例内，对相同 (ticker, document_id) 的
-        meta.json 读取做内存缓存，避免同一次工具调用链中重复 IO。
-
-        Args:
-            ticker: 标准化股票代码。
-            document_id: 标准化文档 ID。
-
-        Returns:
-            meta 字典；文档不存在时返回 None。
-        """
-        try:
-            source_kind = self._resolve_source_kind(ticker=ticker, document_id=document_id)
-        except FileNotFoundError:
-            return None
-        return self._get_source_meta_cached_by_kind(ticker, document_id, source_kind)
 
     def _enrich_sections_with_semantic(
         self,
@@ -2352,24 +2767,20 @@ class FinsReadRuntime:
             enriched.append(entry)
         return enriched
 
-    def _resolve_document_form_type(self, *, ticker: str, document_id: str) -> Optional[str]:
-        """读取文档 form_type。
+    def _resolve_document_form_type(self, *, borrow: _ProcessorBorrow) -> Optional[str]:
+        """从当前 processor borrow 的同版 meta 读取 form_type。
 
         Args:
-            ticker: 标准化股票代码。
-            document_id: 标准化文档 ID。
+            borrow: 当前 read 调用持有的 processor/snapshot borrow。
 
         Returns:
-            标准化后的 form_type；读取失败时返回 `None`。
+            标准化后的 form_type。
 
         Raises:
-            RuntimeError: 读取失败时抛出。
+            无。
         """
 
-        meta = self._get_document_meta_cached(ticker, document_id)
-        if meta is None:
-            return None
-        return _normalize_form_type_for_matching(meta.get("form_type"))
+        return _normalize_form_type_for_matching(borrow.source_meta.get("form_type"))
 
     def _read_company_info(self, ticker: str) -> tuple[str, str]:
         """读取公司信息。
@@ -2455,14 +2866,15 @@ class FinsReadRuntime:
                 continue
             if cache_key.document_id == current_document_id:
                 continue
-            cached_processor = self._get_fresh_cached_processor_for_diagnosis(cache_key)
-            if cached_processor is None:
+            borrow = self._get_cached_processor_borrow_for_diagnosis(cache_key)
+            if borrow is None:
                 continue
             try:
-                if kind == "ref":
-                    cached_processor.read_section(locator)
-                else:
-                    cached_processor.read_table(locator)
+                with borrow:
+                    if kind == "ref":
+                        borrow.processor.read_section(locator)
+                    else:
+                        borrow.processor.read_table(locator)
             except KeyError:
                 continue
             except Exception as exc:
@@ -2477,18 +2889,18 @@ class FinsReadRuntime:
             return cache_key.document_id
         return None
 
-    def _get_fresh_cached_processor_for_diagnosis(
+    def _get_cached_processor_borrow_for_diagnosis(
         self,
         cache_key: ProcessorCacheKey,
-    ) -> DocumentProcessor | None:
-        """读取仍与 storage revision 一致的诊断候选 processor。
+    ) -> _ProcessorBorrow | None:
+        """借用仍与 storage lightweight snapshot 一致的诊断候选 processor。
 
         Args:
             cache_key: 无 source-kind 维度的 processor cache key。
 
         Returns:
-            revision 一致的 processor；未命中、source 失效或 revision
-            mismatch 时返回 ``None``。
+            snapshot 一致的 active borrow；未命中、source 失效或 mismatch
+            时返回 ``None``。
 
         Raises:
             RuntimeError: document lock 或缓存内部操作失败时抛出。
@@ -2500,35 +2912,43 @@ class FinsReadRuntime:
             if cached is None:
                 return None
             try:
-                revision = self._source_repository.get_source_revision(
-                    cache_key.ticker,
-                    cache_key.document_id,
-                    cached.source_kind,
-                )
-            except Exception:
-                self._evict_processor_path_caches(
+                source_kind = cached.snapshot.source_kind
+                light_snapshot = self._read_source_snapshot(
                     ticker=cache_key.ticker,
                     document_id=cache_key.document_id,
-                    source_kind=cached.source_kind,
+                    source_kind=source_kind,
+                    materialize_files=False,
                 )
+            except Exception as read_error:
+                self._evict_processor_entry(cache_key, active_error=read_error)
                 return None
-            if cached.revision != revision:
-                self._evict_processor_path_caches(
-                    ticker=cache_key.ticker,
-                    document_id=cache_key.document_id,
-                    source_kind=cached.source_kind,
-                )
+            try:
+                is_matching = cached.matches(light_snapshot)
+                acquired = is_matching and cached.try_acquire_borrow()
+            except Exception as exc:
+                self._close_unowned_snapshot(light_snapshot, active_error=exc)
+                self._evict_processor_entry(cache_key, active_error=exc)
                 return None
-            return cached.processor
+            try:
+                self._close_unowned_snapshot(light_snapshot, active_error=None)
+            except Exception as close_error:
+                if acquired:
+                    self._release_processor_borrow(cached, active_error=close_error)
+                self._evict_processor_entry(cache_key, active_error=close_error)
+                return None
+            if not acquired:
+                self._evict_processor_entry(cache_key)
+                return None
+            return _ProcessorBorrow(runtime=self, entry=cached)
 
-    def _get_or_create_processor(
+    def _borrow_processor(
         self,
         *,
         ticker: str,
         document_id: str,
         cancellation_token: CancellationToken | None = None,
-    ) -> DocumentProcessor:
-        """读取或创建 Processor 实例。
+    ) -> _ProcessorBorrow:
+        """读取或创建同版 processor cache entry，并返回 active borrow。
 
         Args:
             ticker: 标准化股票代码。
@@ -2536,185 +2956,179 @@ class FinsReadRuntime:
             cancellation_token: Host 注入的取消观察令牌。
 
         Returns:
-            Processor 实例。
+            覆盖 processor/meta/provenance/citation/result 全路径的 active borrow。
 
         Raises:
             FileNotFoundError: 文档不存在时抛出。
             ValueError: 未匹配处理器时抛出。
-            FinsReadBusinessError: source 解码失败或构建期间 revision 变化时抛出。
+            FinsReadBusinessError: source 解码失败或 storage 稳定读取耗尽时抛出。
+            RuntimeError: runtime 已关闭时抛出。
         """
 
+        self._ensure_open()
         _raise_if_fins_cancelled(cancellation_token)
         cache_key = ProcessorCacheKey(ticker=ticker, document_id=document_id)
-        source_kind = self._resolve_source_kind(
-            ticker=ticker,
-            document_id=document_id,
-            cancellation_token=cancellation_token,
-        )
         lock = self._get_creation_lock(cache_key)
-        with lock:
-            _raise_if_fins_cancelled(cancellation_token)
-            try:
-                revision_before = self._source_repository.get_source_revision(ticker, document_id, source_kind)
-            except Exception:
-                self._evict_processor_path_caches(
-                    ticker=ticker,
-                    document_id=document_id,
-                    source_kind=source_kind,
-                )
-                raise
-            cached = self._processor_cache.get(cache_key)
-            cached_meta = self._meta_cache.peek(
-                ProcessorCacheKey(ticker=ticker, document_id=document_id, source_kind=source_kind.value)
-            )
-            processor_is_current = (
-                cached is not None
-                and cached.source_kind is source_kind
-                and cached.revision == revision_before
-            )
-            meta_is_current = cached_meta is None or (
-                cached_meta.source_kind is source_kind and cached_meta.revision == revision_before
-            )
-            if processor_is_current and meta_is_current and cached is not None:
-                return cached.processor
-            if cached is not None or not meta_is_current:
-                self._evict_processor_path_caches(
-                    ticker=ticker,
-                    document_id=document_id,
-                    source_kind=source_kind,
-                )
-
-            processor = self._create_processor(
+        cached_before_read = self._processor_cache.peek(cache_key)
+        try:
+            light_snapshot = self._read_source_snapshot(
                 ticker=ticker,
                 document_id=document_id,
-                cancellation_token=cancellation_token,
+                source_kind=None,
+                materialize_files=False,
             )
-            _raise_if_fins_cancelled(cancellation_token)
-            try:
-                revision_after = self._source_repository.get_source_revision(ticker, document_id, source_kind)
-            except Exception as exc:
-                self._evict_processor_path_caches(
-                    ticker=ticker,
-                    document_id=document_id,
-                    source_kind=source_kind,
+        except BaseException as read_error:
+            if cached_before_read is not None:
+                self._evict_processor_entry_if_matches(
+                    cache_key,
+                    expected=cached_before_read,
+                    active_error=read_error,
                 )
-                self._raise_source_changed_during_read(cause=exc)
-            if revision_before != revision_after:
-                self._evict_processor_path_caches(
-                    ticker=ticker,
-                    document_id=document_id,
-                    source_kind=source_kind,
+            raise
+
+        cached = self._processor_cache.get(cache_key)
+        acquired_cached = False
+        try:
+            acquired_cached = (
+                cached is not None
+                and cached.matches(light_snapshot)
+                and cached.try_acquire_borrow()
+            )
+        except BaseException as compare_error:
+            self._close_unowned_snapshot(light_snapshot, active_error=compare_error)
+            if cached is not None:
+                self._evict_processor_entry_if_matches(
+                    cache_key,
+                    expected=cached,
+                    active_error=compare_error,
                 )
-                self._raise_source_changed_during_read()
-            self._processor_cache.put(
+            raise
+        try:
+            self._close_unowned_snapshot(light_snapshot, active_error=None)
+        except BaseException as close_error:
+            if acquired_cached and cached is not None:
+                self._release_processor_borrow(cached, active_error=close_error)
+            raise
+        if acquired_cached and cached is not None:
+            return _ProcessorBorrow(runtime=self, entry=cached)
+        if cached is not None:
+            self._evict_processor_entry_if_matches(
                 cache_key,
-                _CachedProcessor(
-                    processor=processor,
-                    source_kind=source_kind,
-                    revision=revision_after,
-                ),
+                expected=cached,
             )
+
+        _raise_if_fins_cancelled(cancellation_token)
+        full_snapshot = self._read_source_snapshot(
+            ticker=ticker,
+            document_id=document_id,
+            source_kind=None,
+            materialize_files=True,
+        )
+        snapshot_transferred = False
+        try:
+            with lock:
+                self._ensure_open()
+                _raise_if_fins_cancelled(cancellation_token)
+                competing = self._processor_cache.get(cache_key)
+                if (
+                    competing is not None
+                    and competing.matches(full_snapshot)
+                    and competing.try_acquire_borrow()
+                ):
+                    try:
+                        self._close_unowned_snapshot(full_snapshot, active_error=None)
+                    except BaseException as close_error:
+                        self._release_processor_borrow(
+                            competing,
+                            active_error=close_error,
+                        )
+                        raise
+                    return _ProcessorBorrow(runtime=self, entry=competing)
+                if competing is not None:
+                    self._evict_processor_entry(cache_key)
+
+                processor, source_meta = self._create_processor_from_snapshot(
+                    snapshot=full_snapshot,
+                    cancellation_token=cancellation_token,
+                )
+                _raise_if_fins_cancelled(cancellation_token)
+                created = _CachedProcessor(
+                    processor=processor,
+                    source_meta=source_meta,
+                    snapshot=full_snapshot,
+                )
+                if not created.try_acquire_borrow():
+                    raise RuntimeError("新建 processor cache entry 无法借用")
+                # 复杂逻辑说明：最终 closed-check 与 cache publication 必须和
+                # close() 的状态切换共用同一线性化锁。processor 构建本身仍不持锁。
+                with self._lifecycle_lock:
+                    self._ensure_open()
+                    displaced = self._processor_cache.put(cache_key, created)
+                    snapshot_transferred = True
+                try:
+                    self._retire_entries(displaced)
+                except BaseException as retire_error:
+                    removed = self._processor_cache.evict(cache_key)
+                    if removed is not None:
+                        self._retire_entry(removed, active_error=retire_error)
+                    self._release_processor_borrow(created, active_error=retire_error)
+                    raise
             Log.debug(
                 f"processor 已创建并缓存: ticker={ticker} document_id={document_id} type={type(processor).__name__}",
                 module=self.MODULE,
             )
-            return processor
+            return _ProcessorBorrow(runtime=self, entry=created)
+        except BaseException as build_error:
+            if not snapshot_transferred:
+                self._close_unowned_snapshot(full_snapshot, active_error=build_error)
+            raise
 
-    def _create_processor(
+    def _create_processor_from_snapshot(
         self,
         *,
-        ticker: str,
-        document_id: str,
+        snapshot: SourceSnapshotProtocol,
         cancellation_token: CancellationToken | None = None,
-    ) -> DocumentProcessor:
-        """创建 Processor 实例。
+    ) -> tuple[DocumentProcessor, _SourceDocumentMeta]:
+        """从一个 full snapshot 创建 Processor 与同版 meta 投影。
 
         Args:
-            ticker: 标准化股票代码。
-            document_id: 标准化文档 ID。
+            snapshot: storage 已稳定物化的 full snapshot。
             cancellation_token: Host 注入的取消观察令牌。
 
         Returns:
-            Processor 实例。
+            ``(processor, source_meta)``。
 
         Raises:
-            FileNotFoundError: 文档不存在时抛出。
             ValueError: 未匹配处理器时抛出。
             RuntimeError: 候选处理器全部创建失败时抛出。
             FinsReadBusinessError: 文本 source 无法可靠解码时抛出。
         """
 
         _raise_if_fins_cancelled(cancellation_token)
-        source_kind = self._resolve_source_kind(
-            ticker=ticker,
-            document_id=document_id,
-            cancellation_token=cancellation_token,
-        )
-        _raise_if_fins_cancelled(cancellation_token)
-        source = self._source_repository.get_primary_source(
-            ticker=ticker,
-            document_id=document_id,
-            source_kind=source_kind,
-        )
-        _raise_if_fins_cancelled(cancellation_token)
-        source_meta = self._source_repository.get_source_meta(ticker, document_id, source_kind)
+        source = snapshot.get_primary_source()
+        source_meta = snapshot.source_meta
         parsed_source_meta = _parse_source_document_meta(source_meta)
         if parsed_source_meta["is_deleted"] or not parsed_source_meta["ingest_complete"]:
             raise FileNotFoundError(
-                f"source document 当前不可读取: ticker={ticker}, document_id={document_id}"
+                f"source document 当前不可读取: ticker={snapshot.ticker}, "
+                f"document_id={snapshot.document_id}"
             )
-        form_type = normalize_optional_text(source_meta.get("form_type"))
+        form_type = normalize_optional_text(parsed_source_meta["form_type"])
         _raise_if_fins_cancelled(cancellation_token)
         try:
             validate_source_utf8_text(source)
-            return self._processor_registry.create_with_fallback(
+            processor = self._processor_registry.create_with_fallback(
                 source=source,
                 form_type=form_type,
                 media_type=source.media_type,
             )
+            return processor, parsed_source_meta
         except FinsSourceDecodeError as exc:
             raise FinsReadBusinessError(
                 ErrorCode.SOURCE_DECODE_FAILED,
                 "源文档无法被可靠解码，当前读取结果不可用。",
                 hint="请重新获取有效的 UTF-8 源文档后再试。",
             ) from exc
-
-    def _resolve_source_kind(
-        self,
-        *,
-        ticker: str,
-        document_id: str,
-        cancellation_token: CancellationToken | None = None,
-    ) -> SourceKind:
-        """解析文档来源类型。
-
-        Args:
-            ticker: 标准化股票代码。
-            document_id: 标准化文档 ID。
-            cancellation_token: Host 注入的取消观察令牌。
-
-        Returns:
-            来源类型。
-
-        Raises:
-            FileNotFoundError: 当文档既不在 filing 也不在 material 中时抛出。
-        """
-
-        try:
-            _raise_if_fins_cancelled(cancellation_token)
-            self._source_repository.get_source_handle(ticker, document_id, SourceKind.FILING)
-            _raise_if_fins_cancelled(cancellation_token)
-            return SourceKind.FILING
-        except FileNotFoundError:
-            pass
-        try:
-            _raise_if_fins_cancelled(cancellation_token)
-            self._source_repository.get_source_handle(ticker, document_id, SourceKind.MATERIAL)
-            _raise_if_fins_cancelled(cancellation_token)
-            return SourceKind.MATERIAL
-        except FileNotFoundError:
-            pass
-        raise FileNotFoundError(f"Document not found: ticker={ticker}, document_id={document_id}")
 
     def _get_creation_lock(self, cache_key: ProcessorCacheKey) -> Lock:
         """读取或创建文档级构建锁。
@@ -2737,73 +3151,326 @@ class FinsReadRuntime:
             self._creation_locks[cache_key] = created
             return created
 
-    def _evict_source_kind_caches(
+    def _read_source_snapshot(
         self,
         *,
         ticker: str,
         document_id: str,
-        source_kind: SourceKind,
-    ) -> None:
-        """清理指定 source kind 的 processor/meta 缓存。
+        source_kind: SourceKind | None,
+        materialize_files: bool,
+    ) -> SourceSnapshotProtocol:
+        """读取 storage snapshot，并单点映射稳定读取耗尽错误。
 
         Args:
-            ticker: 标准化股票代码。
-            document_id: 标准化文档 ID。
-            source_kind: 发生 revision mismatch 的 source kind。
+            ticker: exact external ticker。
+            document_id: exact external document ID。
+            source_kind: 可选显式 source kind。
+            materialize_files: 是否物化全部业务文件。
 
         Returns:
-            无。
+            storage-owned light/full snapshot。
 
         Raises:
-            RuntimeError: 缓存内部操作失败时抛出。
+            FinsReadBusinessError: storage 稳定读取预算耗尽时抛出。
+            FileNotFoundError: source 不存在时抛出。
+            ValueError: source kind 歧义或 snapshot 不完整时抛出。
+            OSError: snapshot 文件系统读取失败时抛出。
         """
 
-        processor_key = ProcessorCacheKey(ticker=ticker, document_id=document_id)
-        cached_processor = self._processor_cache.peek(processor_key)
-        if cached_processor is not None and cached_processor.source_kind is source_kind:
-            self._processor_cache.evict(processor_key)
-        self._meta_cache.evict(
-            ProcessorCacheKey(ticker=ticker, document_id=document_id, source_kind=source_kind.value)
-        )
-        # no-kind positive cache 已删除；保留清理动作避免旧运行时条目残留。
-        self._meta_cache.evict(processor_key)
-
-    def _evict_processor_path_caches(
-        self,
-        *,
-        ticker: str,
-        document_id: str,
-        source_kind: SourceKind,
-    ) -> None:
-        """清理 processor 路由及其关联 source meta 缓存。
-
-        Args:
-            ticker: 标准化股票代码。
-            document_id: 标准化文档 ID。
-            source_kind: 当前 storage 路由解析出的 source kind。
-
-        Returns:
-            无。
-
-        Raises:
-            RuntimeError: 缓存内部操作失败时抛出。
-        """
-
-        processor_key = ProcessorCacheKey(ticker=ticker, document_id=document_id)
-        cached_processor = self._processor_cache.peek(processor_key)
-        self._processor_cache.evict(processor_key)
-        kinds_to_evict = {source_kind}
-        if cached_processor is not None:
-            kinds_to_evict.add(cached_processor.source_kind)
-        for cached_source_kind in kinds_to_evict:
-            self._meta_cache.evict(
-                ProcessorCacheKey(
-                    ticker=ticker,
-                    document_id=document_id,
-                    source_kind=cached_source_kind.value,
-                )
+        try:
+            return self._source_repository.read_source_snapshot(
+                ticker,
+                document_id,
+                source_kind,
+                materialize_files=materialize_files,
             )
-        self._meta_cache.evict(processor_key)
+        except SourceSnapshotConsistencyError as exc:
+            self._raise_source_changed_during_read(cause=exc)
+
+    def _evict_processor_entry(
+        self,
+        cache_key: ProcessorCacheKey,
+        *,
+        active_error: BaseException | None = None,
+    ) -> None:
+        """从 LRU 移除一个 processor entry 并交给 lifecycle owner retire。
+
+        Args:
+            cache_key: 无 source-kind 维度的 processor cache key。
+            active_error: 当前活动主异常；正常 eviction 为 ``None``。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: 无 active borrow 且 snapshot cleanup 失败时抛出。
+        """
+
+        displaced = self._processor_cache.evict(cache_key)
+        if displaced is not None:
+            self._retire_entry(displaced, active_error=active_error)
+
+    def _evict_processor_entry_if_matches(
+        self,
+        cache_key: ProcessorCacheKey,
+        *,
+        expected: _CachedProcessor,
+        active_error: BaseException | None = None,
+    ) -> None:
+        """只 retire caller 先前观察到且尚未被替换的 entry。
+
+        Args:
+            cache_key: processor cache key。
+            expected: caller 先前观察到的 entry 实例。
+            active_error: 当前活动主异常；正常 stale eviction 为 ``None``。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: 无活动主异常且 snapshot cleanup 失败时抛出。
+        """
+
+        displaced = self._processor_cache.evict_if(cache_key, expected)
+        if displaced is not None:
+            self._retire_entry(displaced, active_error=active_error)
+
+    def _retire_entries(self, entries: tuple[_CachedProcessor, ...]) -> None:
+        """完整 retire 一组 LRU displaced entries。
+
+        Args:
+            entries: replacement/eviction/clear 返回的旧条目。
+
+        Returns:
+            无。
+
+        Raises:
+            BaseException: 完整处理所有条目后，抛出遇到的第一个 snapshot cleanup 失败。
+        """
+
+        first_error: BaseException | None = None
+        for entry in entries:
+            try:
+                self._retire_entry(entry, active_error=None)
+            except BaseException as close_error:
+                if first_error is None:
+                    first_error = close_error
+                else:
+                    first_error.add_note(
+                        f"另一个 processor snapshot cleanup 失败: type={type(close_error).__name__}"
+                    )
+        if first_error is not None:
+            raise first_error
+
+    def _retire_entry(
+        self,
+        entry: _CachedProcessor,
+        *,
+        active_error: BaseException | None,
+    ) -> None:
+        """把单个 cache entry 转为 retired，并按 borrow 状态释放资源。
+
+        Args:
+            entry: 待 retire 的缓存条目。
+            active_error: 当前业务主异常；正常路径为 ``None``。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: 无业务主异常且 snapshot cleanup 失败时抛出。
+        """
+
+        with self._lifecycle_lock:
+            self._retired_entries.add(entry)
+        if entry.retire():
+            self._close_retired_entry(entry, active_error=active_error)
+
+    def _release_processor_borrow(
+        self,
+        entry: _CachedProcessor,
+        *,
+        active_error: BaseException | None,
+    ) -> None:
+        """释放 borrow，并在 retired 最后借用处执行 snapshot cleanup。
+
+        Args:
+            entry: borrow 所属缓存条目。
+            active_error: borrow scope 内活动业务异常。
+
+        Returns:
+            无。
+
+        Raises:
+            RuntimeError: borrow 计数下溢时抛出。
+            OSError: 无业务主异常且 snapshot cleanup 失败时抛出。
+        """
+
+        if entry.release_borrow():
+            self._close_retired_entry(entry, active_error=active_error)
+
+    def _close_retired_entry(
+        self,
+        entry: _CachedProcessor,
+        *,
+        active_error: BaseException | None,
+    ) -> None:
+        """关闭一个已取得 close authority 的 retired entry。
+
+        Args:
+            entry: 已 retired 且无 active borrow 的条目。
+            active_error: 当前业务主异常；存在时 cleanup 失败只追加 path-free note。
+
+        Returns:
+            无。
+
+        Raises:
+            BaseException: 无业务主异常且 snapshot cleanup 失败时原样抛出。
+        """
+
+        try:
+            entry.snapshot.close()
+        except BaseException as close_error:
+            entry.finish_close(succeeded=False)
+            if active_error is not None:
+                self._append_cleanup_note(active_error, close_error)
+                return
+            raise
+        entry.finish_close(succeeded=True)
+        with self._lifecycle_lock:
+            self._retired_entries.discard(entry)
+
+    def _close_unowned_snapshot(
+        self,
+        snapshot: SourceSnapshotProtocol,
+        *,
+        active_error: BaseException | None,
+    ) -> None:
+        """关闭尚未交给 cache entry 的 snapshot，并保留失败重试 authority。
+
+        Args:
+            snapshot: light、losing 或 processor build 失败的 snapshot。
+            active_error: 当前业务主异常；正常路径为 ``None``。
+
+        Returns:
+            无。
+
+        Raises:
+            BaseException: 无业务主异常且 snapshot cleanup 失败时原样抛出。
+        """
+
+        try:
+            snapshot.close()
+        except BaseException as close_error:
+            with self._lifecycle_lock:
+                if all(candidate is not snapshot for candidate in self._pending_snapshots):
+                    self._pending_snapshots.append(snapshot)
+            if active_error is not None:
+                self._append_cleanup_note(active_error, close_error)
+                return
+            raise
+
+    def _retry_pending_cleanup(self) -> None:
+        """重试此前失败的 unowned snapshot 与 retired entry cleanup。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            BaseException: 任一重试仍失败时，在尝试全部资源后抛出首个失败。
+        """
+
+        with self._lifecycle_lock:
+            snapshots = tuple(self._pending_snapshots)
+            entries = tuple(self._retired_entries)
+        first_error: BaseException | None = None
+        for snapshot in snapshots:
+            try:
+                snapshot.close()
+            except BaseException as close_error:
+                if first_error is None:
+                    first_error = close_error
+                continue
+            with self._lifecycle_lock:
+                self._pending_snapshots = [
+                    candidate for candidate in self._pending_snapshots if candidate is not snapshot
+                ]
+        for entry in entries:
+            if not entry.retry_close():
+                continue
+            try:
+                self._close_retired_entry(entry, active_error=None)
+            except BaseException as close_error:
+                if first_error is None:
+                    first_error = close_error
+        if first_error is not None:
+            raise first_error
+
+    def _ensure_open(self) -> None:
+        """确认 runtime 仍允许发起新的 read borrow。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            RuntimeError: runtime 已关闭时抛出。
+        """
+
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("Fins read runtime 已关闭")
+
+    def close(self) -> None:
+        """幂等关闭 runtime，并 retire/clear 全部 processor snapshot 资源。
+
+        已在执行的 active borrow 可以完成；对应 retired snapshot 会在最后一个
+        borrow release 时关闭。关闭后禁止发起新的 read。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            BaseException: snapshot cleanup 失败且无业务主异常可承载时抛出。
+        """
+
+        with self._lifecycle_lock:
+            first_close = not self._closed
+            self._closed = True
+        if first_close:
+            self._retire_entries(self._processor_cache.clear())
+        self._retry_pending_cleanup()
+
+    @staticmethod
+    def _append_cleanup_note(primary_error: BaseException, close_error: BaseException) -> None:
+        """向业务主异常追加不含 locator/message 的 cleanup 次要诊断。
+
+        Args:
+            primary_error: 应保持优先级的业务异常。
+            close_error: snapshot cleanup 次要异常。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        errno_text = ""
+        if isinstance(close_error, OSError) and close_error.errno is not None:
+            errno_text = f" errno={close_error.errno}"
+        primary_error.add_note(
+            "processor snapshot cleanup 失败: "
+            f"type={type(close_error).__name__}{errno_text}"
+        )
 
     @staticmethod
     def _raise_source_changed_during_read(*, cause: Exception | None = None) -> NoReturn:
@@ -2821,8 +3488,8 @@ class FinsReadRuntime:
 
         failure = FinsReadBusinessError(
             ErrorCode.SOURCE_CHANGED_DURING_READ,
-            "读取期间源文档发生变化，当前结果已丢弃。",
-            hint="请重新发起一次读取，以使用最新源文档。",
+            "源文档持续更新，暂时无法取得完整一致的读取版本。",
+            hint="请稍后重新发起读取。",
         )
         if cause is None:
             raise failure

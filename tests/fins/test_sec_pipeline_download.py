@@ -8,6 +8,7 @@ import json
 import logging
 import datetime as dt
 from collections.abc import AsyncIterator, Callable, Mapping
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Optional, cast
@@ -39,6 +40,7 @@ from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.pipelines import sec_download_filing_workflow as _sec_download_filing_workflow
 from dayu.fins.pipelines import sec_download_state as _sec_download_state
 from dayu.fins.pipelines import sec_6k_primary_document_repair as _sec_6k_primary_repair
+from dayu.fins.pipelines import sec_fiscal_fields as _sec_fiscal_fields
 from dayu.fins.pipelines import sec_pipeline
 from dayu.fins.pipelines import sec_rebuild_workflow as _sec_rebuild_workflow
 from dayu.fins.pipelines.sec_6k_rules import _extract_head_text
@@ -65,11 +67,70 @@ from dayu.fins.storage import (
     FsFilingMaintenanceRepository,
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
-    SourceDocumentRepositoryProtocol,
 )
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
+from dayu.fins.storage.repository_protocols import SourceSnapshotProtocol
 from dayu.fins.ticker_normalization import normalize_ticker
 from dayu.documents.processors.processor_registry import ProcessorRegistry
+
+
+@dataclass(frozen=True, slots=True)
+class _FiscalXbrlResult:
+    """测试用最小 XBRL fiscal 投影。"""
+
+    fiscal_year: int
+    fiscal_period: str
+    entity_info: dict[str, str]
+
+
+@dataclass(slots=True)
+class _FinancialStatementFixtureProcessor:
+    """按 statement type 返回预设结果的 fiscal processor。"""
+
+    results: dict[str, dict[str, JsonValue] | RuntimeError | str]
+
+    def get_financial_statement(self, *, statement_type: str) -> dict[str, JsonValue]:
+        """返回预设报表结果或抛出预设异常。
+
+        Args:
+            statement_type: 财务报表类型。
+
+        Returns:
+            预设报表 JSON。
+
+        Raises:
+            RuntimeError: 当前报表配置为失败时抛出。
+        """
+
+        result = self.results[statement_type]
+        if isinstance(result, RuntimeError):
+            raise result
+        return cast(dict[str, JsonValue], result)
+
+
+@dataclass(slots=True)
+class _XbrlQueryFixtureProcessor:
+    """返回预设 XBRL facts payload 的 fiscal processor。"""
+
+    payload: dict[str, JsonValue] | RuntimeError
+
+    def query_xbrl_facts(self, *, concepts: list[str]) -> dict[str, JsonValue]:
+        """返回预设 facts payload 或抛出预设异常。
+
+        Args:
+            concepts: consumer 请求的 XBRL concepts。
+
+        Returns:
+            预设 facts payload。
+
+        Raises:
+            RuntimeError: 当前查询配置为失败时抛出。
+        """
+
+        del concepts
+        if isinstance(self.payload, RuntimeError):
+            raise self.payload
+        return self.payload
 
 
 class _NeverCancelled:
@@ -1094,7 +1155,136 @@ def _seed_complete_sec_source(
         batching_repository.rollback_batch(batch)
         raise
     batching_repository.commit_batch(batch)
-    return workspace_root / "portfolio" / ticker / "filings" / document_id / "meta.json"
+    return _source_meta_path(workspace_root, ticker, document_id)
+
+
+def _source_meta_path(
+    workspace_root: Path,
+    ticker: str,
+    document_id: str,
+) -> Path:
+    """通过 storage identity owner 定位 published filing meta。
+
+    Args:
+        workspace_root: Fins 工作区根目录。
+        ticker: exact external ticker。
+        document_id: exact external document ID。
+
+    Returns:
+        已通过 descriptor 校验的 filing meta 路径。
+
+    Raises:
+        ValueError: identity descriptor 不一致时抛出。
+        OSError: 文件系统读取失败时抛出。
+    """
+
+    core = build_fs_repository_set(workspace_root=workspace_root).core
+    return core._source_meta_path_for_read(ticker, document_id, SourceKind.FILING)
+
+
+def _company_meta_path(workspace_root: Path, ticker: str) -> Path:
+    """通过 storage identity owner 定位 published company meta。
+
+    Args:
+        workspace_root: Fins 工作区根目录。
+        ticker: exact external ticker。
+
+    Returns:
+        已通过 descriptor 校验的 company meta 路径。
+
+    Raises:
+        ValueError: identity descriptor 不一致时抛出。
+        OSError: 文件系统读取失败时抛出。
+    """
+
+    core = build_fs_repository_set(workspace_root=workspace_root).core
+    return core._company_meta_path_for_read(ticker)
+
+
+def _filing_manifest_path(workspace_root: Path, ticker: str) -> Path:
+    """通过 storage identity owner 定位 published filing manifest。
+
+    Args:
+        workspace_root: Fins 工作区根目录。
+        ticker: exact external ticker。
+
+    Returns:
+        filing manifest 路径。
+
+    Raises:
+        ValueError: identity descriptor 不一致时抛出。
+        OSError: 文件系统读取失败时抛出。
+    """
+
+    core = build_fs_repository_set(workspace_root=workspace_root).core
+    return core._filing_manifest_path_for_read(ticker)
+
+
+def _processed_meta_path(
+    workspace_root: Path,
+    ticker: str,
+    document_id: str,
+) -> Path:
+    """通过 storage identity owner 定位 published processed meta。
+
+    Args:
+        workspace_root: Fins 工作区根目录。
+        ticker: exact external ticker。
+        document_id: exact external document ID。
+
+    Returns:
+        processed meta 路径。
+
+    Raises:
+        ValueError: identity descriptor 不一致时抛出。
+        OSError: 文件系统读取失败时抛出。
+    """
+
+    core = build_fs_repository_set(workspace_root=workspace_root).core
+    return core._processed_meta_path_for_read(ticker, document_id)
+
+
+def _download_rejections_path(workspace_root: Path, ticker: str) -> Path:
+    """通过 storage identity owner 定位 published rejection registry。
+
+    Args:
+        workspace_root: Fins 工作区根目录。
+        ticker: exact external ticker。
+
+    Returns:
+        download rejection registry 路径。
+
+    Raises:
+        ValueError: identity descriptor 不一致时抛出。
+        OSError: 文件系统读取失败时抛出。
+    """
+
+    core = build_fs_repository_set(workspace_root=workspace_root).core
+    return core._download_rejections_path_for_read(ticker)
+
+
+def _rejected_meta_path(
+    workspace_root: Path,
+    ticker: str,
+    document_id: str,
+) -> Path:
+    """通过 storage identity owner 定位 published rejected filing meta。
+
+    Args:
+        workspace_root: Fins 工作区根目录。
+        ticker: exact external ticker。
+        document_id: exact external document ID。
+
+    Returns:
+        已通过 descriptor 校验的 rejected filing meta 路径。
+
+    Raises:
+        ValueError: identity descriptor 不一致时抛出。
+        OSError: 文件系统读取失败时抛出。
+    """
+
+    core = build_fs_repository_set(workspace_root=workspace_root).core
+    return core._rejected_filing_meta_path_for_read(ticker, document_id)
 
 
 def _seed_complete_6k_source_and_processed(
@@ -1195,6 +1385,94 @@ def _seed_complete_6k_source_and_processed(
     batching_repository.commit_batch(batch)
 
 
+def _seed_complete_xbrl_source(
+    *,
+    workspace_root: Path,
+    ticker: str,
+    document_id: str,
+) -> list[dict[str, JsonValue]]:
+    """通过真实 batch 发布一组完整 XBRL source 文件。
+
+    Args:
+        workspace_root: Fins 工作区根目录。
+        ticker: 事务绑定 ticker。
+        document_id: source 文档 ID。
+
+    Returns:
+        与已发布 source 同版的完整文件描述符列表。
+
+    Raises:
+        OSError: blob/source 或 commit 写入失败时抛出。
+        ValueError: fixture 违反 complete publication contract 时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    source_handle = SourceHandle(
+        ticker=ticker,
+        document_id=document_id,
+        source_kind=SourceKind.FILING.value,
+    )
+    file_entries: list[dict[str, JsonValue]] = []
+    filenames = (
+        "report_htm.xml",
+        "report.xsd",
+        "report_pre.xml",
+        "report_cal.xml",
+        "report_def.xml",
+        "report_lab.xml",
+    )
+    batch = batching_repository.begin_batch(ticker)
+    try:
+        for filename in filenames:
+            file_meta = blob_repository.store_file(
+                source_handle,
+                filename,
+                BytesIO(f"<{filename}>payload</{filename}>".encode("utf-8")),
+                batch=batch,
+                content_type="application/xml",
+            )
+            file_entries.append(
+                SourceFileEntry(
+                    name=filename,
+                    uri=file_meta.uri,
+                    etag=file_meta.etag,
+                    last_modified=file_meta.last_modified,
+                    size=file_meta.size,
+                    content_type=file_meta.content_type,
+                    sha256=file_meta.sha256,
+                    source_url=f"https://example.com/{filename}",
+                ).to_dict()
+            )
+        source_repository.create_source_document(
+            SourceDocumentUpsertRequest(
+                ticker=ticker,
+                document_id=document_id,
+                internal_document_id=document_id.removeprefix("fil_"),
+                form_type="10-K",
+                primary_document="report_htm.xml",
+                meta={
+                    "accession_number": document_id.removeprefix("fil_"),
+                    "ingest_method": "download",
+                    "source_provider": FinsSourceProvider.SEC_EDGAR.to_storage_value(),
+                    "company_id": "320193",
+                    "document_version": "v1",
+                    "source_fingerprint": "xbrl-seed",
+                },
+                file_entries=file_entries,
+            ),
+            SourceKind.FILING,
+            batch=batch,
+        )
+    except BaseException:
+        batching_repository.rollback_batch(batch)
+        raise
+    batching_repository.commit_batch(batch)
+    return file_entries
+
+
 def test_sec_pipeline_download_writes_meta_and_manifest(tmp_path: Path) -> None:
     """验证下载成功后写 meta 与 manifest。
 
@@ -1231,17 +1509,17 @@ def test_sec_pipeline_download_writes_meta_and_manifest(tmp_path: Path) -> None:
     result = pipeline.download(ticker="AAPL", overwrite=False)
 
     assert result["summary"]["downloaded"] == 1
-    meta_path = tmp_path / "portfolio" / "AAPL" / "filings" / "fil_0000000000-25-000001" / "meta.json"
+    meta_path = _source_meta_path(tmp_path, "AAPL", "fil_0000000000-25-000001")
     assert meta_path.exists()
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     assert meta["files"][0]["uri"].endswith("sample-10k.htm")
     assert meta["fiscal_year"] == 2024
     assert meta["fiscal_period"] == "FY"
     assert meta["source_provider"] == "sec_edgar"
-    manifest_path = tmp_path / "portfolio" / "AAPL" / "filings" / "filing_manifest.json"
+    manifest_path = _filing_manifest_path(tmp_path, "AAPL")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["documents"][0]["document_id"] == "fil_0000000000-25-000001"
-    company_meta_path = tmp_path / "portfolio" / "AAPL" / "meta.json"
+    company_meta_path = _company_meta_path(tmp_path, "AAPL")
     company_meta = json.loads(company_meta_path.read_text(encoding="utf-8"))
     assert company_meta["ticker"] == "AAPL"
     assert company_meta["market"] == "US"
@@ -1278,7 +1556,7 @@ def test_sec_pipeline_download_merges_cli_aliases_with_sec_aliases(tmp_path: Pat
         ticker_aliases=["AAPL", "AAPL.SW", "APC"],
     )
 
-    company_meta_path = tmp_path / "portfolio" / "AAPL" / "meta.json"
+    company_meta_path = _company_meta_path(tmp_path, "AAPL")
     company_meta = json.loads(company_meta_path.read_text(encoding="utf-8"))
     assert company_meta["ticker_aliases"] == ["AAPL", "APC", "AAPL.SW"]
 
@@ -1356,8 +1634,8 @@ def test_sec_pipeline_rebuild_local_meta_manifest_without_redownload(tmp_path: P
         batch=batch,
     )
     batching_repository.commit_batch(batch)
-    meta_path = tmp_path / "portfolio" / ticker / "filings" / document_id / "meta.json"
-    manifest_path = tmp_path / "portfolio" / ticker / "filings" / "filing_manifest.json"
+    meta_path = _source_meta_path(tmp_path, ticker, document_id)
+    manifest_path = _filing_manifest_path(tmp_path, ticker)
 
     downloader = RebuildOnlyDownloader()
     pipeline = SecPipeline(
@@ -1687,10 +1965,437 @@ def test_sec_pipeline_download_prefers_dei_fiscal_when_available(
 
     pipeline.download(ticker="AAPL", overwrite=False)
 
-    meta_path = tmp_path / "portfolio" / "AAPL" / "filings" / "fil_0000000000-25-000001" / "meta.json"
+    meta_path = _source_meta_path(tmp_path, "AAPL", "fil_0000000000-25-000001")
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     assert meta["fiscal_year"] == 2023
     assert meta["fiscal_period"] == "FY"
+
+
+def test_sec_fiscal_files_consume_one_storage_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SEC fiscal 多文件读取必须来自同一份 full snapshot。
+
+    Args:
+        tmp_path: 临时工作区根目录。
+        monkeypatch: pytest monkeypatch。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: consumer 重回逐文件仓储读取或资源未清理时抛出。
+    """
+
+    from edgar.xbrl import XBRL
+
+    ticker = "AAPL"
+    document_id = "fil_0000000000-25-000001"
+    file_entries = _seed_complete_xbrl_source(
+        workspace_root=tmp_path,
+        ticker=ticker,
+        document_id=document_id,
+    )
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source_repository = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    original_read_snapshot = source_repository.read_source_snapshot
+    snapshots: list[SourceSnapshotProtocol] = []
+    materialized_paths: list[Path] = []
+
+    def _observe_snapshot_read(
+        observed_ticker: str,
+        observed_document_id: str,
+        source_kind: SourceKind | None = None,
+        *,
+        materialize_files: bool,
+    ) -> SourceSnapshotProtocol:
+        """记录真实 storage snapshot 调用并返回原始资源。"""
+
+        snapshot = original_read_snapshot(
+            observed_ticker,
+            observed_document_id,
+            source_kind,
+            materialize_files=materialize_files,
+        )
+        snapshots.append(snapshot)
+        return snapshot
+
+    def _forbid_legacy_source_read(source_handle: SourceHandle, filename: str) -> None:
+        """禁止 fiscal consumer 退回逐文件 source 读取。"""
+
+        del source_handle, filename
+        raise AssertionError("fiscal consumer must use its one snapshot")
+
+    def _fake_xbrl_from_files(
+        instance_file: str | Path | None = None,
+        schema_file: str | Path | None = None,
+        presentation_file: str | Path | None = None,
+        calculation_file: str | Path | None = None,
+        definition_file: str | Path | None = None,
+        label_file: str | Path | None = None,
+    ) -> _FiscalXbrlResult:
+        """记录解析器看到的同版临时文件并返回确定 fiscal 值。"""
+
+        raw_paths = (
+            instance_file,
+            schema_file,
+            presentation_file,
+            calculation_file,
+            definition_file,
+            label_file,
+        )
+        materialized_paths.extend(Path(path) for path in raw_paths if path is not None)
+        return _FiscalXbrlResult(
+            fiscal_year=2024,
+            fiscal_period="FY",
+            entity_info={},
+        )
+
+    monkeypatch.setattr(source_repository, "read_source_snapshot", _observe_snapshot_read)
+    monkeypatch.setattr(source_repository, "get_source", _forbid_legacy_source_read)
+    monkeypatch.setattr(XBRL, "from_files", staticmethod(_fake_xbrl_from_files))
+
+    fiscal_year, fiscal_period = _sec_fiscal_fields._extract_download_fiscal_from_xbrl(
+        source_handle=SourceHandle(
+            ticker=ticker,
+            document_id=document_id,
+            source_kind=SourceKind.FILING.value,
+        ),
+        source_repository=source_repository,
+        file_entries=file_entries,
+        form_type="10-K",
+    )
+
+    assert (fiscal_year, fiscal_period) == (2024, "FY")
+    assert len(snapshots) == 1
+    assert materialized_paths
+    assert all(not path.exists() for path in materialized_paths)
+    with pytest.raises(RuntimeError, match="已关闭"):
+        snapshots[0].get_primary_source()
+
+
+def test_sec_fiscal_financial_payload_and_quality_contracts() -> None:
+    """fiscal owner 应保留报表部分失败、XBRL 可用性与质量矩阵。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: fiscal payload 或质量矩阵发生漂移时抛出。
+    """
+
+    processor = _FinancialStatementFixtureProcessor(
+        results={
+            "income": {
+                "statement_type": "income",
+                "rows": [{"label": "Revenue"}],
+                "data_quality": "xbrl",
+            },
+            "balance_sheet": "invalid",
+            "cash_flow": RuntimeError("cash unavailable"),
+            "equity": {
+                "statement_type": "equity",
+                "rows": [],
+                "data_quality": "partial",
+            },
+            "comprehensive_income": {
+                "statement_type": "comprehensive_income",
+                "rows": [],
+                "data_quality": "partial",
+            },
+        }
+    )
+
+    payload, has_xbrl = _sec_fiscal_fields._build_financials_payload(processor)
+
+    assert has_xbrl is True
+    assert payload is not None
+    statements = cast(dict[str, JsonValue], payload["statements"])
+    assert cast(dict[str, JsonValue], statements["balance_sheet"])["reason"] == "invalid_statement_result"
+    assert str(cast(dict[str, JsonValue], statements["cash_flow"])["reason"]).startswith("processor_error:")
+    assert _sec_fiscal_fields._build_financials_payload(None) == (None, False)
+    no_xbrl_payload, no_xbrl = _sec_fiscal_fields._build_financials_payload(
+        _FinancialStatementFixtureProcessor(
+            results={
+                statement_type: {
+                    "statement_type": statement_type,
+                    "rows": [],
+                    "data_quality": "partial",
+                }
+                for statement_type in _sec_fiscal_fields.FINANCIAL_STATEMENT_TYPES
+            }
+        )
+    )
+    assert (no_xbrl_payload, no_xbrl) == (None, False)
+    assert _sec_fiscal_fields._resolve_processed_quality(True, True, "10-K") == "full"
+    assert _sec_fiscal_fields._resolve_processed_quality(False, True, "10-K") == "partial"
+    assert _sec_fiscal_fields._resolve_processed_quality(False, False, "10-K") == "fallback"
+    assert _sec_fiscal_fields._resolve_processed_quality(True, True, "DEF14A") == "partial"
+
+
+def test_sec_fiscal_processed_resolution_precedence_and_fallbacks() -> None:
+    """processed fiscal 字段应按 source、query、payload、report date 顺序解析。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: fiscal precedence 或 form 约束发生漂移时抛出。
+    """
+
+    query_processor = _XbrlQueryFixtureProcessor(
+        payload={
+            "query_params": {},
+            "facts": [{"fiscal_year": 2024, "fiscal_period": "FY"}],
+            "total": 1,
+            "data_quality": "xbrl",
+            "reason": None,
+        }
+    )
+    financials_payload: dict[str, JsonValue] = {
+        "statements": {
+            "income": {
+                "periods": [{"fiscal_year": 2023, "fiscal_period": "Q2"}],
+            }
+        }
+    }
+
+    assert _sec_fiscal_fields._resolve_processed_fiscal_fields(
+        {"form_type": "10-K", "fiscal_year": 2022, "fiscal_period": "FY"},
+        financials_payload,
+        query_processor,
+    ) == (2022, "FY")
+    assert _sec_fiscal_fields._resolve_processed_fiscal_fields(
+        {"form_type": "10-K"},
+        financials_payload,
+        query_processor,
+    ) == (2024, "FY")
+    assert _sec_fiscal_fields._resolve_processed_fiscal_fields(
+        {"form_type": "10-Q", "fiscal_year": 2025},
+        financials_payload,
+        query_processor,
+        allow_xbrl_query=False,
+    ) == (2025, "Q2")
+    assert _sec_fiscal_fields._resolve_processed_fiscal_fields(
+        {"form_type": "20-F", "report_date": "2021-12-31"},
+        None,
+        None,
+    ) == (2021, "FY")
+    assert _sec_fiscal_fields._resolve_processed_fiscal_fields(
+        {"form_type": "6-K", "report_date": "bad-date"},
+        None,
+        None,
+    ) == (None, None)
+
+
+def test_sec_fiscal_download_resolution_preserves_existing_business_rules(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """download fiscal 合并只替换文件来源，不改变 DEI 与日期回退规则。
+
+    Args:
+        tmp_path: 临时工作区根目录。
+        monkeypatch: pytest monkeypatch。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: download fiscal precedence 发生漂移时抛出。
+    """
+
+    source_repository = FsSourceDocumentRepository(tmp_path)
+    source_handle = SourceHandle(
+        ticker="AAPL",
+        document_id="fil_0000000000-25-000001",
+        source_kind=SourceKind.FILING.value,
+    )
+    extracted: tuple[int | None, str | None] = (None, None)
+
+    def _extract_fixture(
+        *,
+        source_handle: SourceHandle,
+        source_repository: FsSourceDocumentRepository,
+        file_entries: list[dict[str, JsonValue]],
+        form_type: str | None,
+    ) -> tuple[int | None, str | None]:
+        """返回当前测试场景配置的 DEI fiscal 字段。"""
+
+        del source_handle, source_repository, file_entries, form_type
+        return extracted
+
+    monkeypatch.setattr(
+        _sec_fiscal_fields,
+        "_extract_download_fiscal_from_xbrl",
+        _extract_fixture,
+    )
+
+    assert _sec_fiscal_fields._resolve_download_fiscal_fields(
+        source_handle=source_handle,
+        source_repository=source_repository,
+        file_entries=[],
+        form_type="10-K",
+        report_date="2023-12-31",
+    ) == (2023, "FY")
+    extracted = (2024, "Q3")
+    assert _sec_fiscal_fields._resolve_download_fiscal_fields(
+        source_handle=source_handle,
+        source_repository=source_repository,
+        file_entries=[],
+        form_type="10-Q",
+        report_date="2023-09-30",
+    ) == (2024, "Q3")
+    extracted = (None, "Q2")
+    assert _sec_fiscal_fields._resolve_download_fiscal_fields(
+        source_handle=source_handle,
+        source_repository=source_repository,
+        file_entries=[],
+        form_type="10-Q",
+        report_date="2023-06-30",
+    ) == (2023, "Q2")
+    extracted = (2025, None)
+    assert _sec_fiscal_fields._resolve_download_fiscal_fields(
+        source_handle=source_handle,
+        source_repository=source_repository,
+        file_entries=[],
+        form_type="20-F",
+        report_date="2024-12-31",
+    ) == (2025, "FY")
+    assert _sec_fiscal_fields._resolve_download_fiscal_fields(
+        source_handle=source_handle,
+        source_repository=source_repository,
+        file_entries=[],
+        form_type="6-K",
+        report_date="2024-12-31",
+    ) == (2025, None)
+
+
+def test_sec_fiscal_helper_contract_matrix() -> None:
+    """fiscal helper 应保留 XBRL 选择、解析、归一与 skip 合同。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任一 fiscal helper owner contract 漂移时抛出。
+    """
+
+    file_map = {
+        "a_pre.xml": Path("a_pre.xml"),
+        "b.xml": Path("b.xml"),
+        "c_ins.xml": Path("c_ins.xml"),
+        "d.xsd": Path("d.xsd"),
+        "filingsummary.xml": Path("filingsummary.xml"),
+    }
+    assert _sec_fiscal_fields._pick_download_xbrl_file(
+        file_map,
+        candidates=("_ins.xml",),
+    ) == Path("c_ins.xml")
+    assert _sec_fiscal_fields._pick_download_xbrl_file(
+        file_map,
+        candidates=("_missing.xml",),
+    ) is None
+    assert _sec_fiscal_fields._pick_download_xbrl_file(
+        file_map,
+        candidates=("_missing.xml",),
+        xml_fallback=True,
+    ) == Path("b.xml")
+    assert _sec_fiscal_fields._mapping_get_case_insensitive(
+        {"DocumentFiscalYearFocus": "2024"},
+        ("documentfiscalyearfocus",),
+    ) == "2024"
+    assert _sec_fiscal_fields._mapping_get_case_insensitive([], ("missing",)) is None
+    assert _sec_fiscal_fields._pick_first_non_empty((None, " ", "FY")) == "FY"
+    assert _sec_fiscal_fields._pick_first_non_empty((None, " ")) is None
+    assert _sec_fiscal_fields._infer_download_fiscal_fields("10-K", "2024-12-31") == (2024, "FY")
+    assert _sec_fiscal_fields._infer_download_fiscal_fields("6-K/A", "2024-12-31") == (None, None)
+    assert _sec_fiscal_fields._resolve_fiscal_period_fallback(
+        form_type="10-Q",
+        fiscal_year=2024,
+        fiscal_year_from_report_date=True,
+    ) is None
+    assert _sec_fiscal_fields._coerce_optional_int(None) is None
+    assert _sec_fiscal_fields._coerce_optional_int(True) is None
+    assert _sec_fiscal_fields._coerce_optional_int(2024) == 2024
+    assert _sec_fiscal_fields._coerce_optional_int(" ") is None
+    assert _sec_fiscal_fields._coerce_optional_int("20x4") is None
+    assert _sec_fiscal_fields._normalize_optional_period("q1") == "Q1"
+    assert _sec_fiscal_fields._normalize_optional_period("n/a") is None
+    assert _sec_fiscal_fields._coerce_year_from_date("2024-12-31") == 2024
+    assert _sec_fiscal_fields._coerce_year_from_date("2024") is None
+    assert _sec_fiscal_fields._should_skip_financial_extraction(None) is False
+    assert _sec_fiscal_fields._should_skip_financial_extraction("DEF14A") is True
+    assert _sec_fiscal_fields._should_skip_financial_extraction("SC 13D/A") is True
+    assert _sec_fiscal_fields._should_skip_financial_extraction("10-K") is False
+
+
+def test_sec_fiscal_payload_and_query_extractors_fail_closed() -> None:
+    """financials 与 XBRL query extractor 应拒绝非法 shape 并保留有效 fiscal。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: extractor 接受非法 payload 或丢失有效 fiscal 时抛出。
+    """
+
+    assert _sec_fiscal_fields._extract_fiscal_from_financials(None) == (None, None)
+    assert _sec_fiscal_fields._extract_fiscal_from_financials({"statements": []}) == (None, None)
+    assert _sec_fiscal_fields._extract_fiscal_from_financials(
+        {
+            "statements": {
+                "income": {
+                    "periods": [None, {"period_end": "2022-12-31", "fiscal_period": "FY"}],
+                }
+            }
+        }
+    ) == (2022, "FY")
+    assert _sec_fiscal_fields._extract_fiscal_from_xbrl_query(None) == (None, None)
+    assert _sec_fiscal_fields._extract_fiscal_from_xbrl_query(
+        _XbrlQueryFixtureProcessor(RuntimeError("query failed"))
+    ) == (None, None)
+    assert _sec_fiscal_fields._extract_fiscal_from_xbrl_query(
+        _XbrlQueryFixtureProcessor({"facts": []})
+    ) == (None, None)
+    assert _sec_fiscal_fields._extract_fiscal_from_xbrl_query(
+        _XbrlQueryFixtureProcessor(
+            {
+                "query_params": {},
+                "facts": [
+                    {"period_end": "2023-12-31"},
+                    {"fiscal_year": 2024, "fiscal_period": "Q1"},
+                ],
+                "total": 2,
+                "data_quality": "xbrl",
+                "reason": None,
+            }
+        )
+    ) == (2024, "Q1")
+    assert _sec_fiscal_fields._extract_fiscal_from_xbrl_query(
+        _XbrlQueryFixtureProcessor(
+            {
+                "query_params": {},
+                "facts": [{"period_end": "2021-12-31"}],
+                "total": 1,
+                "data_quality": "xbrl",
+                "reason": None,
+            }
+        )
+    ) == (2021, None)
 
 
 def test_sec_pipeline_skip_when_meta_matches(tmp_path: Path) -> None:
@@ -1880,7 +2585,7 @@ def test_sec_pipeline_failed_filing_does_not_write_meta(tmp_path: Path) -> None:
     result = pipeline.download(ticker="AAPL", overwrite=False)
 
     assert result["summary"]["failed"] == 1
-    meta_path = tmp_path / "portfolio" / "AAPL" / "filings" / "fil_0000000000-25-000001" / "meta.json"
+    meta_path = _source_meta_path(tmp_path, "AAPL", "fil_0000000000-25-000001")
     assert not meta_path.exists()
     assert result["filings"][0]["reason_code"] == "file_download_failed"
     assert result["filings"][0]["reason_message"] == "存在文件下载失败"
@@ -1926,8 +2631,10 @@ def test_sec_pipeline_remote_change_marks_reprocess(tmp_path: Path) -> None:
         batch=processed_batch,
     )
     batching_repository.commit_batch(processed_batch)
-    processed_meta_path = (
-        tmp_path / "portfolio" / "AAPL" / "processed" / "fil_0000000000-25-000001" / "tool_snapshot_meta.json"
+    processed_meta_path = _processed_meta_path(
+        tmp_path,
+        "AAPL",
+        "fil_0000000000-25-000001",
     )
 
     remote_files_v2 = [_make_descriptor("etag-v2")]
@@ -2091,7 +2798,7 @@ def test_sec_pipeline_download_resolves_foreign_issuer_from_submissions(tmp_path
     forms = _require_json_list(result["filters"]["forms"])
     assert "6-K" in forms
     assert "20-F" in forms
-    company_meta_path = tmp_path / "portfolio" / "TCOM" / "meta.json"
+    company_meta_path = _company_meta_path(tmp_path, "TCOM")
     company_meta = json.loads(company_meta_path.read_text(encoding="utf-8"))
     assert company_meta["ticker"] == "TCOM"
     assert company_meta["market"] == "US"
@@ -2172,22 +2879,18 @@ def test_sec_pipeline_filters_6k_excluded(
         in caplog.text
     )
     assert downloader.download_files_called is True
-    meta_path = tmp_path / "portfolio" / "TCOM" / "filings" / "fil_0000000000-25-000101" / "meta.json"
+    meta_path = _source_meta_path(tmp_path, "TCOM", "fil_0000000000-25-000101")
     assert not meta_path.exists()
-    rejected_meta_path = (
-        tmp_path
-        / "portfolio"
-        / "TCOM"
-        / "filings"
-        / ".rejections"
-        / "fil_0000000000-25-000101"
-        / "meta.json"
+    rejected_meta_path = _rejected_meta_path(
+        tmp_path,
+        "TCOM",
+        "fil_0000000000-25-000101",
     )
     assert rejected_meta_path.exists()
     rejected_meta = json.loads(rejected_meta_path.read_text(encoding="utf-8"))
     assert rejected_meta["rejection_reason"] == "6k_filtered"
     assert rejected_meta["rejection_category"] == "EXCLUDE_NON_QUARTERLY"
-    registry_path = tmp_path / "portfolio" / "TCOM" / "filings" / "_download_rejections.json"
+    registry_path = _download_rejections_path(tmp_path, "TCOM")
     registry_payload = json.loads(registry_path.read_text(encoding="utf-8"))
     rejected_registry_entry = registry_payload["fil_0000000000-25-000101"]
     assert rejected_registry_entry["document_id"] == "fil_0000000000-25-000101"
@@ -2447,7 +3150,7 @@ def test_sec_pipeline_keeps_6k_results_release(tmp_path: Path) -> None:
 
     assert result["summary"]["downloaded"] == 1
     assert downloader.download_files_called is True
-    meta_path = tmp_path / "portfolio" / "TCOM" / "filings" / "fil_0000000000-25-000101" / "meta.json"
+    meta_path = _source_meta_path(tmp_path, "TCOM", "fil_0000000000-25-000101")
     assert meta_path.exists()
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     assert meta["primary_document"] == "sample-6k.htm"
@@ -2495,7 +3198,7 @@ def test_sec_pipeline_keeps_primary_only_6k_results_release(tmp_path: Path) -> N
 
     assert result["summary"]["downloaded"] == 1
     assert downloader.download_files_called is True
-    meta_path = tmp_path / "portfolio" / "TCOM" / "filings" / "fil_0000000000-25-000101" / "meta.json"
+    meta_path = _source_meta_path(tmp_path, "TCOM", "fil_0000000000-25-000101")
     assert meta_path.exists()
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     assert meta["primary_document"] == "sample-6k.htm"
@@ -2572,7 +3275,7 @@ def test_sec_pipeline_promotes_positive_6k_exhibit_when_cover_is_excluded(tmp_pa
 
     assert result["summary"]["downloaded"] == 1
     assert downloader.download_files_called is True
-    meta_path = tmp_path / "portfolio" / "TCOM" / "filings" / "fil_0000000000-25-000101" / "meta.json"
+    meta_path = _source_meta_path(tmp_path, "TCOM", "fil_0000000000-25-000101")
     assert meta_path.exists()
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     assert meta["primary_document"] == "d123dex991.htm"
@@ -2674,7 +3377,7 @@ def test_sec_pipeline_repairs_cover_primary_when_attachment_has_core_statements(
     result = pipeline.download(ticker="ALVO", overwrite=False)
 
     assert result["summary"]["downloaded"] == 1
-    meta_path = tmp_path / "portfolio" / "ALVO" / "filings" / "fil_0000000000-25-000101" / "meta.json"
+    meta_path = _source_meta_path(tmp_path, "ALVO", "fil_0000000000-25-000101")
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     assert meta["primary_document"] == "ex99-1.htm"
 
@@ -2761,7 +3464,7 @@ def test_sec_pipeline_rolls_back_when_prepared_primary_selection_raises(
     with pytest.raises(RuntimeError, match="boom"):
         pipeline.download(ticker="TCOM", overwrite=False)
 
-    meta_path = tmp_path / "portfolio" / "TCOM" / "filings" / "fil_0000000000-25-000101" / "meta.json"
+    meta_path = _source_meta_path(tmp_path, "TCOM", "fil_0000000000-25-000101")
     assert not meta_path.exists()
 
 
@@ -2795,15 +3498,13 @@ def test_standalone_6k_reconcile_publishes_source_and_processed_together(
 
     def _assess_active_candidate(
         *,
-        source_repository: SourceDocumentRepositoryProtocol,
-        ticker: str,
-        document_id: str,
+        snapshot: SourceSnapshotProtocol,
         filename: str,
         primary_document: str,
     ) -> _sec_6k_primary_repair.SixKPrimaryCandidateAssessment:
         """保留真实 batch/publication，只稳定处理器评估结果。"""
 
-        del source_repository, ticker, document_id, primary_document
+        del snapshot, primary_document
         return assessments[filename]
 
     monkeypatch.setattr(
@@ -2827,6 +3528,136 @@ def test_standalone_6k_reconcile_publishes_source_and_processed_together(
     assert report.updated[0].selected_primary_document == "ex99-1.htm"
     assert published_meta["primary_document"] == "ex99-1.htm"
     assert processed_meta["reprocess_required"] is True
+
+
+def test_active_6k_candidate_assessment_consumes_one_storage_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """active 6-K 全部候选评估必须共享同一份 full snapshot。
+
+    Args:
+        tmp_path: 临时工作区根目录。
+        monkeypatch: pytest monkeypatch。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: consumer 逐文件读取仓储、混用 snapshot 或泄漏资源时抛出。
+    """
+
+    ticker = "TCOM"
+    document_id = "fil_0000000000-25-000101"
+    _seed_complete_6k_source_and_processed(
+        workspace_root=tmp_path,
+        ticker=ticker,
+        document_id=document_id,
+    )
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching_repository = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    source_repository = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    processed_repository = FsProcessedDocumentRepository(tmp_path, repository_set=repository_set)
+    original_read_snapshot = source_repository.read_source_snapshot
+    acquired_snapshots: list[SourceSnapshotProtocol] = []
+    assessed_snapshots: list[SourceSnapshotProtocol] = []
+    materialized_paths: list[Path] = []
+    assessments = {
+        "form6-k.htm": _sec_6k_primary_repair.SixKPrimaryCandidateAssessment(
+            filename="form6-k.htm",
+            income_row_count=0,
+            balance_sheet_row_count=0,
+            filename_priority=3,
+        ),
+        "ex99-1.htm": _sec_6k_primary_repair.SixKPrimaryCandidateAssessment(
+            filename="ex99-1.htm",
+            income_row_count=20,
+            balance_sheet_row_count=30,
+            filename_priority=0,
+        ),
+    }
+
+    def _observe_snapshot_read(
+        observed_ticker: str,
+        observed_document_id: str,
+        source_kind: SourceKind | None = None,
+        *,
+        materialize_files: bool,
+    ) -> SourceSnapshotProtocol:
+        """记录真实 storage snapshot 调用并返回原始资源。"""
+
+        snapshot = original_read_snapshot(
+            observed_ticker,
+            observed_document_id,
+            source_kind,
+            materialize_files=materialize_files,
+        )
+        acquired_snapshots.append(snapshot)
+        return snapshot
+
+    def _forbid_source_meta_read(
+        observed_ticker: str,
+        observed_document_id: str,
+        source_kind: SourceKind | None = None,
+    ) -> None:
+        """禁止 6-K consumer 在 snapshot 外重复读取 meta。"""
+
+        del observed_ticker, observed_document_id, source_kind
+        raise AssertionError("6-K consumer must read meta from its snapshot")
+
+    def _forbid_source_file_read(source_handle: SourceHandle, filename: str) -> None:
+        """禁止 6-K consumer 在 snapshot 外逐文件读取 source。"""
+
+        del source_handle, filename
+        raise AssertionError("6-K consumer must read files from its snapshot")
+
+    def _assess_active_candidate(
+        *,
+        snapshot: SourceSnapshotProtocol,
+        filename: str,
+        primary_document: str,
+    ) -> _sec_6k_primary_repair.SixKPrimaryCandidateAssessment:
+        """记录候选共享的 snapshot 及其临时文件生命周期。"""
+
+        del primary_document
+        assessed_snapshots.append(snapshot)
+        materialized_paths.append(snapshot.get_source(filename).materialize())
+        return assessments[filename]
+
+    monkeypatch.setattr(source_repository, "read_source_snapshot", _observe_snapshot_read)
+    monkeypatch.setattr(source_repository, "get_source_meta", _forbid_source_meta_read)
+    monkeypatch.setattr(source_repository, "get_source", _forbid_source_file_read)
+    monkeypatch.setattr(
+        _sec_6k_primary_repair,
+        "_assess_active_6k_candidate",
+        _assess_active_candidate,
+    )
+
+    batch = batching_repository.begin_batch(ticker)
+    commit_started = False
+    try:
+        outcome = _sec_6k_primary_repair.reconcile_active_6k_primary_document(
+            source_repository=source_repository,
+            processed_repository=processed_repository,
+            ticker=ticker,
+            document_id=document_id,
+            batch=batch,
+        )
+        commit_started = True
+        batching_repository.commit_batch(batch)
+    finally:
+        if not commit_started:
+            batching_repository.rollback_batch(batch)
+
+    assert outcome is not None
+    assert outcome.selected_primary_document == "ex99-1.htm"
+    assert len(acquired_snapshots) == 1
+    assert assessed_snapshots
+    assert all(snapshot is acquired_snapshots[0] for snapshot in assessed_snapshots)
+    assert materialized_paths
+    assert all(not path.exists() for path in materialized_paths)
+    with pytest.raises(RuntimeError, match="已关闭"):
+        acquired_snapshots[0].get_primary_source()
 
 
 def test_sec_form_domain_parser_accepts_supported_aliases() -> None:
@@ -2960,23 +3791,15 @@ def test_sec_pipeline_sc13_direction_filters_gs_like_records(tmp_path: Path) -> 
     assert result["summary"]["total"] == 0
     assert result["summary"]["downloaded"] == 0
     assert downloader.download_files_called is True
-    assert (
-        tmp_path
-        / "portfolio"
-        / "GS"
-        / "filings"
-        / ".rejections"
-        / "fil_0000000000-25-000701"
-        / "meta.json"
+    assert _rejected_meta_path(
+        tmp_path,
+        "GS",
+        "fil_0000000000-25-000701",
     ).exists()
-    assert (
-        tmp_path
-        / "portfolio"
-        / "GS"
-        / "filings"
-        / ".rejections"
-        / "fil_0000000000-25-000702"
-        / "meta.json"
+    assert _rejected_meta_path(
+        tmp_path,
+        "GS",
+        "fil_0000000000-25-000702",
     ).exists()
 
 
@@ -3037,9 +3860,9 @@ def test_sec_pipeline_sc13_direction_keeps_aapl_like_records(tmp_path: Path) -> 
     result = pipeline.download(ticker="AAPL", form_type="SC13D/G", overwrite=False)
 
     assert result["summary"]["downloaded"] == 1
-    kept_meta = tmp_path / "portfolio" / "AAPL" / "filings" / "fil_0000000000-25-000801" / "meta.json"
-    filtered_meta = tmp_path / "portfolio" / "AAPL" / "filings" / "fil_0000000000-25-000802" / "meta.json"
-    unknown_meta = tmp_path / "portfolio" / "AAPL" / "filings" / "fil_0000000000-25-000803" / "meta.json"
+    kept_meta = _source_meta_path(tmp_path, "AAPL", "fil_0000000000-25-000801")
+    filtered_meta = _source_meta_path(tmp_path, "AAPL", "fil_0000000000-25-000802")
+    unknown_meta = _source_meta_path(tmp_path, "AAPL", "fil_0000000000-25-000803")
     assert kept_meta.exists()
     assert not filtered_meta.exists()
     assert not unknown_meta.exists()
@@ -3116,7 +3939,7 @@ def test_sec_pipeline_supplements_sc13_from_browse(tmp_path: Path) -> None:
 
     assert result["summary"]["downloaded"] == 1
     assert downloader.browse_calls == ["005-12345"]
-    meta_path = tmp_path / "portfolio" / "AAPL" / "filings" / "fil_0000000000-25-000777" / "meta.json"
+    meta_path = _source_meta_path(tmp_path, "AAPL", "fil_0000000000-25-000777")
     assert meta_path.exists()
 
 
@@ -3189,8 +4012,8 @@ def test_sec_pipeline_sc13_keeps_latest_per_filer(tmp_path: Path) -> None:
     result = pipeline.download(ticker="AAPL", form_type="SC13D/G", overwrite=False)
 
     assert result["summary"]["downloaded"] == 1
-    old_meta = tmp_path / "portfolio" / "AAPL" / "filings" / "fil_0000000000-25-000777" / "meta.json"
-    latest_meta = tmp_path / "portfolio" / "AAPL" / "filings" / "fil_0000000000-25-000888" / "meta.json"
+    old_meta = _source_meta_path(tmp_path, "AAPL", "fil_0000000000-25-000777")
+    latest_meta = _source_meta_path(tmp_path, "AAPL", "fil_0000000000-25-000888")
     assert not old_meta.exists()
     assert latest_meta.exists()
 

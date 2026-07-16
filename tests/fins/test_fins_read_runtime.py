@@ -6,6 +6,7 @@ import pytest
 
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.pipelines.sec_fiscal_fields import _extract_fiscal_from_xbrl_query
+from dayu.fins.tools.cache import ProcessorCacheKey, ProcessorLRUCache
 from dayu.fins.tools.read_runtime_helpers import _normalize_form_type_for_matching, _normalize_xbrl_query_payload
 
 
@@ -42,6 +43,36 @@ class _FiscalXbrlProcessor:
 
         del concepts
         return self._payload
+
+
+def test_generic_lru_returns_replaced_evicted_and_cleared_values() -> None:
+    """generic LRU 应把所有 displaced values 返回给资源 owner。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: replacement、capacity eviction、evict 或 clear 丢失旧值时抛出。
+    """
+
+    cache = ProcessorLRUCache[str](max_entries=2)
+    first_key = ProcessorCacheKey(ticker="AAPL", document_id="doc-1")
+    second_key = ProcessorCacheKey(ticker="AAPL", document_id="doc-2")
+    third_key = ProcessorCacheKey(ticker="AAPL", document_id="doc-3")
+
+    assert cache.put(first_key, "first") == ()
+    assert cache.put(first_key, "replacement") == ("first",)
+    assert cache.put(second_key, "second") == ()
+    assert cache.put(third_key, "third") == ("replacement",)
+    assert cache.evict_if(second_key, "wrong-instance") is None
+    assert cache.evict_if(second_key, "second") == "second"
+    assert cache.put(second_key, "second-new") == ()
+    assert cache.evict(second_key) == "second-new"
+    assert cache.evict(second_key) is None
+    assert cache.clear() == ("third",)
 
 
 def test_read_runtime_form_matching_consumes_domain_sec_aliases() -> None:

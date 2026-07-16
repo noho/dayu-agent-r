@@ -20,6 +20,7 @@ import pytest
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
+from dayu.documents.processors.source import Source
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins import ticker_normalization
 from dayu.fins.domain.enums import SourceKind
@@ -60,6 +61,7 @@ from dayu.fins.domain.document_models import (
     FinsIngestMethod,
     ProcessedCreateRequest,
     RejectedFilingArtifactUpsertRequest,
+    SourceDocumentRevision,
     SourceDocumentUpsertRequest,
     SourceHandle,
     now_iso8601,
@@ -103,6 +105,7 @@ from dayu.fins.storage import (
     SourceDocumentRepositoryProtocol,
 )
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
+from dayu.fins.storage.repository_protocols import SourceSnapshotProtocol
 from dayu.fins.ticker_normalization import NormalizedTicker
 from dayu.fins.tools.read_runtime import FinsReadRuntime
 
@@ -2322,6 +2325,77 @@ def test_start_preprocess_allows_slash_in_document_ids(tmp_path: Path) -> None:
     assert record.request_summary["form_types"] == ["10-K/A"]
 
 
+def test_preprocess_request_round_trips_hierarchical_document_id_through_storage(
+    tmp_path: Path,
+) -> None:
+    """hierarchical document ID 应从 preprocess 请求精确往返到 processed storage。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: document ID 被路径解释、归一化或丢失时抛出。
+    """
+
+    workspace_root = tmp_path / "hierarchical-preprocess"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    source = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    document_id = "sec/苹果\\2024/C:10-k/.."
+    batch = batching.begin_batch("AAPL")
+    handle = SourceHandle(
+        ticker="AAPL",
+        document_id=document_id,
+        source_kind=SourceKind.FILING.value,
+    )
+    file_meta = blob.store_file(
+        handle,
+        "report.md",
+        io.BytesIO(_fixture_markdown().encode("utf-8")),
+        batch=batch,
+        content_type="text/markdown",
+    )
+    source.create_source_document(
+        SourceDocumentUpsertRequest(
+            ticker="AAPL",
+            document_id=document_id,
+            internal_document_id=document_id,
+            form_type="10-K",
+            primary_document="report.md",
+            files=[file_meta],
+            meta={
+                "ingest_method": FinsIngestMethod.UPLOAD.to_storage_value(),
+                "source_provider": FinsSourceProvider.USER_UPLOAD.to_storage_value(),
+            },
+        ),
+        SourceKind.FILING,
+        batch=batch,
+    )
+    batching.commit_batch(batch)
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    ingestion = runtime.get_ingestion_runtime()
+
+    start = ingestion.start_preprocess(
+        FinsPreprocessRequest(
+            ticker="AAPL",
+            document_ids=(document_id,),
+            form_types=("10-K",),
+        )
+    )
+    record = _wait_terminal(ingestion, start.job_id)
+
+    assert record.status is FinsIngestionJobStatus.SUCCEEDED
+    assert record.result_summary["processed_document_ids"] == [document_id]
+    assert runtime.processed_repository.get_processed_meta(
+        "AAPL",
+        document_id,
+    )["document_id"] == document_id
+
+
 def test_preprocess_start_cancel_between_create_and_submit_marks_job_cancelled_and_does_not_submit(
     tmp_path: Path,
 ) -> None:
@@ -3778,6 +3852,178 @@ def test_start_preprocess_processes_source_document_to_processed_repository(tmp_
     assert progress_events[3].payload["processed_count"] == 1
 
 
+def test_preprocess_snapshot_and_processed_publication_share_source_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """preprocess 应先持 writer batch，再消费一份 snapshot 并在 commit 前关闭。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: begin/snapshot/close/commit 顺序或 revision preservation 漂移时抛出。
+    """
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    ingestion = runtime.get_ingestion_runtime()
+    published_revision = _read_snapshot_revision(
+        runtime.source_repository,
+        "AAPL",
+        "aapl-2024-10k",
+        SourceKind.FILING,
+    )
+    batch_started = False
+    snapshot_revisions: list[SourceDocumentRevision] = []
+    snapshot_sources: list[Source] = []
+    snapshot_roots: list[Path] = []
+    original_begin = ingestion.batching_repository.begin_batch
+    original_commit = ingestion.batching_repository.commit_batch
+    original_snapshot = ingestion.source_repository.read_source_snapshot
+
+    def _observe_begin(ticker: str) -> BatchToken:
+        """记录 writer batch 已在 snapshot 前开始。
+
+        Args:
+            ticker: preprocess ticker。
+
+        Returns:
+            真实 batching owner 返回的 capability。
+
+        Raises:
+            RuntimeError: 真实 writer mutex 获取失败时抛出。
+            OSError: 真实 staging 初始化失败时抛出。
+        """
+
+        nonlocal batch_started
+        token = original_begin(ticker)
+        batch_started = True
+        return token
+
+    def _observe_snapshot(
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind | None = None,
+        *,
+        materialize_files: bool,
+    ) -> SourceSnapshotProtocol:
+        """消费真实 full snapshot 并记录同版 revision 与临时资源。
+
+        Args:
+            ticker: preprocess ticker。
+            document_id: preprocess document ID。
+            source_kind: 显式 source kind。
+            materialize_files: 是否物化文件。
+
+        Returns:
+            真实 storage snapshot resource。
+
+        Raises:
+            AssertionError: snapshot 发生在 begin 前或不是 full snapshot 时抛出。
+            OSError: 真实 snapshot 读取失败时抛出。
+            ValueError: 真实 source 完整性非法时抛出。
+        """
+
+        assert batch_started
+        assert materialize_files
+        snapshot = original_snapshot(
+            ticker,
+            document_id,
+            source_kind,
+            materialize_files=materialize_files,
+        )
+        primary_source = snapshot.get_primary_source()
+        snapshot_revisions.append(snapshot.revision)
+        snapshot_sources.append(primary_source)
+        snapshot_roots.append(primary_source.materialize().parent)
+        return snapshot
+
+    def _observe_commit(batch: BatchToken) -> None:
+        """确认 snapshot 已在 storage commit authority 接管前关闭。
+
+        Args:
+            batch: preprocess caller 即将交给 storage 的 capability。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: snapshot 临时树仍存在或 Source 仍可读时抛出。
+            OSError: 真实 commit 失败时抛出。
+            ValueError: capability 非法时抛出。
+        """
+
+        assert snapshot_roots
+        assert all(not root.exists() for root in snapshot_roots)
+        for source in snapshot_sources:
+            with pytest.raises(RuntimeError, match="已关闭"):
+                source.open()
+        original_commit(batch)
+
+    monkeypatch.setattr(ingestion.batching_repository, "begin_batch", _observe_begin)
+    monkeypatch.setattr(
+        ingestion.source_repository,
+        "read_source_snapshot",
+        _observe_snapshot,
+    )
+    monkeypatch.setattr(ingestion.batching_repository, "commit_batch", _observe_commit)
+
+    result = ingestion._preprocess_one_document(
+        ticker="AAPL",
+        document_id="aapl-2024-10k",
+        source_kind=SourceKind.FILING,
+        rebuild_processed=False,
+    )
+    with original_snapshot(
+        "AAPL",
+        "aapl-2024-10k",
+        SourceKind.FILING,
+        materialize_files=False,
+    ) as preserved_snapshot:
+        preserved_revision = preserved_snapshot.revision
+    processed_meta = runtime.processed_repository.get_processed_meta(
+        "AAPL",
+        "aapl-2024-10k",
+    )
+
+    assert result == "processed"
+    assert snapshot_revisions == [published_revision]
+    assert preserved_revision == published_revision
+    assert published_revision.token not in json.dumps(processed_meta, ensure_ascii=False)
+    assert all(not root.exists() for root in snapshot_roots)
+
+
+def test_default_runtime_close_is_idempotent_and_preserves_lazy_read_creation(
+    tmp_path: Path,
+) -> None:
+    """DefaultFinsRuntime.close 不得为清理创建 read runtime，且关闭保持幂等。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: close 破坏 lazy assembly、幂等或关闭后 fail-fast 时抛出。
+    """
+
+    runtime = DefaultFinsRuntime.create(workspace_root=tmp_path / "lazy-close")
+    assert runtime._read_runtime is None
+
+    runtime.close()
+    runtime.close()
+
+    assert runtime._read_runtime is None
+    with pytest.raises(RuntimeError, match="已关闭"):
+        runtime.get_read_runtime()
+
+
 def test_start_preprocess_whole_ticker_applies_limit_after_form_filter(tmp_path: Path) -> None:
     """整 ticker 预处理上限应作用于表单过滤后的实际工作集。"""
 
@@ -3822,13 +4068,12 @@ def test_preprocess_selection_rejects_missing_completion_and_keeps_complete_sour
     workspace_root = _build_fins_workspace(tmp_path)
     _add_unmatched_source_documents(workspace_root=workspace_root, count=1)
     incomplete_document_id = "aapl-2024-10q-00"
-    incomplete_meta_path = (
-        workspace_root
-        / "portfolio"
-        / "AAPL"
-        / "filings"
-        / incomplete_document_id
-        / "meta.json"
+    incomplete_meta_path = build_fs_repository_set(
+        workspace_root=workspace_root,
+    ).core._source_meta_path_for_read(
+        "AAPL",
+        incomplete_document_id,
+        SourceKind.FILING,
     )
     incomplete_meta = cast(
         dict[str, JsonValue],
@@ -4567,6 +4812,38 @@ async def _collect_direct_events(events: AsyncIterator[FinsEvent]) -> tuple[Fins
     async for event in events:
         collected.append(event)
     return tuple(collected)
+
+
+def _read_snapshot_revision(
+    repository: SourceDocumentRepositoryProtocol,
+    ticker: str,
+    document_id: str,
+    source_kind: SourceKind,
+) -> SourceDocumentRevision:
+    """从 storage-owned light snapshot 读取 opaque published revision。
+
+    Args:
+        repository: source repository protocol。
+        ticker: exact external ticker。
+        document_id: exact external document ID。
+        source_kind: 显式 source kind。
+
+    Returns:
+        snapshot 同版 revision。
+
+    Raises:
+        FileNotFoundError: source 不存在或已删除时抛出。
+        ValueError: snapshot descriptor 非法时抛出。
+        OSError: snapshot I/O 或 close 失败时抛出。
+    """
+
+    with repository.read_source_snapshot(
+        ticker,
+        document_id,
+        source_kind,
+        materialize_files=False,
+    ) as snapshot:
+        return snapshot.revision
 
 
 def _build_fins_workspace(

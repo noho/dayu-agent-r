@@ -75,7 +75,7 @@ Fins 与其它层的稳定边界如下：
 `dayu.fins.service_runtime.DefaultFinsRuntime` 是 Fins 默认共享装配根：
 
 - `DefaultFinsRuntime.create(workspace_root=Path)`：由显式 Fins workspace root 创建文件系统仓储、processor registry、ingestion runtime 和 legacy job store。
-- `get_read_runtime(processor_cache_max_entries=128)`：懒加载并缓存 `FinsReadRuntime`。
+- `get_read_runtime(processor_cache_max_entries=128)`：懒加载并缓存 `FinsReadRuntime`；`close()` 只关闭已经创建的 read runtime，不为清理触发惰性创建，关闭后拒绝新的 read runtime 获取。
 - `get_ingestion_runtime()`：懒加载并缓存 `FinsIngestionRuntime`。
 - `get_processor_registry()`：返回 Fins processor registry。
 
@@ -94,9 +94,13 @@ Fins 与其它层的稳定边界如下：
 - 对应 `Fs*Repository` 文件系统实现
 - `FileStore` / `LocalFileStore`
 
-source document meta 中的 `source_provider` 是来源提供方真源，当前支持 SEC EDGAR、巨潮资讯、港交所披露易与用户上传。`SourceDocumentRepositoryProtocol` 负责把 source meta 投影为 typed provenance；read runtime 的 citation 只消费该 provenance 来生成 LLM-facing `source_type` 与 `source_provider`。
+source document meta 中的 `source_provider` 是来源提供方真源，当前支持 SEC EDGAR、巨潮资讯、港交所披露易与用户上传。storage snapshot 负责把同版 source meta 投影为 typed provenance；read runtime 的 citation 只消费当前 processor borrow 所持 snapshot 的 provenance 来生成 LLM-facing `source_type` 与 `source_provider`，不重新读取仓储或猜测来源。
 
-`SourceDocumentRepositoryProtocol.get_source_revision(...)` 是 read cache freshness 的仓储真源。revision 由会影响 processor 输入的 canonical source meta 与文件身份/内容字段确定性计算；read runtime 的 processor cache 和 source meta cache 都绑定该 typed revision，复用前必须重新比较。revision 不一致时两类缓存一起失效；processor 构建或独立 meta 读取期间 revision 改变时，本次读取以 `source_changed_during_read` 失败关闭，不返回混合版本结果，也不在 owner 内自动重试。
+source published revision 由 complete-source mutation owner 在每次 source create、update、replace、delete 或 restore 的最终 meta 中自动生成并持久化，随同一个 batch commit 与 source 内容原子发布。`SourceDocumentRevision.token` 只承诺非空字符串的 exact opaque equality，不承诺 prefix、长度、字符集、hash 算法或其它 grammar；producer 不能传入 token，processed / company / maintenance-only batch 与 rollback 不改变已发布 token。consumer 只通过 storage snapshot 取得同版 opaque revision，不按 meta、文件字段、时间或内容 hash 重建它。
+
+`SourceDocumentRepositoryProtocol.read_source_snapshot(...)` 是 storage-owned 单文档一致读取边界。light snapshot 在同一 publication guard 下返回 exact identity、typed source kind、完整 source meta、provenance、persisted revision、完整有序文件描述符与 primary filename，不暴露 published path 或 local URI；full snapshot 从同一次 guard 内打开的全部 regular file descriptors 复制到 snapshot 私有临时树，并在复制后核对同一 source kind 的 persisted revision、identity descriptor 与 deletion state。真实 publication 变化可由 storage 内部有界重取，持续变化抛出不携带 path/key/revision 的 typed consistency error；静态 inode/content/meta corruption 保持原有 corruption / I/O failure，不伪装为 publication change。snapshot 必须显式关闭且 close 幂等，关闭后其 `Source` 不可再读，full snapshot 的 `materialize()` 只返回临时树路径。
+
+read runtime 的每个 processor cache entry 独占一份 full snapshot，并从中取得 processor、source meta、provenance 与 citation 所需事实。单次 read 在同一 active borrow 内完成 processor 调用、结果与 citation 构造；replacement、LRU eviction、clear 与 runtime close 只 retire entry，若仍有 active borrow 则延迟到最后一次 release 后关闭 snapshot。相同文档的并发 cache miss 在 creation lock 内按 full snapshot 再次核对，只有一个 matching entry 被构建和发布，竞争失败的 snapshot 会立即关闭。storage typed consistency exhaustion 只在 read runtime 映射为既有 `source_changed_during_read` 业务错误。
 
 storage mutation authority 由显式 `BatchToken(transaction_id, ticker)` 承载。只有 `BatchingRepositoryProtocol` 提供 `begin_batch(...)`、`commit_batch(...)` 与 `rollback_batch(...)` lifecycle；source、blob、processed、company 与 filing maintenance 的所有 mutation 都要求 keyword-only `batch=`，并由 shared repository set 的同一 storage core 校验 token 仍开放且 ticker 匹配。异步 task、线程或 callback 不从上下文推断 authority；需要回调写文件时，每次 invocation 都显式接收并传递同一个 token。
 
@@ -108,7 +112,7 @@ download / upload overwrite 是单目标替换语义，不是 ticker 级清空�
 
 `FilingMaintenanceRepositoryProtocol` 持有 SEC 下载拒绝注册表。注册表条目使用 `DownloadRejectionEntry` typed contract，包含 document id、拒绝原因、分类、SEC form、filing date 和下载版本；文件系统仓储读取非法 registry 时失败关闭，保存时只通过 typed entry 序列化，SEC 下载、SC13 过滤和下载诊断只消费该 typed registry。
 
-文件系统仓储统一持有 document id 的路径组件边界：source、processed、blob handle、rejected filing artifact、download rejection registry 和 manifest 写入 / 删除入口都必须把 `document_id` 校验为单个路径组件。调用方不得用下游路径拼接、展示层过滤或测试夹具来补偿非法 document id。
+文件系统仓储把 external ticker / document ID 作为 exact opaque identity 保存，并由 storage-private mapping key 与 identity descriptor 唯一完成业务 identity 到物理目录的双向映射；lookup、枚举、staging、publication、backup 与 recovery 都必须验证 descriptor，不从目录名、lock stem 或路径文本反推业务 identity。filename、primary filename、manifest entry、object key 与 local URI 仍保持单路径组件、containment 与 symlink fail-closed 边界；调用方不得把 identity 规则与 filename/path 规则混用，也不得在下游补偿损坏映射。
 
 financial statement result contract 由 `dayu.fins.domain.financial_result_contract` 持有。processor 必须显式产生 `periods`、`rows`、`currency`、`units`、`scale`、`data_quality`、`reason` 与 `statement_locator`；`units` 只表达货币或计量单位，`scale` 独立表达 `units/thousands/millions/billions` 数值倍率。`partial` 必须有稳定 reason，`xbrl/extracted` 必须没有 reason；存在 rows 但缺少直接 scale 或 fiscal 证据时保持已有数据并降级为 `partial`，不得由 read runtime 补默认值。
 
@@ -142,7 +146,7 @@ resolver 只提供业务解析能力；调用方负责读取环境变量、配�
 - `get_financial_statement`
 - `query_xbrl_facts`
 
-read runtime 持有 `document_id -> source_kind -> source -> processor` 路由和 read tool 输出投影。processor 的可选能力边界使用 typed protocol 显式判断：分页、财务报表、XBRL facts 与 XBRL taxonomy 能力都由 protocol 方法承诺，不通过字符串属性名探测。source meta 在 read runtime 内先从仓储 raw JSON 收窄为本地 typed projection；fiscal year 只接受 producer 持久化的正整数，fiscal period 只接受 domain canonical 值，缺失值保持 `None`，不从 form、report date 或 filing date 补偿。实例级 source meta cache 使用有界 LRU，容量由 `source_meta_cache_max_entries` 控制，并与 storage source revision 一起决定能否复用。
+read runtime 持有 `document_id -> storage snapshot -> processor` 路由和 read tool 输出投影。processor 的可选能力边界使用 typed protocol 显式判断：分页、财务报表、XBRL facts 与 XBRL taxonomy 能力都由 protocol 方法承诺，不通过字符串属性名探测。source meta 从当前 snapshot 收窄为本地 typed projection；fiscal year 只接受 producer 持久化的正整数，fiscal period 只接受 domain canonical 值，缺失值保持 `None`，不从 form、report date 或 filing date 补偿。processor cache 有界并拥有 snapshot 资源生命周期，不另设 source meta cache；`list_documents` 只组合 filing/material 两个 typed document list 与对应轻量 meta 投影，不为每个列表项创建 snapshot。
 
 read path 对 source decode、search index 构建、XBRL 查询全失败和读取期间 source 变化使用 typed failure code。非法 UTF-8 不以忽略字符或空文本继续；section/enrichment/BM25F 任一构建失败不返回空搜索成功；这些失败在工具边界投影为稳定业务错误，原始异常只作为内部 cause 保留。协作式取消仍优先传播，不被 degradation mapping 改写。
 
@@ -485,7 +489,7 @@ Processors 在 `dayu.documents.processors` 通用能力上增加财报语义：
 
 ### FinsReadRuntime
 
-`FinsReadRuntime` 是 read path runtime，负责 ticker 标准化、文档选择、document_id 到 source / processor 的路由、revision-aware processor/meta LRU 缓存、not-supported 降级、typed read failure 投影，以及列表 / 章节 / 表格 / 页面 / 财务报表 / XBRL 查询结果构造。它不依赖 Host EventLog，也不把 processed 产物作为 read path 的唯一事实来源。
+`FinsReadRuntime` 是 read path runtime，负责 ticker 标准化、文档选择、document_id 到 snapshot / processor 的路由、not-supported 降级、typed read failure 投影，以及列表 / 章节 / 表格 / 页面 / 财务报表 / XBRL 查询结果构造。processor、meta、provenance、citation 与结果在同一 snapshot borrow 内保持同版；有界 processor LRU 把替换、淘汰和清空的资源交还 runtime 统一 retire/close，runtime close 后新 read fail fast。
 
 ### Tools providers
 
@@ -552,7 +556,7 @@ ToolsDiscovery
   -> tool result accepted by Host ToolRuntime
 ```
 
-Read path 只读取 Fins workspace 中已经存在的财报材料。九个 read tools 的生产执行形态为 `process_backed`：父进程只把 `workspace_root` 字符串、工具名、参数 JSON 副本、limits 和 timeout 标量放入可序列化 target；子进程通过 `DefaultFinsRuntime.create(workspace_root=Path(...))` 重新打开只读仓储并创建 `FinsReadRuntime`。read tool process target 不跨进程序列化 `FinsReadRuntime`、仓储对象、processor cache、provider lock、Host cancellation token 或 Host 内部对象。需要截断的 read tools 声明 `ToolTruncateSpec`；实际截断、cursor、`fetch_more` 与工具结果 accept 由 Host ToolRuntime 负责。
+Read path 只读取 Fins workspace 中已经存在的财报材料。九个 read tools 的生产执行形态为 `process_backed`：父进程只把 `workspace_root` 字符串、工具名、参数 JSON 副本、limits 和 timeout 标量放入可序列化 target；子进程通过 `DefaultFinsRuntime.create(workspace_root=Path(...))` 重新打开只读仓储并创建 `FinsReadRuntime`，并在成功或失败终态的 `finally` 路径关闭 runtime 与 snapshot cache。read tool process target 不跨进程序列化 `FinsReadRuntime`、仓储对象、processor cache、provider lock、Host cancellation token 或 Host 内部对象。需要截断的 read tools 声明 `ToolTruncateSpec`；实际截断、cursor、`fetch_more` 与工具结果 accept 由 Host ToolRuntime 负责。
 
 ### Download / preprocess / upload awaiting tool 路径
 
@@ -740,7 +744,7 @@ SecProcessor
 
 ### Processor registry 与 processor cache
 
-`build_fins_processor_registry()` 在 documents 默认处理器注册表基础上注册 Fins 业务增强处理器。`FinsReadRuntime` 按 ticker / document_id / source kind 路由到 source repository 和 processor registry，并缓存绑定 source revision 的 processor 实例与 typed source meta；缓存只在当前 storage revision 相等时复用，不把 Host tool result、EventLog fact 或 LLM-facing material 缓存在 Fins 内部。
+`build_fins_processor_registry()` 在 documents 默认处理器注册表基础上注册 Fins 业务增强处理器。当前 `FinsReadRuntime` 按 ticker / document_id 向 storage 请求唯一 source snapshot，再把同一 full snapshot 交给 processor registry，并以有界 cache entry 共同持有 processor、typed source meta、provenance 与资源生命周期。cache replacement/eviction/clear/runtime close 使用 retire 与 active borrow 协调，避免正在读取的 processor 失去 source，同时保证无活动借用的临时资源及时关闭。Fins 不缓存 Host tool result、EventLog fact 或 LLM-facing material。
 
 ### Read tool 结果与截断
 
@@ -752,7 +756,7 @@ Read tools 的 schema、错误和结果字段必须面向 LLM 自解释。工具
 
 ### Preprocess / process pipeline
 
-`start_preprocess` 从 source repository 选择已存在源文档，按 `document_ids`、`form_types`、`source_kind` 和 `rebuild_processed` 控制处理范围。后台 pipeline 使用 processor registry 生成 sections / tables，并通过 processed repository create / update 写入 processed 产物。`rebuild_processed=false` 时跳过已有 processed 文档；`rebuild_processed=true` 时允许重建。
+`start_preprocess` 从 source repository 选择已存在源文档，按 `document_ids`、`form_types`、`source_kind` 和 `rebuild_processed` 控制处理范围。单文档处理先取得 caller-owned batch，再读取一份 full source snapshot；processor、source meta、sections 与 tables 都消费该 snapshot，snapshot 在 commit 前关闭，commit 前失败只 rollback 一次，commit 开始后 caller 不二次 rollback。后台 pipeline 通过 processed repository create / update 写入 processed 产物；`rebuild_processed=false` 时跳过已有 processed 文档，`rebuild_processed=true` 时允许重建。
 
 ### Direct stream / observation / legacy job 与取消
 

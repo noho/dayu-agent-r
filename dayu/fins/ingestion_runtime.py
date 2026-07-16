@@ -4132,57 +4132,65 @@ class FinsIngestionRuntime:
         if not rebuild_processed and _processed_exists(self.processed_repository, ticker, document_id):
             return "skipped"
 
-        source_meta = self.source_repository.get_source_meta(ticker, document_id, source_kind)
-        source = self.source_repository.get_primary_source(ticker, document_id, source_kind)
-        form_type = _optional_bounded_text(_optional_text_from_meta(source_meta, "form_type"), "form_type")
-        try:
-            processor = self.processor_registry.create_with_fallback(
-                source=source,
-                form_type=form_type,
-                media_type=source.media_type,
-            )
-        except ValueError as exc:
-            raise _PreprocessNotSupportedError(str(exc)) from exc
-        sections = _build_processed_sections(processor)
-        tables = _build_processed_tables(processor)
-        processed_meta = _build_processed_meta(
-            source_meta=source_meta,
-            parser_version=processor.get_parser_version(),
-        )
-
         batch = self.batching_repository.begin_batch(ticker)
         commit_started = False
         try:
-            if _processed_exists(self.processed_repository, ticker, document_id):
-                self.processed_repository.update_processed(
-                ProcessedUpdateRequest(
-                    ticker=ticker,
-                    document_id=document_id,
-                    internal_document_id=_internal_document_id(source_meta, document_id),
-                    source_kind=source_kind.value,
-                    form_type=form_type,
-                    meta=processed_meta,
-                    sections=sections,
-                    tables=tables,
-                    financials=None,
-                    ),
-                    batch=batch,
+            with self.source_repository.read_source_snapshot(
+                ticker,
+                document_id,
+                source_kind,
+                materialize_files=True,
+            ) as snapshot:
+                source_meta = dict(snapshot.source_meta)
+                source = snapshot.get_primary_source()
+                form_type = _optional_bounded_text(
+                    _optional_text_from_meta(source_meta, "form_type"),
+                    "form_type",
                 )
-            else:
-                self.processed_repository.create_processed(
-                    ProcessedCreateRequest(
-                ticker=ticker,
-                document_id=document_id,
-                internal_document_id=_internal_document_id(source_meta, document_id),
-                source_kind=source_kind.value,
-                form_type=form_type,
-                meta=processed_meta,
-                sections=sections,
-                tables=tables,
-                financials=None,
-                    ),
-                    batch=batch,
+                try:
+                    processor = self.processor_registry.create_with_fallback(
+                        source=source,
+                        form_type=form_type,
+                        media_type=source.media_type,
+                    )
+                except ValueError as exc:
+                    raise _PreprocessNotSupportedError(str(exc)) from exc
+                sections = _build_processed_sections(processor)
+                tables = _build_processed_tables(processor)
+                processed_meta = _build_processed_meta(
+                    source_meta=source_meta,
+                    parser_version=processor.get_parser_version(),
                 )
+                if _processed_exists(self.processed_repository, ticker, document_id):
+                    self.processed_repository.update_processed(
+                        ProcessedUpdateRequest(
+                            ticker=ticker,
+                            document_id=document_id,
+                            internal_document_id=_internal_document_id(source_meta, document_id),
+                            source_kind=source_kind.value,
+                            form_type=form_type,
+                            meta=processed_meta,
+                            sections=sections,
+                            tables=tables,
+                            financials=None,
+                        ),
+                        batch=batch,
+                    )
+                else:
+                    self.processed_repository.create_processed(
+                        ProcessedCreateRequest(
+                            ticker=ticker,
+                            document_id=document_id,
+                            internal_document_id=_internal_document_id(source_meta, document_id),
+                            source_kind=source_kind.value,
+                            form_type=form_type,
+                            meta=processed_meta,
+                            sections=sections,
+                            tables=tables,
+                            financials=None,
+                        ),
+                        batch=batch,
+                    )
             commit_started = True
             self.batching_repository.commit_batch(batch)
         finally:

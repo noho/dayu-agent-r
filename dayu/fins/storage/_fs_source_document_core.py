@@ -2,13 +2,9 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
-import shutil
-from collections.abc import Mapping
-from typing import Final, Optional
+import uuid
+from typing import Optional
 
-from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.source import Source
 from dayu.fins.domain.document_models import (
     BatchToken,
@@ -28,7 +24,6 @@ from dayu.fins.domain.document_models import (
     MaterialRestoreRequest,
     MaterialUpdateRequest,
     SourceDocumentProvenance,
-    SourceDocumentRevision,
     SourceDocumentUpsertRequest,
     SourceHandle,
     now_iso8601,
@@ -37,180 +32,38 @@ from dayu.fins.domain.enums import SourceKind
 from dayu.fins.xbrl_file_discovery import has_xbrl_instance
 
 from .local_file_source import LocalFileSource
-from ._fs_storage_infra import _ActiveBatchState, _FsStorageInfra
+from ._fs_source_snapshot import _read_source_snapshot
+from ._fs_storage_infra import (
+    _SOURCE_REVISION_META_FIELD,
+    _ActiveBatchState,
+    _FsStorageInfra,
+    _source_meta_without_revision,
+)
+from ._fs_identity import (
+    _FILING_IDENTITY_NAMESPACE,
+    _MATERIAL_IDENTITY_NAMESPACE,
+    _PROCESSED_IDENTITY_NAMESPACE,
+    _identity_directory_for_read,
+    _list_external_identities,
+    _require_external_identity,
+)
 from ._fs_storage_utils import (
-    _SOURCE_META_FILENAME,
     _build_file_payloads,
     _extract_file_payloads,
     _file_object_meta_from_dict,
     _guess_media_type,
     _infer_filename_from_uri,
-    _list_directory_names,
     _local_path_from_uri,
-    _normalize_document_id,
     _normalize_file_entries,
     _normalize_source_kind,
-    _normalize_ticker,
+    _project_filesystem_error,
+    _raise_path_free_error,
     _read_json_object,
     _resolve_primary_uri,
+    _unlink_path,
     _write_json,
 )
-
-
-_SOURCE_REVISION_REQUIRED_TEXT_FIELDS: Final[tuple[str, ...]] = (
-    "document_version",
-    "source_fingerprint",
-)
-"""source revision 必须消费且不得为 null 的字符串字段。"""
-
-_SOURCE_REVISION_OPTIONAL_TEXT_FIELDS: Final[tuple[str, ...]] = (
-    "form_type",
-    "primary_document",
-)
-"""source revision 中允许缺省为空的字符串字段。"""
-
-_SOURCE_REVISION_FILE_OPTIONAL_TEXT_FIELDS: Final[tuple[str, ...]] = (
-    "etag",
-    "last_modified",
-    "sha256",
-    "content_type",
-)
-"""文件 revision 投影中允许缺省为空的字符串字段。"""
-
-
-def _read_revision_text_field(
-    meta: Mapping[str, JsonValue],
-    field_name: str,
-    *,
-    allow_missing: bool,
-    allow_none: bool,
-) -> str | None:
-    """读取 source revision 使用的可选文本字段。
-
-    Args:
-        meta: source meta 或文件条目。
-        field_name: 字段名。
-        allow_missing: 是否允许字段缺省并规范为 ``None``。
-        allow_none: 是否允许显式 JSON null。
-
-    Returns:
-        规范化字符串或 ``None``。
-
-    Raises:
-        KeyError: 必需字段缺失时抛出。
-        ValueError: 字段不是字符串或 ``None`` 时抛出。
-    """
-
-    if field_name not in meta:
-        if allow_missing:
-            return None
-        raise KeyError(f"source meta 缺少 revision 字段: {field_name}")
-    value = meta[field_name]
-    if value is None:
-        if allow_none:
-            return None
-        raise ValueError(f"source revision 字段 {field_name} 不得为 null")
-    if not isinstance(value, str):
-        raise ValueError(f"source revision 字段 {field_name} 必须为字符串或 null")
-    return value
-
-
-def _build_source_revision_file_payload(raw_file: JsonValue) -> dict[str, str | int | None]:
-    """把单个 source file 条目收窄为稳定 revision 载荷。
-
-    Args:
-        raw_file: source meta ``files`` 中的原始条目。
-
-    Returns:
-        只含文件身份与内容字段的规范化载荷。
-
-    Raises:
-        ValueError: 文件条目或字段类型非法时抛出。
-        KeyError: 文件条目缺少 ``name`` 或 ``uri`` 时抛出。
-    """
-
-    if not isinstance(raw_file, Mapping):
-        raise ValueError("source revision files 条目必须为 object")
-    name = _read_revision_text_field(raw_file, "name", allow_missing=False, allow_none=False)
-    uri = _read_revision_text_field(raw_file, "uri", allow_missing=False, allow_none=False)
-    if name is None or not name.strip():
-        raise ValueError("source revision file.name 不能为空")
-    if uri is None or not uri.strip():
-        raise ValueError("source revision file.uri 不能为空")
-    size = raw_file.get("size")
-    if size is not None and (not isinstance(size, int) or isinstance(size, bool) or size < 0):
-        raise ValueError("source revision file.size 必须为非负整数或 null")
-    payload: dict[str, str | int | None] = {
-        "name": name,
-        "uri": uri,
-        "size": size,
-    }
-    for field_name in _SOURCE_REVISION_FILE_OPTIONAL_TEXT_FIELDS:
-        payload[field_name] = _read_revision_text_field(
-            raw_file,
-            field_name,
-            allow_missing=True,
-            allow_none=True,
-        )
-    return payload
-
-
-def _build_source_revision(meta: Mapping[str, JsonValue]) -> SourceDocumentRevision:
-    """从 source meta 计算 processor 输入版本。
-
-    Args:
-        meta: storage owner 读取到的 source meta。
-
-    Returns:
-        基于 canonical JSON 与 SHA-256 的强类型版本投影。
-
-    Raises:
-        KeyError: 必需字段缺失时抛出。
-        ValueError: 字段类型或内容非法时抛出。
-        TypeError: canonical 载荷无法序列化时抛出。
-    """
-
-    revision_payload: dict[str, str | bool | list[dict[str, str | int | None]] | None] = {}
-    for field_name in _SOURCE_REVISION_REQUIRED_TEXT_FIELDS:
-        revision_payload[field_name] = _read_revision_text_field(
-            meta,
-            field_name,
-            allow_missing=False,
-            allow_none=False,
-        )
-    document_version = revision_payload["document_version"]
-    if not isinstance(document_version, str) or not document_version.strip():
-        raise ValueError("source revision 字段 document_version 不能为空")
-    for field_name in _SOURCE_REVISION_OPTIONAL_TEXT_FIELDS:
-        revision_payload[field_name] = _read_revision_text_field(
-            meta,
-            field_name,
-            allow_missing=True,
-            allow_none=True,
-        )
-    for field_name in ("ingest_complete", "is_deleted"):
-        if field_name not in meta:
-            raise KeyError(f"source meta 缺少 revision 字段: {field_name}")
-        value = meta[field_name]
-        if not isinstance(value, bool):
-            raise ValueError(f"source revision 字段 {field_name} 必须为布尔值")
-        revision_payload[field_name] = value
-    raw_files = meta.get("files", [])
-    if not isinstance(raw_files, list):
-        raise ValueError("source revision 字段 files 必须为数组")
-    file_payloads = [_build_source_revision_file_payload(raw_file) for raw_file in raw_files]
-    file_payloads.sort(
-        key=lambda payload: json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
-    )
-    revision_payload["files"] = file_payloads
-    canonical_json = json.dumps(
-        revision_payload,
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    digest = hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
-    return SourceDocumentRevision(digest=f"sha256:{digest}")
+from .repository_protocols import SourceSnapshotProtocol
 
 
 class _FsSourceDocumentMixin(_FsStorageInfra):
@@ -474,11 +327,17 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             OSError: published meta 读取失败时抛出。
         """
 
-        normalized_ticker = _normalize_ticker(ticker)
-        normalized_document_id = _normalize_document_id(document_id)
-        guard_token = self._acquire_publication_guard(normalized_ticker)
+        external_ticker = _require_external_identity(ticker, field_name="ticker")
+        external_document_id = _require_external_identity(
+            document_id,
+            field_name="document_id",
+        )
+        guard_token = self._acquire_publication_guard(external_ticker)
         try:
-            return self._get_document_meta_unguarded(normalized_ticker, normalized_document_id)
+            return self._get_document_meta_unguarded(
+                external_ticker,
+                external_document_id,
+            )
         finally:
             self._release_lock_token(guard_token)
 
@@ -508,7 +367,13 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         ]
         for meta_path in meta_candidates:
             if meta_path.exists():
-                return _read_json_object(meta_path)
+                meta = _read_json_object(meta_path)
+                if meta.get("document_id") != normalized_document_id:
+                    raise ValueError("document meta 与 identity descriptor 不一致")
+                meta_ticker = meta.get("ticker")
+                if meta_ticker is not None and meta_ticker != normalized_ticker:
+                    raise ValueError("document meta ticker 与 identity descriptor 不一致")
+                return meta
         raise FileNotFoundError(f"document_id={normalized_document_id} 的 meta.json 不存在")
 
     def get_source_meta(self, ticker: str, document_id: str, source_kind: SourceKind) -> DocumentMeta:
@@ -529,14 +394,17 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             OSError: published meta 读取失败时抛出。
         """
 
-        normalized_ticker = _normalize_ticker(ticker)
-        normalized_document_id = _normalize_document_id(document_id)
+        external_ticker = _require_external_identity(ticker, field_name="ticker")
+        external_document_id = _require_external_identity(
+            document_id,
+            field_name="document_id",
+        )
         normalized_source_kind = _normalize_source_kind(source_kind)
-        guard_token = self._acquire_publication_guard(normalized_ticker)
+        guard_token = self._acquire_publication_guard(external_ticker)
         try:
             return self._get_source_meta_unguarded(
-                normalized_ticker,
-                normalized_document_id,
+                external_ticker,
+                external_document_id,
                 normalized_source_kind,
             )
         finally:
@@ -544,69 +412,106 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
 
     def _get_source_meta_unguarded(
         self,
-        normalized_ticker: str,
-        normalized_document_id: str,
+        external_ticker: str,
+        external_document_id: str,
         normalized_source_kind: SourceKind,
     ) -> DocumentMeta:
         """在 caller 已持 publication guard 时读取 source meta。
 
         Args:
-            normalized_ticker: 已规范化 ticker。
-            normalized_document_id: 已规范化文档 ID。
+            external_ticker: exact external ticker。
+            external_document_id: exact external document ID。
             normalized_source_kind: 已规范化来源类型。
 
         Returns:
             source meta。
 
         Raises:
-            FileNotFoundError: source meta 不存在时抛出。
+            FileNotFoundError: source meta 不存在或 source 已删除时抛出。
             ValueError: meta 内容非法时抛出。
         """
 
-        meta_path = self._source_meta_path_for_read(normalized_ticker, normalized_document_id, normalized_source_kind)
-        if not meta_path.exists():
-            raise FileNotFoundError(
-                f"document_id={normalized_document_id} 的 {normalized_source_kind.value} meta.json 不存在"
-            )
-        return _read_json_object(meta_path)
+        persisted_meta = self._get_persisted_source_meta_unguarded(
+            external_ticker,
+            external_document_id,
+            normalized_source_kind,
+        )
+        return _source_meta_without_revision(persisted_meta)
 
-    def get_source_revision(
+    def _get_persisted_source_meta_unguarded(
         self,
-        ticker: str,
-        document_id: str,
-        source_kind: SourceKind,
-    ) -> SourceDocumentRevision:
-        """从 published source meta 读取影响 processor 输入的源文档版本。
+        external_ticker: str,
+        external_document_id: str,
+        normalized_source_kind: SourceKind,
+    ) -> DocumentMeta:
+        """在 caller 已持 publication guard 时读取 persisted source meta。
 
         Args:
-            ticker: 股票代码。
-            document_id: 文档 ID。
-            source_kind: 来源类型。
+            external_ticker: exact external ticker。
+            external_document_id: exact external document ID。
+            normalized_source_kind: 已规范化来源类型。
 
         Returns:
-            由 canonical source meta 计算的强类型版本投影。
+            包含 storage 私有 publication 字段的 persisted source meta。
 
         Raises:
             FileNotFoundError: source meta 不存在时抛出。
-            KeyError: source meta 缺少必需版本字段时抛出。
-            ValueError: source meta 版本字段类型或内容非法时抛出。
-            RuntimeFileLockError: publication guard 获取或释放失败时抛出。
-            OSError: 底层文件系统读取失败时抛出。
+            ValueError: meta 与 identity/source kind 不一致时抛出。
+            OSError: persisted meta 读取失败时抛出。
         """
 
-        normalized_ticker = _normalize_ticker(ticker)
-        normalized_document_id = _normalize_document_id(document_id)
-        normalized_source_kind = _normalize_source_kind(source_kind)
-        guard_token = self._acquire_publication_guard(normalized_ticker)
-        try:
-            meta = self._get_source_meta_unguarded(
-                normalized_ticker,
-                normalized_document_id,
-                normalized_source_kind,
+        meta_path = self._source_meta_path_for_read(
+            external_ticker,
+            external_document_id,
+            normalized_source_kind,
+        )
+        if not meta_path.exists():
+            raise FileNotFoundError(
+                f"document_id={external_document_id} 的 {normalized_source_kind.value} meta.json 不存在"
             )
-            return _build_source_revision(meta)
-        finally:
-            self._release_lock_token(guard_token)
+        meta = _read_json_object(meta_path)
+        if (
+            meta.get("ticker") != external_ticker
+            or meta.get("document_id") != external_document_id
+            or meta.get("source_kind") != normalized_source_kind.value
+        ):
+            raise ValueError("source meta 与 identity descriptor/source kind 不一致")
+        return meta
+
+    def read_source_snapshot(
+        self,
+        ticker: str,
+        document_id: str,
+        source_kind: Optional[SourceKind] = None,
+        *,
+        materialize_files: bool,
+    ) -> SourceSnapshotProtocol:
+        """读取同一 published revision 的 typed source snapshot。
+
+        Args:
+            ticker: exact external ticker。
+            document_id: exact external document ID。
+            source_kind: 可选显式 source kind；缺省时由 storage 同 guard 解析。
+            materialize_files: 是否复制全部业务文件到 snapshot 私有临时树。
+
+        Returns:
+            同时拥有 meta、provenance、revision、files 与 primary 的资源。
+
+        Raises:
+            FileNotFoundError: source 不存在、已删除或 reset 后抛出。
+            ValueError: source kind 歧义、descriptor、meta 或文件完整性非法时抛出。
+            SourceSnapshotConsistencyError: publication 持续变化时抛出。
+            RuntimeError: publication guard 操作失败时抛出。
+            OSError: published 或临时文件系统访问失败时抛出。
+        """
+
+        return _read_source_snapshot(
+            self,
+            ticker,
+            document_id,
+            source_kind,
+            materialize_files=materialize_files,
+        )
 
     def get_source_document_provenance(
         self,
@@ -635,16 +540,19 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             OSError: published meta 读取失败时抛出。
         """
 
-        normalized_ticker = _normalize_ticker(ticker)
-        normalized_document_id = _normalize_document_id(document_id)
+        external_ticker = _require_external_identity(ticker, field_name="ticker")
+        external_document_id = _require_external_identity(
+            document_id,
+            field_name="document_id",
+        )
         normalized_source_kind = _normalize_source_kind(source_kind)
-        guard_token = self._acquire_publication_guard(normalized_ticker)
+        guard_token = self._acquire_publication_guard(external_ticker)
         try:
             source_meta = meta
             if source_meta is None:
                 source_meta = self._get_source_meta_unguarded(
-                    normalized_ticker,
-                    normalized_document_id,
+                    external_ticker,
+                    external_document_id,
                     normalized_source_kind,
                 )
             return SourceDocumentProvenance.from_meta(source_meta, normalized_source_kind)
@@ -678,13 +586,16 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             OSError: 写入失败时抛出。
         """
 
-        normalized_ticker = _normalize_ticker(ticker)
-        normalized_document_id = _normalize_document_id(document_id)
+        external_ticker = _require_external_identity(ticker, field_name="ticker")
+        external_document_id = _require_external_identity(
+            document_id,
+            field_name="document_id",
+        )
         normalized_source_kind = _normalize_source_kind(source_kind)
-        state = self._resolve_active_batch(batch, normalized_ticker)
+        state = self._resolve_active_batch(batch, external_ticker)
         meta_path = self._source_meta_path(
-            normalized_ticker,
-            normalized_document_id,
+            external_ticker,
+            external_document_id,
             normalized_source_kind,
             state,
         )
@@ -694,8 +605,8 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             )
         normalized_meta = _prepare_complete_source_meta(
             meta,
-            ticker=normalized_ticker,
-            document_id=normalized_document_id,
+            ticker=external_ticker,
+            document_id=external_document_id,
             source_kind=normalized_source_kind,
         )
         _write_json(meta_path, normalized_meta)
@@ -727,22 +638,22 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
         """
 
-        normalized_ticker = _normalize_ticker(ticker)
-        guard_token = self._acquire_publication_guard(normalized_ticker)
+        external_ticker = _require_external_identity(ticker, field_name="ticker")
+        guard_token = self._acquire_publication_guard(external_ticker)
         try:
-            return self._list_documents_unguarded(normalized_ticker, query)
+            return self._list_documents_unguarded(external_ticker, query)
         finally:
             self._release_lock_token(guard_token)
 
     def _list_documents_unguarded(
         self,
-        normalized_ticker: str,
+        external_ticker: str,
         query: DocumentQuery,
     ) -> list[DocumentSummary]:
         """在 caller 已持 publication guard 时查询 processed manifest。
 
         Args:
-            normalized_ticker: 已规范化 ticker。
+            external_ticker: exact external ticker。
             query: 查询条件。
 
         Returns:
@@ -753,10 +664,35 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             ValueError: manifest 内容非法时抛出。
         """
 
-        manifest = self._read_manifest(self._processed_manifest_path_for_read(normalized_ticker), normalized_ticker)
+        manifest = self._read_manifest(
+            self._processed_manifest_path_for_read(external_ticker),
+            external_ticker,
+        )
+        ticker_dir = self._ticker_dir_for_read(external_ticker)
+        processed_root = self._storage_subdirectory_for_read(ticker_dir, "processed")
+        descriptor_document_ids = _list_external_identities(
+            processed_root,
+            _PROCESSED_IDENTITY_NAMESPACE,
+        )
+        manifest_document_ids: list[str] = []
         result: list[DocumentSummary] = []
         for item in manifest["documents"]:
             summary = DocumentSummary.from_dict(item)
+            external_document_id = _require_external_identity(
+                summary.document_id,
+                field_name="processed manifest document_id",
+            )
+            if external_document_id in manifest_document_ids:
+                raise ValueError("processed manifest document_id 重复")
+            meta = _read_json_object(
+                self._processed_meta_path_for_read(
+                    external_ticker,
+                    external_document_id,
+                )
+            )
+            if meta.get("document_id") != external_document_id:
+                raise ValueError("processed meta/manifest 与 identity descriptor 不一致")
+            manifest_document_ids.append(external_document_id)
             if not query.include_deleted and summary.is_deleted:
                 continue
             if query.source_kind and summary.source_kind != query.source_kind:
@@ -768,6 +704,8 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             if query.fiscal_periods and summary.fiscal_period not in query.fiscal_periods:
                 continue
             result.append(summary)
+        if sorted(manifest_document_ids) != descriptor_document_ids:
+            raise ValueError("processed manifest 与 identity descriptors 不双向一致")
         return result
 
     def list_document_ids(self, ticker: str, source_kind: Optional[SourceKind] = None) -> list[str]:
@@ -781,15 +719,16 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             已排序文档 ID 列表。
 
         Raises:
+            ValueError: ticker、source kind、descriptor 或 source root 不合法时抛出。
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
             OSError: 读取目录失败时抛出。
         """
 
-        normalized_ticker = _normalize_ticker(ticker)
+        external_ticker = _require_external_identity(ticker, field_name="ticker")
         normalized_source_kind = None if source_kind is None else _normalize_source_kind(source_kind)
-        guard_token = self._acquire_publication_guard(normalized_ticker)
+        guard_token = self._acquire_publication_guard(external_ticker)
         try:
-            return self._list_document_ids_unguarded(normalized_ticker, normalized_source_kind)
+            return self._list_document_ids_unguarded(external_ticker, normalized_source_kind)
         finally:
             self._release_lock_token(guard_token)
 
@@ -808,22 +747,27 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             已排序文档 ID 列表。
 
         Raises:
+            ValueError: descriptor 或 source root 不合法时抛出。
             OSError: 读取目录失败时抛出。
         """
 
         if source_kind == SourceKind.FILING:
-            return _list_directory_names(
-                self._source_root_for_read(normalized_ticker, SourceKind.FILING)
+            return _list_external_identities(
+                self._source_root_for_read(normalized_ticker, SourceKind.FILING),
+                _FILING_IDENTITY_NAMESPACE,
             )
         if source_kind == SourceKind.MATERIAL:
-            return _list_directory_names(
-                self._source_root_for_read(normalized_ticker, SourceKind.MATERIAL)
+            return _list_external_identities(
+                self._source_root_for_read(normalized_ticker, SourceKind.MATERIAL),
+                _MATERIAL_IDENTITY_NAMESPACE,
             )
-        filings = _list_directory_names(
-            self._source_root_for_read(normalized_ticker, SourceKind.FILING)
+        filings = _list_external_identities(
+            self._source_root_for_read(normalized_ticker, SourceKind.FILING),
+            _FILING_IDENTITY_NAMESPACE,
         )
-        materials = _list_directory_names(
-            self._source_root_for_read(normalized_ticker, SourceKind.MATERIAL)
+        materials = _list_external_identities(
+            self._source_root_for_read(normalized_ticker, SourceKind.MATERIAL),
+            _MATERIAL_IDENTITY_NAMESPACE,
         )
         return sorted(set(filings + materials))
 
@@ -839,19 +783,23 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
 
         Raises:
             NotADirectoryError: 根路径存在但不是目录时抛出。
+            ValueError: ticker、source kind、descriptor 或 root 不合法时抛出。
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
             OSError: 文件系统访问失败时抛出。
         """
 
-        normalized_ticker = _normalize_ticker(ticker)
+        external_ticker = _require_external_identity(ticker, field_name="ticker")
         normalized_source_kind = _normalize_source_kind(source_kind)
-        guard_token = self._acquire_publication_guard(normalized_ticker)
+        guard_token = self._acquire_publication_guard(external_ticker)
         try:
-            root = self._source_root_for_read(normalized_ticker, normalized_source_kind)
+            root = self._source_root_for_read(external_ticker, normalized_source_kind)
             if not root.exists():
                 return False
             if not root.is_dir():
-                raise NotADirectoryError(f"source root 不是目录: {root}")
+                raise NotADirectoryError(
+                    "source root 不是目录: "
+                    f"ticker={external_ticker} source_kind={normalized_source_kind.value}"
+                )
             return True
         finally:
             self._release_lock_token(guard_token)
@@ -869,31 +817,35 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         Raises:
             FileNotFoundError: filing 目录不存在时抛出。
             NotADirectoryError: filing 路径存在但不是目录时抛出。
+            ValueError: ticker、document identity 或 descriptor 不合法时抛出。
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
             OSError: 文件系统访问失败时抛出。
         """
 
-        normalized_ticker = _normalize_ticker(ticker)
-        normalized_document_id = _normalize_document_id(document_id)
-        guard_token = self._acquire_publication_guard(normalized_ticker)
+        external_ticker = _require_external_identity(ticker, field_name="ticker")
+        external_document_id = _require_external_identity(
+            document_id,
+            field_name="document_id",
+        )
+        guard_token = self._acquire_publication_guard(external_ticker)
         try:
             return self._has_filing_xbrl_instance_unguarded(
-                normalized_ticker,
-                normalized_document_id,
+                external_ticker,
+                external_document_id,
             )
         finally:
             self._release_lock_token(guard_token)
 
     def _has_filing_xbrl_instance_unguarded(
         self,
-        normalized_ticker: str,
-        normalized_document_id: str,
+        external_ticker: str,
+        external_document_id: str,
     ) -> bool:
         """在 caller 已持 publication guard 时检查 filing XBRL instance。
 
         Args:
-            normalized_ticker: 已规范化 ticker。
-            normalized_document_id: 已规范化文档 ID。
+            external_ticker: exact external ticker。
+            external_document_id: exact external document ID。
 
         Returns:
             是否存在 XBRL instance。
@@ -901,18 +853,34 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         Raises:
             FileNotFoundError: filing 目录不存在时抛出。
             NotADirectoryError: filing 路径不是目录时抛出。
+            ValueError: document identity 或 descriptor 不合法时抛出。
             OSError: 文件系统访问失败时抛出。
         """
 
-        filing_dir = (
-            self._source_root_for_read(normalized_ticker, SourceKind.FILING)
-            / normalized_document_id
+        filing_dir = _identity_directory_for_read(
+            self._source_root_for_read(external_ticker, SourceKind.FILING),
+            _FILING_IDENTITY_NAMESPACE,
+            external_document_id,
         )
         if not filing_dir.exists():
-            raise FileNotFoundError(f"filing 目录不存在: {filing_dir}")
+            raise FileNotFoundError(
+                "filing 目录不存在: "
+                f"ticker={external_ticker} document_id={external_document_id}"
+            )
         if not filing_dir.is_dir():
-            raise NotADirectoryError(f"filing 路径不是目录: {filing_dir}")
-        return has_xbrl_instance(filing_dir)
+            raise NotADirectoryError(
+                "filing 路径不是目录: "
+                f"ticker={external_ticker} document_id={external_document_id}"
+            )
+        try:
+            return has_xbrl_instance(filing_dir)
+        except OSError as exc:
+            _raise_path_free_error(
+                _project_filesystem_error(
+                    exc,
+                    action="检查 published filing XBRL 文件",
+                )
+            )
 
     def has_staged_filing_xbrl_instance(
         self,
@@ -938,15 +906,37 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             OSError: 文件系统访问失败时抛出。
         """
 
-        normalized_ticker = _normalize_ticker(ticker)
-        normalized_document_id = _normalize_document_id(document_id)
-        state = self._resolve_active_batch(batch, normalized_ticker)
-        filing_dir = state.staging_ticker_dir / "filings" / normalized_document_id
+        external_ticker = _require_external_identity(ticker, field_name="ticker")
+        external_document_id = _require_external_identity(
+            document_id,
+            field_name="document_id",
+        )
+        state = self._resolve_active_batch(batch, external_ticker)
+        filing_dir = self._source_meta_path(
+            external_ticker,
+            external_document_id,
+            SourceKind.FILING,
+            state,
+        ).parent
         if not filing_dir.exists():
-            raise FileNotFoundError(f"staging filing 目录不存在: {filing_dir}")
+            raise FileNotFoundError(
+                "staging filing 目录不存在: "
+                f"ticker={external_ticker} document_id={external_document_id}"
+            )
         if not filing_dir.is_dir():
-            raise NotADirectoryError(f"staging filing 路径不是目录: {filing_dir}")
-        return has_xbrl_instance(filing_dir)
+            raise NotADirectoryError(
+                "staging filing 路径不是目录: "
+                f"ticker={external_ticker} document_id={external_document_id}"
+            )
+        try:
+            return has_xbrl_instance(filing_dir)
+        except OSError as exc:
+            _raise_path_free_error(
+                _project_filesystem_error(
+                    exc,
+                    action="检查 staging filing XBRL 文件",
+                )
+            )
 
     def _reset_source_document_impl(
         self,
@@ -959,7 +949,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
 
         行为与错误传播：
 
-        - 目标目录存在且为目录：调用 ``shutil.rmtree`` 物理删除整个文档目录。
+        - 目标目录存在且为目录：调用 storage directory owner 物理删除整个文档目录。
           若目录下存在无权限的子项或只读文件，``rmtree`` 会抛 ``OSError``。
         - 目标是文件（少数异常路径下出现）：``unlink(missing_ok=True)`` 删除。
         - 随后从对应 manifest 中移除该 document_id 条目。
@@ -985,24 +975,37 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
                 中止后续写入，以保证仓储一致性。
         """
 
-        normalized_ticker = _normalize_ticker(ticker)
-        normalized_document_id = _normalize_document_id(document_id)
-        normalized_source_kind = _normalize_source_kind(source_kind)
-        document_dir = (
-            self._source_root(normalized_ticker, normalized_source_kind, state)
-            / normalized_document_id
+        external_ticker = _require_external_identity(ticker, field_name="ticker")
+        external_document_id = _require_external_identity(
+            document_id,
+            field_name="document_id",
         )
+        normalized_source_kind = _normalize_source_kind(source_kind)
+        document_dir = self._source_meta_path(
+            external_ticker,
+            external_document_id,
+            normalized_source_kind,
+            state,
+        ).parent
         if document_dir.exists():
             if document_dir.is_dir():
-                shutil.rmtree(document_dir)
+                self._remove_directory(document_dir)
             else:
-                document_dir.unlink(missing_ok=True)
+                _unlink_path(
+                    document_dir,
+                    missing_ok=True,
+                    action="删除 source document 异常条目",
+                )
         if normalized_source_kind == SourceKind.FILING:
-            manifest_path = self._filing_manifest_path(normalized_ticker, state)
+            manifest_path = self._filing_manifest_path(external_ticker, state)
         else:
-            manifest_path = self._material_manifest_path(normalized_ticker, state)
+            manifest_path = self._material_manifest_path(external_ticker, state)
         if manifest_path.exists():
-            self._remove_manifest_item(manifest_path, normalized_ticker, normalized_document_id)
+            self._remove_manifest_item(
+                manifest_path,
+                external_ticker,
+                external_document_id,
+            )
 
     # ========== handle & 文件访问 ==========
 
@@ -1019,17 +1022,22 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
 
         Raises:
             FileNotFoundError: 文档不存在时抛出。
+            ValueError: ticker、document identity、source kind、descriptor 或 meta 不合法时抛出。
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
+            OSError: descriptor 或 meta 读取失败时抛出。
         """
 
-        normalized_ticker = _normalize_ticker(ticker)
-        normalized_document_id = _normalize_document_id(document_id)
+        external_ticker = _require_external_identity(ticker, field_name="ticker")
+        external_document_id = _require_external_identity(
+            document_id,
+            field_name="document_id",
+        )
         normalized_source_kind = _normalize_source_kind(source_kind)
-        guard_token = self._acquire_publication_guard(normalized_ticker)
+        guard_token = self._acquire_publication_guard(external_ticker)
         try:
             return self._get_source_handle_unguarded(
-                normalized_ticker,
-                normalized_document_id,
+                external_ticker,
+                external_document_id,
                 normalized_source_kind,
             )
         finally:
@@ -1037,15 +1045,15 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
 
     def _get_source_handle_unguarded(
         self,
-        normalized_ticker: str,
-        normalized_document_id: str,
+        external_ticker: str,
+        external_document_id: str,
         normalized_source_kind: SourceKind,
     ) -> SourceHandle:
         """在 caller 已持 publication guard 时构造 source handle。
 
         Args:
-            normalized_ticker: 已规范化 ticker。
-            normalized_document_id: 已规范化文档 ID。
+            external_ticker: exact external ticker。
+            external_document_id: exact external document ID。
             normalized_source_kind: 已规范化来源类型。
 
         Returns:
@@ -1055,14 +1063,14 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             FileNotFoundError: source meta 不存在时抛出。
         """
 
-        meta_path = self._source_meta_path_for_read(normalized_ticker, normalized_document_id, normalized_source_kind)
-        if not meta_path.exists():
-            raise FileNotFoundError(
-                f"document_id={normalized_document_id} 不存在于 {normalized_source_kind}"
-            )
+        self._get_source_meta_unguarded(
+            external_ticker,
+            external_document_id,
+            normalized_source_kind,
+        )
         return SourceHandle(
-            ticker=normalized_ticker,
-            document_id=normalized_document_id,
+            ticker=external_ticker,
+            document_id=external_document_id,
             source_kind=normalized_source_kind.value,
         )
 
@@ -1082,8 +1090,8 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             OSError: published meta 读取失败时抛出。
         """
 
-        normalized_ticker = _normalize_ticker(handle.ticker)
-        guard_token = self._acquire_publication_guard(normalized_ticker)
+        external_ticker = _require_external_identity(handle.ticker, field_name="ticker")
+        guard_token = self._acquire_publication_guard(external_ticker)
         try:
             return self._get_primary_file_unguarded(handle)
         finally:
@@ -1136,8 +1144,8 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             OSError: 构建 Source 失败时抛出。
         """
 
-        normalized_ticker = _normalize_ticker(handle.ticker)
-        guard_token = self._acquire_publication_guard(normalized_ticker)
+        external_ticker = _require_external_identity(handle.ticker, field_name="ticker")
+        guard_token = self._acquire_publication_guard(external_ticker)
         try:
             return self._get_source_unguarded(handle, file_meta)
         finally:
@@ -1162,7 +1170,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             OSError: 路径解析失败时抛出。
         """
 
-        normalized_ticker = _normalize_ticker(handle.ticker)
+        external_ticker = _require_external_identity(handle.ticker, field_name="ticker")
         uri = str(file_meta.uri or "").strip()
         if not uri:
             raise ValueError("file_meta.uri 不能为空")
@@ -1174,7 +1182,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             media_type=media_type,
             content_length=file_meta.size,
             etag=file_meta.etag,
-            opener=self._publication_guarded_binary_opener(normalized_ticker),
+            opener=self._publication_guarded_binary_opener(external_ticker),
         )
 
     def get_source_by_filename(self, handle: SourceHandle, filename: str) -> Source:
@@ -1194,11 +1202,11 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             OSError: published I/O 失败时抛出。
         """
 
-        normalized_ticker = _normalize_ticker(handle.ticker)
+        external_ticker = _require_external_identity(handle.ticker, field_name="ticker")
         normalized_filename = filename.strip()
         if not normalized_filename:
             raise FileNotFoundError("filename 不能为空")
-        guard_token = self._acquire_publication_guard(normalized_ticker)
+        guard_token = self._acquire_publication_guard(external_ticker)
         try:
             file_metas = self._list_handle_files_unguarded(handle)
             for file_meta in file_metas:
@@ -1226,14 +1234,17 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             OSError: 构建 Source 失败时抛出。
         """
 
-        normalized_ticker = _normalize_ticker(ticker)
-        normalized_document_id = _normalize_document_id(document_id)
+        external_ticker = _require_external_identity(ticker, field_name="ticker")
+        external_document_id = _require_external_identity(
+            document_id,
+            field_name="document_id",
+        )
         normalized_source_kind = _normalize_source_kind(source_kind)
-        guard_token = self._acquire_publication_guard(normalized_ticker)
+        guard_token = self._acquire_publication_guard(external_ticker)
         try:
             handle = self._get_source_handle_unguarded(
-                normalized_ticker,
-                normalized_document_id,
+                external_ticker,
+                external_document_id,
                 normalized_source_kind,
             )
             primary_file = self._get_primary_file_unguarded(handle)
@@ -1264,21 +1275,34 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         Raises:
             FileExistsError: 创建时文档已存在。
             FileNotFoundError: 更新时文档不存在或拷贝文件不存在。
+            ValueError: ticker、document identity、descriptor 或 source meta 不合法时抛出。
             OSError: 写入失败。
         """
 
-        ticker = _normalize_ticker(req.ticker)
-        normalized_document_id = _normalize_document_id(req.document_id)
+        ticker = _require_external_identity(req.ticker, field_name="ticker")
+        document_id = _require_external_identity(
+            req.document_id,
+            field_name="document_id",
+        )
         source_root = self._source_root(ticker, source_kind, state)
         source_root.mkdir(parents=True, exist_ok=True)
-        document_dir = source_root / normalized_document_id
-        meta_path = document_dir / _SOURCE_META_FILENAME
+        meta_path = self._source_meta_path(
+            ticker,
+            document_id,
+            source_kind,
+            state,
+        )
+        document_dir = meta_path.parent
 
         meta_exists = meta_path.exists()
         if is_create and meta_exists:
-            raise FileExistsError(f"文档已存在: {meta_path}")
+            raise FileExistsError(
+                f"文档已存在: ticker={ticker} document_id={document_id}"
+            )
         if not is_create and not meta_exists:
-            raise FileNotFoundError(f"文档不存在: {meta_path}")
+            raise FileNotFoundError(
+                f"文档不存在: ticker={ticker} document_id={document_id}"
+            )
 
         document_dir.mkdir(parents=True, exist_ok=True)
         previous_meta = _read_json_object(meta_path) if meta_path.exists() else {}
@@ -1295,7 +1319,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         merged_meta = dict(previous_meta)
         merged_meta.update(req.meta)
         merged_meta["ticker"] = ticker
-        merged_meta["document_id"] = normalized_document_id
+        merged_meta["document_id"] = document_id
         merged_meta["source_kind"] = source_kind.value
         merged_meta["internal_document_id"] = req.internal_document_id
         merged_meta["form_type"] = req.form_type or merged_meta.get("form_type")
@@ -1319,7 +1343,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         merged_meta = _prepare_complete_source_meta(
             merged_meta,
             ticker=ticker,
-            document_id=normalized_document_id,
+            document_id=document_id,
             source_kind=source_kind,
         )
 
@@ -1343,7 +1367,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         )
         return DocumentHandle(
             ticker=ticker,
-            document_id=normalized_document_id,
+            document_id=document_id,
             form_type=merged_meta.get("form_type"),
             primary_file_uri=primary_file_uri,
             file_uris=[str(item.get("uri")) for item in file_payloads if isinstance(item, dict)],
@@ -1371,19 +1395,26 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
 
         Raises:
             FileNotFoundError: 文档不存在。
+            ValueError: ticker、document identity、descriptor 或 source meta 不合法时抛出。
             OSError: 写入失败。
         """
 
-        normalized_ticker = _normalize_ticker(ticker)
-        normalized_document_id = _normalize_document_id(document_id)
+        external_ticker = _require_external_identity(ticker, field_name="ticker")
+        external_document_id = _require_external_identity(
+            document_id,
+            field_name="document_id",
+        )
         meta_path = self._source_meta_path(
-            normalized_ticker,
-            normalized_document_id,
+            external_ticker,
+            external_document_id,
             source_kind,
             state,
         )
         if not meta_path.exists():
-            raise FileNotFoundError(f"文档不存在: {meta_path}")
+            raise FileNotFoundError(
+                "文档不存在: "
+                f"ticker={external_ticker} document_id={external_document_id}"
+            )
 
         meta = _read_json_object(meta_path)
         meta["is_deleted"] = deleted
@@ -1391,8 +1422,8 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         meta["updated_at"] = now_iso8601()
         meta = _prepare_complete_source_meta(
             meta,
-            ticker=normalized_ticker,
-            document_id=normalized_document_id,
+            ticker=external_ticker,
+            document_id=external_document_id,
             source_kind=source_kind,
         )
         _write_json(meta_path, meta)
@@ -1410,8 +1441,8 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
 
         file_payloads = _extract_file_payloads(meta)
         return DocumentHandle(
-            ticker=normalized_ticker,
-            document_id=normalized_document_id,
+            ticker=external_ticker,
+            document_id=external_document_id,
             form_type=meta.get("form_type"),
             primary_file_uri=_resolve_primary_uri(
                 file_payloads,
@@ -1452,5 +1483,7 @@ def _prepare_complete_source_meta(
     normalized["document_id"] = document_id
     normalized["source_kind"] = source_kind.value
     normalized["ingest_complete"] = True
+    normalized.pop(_SOURCE_REVISION_META_FIELD, None)
     SourceDocumentProvenance.from_meta(normalized, source_kind)
+    normalized[_SOURCE_REVISION_META_FIELD] = uuid.uuid4().hex
     return normalized

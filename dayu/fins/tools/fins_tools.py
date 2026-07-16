@@ -78,8 +78,37 @@ _INVALID_ARGUMENT_HINT: Final[str] = "Fix arguments to match the tool schema and
 _FILE_NOT_FOUND_HINT: Final[str] = "Verify the ticker, document_id, ref, or table_ref and retry."
 _UNEXPECTED_FAILURE_HINT: Final[str] = "Inspect provider diagnostics or retry with narrower arguments."
 _FINS_CANCELLED_HINT: Final[str] = "当前工具调用已停止；如仍需要该结果，请等待用户确认后再重新发起。"
+_PROCESS_RUNTIME_CLOSE_FOLLOW_UP_ACTION: Final[str] = "runtime.close.follow_up"
 
 _BusinessCall = Callable[[CancellationToken], JsonValue]
+
+
+def _follow_up_process_runtime_close(runtime: DefaultFinsRuntime) -> None:
+    """在首次关闭失败后再消费一次公共幂等 cleanup authority。
+
+    Args:
+        runtime: process target 本次创建的默认 Fins runtime。
+
+    Returns:
+        无。
+
+    Raises:
+        无；二次失败只记录 path-free 结构化诊断。
+    """
+
+    try:
+        runtime.close()
+    except Exception as close_error:
+        errno_value = (
+            str(close_error.errno)
+            if isinstance(close_error, OSError) and close_error.errno is not None
+            else "none"
+        )
+        Log.warning(
+            f"action={_PROCESS_RUNTIME_CLOSE_FOLLOW_UP_ACTION} "
+            f"type={type(close_error).__name__} errno={errno_value}",
+            module=MODULE,
+        )
 
 
 def build_fins_read_tool_definitions(
@@ -264,6 +293,9 @@ class _FinsReadProcessTarget:
             index_in_iteration=0,
             provider_state=None,
         )
+        runtime: DefaultFinsRuntime | None = None
+        outcome: JsonValue
+        primary_failed = False
         try:
             runtime = DefaultFinsRuntime.create(workspace_root=Path(self.workspace_root_locator))
             read_runtime = runtime.get_read_runtime(processor_cache_max_entries=self.limits.processor_cache_max_entries)
@@ -275,15 +307,30 @@ class _FinsReadProcessTarget:
                 limits=self.limits,
                 cancellation_token=_FinsProcessCancellationToken(),
             )
+            outcome = process_tool_completed_envelope(value)
         except _FinsReadBusinessFailure as failure:
-            return _process_failed_envelope(failure)
+            primary_failed = True
+            outcome = _process_failed_envelope(failure)
         except Exception:
-            return process_tool_failed_envelope(
+            primary_failed = True
+            outcome = process_tool_failed_envelope(
                 error_type="execution_error",
                 message=f"Tool {self.tool_name!r} execution failed.",
                 hint=_UNEXPECTED_FAILURE_HINT,
             )
-        return process_tool_completed_envelope(value)
+        finally:
+            if runtime is not None:
+                try:
+                    runtime.close()
+                except Exception:
+                    if not primary_failed:
+                        outcome = process_tool_failed_envelope(
+                            error_type="execution_error",
+                            message=f"Tool {self.tool_name!r} execution failed.",
+                            hint=_UNEXPECTED_FAILURE_HINT,
+                        )
+                    _follow_up_process_runtime_close(runtime)
+        return outcome
 
 
 @dataclass(frozen=True, slots=True)

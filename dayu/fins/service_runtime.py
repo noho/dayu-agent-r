@@ -314,6 +314,7 @@ class DefaultFinsRuntime:
     ingestion_job_store: FsFinsIngestionJobStore
     _read_runtime: FinsReadRuntime | None = field(init=False, default=None, repr=False)
     _read_runtime_lock: Lock = field(init=False, repr=False)
+    _closed: bool = field(init=False, default=False, repr=False)
     _ingestion_runtime: FinsIngestionRuntime | None = field(init=False, default=None, repr=False)
     _ingestion_runtime_lock: Lock = field(init=False, repr=False)
 
@@ -404,11 +405,12 @@ class DefaultFinsRuntime:
 
         Raises:
             ValueError: 缓存容量非法时由 FinsReadRuntime 抛出。
+            RuntimeError: runtime 已关闭时抛出。
         """
 
-        if self._read_runtime is not None:
-            return self._read_runtime
         with self._read_runtime_lock:
+            if self._closed:
+                raise RuntimeError("DefaultFinsRuntime 已关闭")
             if self._read_runtime is not None:
                 return self._read_runtime
             # dayu.fins.tools 包初始化会导入 provider，provider 又需要本模块；
@@ -424,6 +426,28 @@ class DefaultFinsRuntime:
             )
             self._read_runtime = read_runtime
             return read_runtime
+
+    def close(self) -> None:
+        """幂等关闭已经按需创建的 read runtime。
+
+        close 不会为了清理而创建 read runtime，因此仅使用 ingestion 能力的
+        ``DefaultFinsRuntime`` 仍保持 read path 的惰性装配。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            BaseException: 已创建 read runtime 的 snapshot cleanup 失败时抛出。
+        """
+
+        with self._read_runtime_lock:
+            self._closed = True
+            read_runtime = self._read_runtime
+        if read_runtime is not None:
+            read_runtime.close()
 
     def get_ingestion_runtime(self) -> FinsIngestionRuntime:
         """返回共享的 Fins ingestion runtime 实例。

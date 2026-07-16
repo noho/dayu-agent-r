@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import gc
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from functools import partial
 from io import BytesIO
 from pathlib import Path
-from threading import Lock
-import time
+from threading import Barrier, Event, Lock
+from typing import Final
 
 import pytest
 
+import dayu.fins.storage._fs_source_snapshot as source_snapshot_module
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.base import (
@@ -27,7 +29,6 @@ from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.documents.processors.source import Source
 from dayu.fins.domain.document_models import (
     CompanyMeta,
-    DocumentMeta,
     FinsSourceProvider,
     SourceHandle,
     SourceDocumentStateChangeRequest,
@@ -61,9 +62,19 @@ from dayu.fins.storage import (
 )
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 from dayu.fins.storage.local_file_source import LocalFileSource
+from dayu.fins.storage.repository_protocols import SourceSnapshotProtocol
 from dayu.fins.tools.error_contract import ErrorCode
+from dayu.fins.tools.cache import ProcessorCacheKey
 from dayu.fins.tools.read_runtime import FinsReadRuntime
-from dayu.fins.tools.read_runtime_helpers import FinsReadBusinessError, FinsReadCancelledError
+from dayu.fins.tools.read_runtime_helpers import (
+    FinsReadArgumentError,
+    FinsReadBusinessError,
+    FinsReadCancelledError,
+)
+
+_LOCK_REGISTRY_CACHE_CAPACITY: Final[int] = 4
+_LOCK_REGISTRY_MISSING_KEY_COUNT: Final[int] = 64
+_LOCK_REGISTRY_VALID_DOCUMENT_COUNT: Final[int] = 12
 
 
 class _MemorySource:
@@ -211,6 +222,7 @@ class _ReadProcessor:
             self.label = stream.read().decode("utf-8")
         self.list_sections_error: Exception | None = None
         self.before_list_sections: Callable[[], None] | None = None
+        self.before_read_section: Callable[[], None] | None = None
 
     @classmethod
     def get_parser_version(cls) -> str:
@@ -295,6 +307,8 @@ class _ReadProcessor:
 
         if ref != "s_0001":
             raise KeyError(ref)
+        if self.before_read_section is not None:
+            self.before_read_section()
         return {
             "ref": ref,
             "title": "Overview",
@@ -418,7 +432,6 @@ class _CountingProcessorRegistry(ProcessorRegistry):
         self.created: list[_ReadProcessor] = []
         self.before_return: Callable[[], None] | None = None
         self.fixed_processor: DocumentProcessor | None = None
-        self.delay_seconds = 0.0
         self._guard = Lock()
 
     def create_with_fallback(
@@ -451,8 +464,6 @@ class _CountingProcessorRegistry(ProcessorRegistry):
             return self.fixed_processor
         if self.before_return is not None:
             self.before_return()
-        if self.delay_seconds > 0:
-            time.sleep(self.delay_seconds)
         with source.open() as stream:
             label = stream.read().decode("utf-8")
         processor = _ReadProcessor(_MemorySource(label.encode("utf-8")))
@@ -461,7 +472,7 @@ class _CountingProcessorRegistry(ProcessorRegistry):
 
 
 class _RevisionProbeRepository(FsSourceDocumentRepository):
-    """返回可变内存 source 并统计 meta 读取的仓储探针。"""
+    """记录 read runtime snapshot 调用与 full snapshot 临时根的仓储探针。"""
 
     def __init__(self, workspace_root: Path, *, repository_set: _FsRepositorySet) -> None:
         """初始化仓储探针。
@@ -486,55 +497,52 @@ class _RevisionProbeRepository(FsSourceDocumentRepository):
             workspace_root,
             repository_set=repository_set,
         )
-        self.payload = b"version-one"
-        self.get_source_meta_calls = 0
-        self.mutate_on_next_meta_read = False
+        self.snapshot_read_calls = 0
+        self.full_snapshot_roots: list[Path] = []
+        self.on_full_snapshot: Callable[[int], None] | None = None
+        self._snapshot_probe_lock = Lock()
 
-    def get_primary_source(self, ticker: str, document_id: str, source_kind: SourceKind) -> Source:
-        """返回当前内存 source。
-
-        Args:
-            ticker: 股票代码。
-            document_id: 文档 ID。
-            source_kind: source kind。
-
-        Returns:
-            当前内存 source。
-
-        Raises:
-            无。
-        """
-
-        del ticker, document_id, source_kind
-        return _MemorySource(self.payload)
-
-    def get_source_meta(
+    def read_source_snapshot(
         self,
         ticker: str,
         document_id: str,
-        source_kind: SourceKind,
-    ) -> DocumentMeta:
-        """读取 meta，并可在返回后注入一次 revision 变化。
+        source_kind: SourceKind | None = None,
+        *,
+        materialize_files: bool,
+    ) -> SourceSnapshotProtocol:
+        """读取真实 storage snapshot，并记录调用与 full snapshot 临时根。
 
         Args:
             ticker: 股票代码。
             document_id: 文档 ID。
-            source_kind: source kind。
+            source_kind: 可选 source kind。
+            materialize_files: 是否物化业务文件。
 
         Returns:
-            读取时刻的 source meta。
+            真实 storage snapshot。
 
         Raises:
-            FileNotFoundError: source meta 不存在时抛出。
-            ValueError: source meta 非法时抛出。
+            FileNotFoundError: source 不存在时抛出。
+            ValueError: snapshot 非法时抛出。
+            OSError: snapshot I/O 失败时抛出。
         """
 
-        self.get_source_meta_calls += 1
-        meta = super().get_source_meta(ticker, document_id, source_kind)
-        if self.mutate_on_next_meta_read:
-            self.mutate_on_next_meta_read = False
-            _update_source(self, fingerprint="revision-during-meta", form_type="10-Q")
-        return meta
+        with self._snapshot_probe_lock:
+            self.snapshot_read_calls += 1
+        snapshot = super().read_source_snapshot(
+            ticker,
+            document_id,
+            source_kind,
+            materialize_files=materialize_files,
+        )
+        if materialize_files:
+            root = snapshot.get_primary_source().materialize().parent
+            with self._snapshot_probe_lock:
+                self.full_snapshot_roots.append(root)
+                full_snapshot_count = len(self.full_snapshot_roots)
+            if self.on_full_snapshot is not None:
+                self.on_full_snapshot(full_snapshot_count)
+        return snapshot
 
 
 class _ManualCancellationToken:
@@ -783,11 +791,16 @@ class _VirtualHarness(_VirtualSectionProcessorMixin, _VirtualBaseProcessor):
         return self._marked_text
 
 
-def _build_runtime(tmp_path: Path) -> tuple[FinsReadRuntime, _RevisionProbeRepository, _CountingProcessorRegistry]:
+def _build_runtime(
+    tmp_path: Path,
+    *,
+    processor_cache_max_entries: int = 128,
+) -> tuple[FinsReadRuntime, _RevisionProbeRepository, _CountingProcessorRegistry]:
     """构造真实 storage + 探针 processor 的 read runtime。
 
     Args:
         tmp_path: pytest 临时目录。
+        processor_cache_max_entries: processor LRU cache 容量。
 
     Returns:
         runtime、source repository 与 registry。
@@ -830,7 +843,14 @@ def _build_runtime(tmp_path: Path) -> tuple[FinsReadRuntime, _RevisionProbeRepos
                     BytesIO(b"version-one"),
                     batch=batch,
                     content_type="text/plain",
-                )
+                ),
+                source_repository._blob_repository.store_file(
+                    SourceHandle("AAPL", "doc-1", SourceKind.FILING.value),
+                    "doc-1-related.txt",
+                    BytesIO(b"related:version-one"),
+                    batch=batch,
+                    content_type="text/plain",
+                ),
             ],
             meta={
                 "ingest_method": "download",
@@ -851,6 +871,7 @@ def _build_runtime(tmp_path: Path) -> tuple[FinsReadRuntime, _RevisionProbeRepos
         source_repository=source_repository,
         processed_repository=processed_repository,
         processor_registry=registry,
+        processor_cache_max_entries=processor_cache_max_entries,
     )
     return runtime, source_repository, registry
 
@@ -861,6 +882,8 @@ def _update_source(
     fingerprint: str,
     form_type: str = "10-K",
     document_id: str = "doc-1",
+    payload: bytes | None = None,
+    source_provider: FinsSourceProvider | None = None,
 ) -> None:
     """更新测试 source revision。
 
@@ -869,6 +892,8 @@ def _update_source(
         fingerprint: 新 source fingerprint。
         form_type: 新表单类型。
         document_id: 待更新文档 ID。
+        payload: 可选、随同一 publication 替换的主文件字节。
+        source_provider: 可选、随同一 publication 更新的 provenance provider。
 
     Returns:
         无。
@@ -879,17 +904,96 @@ def _update_source(
 
     batch = repository._batching_repository.begin_batch("AAPL")
     try:
+        files = []
+        primary_document = None
+        if payload is not None:
+            primary_document = f"{document_id}.txt"
+            files = [
+                repository._blob_repository.store_file(
+                    SourceHandle("AAPL", document_id, SourceKind.FILING.value),
+                    primary_document,
+                    BytesIO(payload),
+                    batch=batch,
+                    content_type="text/plain",
+                ),
+                repository._blob_repository.store_file(
+                    SourceHandle("AAPL", document_id, SourceKind.FILING.value),
+                    f"{document_id}-related.txt",
+                    BytesIO(b"related:" + payload),
+                    batch=batch,
+                    content_type="text/plain",
+                ),
+            ]
+        meta: dict[str, JsonValue] = {"source_fingerprint": fingerprint}
+        if source_provider is not None:
+            meta["source_provider"] = source_provider.to_storage_value()
         repository.update_source_document(
             SourceDocumentUpsertRequest(
                 ticker="AAPL",
                 document_id=document_id,
                 internal_document_id=document_id,
                 form_type=form_type,
-                meta={"source_fingerprint": fingerprint},
+                primary_document=primary_document,
+                files=files,
+                meta=meta,
             ),
             SourceKind.FILING,
             batch=batch,
         )
+    except Exception:
+        repository._batching_repository.rollback_batch(batch)
+        raise
+    repository._batching_repository.commit_batch(batch)
+
+
+def _create_test_source_documents(
+    repository: _RevisionProbeRepository,
+    document_ids: tuple[str, ...],
+) -> None:
+    """在一次真实 batch 中创建一组可读取的测试 source document。
+
+    Args:
+        repository: source repository 探针。
+        document_ids: 待创建的 exact document ID 元组。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: source 文件写入或 batch publication 失败时抛出。
+        ValueError: source contract 非法时抛出。
+    """
+
+    batch = repository._batching_repository.begin_batch("AAPL")
+    try:
+        for document_id in document_ids:
+            filename = f"{document_id}.txt"
+            payload = f"payload:{document_id}".encode("utf-8")
+            file_meta = repository._blob_repository.store_file(
+                SourceHandle("AAPL", document_id, SourceKind.FILING.value),
+                filename,
+                BytesIO(payload),
+                batch=batch,
+                content_type="text/plain",
+            )
+            repository.create_source_document(
+                SourceDocumentUpsertRequest(
+                    ticker="AAPL",
+                    document_id=document_id,
+                    internal_document_id=document_id,
+                    form_type="10-K",
+                    primary_document=filename,
+                    files=[file_meta],
+                    meta={
+                        "ingest_method": "download",
+                        "source_provider": FinsSourceProvider.SEC_EDGAR.to_storage_value(),
+                        "ingest_complete": True,
+                        "is_deleted": False,
+                    },
+                ),
+                SourceKind.FILING,
+                batch=batch,
+            )
     except Exception:
         repository._batching_repository.rollback_batch(batch)
         raise
@@ -1023,7 +1127,47 @@ def _read_runtime_processor(runtime: FinsReadRuntime, _index: int) -> DocumentPr
         FinsReadBusinessError: processor 读取失败时抛出。
     """
 
-    return runtime._get_or_create_processor(ticker="AAPL", document_id="doc-1")
+    del _index
+    with runtime._borrow_processor(ticker="AAPL", document_id="doc-1") as borrow:
+        return borrow.processor
+
+
+def _read_runtime_processor_for_document(
+    runtime: FinsReadRuntime,
+    document_id: str,
+) -> DocumentProcessor:
+    """借用一次指定文档 processor 并返回其稳定实例身份。
+
+    Args:
+        runtime: 待读取的 read runtime。
+        document_id: 文档 ID。
+
+    Returns:
+        当前 snapshot entry 的 processor。
+
+    Raises:
+        FinsReadBusinessError: storage snapshot 无法稳定读取时抛出。
+        FileNotFoundError: source 不存在时抛出。
+    """
+
+    with runtime._borrow_processor(ticker="AAPL", document_id=document_id) as borrow:
+        return borrow.processor
+
+
+def _raise_processor_build_failure(failure: Exception) -> None:
+    """在 processor registry 返回前抛出指定构建失败。
+
+    Args:
+        failure: 要保留身份并抛出的构建异常。
+
+    Returns:
+        不返回。
+
+    Raises:
+        Exception: 始终抛出传入 failure。
+    """
+
+    raise failure
 
 
 def _raise_search_enrichment_failure(
@@ -1298,7 +1442,7 @@ def test_both_ten_k_paths_migrate_to_shared_refresh_without_behavior_drift(
 
 
 def test_processor_cache_reuses_equal_revision_and_rebuilds_after_source_change(tmp_path: Path) -> None:
-    """processor cache 只应复用 revision 相等的实例。
+    """processor cache 只复用 snapshot revision/source kind 相等的实例。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -1311,13 +1455,12 @@ def test_processor_cache_reuses_equal_revision_and_rebuilds_after_source_change(
     """
 
     runtime, repository, registry = _build_runtime(tmp_path)
-    first = runtime._get_or_create_processor(ticker="AAPL", document_id="doc-1")
-    assert runtime._get_or_create_processor(ticker="AAPL", document_id="doc-1") is first
+    first = _read_runtime_processor_for_document(runtime, "doc-1")
+    assert _read_runtime_processor_for_document(runtime, "doc-1") is first
     assert registry.create_count == 1
 
-    repository.payload = b"version-two"
-    _update_source(repository, fingerprint="revision-two")
-    second = runtime._get_or_create_processor(ticker="AAPL", document_id="doc-1")
+    _update_source(repository, fingerprint="revision-two", payload=b"version-two")
+    second = _read_runtime_processor_for_document(runtime, "doc-1")
     assert second is not first
     assert isinstance(second, _ReadProcessor)
     assert second.label == "version-two"
@@ -1338,19 +1481,25 @@ def test_read_runtime_maps_invalid_utf8_to_source_decode_failure(tmp_path: Path)
     """
 
     runtime, repository, registry = _build_runtime(tmp_path)
-    repository.payload = b"valid\xffinvalid"
+    _update_source(
+        repository,
+        fingerprint="invalid-utf8",
+        payload=b"valid\xffinvalid",
+    )
 
     with pytest.raises(FinsReadBusinessError) as error_info:
-        runtime._get_or_create_processor(ticker="AAPL", document_id="doc-1")
+        _read_runtime_processor_for_document(runtime, "doc-1")
 
     assert error_info.value.code is ErrorCode.SOURCE_DECODE_FAILED
     assert isinstance(error_info.value.__cause__, FinsSourceDecodeError)
     assert registry.create_count == 0
     assert runtime._processor_cache.size() == 0
+    assert len(repository.full_snapshot_roots) == 1
+    assert all(not root.exists() for root in repository.full_snapshot_roots)
 
 
-def test_independent_meta_cache_compares_revision_and_evicts_old_processor(tmp_path: Path) -> None:
-    """独立 meta 路径应刷新 meta 并驱逐同 revision owner 的旧 processor。
+def test_processor_build_failure_closes_unpublished_full_snapshot(tmp_path: Path) -> None:
+    """processor registry 构建失败时应保留主因并关闭未发布 snapshot。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -1359,17 +1508,87 @@ def test_independent_meta_cache_compares_revision_and_evicts_old_processor(tmp_p
         无。
 
     Raises:
-        AssertionError: meta/processor cache 未同步失效时抛出。
+        AssertionError: 主异常、cache 状态或 snapshot cleanup 不正确时抛出。
+    """
+
+    runtime, repository, registry = _build_runtime(tmp_path)
+    build_failure = RuntimeError("processor build failure")
+    registry.before_return = partial(_raise_processor_build_failure, build_failure)
+
+    with pytest.raises(RuntimeError) as error_info:
+        _read_runtime_processor_for_document(runtime, "doc-1")
+
+    assert error_info.value is build_failure
+    assert registry.create_count == 1
+    assert registry.created == []
+    assert runtime._processor_cache.size() == 0
+    assert len(repository.full_snapshot_roots) == 1
+    assert all(not root.exists() for root in repository.full_snapshot_roots)
+
+
+def test_processor_build_cancellation_closes_unpublished_full_snapshot(tmp_path: Path) -> None:
+    """full snapshot 取得后、cache publish 前取消时应保留取消并清理资源。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 取消优先级、cache 状态或 snapshot cleanup 不正确时抛出。
+    """
+
+    runtime, repository, registry = _build_runtime(tmp_path)
+    cancellation_token = _ManualCancellationToken()
+    registry.before_return = cancellation_token.cancel
+
+    with pytest.raises(FinsReadCancelledError):
+        runtime.get_document_sections(
+            ticker="AAPL",
+            document_id="doc-1",
+            cancellation_token=cancellation_token,
+        )
+
+    assert registry.create_count == 1
+    assert runtime._processor_cache.size() == 0
+    assert runtime._retired_entries == set()
+    assert runtime._pending_snapshots == []
+    assert len(repository.full_snapshot_roots) == 1
+    assert all(not root.exists() for root in repository.full_snapshot_roots)
+
+
+def test_single_snapshot_entry_replaces_meta_and_processor_together(tmp_path: Path) -> None:
+    """同一个 cache entry 应一起替换 processor、meta 与 snapshot resource。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: meta/processor 不同版或旧 snapshot 未释放时抛出。
     """
 
     runtime, repository, _registry = _build_runtime(tmp_path)
-    runtime._get_or_create_processor(ticker="AAPL", document_id="doc-1")
-    assert runtime._get_source_meta_cached_by_kind("AAPL", "doc-1", SourceKind.FILING)["form_type"] == "10-K"
+    with runtime._borrow_processor(ticker="AAPL", document_id="doc-1") as first_borrow:
+        first_processor = first_borrow.processor
+        first_root = first_borrow.snapshot.get_primary_source().materialize().parent
+        assert first_borrow.source_meta["form_type"] == "10-K"
 
-    _update_source(repository, fingerprint="meta-revision-two", form_type="10-Q")
-    refreshed = runtime._get_source_meta_cached_by_kind("AAPL", "doc-1", SourceKind.FILING)
-    assert refreshed["form_type"] == "10-Q"
-    assert runtime._processor_cache.size() == 0
+    _update_source(
+        repository,
+        fingerprint="meta-revision-two",
+        form_type="10-Q",
+        payload=b"version-two",
+    )
+    with runtime._borrow_processor(ticker="AAPL", document_id="doc-1") as second_borrow:
+        assert second_borrow.processor is not first_processor
+        assert second_borrow.source_meta["form_type"] == "10-Q"
+        assert second_borrow.snapshot.source_kind is SourceKind.FILING
+    assert not first_root.exists()
+    assert runtime._processor_cache.size() == 1
 
 
 def test_cross_document_diagnosis_does_not_reuse_stale_cached_processor(tmp_path: Path) -> None:
@@ -1414,7 +1633,7 @@ def test_cross_document_diagnosis_does_not_reuse_stale_cached_processor(tmp_path
         batch=create_batch,
     )
     repository._batching_repository.commit_batch(create_batch)
-    runtime._get_or_create_processor(ticker="AAPL", document_id="doc-2")
+    _read_runtime_processor_for_document(runtime, "doc-2")
     _update_source(repository, fingerprint="doc-2-revision-two", document_id="doc-2")
 
     assert runtime._diagnose_cross_document_locator(
@@ -1426,54 +1645,120 @@ def test_cross_document_diagnosis_does_not_reuse_stale_cached_processor(tmp_path
     assert runtime._processor_cache.size() == 0
 
 
-def test_processor_build_revision_race_has_zero_retry_and_no_cache_artifact(tmp_path: Path) -> None:
-    """processor build 期间 revision 变化应立即 typed fail，固定零 retry。
+def test_transient_storage_change_recovers_without_consumer_retry_or_cache_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实 publication 在 copy 后变化时由 storage 内部恢复，consumer 只调用一次 full snapshot。
 
     Args:
         tmp_path: pytest 临时目录。
+        monkeypatch: 用于挂接真实 fd-copy 后的确定性协调 seam。
 
     Returns:
         无。
 
     Raises:
-        AssertionError: failure code、构建次数或 cache 状态不正确时抛出。
+        AssertionError: consumer 重试、结果混版或 cache 构建次数不正确时抛出。
     """
 
     runtime, repository, registry = _build_runtime(tmp_path)
-    registry.before_return = lambda: _update_source(repository, fingerprint="revision-during-build")
+    original_copy = source_snapshot_module._copy_snapshot_files
+    first_copy_complete = Event()
+    publication_complete = Event()
+    first_attempt = True
 
-    with pytest.raises(FinsReadBusinessError) as error_info:
-        runtime._get_or_create_processor(ticker="AAPL", document_id="doc-1")
+    def _coordinated_copy(
+        open_files: list[source_snapshot_module._OpenSnapshotFile],
+        temp_root: Path,
+    ) -> None:
+        """第一次真实 fd-copy 后等待测试线程完成 B publication。"""
 
-    assert error_info.value.code is ErrorCode.SOURCE_CHANGED_DURING_READ
+        nonlocal first_attempt
+        original_copy(open_files, temp_root)
+        if first_attempt:
+            first_attempt = False
+            first_copy_complete.set()
+            assert publication_complete.wait(timeout=5.0)
+
+    monkeypatch.setattr(source_snapshot_module, "_copy_snapshot_files", _coordinated_copy)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_read_runtime_processor_for_document, runtime, "doc-1")
+        assert first_copy_complete.wait(timeout=5.0)
+        _update_source(
+            repository,
+            fingerprint="transient-b",
+            payload=b"version-b",
+            source_provider=FinsSourceProvider.USER_UPLOAD,
+        )
+        publication_complete.set()
+        processor = future.result(timeout=5.0)
+
+    assert isinstance(processor, _ReadProcessor)
+    assert processor.label == "version-b"
+    assert repository.snapshot_read_calls == 2
     assert registry.create_count == 1
-    assert runtime._processor_cache.size() == 0
-    assert runtime._meta_cache.size() == 0
+    assert runtime._processor_cache.size() == 1
 
 
-def test_independent_meta_revision_race_has_zero_retry_and_no_cache_artifact(tmp_path: Path) -> None:
-    """meta read 期间 revision 变化应立即 typed fail，固定零 retry。
+def test_sustained_storage_change_maps_once_to_source_changed_during_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实持续 publication 令 storage 耗尽预算，并由 runtime 单点映射。
 
     Args:
         tmp_path: pytest 临时目录。
+        monkeypatch: 用于挂接真实 fd-copy 后的确定性协调 seam。
 
     Returns:
         无。
 
     Raises:
-        AssertionError: failure code、读取次数或 cache 状态不正确时抛出。
+        AssertionError: storage 未真实耗尽、consumer 重试或 cache 状态不正确时抛出。
     """
 
     runtime, repository, _registry = _build_runtime(tmp_path)
-    repository.get_source_meta_calls = 0
-    repository.mutate_on_next_meta_read = True
+    original_copy = source_snapshot_module._copy_snapshot_files
+    publication_barrier = Barrier(2, timeout=5.0)
+    copied_attempts = 0
 
-    with pytest.raises(FinsReadBusinessError) as error_info:
-        runtime._get_source_meta_cached_by_kind("AAPL", "doc-1", SourceKind.FILING)
+    def _coordinate_every_copy(
+        open_files: list[source_snapshot_module._OpenSnapshotFile],
+        temp_root: Path,
+    ) -> None:
+        """每次真实 fd-copy 后等待测试线程发布下一版。"""
+
+        nonlocal copied_attempts
+        original_copy(open_files, temp_root)
+        copied_attempts += 1
+        publication_barrier.wait()
+        publication_barrier.wait()
+
+    monkeypatch.setattr(source_snapshot_module, "_copy_snapshot_files", _coordinate_every_copy)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_read_runtime_processor_for_document, runtime, "doc-1")
+        for attempt_index in range(source_snapshot_module._STABLE_READ_ATTEMPT_LIMIT):
+            publication_barrier.wait()
+            publish_b = attempt_index % 2 == 0
+            _update_source(
+                repository,
+                fingerprint="sustained-b" if publish_b else "sustained-a",
+                payload=b"version-b" if publish_b else b"version-a",
+                source_provider=(
+                    FinsSourceProvider.USER_UPLOAD
+                    if publish_b
+                    else FinsSourceProvider.SEC_EDGAR
+                ),
+            )
+            publication_barrier.wait()
+        with pytest.raises(FinsReadBusinessError) as error_info:
+            future.result(timeout=5.0)
 
     assert error_info.value.code is ErrorCode.SOURCE_CHANGED_DURING_READ
-    assert repository.get_source_meta_calls == 1
-    assert runtime._meta_cache.size() == 0
+    assert copied_attempts == source_snapshot_module._STABLE_READ_ATTEMPT_LIMIT
+    assert repository.snapshot_read_calls == 2
+    assert repository.full_snapshot_roots == []
     assert runtime._processor_cache.size() == 0
 
 
@@ -1491,16 +1776,528 @@ def test_concurrent_reads_after_revision_change_build_one_processor(tmp_path: Pa
     """
 
     runtime, repository, registry = _build_runtime(tmp_path)
-    runtime._get_or_create_processor(ticker="AAPL", document_id="doc-1")
-    repository.payload = b"version-concurrent"
-    _update_source(repository, fingerprint="revision-concurrent")
-    registry.delay_seconds = 0.05
+    _read_runtime_processor_for_document(runtime, "doc-1")
+    _update_source(repository, fingerprint="revision-concurrent", payload=b"version-concurrent")
+    build_entered = Event()
+    release_build = Event()
 
+    def _block_first_build() -> None:
+        """让第二个 reader 取得 losing full snapshot 后再释放唯一 build。"""
+
+        build_entered.set()
+        assert release_build.wait(timeout=5.0)
+
+    registry.before_return = _block_first_build
     with ThreadPoolExecutor(max_workers=2) as executor:
-        results = list(executor.map(partial(_read_runtime_processor, runtime), range(2)))
+        first_future = executor.submit(_read_runtime_processor, runtime, 0)
+        assert build_entered.wait(timeout=5.0)
+        second_future = executor.submit(_read_runtime_processor, runtime, 1)
+        release_build.set()
+        results = [first_future.result(timeout=5.0), second_future.result(timeout=5.0)]
 
     assert results[0] is results[1]
     assert registry.create_count == 2
+
+
+def test_concurrent_initial_cache_miss_builds_one_processor_and_closes_losing_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同文档初始 miss 共用一把 creation lock 且只发布一个 processor。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: 用于记录两个重叠 caller 取得的 creation lock。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 构建次数、processor 身份或 losing snapshot cleanup 不正确时抛出。
+    """
+
+    runtime, repository, registry = _build_runtime(tmp_path)
+    build_entered = Event()
+    release_build = Event()
+    second_full_ready = Event()
+    creation_lock_id_guard = Lock()
+    creation_lock_ids: list[int] = []
+    original_get_creation_lock = runtime._get_creation_lock
+
+    def _record_creation_lock(cache_key: ProcessorCacheKey) -> Lock:
+        """记录 caller 取得的强引用 document creation lock。
+
+        Args:
+            cache_key: processor cache key。
+
+        Returns:
+            runtime registry 返回的 document creation lock。
+
+        Raises:
+            RuntimeError: runtime lock registry 访问失败时抛出。
+        """
+
+        creation_lock = original_get_creation_lock(cache_key)
+        with creation_lock_id_guard:
+            creation_lock_ids.append(id(creation_lock))
+        return creation_lock
+
+    def _block_build() -> None:
+        """阻塞唯一 processor build，直到第二个 full snapshot 已取得。"""
+
+        build_entered.set()
+        assert release_build.wait(timeout=5.0)
+
+    def _observe_full_snapshot(count: int) -> None:
+        """第二个 full snapshot 构造完成时通知测试主线程。"""
+
+        if count >= 2:
+            second_full_ready.set()
+
+    registry.before_return = _block_build
+    repository.on_full_snapshot = _observe_full_snapshot
+    monkeypatch.setattr(runtime, "_get_creation_lock", _record_creation_lock)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(_read_runtime_processor, runtime, 0)
+        assert build_entered.wait(timeout=5.0)
+        second_future = executor.submit(_read_runtime_processor, runtime, 1)
+        assert second_full_ready.wait(timeout=5.0)
+        release_build.set()
+        processors = [first_future.result(timeout=5.0), second_future.result(timeout=5.0)]
+
+    assert processors[0] is processors[1]
+    assert registry.create_count == 1
+    assert len(creation_lock_ids) == 2
+    assert len(set(creation_lock_ids)) == 1
+    assert len(repository.full_snapshot_roots) == 2
+    assert sum(root.exists() for root in repository.full_snapshot_roots) == 1
+
+
+def test_runtime_close_before_cache_publication_rejects_build_and_cleans_snapshot(
+    tmp_path: Path,
+) -> None:
+    """close 先线性化时，阻塞中的 build 必须失败且不得事后发布 entry。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: build 未以 close-state 失败或 cache/temp root 残留时抛出。
+    """
+
+    runtime, repository, registry = _build_runtime(tmp_path)
+    build_entered = Event()
+    release_build = Event()
+
+    def _block_before_registry_return() -> None:
+        """在 processor 已构建、cache 尚未发布的窗口阻塞 worker。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 主线程未释放 build 时抛出。
+        """
+
+        build_entered.set()
+        assert release_build.wait(timeout=5.0)
+
+    registry.before_return = _block_before_registry_return
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        build_future = executor.submit(_read_runtime_processor_for_document, runtime, "doc-1")
+        assert build_entered.wait(timeout=5.0)
+        runtime.close()
+        assert runtime._processor_cache.size() == 0
+        release_build.set()
+        with pytest.raises(RuntimeError, match="Fins read runtime 已关闭"):
+            build_future.result(timeout=5.0)
+        assert build_future.done()
+
+    assert registry.create_count == 1
+    assert runtime._processor_cache.size() == 0
+    assert runtime._retired_entries == set()
+    assert runtime._pending_snapshots == []
+    assert len(repository.full_snapshot_roots) == 1
+    assert all(not root.exists() for root in repository.full_snapshot_roots)
+
+
+def test_creation_lock_registry_reclaims_missing_and_evicted_document_keys(
+    tmp_path: Path,
+) -> None:
+    """missing 与超容量 valid key 调用结束后不得在线性 lock registry 中残留。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: creation lock registry 随历史 key 线性增长时抛出。
+    """
+
+    runtime, repository, registry = _build_runtime(
+        tmp_path,
+        processor_cache_max_entries=_LOCK_REGISTRY_CACHE_CAPACITY,
+    )
+    missing_document_ids = tuple(
+        f"missing-{index}" for index in range(_LOCK_REGISTRY_MISSING_KEY_COUNT)
+    )
+    for document_id in missing_document_ids:
+        with pytest.raises(FileNotFoundError):
+            _read_runtime_processor_for_document(runtime, document_id)
+    gc.collect()
+
+    assert runtime._processor_cache.size() == 0
+    assert len(runtime._creation_locks) == 0
+
+    added_document_ids = tuple(
+        f"doc-{index}" for index in range(2, _LOCK_REGISTRY_VALID_DOCUMENT_COUNT + 1)
+    )
+    _create_test_source_documents(repository, added_document_ids)
+    valid_document_ids = ("doc-1", *added_document_ids)
+    for document_id in valid_document_ids:
+        _read_runtime_processor_for_document(runtime, document_id)
+    gc.collect()
+
+    assert registry.create_count == _LOCK_REGISTRY_VALID_DOCUMENT_COUNT
+    assert runtime._processor_cache.size() == _LOCK_REGISTRY_CACHE_CAPACITY
+    assert len(runtime._creation_locks) == 0
+    assert sum(root.exists() for root in repository.full_snapshot_roots) == (
+        _LOCK_REGISTRY_CACHE_CAPACITY
+    )
+    runtime.close()
+    assert all(not root.exists() for root in repository.full_snapshot_roots)
+
+
+def test_cache_eviction_defers_snapshot_close_until_active_borrow_releases(tmp_path: Path) -> None:
+    """revision replacement retire 旧条目后，应等 active borrow 释放再删除旧临时树。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 旧 snapshot 过早关闭或最后 borrow 后仍泄漏时抛出。
+    """
+
+    runtime, repository, _registry = _build_runtime(tmp_path)
+    old_borrow = runtime._borrow_processor(ticker="AAPL", document_id="doc-1")
+    old_root = old_borrow.snapshot.get_primary_source().materialize().parent
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        def _publish_and_read() -> DocumentProcessor:
+            """发布 B 并借用新 processor。"""
+
+            _update_source(repository, fingerprint="borrow-b", payload=b"version-b")
+            return _read_runtime_processor_for_document(runtime, "doc-1")
+
+        new_processor = executor.submit(_publish_and_read).result(timeout=5.0)
+
+    assert isinstance(new_processor, _ReadProcessor)
+    assert new_processor.label == "version-b"
+    assert old_root.exists()
+    with old_borrow.snapshot.get_primary_source().open() as stream:
+        assert stream.read() == b"version-one"
+    old_borrow.__exit__(None, None, None)
+    assert not old_root.exists()
+
+
+def test_cache_publication_before_runtime_close_preserves_active_borrow(
+    tmp_path: Path,
+) -> None:
+    """entry 先发布且已被借用时，close 应 retire 并允许当前调用完成。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: close 提前删除 active snapshot 或最终未清理时抛出。
+    """
+
+    runtime, _repository, _registry = _build_runtime(tmp_path)
+    with runtime._borrow_processor(ticker="AAPL", document_id="doc-1") as borrow:
+        processor = borrow.processor
+        snapshot_root = borrow.snapshot.get_primary_source().materialize().parent
+    assert isinstance(processor, _ReadProcessor)
+    borrow_entered = Event()
+    release_borrow = Event()
+
+    def _block_active_borrow() -> None:
+        """让已发布 entry 的 active borrow 跨越 runtime.close。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 主线程未释放 active borrow 时抛出。
+        """
+
+        borrow_entered.set()
+        assert release_borrow.wait(timeout=5.0)
+
+    processor.before_list_sections = _block_active_borrow
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        read_future = executor.submit(
+            runtime.get_document_sections,
+            ticker="AAPL",
+            document_id="doc-1",
+        )
+        assert borrow_entered.wait(timeout=5.0)
+        runtime.close()
+        assert runtime._processor_cache.size() == 0
+        assert snapshot_root.exists()
+        release_borrow.set()
+        result = read_future.result(timeout=5.0)
+
+    assert result["sections"][0]["title"] == "Overview"
+    assert not snapshot_root.exists()
+    assert runtime._retired_entries == set()
+    assert runtime._pending_snapshots == []
+    runtime.close()
+
+
+def test_cache_clear_and_runtime_close_release_all_snapshot_resources(tmp_path: Path) -> None:
+    """runtime close 应清空 cache、释放 snapshot，并保持幂等与关闭后 fail-fast。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: cache/temp cleanup 或幂等关闭不正确时抛出。
+    """
+
+    runtime, _repository, _registry = _build_runtime(tmp_path)
+    with runtime._borrow_processor(ticker="AAPL", document_id="doc-1") as borrow:
+        snapshot_root = borrow.snapshot.get_primary_source().materialize().parent
+    assert snapshot_root.exists()
+
+    runtime.close()
+    runtime.close()
+
+    assert runtime._processor_cache.size() == 0
+    assert not snapshot_root.exists()
+    with pytest.raises(RuntimeError, match="已关闭"):
+        runtime._borrow_processor(ticker="AAPL", document_id="doc-1")
+
+
+def test_citation_and_result_use_the_same_borrowed_snapshot_during_publication(
+    tmp_path: Path,
+) -> None:
+    """processor 返回 A 后发布 B，当前 result/citation 仍同为 A，下一次同为 B。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 内容与 provenance citation 混版时抛出。
+    """
+
+    runtime, repository, _registry = _build_runtime(tmp_path)
+    processor = _read_runtime_processor_for_document(runtime, "doc-1")
+    assert isinstance(processor, _ReadProcessor)
+    result_ready = Event()
+    allow_result = Event()
+
+    def _pause_after_borrow() -> None:
+        """在 processor 消费旧 snapshot 时等待 B publication 完成。"""
+
+        result_ready.set()
+        assert allow_result.wait(timeout=5.0)
+
+    processor.before_read_section = _pause_after_borrow
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        old_future = executor.submit(
+            runtime.read_section,
+            ticker="AAPL",
+            document_id="doc-1",
+            ref="s_0001",
+        )
+        assert result_ready.wait(timeout=5.0)
+        _update_source(
+            repository,
+            fingerprint="citation-b",
+            payload=b"version-b",
+            source_provider=FinsSourceProvider.USER_UPLOAD,
+        )
+        allow_result.set()
+        old_result = old_future.result(timeout=5.0)
+
+    assert old_result["content"] == "version-one"
+    assert old_result["citation"]["source_provider"] == "SEC_EDGAR"
+    new_result = runtime.read_section(ticker="AAPL", document_id="doc-1", ref="s_0001")
+    assert new_result["content"] == "version-b"
+    assert new_result["citation"]["source_provider"] == "USER_UPLOAD"
+
+
+def test_multi_query_search_keeps_result_and_citation_in_one_snapshot(tmp_path: Path) -> None:
+    """批量 search 的聚合诊断、结果与 citation 应留在一个 snapshot borrow。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: multi-query 投影或 citation provenance 不正确时抛出。
+    """
+
+    runtime, _repository, _registry = _build_runtime(tmp_path)
+
+    result = runtime.search_document(
+        ticker="AAPL",
+        document_id="doc-1",
+        queries=["version one", "missing phrase"],
+        mode="keyword",
+    )
+
+    assert result["query"] is None
+    assert result.get("queries") == ["version one", "missing phrase"]
+    diagnostics = result.get("diagnostics")
+    assert isinstance(diagnostics, dict)
+    assert diagnostics["query_count"] == 2
+    per_query_stats = diagnostics["per_query_stats"]
+    assert isinstance(per_query_stats, list)
+    assert len(per_query_stats) == 2
+    assert result.get("next_section_by_query") == {
+        "version one": None,
+        "missing phrase": None,
+    }
+    assert result["citation"]["source_provider"] == "SEC_EDGAR"
+    runtime.close()
+
+
+def test_optional_processor_entries_share_borrow_and_preserve_not_supported_contract(
+    tmp_path: Path,
+) -> None:
+    """table error 与 page/financial/XBRL 不支持路径应安全释放同版 borrow。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 参数失败或 optional capability 投影漂移时抛出。
+    """
+
+    runtime, _repository, _registry = _build_runtime(tmp_path)
+
+    with pytest.raises(FinsReadArgumentError) as table_error:
+        runtime.get_table(
+            ticker="AAPL",
+            document_id="doc-1",
+            table_ref="missing-table",
+        )
+    page_result = runtime.get_page_content(
+        ticker="AAPL",
+        document_id="doc-1",
+        page_no=1,
+    )
+    financial_result = runtime.get_financial_statement(
+        ticker="AAPL",
+        document_id="doc-1",
+        statement_type="income",
+    )
+    xbrl_result = runtime.query_xbrl_facts(
+        ticker="AAPL",
+        document_id="doc-1",
+        concepts=["Revenue"],
+    )
+
+    assert table_error.value.arg_name == "table_ref"
+    assert page_result["supported"] is False
+    assert "error" in financial_result
+    assert "error" in xbrl_result
+    runtime.close()
+
+
+def test_document_alias_across_source_kinds_is_rejected_as_ambiguous(tmp_path: Path) -> None:
+    """跨 filing/material 命中同一 alias 时不得隐式选择任一 source kind。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: alias 歧义未在 read-runtime 参数边界被拒绝时抛出。
+    """
+
+    runtime, repository, _registry = _build_runtime(tmp_path)
+    batch = repository._batching_repository.begin_batch("AAPL")
+    material_document_id = "material-doc"
+    shared_alias = "shared-alias"
+    try:
+        repository.update_source_document(
+            SourceDocumentUpsertRequest(
+                ticker="AAPL",
+                document_id="doc-1",
+                internal_document_id=shared_alias,
+            ),
+            SourceKind.FILING,
+            batch=batch,
+        )
+        material_file = repository._blob_repository.store_file(
+            SourceHandle("AAPL", material_document_id, SourceKind.MATERIAL.value),
+            "material.txt",
+            BytesIO(b"material-version"),
+            batch=batch,
+            content_type="text/plain",
+        )
+        repository.create_source_document(
+            SourceDocumentUpsertRequest(
+                ticker="AAPL",
+                document_id=material_document_id,
+                internal_document_id=shared_alias,
+                form_type="EX-99",
+                primary_document="material.txt",
+                files=[material_file],
+                meta={
+                    "ingest_method": "upload",
+                    "source_provider": FinsSourceProvider.USER_UPLOAD.to_storage_value(),
+                    "ingest_complete": True,
+                    "is_deleted": False,
+                },
+            ),
+            SourceKind.MATERIAL,
+            batch=batch,
+        )
+    except Exception:
+        repository._batching_repository.rollback_batch(batch)
+        raise
+    repository._batching_repository.commit_batch(batch)
+
+    with pytest.raises(FinsReadArgumentError, match="matches multiple documents"):
+        runtime.read_section(
+            ticker="AAPL",
+            document_id=shared_alias,
+            ref="s_0001",
+        )
+    assert runtime._processor_cache.size() == 0
+    runtime.close()
 
 
 def test_cached_processor_is_not_returned_after_source_deleted(tmp_path: Path) -> None:
@@ -1517,7 +2314,7 @@ def test_cached_processor_is_not_returned_after_source_deleted(tmp_path: Path) -
     """
 
     runtime, repository, _registry = _build_runtime(tmp_path)
-    runtime._get_or_create_processor(ticker="AAPL", document_id="doc-1")
+    _read_runtime_processor_for_document(runtime, "doc-1")
     delete_batch = repository._batching_repository.begin_batch("AAPL")
     repository.delete_source_document(
         SourceDocumentStateChangeRequest("AAPL", "doc-1", SourceKind.FILING.value),
@@ -1526,7 +2323,7 @@ def test_cached_processor_is_not_returned_after_source_deleted(tmp_path: Path) -
     repository._batching_repository.commit_batch(delete_batch)
 
     with pytest.raises(FileNotFoundError):
-        runtime._get_or_create_processor(ticker="AAPL", document_id="doc-1")
+        _read_runtime_processor_for_document(runtime, "doc-1")
     assert runtime._processor_cache.size() == 0
 
 

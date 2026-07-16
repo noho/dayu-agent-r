@@ -287,16 +287,16 @@ DownloadRejectionRegistry: TypeAlias = dict[str, DownloadRejectionEntry]
 
 @dataclass(frozen=True)
 class SourceDocumentRevision:
-    """源文档处理输入的仓储版本投影。
+    """源文档已发布版本的仓储投影。
 
     Attributes:
-        digest: storage owner 根据规范化 source meta 计算的 SHA-256 摘要。
+        token: storage publication owner 生成的非空 opaque equality token。
     """
 
-    digest: str
+    token: str
 
     def __post_init__(self) -> None:
-        """校验 revision 摘要格式。
+        """校验 revision token 非空。
 
         Args:
             无。
@@ -305,17 +305,11 @@ class SourceDocumentRevision:
             无。
 
         Raises:
-            ValueError: 摘要不是 ``sha256:<64位十六进制>`` 时抛出。
+            ValueError: token 为空字符串时抛出。
         """
 
-        prefix = "sha256:"
-        hexadecimal = self.digest.removeprefix(prefix)
-        if (
-            not self.digest.startswith(prefix)
-            or len(hexadecimal) != 64
-            or any(character not in "0123456789abcdef" for character in hexadecimal)
-        ):
-            raise ValueError("source revision digest 必须为 sha256 摘要")
+        if self.token == "":
+            raise ValueError("source revision token 不能为空")
 
 
 @dataclass(frozen=True)
@@ -496,13 +490,13 @@ class CompanyMetaInventoryEntry:
     """公司目录扫描结果。
 
     Attributes:
-        directory_name: 公司目录名。
+        ticker: descriptor 可恢复时的 external ticker；损坏或 lock-only 条目为 ``None``。
         status: 扫描状态。
         company_meta: 当状态为 ``available`` 时的公司元数据。
         detail: 附加说明或错误信息。
     """
 
-    directory_name: str
+    ticker: Optional[str]
     status: CompanyMetaInventoryStatus
     company_meta: Optional[CompanyMeta] = None
     detail: str = ""

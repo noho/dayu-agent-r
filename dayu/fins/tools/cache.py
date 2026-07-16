@@ -24,14 +24,10 @@ class ProcessorCacheKey:
     Attributes:
         ticker: 股票代码（标准化后）。
         document_id: 文档唯一标识。
-        source_kind: 可选来源类型维度。Processor 实例缓存与构建锁保持
-            ``None``，source meta 这类已按来源类型读取的缓存必须填入稳定
-            的来源类型字符串，避免同一文档 ID 在不同来源目录下互相污染。
     """
 
     ticker: str
     document_id: str
-    source_kind: str | None = None
 
 
 class ProcessorLRUCache(Generic[ProcessorT]):
@@ -119,7 +115,7 @@ class ProcessorLRUCache(Generic[ProcessorT]):
         with self._lock:
             return self._store.get(key)
 
-    def put(self, key: ProcessorCacheKey, value: ProcessorT) -> None:
+    def put(self, key: ProcessorCacheKey, value: ProcessorT) -> tuple[ProcessorT, ...]:
         """写入缓存并按 LRU 规则淘汰。
 
         Args:
@@ -127,56 +123,79 @@ class ProcessorLRUCache(Generic[ProcessorT]):
             value: Processor 实例。
 
         Returns:
-            无。
+            因同键替换或容量淘汰而移出的旧值，按移出顺序返回。
 
         Raises:
             RuntimeError: 内部存储异常时抛出。
         """
 
+        displaced: list[ProcessorT] = []
         with self._lock:
             if key in self._store:
+                displaced.append(self._store[key])
                 self._store[key] = value
                 self._store.move_to_end(key, last=True)
-                return
+                return tuple(displaced)
             self._store[key] = value
             # 复杂逻辑说明：超过容量时持续淘汰最旧条目，确保容量严格受控。
             while len(self._store) > self._max_entries:
-                self._store.popitem(last=False)
+                _, displaced_value = self._store.popitem(last=False)
+                displaced.append(displaced_value)
+        return tuple(displaced)
 
-    def evict(self, key: ProcessorCacheKey) -> bool:
+    def evict(self, key: ProcessorCacheKey) -> Optional[ProcessorT]:
         """移除指定缓存键。
 
         Args:
             key: 缓存键。
 
         Returns:
-            当键存在并被移除时返回 `True`，否则返回 `False`。
+            键存在时返回被移除的旧值；未命中返回 ``None``。
 
         Raises:
             RuntimeError: 内部存储异常时抛出。
         """
 
         with self._lock:
-            if key not in self._store:
-                return False
-            self._store.pop(key, None)
-            return True
+            return self._store.pop(key, None)
 
-    def clear(self) -> None:
+    def evict_if(self, key: ProcessorCacheKey, expected: ProcessorT) -> Optional[ProcessorT]:
+        """仅当键仍指向 expected 实例时移除条目。
+
+        Args:
+            key: 缓存键。
+            expected: caller 先前观察到的值实例。
+
+        Returns:
+            仍为同一实例时返回被移除值；键缺失或已被替换时返回 ``None``。
+
+        Raises:
+            RuntimeError: 内部存储异常时抛出。
+        """
+
+        with self._lock:
+            current = self._store.get(key)
+            if current is not expected:
+                return None
+            return self._store.pop(key)
+
+    def clear(self) -> tuple[ProcessorT, ...]:
         """清空缓存。
 
         Args:
             无。
 
         Returns:
-            无。
+            清空前按 LRU 顺序排列的全部旧值。
 
         Raises:
             RuntimeError: 内部存储异常时抛出。
         """
 
         with self._lock:
+            displaced = tuple(self._store.values())
             self._store.clear()
+            return displaced
 
     def size(self) -> int:
         """返回当前缓存条目数。

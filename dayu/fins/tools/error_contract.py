@@ -15,7 +15,7 @@ class ErrorCode(str, Enum):
         XBRL_QUERY_FAILED: 所有可执行 XBRL concept 查询均失败。
         SOURCE_DECODE_FAILED: source 无法被可靠读取或解码。
         SEARCH_INDEX_FAILED: 搜索索引或语义画像构建失败。
-        SOURCE_CHANGED_DURING_READ: 读取期间 source revision 发生变化。
+        SOURCE_CHANGED_DURING_READ: 源文档持续更新，暂时无法取得完整一致的读取版本。
     """
 
     NOT_FOUND = "not_found"

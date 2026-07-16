@@ -17,6 +17,7 @@ from dayu.fins.domain.filing_semantics import (
 )
 from dayu.fins.domain.xbrl_result_contract import validate_xbrl_facts_result_payload
 from dayu.fins.storage import SourceDocumentRepositoryProtocol
+from dayu.fins.storage.repository_protocols import SourceSnapshotProtocol
 
 from .sec_6k_rules import _infer_filename_from_uri
 
@@ -261,11 +262,60 @@ def _extract_download_fiscal_from_xbrl(
     file_entries: list[dict[str, JsonValue]],
     form_type: Optional[str],
 ) -> tuple[Optional[int], Optional[str]]:
-    """从下载后的本地 XBRL 中抽取 fiscal_year/fiscal_period。"""
+    """从一份已发布 source snapshot 抽取 fiscal_year/fiscal_period。
+
+    Args:
+        source_handle: 指向已发布 source 的精确业务身份。
+        source_repository: 提供原子 snapshot 的 source 仓储协议。
+        file_entries: 当前下载描述符顺序下的完整业务文件条目。
+        form_type: 当前 SEC form type。
+
+    Returns:
+        可选 fiscal year 与 fiscal period；snapshot 或 XBRL 不可用时返回空值。
+
+    Raises:
+        无；沿用 download fiscal 的 best-effort 语义吸收读取与解析失败。
+    """
+
+    try:
+        snapshot = source_repository.read_source_snapshot(
+            source_handle.ticker,
+            source_handle.document_id,
+            SourceKind(source_handle.source_kind),
+            materialize_files=True,
+        )
+    except Exception:
+        return None, None
+    with snapshot:
+        return _extract_download_fiscal_from_snapshot(
+            snapshot=snapshot,
+            file_entries=file_entries,
+            form_type=form_type,
+        )
+
+
+def _extract_download_fiscal_from_snapshot(
+    *,
+    snapshot: SourceSnapshotProtocol,
+    file_entries: list[dict[str, JsonValue]],
+    form_type: Optional[str],
+) -> tuple[Optional[int], Optional[str]]:
+    """从一份 full snapshot 的同版 XBRL 文件组提取 fiscal 字段。
+
+    Args:
+        snapshot: storage owner 返回的 full source snapshot。
+        file_entries: 当前下载描述符顺序下的业务文件条目。
+        form_type: 当前 SEC form type。
+
+    Returns:
+        可选 fiscal year 与 fiscal period。
+
+    Raises:
+        RuntimeError: snapshot 已关闭或未物化文件时抛出。
+    """
 
     local_file_map = _build_download_local_file_map(
-        source_handle=source_handle,
-        source_repository=source_repository,
+        snapshot=snapshot,
         file_entries=file_entries,
     )
     if not local_file_map:
@@ -323,11 +373,21 @@ def _extract_download_fiscal_from_xbrl(
 
 def _build_download_local_file_map(
     *,
-    source_handle: SourceHandle,
-    source_repository: SourceDocumentRepositoryProtocol,
+    snapshot: SourceSnapshotProtocol,
     file_entries: list[dict[str, JsonValue]],
 ) -> dict[str, Path]:
-    """将下载文件条目解析为本地文件路径映射。"""
+    """将业务文件条目映射到同一 full snapshot 的临时路径。
+
+    Args:
+        snapshot: storage owner 返回的 full source snapshot。
+        file_entries: 当前下载描述符顺序下的业务文件条目。
+
+    Returns:
+        以 lowercase exact 业务文件名为键的 snapshot 临时路径映射。
+
+    Raises:
+        无；单文件不可用时沿用既有 best-effort 语义跳过该条目。
+    """
 
     result: dict[str, Path] = {}
     for item in file_entries:
@@ -340,12 +400,7 @@ def _build_download_local_file_map(
         if name is None:
             continue
         try:
-            source = source_repository.get_source(
-                source_handle.ticker,
-                source_handle.document_id,
-                SourceKind(source_handle.source_kind),
-                name,
-            )
+            source = snapshot.get_source(name)
             local_path = source.materialize()
         except Exception:
             continue

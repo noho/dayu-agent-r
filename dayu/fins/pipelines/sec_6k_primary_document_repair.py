@@ -34,6 +34,7 @@ from dayu.fins.storage import (
     SourceDocumentRepositoryProtocol,
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
+from dayu.fins.storage.repository_protocols import SourceSnapshotProtocol
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,30 +106,32 @@ def reconcile_active_6k_primary_document(
         ValueError: 文档元数据非法时抛出。
     """
 
-    meta = source_repository.get_source_meta(ticker, document_id, SourceKind.FILING)
-    if bool(meta.get("is_deleted", False)):
-        return None
-    if str(meta.get("form_type", "")).strip().upper() != "6-K":
-        return None
+    with source_repository.read_source_snapshot(
+        ticker,
+        document_id,
+        SourceKind.FILING,
+        materialize_files=True,
+    ) as snapshot:
+        meta = dict(snapshot.source_meta)
+        if str(meta.get("form_type", "")).strip().upper() != "6-K":
+            return None
 
-    primary_document = str(meta.get("primary_document", "")).strip()
-    candidate_filenames = _list_candidate_html_filenames(meta)
-    if not candidate_filenames:
-        return None
+        primary_document = snapshot.primary_filename
+        candidate_filenames = _list_candidate_html_filenames(meta)
+        if not candidate_filenames:
+            return None
 
-    candidate_assessments = _collect_candidate_assessments(
-        source_repository=source_repository,
-        ticker=ticker,
-        document_id=document_id,
-        candidate_filenames=candidate_filenames,
-        primary_document=primary_document,
-    )
-    outcome = _select_reconcile_outcome(
-        ticker=ticker,
-        document_id=document_id,
-        primary_document=primary_document,
-        candidate_assessments=candidate_assessments,
-    )
+        candidate_assessments = _collect_candidate_assessments(
+            snapshot=snapshot,
+            candidate_filenames=candidate_filenames,
+            primary_document=primary_document,
+        )
+        outcome = _select_reconcile_outcome(
+            ticker=ticker,
+            document_id=document_id,
+            primary_document=primary_document,
+            candidate_assessments=candidate_assessments,
+        )
     if outcome is None:
         return None
 
@@ -431,18 +434,14 @@ def _list_candidate_html_filenames(meta: dict[str, JsonValue]) -> list[str]:
 
 def _collect_candidate_assessments(
     *,
-    source_repository: SourceDocumentRepositoryProtocol,
-    ticker: str,
-    document_id: str,
+    snapshot: SourceSnapshotProtocol,
     candidate_filenames: list[str],
     primary_document: str,
 ) -> list[SixKPrimaryCandidateAssessment]:
     """评估全部 6-K HTML 候选文件的核心报表可提取性。
 
     Args:
-        source_repository: source 仓储。
-        ticker: 股票代码。
-        document_id: 文档 ID。
+        snapshot: storage owner 返回的单一 full source snapshot。
         candidate_filenames: 全部 HTML 候选文件名。
         primary_document: 当前主文件名，用于 filename 优先级排序。
 
@@ -458,9 +457,7 @@ def _collect_candidate_assessments(
     for filename in candidate_filenames:
         assessments.append(
             _assess_active_6k_candidate(
-                source_repository=source_repository,
-                ticker=ticker,
-                document_id=document_id,
+                snapshot=snapshot,
                 filename=filename,
                 primary_document=primary_document,
             )
@@ -470,18 +467,14 @@ def _collect_candidate_assessments(
 
 def _assess_active_6k_candidate(
     *,
-    source_repository: SourceDocumentRepositoryProtocol,
-    ticker: str,
-    document_id: str,
+    snapshot: SourceSnapshotProtocol,
     filename: str,
     primary_document: str,
 ) -> SixKPrimaryCandidateAssessment:
     """评估某个 active 6-K 候选文件的核心报表可提取性。
 
     Args:
-        source_repository: source 仓储。
-        ticker: 股票代码。
-        document_id: 文档 ID。
+        snapshot: storage owner 返回的单一 full source snapshot。
         filename: 待评估文件名。
         primary_document: 当前主文件名，用于 filename 优先级排序。
 
@@ -493,7 +486,7 @@ def _assess_active_6k_candidate(
         RuntimeError: 处理器初始化失败时抛出。
     """
 
-    source = source_repository.get_source(ticker, document_id, SourceKind.FILING, filename)
+    source = snapshot.get_source(filename)
     processor = BsSixKFormProcessor(source, form_type="6-K")
     statement_rows = {
         statement_type: _count_statement_rows(processor, statement_type)

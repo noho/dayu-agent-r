@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import shutil
 from typing import BinaryIO, Optional
 
 from dayu.fins.domain.document_models import (
@@ -14,7 +13,15 @@ from dayu.fins.domain.document_models import (
 )
 
 from ._fs_storage_infra import _ActiveBatchState, _FsStorageInfra
-from ._fs_storage_utils import _normalize_filename, _normalize_ticker
+from ._fs_identity import _IDENTITY_DESCRIPTOR_FILENAME, _require_external_identity
+from ._fs_storage_utils import (
+    _list_directory,
+    _normalize_filename,
+    _project_filesystem_error,
+    _raise_path_free_error,
+    _read_file_bytes,
+    _unlink_path,
+)
 
 
 class _FsBlobMixin(_FsStorageInfra):
@@ -30,12 +37,13 @@ class _FsBlobMixin(_FsStorageInfra):
             直系条目列表；目录不存在时返回空列表。
 
         Raises:
+            ValueError: handle identity、descriptor 或目录结构不合法时抛出。
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
             OSError: 读取目录失败时抛出。
         """
 
-        normalized_ticker = _normalize_ticker(handle.ticker)
-        guard_token = self._acquire_publication_guard(normalized_ticker)
+        external_ticker = _require_external_identity(handle.ticker, field_name="ticker")
+        guard_token = self._acquire_publication_guard(external_ticker)
         try:
             return self._list_entries_unguarded(handle)
         finally:
@@ -60,10 +68,19 @@ class _FsBlobMixin(_FsStorageInfra):
         directory = self._handle_dir_path(handle)
         if not directory.exists() or not directory.is_dir():
             return []
-        return [
-            DocumentEntry(name=child.name, is_file=child.is_file())
-            for child in sorted(directory.iterdir(), key=lambda item: item.name)
-        ]
+        try:
+            return [
+                DocumentEntry(name=child.name, is_file=child.is_file())
+                for child in sorted(
+                    _list_directory(directory, action="枚举 document blob 目录"),
+                    key=lambda item: item.name,
+                )
+                if child.name != _IDENTITY_DESCRIPTOR_FILENAME
+            ]
+        except OSError as exc:
+            _raise_path_free_error(
+                _project_filesystem_error(exc, action="检查 document blob 条目")
+            )
 
     def read_file_bytes(self, handle: SourceHandle | ProcessedHandle, filename: str) -> bytes:
         """从 published tree 读取文档目录下的单个文件内容。
@@ -78,12 +95,13 @@ class _FsBlobMixin(_FsStorageInfra):
         Raises:
             FileNotFoundError: 文件不存在时抛出。
             IsADirectoryError: 目标为目录时抛出。
+            ValueError: handle identity、descriptor 或 filename 不合法时抛出。
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
             OSError: 读取失败时抛出。
         """
 
-        normalized_ticker = _normalize_ticker(handle.ticker)
-        guard_token = self._acquire_publication_guard(normalized_ticker)
+        external_ticker = _require_external_identity(handle.ticker, field_name="ticker")
+        guard_token = self._acquire_publication_guard(external_ticker)
         try:
             return self._read_file_bytes_unguarded(handle, filename)
         finally:
@@ -111,10 +129,16 @@ class _FsBlobMixin(_FsStorageInfra):
 
         path = self._resolve_handle_child_path(handle, filename)
         if not path.exists():
-            raise FileNotFoundError(f"文件不存在: {path}")
+            raise FileNotFoundError(
+                "文件不存在: "
+                f"ticker={handle.ticker} document_id={handle.document_id} filename={filename}"
+            )
         if path.is_dir():
-            raise IsADirectoryError(f"目标是目录，无法按文件读取: {path}")
-        return path.read_bytes()
+            raise IsADirectoryError(
+                "目标是目录，无法按文件读取: "
+                f"ticker={handle.ticker} document_id={handle.document_id} filename={filename}"
+            )
+        return _read_file_bytes(path, action="读取 document blob")
 
     def delete_entry(
         self,
@@ -165,11 +189,14 @@ class _FsBlobMixin(_FsStorageInfra):
 
         path = self._resolve_handle_child_path_for_state(handle, name, state)
         if not path.exists():
-            raise FileNotFoundError(f"条目不存在: {path}")
+            raise FileNotFoundError(
+                "条目不存在: "
+                f"ticker={handle.ticker} document_id={handle.document_id} name={name}"
+            )
         if path.is_dir():
-            shutil.rmtree(path)
+            self._remove_directory(path)
             return
-        path.unlink()
+        _unlink_path(path, missing_ok=False, action="删除 document blob 条目")
 
     def store_file(
         self,
@@ -213,9 +240,9 @@ class _FsBlobMixin(_FsStorageInfra):
         self._resolve_handle_child_path_for_state(handle, normalized_filename, state)
         if isinstance(handle, ProcessedHandle):
             self._get_handle_meta_for_state(handle, state)
-        normalized_ticker = _normalize_ticker(handle.ticker)
+        external_ticker = _require_external_identity(handle.ticker, field_name="ticker")
         key = self._build_store_key_from_normalized_filename(handle, normalized_filename)
-        file_store = self._build_file_store(normalized_ticker, state)
+        file_store = self._build_file_store(external_ticker, state)
         return file_store.put_object(
             key,
             data,
@@ -239,8 +266,8 @@ class _FsBlobMixin(_FsStorageInfra):
             OSError: published meta 读取失败时抛出。
         """
 
-        normalized_ticker = _normalize_ticker(handle.ticker)
-        guard_token = self._acquire_publication_guard(normalized_ticker)
+        external_ticker = _require_external_identity(handle.ticker, field_name="ticker")
+        guard_token = self._acquire_publication_guard(external_ticker)
         try:
             return self._list_files_unguarded(handle)
         finally:

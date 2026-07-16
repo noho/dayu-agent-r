@@ -10,7 +10,7 @@ import mimetypes
 import os
 import uuid
 from pathlib import Path, PureWindowsPath
-from typing import Any, Optional
+from typing import Any, BinaryIO, NoReturn, Optional
 
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.document_models import FileObjectMeta, now_iso8601
@@ -53,17 +53,17 @@ def _normalize_path_component(value: str, *, field_name: str) -> str:
     return normalized
 
 
-def _normalize_ticker(ticker: str) -> str:
-    """标准化 ticker。
+def _canonicalize_ticker_alias(ticker: str) -> str:
+    """把公司检索 alias 规范化为公共 ticker alias。
 
     优先走 ``try_normalize_ticker`` 真源；识别失败时回退到
     ``strip().upper()``。canonical 与 fallback 最终都通过同一个单路径组件校验。
 
     Args:
-        ticker: 原始 ticker。
+        ticker: 原始公司检索 alias。
 
     Returns:
-        标准化后的 ticker。
+        标准化后的 ticker alias。
 
     Raises:
         ValueError: ticker 为空、包含路径分隔符或表达绝对路径/盘符时抛出。
@@ -92,9 +92,9 @@ def _normalize_company_ticker_aliases(
         ValueError: alias 中存在空白 ticker 时抛出。
     """
 
-    normalized_aliases: list[str] = []
-    for raw_alias in [canonical_ticker, *(ticker_aliases or [])]:
-        normalized_alias = _normalize_ticker(raw_alias)
+    normalized_aliases: list[str] = [canonical_ticker]
+    for raw_alias in ticker_aliases or []:
+        normalized_alias = _canonicalize_ticker_alias(raw_alias)
         if normalized_alias in normalized_aliases:
             continue
         normalized_aliases.append(normalized_alias)
@@ -115,22 +115,6 @@ def _normalize_entry_name(name: str) -> str:
     """
 
     return _normalize_path_component(name, field_name="条目名称")
-
-
-def _normalize_document_id(document_id: str) -> str:
-    """标准化并校验仓储文档 ID。
-
-    Args:
-        document_id: 原始文档 ID。
-
-    Returns:
-        可作为单个路径组件使用的文档 ID。
-
-    Raises:
-        ValueError: 文档 ID 为空、包含路径分隔或为 ``.`` / ``..`` 时抛出。
-    """
-
-    return _normalize_path_component(document_id, field_name="document_id")
 
 
 def _normalize_filename(filename: str) -> str:
@@ -265,17 +249,24 @@ def _local_path_from_uri(portfolio_root: Path, uri: str) -> Path:
     if not raw:
         raise ValueError("uri 不能为空")
     if not raw.startswith("local://"):
-        raise ValueError(f"不支持的 URI scheme: {raw}")
+        raise ValueError("只支持 local URI")
     raw_key = raw.split("local://", 1)[1]
     if not raw_key:
         raise ValueError("local URI 缺少 key")
     key = _normalize_object_key(raw_key)
-    normalized_root = portfolio_root.resolve()
-    path = (normalized_root / Path(*key.split("/"))).resolve()
+    try:
+        normalized_root = portfolio_root.resolve()
+        path = (normalized_root / Path(*key.split("/"))).resolve()
+    except OSError as exc:
+        _raise_path_free_error(
+            _project_filesystem_error(exc, action="解析 local storage URI")
+        )
     try:
         path.relative_to(normalized_root)
-    except ValueError as exc:
-        raise ValueError("local URI key 越界，禁止访问 portfolio 根目录外路径") from exc
+    except ValueError:
+        _raise_path_free_error(
+            ValueError("local URI key 越界，禁止访问 portfolio 根目录外路径")
+        )
     return path
 
 
@@ -460,6 +451,185 @@ def _coerce_optional_int(value: JsonValue) -> int | None:
 # ---------- JSON 读写 ----------
 
 
+def _new_path_free_filesystem_error(error: OSError, *, message: str) -> OSError:
+    """按原始异常类别与 errno 构造无物理 locator 的新异常。
+
+    Args:
+        error: 底层文件系统抛出的原始异常。
+        message: 不包含物理路径的异常说明。
+
+    Returns:
+        保留有意义 subclass 与 ``errno``、但没有 raw args/notes/traceback 的异常。
+
+    Raises:
+        无。
+    """
+
+    error_type = type(error)
+    if error.errno is None:
+        return error_type(message)
+    return error_type(error.errno, message)
+
+
+def _project_filesystem_error(error: OSError, *, action: str) -> OSError:
+    """将原始文件系统异常投影为完整 graph 均无 locator 的同类异常。
+
+    Args:
+        error: 底层文件系统抛出的原始异常。
+        action: 不包含物理路径的 storage 操作说明。
+
+    Returns:
+        保留有意义 subclass、``errno`` 与 path-free cause 类别的异常。
+
+    Raises:
+        无。
+    """
+
+    projected_error = _new_path_free_filesystem_error(
+        error,
+        message=f"{action}失败",
+    )
+    projected_cause = _new_path_free_filesystem_error(
+        error,
+        message=f"{action}底层文件系统失败",
+    )
+    projected_error.__cause__ = projected_cause
+    projected_error.__suppress_context__ = True
+    return projected_error
+
+
+def _raise_path_free_error(error: BaseException) -> NoReturn:
+    """抛出已投影异常并显式移除当前 raw exception context。
+
+    该 helper 只接受 owner 已重新构造、其 args/notes/cause 均不含 locator
+    的异常。它不读取或清洗 raw message，也不承担下游补偿职责。
+
+    Args:
+        error: storage owner 已构造的 path-free 异常。
+
+    Returns:
+        永不返回。
+
+    Raises:
+        BaseException: 原样抛出传入异常；其 context 被清空，safe cause 保留。
+    """
+
+    try:
+        raise error from error.__cause__
+    except BaseException as projected_error:
+        # 复杂逻辑说明：Python 会自动把当前 except 的 raw error 写入
+        # __context__；必须在 re-raise 前清除，才能关闭完整 exception graph。
+        projected_error.__context__ = None
+        raise
+
+
+def _append_secondary_error_note(
+    primary_error: BaseException,
+    secondary_error: BaseException,
+    *,
+    action: str,
+) -> None:
+    """把次级失败以无 locator 诊断附加到主异常。
+
+    Args:
+        primary_error: 必须保留的 authoritative 主异常。
+        secondary_error: cleanup 或 lock release 阶段的次级异常。
+        action: 不包含物理路径的次级操作说明。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    diagnostic = f"{action}: error_type={secondary_error.__class__.__name__}"
+    if isinstance(secondary_error, OSError) and secondary_error.errno is not None:
+        diagnostic = f"{diagnostic} errno={secondary_error.errno}"
+    primary_error.add_note(diagnostic)
+
+
+def _list_directory(path: Path, *, action: str) -> list[Path]:
+    """枚举目录并在 storage producer boundary 移除物理 locator。
+
+    Args:
+        path: 待枚举目录。
+        action: 不包含物理路径的业务操作说明。
+
+    Returns:
+        当次枚举得到的直系条目快照。
+
+    Raises:
+        OSError: 目录枚举失败时抛出不含物理 locator 的同类异常。
+    """
+
+    try:
+        return list(path.iterdir())
+    except OSError as exc:
+        _raise_path_free_error(_project_filesystem_error(exc, action=action))
+
+
+def _read_file_bytes(path: Path, *, action: str) -> bytes:
+    """读取文件字节并在 storage producer boundary 移除物理 locator。
+
+    Args:
+        path: 待读取文件。
+        action: 不包含物理路径的业务操作说明。
+
+    Returns:
+        文件全部字节。
+
+    Raises:
+        OSError: 文件读取失败时抛出不含物理 locator 的同类异常。
+    """
+
+    try:
+        return path.read_bytes()
+    except OSError as exc:
+        _raise_path_free_error(_project_filesystem_error(exc, action=action))
+
+
+def _open_binary_file(path: Path, *, action: str) -> BinaryIO:
+    """以二进制只读模式打开文件并移除物理 locator。
+
+    Args:
+        path: 待打开文件。
+        action: 不包含物理路径的业务操作说明。
+
+    Returns:
+        已打开的二进制只读流。
+
+    Raises:
+        OSError: 文件打开失败时抛出不含物理 locator 的同类异常。
+    """
+
+    try:
+        return path.open("rb")
+    except OSError as exc:
+        _raise_path_free_error(_project_filesystem_error(exc, action=action))
+
+
+def _unlink_path(path: Path, *, missing_ok: bool, action: str) -> None:
+    """删除文件型条目并在 storage producer boundary 移除物理 locator。
+
+    Args:
+        path: 待删除条目。
+        missing_ok: 条目缺失时是否视为成功。
+        action: 不包含物理路径的业务操作说明。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: 删除失败时抛出不含物理 locator 的同类异常。
+    """
+
+    try:
+        path.unlink(missing_ok=missing_ok)
+    except OSError as exc:
+        _raise_path_free_error(_project_filesystem_error(exc, action=action))
+
+
 def _read_json(path: Path) -> dict[str, Any] | list[Any]:
     """读取 JSON 文件。
 
@@ -471,13 +641,21 @@ def _read_json(path: Path) -> dict[str, Any] | list[Any]:
 
     Raises:
         FileNotFoundError: 文件不存在时抛出。
-        ValueError: JSON 无法解析时抛出。
+        ValueError: 路径是 symlink、非 regular file 或 JSON 无法解析时抛出。
     """
 
     try:
+        if path.is_symlink():
+            raise ValueError("JSON 文件禁止 symlink")
+        if path.exists() and not path.is_file():
+            raise ValueError("JSON 路径必须为 regular file")
         return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        raise ValueError(f"JSON 解析失败: {path}") from exc
+        raise ValueError("JSON 解析失败") from exc
+    except OSError as exc:
+        _raise_path_free_error(
+            _project_filesystem_error(exc, action="读取 storage JSON")
+        )
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
@@ -496,7 +674,7 @@ def _read_json_object(path: Path) -> dict[str, Any]:
 
     payload = _read_json(path)
     if not isinstance(payload, dict):
-        raise ValueError(f"JSON 根节点必须是 object: {path}")
+        raise ValueError("JSON 根节点必须是 object")
     return payload
 
 
@@ -516,7 +694,7 @@ def _read_json_array(path: Path) -> list[Any]:
 
     payload = _read_json(path)
     if not isinstance(payload, list):
-        raise ValueError(f"JSON 根节点必须是 array: {path}")
+        raise ValueError("JSON 根节点必须是 array")
     return payload
 
 
@@ -535,10 +713,11 @@ def _write_json(path: Path, payload: Any) -> None:
         TypeError: 对象不可序列化时抛出。
     """
 
-    path.parent.mkdir(parents=True, exist_ok=True)
     serialized = json.dumps(payload, ensure_ascii=False, indent=2)
     temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    primary_error: BaseException | None = None
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         with temp_path.open("w", encoding="utf-8") as stream:
             stream.write(serialized)
             stream.flush()
@@ -546,8 +725,28 @@ def _write_json(path: Path, payload: Any) -> None:
         # 复杂逻辑说明：通过明确的 same-directory 原子替换确保意外退出时不会留下半写入 JSON。
         os.replace(temp_path, path)
         _fsync_directory(path.parent)
+    except OSError as exc:
+        projected_error = _project_filesystem_error(exc, action="写入 storage JSON")
+        primary_error = projected_error
+        _raise_path_free_error(projected_error)
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        temp_path.unlink(missing_ok=True)
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            projected_cleanup_error = _project_filesystem_error(
+                cleanup_error,
+                action="清理 storage JSON 临时文件",
+            )
+            if primary_error is None:
+                _raise_path_free_error(projected_cleanup_error)
+            _append_secondary_error_note(
+                primary_error,
+                projected_cleanup_error,
+                action="storage JSON 临时文件清理失败",
+            )
 
 
 def _fsync_directory(path: Path) -> None:
@@ -573,24 +772,3 @@ def _fsync_directory(path: Path) -> None:
         return
     finally:
         os.close(directory_fd)
-
-
-def _list_directory_names(root: Path) -> list[str]:
-    """列出目录下的一级子目录名。
-
-    Args:
-        root: 根目录。
-
-    Returns:
-        已排序目录名列表。
-
-    Raises:
-        OSError: 读取目录失败时抛出。
-    """
-
-    if not root.exists():
-        return []
-    # 隐藏目录（例如 `.rejections/`）属于仓储内部治理数据，不应暴露为 active 文档 ID。
-    names = [path.name for path in root.iterdir() if path.is_dir() and not path.name.startswith(".")]
-    names.sort()
-    return names

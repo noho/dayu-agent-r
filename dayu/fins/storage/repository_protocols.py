@@ -11,8 +11,12 @@
 
 from __future__ import annotations
 
-from typing import BinaryIO, Optional, Protocol
+from collections.abc import Mapping
+from dataclasses import dataclass
+from types import TracebackType
+from typing import BinaryIO, Literal, Optional, Protocol
 
+from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.source import Source
 from dayu.fins.domain.document_models import (
     BatchToken,
@@ -38,6 +42,183 @@ from dayu.fins.domain.document_models import (
     SourceHandle,
 )
 from dayu.fins.domain.enums import SourceKind
+
+
+@dataclass(frozen=True, slots=True)
+class SourceSnapshotFileDescriptor:
+    """source snapshot 内单个业务文件的无路径描述符。
+
+    Attributes:
+        name: source meta 声明的 exact 业务文件名。
+        etag: 可选对象标识。
+        last_modified: 可选最近修改时间。
+        size: 可选声明字节数。
+        content_type: 可选媒体类型。
+        sha256: 可选文件内容摘要。
+    """
+
+    name: str
+    etag: Optional[str]
+    last_modified: Optional[str]
+    size: Optional[int]
+    content_type: Optional[str]
+    sha256: Optional[str]
+
+
+class SourceSnapshotConsistencyError(RuntimeError):
+    """source publication 持续变化导致无法取得稳定 snapshot。"""
+
+    def __init__(self) -> None:
+        """构造不携带 revision 或 filesystem locator 的一致性异常。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        super().__init__("源文档发布在读取期间持续变化，无法取得稳定快照")
+
+
+class SourceSnapshotProtocol(Protocol):
+    """storage-owned source snapshot 资源协议。"""
+
+    def __enter__(self) -> SourceSnapshotProtocol:
+        """进入 snapshot 资源生命周期。
+
+        Args:
+            无。
+
+        Returns:
+            当前仍可读的 snapshot 资源。
+
+        Raises:
+            RuntimeError: snapshot 已关闭时抛出。
+        """
+
+        ...
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> Literal[False]:
+        """退出 snapshot 资源生命周期并释放临时资源。
+
+        Args:
+            exc_type: 生命周期内活动异常的类型；正常退出时为 ``None``。
+            exc: 生命周期内活动异常；正常退出时为 ``None``。
+            traceback: 生命周期内活动异常的 traceback；正常退出时为 ``None``。
+
+        Returns:
+            始终返回 ``False``，不压制生命周期内的活动异常。
+
+        Raises:
+            OSError: 正常退出且临时资源清理失败时抛出 path-free 文件系统异常。
+        """
+
+        ...
+
+    @property
+    def ticker(self) -> str:
+        """返回 exact external ticker。"""
+
+        ...
+
+    @property
+    def document_id(self) -> str:
+        """返回 exact external document ID。"""
+
+        ...
+
+    @property
+    def source_kind(self) -> SourceKind:
+        """返回 snapshot 已解析的 source kind。"""
+
+        ...
+
+    @property
+    def source_meta(self) -> Mapping[str, JsonValue]:
+        """返回不含 storage 私有字段的独立 source meta 副本。"""
+
+        ...
+
+    @property
+    def provenance(self) -> SourceDocumentProvenance:
+        """返回与 snapshot 同版的 source provenance。"""
+
+        ...
+
+    @property
+    def revision(self) -> SourceDocumentRevision:
+        """返回与 snapshot 同版的 opaque published revision。"""
+
+        ...
+
+    @property
+    def files(self) -> tuple[SourceSnapshotFileDescriptor, ...]:
+        """返回 source meta 顺序下的完整业务文件描述符。"""
+
+        ...
+
+    @property
+    def primary_filename(self) -> str:
+        """返回精确命中文件描述符的主文件名。"""
+
+        ...
+
+    def get_source(self, filename: str) -> Source:
+        """返回 full snapshot 中指定业务文件的临时 Source。
+
+        Args:
+            filename: snapshot 描述符中的 exact 业务文件名。
+
+        Returns:
+            只引用 snapshot 私有临时树的 Source。
+
+        Raises:
+            FileNotFoundError: filename 不属于 snapshot 时抛出。
+            RuntimeError: snapshot 未物化文件或已经关闭时抛出。
+            OSError: 临时文件不可读时抛出。
+        """
+
+        ...
+
+    def get_primary_source(self) -> Source:
+        """返回 full snapshot 的主文件临时 Source。
+
+        Args:
+            无。
+
+        Returns:
+            只引用 snapshot 私有临时树的主文件 Source。
+
+        Raises:
+            RuntimeError: snapshot 未物化文件或已经关闭时抛出。
+            OSError: 临时主文件不可读时抛出。
+        """
+
+        ...
+
+    def close(self) -> None:
+        """幂等关闭 snapshot 并释放其临时资源。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: 临时资源清理失败时抛出 path-free 文件系统异常。
+        """
+
+        ...
 
 
 class BatchingRepositoryProtocol(Protocol):
@@ -388,28 +569,31 @@ class SourceDocumentRepositoryProtocol(Protocol):
         """
         ...
 
-    def get_source_revision(
+    def read_source_snapshot(
         self,
         ticker: str,
         document_id: str,
-        source_kind: SourceKind,
-    ) -> SourceDocumentRevision:
-        """从 published source meta 读取影响 processor 输入的源文档版本。
+        source_kind: Optional[SourceKind] = None,
+        *,
+        materialize_files: bool,
+    ) -> SourceSnapshotProtocol:
+        """读取同一 published revision 的完整 typed source snapshot。
 
         Args:
-            ticker: 股票代码。
-            document_id: 文档 ID。
-            source_kind: 来源类型。
+            ticker: exact external ticker。
+            document_id: exact external document ID。
+            source_kind: 可选显式 source kind；缺省时由 storage 在同一 guard 内解析。
+            materialize_files: 是否把全部业务文件复制到 snapshot 私有临时树。
 
         Returns:
-            storage owner 计算的强类型 source revision。
+            同时拥有 identity、meta、provenance、revision、files 与 primary 的资源。
 
         Raises:
-            FileNotFoundError: source meta 不存在时抛出。
-            KeyError: source meta 缺少必需版本字段时抛出。
-            ValueError: source meta 版本字段类型或内容非法时抛出。
-            RuntimeFileLockError: publication guard 获取或释放失败时抛出。
-            OSError: 底层文件系统读取失败时抛出。
+            FileNotFoundError: source 不存在、已删除或 reset 后抛出。
+            ValueError: source kind 歧义、descriptor、meta、primary 或文件声明非法时抛出。
+            SourceSnapshotConsistencyError: publication 持续变化且内部稳定读取耗尽时抛出。
+            RuntimeError: publication guard 获取或释放失败时抛出。
+            OSError: published 或临时文件系统访问失败时抛出。
         """
         ...
 
@@ -1027,6 +1211,9 @@ class FilingMaintenanceRepositoryProtocol(Protocol):
 __all__ = [
     "BatchingRepositoryProtocol",
     "CompanyMetaRepositoryProtocol",
+    "SourceSnapshotConsistencyError",
+    "SourceSnapshotFileDescriptor",
+    "SourceSnapshotProtocol",
     "SourceDocumentRepositoryProtocol",
     "ProcessedDocumentRepositoryProtocol",
     "DocumentBlobRepositoryProtocol",

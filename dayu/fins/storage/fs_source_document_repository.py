@@ -20,7 +20,6 @@ from dayu.fins.domain.document_models import (
     MaterialRestoreRequest,
     MaterialUpdateRequest,
     SourceDocumentProvenance,
-    SourceDocumentRevision,
     SourceDocumentStateChangeRequest,
     SourceDocumentUpsertRequest,
     SourceHandle,
@@ -29,7 +28,7 @@ from dayu.fins.domain.enums import SourceKind
 
 from ._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 from .file_store import FileStore
-from .repository_protocols import SourceDocumentRepositoryProtocol
+from .repository_protocols import SourceDocumentRepositoryProtocol, SourceSnapshotProtocol
 
 
 def _build_source_handle(ticker: str, document_id: str, source_kind: SourceKind) -> SourceHandle:
@@ -508,31 +507,39 @@ class FsSourceDocumentRepository(SourceDocumentRepositoryProtocol):
 
         return self._repository_set.core.get_source_meta(ticker, document_id, source_kind)
 
-    def get_source_revision(
+    def read_source_snapshot(
         self,
         ticker: str,
         document_id: str,
-        source_kind: SourceKind,
-    ) -> SourceDocumentRevision:
-        """从 published source meta 读取影响 processor 输入的源文档版本。
+        source_kind: Optional[SourceKind] = None,
+        *,
+        materialize_files: bool,
+    ) -> SourceSnapshotProtocol:
+        """读取同一 published revision 的 typed source snapshot。
 
         Args:
-            ticker: 股票代码。
-            document_id: 文档 ID。
-            source_kind: 来源类型。
+            ticker: exact external ticker。
+            document_id: exact external document ID。
+            source_kind: 可选显式 source kind；缺省时由 storage 同 guard 解析。
+            materialize_files: 是否复制全部业务文件到 snapshot 私有临时树。
 
         Returns:
-            storage owner 计算的强类型 source revision。
+            同时拥有 meta、provenance、revision、files 与 primary 的资源。
 
         Raises:
-            FileNotFoundError: source meta 不存在时抛出。
-            KeyError: source meta 缺少必需版本字段时抛出。
-            ValueError: source meta 版本字段类型或内容非法时抛出。
-            RuntimeFileLockError: publication guard 获取或释放失败时抛出。
-            OSError: 底层文件系统读取失败时抛出。
+            FileNotFoundError: source 不存在、已删除或 reset 后抛出。
+            ValueError: source kind 歧义、descriptor、meta 或文件完整性非法时抛出。
+            SourceSnapshotConsistencyError: publication 持续变化时抛出。
+            RuntimeError: publication guard 操作失败时抛出。
+            OSError: published 或临时文件系统访问失败时抛出。
         """
 
-        return self._repository_set.core.get_source_revision(ticker, document_id, source_kind)
+        return self._repository_set.core.read_source_snapshot(
+            ticker,
+            document_id,
+            source_kind,
+            materialize_files=materialize_files,
+        )
 
     def get_source_document_provenance(
         self,

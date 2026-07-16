@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import shutil
+from pathlib import Path
 
 from dayu.fins.domain.document_models import (
     BatchToken,
@@ -17,12 +17,18 @@ from dayu.fins.domain.document_models import (
 )
 
 from ._fs_storage_infra import _ActiveBatchState, _FsStorageInfra
+from ._fs_identity import (
+    _PROCESSED_IDENTITY_NAMESPACE,
+    _identity_directory_for_read,
+    _read_identity_descriptor,
+    _require_external_identity,
+)
 from ._fs_storage_utils import (
     _PROCESSED_META_FILENAME,
-    _normalize_document_id,
-    _normalize_ticker,
+    _list_directory,
     _read_json_array,
     _read_json_object,
+    _unlink_path,
     _write_json,
 )
 
@@ -115,19 +121,26 @@ class _FsProcessedMixin(_FsStorageInfra):
 
         Raises:
             FileNotFoundError: 产物不存在时抛出。
+            ValueError: identity descriptor 或 processed meta 不一致时抛出。
             OSError: 删除失败时抛出。
         """
 
-        ticker = _normalize_ticker(req.ticker)
-        normalized_document_id = _normalize_document_id(req.document_id)
-        processed_dir = self._processed_dir_for_write(ticker, normalized_document_id, state)
-        if not processed_dir.exists():
-            raise FileNotFoundError(f"processed 文档不存在: {processed_dir}")
-        shutil.rmtree(processed_dir)
+        ticker = _require_external_identity(req.ticker, field_name="ticker")
+        document_id = _require_external_identity(req.document_id, field_name="document_id")
+        processed_dir = self._processed_dir_for_write(ticker, document_id, state)
+        meta_path = processed_dir / _PROCESSED_META_FILENAME
+        if not meta_path.exists():
+            raise FileNotFoundError(
+                f"processed 文档不存在: ticker={ticker} document_id={document_id}"
+            )
+        meta = _read_json_object(meta_path)
+        if meta.get("document_id") != document_id:
+            raise ValueError("processed meta 与 identity descriptor 不一致")
+        self._remove_directory(processed_dir)
         self._remove_manifest_item(
             self._processed_manifest_path(ticker, state),
             ticker,
-            normalized_document_id,
+            document_id,
         )
 
     # ========== handle & 元数据 ==========
@@ -144,39 +157,58 @@ class _FsProcessedMixin(_FsStorageInfra):
 
         Raises:
             FileNotFoundError: 文档不存在时抛出。
+            ValueError: ticker、document ID、descriptor 或 meta 不合法时抛出。
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
+            OSError: descriptor 或 meta 读取失败时抛出。
         """
 
-        normalized_ticker = _normalize_ticker(ticker)
-        normalized_document_id = _normalize_document_id(document_id)
-        guard_token = self._acquire_publication_guard(normalized_ticker)
+        external_ticker = _require_external_identity(ticker, field_name="ticker")
+        external_document_id = _require_external_identity(
+            document_id,
+            field_name="document_id",
+        )
+        guard_token = self._acquire_publication_guard(external_ticker)
         try:
-            return self._get_processed_handle_unguarded(normalized_ticker, normalized_document_id)
+            return self._get_processed_handle_unguarded(
+                external_ticker,
+                external_document_id,
+            )
         finally:
             self._release_lock_token(guard_token)
 
     def _get_processed_handle_unguarded(
         self,
-        normalized_ticker: str,
-        normalized_document_id: str,
+        external_ticker: str,
+        external_document_id: str,
     ) -> ProcessedHandle:
         """在 caller 已持 publication guard 时构造 processed 句柄。
 
         Args:
-            normalized_ticker: 已规范化 ticker。
-            normalized_document_id: 已规范化文档 ID。
+            external_ticker: exact external ticker。
+            external_document_id: exact external document ID。
 
         Returns:
             processed 句柄。
 
         Raises:
             FileNotFoundError: processed meta 不存在时抛出。
+            ValueError: descriptor 或 processed meta 不一致时抛出。
+            OSError: descriptor 或 meta 读取失败时抛出。
         """
 
-        meta_path = self._processed_meta_path_for_read(normalized_ticker, normalized_document_id)
+        meta_path = self._processed_meta_path_for_read(
+            external_ticker,
+            external_document_id,
+        )
         if not meta_path.exists():
-            raise FileNotFoundError(f"processed 文档不存在: {meta_path}")
-        return ProcessedHandle(ticker=normalized_ticker, document_id=normalized_document_id)
+            raise FileNotFoundError(
+                "processed 文档不存在: "
+                f"ticker={external_ticker} document_id={external_document_id}"
+            )
+        meta = _read_json_object(meta_path)
+        if meta.get("document_id") != external_document_id:
+            raise ValueError("processed meta 与 identity descriptor 不一致")
+        return ProcessedHandle(ticker=external_ticker, document_id=external_document_id)
 
     def get_processed_meta(self, ticker: str, document_id: str) -> DocumentMeta:
         """从 published tree 读取 processed 元数据。
@@ -197,24 +229,30 @@ class _FsProcessedMixin(_FsStorageInfra):
             OSError: published meta 读取失败时抛出。
         """
 
-        normalized_ticker = _normalize_ticker(ticker)
-        normalized_document_id = _normalize_document_id(document_id)
-        guard_token = self._acquire_publication_guard(normalized_ticker)
+        external_ticker = _require_external_identity(ticker, field_name="ticker")
+        external_document_id = _require_external_identity(
+            document_id,
+            field_name="document_id",
+        )
+        guard_token = self._acquire_publication_guard(external_ticker)
         try:
-            return self._get_processed_meta_unguarded(normalized_ticker, normalized_document_id)
+            return self._get_processed_meta_unguarded(
+                external_ticker,
+                external_document_id,
+            )
         finally:
             self._release_lock_token(guard_token)
 
     def _get_processed_meta_unguarded(
         self,
-        normalized_ticker: str,
-        normalized_document_id: str,
+        external_ticker: str,
+        external_document_id: str,
     ) -> DocumentMeta:
         """在 caller 已持 publication guard 时读取 processed meta。
 
         Args:
-            normalized_ticker: 已规范化 ticker。
-            normalized_document_id: 已规范化文档 ID。
+            external_ticker: exact external ticker。
+            external_document_id: exact external document ID。
 
         Returns:
             processed 元数据。
@@ -224,10 +262,19 @@ class _FsProcessedMixin(_FsStorageInfra):
             ValueError: meta 内容非法时抛出。
         """
 
-        meta_path = self._processed_meta_path_for_read(normalized_ticker, normalized_document_id)
+        meta_path = self._processed_meta_path_for_read(
+            external_ticker,
+            external_document_id,
+        )
         if meta_path.exists():
-            return _read_json_object(meta_path)
-        raise FileNotFoundError(f"processed 元数据不存在: {meta_path}")
+            meta = _read_json_object(meta_path)
+            if meta.get("document_id") != external_document_id:
+                raise ValueError("processed meta 与 identity descriptor 不一致")
+            return meta
+        raise FileNotFoundError(
+            "processed 元数据不存在: "
+            f"ticker={external_ticker} document_id={external_document_id}"
+        )
 
     # ========== reprocess ==========
 
@@ -277,22 +324,113 @@ class _FsProcessedMixin(_FsStorageInfra):
             无。
 
         Raises:
+            ValueError: ticker、document ID、descriptor 或 meta 不合法时抛出。
             OSError: 读写失败时抛出。
         """
 
-        processed_meta_path = self._processed_meta_path(
-            _normalize_ticker(ticker),
-            _normalize_document_id(document_id),
+        self._require_state_ticker(
             state,
+            _require_external_identity(ticker, field_name="ticker"),
         )
+        external_document_id = _require_external_identity(
+            document_id,
+            field_name="document_id",
+        )
+        processed_dir = _identity_directory_for_read(
+            state.staging_ticker_dir / "processed",
+            _PROCESSED_IDENTITY_NAMESPACE,
+            external_document_id,
+        )
+        processed_meta_path = processed_dir / _PROCESSED_META_FILENAME
         if not processed_meta_path.exists():
             return
         processed_meta = _read_json_object(processed_meta_path)
+        if processed_meta.get("document_id") != external_document_id:
+            raise ValueError("processed meta 与 identity descriptor 不一致")
         processed_meta["reprocess_required"] = True
         processed_meta["updated_at"] = now_iso8601()
         _write_json(processed_meta_path, processed_meta)
 
     # ========== 批量清理 ==========
+
+    def _preflight_processed_cleanup(
+        self,
+        external_ticker: str,
+        state: _ActiveBatchState,
+    ) -> list[Path]:
+        """在任何 processed clear mutation 前验证整棵 staging processed tree。
+
+        Args:
+            external_ticker: exact external ticker。
+            state: 已解析的内部 transaction state。
+
+        Returns:
+            通过完整 preflight 的 processed root 直系条目快照。
+
+        Raises:
+            ValueError: root、control file、identity、meta 或 manifest 不一致时抛出。
+            OSError: 枚举或读取失败时抛出无物理 locator 的异常。
+        """
+
+        processed_root = self._ticker_dir_for_write(external_ticker, state) / "processed"
+        if not processed_root.exists():
+            return []
+        if processed_root.is_symlink() or not processed_root.is_dir():
+            raise ValueError("processed root 必须为 non-symlink directory")
+        entries = _list_directory(
+            processed_root,
+            action="枚举 processed cleanup entries",
+        )
+        descriptor_document_ids: list[str] = []
+        for child in entries:
+            if child.name == "manifest.json":
+                if child.is_symlink() or not child.is_file():
+                    raise ValueError("processed manifest 必须为 non-symlink regular file")
+                continue
+            if child.is_symlink() or not child.is_dir():
+                raise ValueError("processed root 存在非法条目")
+            external_document_id = _read_identity_descriptor(
+                child,
+                _PROCESSED_IDENTITY_NAMESPACE,
+            )
+            meta_path = child / _PROCESSED_META_FILENAME
+            if meta_path.is_symlink() or not meta_path.is_file():
+                raise ValueError("processed meta 必须为 non-symlink regular file")
+            meta = _read_json_object(meta_path)
+            if meta.get("document_id") != external_document_id:
+                raise ValueError("processed meta 与 identity descriptor 不一致")
+            for document_entry in _list_directory(
+                child,
+                action="枚举 processed document entries",
+            ):
+                if document_entry.is_symlink() or not document_entry.is_file():
+                    raise ValueError("processed document 存在非法文件条目")
+            descriptor_document_ids.append(external_document_id)
+
+        manifest = self._read_manifest(
+            self._processed_manifest_path(external_ticker, state),
+            external_ticker,
+        )
+        raw_documents = manifest.get("documents")
+        if not isinstance(raw_documents, list):
+            raise ValueError("processed manifest documents 必须为数组")
+        manifest_document_ids: list[str] = []
+        for raw_document in raw_documents:
+            if not isinstance(raw_document, dict):
+                raise ValueError("processed manifest document 必须为 object")
+            raw_document_id = raw_document.get("document_id")
+            if not isinstance(raw_document_id, str):
+                raise ValueError("processed manifest document_id 必须为字符串")
+            external_document_id = _require_external_identity(
+                raw_document_id,
+                field_name="processed manifest document_id",
+            )
+            if external_document_id in manifest_document_ids:
+                raise ValueError("processed manifest document_id 重复")
+            manifest_document_ids.append(external_document_id)
+        if sorted(manifest_document_ids) != sorted(descriptor_document_ids):
+            raise ValueError("processed manifest 与 identity descriptors 不双向一致")
+        return entries
 
     def clear_processed_documents(self, ticker: str, *, batch: BatchToken) -> None:
         """清空某个 ticker 下的 processed 目录内容。
@@ -323,18 +461,24 @@ class _FsProcessedMixin(_FsStorageInfra):
             无。
 
         Raises:
+            ValueError: ticker、document ID 或 identity directory 不合法时抛出。
             OSError: 清理失败时抛出。
         """
 
-        normalized_ticker = _normalize_ticker(ticker)
-        processed_dir = self._ticker_dir_for_write(normalized_ticker, state) / "processed"
+        external_ticker = _require_external_identity(ticker, field_name="ticker")
+        processed_dir = self._ticker_dir_for_write(external_ticker, state) / "processed"
         if not processed_dir.exists():
             return
-        for child in processed_dir.iterdir():
+        cleanup_entries = self._preflight_processed_cleanup(external_ticker, state)
+        for child in cleanup_entries:
             if child.is_dir():
-                shutil.rmtree(child)
+                self._remove_directory(child)
                 continue
-            child.unlink(missing_ok=True)
+            _unlink_path(
+                child,
+                missing_ok=True,
+                action="删除 processed cleanup control file",
+            )
 
     # ========== 内部实现 ==========
 
@@ -357,22 +501,29 @@ class _FsProcessedMixin(_FsStorageInfra):
         Raises:
             FileExistsError: 创建时已存在。
             FileNotFoundError: 更新时不存在。
+            ValueError: identity descriptor 或 processed meta 不一致时抛出。
             OSError: 写入失败。
         """
 
-        ticker = _normalize_ticker(req.ticker)
-        normalized_document_id = _normalize_document_id(req.document_id)
-        processed_dir = self._processed_dir_for_write(ticker, normalized_document_id, state)
+        ticker = _require_external_identity(req.ticker, field_name="ticker")
+        document_id = _require_external_identity(req.document_id, field_name="document_id")
+        processed_dir = self._processed_dir_for_write(ticker, document_id, state)
         meta_path = processed_dir / _PROCESSED_META_FILENAME
 
-        exists = processed_dir.exists()
+        exists = meta_path.exists()
         if is_create and exists:
-            raise FileExistsError(f"processed 文档已存在: {processed_dir}")
+            raise FileExistsError(
+                f"processed 文档已存在: ticker={ticker} document_id={document_id}"
+            )
         if not is_create and not exists:
-            raise FileNotFoundError(f"processed 文档不存在: {processed_dir}")
+            raise FileNotFoundError(
+                f"processed 文档不存在: ticker={ticker} document_id={document_id}"
+            )
 
         processed_dir.mkdir(parents=True, exist_ok=True)
         previous_meta = _read_json_object(meta_path) if meta_path.exists() else {}
+        if previous_meta and previous_meta.get("document_id") != document_id:
+            raise ValueError("processed meta 与 identity descriptor 不一致")
         financials_path = processed_dir / "financials.json"
 
         if req.sections is not None:
@@ -383,7 +534,11 @@ class _FsProcessedMixin(_FsStorageInfra):
             _write_json(financials_path, req.financials)
         elif financials_path.exists():
             # 显式移除旧 financials，避免 has_xbrl 被历史产物污染。
-            financials_path.unlink()
+            _unlink_path(
+                financials_path,
+                missing_ok=False,
+                action="删除旧 processed financials",
+            )
 
         sections_path = processed_dir / "sections.json"
         tables_path = processed_dir / "tables.json"
@@ -394,7 +549,7 @@ class _FsProcessedMixin(_FsStorageInfra):
 
         merged_meta = dict(previous_meta)
         merged_meta.update(req.meta)
-        merged_meta["document_id"] = normalized_document_id
+        merged_meta["document_id"] = document_id
         merged_meta["internal_document_id"] = req.internal_document_id
         merged_meta["source_kind"] = req.source_kind
         merged_meta.setdefault("source_document_version", "v1")
@@ -413,7 +568,7 @@ class _FsProcessedMixin(_FsStorageInfra):
             state,
             [
                 ProcessedManifestItem(
-                    document_id=normalized_document_id,
+                    document_id=document_id,
                     internal_document_id=req.internal_document_id,
                     source_kind=req.source_kind,
                     form_type=req.form_type,
@@ -435,6 +590,6 @@ class _FsProcessedMixin(_FsStorageInfra):
 
         return DocumentHandle(
             ticker=ticker,
-            document_id=normalized_document_id,
+            document_id=document_id,
             form_type=req.form_type,
         )

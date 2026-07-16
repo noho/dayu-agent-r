@@ -43,6 +43,7 @@ from dayu.fins.storage import (
     FsSourceDocumentRepository,
 )
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
+from dayu.fins.storage.repository_protocols import SourceSnapshotProtocol
 from dayu.fins.tools.read_runtime import FinsReadRuntime, _parse_source_document_meta
 from dayu.fins.tools.read_runtime_helpers import FinsReadBusinessError, _resolve_processor_taxonomy
 from dayu.fins.tools.result_types import FinancialStatementResult, NotSupportedResult
@@ -502,7 +503,7 @@ class _FixedProcessorRegistry(ProcessorRegistry):
 
 
 class _CountingSourceRepository(FsSourceDocumentRepository):
-    """统计 source meta 读取次数的测试仓储。"""
+    """统计 typed list、meta 与 snapshot 读取的测试仓储。"""
 
     def __init__(self, workspace_root: Path, *, repository_set: _FsRepositorySet) -> None:
         """初始化计数仓储。
@@ -529,6 +530,68 @@ class _CountingSourceRepository(FsSourceDocumentRepository):
         )
         self.get_source_meta_calls = 0
         self.get_source_meta_calls_by_kind: dict[SourceKind, int] = {}
+        self.list_source_document_ids_calls: list[SourceKind] = []
+        self.snapshot_read_calls = 0
+        self.full_snapshot_roots: list[Path] = []
+
+    def list_source_document_ids(
+        self,
+        ticker: str,
+        source_kind: SourceKind,
+    ) -> list[str]:
+        """统计并执行 typed source document list。
+
+        Args:
+            ticker: 股票代码。
+            source_kind: 来源类型。
+
+        Returns:
+            storage 返回的文档 ID 列表。
+
+        Raises:
+            OSError: 底层目录读取失败时抛出。
+        """
+
+        self.list_source_document_ids_calls.append(source_kind)
+        return super().list_source_document_ids(ticker, source_kind)
+
+    def read_source_snapshot(
+        self,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind | None = None,
+        *,
+        materialize_files: bool,
+    ) -> SourceSnapshotProtocol:
+        """统计并执行真实 storage snapshot 读取。
+
+        Args:
+            ticker: 股票代码。
+            document_id: 文档 ID。
+            source_kind: 可选来源类型。
+            materialize_files: 是否物化业务文件。
+
+        Returns:
+            storage-owned snapshot。
+
+        Raises:
+            FileNotFoundError: source 不存在时抛出。
+            ValueError: source kind 歧义或 descriptor 非法时抛出。
+            OSError: snapshot I/O 失败时抛出。
+        """
+
+        self.snapshot_read_calls += 1
+        snapshot = super().read_source_snapshot(
+            ticker,
+            document_id,
+            source_kind,
+            materialize_files=materialize_files,
+        )
+        if materialize_files:
+            self.full_snapshot_roots.append(
+                snapshot.get_primary_source().materialize().parent
+            )
+        return snapshot
 
     def get_source_meta(
         self,
@@ -661,8 +724,10 @@ def test_parse_source_document_meta_rejects_non_bool_fields(field_name: str, val
         _parse_source_document_meta(raw_meta)
 
 
-def test_read_runtime_source_meta_cache_is_bounded(tmp_path: Path) -> None:
-    """source meta cache 不得超过配置上限。
+def test_read_runtime_snapshot_processor_cache_is_bounded_and_releases_evicted_resources(
+    tmp_path: Path,
+) -> None:
+    """snapshot processor cache 受容量约束且淘汰时释放资源。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -674,19 +739,29 @@ def test_read_runtime_source_meta_cache_is_bounded(tmp_path: Path) -> None:
         AssertionError: 断言失败时抛出。
     """
 
-    runtime, source_repository = _build_runtime_with_source_documents(tmp_path, source_meta_cache_max_entries=2)
+    processor = _FinancialStatementPayloadProcessor(_FakeSource())
+    runtime, source_repository = _build_runtime_with_source_documents(
+        tmp_path,
+        processor_cache_max_entries=2,
+        processor_registry=_FixedProcessorRegistry(processor),
+    )
+    roots: list[Path] = []
+    for document_id in ("doc-1", "doc-2", "doc-3"):
+        with runtime._borrow_processor(ticker="AAPL", document_id=document_id) as borrow:
+            roots.append(borrow.snapshot.get_primary_source().materialize().parent)
 
-    assert runtime._get_document_meta_cached("AAPL", "doc-1") is not None
-    assert runtime._get_document_meta_cached("AAPL", "doc-2") is not None
-    assert runtime._get_document_meta_cached("AAPL", "doc-3") is not None
-    assert source_repository.get_source_meta_calls == 3
+    assert runtime._processor_cache.size() == 2
+    assert len(source_repository.full_snapshot_roots) == 3
+    assert not roots[0].exists()
+    assert roots[1].exists()
+    assert roots[2].exists()
 
-    assert runtime._get_document_meta_cached("AAPL", "doc-1") is not None
-    assert source_repository.get_source_meta_calls == 4
+    runtime.close()
+    assert all(not root.exists() for root in roots)
 
 
-def test_read_runtime_source_meta_cache_is_partitioned_by_source_kind(tmp_path: Path) -> None:
-    """source meta by-kind 缓存不得混用不同来源类型。
+def test_storage_snapshot_resolves_explicit_kind_and_rejects_ambiguity(tmp_path: Path) -> None:
+    """source kind 的 0/1/2 解析只由 storage snapshot owner 完成。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -698,7 +773,10 @@ def test_read_runtime_source_meta_cache_is_partitioned_by_source_kind(tmp_path: 
         AssertionError: 断言失败时抛出。
     """
 
-    runtime, source_repository = _build_runtime_with_source_documents(tmp_path, source_meta_cache_max_entries=4)
+    _runtime, source_repository = _build_runtime_with_source_documents(
+        tmp_path,
+        processor_cache_max_entries=4,
+    )
     batch = source_repository._batching_repository.begin_batch("AAPL")
     _create_source_document(
         source_repository=source_repository,
@@ -710,19 +788,27 @@ def test_read_runtime_source_meta_cache_is_partitioned_by_source_kind(tmp_path: 
     )
     source_repository._batching_repository.commit_batch(batch)
 
-    filing_meta = runtime._get_source_meta_cached_by_kind("AAPL", "doc-1", SourceKind.FILING)
-    material_meta = runtime._get_source_meta_cached_by_kind("AAPL", "doc-1", SourceKind.MATERIAL)
-    cached_filing_meta = runtime._get_source_meta_cached_by_kind("AAPL", "doc-1", SourceKind.FILING)
-    cached_material_meta = runtime._get_source_meta_cached_by_kind("AAPL", "doc-1", SourceKind.MATERIAL)
-
-    assert filing_meta["form_type"] == "10-K"
-    assert material_meta["form_type"] == "EX-99"
-    assert cached_filing_meta["form_type"] == "10-K"
-    assert cached_material_meta["form_type"] == "EX-99"
-    assert source_repository.get_source_meta_calls_by_kind == {
-        SourceKind.FILING: 1,
-        SourceKind.MATERIAL: 1,
-    }
+    with pytest.raises(ValueError, match="不明确"):
+        source_repository.read_source_snapshot(
+            "AAPL",
+            "doc-1",
+            None,
+            materialize_files=False,
+        )
+    with source_repository.read_source_snapshot(
+        "AAPL",
+        "doc-1",
+        SourceKind.FILING,
+        materialize_files=False,
+    ) as filing_snapshot:
+        assert filing_snapshot.source_meta["form_type"] == "10-K"
+    with source_repository.read_source_snapshot(
+        "AAPL",
+        "doc-1",
+        SourceKind.MATERIAL,
+        materialize_files=False,
+    ) as material_snapshot:
+        assert material_snapshot.source_meta["form_type"] == "EX-99"
 
 
 @pytest.mark.parametrize(
@@ -828,7 +914,7 @@ def test_get_financial_statement_accepts_list_rows(tmp_path: Path) -> None:
     )
     runtime, _source_repository = _build_runtime_with_source_documents(
         tmp_path,
-        source_meta_cache_max_entries=4,
+        processor_cache_max_entries=4,
         processor_registry=_FixedProcessorRegistry(processor),
     )
 
@@ -865,7 +951,7 @@ def test_query_xbrl_facts_maps_all_failed_to_typed_business_failure(tmp_path: Pa
     processor = _AllFailedXbrlProcessor(_FakeSource())
     runtime, _source_repository = _build_runtime_with_source_documents(
         tmp_path,
-        source_meta_cache_max_entries=4,
+        processor_cache_max_entries=4,
         processor_registry=_FixedProcessorRegistry(processor),
     )
 
@@ -923,6 +1009,83 @@ def test_fins_read_runtime_weak_typing_guards_lock_owner_boundaries() -> None:
         )
 
 
+def test_read_runtime_has_no_revision_hash_double_read_or_source_kind_probe() -> None:
+    """read runtime 不得重建 revision、double-read 或自行探测 source kind。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: consumer 旧一致性算法或 source kind probing 回归时抛出。
+    """
+
+    path = Path("dayu/fins/tools/read_runtime.py")
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(path))
+    forbidden_names = {
+        "_build_source_" + "revision",
+        "_resolve_source_kind",
+        "_get_document_meta_cached",
+        "_get_source_meta_cached_by_kind",
+        "revision_" + "before",
+        "revision_" + "after",
+    }
+    assert forbidden_names.isdisjoint(
+        node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
+    )
+    forbidden_repository_calls = (
+        "get_source_" + "revision",
+        "get_document_provenance",
+        "get_source_handle",
+        "get_primary_source",
+        "get_source",
+    )
+    repository_calls = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and ast.unparse(node.func.value).endswith("_source_repository")
+    }
+    assert repository_calls.isdisjoint(forbidden_repository_calls)
+    assert "hashlib" not in source
+    assert ".digest" not in source
+
+
+def test_list_documents_uses_two_typed_storage_lists_without_per_document_snapshot(
+    tmp_path: Path,
+) -> None:
+    """list_documents 只组合 filing/material typed list，不构造 per-document snapshot。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: list 路径触发 kind probing 或 snapshot N+1 时抛出。
+    """
+
+    runtime, source_repository = _build_runtime_with_source_documents(
+        tmp_path,
+        processor_cache_max_entries=4,
+    )
+
+    result = runtime.list_documents(ticker="AAPL")
+
+    assert result["total"] == 3
+    assert source_repository.list_source_document_ids_calls == [
+        SourceKind.FILING,
+        SourceKind.MATERIAL,
+    ]
+    assert source_repository.get_source_meta_calls == 3
+    assert source_repository.snapshot_read_calls == 0
+
+
 def test_fins_import_boundary_keeps_host_exception_narrow() -> None:
     """Fins import boundary 只允许 wait adapter 依赖 Host wait contract。
 
@@ -949,14 +1112,14 @@ def test_fins_import_boundary_keeps_host_exception_narrow() -> None:
 def _build_runtime_with_source_documents(
     tmp_path: Path,
     *,
-    source_meta_cache_max_entries: int,
+    processor_cache_max_entries: int,
     processor_registry: ProcessorRegistry | None = None,
 ) -> tuple[FinsReadRuntime, _CountingSourceRepository]:
     """构造带多个 source document 的 read runtime 与计数仓储。
 
     Args:
         tmp_path: pytest 临时目录。
-        source_meta_cache_max_entries: source meta 缓存容量。
+        processor_cache_max_entries: snapshot processor 缓存容量。
         processor_registry: 可选 processor registry。
 
     Returns:
@@ -1001,7 +1164,7 @@ def _build_runtime_with_source_documents(
         source_repository=source_repository,
         processed_repository=processed_repository,
         processor_registry=processor_registry or ProcessorRegistry(),
-        source_meta_cache_max_entries=source_meta_cache_max_entries,
+        processor_cache_max_entries=processor_cache_max_entries,
     )
     return runtime, source_repository
 
