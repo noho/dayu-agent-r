@@ -6,11 +6,11 @@
 |---|---|
 | umbrella | `WU-SEMANTIC-OWNERSHIP-01` |
 | sub-WU | 既有 remediation `R08`；不是新 WU、feature 或 issue |
-| gate | plan review fix 后的 code-generation-ready plan；完成后停回 Controller validation |
-| base / transition HEAD | `8d9bf63b3ab56f9ba3d5355d75af4ee002548c9c` |
+| gate | 同一 R08 cumulative validation plan-correction review fix；完成后停回 Controller，由 Controller 派发两路完整 re-review |
+| accepted plan / S1 transition | `19cbe8a054784297a593cfd6ea823bac40109b99` / `c433b21a881ff10311a3bdf8ac77a583a98184aa` |
 | R07 completion commit | `28b6fc1956bd3832489a471fa29bfe354b319860` |
 | 固定 slices | S1 producer domain contracts + all actual processors；S2 read/tool/LLM single projection |
-| 本 gate 授权 | 只修改本计划并新增一个 plan-fix artifact；不实施、不 stage、不 commit、不 push、不建 PR |
+| 本 gate 授权 | 只修改本计划并新增 cumulative-validation plan-correction review-fix artifact；不修改当前 production/tests/S1 artifact/control/controller/reviewer artifacts/README/design，不实施 S2，不 stage、不 commit、不 push、不建 PR |
 
 R08 只落实 umbrella remediation plan §15 已裁决的 Topic 6.4：收窄 financial/XBRL 的 LLM-facing contract，并建立单一 public typed projection。R06 transaction/publication owner 与 R07 identity/revision/snapshot/citation/provenance owner 已完成，本计划只消费它们，不回改。
 
@@ -38,7 +38,7 @@ R08 只落实 umbrella remediation plan §15 已裁决的 Topic 6.4：收窄 fin
 - Public XBRL 只有一个 `fact_count`，且唯一赋值 owner 执行 `len(returned_facts)`。
 - Tool description、result serializer 与 LLM-facing 字段说明从同一 typed projection/helper 派生，自足说明字段、类型、必填性、枚举与最小示例。
 - 真实 AAPL XBRL fixture、真实 HTML 财务表 smoke、owner tests、逐文件 coverage、pyright、Ruff、diff/source/propagation scans 全部通过。
-- S1 完整 review/fix/re-review 关闭后才进入 S2；R08 后仍需 R09-R12 与 umbrella aggregate deepreview。
+- S1→S2 保持 producer→consumer 的实现依赖顺序，但两步属于同一累计 destructive cutover；S1 不再是独立 validation/review gate，只有累计 S1+S2 tree 全绿后才进入一次 immutable dual code review、fix/re-review 与 aggregate deepreview。R08 后仍需 R09-R12 与 umbrella aggregate deepreview。
 
 ### 2.2 不可回改的 owner
 
@@ -371,7 +371,7 @@ tests/fins/test_fins_read_runtime.py
 
 - S1 只允许迁移 `_extract_fiscal_from_xbrl_query` 的 import、专用 fixture `_FiscalXbrlProcessor` 与当前 node `test_sec_fiscal_inference_rejects_invalid_xbrl_total`；该 node 改为 `test_sec_fiscal_inference_consumes_countless_xbrl_contract`，直接证明 fiscal consumer 接受无 count 的新 producer contract。
 - S2 只允许迁移 `_normalize_xbrl_query_payload` 的 import 与当前 `test_xbrl_query_payload_missing_total_fails_closed`、`test_xbrl_query_payload_non_int_total_fails_closed`、`test_xbrl_query_payload_mismatched_raw_total_fails_closed_before_dedup`、`test_xbrl_query_payload_preserves_processor_total_after_dedup`、`test_xbrl_query_payload_always_projects_dedup_count_and_owner_quality`、`test_xbrl_query_payload_rejects_producer_dedup_count` 这组 read normalize/dedup nodes。
-- 两个 slice 都不得修改该文件的 generic LRU、form matching nodes；共享 import 行只能作与上述各自 symbols 直接相关的机械调整。S1 Controller validation 与两路 review 必须按 symbol 而非整文件授权核对 diff。六个 normalize/dedup nodes 仍由 S2 完整迁移、运行和验收；S1 不运行它们，也不得对它们加 `skip` / `xfail`、兼容 fixture 或 production shim 伪造绿色。
+- 两个 implementation step 都不得修改该文件的 generic LRU、form matching nodes；共享 import 行只能作与上述各自 symbols 直接相关的机械调整。六个 normalize/dedup nodes 仍由 S2 完整迁移，并与 S1 fiscal node 一起在累计 S1+S2 tree 上运行和验收；不得对任一 node 加 `skip` / `xfail`、兼容 fixture 或 production shim 伪造绿色。
 
 ### 5.2 实施顺序
 
@@ -397,40 +397,27 @@ tests/fins/test_fins_read_runtime.py
 - Producer不输出任何count，validator前后raw payload/list/facts深度相等；
 - Fiscal extraction只消费新validator，不存在alternate financial reason owner。
 
-最小focused命令：
+S1 owner tests 仍须随 producer owner 实现，但不在 producer/旧 public consumer 共存的中间 tree 上形成正式 collection、coverage 或 acceptance 命令。`test_sec_fiscal_inference_consumes_countless_xbrl_contract` 与全部 S1 owner tests 在 S2 恢复 public import graph 后，按 §6.6 的累计命令统一收集。
 
-```bash
-source .venv/bin/activate
-pytest tests/fins/test_financial_read_contracts.py tests/fins/test_sec_pipeline_download.py tests/fins/test_processor_registry.py -k 'financial or statement or xbrl or quality or reason or fiscal'
-pytest tests/fins/test_fins_read_runtime.py::test_sec_fiscal_inference_consumes_countless_xbrl_contract
-```
+### 5.4 S1 中间 tree 定位：实现证据，不是 validation/review gate
 
-### 5.4 验证门
+S1 implementation artifact `docs/reviews/wu-semantic-ownership-01-r08-s1-implementation-codex.md` 保留为 blocked intermediate evidence。它记录 producer/processor 实现、focused owner matrix、modified-owner pyright、scoped Ruff、source scans、diff check，以及下列 plan-drift root-cause；它不代表可接受 product state：
 
-```bash
-source .venv/bin/activate
-pytest tests/fins/test_financial_read_contracts.py tests/fins/test_sec_pipeline_download.py tests/fins/test_fins_read_runtime.py::test_sec_fiscal_inference_consumes_countless_xbrl_contract tests/fins/test_processor_registry.py
-python -m coverage erase
-python -m coverage run -m pytest tests/fins/test_financial_read_contracts.py tests/fins/test_sec_pipeline_download.py tests/fins/test_fins_read_runtime.py::test_sec_fiscal_inference_consumes_countless_xbrl_contract
-python -m coverage report --include='dayu/fins/domain/financial_result_contract.py,dayu/fins/domain/xbrl_result_contract.py,dayu/fins/processors/financial_base.py,dayu/fins/processors/html_financial_statement_common.py,dayu/fins/processors/report_form_financial_statement_common.py,dayu/fins/processors/sec_report_form_common.py,dayu/fins/processors/bs_report_form_common.py,dayu/fins/processors/six_k_form_common.py,dayu/fins/processors/sec_processor.py,dayu/fins/processors/bs_six_k_processor.py,dayu/fins/processors/sec_xbrl_query.py,dayu/fins/pipelines/sec_fiscal_fields.py' --fail-under=80
-pyright <S1全部实际修改的production与test Python文件>
-pyright
-python -m ruff check <S1全部实际修改的Python文件>
-git diff --check
-```
+- 任何 `dayu.fins.tools` 子模块 collection 都会经旧 S2 consumer import graph 读取已删除的 `StatementLocator`，因此 S1 exact fiscal node 不能在测试执行前被收集；
+- 两份当前可收集 owner tests 与已发现相关测试并集仍使七个实际修改 processor 文件只有 `41%–67%` whole-file coverage；
+- full pyright 的五条诊断全部是新 producer contract 向尚未迁移 S2 consumer 的直接传播，但红色 ledger 只保留为 drift/root-cause 证据，不再构成 formal pass。
 
-S1 正式 pytest 与 coverage 命令对共享 `tests/fins/test_fins_read_runtime.py` 只能使用上述单一 fiscal node id；不得把整个共享文件、`-k xbrl_query_payload` 或六个 S2 normalize/dedup node 纳入 S1 收集。Coverage门必须逐个实际修改production文件`>=80.00%`，不能用aggregate掩盖低文件。只列入allowlist但零diff的文件不新增coverage义务。S1 modified-owner scoped pyright/类型验证必须零；同时必须执行full pyright。
+因此 S1 完成实现后直接在同一未提交 tree 上进入 S2，且必须满足：
 
-S1 implementation 结束后、两路 review 开始前，Controller validation artifact 必须锁定同一受保护 tree，并产出不可变证据：
+1. S1/S2 实现顺序不变；S2 只按 §6.1 既有 production/test/README allowlist 迁移 public consumer，不提前或反向修改 producer owner；
+2. 不为 S1 中间 tree 运行或要求独立 exact-node collection、whole-file coverage session、full-pyright propagation-ledger pass、Controller immutable-tree lock、双路 code review、fix/re-review；
+3. 不新增 compatibility field/type、lazy import、cast、ignore、test shim、skip/xfail、默认值或临时 adapter；
+4. S1/S2 之间不 stage、不 commit；当前 S1 artifact 保持 blocked intermediate evidence；
+5. focused tests、real smokes、全部 scans、full pyright、scoped Ruff、逐文件 coverage、immutable tree lock 与双路 review 全部移动到 §6.6/§6.9 的累计 S1+S2 tree。
 
-1. 记录 base HEAD、`git status --short`、S1 changed-path manifest、每个 changed path 工作树内容的 SHA-256，以及完整 S1 `git diff --binary` 的 SHA-256；path content-hash manifest + cumulative diff hash 共同构成两路 reviewer 的唯一受保护 review tree 标识，无需 stage 或 commit。
-2. 在该 tree 上运行 full `pyright`，保留完整诊断，并产出精确 propagation ledger：每行必须记录诊断文件、symbol、pyright rule/message、已删除 producer field/type、对应 S2 owner/action。
-3. ledger 中诊断只允许落在预声明四个 S2 production paths：`dayu/fins/tools/result_types.py`、`dayu/fins/tools/read_runtime_helpers.py`、`dayu/fins/tools/read_runtime.py`、`dayu/fins/tools/fins_tools.py`。每条必须是已删 producer field/type 的直接传播；测试文件、S1 owner、其它 production path、无法精确对应 S2 action 的任何诊断均使 S1 失败。
-4. 两路 reviewer 必须分别重算并核对同一 diff hash，逐条核对同一 full-pyright ledger，不得用“S2 会修”接受未登记诊断。锁定后任何文件变化都使 Controller validation 与两路 review 失效，必须在新 hash 上完整重跑。
+### 5.5 Producer-owner scans（在累计 tree 上执行）
 
-S1 不用 compatibility field、cast、ignore、shim 或临时 adapter 伪造 full pyright green，也不增加 S1 commit。该红色 full-pyright ledger 只是固定 two-slice/no-compat 约束下的 internal review checkpoint，不是可接受 product state；S2 完成后 full pyright 必须 `0 errors`。
-
-### 5.5 S1 scans
+以下 scans 保持原样，但不构成 S1 独立 gate；S2 完成后与 §6.7 的 public/LLM/AST/no-touch scans 在同一累计 tree 上统一执行。
 
 Internal raw-total positive inventory只扫owner roots，不做全仓`total`零命中：
 
@@ -459,17 +446,17 @@ rg -n 'statement_locator|StatementLocator|build_statement_locator|statement_meth
 
 预期零命中。测试不得通过拆字符串规避scan；另用exact-key/AST/运行时assertions证明删除。
 
-### 5.6 S1 review与commit边界
+### 5.6 S1→S2 累计 cutover 与 commit 边界
 
-顺序固定为：AgentCodex implementation/self-check → Controller validation锁定§5.4 tree/diff hash与full-pyright exact ledger → AgentMiMo与AgentDS对同一immutable S1 diff并发完整review且独立核对同一ledger → Controller adjudication → 必要fix → 两路re-review → Controller逐条关闭。任何fix都必须生成新hash并重跑validation/review；全部关闭前不得进入S2。
+顺序固定为：AgentCodex S1 implementation/self-check（blocked intermediate evidence）→ AgentCodex 直接在同一 tree 上实施 S2 → §6.6 累计完整验证。S1 不是独立 acceptance、validation 或 review boundary；不得在 S1/S2 之间插入 Controller lock、MiMo/DS review、fix/re-review、stage 或 commit。
 
-S1不做中间commit。S1与S2是同一次破坏性contract cutover；中间commit会把旧public consumer与新producer组合声明为可接受历史状态。S1仍是严格review boundary，必须有focused tests、逐文件coverage、scoped Ruff、scans、diff check和限定propagation evidence，不能用临时shim制造绿色。
+S1与S2是同一次破坏性contract cutover；中间commit会把旧public consumer与新producer组合声明为可接受历史状态。只有累计 S1+S2 tree 按 §6.6 全绿、按 §6.9 完成 immutable dual code review/fix/re-review、再完成 aggregate deepreview 后，Controller才可授权一个exact-scope accepted local implementation commit。
 
 ## 6. R08-S2 — read/tool/LLM single projection
 
 ### 6.1 依赖与 exact allowlist
 
-进入条件：S1 implementation validation通过，两路review/fix/re-review和Controller adjudication全部关闭；S1 cumulative tree未commit且未混入其它scope。
+进入条件：S1 producer/processor implementation 与 blocked intermediate artifact 已完成；当前 11 个 production、3 个 tests 的受保护 binary diff SHA-256 仍为 `0d985b85aa65d7c4b06d9ee464cd73fc4a39ef2ee0934f376b0b845a09b20f57`；tree 未 stage/commit 且未混入其它scope。S1 独立 validation/review 不再是 S2 前置条件。
 
 S2 production diff闭集：
 
@@ -552,7 +539,7 @@ Forced-truncation 的 current-tree 可执行机制固定在 `tests/fins/test_fin
 
 本R08不修改Host、不私造cursor/fetch_more、不静默丢弃超限facts、不把configured limit搬到read做截断。如果Controller裁决“`fact_count=len(returned facts)`必须对Host截断后的每一页可见list成立”，当前generic Host API无法原子维护该sibling字段，S2必须stop并回Controller；不得越界改Host或用fallback伪装通过。该stop只处理已识别的owner冲突，不重开financial/XBRL产品contract。
 
-### 6.5 S2 tests与真实 smoke
+### 6.5 累计 owner/public tests与真实 smoke
 
 Owner/public tests必须覆盖：
 
@@ -570,7 +557,7 @@ Owner/public tests必须覆盖：
 - Process-backed completed/failed/cancelled paths不泄露revision、private key、路径或内部reason；
 - 第6.4节under-limit与forced-truncation组合风险均被显式验证；forced node 必须完成 pre-Host 等式、Host public cursor envelope、Host-injected `fetch_more` remainder 三段公开链路，不断言私有 envelope/helper/manager 状态。
 
-`tests/fins/test_fins_read_runtime.py` 的六个 normalize/dedup nodes 在 S2 必须全部迁移并由 S2 focused、coverage 与完整验证收集；不得 `skip` / `xfail`、删 node、改名逃避收集或用 compatibility fixture/production shim 保留旧 count contract。
+`tests/fins/test_fins_read_runtime.py` 的六个 normalize/dedup nodes 在 S2 必须全部迁移，并在 §6.6 累计 focused、coverage 与完整验证中和 S1 fiscal node 一起收集；不得 `skip` / `xfail`、删 node、改名逃避收集或用 compatibility fixture/production shim 保留旧 count contract。
 
 必须复用`tests/fins/test_fins_storage_provider.py`现有真实仓储构造，不以简化fake替代：
 
@@ -578,7 +565,7 @@ Owner/public tests必须覆盖：
 2. 真实HTML财务表fixture：HTML source→processor抽取→financial read tool；断言最小字段、无locator、period/scale/quality不由read补造、citation可读。
 3. No-statement路径：真实producer terminal形成partial + `statement_not_found`，read只复制reason。
 
-Focused命令：
+以下 focused 命令是 §6.6 唯一累计 validation 的组成部分，不是 S2 独立 gate：
 
 ```bash
 source .venv/bin/activate
@@ -594,10 +581,17 @@ pytest tests/fins/test_fins_storage_provider.py::test_fins_read_aapl_xbrl_query_
 
 真实smoke evidence必须记录现有fixture路径、exact node id与结果。
 
-### 6.6 S2验证门
+### 6.6 累计 S1+S2 validation gate
+
+S2 完成后只执行一次累计 validation gate；它同时验收 S1 producer/processor 与 S2 public consumer/projection，不存在 S1-only 或 S2-only acceptance session。所有命令都在同一未提交 tree 上运行：
 
 ```bash
 source .venv/bin/activate
+# S1 focused owner matrix（此时 public import graph 已由 S2 恢复）
+pytest tests/fins/test_financial_read_contracts.py tests/fins/test_sec_pipeline_download.py tests/fins/test_processor_registry.py -k 'financial or statement or xbrl or quality or reason or fiscal'
+pytest tests/fins/test_fins_read_runtime.py::test_sec_fiscal_inference_consumes_countless_xbrl_contract
+
+# S2 focused/public matrix
 pytest \
   tests/fins/test_financial_read_contracts.py \
   tests/fins/test_fins_read_runtime.py \
@@ -605,19 +599,117 @@ pytest \
   tests/fins/test_processor_read_consistency.py \
   tests/fins/test_fins_ingestion_tools.py \
   tests/fins/test_fins_storage_provider.py
-python -m coverage erase
-python -m coverage run -m pytest \
+
+# 三段 forced-truncation public chain + AAPL/HTML/no-statement real smokes
+pytest tests/fins/test_fins_storage_provider.py::test_fins_read_aapl_xbrl_query_separates_pre_host_value_from_host_truncation
+pytest \
+  tests/fins/test_fins_storage_provider.py::test_fins_read_aapl_xbrl_query_runs_in_spawned_child \
+  tests/fins/test_fins_storage_provider.py::test_fins_read_financial_statement_runs_in_spawned_child \
+  tests/fins/test_fins_storage_provider.py::test_fins_read_financial_statement_projects_statement_not_found
+
+# R08 aggregate matrix；随后运行完整 Fins regression
+pytest \
+  tests/fins/test_financial_read_contracts.py \
+  tests/fins/test_sec_pipeline_download.py \
   tests/fins/test_fins_read_runtime.py \
   tests/fins/test_read_runtime_semantic_ownership_guards.py \
   tests/fins/test_processor_read_consistency.py \
+  tests/fins/test_processor_registry.py \
+  tests/fins/test_fins_ingestion_tools.py \
   tests/fins/test_fins_storage_provider.py
-python -m coverage report --include='dayu/fins/tools/result_types.py,dayu/fins/tools/read_runtime_helpers.py,dayu/fins/tools/read_runtime.py,dayu/fins/tools/fins_tools.py' --fail-under=80
+pytest tests/fins -q
+
+# 累计测试集包含既有 focused/aggregate/零diff回归 targets；只有新增/修改测试才限于 S1/S2 test diff allowlist并直连owner
+python -m coverage erase
+python -m coverage run -m pytest \
+  tests/fins/test_financial_read_contracts.py \
+  tests/fins/test_sec_pipeline_download.py \
+  tests/fins/test_fins_read_runtime.py \
+  tests/fins/test_read_runtime_semantic_ownership_guards.py \
+  tests/fins/test_processor_read_consistency.py \
+  tests/fins/test_processor_registry.py \
+  tests/fins/test_fins_ingestion_tools.py \
+  tests/fins/test_fins_storage_provider.py
+python -m coverage json -o workspace/tmp/r08-cumulative-coverage.json
+
+# 必须从 repository root 运行；Git pathspec 直接产生 repo-relative、仅 dayu/fins 的实际 changed production Python manifest
+git diff --name-only -z --diff-filter=ACMR -- \
+  ':(top,glob)dayu/fins/**/*.py' \
+  > workspace/tmp/r08-changed-production-python.nul
+
+# exact-key 逐文件 coverage checker；manifest 为空、key 缺失或任一文件低于 80.00% 都非零退出
+python - \
+  workspace/tmp/r08-changed-production-python.nul \
+  workspace/tmp/r08-cumulative-coverage.json <<'PY'
+import json
+import os
+from pathlib import Path
+import sys
+
+threshold = 80.0
+manifest_path = Path(sys.argv[1])
+coverage_path = Path(sys.argv[2])
+manifest = [
+    os.fsdecode(raw_path)
+    for raw_path in manifest_path.read_bytes().split(b"\0")
+    if raw_path
+]
+if not manifest:
+    print("FAIL manifest: no changed dayu/fins Python files")
+    raise SystemExit(1)
+
+coverage_files = json.loads(coverage_path.read_text(encoding="utf-8"))["files"]
+failed = False
+for path in manifest:
+    if not path.startswith("dayu/fins/") or not path.endswith(".py"):
+        print(f"FAIL {path}: manifest path is not repo-relative dayu/fins Python")
+        failed = True
+        continue
+    if path not in coverage_files:
+        print(f"FAIL {path}: exact coverage JSON key is missing")
+        failed = True
+        continue
+    percent = coverage_files[path]["summary"]["percent_covered"]
+    status = "PASS" if percent >= threshold else "FAIL"
+    print(f"{status} {path}: {percent:.2f}%")
+    if percent < threshold:
+        failed = True
+
+raise SystemExit(1 if failed else 0)
+PY
+
 pyright
-python -m ruff check <S1+S2全部实际修改的Python文件>
+
+# NUL-safe 地生成并消费 dayu/fins + tests/fins 全部实际 changed Python manifest；空 manifest 必须失败
+git diff --name-only -z --diff-filter=ACMR -- \
+  ':(top,glob)dayu/fins/**/*.py' \
+  ':(top,glob)tests/fins/**/*.py' \
+  > workspace/tmp/r08-changed-fins-python.nul
+python -c '
+import os
+from pathlib import Path
+import sys
+
+paths = [
+    os.fsdecode(raw_path)
+    for raw_path in Path(sys.argv[1]).read_bytes().split(b"\0")
+    if raw_path
+]
+if not paths:
+    print("FAIL Ruff manifest: no changed dayu/fins or tests/fins Python files")
+    raise SystemExit(1)
+os.execv(sys.executable, [sys.executable, "-m", "ruff", "check", *paths])
+' workspace/tmp/r08-changed-fins-python.nul
 git diff --check
 ```
 
-每个实际修改production文件line coverage必须单独`>=80.00%`，不能以四文件aggregate替代。Full pyright必须`0 errors`；全部实际修改Python文件scoped Ruff必须零。
+Coverage manifest 与 coverage run/json 必须都从 repository root 运行。Git 的 top-level glob pathspec 直接限制到 `dayu/fins/**/*.py`，不得先收集 README 或其它非 Python path 再人工过滤；checker 只以 manifest 中 repo-relative path 对 coverage JSON `files` 做 exact key lookup，不做 basename、suffix、absolute-path、路径规范化或其它 loose fallback。若 JSON key 不是同一 repo-relative exact path，必须修正 coverage invocation/working directory后重跑；不得放宽匹配。每个实际 changed production Python 文件都必须打印 ledger，且 `summary.percent_covered >= 80.00`；manifest 空、exact key缺失与任一低于阈值均使 gate 失败。不得使用 aggregate `--fail-under`、changed-line coverage、pragma/omit、fake-only padding、skip/xfail 或阈值豁免代替逐文件结果；只在allowlist中但零diff的production文件不计入实际 changed manifest。
+
+Ruff manifest 同样由 Git top-level glob pathspec 直接限定到 `dayu/fins/**/*.py` 与 `tests/fins/**/*.py`，以 NUL 分隔路径，并由同一命令块机械传给 Ruff；不得手抄 allowlist、遗漏 tests、把零diff文件伪装为实际 changed path，或让空 manifest 静默成功。
+
+累计 coverage 测试集必须直接触达每个 changed owner 的 contract/behavior。若现有测试不足，只能在 §5.1/§6.1 已有 test allowlist 中修改与该 owner 直接对应的文件；不得扩大 production allowlist、修改无关功能、通过 fixture 固化偶然实现，或添加 coverage-only 空执行。
+
+Full pyright 必须为 `0 errors`，不再接受红色 propagation ledger；全部实际修改 Python 文件 scoped Ruff 必须零。§5.5、§6.7 的 source/LLM/unique-owner/no-touch scans，AST owner assertions，README current-contract scan，retained-security/no-deferred-scope scan，以及 `git diff --check` 必须在同一累计 tree 全部通过。
 
 ### 6.7 双向 scans与唯一同源证明
 
@@ -671,6 +763,13 @@ rg -n 'fact_count' \
 
 以`git diff -U0`核验`read_runtime.py`只改financial/XBRL projection symbols；snapshot acquire/borrow/release、cache revision、citation generation、source-changed paths零diff。运行既有processor/result/citation同snapshot tests。
 
+#### E. AST、README、security与scope scan
+
+- AST/runtime owner assertions 必须证明 `fact_count` 只有 `result_types.py` public builder 一个 production 赋值点，旧 tools 类型名无 alias/re-export/wrapper，producer/public exact keys 与 optional reason presence 一致；
+- README/LLM scan 必须证明 `dayu/fins/README.md`、`tests/README.md` 和 tool descriptions 只陈述 current contract，不含 locator、raw/dedup count、processor/Host 治理术语、历史 gate 或未来计划；
+- retained-security/no-touch scan 必须证明 R06/R07 storage、identity、revision、snapshot、citation、containment、symlink、atomic publication/recovery、Host truncation owner均无语义 diff；
+- exact allowlist scan 必须拒绝 S1/S2 production/test/README allowlist外路径，以及 R09-R12、Issues 142/151/175/177/178、Host/Engine/Service/UI、`dayu/config/prompts/**` 或统一 authorization 实现。
+
 ### 6.8 README同步
 
 - `dayu/fins/README.md`删除mandatory locator、producer total、dedup count说明，写入最小producer contract、optional actionable reason、独立public dedup projection和唯一fact_count。
@@ -679,35 +778,21 @@ rg -n 'fact_count' \
 
 ### 6.9 S2 review与commit边界
 
-顺序固定：AgentCodex implementation/self-check → Controller validation → AgentMiMo与AgentDS对同一immutable S1+S2 cumulative diff并发review → Controller adjudication → 必要fix → 两路re-review → Controller关闭全部finding。
+顺序固定：AgentCodex S2 implementation/self-check → §6.6/§6.7 累计 validation 全绿 → Controller 记录完整 changed-path manifest、每个 changed path content SHA-256 与完整累计 `git diff --binary` SHA-256 → AgentMiMo与AgentDS对同一 immutable S1+S2 cumulative tree 并发完整 code review并各自重算 hash → Controller adjudication → AgentCodex 修复全部 accepted findings → 在新 hash 上重跑完整累计 validation → 两路完整 re-review → Controller逐条关闭。
 
-S2不单独commit。只有S1/S2闭环、aggregate validation与aggregate双路deepreview都通过后，Controller才可授权一个exact-scope local implementation commit。该commit只完成R08，不完成umbrella。
+Controller 只能在累计 validation 全绿后锁 tree；任一 production、test、README、artifact 或其它 reviewed path 变化都会使先前 lock/review 失效，必须在新 content manifest 与 binary diff hash 上重跑。两路 reviewer 必须审查完整累计 diff，不得把 S1 当作已单独接受的历史或只审 S2 增量。
 
-## 7. Aggregate validation、review与后续
+S1/S2 都不单独commit，也不建立中间 checkpoint commit。只有累计 code review/fix/re-review闭环、aggregate deepreview及其必要fix/re-review全部通过后，Controller才可授权一个exact-scope local implementation commit。该commit只完成R08，不完成umbrella。
 
-Aggregate矩阵：
+## 7. Aggregate deepreview与后续
 
-```bash
-source .venv/bin/activate
-pytest \
-  tests/fins/test_financial_read_contracts.py \
-  tests/fins/test_sec_pipeline_download.py \
-  tests/fins/test_fins_read_runtime.py \
-  tests/fins/test_read_runtime_semantic_ownership_guards.py \
-  tests/fins/test_processor_read_consistency.py \
-  tests/fins/test_processor_registry.py \
-  tests/fins/test_fins_ingestion_tools.py \
-  tests/fins/test_fins_storage_provider.py
-pyright
-python -m ruff check <R08全部实际修改的Python文件>
-git diff --check
-```
-
-同时执行三个真实smoke exact nodes、全部双向scans、R07 no-touch scan和逐文件coverage检查。
+§6.6 是唯一累计/aggregate validation 真源；不得在本节复制或缩减另一份命令矩阵。它必须同时覆盖三段 forced-truncation smoke、AAPL/HTML/no-statement real smokes、全部双向/source/AST/LLM/README/security/no-touch scans、full pyright、scoped Ruff、`git diff --check` 和每个实际 changed production 文件逐文件 coverage 检查。
 
 已审计baseline仅用于增量判定：focused contract/read/ownership/consistency matrix为`111 passed`；真实AAPL/HTML/description/failed-outcome/fiscal exact nodes为`5 passed`；full pyright为零；full Ruff有150个继承问题。R08不承担全仓Ruff，但所有实际修改文件scoped Ruff必须归零；S1必改producer中已有两个F401随本切片清除。不得新增warning类别或pyright错误。
 
-Aggregate deepreview必须检查：owner唯一性、reason动作性、count单一同源、raw immutability、query params单一shape、tool/serializer drift、R07 no-touch、compat/shim、allowlist/README/tests越界。所有finding完成fix/re-review和Controller adjudication后才可进入accepted local implementation commit。
+累计 immutable dual code review 闭环后，aggregate deepreview必须再次检查：owner唯一性、reason动作性、count单一同源、raw immutability、query params单一shape、tool/serializer drift、R07 no-touch、compat/shim、allowlist/README/tests越界，以及 S1/S2 累计变更之间的 semantic ownership drift。
+
+任一 aggregate deepreview accepted finding 的修复只要改变 reviewed tree，旧累计 validation、changed-path content manifest、binary diff hash 与两路 aggregate deepreview 即全部失效。必须在新 hash 上重跑完整 §6.6 与 §6.7，包括全部 focused/aggregate/full Fins tests、real smokes、逐文件 coverage checker、full pyright、实际 changed Python scoped Ruff、全部 scans 与 `git diff --check`；全绿并锁定新 hash 后，再由两路 reviewer 对完整 aggregate tree 进行 re-review。只有两路 aggregate re-review 与 Controller 逐条 adjudication 全部关闭后，才可授权 accepted local implementation commit。
 
 R08 completion后umbrella仍active；依次继续R09、R10、R11、R12，之后还需umbrella aggregate validation/deepreview/final closeout。
 
@@ -718,7 +803,7 @@ R08 completion后umbrella仍active；依次继续R09、R10、R11、R12，之后�
 | Producer不能提供required essential field | 停在producer owner澄清 | read默认/猜值/空字符串 |
 | Method absent/empty分散 | actual producer terminal统一`statement_not_found` | read看rows推断；保留旧reason alias |
 | Provider确有raw total | internal typed validation/diagnostic inventory+tests | 暴露public/LLM；改名逃scan |
-| S1 type change触发S2旧consumer错误 | 精确登记S2 propagation，S2后full pyright归零 | compat field、cast、ignore、shim |
+| S1 type change触发S2旧consumer错误 | 保留为blocked intermediate/root-cause evidence并直接继续S2；累计tree full pyright归零 | 把红色ledger当formal pass；compat field、cast、ignore、shim |
 | Dedup需要修改fact | 深复制后修改public fact | 原地覆盖raw fact/list |
 | Description需要字段清单 | 消费result_types owner helper | 手写第二份contract |
 | Host截断产生cursor envelope | 按第6.4节验证或stop回Controller | Fins私造fetch_more、静默drop、越界改Host |
@@ -731,18 +816,16 @@ R08 completion后umbrella仍active；依次继续R09、R10、R11、R12，之后�
 
 - [ ] Base/R07 lineage与worktree核验；
 - [ ] S1 allowlist、contracts、all actual producers完成；
-- [ ] `test_fins_read_runtime.py` 只修改并在正式 pytest/coverage 中运行 S1 fiscal node，六个 S2 read normalize/dedup nodes未提前迁移、运行、skip/xfail或shim；
+- [ ] `test_fins_read_runtime.py` 只修改 S1 fiscal node；六个 S2 read normalize/dedup nodes未提前迁移、skip/xfail或shim；
 - [ ] Locator helper与alternate reason owner删除；
 - [ ] 共享 fiscal-period owner、bool 显式拒绝与 focused owner tests完成；
-- [ ] Focused tests、逐文件coverage、scoped Ruff、scans、diff check完成；
-- [ ] Controller 锁定 immutable tree/diff hash，full-pyright exact ledger 只含四个预声明 S2 production paths，两路 reviewer 独立核对通过；
-- [ ] Internal positive inventory逐条闭合；
-- [ ] 双路review/fix/re-review与Controller adjudication关闭；
-- [ ] 未开始S2、未commit。
+- [ ] S1 implementation artifact明确保持blocked intermediate evidence，不声明acceptable product state；
+- [ ] 未运行/要求S1独立exact-node collection、whole-file coverage、红色full-pyright ledger formal pass或immutable dual review；
+- [ ] 未stage/commit，直接在同一tree进入S2。
 
 ### S2 / aggregate
 
-- [ ] S1 gate已关闭；
+- [ ] S1 blocked intermediate tree受保护且无compat/shim；S2按既有allowlist直接继续；
 - [ ] Single typed public projection/helper完成；
 - [ ] Public types 精确命名为 `PublicFinancialStatementResult` / `PublicXbrlQueryResult`，旧 tools 名称无 alias/re-export/wrapper；
 - [ ] Citation 使用 `Mapping[str, JsonValue]` 输入和独立 `dict[str, JsonValue]` 输出，同 borrowed snapshot 内容一致且 R07 no-touch；
@@ -751,20 +834,27 @@ R08 completion后umbrella仍active；依次继续R09、R10、R11、R12，之后�
 - [ ] `fiscal_period` schema 与 producer 共享 `FY|H1|Q1|Q2|Q3|Q4` owner，number schema/callable 的 bool 拒绝已验证；
 - [ ] 真实 provider 的 pre-Host typed 等式、Host public cursor envelope 与 Host-injected `fetch_more` remainder 组合验证通过；若 public seam 不可观测则 stop 回 Controller；
 - [ ] R07 snapshot/citation symbols零语义变更；
-- [ ] AAPL、HTML、no-statement真实smoke通过；
+- [ ] 三段forced-truncation、AAPL、HTML、no-statement真实smoke通过；
 - [ ] 两份README按自身约束更新；
-- [ ] Full pyright零、修改文件Ruff零、逐文件coverage>=80%；
-- [ ] Positive/negative/unique-count/no-touch scans通过；
-- [ ] S2双路review与aggregate双路deepreview关闭；
+- [ ] S1+S2全部focused/aggregate tests与完整Fins regression通过；
+- [ ] Full pyright零、全部实际修改Python文件Ruff零、每个实际changed production文件逐文件coverage>=80%，无changed-line/aggregate/豁免；
+- [ ] Positive/negative/source/AST/LLM/README/security/unique-count/no-touch scans通过；
+- [ ] Controller在全绿后锁定累计changed-path content hashes与binary diff hash；MiMo/DS对同一immutable累计tree完成完整code review；
+- [ ] 全部accepted findings由AgentCodex修复并经完整累计validation与双路re-review关闭；aggregate双路deepreview关闭；
+- [ ] 任一 aggregate deepreview accepted fix 后在新 hash 上完整重跑 §6.6/§6.7，并经双路 aggregate re-review 与 Controller adjudication 关闭；
 - [ ] 未stage/commit，等待Controller另行授权。
 
-## 10. 本 fixed-plan re-review fix gate 自检要求
+## 10. 本 cumulative validation plan-correction review-fix gate 自检要求
 
 本gate唯一允许新增/修改artifact：
 
 ```text
 docs/host/wu-semantic-ownership-01-r08-fins-financial-xbrl-contract-plan.md
-docs/reviews/wu-semantic-ownership-01-r08-fins-financial-xbrl-contract-plan-rereview-fix-codex.md
+docs/reviews/wu-semantic-ownership-01-r08-cumulative-validation-plan-correction-review-fix-codex.md
 ```
 
-交付前必须以`git status --short --untracked-files=all`核对本次只增加上述两个 allowed-path delta，不覆盖或误认用户既有 worktree 状态；由于两个 artifact 可处于 untracked 状态，分别使用 `git diff --no-index --check /dev/null <path>` 做 whitespace/diff check。以 Controller 锁定的 plan SHA-256 `07268a120c8b77f44fc4375b372c42ed539a922d63cbdf1b894f9b33397ecde5` 为 before hash，计算 final plan SHA-256，只在 re-review fix artifact/handoff 中报告，不自嵌入 plan；artifact 逐项记录 `R08-RR-PF-01..02` 的 before/after plan 位置、Controller 三项 rejected/no-fix 路径缺席证据、final hash/status/no-index diff check 与 scope。确认本计划没有 optional-reason 私有 helper 指令、reason frozenset 额外 checklist、R09 truncation routing、Host/Issue 177 实施或其它 accepted finding 扩张后，停止在 Controller validation；不得进入 implementation。
+交付前必须完整核对 `git status --short --untracked-files=all`，证明本次只增加上述两个 allowed-path delta，未修改当前 11 个 production、3 个 tests、S1 implementation artifact、control/controller/reviewer artifacts、README/design。以 corrected plan SHA-256 `4ff2c00c5999cf20ff314afd7e9a0fa041c32d2f36c23566d21752887c997e3d` 为 before hash，计算 final plan SHA-256，只在 review-fix artifact/handoff 中报告，不自嵌入 plan。
+
+必须重算当前受保护 14-path 完整 `git diff --binary` SHA-256 并精确等于 `0d985b85aa65d7c4b06d9ee464cd73fc4a39ef2ee0934f376b0b845a09b20f57`；任何 drift 使 review-fix gate 失败。Review-fix artifact 必须给出 `R08-CVPF-01..03` 逐项 closure、rejected/no-fix 缺席证据、before/after section、final plan SHA、protected diff command/result、`git diff --check`、modified plan 与新增 artifact 的 whitespace check、完整 status 与 staged-empty 证据。
+
+确认 `R08-CVPF-01..03` 全部且仅按 Controller 裁决关闭，§4 product contracts、S1/S2 production/test/README allowlists、R07 no-touch、Host truncation owner、Topic 8-9 no-code、Issues 142/151/175/177/178 与 R09-R12 deferred boundaries 均未改变后，停止回 Controller，由 Controller 派发两路完整 re-review；不得进入 S2 implementation、commit 或任何后续 gate。
