@@ -194,15 +194,26 @@ transition 不计入 product allowlist。除此以外任何 tracked diff 都立�
 是只读验证输入，不在修改 allowlist。`test_public_package_entrypoints.py` 还拥有非 placeholder 的 Docling dependency/lock
 测试，必须只删除/改写 placeholder 部分，不能机械删除整个文件。
 
-两个 implementation slices 对上述 cumulative allowlist 的唯一分配如下；不得以 work package 为由缩窄或扩张 slice
-allowlist：
+两个 implementation slices 对上述 cumulative allowlist 的分配如下。cumulative unique path count 仍为 `22`；
+`tests/cli/test_arg_parsing.py` 是唯一跨 slice path，但两个 slices 的 test-node ownership 不重叠，不得以 work package 或
+共享路径为由缩窄、扩张或重开其它 owner contract：
 
-- `R11-I1 atomic cutover` 合并 §5 WP-A 与 §6 WP-B：`dayu/fins/upload_batch.py`、
+- `R11-I1 atomic cutover` 合并 §5 WP-A 与 §6 WP-B，exact path count 为 `8`：`dayu/fins/upload_batch.py`、
   `tests/fins/test_upload_batch.py`、`dayu/cli/commands/fins.py`、`dayu/cli/arg_parsing.py`、新增
   `dayu/cli/upload_script.py`、`tests/cli/test_upload_filings_from_command.py`、`tests/cli/test_fins_commands.py`、
-  `tests/cli/test_arg_parsing.py`。`tests/fins/test_fmp_company_info_resolver.py` 仍仅为只读验证输入。
-- `R11-I2 packaging` 精确使用 §7 列出的 packaging/CI/deletion/test/README 路径；内容与原 packaging slice 相同，不把
-  producer、consumer、Service/storage/runtime、其它 README 或新产品能力带入该 slice。
+  `tests/cli/test_arg_parsing.py`。后者除
+  `test_root_readme_matches_current_cli_public_contract` 外的所有 parser/help owner tests 均只属于 I1；
+  `tests/fins/test_fmp_company_info_resolver.py` 仍仅为只读验证输入。
+- `R11-I2 packaging` exact path count 从原 `14` 修正为 `15`：精确使用 §7 列出的
+  packaging/CI/deletion/test/README 路径，并共享 `tests/cli/test_arg_parsing.py` 这一个 path，但只允许修改
+  `test_root_readme_matches_current_cli_public_contract`。内容仍是原 packaging slice 加这一项 root README contract-test
+  projection correction，不把 producer、consumer、其它 parser tests、Service/storage/runtime、其它 README 或新产品能力
+  带入该 slice。
+
+I2 mutation 前必须先复核 `tests/cli/test_arg_parsing.py` 的 protected I1 SHA-256
+`7cdc4c1d014bc7012aca28f05927b8afbbd04b86cc6d0aa2dfbf5f87af91ece6`。该 hash 是 I2 单节点修改的
+before-lock，不是要求修改后整文件 hash 不变；I2 checkpoint 必须证明只有上述函数发生 I2 delta，另外 `7` 个 I1 paths
+及该文件其余 test nodes 均保持 protected。
 
 `R11-I1` 的合并只修复 contract cutover sequencing，不改变 semantic owner：Fins 仍唯一产生分类/财期/material/skip
 facts，CLI 仍只消费 typed plan 并拥有 argv/renderer/publisher/summary。严禁为形成中间 tree 保留 old/new dual surface、
@@ -535,13 +546,14 @@ allowlist/contract/tests/smokes/coverage/full pyright/Ruff/scans 全部通过，
 
 ### 7.1 Exact allowlist 与 changes
 
-本 slice 只允许修改/新增/删除：
+本 slice 只允许修改/新增/删除以下 `15` 个 product/test/README/CI paths：
 
 - `pyproject.toml`
 - `requirements.txt`
 - `.github/workflows/r11-upload-script-windows.yml`（新增）
 - 删除 §4 列出的六个 Web/WeChat/render package 文件
 - `tests/cli/test_public_package_entrypoints.py`
+- `tests/cli/test_arg_parsing.py`，仅限 `test_root_readme_matches_current_cli_public_contract`
 - `README.md`
 - `dayu/README.md`
 - `dayu/fins/README.md`
@@ -557,11 +569,16 @@ allowlist/contract/tests/smokes/coverage/full pyright/Ruff/scans 全部通过，
    wrapper 或 README “暂不可用” surface，不实现 tracker 能力。
 4. `test_public_package_entrypoints.py` 删除 placeholder 成功/失败/help contract，保留 Docling dependency/constraints 等真实
    packaging tests，并增加 wheel entrypoint/metadata/archive negative assertions。
-5. 根 README 按其最终用户约束说明脚本生成/检查/执行、POSIX/Windows default 后缀、default/explicit output、ticker CSV、
+5. `test_root_readme_matches_current_cli_public_contract` 删除旧的全局 `--infer` 禁止、
+   `"schema_version": 1` / `"commands"` 必须存在以及“不生成 shell”必须存在的 assertions，改为 current root README
+   contract：正向断言 `upload_filings_from` batch-only `--infer` 与 `FMP_API_KEY`、可执行 POSIX `.sh` / Windows `.cmd`
+   及其 `/bin/sh` / `cmd.exe /d /c` 执行入口；负向断言 direct upload 未获得 `--infer`、旧 JSON argv
+   `schema_version=1` / `commands` 公共协议和“不生成 shell”文案均不存在。不得修改本文件其它 parser/help tests。
+6. 根 README 按其最终用户约束说明脚本生成/检查/执行、POSIX/Windows default 后缀、default/explicit output、ticker CSV、
    `--infer` 环境要求、auto、summary、追加参数与排障；删除 JSON argv 和 placeholder claims。
-6. `dayu/README.md` 只删除把 Web/WeChat/render placeholder 写成当前稳定 package boundary 的 stale 承诺，并说明目前只列
+7. `dayu/README.md` 只删除把 Web/WeChat/render placeholder 写成当前稳定 package boundary 的 stale 承诺，并说明目前只列
    真实 package；不得改分层、装配或引入 future capability。
-7. Fins README 只说明 typed scan/classification owner、OLD规则/caps/skip contract 与 CLI consumer boundary，不写 workflow/
+8. Fins README 只说明 typed scan/classification owner、OLD规则/caps/skip contract 与 CLI consumer boundary，不写 workflow/
    review 过程。tests README 只同步当前 tests、真实 smoke、Windows release gate 与 commands。
 
 ### 7.2 Existing Windows runner conclusion and minimal workflow
@@ -576,9 +593,10 @@ artifact 读取位置。R11 必须新增且只新增：
 
 - name：`R11 upload script Windows gate`；`permissions: contents: read`；job runner `windows-latest`；Python `3.11`；
   `timeout-minutes: 30`。
-- triggers：`workflow_dispatch`；`pull_request.paths` 精确列出 §4 closed product allowlist：三个 changed production files、
+- triggers：`workflow_dispatch`；`pull_request.paths` 精确列出 §4 的 `22` 个 cumulative unique closed product paths：三个 changed production files、
   新 renderer、六个待删 placeholder package files、五个 test files、`pyproject.toml`、`requirements.txt`、四个 README 与本
-  workflow。不得使用更宽 glob，不得添加 schedule、release、deployment、secret/provider 或 unrelated matrix。
+  workflow。I2 write allowlist 的 `15` paths 中，`tests/cli/test_arg_parsing.py` 已包含在这五个 cumulative test files 内，
+  不重复计数。不得使用更宽 glob，不得添加 schedule、release、deployment、secret/provider 或 unrelated matrix。
 - install：checkout、setup-python 3.11，并精确执行
   `python -m pip install -e ".[test,dev]" -c constraints/lock-windows-x64-py311.txt`；不安装被删除的 Web extra。
 - test command 精确为：
@@ -612,6 +630,11 @@ aggregate acceptance、PR ready/final closeout，不得转 residual risk。
 
 ### 7.3 Packaging real smoke 与 stop
 
+I2 continuation 必须先匹配 §4 的 protected `tests/cli/test_arg_parsing.py` before-lock，再只修改
+`test_root_readme_matches_current_cli_public_contract`。以下 focused command 因而同时验证 public packaging 和修正后的根
+README current contract；I2 checkpoint 必须记录 exact `15`-path allowlist，并用 node-level diff review 证明该文件其它
+parser/help tests 未变化：
+
 ```bash
 source .venv/bin/activate
 pytest tests/cli/test_public_package_entrypoints.py \
@@ -643,7 +666,8 @@ wildcard 展开。importability assertion 也必须 exit 0。archive/RECORD orac
 Slice stop：删除项仍被 production import/entrypoint 引用、optional dependency 兼有真实非-placeholder owner、wheel 仍含
 package/extra/requirement、需要实现 tracker 能力、Windows workflow 需 secrets或无法运行真实 cmd、或 README 职责越界时
 立即 stop。`R11-I2` 通过 Controller exact allowlist/contract/test/smoke checkpoint 后进入一次 cumulative review，不做
-slice acceptance 或中间 implementation commit；本 slice 不回改或扩张 `R11-I1` 产品范围。
+slice acceptance 或中间 implementation commit；除上述唯一 root README contract-test node 外，本 slice 不回改或扩张
+`R11-I1` production/test 范围。
 
 ## 8. Cumulative validation、coverage、scans 与 security gates
 
@@ -662,7 +686,9 @@ safety stop 不把当前 transient tree 升格为 validation baseline 或合法 
 focused/full tests、real smokes、逐文件 coverage、full pyright、scoped/full-baseline Ruff、diffcheck、JSON/owner/
 propagation/security/deferred scans；correction 后必须 combined revalidation，不能只复用此前结果。`R11-I1` 只有这套
 cumulative validation 全通过才可 checkpoint。`R11-I2` 完成后必须对最终 cumulative tree 重跑以下完整 validation，并加入
-packaging/wheel/README/placeholder/Windows evidence；不得复用 I1 结果冒充 final pass。仅在 I1 尚未修改的 packaging
+packaging/wheel/README/placeholder/Windows evidence；还必须验证 I2 exact `15`-path allocation、
+`test_root_readme_matches_current_cli_public_contract` 的 current positive/negative contract 与同文件其它节点的 protected-I1
+状态，不得复用 I1 结果冒充 final pass。仅在 I1 尚未修改的 packaging
 placeholder negative oracle 会保留到 I2 后判零，其余 I1-scope gate 均不得推迟。任何时点都不得放宽当前 full pyright
 `0 errors` 要求；其余产品、security、deferred、Windows 与 Ruff gates 同样保持不变。
 
@@ -734,7 +760,7 @@ git diff --name-status 2b14b2fbc89654267e3d33daa2ae410ceff45e68 -- \
 git diff --name-only 2b14b2fbc89654267e3d33daa2ae410ceff45e68 -- \
   README.md dayu/README.md dayu/fins/README.md tests/README.md
 rg -n 'upload_filings_from|upload_filings_<TICKER>|--infer|action.*auto' \
-  README.md dayu/fins/README.md tests/README.md
+  README.md dayu/fins/README.md tests/README.md tests/cli/test_arg_parsing.py
 git diff --name-only 2b14b2fbc89654267e3d33daa2ae410ceff45e68 -- \
   dayu/service dayu/host dayu/engine dayu/runtime dayu/config dayu/tool dayu/ui constraints \
   docs/host/design.md docs/engine/design.md docs/tool/design.md docs/fins/design.md docs/ui/design.md
@@ -748,6 +774,11 @@ git diff --cached --name-only
 files 无 diff，不能把它们纳入 placeholder 零命中。schema scan 不扫其它合法 storage/ingestion schema；API-key scan 只扫真实
 生成 artifact 中的 env 名、固定 test secret 值与 provider URL，不把生产输入边界合法读取 `FMP_API_KEY` 误判为泄漏。Windows
 artifact scan 在 release run artifact 下载后执行；缺 artifact 是 blocker，不等于零命中。
+
+根 README contract scan 不是裸关键词通过：人工/owner review 必须在
+`test_root_readme_matches_current_cli_public_contract` 内同时确认 batch `upload_filings_from --infer` + `FMP_API_KEY`、
+executable `.sh` / `.cmd` 正向 assertions，以及 JSON argv / `schema_version=1` / `commands` / “不生成 shell”负向
+assertions；`--infer` 不得重新成为 direct upload contract。该函数外的 `tests/cli/test_arg_parsing.py` I2 diff 必须为空。
 
 product `git diff --name-status` 必须逐项等于 §4 closed allowlist 的实际变更子集；deferred diff 必须为空。`git diff
 --cached --name-only` 在 Controller 授权 stage 前必须为空。任何 allowlist 外路径、unexpected deletion/rename 或 Controller dirty
@@ -789,7 +820,7 @@ R11-I1 coordinated implementation
  -> 若真实 consumer 暴露 owner gap：同一 slice 内 Fins owner targeted correction + combined revalidation
  -> producer+consumer cumulative tests/smokes/coverage/full pyright/Ruff/scans
  -> Controller R11-I1 atomic checkpoint
- -> R11-I2 packaging/README/Windows implementation（仅 I1 checkpoint pass）
+ -> R11-I2 packaging/README/Windows implementation（仅 I1 checkpoint pass；15 paths，唯一共享 path 只改 root README test node）
  -> final cumulative tests/smokes/coverage/full pyright/Ruff/scans + packaging/Windows gate evidence
  -> Controller R11-I2 checkpoint
  -> one cumulative code-review gate
@@ -816,8 +847,10 @@ tests，严禁在 builder/renderer/adapter/test fixture 补偿，严禁创建新
 
 任一 material source drift、merged allowlist 外依赖、stop condition、atomic checkpoint failure 或 blocker 均禁止进入
 `R11-I2`。两个 slices 之间不做 slice acceptance、code-review gate 或 commit；`R11-I2` checkpoint 必须重跑最终 cumulative
-tests/scans，防止 packaging 破坏 `R11-I1` owner contract。code review 仍只在两个 implementation slices 全部完成后对完整
-cumulative diff 执行一次。
+tests/scans，防止 packaging 破坏 `R11-I1` owner contract。I2 mutation 前八个 I1 path locks必须全部匹配；mutation 后七个
+非共享 I1 paths保持 hash 不变，`tests/cli/test_arg_parsing.py` 只允许
+`test_root_readme_matches_current_cli_public_contract` 产生 I2 delta，其余节点继续受 I1 protection。code review 仍只在两个
+implementation slices 全部完成后对完整 cumulative diff 执行一次。
 
 ### 9.2 Aggregate gate
 
@@ -870,7 +903,8 @@ Windows release blocker；真正 release closeout 时三者均为 0。
       stop/adjudication artifacts 均未被触碰、删除或 stage。
 - [ ] Fins typed plan 与 CLI/renderer/package owner 边界无重叠。
 - [ ] 精确两个 dependency-ordered slices 的 allowlist、contract、tests、real smoke、stop conditions均被接受；原 packaging
-      内容未扩 scope。
+      内容未扩 scope；cumulative unique paths 为 22，I1 为 8 paths，I2 从 14 修正为 15 paths，唯一共享 path 只开放
+      `test_root_readme_matches_current_cli_public_contract`。
 - [ ] `R11-I1` 精确合并原 producer+consumer allowlists；同一 uninterrupted Agent task 可顺序编辑且不要求跨文件事务原子写；
       全部 coordinated edits 完成前的 transient inconsistency 不是合法 intermediate tree 或 pass/failure baseline，不运行/
       宣称 validation，不做 checkpoint、acceptance、stage、commit、handoff、review 或 next-slice transition；真实 blocker
@@ -883,6 +917,8 @@ Windows release blocker；真正 release closeout 时三者均为 0。
 - [ ] Windows outcome/invariants/oracle固定；具体 algorithm 保留给真实 runner反证，不存在 `list2cmdline`/fallback/shim。
 - [ ] placeholder deletion、wheel metadata/extracted names/RECORD、README触发、line coverage、full tests/pyright/Ruff 同版本
       baseline/scans完整。
+- [ ] 根 README owner test 已删除旧全局 `--infer` 禁止与 JSON/no-shell 正向 assertions，改为 batch-only infer、no JSON argv、
+      executable `.sh`/`.cmd` current contract；同文件其它 parser/help nodes 与另外七个 I1 paths保持 protected。
 - [ ] full pyright 保持零新增/扩散且不放宽；old/new dual surface、compatibility seam、CLI fallback/重算均为零。
 - [ ] security保留项与 deferred/no-touch边界完整；R12与 tracker能力未进入。
 - [ ] 两个 implementation slices 全部完成后才执行一次 cumulative code review；accepted implementation、aggregate、
