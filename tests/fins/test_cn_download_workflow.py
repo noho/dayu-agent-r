@@ -254,6 +254,8 @@ class _FakeDiscoveryClient:
     candidates: tuple[CnReportCandidate, ...]
     pdf_bytes: bytes = _PDF_BYTES
     download_calls: int = 0
+    cancellation_checkpoints: list[Callable[[], None] | None] = field(default_factory=list)
+    checkpoint_errors: list[RuntimeError] = field(default_factory=list)
 
     def resolve_company(self, query: CnReportQuery) -> CnCompanyProfile:
         """返回固定公司元数据。
@@ -279,12 +281,15 @@ class _FakeDiscoveryClient:
         self,
         query: CnReportQuery,
         profile: CnCompanyProfile,
+        *,
+        cancellation_checkpoint: Callable[[], None] | None = None,
     ) -> tuple[CnReportCandidate, ...]:
         """返回测试候选。
 
         Args:
             query: 下载查询。
             profile: 公司元数据。
+            cancellation_checkpoint: workflow-owned 无参取消检查点。
 
         Returns:
             候选报告 tuple。
@@ -294,6 +299,13 @@ class _FakeDiscoveryClient:
         """
 
         del query, profile
+        self.cancellation_checkpoints.append(cancellation_checkpoint)
+        if cancellation_checkpoint is not None:
+            try:
+                cancellation_checkpoint()
+            except RuntimeError as exc:
+                self.checkpoint_errors.append(exc)
+                raise
         return self.candidates
 
     def download_report_pdf(self, candidate: CnReportCandidate) -> DownloadedReportAsset:
@@ -1597,6 +1609,127 @@ def test_cn_cancel_checker_preserves_cancel_exception_object() -> None:
         assert exc is expected
     else:
         raise AssertionError("应传播原始 CnDownloadCancelledError")
+
+
+def test_cn_workflow_maps_bool_true_inside_single_owned_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """raw checker 在 discovery-pre 为 false、checkpoint 内为 true 时应映射为 typed cancel。"""
+
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(_candidate(),))
+    converter = _FakeConverter()
+    pipeline = _build_pipeline(tmp_path=tmp_path, discovery=discovery, converter=converter)
+    raw_calls = 0
+
+    def cancel_checker() -> bool:
+        nonlocal raw_calls
+        raw_calls += 1
+        return raw_calls == 4
+
+    events = _collect_events(pipeline, cancel_checker=cancel_checker)
+    result = _final_result(events)
+
+    assert result["status"] == "cancelled"
+    assert raw_calls == 4
+    assert len(discovery.cancellation_checkpoints) == 1
+    checkpoint = discovery.cancellation_checkpoints[0]
+    assert checkpoint is not None
+    assert checkpoint is not cancel_checker
+    assert len(discovery.checkpoint_errors) == 1
+    assert isinstance(discovery.checkpoint_errors[0], CnDownloadCancelledError)
+    assert discovery.download_calls == 0
+    assert converter.calls == 0
+    assert all(
+        event.event_type
+        not in {
+            DownloadEventType.FILING_STARTED,
+            DownloadEventType.FILE_DOWNLOAD_STARTED,
+        }
+        for event in events
+    )
+
+
+def test_cn_workflow_preserves_caller_cancel_object_through_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """raw checker 主动抛出的 typed cancel 应穿过 partial/protocol 保持 identity。"""
+
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(_candidate(),))
+    converter = _FakeConverter()
+    pipeline = _build_pipeline(tmp_path=tmp_path, discovery=discovery, converter=converter)
+    expected = CnDownloadCancelledError("caller cancelled inside checkpoint")
+    raw_calls = 0
+
+    def cancel_checker() -> bool:
+        nonlocal raw_calls
+        raw_calls += 1
+        if raw_calls == 4:
+            raise expected
+        return False
+
+    result = _final_result(_collect_events(pipeline, cancel_checker=cancel_checker))
+
+    assert result["status"] == "cancelled"
+    assert discovery.checkpoint_errors == [expected]
+    assert discovery.checkpoint_errors[0] is expected
+    assert discovery.download_calls == 0
+    assert converter.calls == 0
+
+
+def test_cn_workflow_cancel_before_first_candidate_suppresses_download(
+    tmp_path: Path,
+) -> None:
+    """discovery 完成后、首个 candidate 前取消应停止 PDF/转换发布。"""
+
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(_candidate(),))
+    converter = _FakeConverter()
+    pipeline = _build_pipeline(tmp_path=tmp_path, discovery=discovery, converter=converter)
+    raw_calls = 0
+
+    def cancel_checker() -> bool:
+        nonlocal raw_calls
+        raw_calls += 1
+        return raw_calls == 6
+
+    events = _collect_events(pipeline, cancel_checker=cancel_checker)
+    result = _final_result(events)
+
+    assert result["status"] == "cancelled"
+    assert raw_calls == 6
+    assert discovery.download_calls == 0
+    assert converter.calls == 0
+    assert DownloadEventType.FILING_STARTED not in {
+        event.event_type for event in events
+    }
+
+
+def test_cn_workflow_wraps_checkpoint_non_cancel_failure_with_direct_cause(
+    tmp_path: Path,
+) -> None:
+    """raw checker 非取消失败只由 workflow owner 包装，且 direct cause 不丢失。"""
+
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(_candidate(),))
+    converter = _FakeConverter()
+    pipeline = _build_pipeline(tmp_path=tmp_path, discovery=discovery, converter=converter)
+    expected = ValueError("raw checker failure")
+    raw_calls = 0
+
+    def cancel_checker() -> bool:
+        nonlocal raw_calls
+        raw_calls += 1
+        if raw_calls == 4:
+            raise expected
+        return False
+
+    result = _final_result(_collect_events(pipeline, cancel_checker=cancel_checker))
+
+    assert result["status"] == "failed"
+    assert len(discovery.checkpoint_errors) == 1
+    workflow_error = discovery.checkpoint_errors[0]
+    assert type(workflow_error) is RuntimeError
+    assert workflow_error.__cause__ is expected
+    assert discovery.download_calls == 0
+    assert converter.calls == 0
 
 
 def test_cn_download_fast_skip_uses_remote_fingerprint(tmp_path: Path) -> None:

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
@@ -28,12 +29,29 @@ _PDF_BYTES = b"%PDF-1.7\n" + b"0" * 2048
 _DOCLING_BYTES = b'{"document": "ok"}'
 
 
+def _never_cancel() -> bool:
+    """返回未取消的稳定测试信号。
+
+    Args:
+        无。
+
+    Returns:
+        始终为 ``False``。
+
+    Raises:
+        无。
+    """
+
+    return False
+
+
 @dataclass
 class _PipelineDownloadFakeDiscoveryClient:
     """CnPipeline wrapper 测试用 CN fake discovery client。"""
 
     temp_dir: Path
     download_calls: int = 0
+    cancellation_checkpoints: list[Callable[[], None] | None] = field(default_factory=list)
 
     def resolve_company(self, query: CnReportQuery) -> CnCompanyProfile:
         """返回固定公司元数据。
@@ -59,12 +77,15 @@ class _PipelineDownloadFakeDiscoveryClient:
         self,
         query: CnReportQuery,
         profile: CnCompanyProfile,
+        *,
+        cancellation_checkpoint: Callable[[], None] | None = None,
     ) -> tuple[CnReportCandidate, ...]:
         """返回一份固定 FY 候选。
 
         Args:
             query: 下载查询。
             profile: 公司元数据。
+            cancellation_checkpoint: workflow-owned 无参取消检查点。
 
         Returns:
             候选 tuple。
@@ -74,6 +95,9 @@ class _PipelineDownloadFakeDiscoveryClient:
         """
 
         del profile
+        self.cancellation_checkpoints.append(cancellation_checkpoint)
+        if cancellation_checkpoint is not None:
+            cancellation_checkpoint()
         return (
             CnReportCandidate(
                 provider="cninfo",
@@ -120,6 +144,7 @@ class _PipelineDownloadFakeHkDiscoveryClient:
 
     temp_dir: Path
     download_calls: int = 0
+    cancellation_checkpoints: list[Callable[[], None] | None] = field(default_factory=list)
 
     def resolve_company(self, query: CnReportQuery) -> CnCompanyProfile:
         """返回固定 HK 公司元数据。
@@ -145,12 +170,15 @@ class _PipelineDownloadFakeHkDiscoveryClient:
         self,
         query: CnReportQuery,
         profile: CnCompanyProfile,
+        *,
+        cancellation_checkpoint: Callable[[], None] | None = None,
     ) -> tuple[CnReportCandidate, ...]:
         """返回一份固定 HK FY 候选。
 
         Args:
             query: 下载查询。
             profile: 公司元数据。
+            cancellation_checkpoint: workflow-owned 无参取消检查点。
 
         Returns:
             候选 tuple。
@@ -160,6 +188,9 @@ class _PipelineDownloadFakeHkDiscoveryClient:
         """
 
         del profile
+        self.cancellation_checkpoints.append(cancellation_checkpoint)
+        if cancellation_checkpoint is not None:
+            cancellation_checkpoint()
         return (
             CnReportCandidate(
                 provider="hkexnews",
@@ -301,6 +332,7 @@ def test_download_runs_cn_workflow_with_injected_discovery_client(tmp_path: Path
         cn_discovery_client=discovery,
         convert_pdf_to_docling_json=converter,
     )
+    cancel_checker = _never_cancel
 
     result = pipeline.download(
         ticker="000001",
@@ -308,6 +340,7 @@ def test_download_runs_cn_workflow_with_injected_discovery_client(tmp_path: Path
         start_date="2025-01-01",
         end_date="2026-12-31",
         overwrite=True,
+        cancel_checker=cancel_checker,
     )
 
     assert result["pipeline"] == "cn"
@@ -318,6 +351,9 @@ def test_download_runs_cn_workflow_with_injected_discovery_client(tmp_path: Path
     assert isinstance(summary, dict)
     assert summary["downloaded"] == 1
     assert discovery.download_calls == 1
+    assert len(discovery.cancellation_checkpoints) == 1
+    assert discovery.cancellation_checkpoints[0] is not None
+    assert discovery.cancellation_checkpoints[0] is not cancel_checker
     assert converter.calls == 1
 
 
@@ -361,6 +397,7 @@ def test_download_runs_hk_workflow_with_injected_discovery_client(tmp_path: Path
         hk_discovery_client=discovery,
         convert_pdf_to_docling_json=converter,
     )
+    cancel_checker = _never_cancel
 
     result = pipeline.download(
         ticker="0700",
@@ -368,6 +405,7 @@ def test_download_runs_hk_workflow_with_injected_discovery_client(tmp_path: Path
         start_date="2024-01-01",
         end_date="2025-12-31",
         overwrite=True,
+        cancel_checker=cancel_checker,
     )
 
     assert result["pipeline"] == "hk"
@@ -381,6 +419,9 @@ def test_download_runs_hk_workflow_with_injected_discovery_client(tmp_path: Path
     assert company_info["company_id"] == "0700_HKEX"
     assert summary["downloaded"] == 1
     assert discovery.download_calls == 1
+    assert len(discovery.cancellation_checkpoints) == 1
+    assert discovery.cancellation_checkpoints[0] is not None
+    assert discovery.cancellation_checkpoints[0] is not cancel_checker
     assert converter.calls == 1
 
 

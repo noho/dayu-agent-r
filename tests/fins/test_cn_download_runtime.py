@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
@@ -85,6 +85,7 @@ class _RuntimeFakeDiscoveryClient:
     title: str
     source_id: str
     download_calls: int = 0
+    cancellation_checkpoints: list[Callable[[], None] | None] = field(default_factory=list)
 
     def resolve_company(self, query: CnReportQuery) -> CnCompanyProfile:
         """返回固定公司元数据。
@@ -110,12 +111,15 @@ class _RuntimeFakeDiscoveryClient:
         self,
         query: CnReportQuery,
         profile: CnCompanyProfile,
+        *,
+        cancellation_checkpoint: Callable[[], None] | None = None,
     ) -> tuple[CnReportCandidate, ...]:
         """返回固定年度报告候选。
 
         Args:
             query: 下载查询。
             profile: 公司元数据。
+            cancellation_checkpoint: workflow-owned 无参取消检查点。
 
         Returns:
             候选报告 tuple。
@@ -125,6 +129,9 @@ class _RuntimeFakeDiscoveryClient:
         """
 
         del profile
+        self.cancellation_checkpoints.append(cancellation_checkpoint)
+        if cancellation_checkpoint is not None:
+            cancellation_checkpoint()
         fiscal_year = 2025 if query.market == "CN" else 2024
         filing_date = "2026-04-01" if query.market == "CN" else "2025-04-08"
         return (

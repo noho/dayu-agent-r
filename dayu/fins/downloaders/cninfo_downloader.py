@@ -43,6 +43,7 @@ from typing import Final, Optional, TypeAlias, cast
 import httpx
 from dayu.fins.pipelines.cn_download_models import (
     CnCompanyProfile,
+    CnDownloadCancelledError,
     CnFiscalPeriod,
     CnReportHeadMeta,
     CnReportCandidate,
@@ -230,6 +231,8 @@ class CninfoDiscoveryClient:
         self,
         query: CnReportQuery,
         profile: CnCompanyProfile,
+        *,
+        cancellation_checkpoint: Callable[[], None] | None = None,
     ) -> tuple[CnReportCandidate, ...]:
         """列出符合 ``query.target_periods`` 与窗口约束的候选报告。
 
@@ -244,6 +247,8 @@ class CninfoDiscoveryClient:
         Args:
             query: 单次 download 查询参数。
             profile: ``resolve_company`` 返回的公司元数据。
+            cancellation_checkpoint: 可选 workflow-owned 无参取消检查点；
+                每个受支持财期的每次 POST 前和成功响应后调用。
 
         Returns:
             候选报告 tuple；按 ``fiscal_year`` 降序、再按 ``fiscal_period``
@@ -285,7 +290,10 @@ class CninfoDiscoveryClient:
                     category=category,
                     start_date=query.start_date,
                     end_date=query.end_date,
+                    cancellation_checkpoint=cancellation_checkpoint,
                 )
+            except CnDownloadCancelledError:
+                raise
             except RuntimeError as exc:
                 raise RuntimeError(
                     f"巨潮公告分类查询失败: ticker={ticker} period={period} category={category} error={exc}"
@@ -436,6 +444,7 @@ class CninfoDiscoveryClient:
         category: str,
         start_date: str,
         end_date: str,
+        cancellation_checkpoint: Callable[[], None] | None,
     ) -> list[CninfoRawAnnouncement]:
         """调 ``hisAnnouncement/query`` 拉取一类公告（自动翻页）。
 
@@ -447,6 +456,7 @@ class CninfoDiscoveryClient:
             category: ``category_*_szsh;``。
             start_date: 窗口起点 ``YYYY-MM-DD``。
             end_date: 窗口终点 ``YYYY-MM-DD``。
+            cancellation_checkpoint: 可选 workflow-owned 无参取消检查点。
 
         Returns:
             原始公告对象列表。
@@ -458,6 +468,8 @@ class CninfoDiscoveryClient:
         announcements: list[CninfoRawAnnouncement] = []
         page_num = 1
         while True:
+            if cancellation_checkpoint is not None:
+                cancellation_checkpoint()
             payload = self._query_announcement_page(
                 column=column,
                 plate=plate,
@@ -469,6 +481,8 @@ class CninfoDiscoveryClient:
                 page_num=page_num,
                 page_size=self._page_size,
             )
+            if cancellation_checkpoint is not None:
+                cancellation_checkpoint()
             items = payload.get("announcements") if isinstance(payload, dict) else None
             if not isinstance(items, list) or not items:
                 break

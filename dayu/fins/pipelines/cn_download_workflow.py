@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import AsyncIterator, Callable
+from functools import partial
 from typing import TypeAlias, cast
 
 from dayu.contracts.json_value import JsonValue
@@ -197,6 +198,15 @@ async def run_cn_download_stream_impl(
         end_date=window.end_date,
         target_periods=periods.target_periods,
     )
+    cancellation_checkpoint: Callable[[], None] | None = None
+    if cancel_checker is not None:
+        cancellation_checkpoint = partial(
+            _raise_if_cancelled,
+            module=module,
+            ticker=normalized_ticker,
+            document_id="",
+            cancel_checker=cancel_checker,
+        )
     filings: list[JsonObject] = []
     warnings: list[str] = []
     notes = list(periods.notes)
@@ -230,7 +240,11 @@ async def run_cn_download_stream_impl(
             ticker=normalized_ticker,
             payload=company_info,
         )
-        candidates = discovery.list_report_candidates(query, profile)
+        candidates = discovery.list_report_candidates(
+            query,
+            profile,
+            cancellation_checkpoint=cancellation_checkpoint,
+        )
         _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
         selected = _select_candidates_for_a4(
             candidates,

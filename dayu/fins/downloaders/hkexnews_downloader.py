@@ -15,14 +15,16 @@ import html
 import json
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Final, Optional, TypeAlias, cast
 
 import httpx
 
 from dayu.fins.pipelines.cn_download_models import (
     CnCompanyProfile,
+    CnDownloadCancelledError,
     CnFiscalPeriod,
     CnLanguage,
     CnReportCandidate,
@@ -73,12 +75,16 @@ _HKEXNEWS_T2_GROUP_RESULTS: Final[str] = "3"
 _HKEXNEWS_T2_ANNUAL_REPORT: Final[str] = "40100"
 _HKEXNEWS_T2_INTERIM_REPORT: Final[str] = "40200"
 _HKEXNEWS_T2_QUARTERLY_RESULTS: Final[str] = "13600"
-_HKEXNEWS_ROW_LIMIT: Final[int] = 100
-_HKEXNEWS_ROW_RANGE: Final[str] = str(_HKEXNEWS_ROW_LIMIT)
+_HKEXNEWS_INITIAL_CUMULATIVE_ROW_RANGE: Final[int] = 100
 _HKEXNEWS_MB_DATE_RANGE: Final[str] = "0"
 _HKEXNEWS_SORT_BY_DATETIME: Final[str] = "DateTime"
 _HKEXNEWS_SORT_DIR_DESC: Final[str] = "0"
 _HKEXNEWS_FILE_TYPE_PDF: Final[str] = "PDF"
+_HKEXNEWS_FIELD_HAS_NEXT_ROW: Final[str] = "hasNextRow"
+_HKEXNEWS_FIELD_ROW_RANGE: Final[str] = "rowRange"
+_HKEXNEWS_FIELD_LOADED_RECORD: Final[str] = "loadedRecord"
+_HKEXNEWS_FIELD_RECORD_COUNT: Final[str] = "recordCnt"
+_HKEXNEWS_FIELD_RESULT: Final[str] = "result"
 _DATE_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"(?P<year>\d{4})[-/](?P<month>\d{1,2})[-/](?P<day>\d{1,2})"
 )
@@ -105,15 +111,19 @@ class _HkStockMappingEntry:
 
 
 @dataclass(frozen=True)
-class _HkexnewsRowsPage:
-    """披露易 title search 单页响应。"""
+class _HkexnewsTitleSearchSnapshot:
+    """披露易 title search 单轮已验证累计快照。"""
 
-    rows: list[JsonValue]
-    total_count: int | None
+    requested_row_range: int
+    response_row_range: int
+    has_next_row: bool
+    loaded_record: int
+    record_count: int
+    rows: tuple[dict[str, JsonValue], ...]
 
 
-class HkexnewsDiscoveryTruncatedError(RuntimeError):
-    """披露易 title search 结果无法证明完整。"""
+class HkexnewsProviderProtocolError(RuntimeError):
+    """披露易 title search 官方响应违反累计协议。"""
 
 
 _PERIOD_TO_CATEGORY_SPEC: Final[dict[CnFiscalPeriod, _HkCategorySpec]] = {
@@ -247,12 +257,16 @@ class HkexnewsDiscoveryClient:
         self,
         query: CnReportQuery,
         profile: CnCompanyProfile,
+        *,
+        cancellation_checkpoint: Callable[[], None] | None = None,
     ) -> tuple[CnReportCandidate, ...]:
         """列出符合窗口和财期的 HK 报告候选。
 
         Args:
             query: 单次 download 查询参数。
             profile: ``resolve_company`` 返回的公司元数据。
+            cancellation_checkpoint: 可选 workflow-owned 无参取消检查点；
+                每个 title search 累计 GET 前和成功响应后调用。
 
         Returns:
             候选报告 tuple。HK 季度报告查无返回空 tuple，不抛异常。
@@ -290,8 +304,11 @@ class HkexnewsDiscoveryClient:
                     category_spec=category_spec,
                     start_date=query.start_date,
                     end_date=query.end_date,
+                    cancellation_checkpoint=cancellation_checkpoint,
                 )
-            except HkexnewsDiscoveryTruncatedError:
+            except CnDownloadCancelledError:
+                raise
+            except HkexnewsProviderProtocolError:
                 raise
             except RuntimeError as exc:
                 raise RuntimeError(
@@ -370,6 +387,7 @@ class HkexnewsDiscoveryClient:
         category_spec: _HkCategorySpec,
         start_date: str,
         end_date: str,
+        cancellation_checkpoint: Callable[[], None] | None,
     ) -> list[HkexnewsRawAnnouncement]:
         """查询单个披露易二级分类的公告列表。
 
@@ -379,6 +397,7 @@ class HkexnewsDiscoveryClient:
             category_spec: 披露易标题分类参数。
             start_date: 起始日期 ``YYYY-MM-DD``。
             end_date: 结束日期 ``YYYY-MM-DD``。
+            cancellation_checkpoint: 可选 workflow-owned 无参取消检查点。
 
         Returns:
             匹配目标股票且非英文的公告列表。
@@ -389,9 +408,8 @@ class HkexnewsDiscoveryClient:
 
         primary: list[HkexnewsRawAnnouncement] = []
         for language in self._languages:
-            payload = self._http_get_json(
-                HKEXNEWS_TITLE_SEARCH_URL,
-                params={
+            base_params: Mapping[str, str] = MappingProxyType(
+                {
                     "lang": _language_param(language),
                     "category": _HKEXNEWS_CATEGORY_ZERO,
                     "market": _HKEXNEWS_CATEGORY_MARKET,
@@ -404,19 +422,17 @@ class HkexnewsDiscoveryClient:
                     "fromDate": start_date.replace("-", ""),
                     "toDate": end_date.replace("-", ""),
                     "MB-Daterange": _HKEXNEWS_MB_DATE_RANGE,
-                    "rowRange": _HKEXNEWS_ROW_RANGE,
                     "sortByOptions": _HKEXNEWS_SORT_BY_DATETIME,
                     "sortDir": _HKEXNEWS_SORT_DIR_DESC,
-                },
+                }
             )
-            page = _extract_title_search_rows_page(payload)
-            _raise_if_title_search_truncated(
-                page,
+            rows = self._fetch_complete_title_search_rows(
+                base_params=base_params,
                 stock_code=stock_code,
                 category_spec=category_spec,
                 language=language,
+                cancellation_checkpoint=cancellation_checkpoint,
             )
-            rows = page.rows
             parsed_rows = [
                 item
                 for item in (_parse_announcement(row, language=language) for row in rows)
@@ -425,6 +441,72 @@ class HkexnewsDiscoveryClient:
             ]
             primary.extend(parsed_rows)
         return primary
+
+    def _fetch_complete_title_search_rows(
+        self,
+        *,
+        base_params: Mapping[str, str],
+        stock_code: str,
+        category_spec: _HkCategorySpec,
+        language: CnLanguage,
+        cancellation_checkpoint: Callable[[], None] | None,
+    ) -> tuple[dict[str, JsonValue], ...]:
+        """按官方 cumulative ``rowRange`` 协议取得最终完整快照。
+
+        Args:
+            base_params: 不含 ``rowRange`` 的不变查询参数。
+            stock_code: 5 位股票代码，仅用于业务可读错误上下文。
+            category_spec: 披露易标题分类参数。
+            language: 查询语言。
+            cancellation_checkpoint: 可选 workflow-owned 无参取消检查点。
+
+        Returns:
+            provider 明确证明完整的最后一轮累计 rows。
+
+        Raises:
+            CnDownloadCancelledError: 检查点报告取消时原样传播。
+            HkexnewsProviderProtocolError: 官方响应字段、轮内不变式或轮间进度矛盾时抛出。
+            RuntimeError: HTTP 请求或 JSON transport 解析失败时抛出。
+        """
+
+        current_row_range = _HKEXNEWS_INITIAL_CUMULATIVE_ROW_RANGE
+        previous_continuation_loaded: int | None = None
+        while True:
+            if cancellation_checkpoint is not None:
+                cancellation_checkpoint()
+            params = dict(base_params)
+            params[_HKEXNEWS_FIELD_ROW_RANGE] = str(current_row_range)
+            payload = self._http_get_json(HKEXNEWS_TITLE_SEARCH_URL, params=params)
+            if cancellation_checkpoint is not None:
+                cancellation_checkpoint()
+            snapshot = _parse_title_search_snapshot(
+                payload,
+                requested_row_range=current_row_range,
+                stock_code=stock_code,
+                category_spec=category_spec,
+                language=language,
+            )
+            latest_rows = snapshot.rows
+            if not snapshot.has_next_row:
+                return latest_rows
+            if (
+                previous_continuation_loaded is not None
+                and snapshot.loaded_record <= previous_continuation_loaded
+            ):
+                raise HkexnewsProviderProtocolError(
+                    "披露易 title search 累计续取无进展: "
+                    f"stock_code={stock_code} lang={language} "
+                    f"t1code={category_spec.t1code} t2code={category_spec.t2code} "
+                    f"requested_row_range={current_row_range} "
+                    f"loaded_record={snapshot.loaded_record} "
+                    f"previous_loaded_record={previous_continuation_loaded} "
+                    f"record_count={snapshot.record_count}"
+                )
+            previous_continuation_loaded = snapshot.loaded_record
+            current_row_range = max(
+                current_row_range * 2,
+                snapshot.record_count,
+            )
 
     def _http_get_json(
         self,
@@ -612,120 +694,239 @@ def _extract_json_rows(payload: JsonValue) -> list[JsonValue]:
     return []
 
 
-def _extract_title_search_rows_page(payload: JsonValue) -> _HkexnewsRowsPage:
-    """从 title search JSON 中提取行与显式总数。
-
-    Args:
-        payload: 披露易 title search JSON 响应。
-
-    Returns:
-        单页行数据与可选总数。
-
-    Raises:
-        无。
-    """
-
-    return _HkexnewsRowsPage(
-        rows=_extract_json_rows(payload),
-        total_count=_extract_title_search_total_count(payload),
-    )
-
-
-def _extract_title_search_total_count(payload: JsonValue) -> int | None:
-    """提取 title search 响应声明的结果总数。
-
-    Args:
-        payload: 披露易 title search JSON 响应。
-
-    Returns:
-        非负总数；响应未声明时返回 ``None``。
-
-    Raises:
-        无。
-    """
-
-    if not isinstance(payload, dict):
-        return None
-    for key in (
-        "total",
-        "totalCount",
-        "total_count",
-        "recordCount",
-        "record_count",
-        "recordsTotal",
-        "records_total",
-        "count",
-    ):
-        value = payload.get(key)
-        count = _coerce_non_negative_int(value)
-        if count is not None:
-            return count
-    return None
-
-
-def _coerce_non_negative_int(value: JsonValue | None) -> int | None:
-    """把 JSON 值收窄为非负整数。
-
-    Args:
-        value: JSON 值。
-
-    Returns:
-        非负整数；无法收窄时返回 ``None``。
-
-    Raises:
-        无。
-    """
-
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value if value >= 0 else None
-    if isinstance(value, float):
-        return int(value) if value >= 0.0 and value.is_integer() else None
-    if isinstance(value, str):
-        text = value.strip()
-        if text.isdecimal():
-            return int(text)
-    return None
-
-
-def _raise_if_title_search_truncated(
-    page: _HkexnewsRowsPage,
+def _parse_title_search_snapshot(
+    payload: JsonValue,
     *,
+    requested_row_range: int,
     stock_code: str,
     category_spec: _HkCategorySpec,
     language: CnLanguage,
-) -> None:
-    """在 title search 结果无法证明完整时失败关闭。
+) -> _HkexnewsTitleSearchSnapshot:
+    """严格解析并校验 title search 单轮官方累计快照。
 
     Args:
-        page: 已解析的单页响应。
+        payload: HTTP helper 返回的 JSON 响应。
+        requested_row_range: 当轮客户端请求的 cumulative range。
         stock_code: 5 位股票代码。
         category_spec: 查询分类参数。
         language: 查询语言。
 
     Returns:
-        无。
+        已校验的 provider-private frozen snapshot。
 
     Raises:
-        HkexnewsDiscoveryTruncatedError: 响应显示仍有更多结果或满页且缺少总数时抛出。
+        HkexnewsProviderProtocolError: 字段缺失、类型错误、负值或轮内事实矛盾时抛出。
     """
 
-    row_count = len(page.rows)
-    if page.total_count is not None:
-        if page.total_count > row_count:
-            raise HkexnewsDiscoveryTruncatedError(
-                "披露易 title search 响应被截断: "
-                f"stock_code={stock_code} lang={language} t1code={category_spec.t1code} "
-                f"t2code={category_spec.t2code} rows={row_count} total={page.total_count}"
-            )
-        return
-    if row_count >= _HKEXNEWS_ROW_LIMIT:
-        raise HkexnewsDiscoveryTruncatedError(
-            "披露易 title search 响应达到单页上限且缺少总数，无法证明完整: "
-            f"stock_code={stock_code} lang={language} t1code={category_spec.t1code} "
-            f"t2code={category_spec.t2code} rows={row_count}"
+    context = (
+        f"stock_code={stock_code} lang={language} "
+        f"t1code={category_spec.t1code} t2code={category_spec.t2code} "
+        f"requested_row_range={requested_row_range}"
+    )
+    if not isinstance(payload, dict):
+        raise HkexnewsProviderProtocolError(
+            f"披露易 title search 响应顶层必须是 object: {context}"
         )
+    has_next_row = _require_title_search_bool(
+        payload,
+        field=_HKEXNEWS_FIELD_HAS_NEXT_ROW,
+        context=context,
+    )
+    response_row_range = _require_title_search_non_negative_int(
+        payload,
+        field=_HKEXNEWS_FIELD_ROW_RANGE,
+        context=context,
+    )
+    loaded_record = _require_title_search_non_negative_int(
+        payload,
+        field=_HKEXNEWS_FIELD_LOADED_RECORD,
+        context=context,
+    )
+    record_count = _require_title_search_non_negative_int(
+        payload,
+        field=_HKEXNEWS_FIELD_RECORD_COUNT,
+        context=context,
+    )
+    rows = _require_title_search_rows(payload, context=context)
+    snapshot = _HkexnewsTitleSearchSnapshot(
+        requested_row_range=requested_row_range,
+        response_row_range=response_row_range,
+        has_next_row=has_next_row,
+        loaded_record=loaded_record,
+        record_count=record_count,
+        rows=rows,
+    )
+    row_count = len(snapshot.rows)
+    if snapshot.response_row_range != snapshot.requested_row_range:
+        raise HkexnewsProviderProtocolError(
+            "披露易 title search 响应 rowRange 与请求不一致: "
+            f"{context} response_row_range={snapshot.response_row_range}"
+        )
+    if snapshot.loaded_record != row_count:
+        raise HkexnewsProviderProtocolError(
+            "披露易 title search loadedRecord 与结果行数不一致: "
+            f"{context} loaded_record={snapshot.loaded_record} rows={row_count}"
+        )
+    if snapshot.loaded_record > snapshot.record_count:
+        raise HkexnewsProviderProtocolError(
+            "披露易 title search loadedRecord 超过 recordCnt: "
+            f"{context} loaded_record={snapshot.loaded_record} "
+            f"record_count={snapshot.record_count}"
+        )
+    if snapshot.loaded_record > snapshot.requested_row_range:
+        raise HkexnewsProviderProtocolError(
+            "披露易 title search loadedRecord 超过请求 rowRange: "
+            f"{context} loaded_record={snapshot.loaded_record}"
+        )
+    if snapshot.has_next_row and snapshot.loaded_record >= snapshot.record_count:
+        raise HkexnewsProviderProtocolError(
+            "披露易 title search 声明有下一条但已加载全部记录: "
+            f"{context} loaded_record={snapshot.loaded_record} "
+            f"record_count={snapshot.record_count}"
+        )
+    if not snapshot.has_next_row and snapshot.loaded_record != snapshot.record_count:
+        raise HkexnewsProviderProtocolError(
+            "披露易 title search 声明完成但记录数不一致: "
+            f"{context} loaded_record={snapshot.loaded_record} "
+            f"record_count={snapshot.record_count} rows={row_count}"
+        )
+    return snapshot
+
+
+def _require_title_search_bool(
+    payload: dict[str, JsonValue],
+    *,
+    field: str,
+    context: str,
+) -> bool:
+    """读取 title search 必填 JSON bool 字段。
+
+    Args:
+        payload: title search 顶层 object。
+        field: 官方字段名。
+        context: 业务可读查询上下文。
+
+    Returns:
+        严格 JSON bool 值。
+
+    Raises:
+        HkexnewsProviderProtocolError: 字段缺失或类型不是 bool 时抛出。
+    """
+
+    value = _require_title_search_field(payload, field=field, context=context)
+    if not isinstance(value, bool):
+        raise HkexnewsProviderProtocolError(
+            f"披露易 title search 字段 {field} 必须是 bool: {context}"
+        )
+    return value
+
+
+def _require_title_search_non_negative_int(
+    payload: dict[str, JsonValue],
+    *,
+    field: str,
+    context: str,
+) -> int:
+    """读取 title search 必填的非负 JSON int 字段。
+
+    Args:
+        payload: title search 顶层 object。
+        field: 官方字段名。
+        context: 业务可读查询上下文。
+
+    Returns:
+        非负整数。
+
+    Raises:
+        HkexnewsProviderProtocolError: 字段缺失、bool 冒充 int、类型错误或负值时抛出。
+    """
+
+    value = _require_title_search_field(payload, field=field, context=context)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise HkexnewsProviderProtocolError(
+            f"披露易 title search 字段 {field} 必须是 int: {context}"
+        )
+    if value < 0:
+        raise HkexnewsProviderProtocolError(
+            f"披露易 title search 字段 {field} 不能为负数: {context} value={value}"
+        )
+    return value
+
+
+def _require_title_search_rows(
+    payload: dict[str, JsonValue],
+    *,
+    context: str,
+) -> tuple[dict[str, JsonValue], ...]:
+    """读取 title search 字符串化 JSON object list。
+
+    Args:
+        payload: title search 顶层 object。
+        context: 业务可读查询上下文。
+
+    Returns:
+        严格解码后的 row object tuple。
+
+    Raises:
+        HkexnewsProviderProtocolError: ``result`` 缺失、非字符串、空值、非法 JSON、
+            解码后非 list 或包含非 object row 时抛出。
+    """
+
+    value = _require_title_search_field(
+        payload,
+        field=_HKEXNEWS_FIELD_RESULT,
+        context=context,
+    )
+    if not isinstance(value, str) or not value.strip():
+        raise HkexnewsProviderProtocolError(
+            f"披露易 title search 字段 result 必须是非空字符串 JSON array: {context}"
+        )
+    try:
+        decoded = cast(JsonValue, json.loads(value))
+    except json.JSONDecodeError as exc:
+        raise HkexnewsProviderProtocolError(
+            f"披露易 title search 字段 result 不是有效 JSON: {context}"
+        ) from exc
+    if not isinstance(decoded, list):
+        raise HkexnewsProviderProtocolError(
+            f"披露易 title search 字段 result 解码后必须是 array: {context}"
+        )
+    rows: list[dict[str, JsonValue]] = []
+    for row_index, row in enumerate(decoded):
+        if not isinstance(row, dict):
+            raise HkexnewsProviderProtocolError(
+                "披露易 title search result 的每一行必须是 object: "
+                f"{context} row_index={row_index}"
+            )
+        rows.append(row)
+    return tuple(rows)
+
+
+def _require_title_search_field(
+    payload: dict[str, JsonValue],
+    *,
+    field: str,
+    context: str,
+) -> JsonValue:
+    """读取 title search 必填字段。
+
+    Args:
+        payload: title search 顶层 object。
+        field: 官方字段名。
+        context: 业务可读查询上下文。
+
+    Returns:
+        字段的原始 JSON 值。
+
+    Raises:
+        HkexnewsProviderProtocolError: 字段缺失时抛出。
+    """
+
+    if field not in payload:
+        raise HkexnewsProviderProtocolError(
+            f"披露易 title search 响应缺少必填字段 {field}: {context}"
+        )
+    return payload[field]
 
 
 def _parse_embedded_json_list(raw: str) -> list[JsonValue] | None:

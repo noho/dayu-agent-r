@@ -10,12 +10,15 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable
-from typing import TypeAlias
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import NoReturn, TypeAlias, cast
 from urllib.parse import parse_qs
 
 import httpx
 import pytest
 
+from dayu.fins.downloaders import hkexnews_downloader as _hkexnews_downloader
 from dayu.fins.downloaders.hkexnews_downloader import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_SLEEP_SECONDS,
@@ -25,11 +28,13 @@ from dayu.fins.downloaders.hkexnews_downloader import (
     HKEXNEWS_INACTIVE_STOCK_ZH_URL,
     HKEXNEWS_TITLE_SEARCH_URL,
     HkexnewsDiscoveryClient,
-    HkexnewsDiscoveryTruncatedError,
+    HkexnewsProviderProtocolError,
 )
 from dayu.fins.pipelines.cn_download_models import (
     CnCompanyProfile,
+    CnDownloadCancelledError,
     CnFiscalPeriod,
+    CnLanguage,
     CnReportCandidate,
     CnReportQuery,
 )
@@ -38,6 +43,34 @@ JsonScalar: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
 
 _PDF_URL = f"{HKEXNEWS_BASE_URL}/listedco/listconews/sehk/2025/0401/2025040100001.pdf"
+
+
+@dataclass
+class _RecordingCheckpoint:
+    """记录 no-arg cancellation checkpoint 的精确调用顺序。"""
+
+    events: list[str]
+    errors_by_call: dict[int, RuntimeError] = field(default_factory=dict)
+    call_count: int = 0
+
+    def __call__(self) -> None:
+        """记录一次调用，并在配置的序号抛出指定异常。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            RuntimeError: 当前调用序号配置了异常时原样抛出。
+        """
+
+        self.call_count += 1
+        self.events.append(f"CP{self.call_count}")
+        error = self.errors_by_call.get(self.call_count)
+        if error is not None:
+            raise error
 
 
 def test_hkexnews_default_user_agent_and_rate_limit_constants_are_explicit() -> None:
@@ -165,6 +198,38 @@ def _announcement(
     }
 
 
+def _announcement_rows(
+    count: int,
+    *,
+    prefix: str,
+    title_year: int = 2024,
+) -> list[dict[str, str]]:
+    """构造可区分来源的累计公告行。
+
+    Args:
+        count: 公告行数。
+        prefix: document/file 识别前缀。
+        title_year: 标题内的财年。
+
+    Returns:
+        公告 row list。
+
+    Raises:
+        无。
+    """
+
+    return [
+        _announcement(
+            document_id=f"{prefix}_{index}",
+            title=f"腾讯控股有限公司：{title_year}年年度报告 {prefix} {index}",
+            file_link=(
+                f"/listedco/listconews/sehk/2025/0401/{prefix.lower()}_{index}.pdf"
+            ),
+        )
+        for index in range(count)
+    ]
+
+
 def _query_from_request(request: httpx.Request) -> dict[str, tuple[str, ...]]:
     """解析 GET query 参数。
 
@@ -182,11 +247,22 @@ def _query_from_request(request: httpx.Request) -> dict[str, tuple[str, ...]]:
     return {key: tuple(values) for key, values in parsed.items()}
 
 
-def _title_search_payload(rows: list[dict[str, str]]) -> dict[str, JsonValue]:
+def _title_search_payload(
+    rows: list[dict[str, str]],
+    *,
+    row_range: int = 100,
+    has_next_row: bool = False,
+    loaded_record: int | None = None,
+    record_count: int | None = None,
+) -> dict[str, JsonValue]:
     """构造披露易 title search 响应。
 
     Args:
         rows: 结果行。
+        row_range: provider 回显的当轮累计 range。
+        has_next_row: provider 是否声明还有后续记录。
+        loaded_record: provider 声明的已加载记录数；默认等于行数。
+        record_count: provider 声明的最新总数；默认等于已加载数。
 
     Returns:
         ``result`` 为字符串 JSON 的响应 dict。
@@ -195,7 +271,17 @@ def _title_search_payload(rows: list[dict[str, str]]) -> dict[str, JsonValue]:
         无。
     """
 
-    return {"result": json.dumps(rows, ensure_ascii=False)}
+    effective_loaded_record = len(rows) if loaded_record is None else loaded_record
+    effective_record_count = (
+        effective_loaded_record if record_count is None else record_count
+    )
+    return {
+        "hasNextRow": has_next_row,
+        "rowRange": row_range,
+        "loadedRecord": effective_loaded_record,
+        "recordCnt": effective_record_count,
+        "result": json.dumps(rows, ensure_ascii=False),
+    }
 
 
 def _build_http_client(
@@ -407,174 +493,581 @@ def test_list_report_candidates_gets_title_search_and_builds_absolute_url() -> N
     assert posted_forms[0]["toDate"] == ("20261231",)
 
 
-def test_list_report_candidates_raises_typed_truncated_when_full_page_lacks_total() -> None:
-    """title search 满页且无总数时必须 typed fail closed。
+def test_list_report_candidates_accepts_exact_100_complete_with_ordered_checkpoint() -> None:
+    """官方字段证明完整时，首轮恰好 100 条应正常返回。"""
 
-    Args:
-        无。
-
-    Returns:
-        无。
-
-    Raises:
-        AssertionError: 断言失败时抛出。
-    """
+    events: list[str] = []
+    checkpoint = _RecordingCheckpoint(events)
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if str(request.url).startswith(HKEXNEWS_TITLE_SEARCH_URL) and request.method == "GET":
-            rows = [
-                _announcement(
-                    document_id=f"DOC_{index}",
-                    title=f"腾讯控股有限公司：2024年年度报告 {index}",
-                )
-                for index in range(100)
-            ]
+        if str(request.url).startswith(HKEXNEWS_TITLE_SEARCH_URL):
+            events.append("GET(100)")
+            rows = _announcement_rows(100, prefix="EXACT")
             return httpx.Response(200, json=_title_search_payload(rows))
-        raise AssertionError(f"unexpected request {request.method} {request.url}")
-
-    client = _build_client(handler)
-
-    with pytest.raises(HkexnewsDiscoveryTruncatedError, match="无法证明完整"):
-        client.list_report_candidates(_query(), _profile())
-
-
-def test_list_report_candidates_accepts_full_page_when_total_proves_complete() -> None:
-    """title search 显式总数等于行数时可证明完整。
-
-    Args:
-        无。
-
-    Returns:
-        无。
-
-    Raises:
-        AssertionError: 断言失败时抛出。
-    """
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if str(request.url).startswith(HKEXNEWS_TITLE_SEARCH_URL) and request.method == "GET":
-            rows = [
-                _announcement(
-                    document_id=f"DOC_{index}",
-                    title=f"腾讯控股有限公司：2024年年度报告 {index}",
-                    file_link=f"/listedco/listconews/sehk/2025/0401/doc_{index}.pdf",
-                )
-                for index in range(100)
-            ]
-            payload = _title_search_payload(rows)
-            payload["total"] = "100"
-            return httpx.Response(200, json=payload)
         if request.method == "HEAD":
             return httpx.Response(200, headers={})
         raise AssertionError(f"unexpected request {request.method} {request.url}")
 
-    client = _build_client(handler)
-    candidates = client.list_report_candidates(_query(), _profile())
+    candidates = _build_client(handler).list_report_candidates(
+        _query(),
+        _profile(),
+        cancellation_checkpoint=checkpoint,
+    )
 
+    assert events[:3] == ["CP1", "GET(100)", "CP2"]
+    assert checkpoint.call_count == 2
     assert len(candidates) == 1
 
 
-def test_list_report_candidates_raises_typed_truncated_when_total_exceeds_rows() -> None:
-    """title search 显式总数大于行数时必须 typed fail closed。
+def test_list_report_candidates_fetches_two_round_cumulative_snapshot_with_invariant_query() -> None:
+    """两轮累计续取应只改 ``rowRange`` 并仅消费最终快照。"""
 
-    Args:
-        无。
-
-    Returns:
-        无。
-
-    Raises:
-        AssertionError: 断言失败时抛出。
-    """
+    events: list[str] = []
+    checkpoint = _RecordingCheckpoint(events)
+    requested: list[dict[str, tuple[str, ...]]] = []
+    final_rows = _announcement_rows(150, prefix="FINAL")
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if str(request.url).startswith(HKEXNEWS_TITLE_SEARCH_URL) and request.method == "GET":
-            rows = [
-                _announcement(
-                    document_id=f"DOC_{index}",
-                    title=f"腾讯控股有限公司：2024年年度报告 {index}",
+        if str(request.url).startswith(HKEXNEWS_TITLE_SEARCH_URL):
+            params = _query_from_request(request)
+            requested.append(params)
+            row_range = int(params["rowRange"][0])
+            events.append(f"GET({row_range})")
+            if row_range == 100:
+                return httpx.Response(
+                    200,
+                    json=_title_search_payload(
+                        _announcement_rows(100, prefix="FIRST"),
+                        has_next_row=True,
+                        record_count=150,
+                    ),
                 )
-                for index in range(2)
-            ]
-            payload = _title_search_payload(rows)
-            payload["total"] = 3
-            return httpx.Response(200, json=payload)
+            assert row_range == 200
+            return httpx.Response(
+                200,
+                json=_title_search_payload(final_rows, row_range=200),
+            )
+        if request.method == "HEAD":
+            assert "first_" not in str(request.url)
+            return httpx.Response(200, headers={})
         raise AssertionError(f"unexpected request {request.method} {request.url}")
 
-    client = _build_client(handler)
+    candidates = _build_client(handler).list_report_candidates(
+        _query(),
+        _profile(),
+        cancellation_checkpoint=checkpoint,
+    )
 
-    with pytest.raises(HkexnewsDiscoveryTruncatedError, match="响应被截断"):
-        client.list_report_candidates(_query(), _profile())
+    assert events[:6] == ["CP1", "GET(100)", "CP2", "CP3", "GET(200)", "CP4"]
+    assert [params["rowRange"] for params in requested] == [("100",), ("200",)]
+    without_range = [
+        {key: value for key, value in params.items() if key != "rowRange"}
+        for params in requested
+    ]
+    assert without_range[0] == without_range[1]
+    assert len(candidates) == 1
+    assert candidates[0].source_id.startswith("FINAL_")
 
 
-def test_list_report_candidates_accepts_integral_float_total() -> None:
-    """title search 非负整数 float 总数应视为可证明完整。
+def test_list_report_candidates_uses_latest_record_count_for_next_range_and_growth() -> None:
+    """每轮应使用最新 ``recordCnt`` 按公式扩大累计 range。"""
 
-    Args:
-        无。
-
-    Returns:
-        无。
-
-    Raises:
-        AssertionError: 断言失败时抛出。
-    """
+    ranges: list[int] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if str(request.url).startswith(HKEXNEWS_TITLE_SEARCH_URL) and request.method == "GET":
-            rows = [
-                _announcement(
-                    document_id=f"DOC_{index}",
-                    title=f"腾讯控股有限公司：2024年年度报告 {index}",
-                    file_link=f"/listedco/listconews/sehk/2025/0401/float_{index}.pdf",
+        if str(request.url).startswith(HKEXNEWS_TITLE_SEARCH_URL):
+            row_range = int(_query_from_request(request)["rowRange"][0])
+            ranges.append(row_range)
+            if row_range == 100:
+                return httpx.Response(
+                    200,
+                    json=_title_search_payload(
+                        _announcement_rows(100, prefix="GROW1"),
+                        has_next_row=True,
+                        record_count=150,
+                    ),
                 )
-                for index in range(100)
-            ]
-            payload = _title_search_payload(rows)
-            payload["total"] = 100.0
-            return httpx.Response(200, json=payload)
+            if row_range == 200:
+                return httpx.Response(
+                    200,
+                    json=_title_search_payload(
+                        _announcement_rows(200, prefix="GROW2"),
+                        row_range=200,
+                        has_next_row=True,
+                        record_count=350,
+                    ),
+                )
+            assert row_range == 400
+            return httpx.Response(
+                200,
+                json=_title_search_payload(
+                    _announcement_rows(350, prefix="GROW3"),
+                    row_range=400,
+                ),
+            )
         if request.method == "HEAD":
             return httpx.Response(200, headers={})
         raise AssertionError(f"unexpected request {request.method} {request.url}")
 
-    client = _build_client(handler)
-    candidates = client.list_report_candidates(_query(), _profile())
+    candidates = _build_client(handler).list_report_candidates(_query(), _profile())
 
+    assert ranges == [100, 200, 400]
     assert len(candidates) == 1
+    assert candidates[0].source_id.startswith("GROW3_")
 
 
-@pytest.mark.parametrize("invalid_total", [100.5, -100.0])
-def test_list_report_candidates_rejects_invalid_float_total(invalid_total: float) -> None:
-    """title search 非整数或负数 float 总数不能证明完整。
+def test_list_report_candidates_uses_record_count_when_larger_than_doubled_range() -> None:
+    """最新总数大于翻倍值时，下轮 range 应精确取 ``recordCnt``。"""
 
-    Args:
-        invalid_total: 待注入的非法显式总数。
-
-    Returns:
-        无。
-
-    Raises:
-        AssertionError: 断言失败时抛出。
-    """
+    ranges: list[int] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if str(request.url).startswith(HKEXNEWS_TITLE_SEARCH_URL) and request.method == "GET":
-            rows = [
-                _announcement(
-                    document_id=f"DOC_{index}",
-                    title=f"腾讯控股有限公司：2024年年度报告 {index}",
+        if str(request.url).startswith(HKEXNEWS_TITLE_SEARCH_URL):
+            row_range = int(_query_from_request(request)["rowRange"][0])
+            ranges.append(row_range)
+            if row_range == 100:
+                return httpx.Response(
+                    200,
+                    json=_title_search_payload(
+                        _announcement_rows(100, prefix="FORMULA1"),
+                        has_next_row=True,
+                        record_count=350,
+                    ),
                 )
-                for index in range(100)
-            ]
-            payload = _title_search_payload(rows)
-            payload["total"] = invalid_total
-            return httpx.Response(200, json=payload)
+            assert row_range == 350
+            return httpx.Response(
+                200,
+                json=_title_search_payload(
+                    _announcement_rows(350, prefix="FORMULA2"),
+                    row_range=350,
+                ),
+            )
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={})
         raise AssertionError(f"unexpected request {request.method} {request.url}")
 
-    client = _build_client(handler)
+    _build_client(handler).list_report_candidates(_query(), _profile())
 
-    with pytest.raises(HkexnewsDiscoveryTruncatedError, match="无法证明完整"):
-        client.list_report_candidates(_query(), _profile())
+    assert ranges == [100, 350]
+
+
+def test_list_report_candidates_replaces_overlapping_snapshot_and_accepts_terminal_shrink() -> None:
+    """最终自洽快照应优先于历史进度，不 append 或推测 prefix。"""
+
+    head_urls: list[str] = []
+    first = _announcement_rows(1, prefix="FIRST_ONLY")
+    final = _announcement_rows(1, prefix="FINAL_ONLY")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).startswith(HKEXNEWS_TITLE_SEARCH_URL):
+            row_range = int(_query_from_request(request)["rowRange"][0])
+            if row_range == 100:
+                return httpx.Response(
+                    200,
+                    json=_title_search_payload(
+                        first,
+                        has_next_row=True,
+                        record_count=2,
+                    ),
+                )
+            return httpx.Response(
+                200,
+                json=_title_search_payload(final, row_range=200),
+            )
+        if request.method == "HEAD":
+            head_urls.append(str(request.url))
+            return httpx.Response(200, headers={})
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    candidates = _build_client(handler).list_report_candidates(_query(), _profile())
+
+    assert [candidate.source_id for candidate in candidates] == ["FINAL_ONLY_0"]
+    assert len(head_urls) == 1
+    assert "final_only_0.pdf" in head_urls[0]
+
+
+def test_list_report_candidates_rejects_continuation_without_loaded_progress() -> None:
+    """续取后 loaded rows 不增加时应有限 typed fail 且不做 HEAD。"""
+
+    request_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        if str(request.url).startswith(HKEXNEWS_TITLE_SEARCH_URL):
+            request_count += 1
+            row_range = int(_query_from_request(request)["rowRange"][0])
+            return httpx.Response(
+                200,
+                json=_title_search_payload(
+                    _announcement_rows(1, prefix="STALL"),
+                    row_range=row_range,
+                    has_next_row=True,
+                    record_count=2 if row_range == 100 else 3,
+                ),
+            )
+        raise AssertionError("no HEAD or additional request is allowed")
+
+    with pytest.raises(HkexnewsProviderProtocolError, match="无进展"):
+        _build_client(handler).list_report_candidates(_query(), _profile())
+
+    assert request_count == 2
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ["hasNextRow", "rowRange", "loadedRecord", "recordCnt", "result"],
+)
+def test_list_report_candidates_requires_all_official_fields(missing_field: str) -> None:
+    """五个官方协议字段任一缺失都应 typed fail。"""
+
+    payload = _title_search_payload([])
+    del payload[missing_field]
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with pytest.raises(HkexnewsProviderProtocolError, match=missing_field):
+        _build_client(handler).list_report_candidates(_query(), _profile())
+
+
+@pytest.mark.parametrize("invalid_value", ["true", 1, None, [], {}])
+def test_list_report_candidates_requires_exact_has_next_bool(invalid_value: JsonValue) -> None:
+    """``hasNextRow`` 只接受 JSON bool。"""
+
+    payload = _title_search_payload([])
+    payload["hasNextRow"] = invalid_value
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with pytest.raises(HkexnewsProviderProtocolError, match="hasNextRow"):
+        _build_client(handler).list_report_candidates(_query(), _profile())
+
+
+@pytest.mark.parametrize("field_name", ["rowRange", "loadedRecord", "recordCnt"])
+@pytest.mark.parametrize("invalid_value", ["0", True, 0.0, 0.5, None, []])
+def test_list_report_candidates_requires_exact_count_ints(
+    field_name: str,
+    invalid_value: JsonValue,
+) -> None:
+    """三个 range/count 字段只接受非负 exact int，bool 不得冒充。"""
+
+    payload = _title_search_payload([])
+    payload[field_name] = invalid_value
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with pytest.raises(HkexnewsProviderProtocolError, match=field_name):
+        _build_client(handler).list_report_candidates(_query(), _profile())
+
+
+@pytest.mark.parametrize("field_name", ["rowRange", "loadedRecord", "recordCnt"])
+def test_list_report_candidates_rejects_negative_count_fields(field_name: str) -> None:
+    """三个 range/count 字段的负值均应 typed fail。"""
+
+    payload = _title_search_payload([])
+    payload[field_name] = -1
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with pytest.raises(HkexnewsProviderProtocolError, match=field_name):
+        _build_client(handler).list_report_candidates(_query(), _profile())
+
+
+@pytest.mark.parametrize("invalid_result", [[], "", "{", "{}", "[1]"])
+def test_list_report_candidates_requires_stringified_object_list(
+    invalid_result: JsonValue,
+) -> None:
+    """``result`` 必须是字符串化 JSON object list，不回退 generic aliases。"""
+
+    payload = _title_search_payload([])
+    payload["result"] = invalid_result
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with pytest.raises(HkexnewsProviderProtocolError, match="result"):
+        _build_client(handler).list_report_candidates(_query(), _profile())
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _title_search_payload([], row_range=99),
+        _title_search_payload(_announcement_rows(1, prefix="MISMATCH"), loaded_record=0),
+        _title_search_payload(_announcement_rows(2, prefix="COUNT"), record_count=1),
+        _title_search_payload(_announcement_rows(101, prefix="RANGE")),
+        _title_search_payload(
+            _announcement_rows(1, prefix="TRUE_COMPLETE"),
+            has_next_row=True,
+        ),
+        _title_search_payload(
+            _announcement_rows(1, prefix="FALSE_PARTIAL"),
+            record_count=2,
+        ),
+    ],
+)
+def test_list_report_candidates_rejects_same_round_contradictions(
+    payload: dict[str, JsonValue],
+) -> None:
+    """响应 range/loaded/count/rows/terminal 事实矛盾时均应 typed fail。"""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with pytest.raises(HkexnewsProviderProtocolError):
+        _build_client(handler).list_report_candidates(_query(), _profile())
+
+
+@pytest.mark.parametrize(
+    ("cancel_call", "first_has_next", "expected_events"),
+    [
+        (1, False, ["CP1"]),
+        (2, False, ["CP1", "GET(100)", "CP2"]),
+        (3, True, ["CP1", "GET(100)", "CP2", "CP3"]),
+    ],
+)
+def test_list_report_candidates_preserves_cancel_identity_and_suppresses_publication(
+    cancel_call: int,
+    first_has_next: bool,
+    expected_events: list[str],
+) -> None:
+    """首请求前、响应后或下轮前取消都应保持 identity 且零发布。"""
+
+    events: list[str] = []
+    expected = CnDownloadCancelledError(f"cancel at checkpoint {cancel_call}")
+    checkpoint = _RecordingCheckpoint(events, errors_by_call={cancel_call: expected})
+    head_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal head_count
+        if str(request.url).startswith(HKEXNEWS_TITLE_SEARCH_URL):
+            row_range = int(_query_from_request(request)["rowRange"][0])
+            events.append(f"GET({row_range})")
+            return httpx.Response(
+                200,
+                json=_title_search_payload(
+                    _announcement_rows(1, prefix="PARTIAL"),
+                    has_next_row=first_has_next,
+                    record_count=2 if first_has_next else 1,
+                ),
+            )
+        if request.method == "HEAD":
+            head_count += 1
+            return httpx.Response(200, headers={})
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    with pytest.raises(CnDownloadCancelledError) as exc_info:
+        _build_client(handler).list_report_candidates(
+            _query(),
+            _profile(),
+            cancellation_checkpoint=checkpoint,
+        )
+
+    assert exc_info.value is expected
+    assert events == expected_events
+    assert head_count == 0
+
+
+def test_list_report_candidates_preserves_non_cancel_failure_full_cause_chain() -> None:
+    """workflow checkpoint 非取消失败经 HKEX context wrapper 后应保留两层 cause。"""
+
+    original = ValueError("checker exploded")
+    request_count = 0
+
+    def checkpoint() -> None:
+        raise RuntimeError("取消检查失败") from original
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return httpx.Response(200, json=_title_search_payload([]))
+
+    with pytest.raises(RuntimeError) as exc_info:
+        _build_client(handler).list_report_candidates(
+            _query(),
+            _profile(),
+            cancellation_checkpoint=checkpoint,
+        )
+
+    assert type(exc_info.value) is RuntimeError
+    assert type(exc_info.value.__cause__) is RuntimeError
+    assert exc_info.value.__cause__.__cause__ is original
+    assert request_count == 0
+
+
+def test_list_report_candidates_preserves_provider_protocol_error_and_direct_cause() -> None:
+    """provider typed error 应在 generic wrapper 前原类型传播并保留 parser cause。"""
+
+    payload = _title_search_payload([])
+    payload["result"] = "{"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with pytest.raises(HkexnewsProviderProtocolError) as exc_info:
+        _build_client(handler).list_report_candidates(_query(), _profile())
+
+    assert isinstance(exc_info.value.__cause__, json.JSONDecodeError)
+
+
+def test_list_report_candidates_preserves_provider_protocol_object_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """预构造 provider protocol error 经 public generic wrapper 边界应保持 identity/cause。"""
+
+    original = ValueError("provider parser cause")
+    expected = HkexnewsProviderProtocolError("expected provider protocol failure")
+    expected.__cause__ = original
+
+    def raise_expected(
+        payload: JsonValue,
+        *,
+        requested_row_range: int,
+        stock_code: str,
+        category_spec: _hkexnews_downloader._HkCategorySpec,
+        language: CnLanguage,
+    ) -> NoReturn:
+        del payload, requested_row_range, stock_code, category_spec, language
+        raise expected
+
+    monkeypatch.setattr(
+        _hkexnews_downloader,
+        "_parse_title_search_snapshot",
+        raise_expected,
+    )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_title_search_payload([]))
+
+    with pytest.raises(HkexnewsProviderProtocolError) as exc_info:
+        _build_client(handler).list_report_candidates(_query(), _profile())
+
+    assert exc_info.value is expected
+    assert exc_info.value.__cause__ is original
+
+
+def test_list_report_candidates_discards_partial_rows_when_later_http_fails() -> None:
+    """后续累计 GET 重试耗尽时不得返回首轮 partial 或发起 HEAD。"""
+
+    title_gets = 0
+    head_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal title_gets, head_count
+        if str(request.url).startswith(HKEXNEWS_TITLE_SEARCH_URL):
+            title_gets += 1
+            row_range = int(_query_from_request(request)["rowRange"][0])
+            if row_range == 100:
+                return httpx.Response(
+                    200,
+                    json=_title_search_payload(
+                        _announcement_rows(1, prefix="HTTP_PARTIAL"),
+                        has_next_row=True,
+                        record_count=2,
+                    ),
+                )
+            return httpx.Response(503)
+        if request.method == "HEAD":
+            head_count += 1
+            return httpx.Response(200, headers={})
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    with pytest.raises(RuntimeError, match="披露易公告分类查询失败"):
+        _build_client(handler).list_report_candidates(_query(), _profile())
+
+    assert title_gets == 3
+    assert head_count == 0
+
+
+def test_list_report_candidates_keeps_cumulative_state_isolated_per_language() -> None:
+    """不同语言查询应各自从 100 开始并保持自身查询不变式。"""
+
+    ranges_by_language: dict[str, list[int]] = {"zh": [], "E": []}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).startswith(HKEXNEWS_TITLE_SEARCH_URL):
+            params = _query_from_request(request)
+            language = params["lang"][0]
+            row_range = int(params["rowRange"][0])
+            ranges_by_language[language].append(row_range)
+            if row_range == 100:
+                return httpx.Response(
+                    200,
+                    json=_title_search_payload(
+                        _announcement_rows(1, prefix=f"{language}_FIRST"),
+                        has_next_row=True,
+                        record_count=2,
+                    ),
+                )
+            return httpx.Response(
+                200,
+                json=_title_search_payload(
+                    _announcement_rows(2, prefix=f"{language}_FINAL"),
+                    row_range=200,
+                ),
+            )
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={})
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    client = HkexnewsDiscoveryClient(
+        client=_build_http_client(handler),
+        languages=("zh", "en"),
+        sleep_seconds=0.0,
+        max_retries=2,
+        sleep_func=lambda _delay: None,
+    )
+    client.list_report_candidates(_query(), _profile())
+
+    assert ranges_by_language == {"zh": [100, 200], "E": [100, 200]}
+
+
+def test_captured_official_title_search_shape_replays_through_strict_owner() -> None:
+    """官方小响应 fixture 的 body hash、请求参数与 exact types 应可审计重放。"""
+
+    fixture_path = (
+        Path(__file__).parent
+        / "fixtures"
+        / "hkexnews"
+        / "title_search_protocol_shape.json"
+    )
+    fixture = cast(JsonValue, json.loads(fixture_path.read_text(encoding="utf-8")))
+    assert isinstance(fixture, dict)
+    raw_body = fixture.get("raw_response_body")
+    expected_hash = fixture.get("raw_response_body_sha256")
+    request_params = fixture.get("request_params")
+    raw_response = fixture.get("raw_json_response")
+    assert isinstance(raw_body, str)
+    assert isinstance(expected_hash, str)
+    assert hashlib.sha256(raw_body.encode("utf-8")).hexdigest() == expected_hash
+    assert isinstance(request_params, dict)
+    assert isinstance(raw_response, dict)
+    assert isinstance(raw_response.get("hasNextRow"), bool)
+    for field_name in ("rowRange", "loadedRecord", "recordCnt"):
+        field_value = raw_response.get(field_name)
+        assert isinstance(field_value, int) and not isinstance(field_value, bool)
+    assert isinstance(raw_response.get("result"), str)
+    expected_query: dict[str, tuple[str, ...]] = {}
+    for key, value in request_params.items():
+        assert isinstance(value, str)
+        expected_query[key] = (value,)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert _query_from_request(request) == expected_query
+        return httpx.Response(200, json=raw_response)
+
+    query = CnReportQuery(
+        market="HK",
+        normalized_ticker="0700",
+        start_date="2026-07-15",
+        end_date="2026-07-15",
+        target_periods=("FY",),
+    )
+
+    assert _build_client(handler).list_report_candidates(query, _profile()) == ()
 
 
 def test_list_report_candidates_does_not_use_english_fallback_when_primary_empty() -> None:
@@ -584,7 +1077,7 @@ def test_list_report_candidates_does_not_use_english_fallback_when_primary_empty
         if str(request.url).startswith(HKEXNEWS_TITLE_SEARCH_URL) and request.method == "GET":
             form = _query_from_request(request)
             if form["lang"] == ("zh",):
-                return httpx.Response(200, json={"result": "[]"})
+                return httpx.Response(200, json=_title_search_payload([]))
             return httpx.Response(
                 200,
                 json=_title_search_payload(
@@ -613,7 +1106,7 @@ def test_list_report_candidates_filters_english_title_from_primary_language() ->
         if str(request.url).startswith(HKEXNEWS_TITLE_SEARCH_URL) and request.method == "GET":
             form = _query_from_request(request)
             if form["lang"] == ("E",):
-                return httpx.Response(200, json={"result": "[]"})
+                return httpx.Response(200, json=_title_search_payload([]))
             return httpx.Response(
                 200,
                 json=_title_search_payload(
@@ -641,7 +1134,7 @@ def test_list_report_candidates_filters_english_title_with_chinese_category() ->
         if str(request.url).startswith(HKEXNEWS_TITLE_SEARCH_URL) and request.method == "GET":
             form = _query_from_request(request)
             if form["lang"] == ("E",):
-                return httpx.Response(200, json={"result": "[]"})
+                return httpx.Response(200, json=_title_search_payload([]))
             return httpx.Response(
                 200,
                 json=_title_search_payload(
@@ -677,7 +1170,7 @@ def test_list_report_candidates_maps_hk_period_codes_and_allows_empty_quarters()
                     form["t2code"][0],
                 )
             )
-            return httpx.Response(200, json={"result": "[]"})
+            return httpx.Response(200, json=_title_search_payload([]))
         raise AssertionError(f"unexpected request {request.method} {request.url}")
 
     client = _build_client(handler)
@@ -705,7 +1198,7 @@ def test_list_report_candidates_raises_on_failed_hk_period_query() -> None:
             if form["t2code"] == ("40100",):
                 return httpx.Response(503, json={"error": "temporarily unavailable"})
             if form["lang"] == ("E",):
-                return httpx.Response(200, json={"result": "[]"})
+                return httpx.Response(200, json=_title_search_payload([]))
             return httpx.Response(
                 200,
                 json=_title_search_payload(
@@ -743,7 +1236,7 @@ def test_list_report_candidates_maps_direct_q2_to_quarterly_category() -> None:
             form = _query_from_request(request)
             seen_t2codes.append(form["t2code"][0])
             if form["lang"] == ("E",):
-                return httpx.Response(200, json={"result": "[]"})
+                return httpx.Response(200, json=_title_search_payload([]))
             return httpx.Response(
                 200,
                 json=_title_search_payload(
@@ -784,7 +1277,7 @@ def test_list_report_candidates_keeps_q4_distinct_from_fy() -> None:
         if str(request.url).startswith(HKEXNEWS_TITLE_SEARCH_URL) and request.method == "GET":
             form = _query_from_request(request)
             if form["lang"] == ("E",):
-                return httpx.Response(200, json={"result": "[]"})
+                return httpx.Response(200, json=_title_search_payload([]))
             if form["t2code"] == ("40100",):
                 return httpx.Response(
                     200,
@@ -839,7 +1332,7 @@ def test_list_report_candidates_treats_traditional_half_year_as_h1() -> None:
         if str(request.url).startswith(HKEXNEWS_TITLE_SEARCH_URL) and request.method == "GET":
             form = _query_from_request(request)
             if form["lang"] == ("E",):
-                return httpx.Response(200, json={"result": "[]"})
+                return httpx.Response(200, json=_title_search_payload([]))
             return httpx.Response(
                 200,
                 json=_title_search_payload(
@@ -882,7 +1375,7 @@ def test_list_report_candidates_filters_q1_q3_by_title_period() -> None:
             assert form["t2Gcode"] == ("3",)
             assert form["t2code"] == ("13600",)
             if form["lang"] == ("E",):
-                return httpx.Response(200, json={"result": "[]"})
+                return httpx.Response(200, json=_title_search_payload([]))
             return httpx.Response(
                 200,
                 json=_title_search_payload(
@@ -935,7 +1428,7 @@ def test_list_report_candidates_reads_hk_quarterly_results_announcements() -> No
             assert form["t2Gcode"] == ("3",)
             assert form["t2code"] == ("13600",)
             if form["lang"] == ("E",):
-                return httpx.Response(200, json={"result": "[]"})
+                return httpx.Response(200, json=_title_search_payload([]))
             return httpx.Response(
                 200,
                 json=_title_search_payload(
@@ -1002,7 +1495,7 @@ def test_list_report_candidates_groups_by_year_and_prefers_amended() -> None:
         if str(request.url).startswith(HKEXNEWS_TITLE_SEARCH_URL) and request.method == "GET":
             form = _query_from_request(request)
             if form["lang"] == ("E",):
-                return httpx.Response(200, json={"result": "[]"})
+                return httpx.Response(200, json=_title_search_payload([]))
             return httpx.Response(
                 200,
                 json=_title_search_payload(
