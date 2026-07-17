@@ -1,13 +1,13 @@
-"""SEC fiscal 字段与财务载荷真源模块。"""
+"""SEC fiscal 字段解析真源模块。"""
 
 from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Optional, Protocol, TypeAlias, TypeGuard, runtime_checkable
+from typing import Optional, Protocol, runtime_checkable
 
 from dayu.contracts.json_value import JsonValue
-from dayu.fins.domain.document_models import SourceHandle, now_iso8601
+from dayu.fins.domain.document_models import SourceHandle
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.domain.filing_semantics import (
     DocumentQuality,
@@ -15,7 +15,10 @@ from dayu.fins.domain.filing_semantics import (
     normalize_sec_form_type_for_matching,
     sanitize_fiscal_period_by_sec_form,
 )
-from dayu.fins.domain.xbrl_result_contract import validate_xbrl_facts_result_payload
+from dayu.fins.domain.xbrl_result_contract import (
+    XbrlFactsPayload,
+    validate_xbrl_facts_result_payload,
+)
 from dayu.fins.storage import SourceDocumentRepositoryProtocol
 from dayu.fins.storage.repository_protocols import SourceSnapshotProtocol
 
@@ -44,30 +47,10 @@ _DOWNLOAD_DEI_FISCAL_PERIOD_KEYS = (
 
 
 @runtime_checkable
-class _FinancialStatementProcessor(Protocol):
-    """可读取标准财务报表的处理器边界。"""
-
-    def get_financial_statement(self, *, statement_type: str) -> dict[str, JsonValue]:
-        """读取指定报表。
-
-        Args:
-            statement_type: 报表类型。
-
-        Returns:
-            报表 JSON 结果。
-
-        Raises:
-            处理器内部异常原样抛出。
-        """
-
-        ...
-
-
-@runtime_checkable
 class _XbrlQueryProcessor(Protocol):
     """可查询 XBRL facts 的处理器边界。"""
 
-    def query_xbrl_facts(self, *, concepts: list[str]) -> dict[str, JsonValue]:
+    def query_xbrl_facts(self, *, concepts: list[str]) -> XbrlFactsPayload:
         """查询 XBRL facts。
 
         Args:
@@ -81,66 +64,6 @@ class _XbrlQueryProcessor(Protocol):
         """
 
         ...
-
-
-_FiscalProcessor: TypeAlias = _FinancialStatementProcessor | _XbrlQueryProcessor
-
-
-def _supports_financial_data(processor: _FiscalProcessor | None) -> TypeGuard[_FinancialStatementProcessor]:
-    """判断处理器是否具备财务数据能力。"""
-
-    return isinstance(processor, _FinancialStatementProcessor)
-
-
-def _build_financials_payload(processor: _FiscalProcessor | None) -> tuple[Optional[dict[str, JsonValue]], bool]:
-    """构建 financials 载荷并返回 XBRL 可用状态。"""
-
-    if not _supports_financial_data(processor):
-        return None, False
-
-    statement_results: dict[str, dict[str, JsonValue]] = {}
-    has_xbrl = False
-    for statement_type in FINANCIAL_STATEMENT_TYPES:
-        statement_result: dict[str, JsonValue]
-        try:
-            raw_result = processor.get_financial_statement(statement_type=statement_type)
-        except Exception as exc:
-            statement_result = {
-                "statement_type": statement_type,
-                "periods": [],
-                "rows": [],
-                "currency": None,
-                "units": None,
-                "data_quality": "partial",
-                "reason": f"processor_error:{exc}",
-            }
-        else:
-            if isinstance(raw_result, dict):
-                statement_result = raw_result
-            else:
-                statement_result = {
-                    "statement_type": statement_type,
-                    "periods": [],
-                    "rows": [],
-                    "currency": None,
-                    "units": None,
-                    "data_quality": "partial",
-                    "reason": "invalid_statement_result",
-                }
-        statement_results[statement_type] = statement_result
-        statement_quality = str(statement_result.get("data_quality", "")).strip().lower()
-        if statement_quality == "xbrl" and bool(statement_result.get("rows")):
-            has_xbrl = True
-
-    if not has_xbrl:
-        return None, False
-
-    return {
-        "data_quality": "xbrl",
-        "generated_at": now_iso8601(),
-        "statements": statement_results,
-    }, True
-
 
 def _resolve_processed_quality(
     has_xbrl: bool,
@@ -174,7 +97,7 @@ def _resolve_processed_quality(
 def _resolve_processed_fiscal_fields(
     source_meta: dict[str, JsonValue],
     financials_payload: Optional[dict[str, JsonValue]],
-    processor: _FiscalProcessor | None,
+    processor: _XbrlQueryProcessor | None,
     allow_xbrl_query: bool = True,
 ) -> tuple[Optional[int], Optional[str]]:
     """解析 processed 元数据中的 fiscal_year/fiscal_period。"""
@@ -525,7 +448,9 @@ def _extract_fiscal_from_financials(
     return None, None
 
 
-def _extract_fiscal_from_xbrl_query(processor: _FiscalProcessor | None) -> tuple[Optional[int], Optional[str]]:
+def _extract_fiscal_from_xbrl_query(
+    processor: _XbrlQueryProcessor | None,
+) -> tuple[Optional[int], Optional[str]]:
     """通过 query_xbrl_facts 提取 fiscal_year/fiscal_period。"""
 
     if not isinstance(processor, _XbrlQueryProcessor):

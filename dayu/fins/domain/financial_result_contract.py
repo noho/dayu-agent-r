@@ -1,7 +1,7 @@
 """财务报表结果、倍率与质量语义的领域真源。
 
 processor 负责产生本模块定义的完整报表事实；read runtime 只能调用校验器并
-逐字段投影，不得补写期间、倍率、质量、原因或定位信息。
+逐字段投影，不得补写期间、倍率、质量或原因。
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
-from typing import Final, Literal, TypeAlias, TypedDict, cast
+from typing import Final, Literal, NotRequired, TypeAlias, TypedDict, cast
 
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.filing_semantics import (
@@ -28,9 +28,7 @@ FinancialScale: TypeAlias = Literal["units", "thousands", "millions", "billions"
 FinancialStatementReason: TypeAlias = Literal[
     "unsupported_statement_type",
     "xbrl_not_available",
-    "statement_method_missing",
     "statement_not_found",
-    "statement_empty",
     "low_confidence_extraction",
     "scale_unavailable",
     "period_semantics_unavailable",
@@ -45,10 +43,30 @@ _FINANCIAL_STATEMENT_REASONS: Final[frozenset[str]] = frozenset(
     {
         "unsupported_statement_type",
         "xbrl_not_available",
-        "statement_method_missing",
         "statement_not_found",
-        "statement_empty",
         "low_confidence_extraction",
+        "scale_unavailable",
+        "period_semantics_unavailable",
+        "scale_and_period_semantics_unavailable",
+    }
+)
+_FINANCIAL_RESULT_REQUIRED_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "statement_type",
+        "periods",
+        "rows",
+        "currency",
+        "units",
+        "scale",
+        "data_quality",
+    }
+)
+_FINANCIAL_RESULT_OPTIONAL_KEYS: Final[frozenset[str]] = frozenset({"reason"})
+_FINANCIAL_PERIOD_KEYS: Final[frozenset[str]] = frozenset(
+    {"period_end", "fiscal_year", "fiscal_period"}
+)
+_DIRECT_EVIDENCE_REASONS: Final[frozenset[FinancialStatementReason]] = frozenset(
+    {
         "scale_unavailable",
         "period_semantics_unavailable",
         "scale_and_period_semantics_unavailable",
@@ -65,15 +83,6 @@ class FinancialPeriod(TypedDict):
     fiscal_period: FiscalPeriod | None
 
 
-class StatementLocator(TypedDict):
-    """财务报表的人类可读定位信息。"""
-
-    statement_type: str
-    statement_title: str
-    period_labels: list[str]
-    row_labels: list[str]
-
-
 class FinancialStatementResult(TypedDict):
     """processor 产生的完整财务报表领域结果。"""
 
@@ -84,8 +93,7 @@ class FinancialStatementResult(TypedDict):
     units: str | None
     scale: FinancialScale | None
     data_quality: FinancialDataQuality
-    reason: FinancialStatementReason | None
-    statement_locator: StatementLocator
+    reason: NotRequired[FinancialStatementReason]
 
 
 FinancialStatementPayload: TypeAlias = Mapping[str, JsonValue] | FinancialStatementResult
@@ -201,6 +209,12 @@ def validate_financial_statement_result_payload(
         ValueError: 必填字段缺失、字段类型非法、JSON shape 非法或质量矩阵冲突时抛出。
     """
 
+    _validate_exact_keys(
+        payload,
+        required_keys=_FINANCIAL_RESULT_REQUIRED_KEYS,
+        optional_keys=_FINANCIAL_RESULT_OPTIONAL_KEYS,
+        context="FinancialStatementResult",
+    )
     statement_type = _required_non_empty_string(payload, "statement_type")
     periods = _required_periods(payload)
     rows = _required_json_rows(payload)
@@ -208,12 +222,11 @@ def validate_financial_statement_result_payload(
     units = _required_optional_string(payload, "units")
     scale = _required_financial_scale(payload)
     data_quality = _required_data_quality(payload)
-    reason = _required_financial_reason(payload)
-    statement_locator = _required_statement_locator(payload)
+    reason = _optional_financial_reason(payload)
     if data_quality == "partial" and reason is None:
         raise ValueError("FinancialStatementResult partial 必须提供 reason")
     if data_quality != "partial" and reason is not None:
-        raise ValueError("FinancialStatementResult 完整结果的 reason 必须为 None")
+        raise ValueError("FinancialStatementResult 完整结果必须省略 reason")
     if not rows and data_quality != "partial":
         raise ValueError("FinancialStatementResult 空 rows 不得声明完整质量")
     if units is not None and (
@@ -221,7 +234,7 @@ def validate_financial_statement_result_payload(
         or re.search(r"\bin\s+(?:thousands|millions|billions)\b", units, re.IGNORECASE)
     ):
         raise ValueError("FinancialStatementResult units 不得承载 scale")
-    if rows:
+    if rows and (data_quality != "partial" or reason in _DIRECT_EVIDENCE_REASONS):
         expected_quality = determine_financial_statement_quality(
             rows=rows,
             periods=periods,
@@ -230,9 +243,7 @@ def validate_financial_statement_result_payload(
         )
         if data_quality != expected_quality.data_quality or reason != expected_quality.reason:
             raise ValueError("FinancialStatementResult quality/reason 与直接证据不一致")
-    if statement_locator["statement_type"] != statement_type:
-        raise ValueError("FinancialStatementResult locator statement_type 必须与结果一致")
-    return FinancialStatementResult(
+    result = FinancialStatementResult(
         statement_type=statement_type,
         periods=periods,
         rows=rows,
@@ -240,9 +251,41 @@ def validate_financial_statement_result_payload(
         units=units,
         scale=scale,
         data_quality=data_quality,
-        reason=reason,
-        statement_locator=statement_locator,
     )
+    if reason is not None:
+        result["reason"] = reason
+    return result
+
+
+def _validate_exact_keys(
+    payload: Mapping[str, JsonValue] | FinancialStatementResult,
+    *,
+    required_keys: frozenset[str],
+    optional_keys: frozenset[str],
+    context: str,
+) -> None:
+    """校验 JSON 对象的必填键与可选键闭集。
+
+    Args:
+        payload: 待校验对象。
+        required_keys: 必须存在的键。
+        optional_keys: 允许缺席的键。
+        context: 错误消息中的契约名称。
+
+    Returns:
+        无。
+
+    Raises:
+        ValueError: 必填键缺失或出现未知键时抛出。
+    """
+
+    actual_keys = frozenset(payload.keys())
+    missing_keys = required_keys - actual_keys
+    if missing_keys:
+        raise ValueError(f"{context} 缺少必填字段: {', '.join(sorted(missing_keys))}")
+    unknown_keys = actual_keys - required_keys - optional_keys
+    if unknown_keys:
+        raise ValueError(f"{context} 包含未知字段: {', '.join(sorted(unknown_keys))}")
 
 
 def _require_field(payload: FinancialStatementPayload, field_name: str) -> JsonValue:
@@ -326,6 +369,12 @@ def _required_periods(payload: FinancialStatementPayload) -> list[FinancialPerio
     for raw_period in raw_periods:
         if not isinstance(raw_period, Mapping):
             raise ValueError("FinancialStatementResult periods 元素必须为对象")
+        _validate_exact_keys(
+            raw_period,
+            required_keys=_FINANCIAL_PERIOD_KEYS,
+            optional_keys=frozenset(),
+            context="FinancialStatementResult period",
+        )
         period_end = _required_non_empty_string(raw_period, "period_end")
         if _ISO_DATE_PATTERN.fullmatch(period_end) is None:
             raise ValueError("FinancialStatementResult period_end 必须为 YYYY-MM-DD")
@@ -447,10 +496,10 @@ def _required_data_quality(payload: FinancialStatementPayload) -> FinancialDataQ
     return normalize_financial_data_quality(value, field_name="FinancialStatementResult data_quality")
 
 
-def _required_financial_reason(
+def _optional_financial_reason(
     payload: FinancialStatementPayload,
 ) -> FinancialStatementReason | None:
-    """读取必填可空降级原因字段。
+    """读取可选降级原因字段。
 
     Args:
         payload: 原始 JSON 对象。
@@ -459,59 +508,17 @@ def _required_financial_reason(
         canonical 原因或 ``None``。
 
     Raises:
-        ValueError: 字段缺失或原因不在封闭集合时抛出。
+        ValueError: 原因为 ``null`` 或不在封闭集合时抛出。
     """
 
+    if "reason" not in payload:
+        return None
     value = _require_field(payload, "reason")
     if value is None:
-        return None
+        raise ValueError("FinancialStatementResult reason 为可选字段，不得使用 null")
     if not isinstance(value, str) or value not in _FINANCIAL_STATEMENT_REASONS:
         raise ValueError("FinancialStatementResult reason 非法")
     return cast(FinancialStatementReason, value)
-
-
-def _required_statement_locator(payload: FinancialStatementPayload) -> StatementLocator:
-    """校验并复制报表定位信息。
-
-    Args:
-        payload: 原始 JSON 对象。
-
-    Returns:
-        强类型报表定位信息。
-
-    Raises:
-        ValueError: locator 缺失或字段类型非法时抛出。
-    """
-
-    raw_locator = _require_field(payload, "statement_locator")
-    if not isinstance(raw_locator, Mapping):
-        raise ValueError("FinancialStatementResult statement_locator 必须为对象")
-    return StatementLocator(
-        statement_type=_required_non_empty_string(raw_locator, "statement_type"),
-        statement_title=_required_non_empty_string(raw_locator, "statement_title"),
-        period_labels=_required_string_list(raw_locator, "period_labels"),
-        row_labels=_required_string_list(raw_locator, "row_labels"),
-    )
-
-
-def _required_string_list(payload: FinancialStatementPayload, field_name: str) -> list[str]:
-    """读取必填字符串数组字段。
-
-    Args:
-        payload: 原始 JSON 对象。
-        field_name: 字段名。
-
-    Returns:
-        独立复制的字符串列表。
-
-    Raises:
-        ValueError: 字段缺失、不是数组或含非字符串元素时抛出。
-    """
-
-    value = _require_field(payload, field_name)
-    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
-        raise ValueError(f"FinancialStatementResult {field_name} 必须为字符串数组")
-    return [item for item in value if isinstance(item, str)]
 
 
 __all__ = [
@@ -522,7 +529,6 @@ __all__ = [
     "FinancialStatementReason",
     "FinancialStatementResult",
     "FinancialStatementPayload",
-    "StatementLocator",
     "determine_financial_statement_quality",
     "infer_financial_scale_from_decimals",
     "validate_financial_statement_result_payload",

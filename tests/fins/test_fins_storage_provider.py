@@ -15,6 +15,7 @@ import time
 import traceback
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import fields
 from datetime import datetime
 from pathlib import Path
@@ -78,6 +79,7 @@ from dayu.fins.domain.document_models import (
     now_iso8601,
 )
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.domain.filing_semantics import FISCAL_PERIODS
 from dayu.fins.domain.xbrl_result_contract import XbrlQueryExecutionError
 from dayu.fins.domain.tool_models import Citation
 from dayu.fins.storage import (
@@ -98,6 +100,10 @@ from dayu.fins.tools.fins_tools import build_fins_read_tool_definitions
 from dayu.fins.tools.provider import discover_tools
 from dayu.fins.tools.read_runtime import FinsReadRuntime
 from dayu.fins.tools.read_runtime_helpers import FinsReadBusinessError, FinsReadCancelledError
+from dayu.fins.tools.result_types import (
+    financial_statement_result_description,
+    xbrl_query_result_description,
+)
 from dayu.host.tool_runtime import (
     DefaultToolRuntimeFactory,
     EffectiveToolBundleBuildRequest,
@@ -112,7 +118,11 @@ from dayu.host.tool_runtime import (
     ToolRuntimeExecutionScope,
     ProcessBackedToolExecutionCapsule,
 )
-from dayu.host.tooling import default_framework_tool_policy_view
+from dayu.host.tooling import (
+    FrameworkToolName,
+    FrameworkToolPolicyView,
+    default_framework_tool_policy_view,
+)
 from dayu.runtime.tools_discovery import (
     PythonImportPathProvider,
     ToolsDiscovery,
@@ -139,6 +149,7 @@ _AAPL_XBRL_FIXTURE_DIR: Final[Path] = (
 )
 _AAPL_XBRL_DOCUMENT_ID: Final[str] = "fil_0000320193-24-000123"
 _AAPL_XBRL_VERIFIED_CONCEPT: Final[str] = "NetIncomeLoss"
+_FORCED_XBRL_MAX_ITEMS: Final[int] = 1
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _FINS_WAIT_ADAPTER_PATH = (_REPO_ROOT / "dayu" / "fins" / "ingestion" / "wait_adapter.py").resolve(strict=False)
 _FINS_DEFAULT_FORBIDDEN_IMPORT_ROOTS = ("dayu.engine", "dayu.host", "dayu.service", "dayu.ui")
@@ -596,9 +607,7 @@ class _XbrlFactsProcessor(_SearchCancellingProcessor):
         return {
             "query_params": {"concepts": concept_values},
             "facts": facts,
-            "total": len(facts),
             "data_quality": "xbrl",
-            "reason": None,
         }
 
 
@@ -3613,9 +3622,76 @@ def test_fins_read_financial_statement_runs_in_spawned_child(tmp_path: Path) -> 
     assert "scale" in value
     assert value.get("data_quality") == "partial"
     assert isinstance(value.get("reason"), str)
-    assert isinstance(value.get("statement_locator"), Mapping)
+    assert set(value) == {
+        "ticker",
+        "document_id",
+        "citation",
+        "statement_type",
+        "periods",
+        "rows",
+        "currency",
+        "units",
+        "scale",
+        "data_quality",
+        "reason",
+    }
     assert "supported" not in value
     assert "error" not in value
+
+
+def test_fins_read_financial_statement_projects_statement_not_found(
+    tmp_path: Path,
+) -> None:
+    """真实 XBRL 缺失目标报表时必须投影 producer 拥有的可操作原因。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: no-statement terminal 被 read 层改写时抛出。
+    """
+
+    workspace_root = _build_fins_aapl_xbrl_workspace(
+        tmp_path,
+        excluded_fixture_names=frozenset({"aapl-20240928_pre.xml"}),
+        primary_payload_override=(
+            b"<html><body><p>Business overview without tabular data.</p></body></html>"
+        ),
+    )
+    target = _build_process_target(
+        workspace_root,
+        "get_financial_statement",
+        {
+            "ticker": "AAPL",
+            "document_id": _AAPL_XBRL_DOCUMENT_ID,
+            "statement_type": "comprehensive_income",
+        },
+    )
+
+    outcome = asyncio.run(_run_process_capsule(target))
+
+    assert isinstance(outcome, ToolCompletedOutcome)
+    value = outcome.result.value
+    assert isinstance(value, Mapping)
+    assert value["rows"] == []
+    assert value["data_quality"] == "partial"
+    assert value["reason"] == "statement_not_found"
+    assert set(value) == {
+        "ticker",
+        "document_id",
+        "citation",
+        "statement_type",
+        "periods",
+        "rows",
+        "currency",
+        "units",
+        "scale",
+        "data_quality",
+        "reason",
+    }
 
 
 def test_fins_read_aapl_xbrl_query_runs_in_spawned_child(tmp_path: Path) -> None:
@@ -3639,13 +3715,141 @@ def test_fins_read_aapl_xbrl_query_runs_in_spawned_child(tmp_path: Path) -> None
     assert isinstance(value, Mapping)
     facts = value.get("facts")
     assert isinstance(facts, list)
-    assert value.get("total") is not None
-    assert value.get("deduped_fact_count") == len(facts)
+    assert "fact_count" in value
+    assert value["fact_count"] == len(facts)
     assert value.get("data_quality") == "xbrl"
-    assert "reason" in value
-    assert value.get("reason") is None
+    assert "reason" not in value
+    assert set(value) == {
+        "ticker",
+        "document_id",
+        "citation",
+        "query_params",
+        "facts",
+        "fact_count",
+        "data_quality",
+    }
     concept_names = {_xbrl_fact_concept_local_name(fact) for fact in facts if isinstance(fact, Mapping)}
     assert _AAPL_XBRL_VERIFIED_CONCEPT in concept_names
+
+
+def test_fins_read_aapl_xbrl_query_separates_pre_host_value_from_host_truncation(
+    tmp_path: Path,
+) -> None:
+    """真实 XBRL public value、截断 envelope 与公开续读必须完整组合。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 三段公开链路的字段、顺序或计数语义不一致时抛出。
+    """
+
+    workspace_root = _build_fins_aapl_xbrl_workspace(tmp_path)
+    extra_config: Mapping[str, JsonValue] = {
+        "limits": {
+            "query_xbrl_facts_max_items": _FORCED_XBRL_MAX_ITEMS,
+        }
+    }
+    provider_output = discover_tools(
+        _spec(workspace_root, extra_config=extra_config)
+    )
+    definitions = _definitions_by_name(provider_output.definitions)
+    query_arguments: Mapping[str, JsonValue] = {
+        "ticker": "AAPL",
+        "document_id": _AAPL_XBRL_DOCUMENT_ID,
+        "concepts": [_AAPL_XBRL_VERIFIED_CONCEPT],
+    }
+
+    pre_outcome = asyncio.run(
+        definitions["query_xbrl_facts"].callable(
+            _call("query_xbrl_facts", query_arguments),
+            _context(),
+        )
+    )
+    assert isinstance(pre_outcome, ToolCompletedOutcome)
+    pre_value = pre_outcome.result.value
+    assert isinstance(pre_value, Mapping)
+    assert "fact_count" in pre_value
+    assert set(pre_value) == {
+        "ticker",
+        "document_id",
+        "citation",
+        "query_params",
+        "facts",
+        "fact_count",
+        "data_quality",
+    }
+    pre_facts_value = pre_value["facts"]
+    assert isinstance(pre_facts_value, list)
+    assert len(pre_facts_value) > _FORCED_XBRL_MAX_ITEMS
+    assert pre_value["fact_count"] == len(pre_facts_value)
+    pre_value_copy = deepcopy(dict(pre_value))
+    pre_facts_copy = deepcopy(pre_facts_value)
+
+    assert FrameworkToolName.FETCH_MORE.value not in definitions
+    runtime, _accepting_port = _tool_runtime(
+        workspace_root,
+        extra_config=extra_config,
+        enable_truncation_manager=True,
+    )
+    assert FrameworkToolName.FETCH_MORE in (
+        runtime.effective_bundle.injected_framework_tool_names
+    )
+    host_response = asyncio.run(
+        runtime.tool_executor.execute(
+            BatchToolExecutionRequest(
+                calls=(
+                    _call("query_xbrl_facts", query_arguments),
+                ),
+                context=_context(),
+            )
+        )
+    )
+    post_outcome = host_response.records[0].outcome
+    assert isinstance(post_outcome, ToolCompletedOutcome)
+    post_value = post_outcome.result.value
+    assert isinstance(post_value, Mapping)
+    assert set(post_value) == set(pre_value_copy)
+    assert post_value["fact_count"] == pre_value_copy["fact_count"]
+    for key, pre_item in pre_value_copy.items():
+        if key != "facts":
+            assert post_value[key] == pre_item
+
+    facts_envelope = post_value["facts"]
+    assert isinstance(facts_envelope, Mapping)
+    assert set(facts_envelope) == {"truncated", "value", "fetch_more"}
+    assert facts_envelope["truncated"] is True
+    visible_value = facts_envelope["value"]
+    fetch_more_reference = facts_envelope["fetch_more"]
+    assert isinstance(visible_value, list)
+    assert len(visible_value) == _FORCED_XBRL_MAX_ITEMS
+    assert isinstance(fetch_more_reference, Mapping)
+    cursor = fetch_more_reference["cursor"]
+    scope_token = fetch_more_reference["scope_token"]
+    assert isinstance(cursor, str)
+    assert isinstance(scope_token, str)
+
+    fetch_response = asyncio.run(
+        runtime.tool_executor.execute(
+            BatchToolExecutionRequest(
+                calls=(
+                    _call(
+                        FrameworkToolName.FETCH_MORE.value,
+                        {"cursor": cursor, "scope_token": scope_token},
+                    ),
+                ),
+                context=_context(),
+            )
+        )
+    )
+    fetch_outcome = fetch_response.records[0].outcome
+    assert isinstance(fetch_outcome, ToolCompletedOutcome)
+    remainder = fetch_outcome.result.value
+    assert isinstance(remainder, list)
+    assert [*visible_value, *remainder] == pre_facts_copy
 
 
 def test_financial_tool_descriptions_explain_owner_fields(tmp_path: Path) -> None:
@@ -3664,32 +3868,132 @@ def test_financial_tool_descriptions_explain_owner_fields(tmp_path: Path) -> Non
     definitions = _definitions_by_name(_discover_definitions(_build_fins_workspace(tmp_path)))
     financial_description = definitions["get_financial_statement"].schema.function.description
     xbrl_description = definitions["query_xbrl_facts"].schema.function.description
+    assert financial_description == financial_statement_result_description()
+    assert xbrl_description == xbrl_query_result_description()
 
     for token in (
+        "ticker",
+        "document_id",
+        "citation",
         "period_end:string",
         "fiscal_year:int|null",
         "fiscal_period:FY|H1|Q1|Q2|Q3|Q4|null",
         "scale",
-        "units/thousands/millions/billions/null",
+        "units|thousands|millions|billions|null",
         "data_quality",
         "partial",
         "reason",
+        "unsupported_statement_type",
+        "xbrl_not_available",
+        "statement_not_found",
+        "low_confidence_extraction",
+        "scale_unavailable",
+        "period_semantics_unavailable",
+        "scale_and_period_semantics_unavailable",
+        "禁止跨期比较",
+        "禁止数量级判断",
+        "SEC_EDGAR",
     ):
         assert token in financial_description
     for token in (
-        "total",
-        "deduped_fact_count",
-        "去重前",
-        "去重后",
+        "ticker",
+        "document_id",
+        "citation",
+        "query_params",
+        "facts",
+        "fact_count",
+        '"fact_count":1',
+        "fiscal_period:FY|H1|Q1|Q2|Q3|Q4",
         "data_quality=xbrl",
-        "total=0",
-        "没有匹配 fact",
+        "没有匹配事实",
         "partial",
         "reason",
+        "xbrl_not_available",
+        "query_partially_failed",
+        "SEC_EDGAR",
     ):
         assert token in xbrl_description
-    forbidden_terms = ("Host", "Engine", "event_id", "digest", "cursor", "SSRF", "allowlist")
+    xbrl_parameters = definitions["query_xbrl_facts"].schema.function.parameters.properties
+    fiscal_period_schema = xbrl_parameters["fiscal_period"]
+    min_value_schema = xbrl_parameters["min_value"]
+    max_value_schema = xbrl_parameters["max_value"]
+    assert isinstance(fiscal_period_schema, Mapping)
+    assert fiscal_period_schema["enum"] == sorted(FISCAL_PERIODS)
+    assert isinstance(min_value_schema, Mapping)
+    assert isinstance(max_value_schema, Mapping)
+    assert min_value_schema["type"] == "number"
+    assert max_value_schema["type"] == "number"
+    forbidden_terms = (
+        "Host",
+        "Engine",
+        "event_id",
+        "digest",
+        "cursor",
+        "SSRF",
+        "allowlist",
+        "fallback branch",
+    )
     assert not any(term in financial_description or term in xbrl_description for term in forbidden_terms)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value", "valid_value"),
+    [
+        ("min_value", True, 0),
+        ("max_value", False, 1.5),
+    ],
+)
+def test_xbrl_number_parameters_reject_bool_and_accept_json_number(
+    tmp_path: Path,
+    field_name: str,
+    invalid_value: JsonValue,
+    valid_value: JsonValue,
+) -> None:
+    """XBRL 数值过滤参数的 callable 行为必须与 number schema 一致。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        field_name: 待验证的数值过滤字段。
+        invalid_value: 必须拒绝的布尔值。
+        valid_value: 必须接受的 JSON number。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: boolean 被接受或合法 number 被拒绝时抛出。
+    """
+
+    workspace_root = _build_fins_aapl_xbrl_workspace(tmp_path)
+    definition = _definitions_by_name(_discover_definitions(workspace_root))[
+        "query_xbrl_facts"
+    ]
+    base_arguments: dict[str, JsonValue] = {
+        "ticker": "AAPL",
+        "document_id": _AAPL_XBRL_DOCUMENT_ID,
+        "concepts": [_AAPL_XBRL_VERIFIED_CONCEPT],
+    }
+    invalid_arguments = dict(base_arguments)
+    invalid_arguments[field_name] = invalid_value
+    valid_arguments = dict(base_arguments)
+    valid_arguments[field_name] = valid_value
+
+    invalid_outcome = asyncio.run(
+        definition.callable(
+            _call("query_xbrl_facts", invalid_arguments),
+            _context(),
+        )
+    )
+    valid_outcome = asyncio.run(
+        definition.callable(
+            _call("query_xbrl_facts", valid_arguments),
+            _context(),
+        )
+    )
+
+    assert isinstance(invalid_outcome, ToolFailedOutcome)
+    assert invalid_outcome.result.error == "invalid_argument"
+    assert isinstance(valid_outcome, ToolCompletedOutcome)
 
 
 def test_financial_tool_process_target_preserves_xbrl_failed_outcome(
@@ -5034,11 +5338,18 @@ def _build_fins_financial_html_workspace(tmp_path: Path) -> Path:
     return workspace_root
 
 
-def _build_fins_aapl_xbrl_workspace(tmp_path: Path) -> Path:
+def _build_fins_aapl_xbrl_workspace(
+    tmp_path: Path,
+    *,
+    excluded_fixture_names: frozenset[str] = frozenset(),
+    primary_payload_override: bytes | None = None,
+) -> Path:
     """构造包含真实 AAPL XBRL fixture 的 Fins 工作区。
 
     Args:
         tmp_path: pytest 临时目录。
+        excluded_fixture_names: 为真实缺失分支移除的可选 XBRL 关系文件名。
+        primary_payload_override: 为无报表分支提供的可选主 HTML 字节。
 
     Returns:
         Fins workspace root。
@@ -5080,16 +5391,23 @@ def _build_fins_aapl_xbrl_workspace(tmp_path: Path) -> Path:
         )
         file_metas = []
         for file_path in _aapl_xbrl_fixture_files():
-            with file_path.open("rb") as stream:
-                file_metas.append(
-                    blob_repository.store_file(
-                        handle,
-                        file_path.name,
-                        stream,
-                        batch=token,
-                        content_type=_fixture_content_type(file_path),
-                    )
+            if file_path.name in excluded_fixture_names:
+                continue
+            payload = (
+                primary_payload_override
+                if file_path.name == primary_document
+                and primary_payload_override is not None
+                else file_path.read_bytes()
+            )
+            file_metas.append(
+                blob_repository.store_file(
+                    handle,
+                    file_path.name,
+                    io.BytesIO(payload),
+                    batch=token,
+                    content_type=_fixture_content_type(file_path),
                 )
+            )
         source_repository.create_source_document(
             SourceDocumentUpsertRequest(
                 ticker="AAPL",
@@ -5789,11 +6107,18 @@ def _assert_path_free_storage_os_error(
     assert error.__cause__.errno == expected_errno
 
 
-def _tool_runtime(workspace_root: Path) -> tuple[ToolRuntimeHandle, _AcceptingPort]:
+def _tool_runtime(
+    workspace_root: Path,
+    *,
+    extra_config: Mapping[str, JsonValue] | None = None,
+    enable_truncation_manager: bool = False,
+) -> tuple[ToolRuntimeHandle, _AcceptingPort]:
     """构造当前 ToolRuntime。
 
     Args:
         workspace_root: Fins workspace root。
+        extra_config: 原样传给真实 Fins provider 的可选配置。
+        enable_truncation_manager: 是否通过公开 policy 启用截断与续读工具。
 
     Returns:
         ToolRuntime 与 accept port。
@@ -5802,16 +6127,24 @@ def _tool_runtime(workspace_root: Path) -> tuple[ToolRuntimeHandle, _AcceptingPo
         Exception: 构造失败时透出。
     """
 
-    output = discover_tools(_spec(workspace_root))
+    output = discover_tools(_spec(workspace_root, extra_config=extra_config))
     accepting_port = _AcceptingPort()
+    framework_tool_policy = default_framework_tool_policy_view()
+    if enable_truncation_manager:
+        framework_tool_policy = FrameworkToolPolicyView(
+            reserved_framework_tool_names=frozenset(
+                {FrameworkToolName.FETCH_MORE}
+            ),
+            enabled_framework_tools=frozenset({FrameworkToolName.FETCH_MORE}),
+        )
     runtime = DefaultToolRuntimeFactory(EffectiveToolBundleBuilder()).create_tool_runtime(
         ToolRuntimeBuildRequest(
             effective_bundle_request=EffectiveToolBundleBuildRequest(
                 business_tool_bundle=ToolBundle(definitions=output.definitions),
                 source_refs=output.source_refs,
-                framework_tool_policy=default_framework_tool_policy_view(),
+                framework_tool_policy=framework_tool_policy,
                 policy_snapshot_digest="sha256:" + "3" * 64,
-                enable_truncation_manager=False,
+                enable_truncation_manager=enable_truncation_manager,
             ),
             execution_scope=ToolRuntimeExecutionScope(
                 session_id="session-fins",

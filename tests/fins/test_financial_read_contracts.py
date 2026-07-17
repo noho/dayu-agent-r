@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import TypeAlias, cast
+from copy import deepcopy
+from pathlib import Path
+from typing import Literal, TypeAlias, cast
 
 import pytest
 import pandas as pd
@@ -13,11 +15,12 @@ from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.financial_result_contract import (
     FinancialPeriod,
     FinancialScale,
+    FinancialStatementResult,
     determine_financial_statement_quality,
     infer_financial_scale_from_decimals,
     validate_financial_statement_result_payload,
 )
-from dayu.fins.domain.filing_semantics import FiscalPeriod
+from dayu.fins.domain.filing_semantics import FISCAL_PERIODS, FiscalPeriod
 from dayu.fins.domain.xbrl_result_contract import (
     XbrlQueryExecutionError,
     validate_xbrl_facts_result_payload,
@@ -26,10 +29,29 @@ from dayu.fins.processors.sec_xbrl_query import _query_facts_rows
 from dayu.fins.processors.sec_processor import SecProcessor
 from dayu.fins.processors.bs_report_form_common import _BaseBsReportFormProcessor
 from dayu.fins.processors.bs_six_k_processor import BsSixKFormProcessor
+from dayu.fins.processors.bs_ten_k_processor import BsTenKFormProcessor
+from dayu.fins.processors.bs_ten_q_processor import BsTenQFormProcessor
+from dayu.fins.processors.bs_twenty_f_processor import BsTwentyFFormProcessor
 from dayu.fins.processors.html_financial_statement_common import (
+    _extract_currency_for_column,
+    _extract_first_date,
+    _extract_fiscal_period_from_direct_text,
+    _extract_fiscal_period_year,
+    _infer_scale_from_caption,
+    _normalize_period_end,
+    _parse_optional_numeric,
     build_html_statement_result_from_tables,
 )
-from dayu.fins.processors.six_k_form_common import extract_statement_result_from_ocr_pages
+from dayu.fins.processors.report_form_financial_statement_common import (
+    classify_report_statement_type_for_table,
+    select_report_statement_tables,
+    should_apply_report_statement_html_fallback,
+)
+from dayu.fins.processors.six_k_form_common import (
+    _classify_statement_type_for_table,
+    extract_statement_result_from_ocr_pages,
+)
+from dayu.fins.storage.local_file_source import LocalFileSource
 
 
 class _SentinelEdgarExecutionError(RuntimeError):
@@ -159,6 +181,10 @@ class _FakeFactQuery:
         return result
 
 
+class _MissingStatements:
+    """不提供任何报表 method 的测试替身。"""
+
+
 class _FakeXbrl:
     """为 concept execution matrix 提供 fake query 的 XBRL 测试替身。"""
 
@@ -167,12 +193,14 @@ class _FakeXbrl:
         results: dict[str, _FakeExecutionResult],
         *,
         statement_dataframe: pd.DataFrame | None = None,
+        statement_method_available: bool = True,
     ) -> None:
         """初始化 concept 结果。
 
         Args:
             results: concept 到 execute 结果/异常的映射。
             statement_dataframe: 可选 statement DataFrame。
+            statement_method_available: 是否提供 income statement method。
 
         Returns:
             无。
@@ -182,7 +210,11 @@ class _FakeXbrl:
         """
 
         self._results = results
-        self.statements = _FakeStatements(statement_dataframe)
+        self.statements: _FakeStatements | _MissingStatements
+        if statement_method_available:
+            self.statements = _FakeStatements(statement_dataframe)
+        else:
+            self.statements = _MissingStatements()
 
     def query(self) -> _FakeFactQuery:
         """创建一次 fake query。
@@ -323,6 +355,7 @@ class _BsQueryHarness(_BaseBsReportFormProcessor):
         """
 
         self._test_xbrl = xbrl
+        self._tables = []
 
     def _get_xbrl(self) -> XBRL | None:
         """返回预设 XBRL 对象。
@@ -357,6 +390,7 @@ class _BsSixKStatementHarness(BsSixKFormProcessor):
         """
 
         self._test_xbrl = xbrl
+        self._tables = []
 
     def _get_xbrl(self) -> XBRL | None:
         """返回预设 XBRL 对象。
@@ -372,6 +406,25 @@ class _BsSixKStatementHarness(BsSixKFormProcessor):
         """
 
         return self._test_xbrl
+
+    def _get_statement_result_from_ocr_pages(
+        self,
+        statement_type: str,
+    ) -> FinancialStatementResult | None:
+        """声明测试场景无 OCR 回退结果。
+
+        Args:
+            statement_type: 目标报表类型。
+
+        Returns:
+            ``None``。
+
+        Raises:
+            无。
+        """
+
+        del statement_type
+        return None
 
 
 class _HtmlTableFixture:
@@ -406,6 +459,42 @@ class _HtmlTableFixture:
                 ["Net income", "10", "8"],
             ]
         )
+
+
+class _ReportTableFixture(_HtmlTableFixture):
+    """报告类 HTML 选择规则使用的真实 DataFrame 表格。"""
+
+    def __init__(
+        self,
+        *,
+        caption: str,
+        headers: list[str],
+        is_financial: bool,
+        table_type: str = "data",
+        dataframe: pd.DataFrame | None = None,
+    ) -> None:
+        """初始化分类、layout 与行信号输入。
+
+        Args:
+            caption: 表格标题。
+            headers: 表头文本。
+            is_financial: 是否由上游标记为财务表。
+            table_type: 表格结构类型。
+            dataframe: 可选自定义 DataFrame。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        super().__init__(caption=caption)
+        self.headers = headers
+        self.is_financial = is_financial
+        self.table_type = table_type
+        if dataframe is not None:
+            self.dataframe = dataframe
 
 
 def _parse_html_fixture_table(table: _HtmlTableFixture) -> pd.DataFrame:
@@ -451,14 +540,78 @@ def _complete_financial_payload() -> dict[str, JsonValue]:
         "units": "USD",
         "scale": "millions",
         "data_quality": "xbrl",
-        "reason": None,
-        "statement_locator": {
-            "statement_type": "income",
-            "statement_title": "Income Statement",
-            "period_labels": ["FY2025"],
-            "row_labels": ["Revenue"],
-        },
     }
+
+
+def _assert_financial_result_contract(result: FinancialStatementResult) -> None:
+    """断言 actual producer 结果满足财务 owner exact contract。
+
+    Args:
+        result: actual producer 返回的财务报表结果。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 键集、可选 reason 或 terminal validator 语义不一致时抛出。
+    """
+
+    required_keys = {
+        "statement_type",
+        "periods",
+        "rows",
+        "currency",
+        "units",
+        "scale",
+        "data_quality",
+    }
+    expected_keys = required_keys | ({"reason"} if result["data_quality"] == "partial" else set())
+
+    assert set(result) == expected_keys
+    assert validate_financial_statement_result_payload(result) == result
+
+
+_StatementObservation = Literal["method_absent", "method_none", "empty_table", "empty_rows"]
+
+
+def _statement_xbrl_for_observation(observation: _StatementObservation) -> XBRL:
+    """构造一类报表不可用的直接 XBRL 观测。
+
+    Args:
+        observation: method 缺失、返回空、空表或空 rows 之一。
+
+    Returns:
+        只包含该观测的 fake XBRL。
+
+    Raises:
+        AssertionError: 传入未声明的观测时抛出。
+    """
+
+    if observation == "method_absent":
+        return cast(XBRL, _FakeXbrl({}, statement_method_available=False))
+    if observation == "method_none":
+        return cast(XBRL, _FakeXbrl({}, statement_dataframe=None))
+    if observation == "empty_table":
+        return cast(
+            XBRL,
+            _FakeXbrl(
+                {},
+                statement_dataframe=pd.DataFrame(
+                    columns=["concept", "label", "2025-12-31"]
+                ),
+            ),
+        )
+    if observation == "empty_rows":
+        return cast(
+            XBRL,
+            _FakeXbrl(
+                {},
+                statement_dataframe=pd.DataFrame(
+                    [{"concept": "", "label": "", "2025-12-31": 100}]
+                ),
+            ),
+        )
+    raise AssertionError(f"未声明的报表观测: {observation}")
 
 
 def test_edgartools_execute_treats_empty_list_as_successful_zero_rows() -> None:
@@ -541,7 +694,7 @@ def test_financial_quality_reason_matrix_uses_direct_evidence(
 
 @pytest.mark.parametrize(
     "missing_field",
-    ["periods", "scale", "data_quality", "reason", "statement_locator"],
+    ["statement_type", "periods", "rows", "currency", "units", "scale", "data_quality"],
 )
 def test_financial_validator_rejects_missing_required_fields(missing_field: str) -> None:
     """财务领域校验器必须拒绝任一 required 字段缺失。
@@ -567,8 +720,9 @@ def test_financial_validator_rejects_missing_required_fields(missing_field: str)
     ("updates", "expected_message"),
     [
         ({"scale": "mega"}, "scale 非法"),
-        ({"data_quality": "partial", "reason": None}, "partial 必须提供 reason"),
-        ({"data_quality": "xbrl", "reason": "scale_unavailable"}, "reason 必须为 None"),
+        ({"data_quality": "partial"}, "partial 必须提供 reason"),
+        ({"data_quality": "xbrl", "reason": "scale_unavailable"}, "必须省略 reason"),
+        ({"reason": None}, "不得使用 null"),
         ({"rows": []}, "空 rows"),
         ({"units": "USD in millions"}, "units 不得承载 scale"),
     ],
@@ -597,6 +751,74 @@ def test_financial_validator_rejects_invalid_quality_and_scale_contracts(
         validate_financial_statement_result_payload(payload)
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "unsupported_statement_type",
+        "xbrl_not_available",
+        "statement_not_found",
+        "low_confidence_extraction",
+        "scale_unavailable",
+        "period_semantics_unavailable",
+        "scale_and_period_semantics_unavailable",
+    ],
+)
+def test_financial_validator_accepts_exact_actionable_reason_set(reason: str) -> None:
+    """财务 producer 只能在 partial 结果中输出七个可行动原因。
+
+    Args:
+        reason: 待验证的业务原因。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 合法原因被拒绝或可选字段丢失时抛出。
+    """
+
+    payload = _complete_financial_payload()
+    payload.update(
+        {
+            "rows": [],
+            "periods": [],
+            "scale": None,
+            "data_quality": "partial",
+            "reason": reason,
+        }
+    )
+
+    validated = validate_financial_statement_result_payload(payload)
+
+    assert "reason" in validated
+    assert validated["reason"] == reason
+
+
+def test_financial_validator_rejects_unknown_fields_and_reason() -> None:
+    """财务 producer 契约必须对未知字段与未知原因 fail closed。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任一未知语义被接受时抛出。
+    """
+
+    unknown_field_payload = _complete_financial_payload()
+    unknown_field_payload["internal_detail"] = "hidden"
+    with pytest.raises(ValueError, match="包含未知字段: internal_detail"):
+        validate_financial_statement_result_payload(unknown_field_payload)
+
+    unknown_reason_payload = _complete_financial_payload()
+    unknown_reason_payload.update(
+        {"rows": [], "data_quality": "partial", "reason": "unknown_reason"}
+    )
+    with pytest.raises(ValueError, match="reason 非法"):
+        validate_financial_statement_result_payload(unknown_reason_payload)
+
+
 def test_financial_validator_preserves_complete_owner_fields() -> None:
     """合法财务载荷必须逐字段通过并保留 owner 语义。
 
@@ -612,7 +834,89 @@ def test_financial_validator_preserves_complete_owner_fields() -> None:
 
     payload = _complete_financial_payload()
 
-    assert validate_financial_statement_result_payload(payload) == payload
+    validated = validate_financial_statement_result_payload(payload)
+
+    assert validated == payload
+    assert set(validated) == {
+        "statement_type",
+        "periods",
+        "rows",
+        "currency",
+        "units",
+        "scale",
+        "data_quality",
+    }
+
+
+@pytest.mark.parametrize("observation", ["method_absent", "method_none", "empty_table", "empty_rows"])
+@pytest.mark.parametrize("processor_type", [_SecQueryHarness, _BsQueryHarness])
+def test_sec_and_bs_statement_terminals_normalize_not_found_observations(
+    observation: _StatementObservation,
+    processor_type: type[_SecQueryHarness] | type[_BsQueryHarness],
+) -> None:
+    """SEC generic 与 BS report terminal 必须统一四类报表缺失观测。
+
+    Args:
+        observation: 报表不可用的直接观测。
+        processor_type: 待验证的 actual processor terminal。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 观测未归一或结果越出 owner contract 时抛出。
+    """
+
+    processor = processor_type(_statement_xbrl_for_observation(observation))
+
+    result = processor.get_financial_statement("income")
+
+    assert "reason" in result
+    assert result["reason"] == "statement_not_found"
+    _assert_financial_result_contract(result)
+
+
+@pytest.mark.parametrize("observation", ["method_absent", "method_none", "empty_table", "empty_rows"])
+def test_bs_six_k_terminal_normalizes_not_found_observations(
+    observation: _StatementObservation,
+) -> None:
+    """BS 6-K terminal 必须在 XBRL/HTML/OCR 均无结果时统一四类观测。
+
+    Args:
+        observation: 报表不可用的直接观测。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 观测未归一或结果越出 owner contract 时抛出。
+    """
+
+    processor = _BsSixKStatementHarness(_statement_xbrl_for_observation(observation))
+
+    result = processor.get_financial_statement("income")
+
+    assert "reason" in result
+    assert result["reason"] == "statement_not_found"
+    _assert_financial_result_contract(result)
+
+
+def test_bs_report_concrete_processors_share_the_validated_terminal_owner() -> None:
+    """BS 10-K/10-Q/20-F concrete processors 必须共享同一报表 terminal。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任一 concrete processor 脱离 common owner 时抛出。
+    """
+
+    assert issubclass(BsTenKFormProcessor, _BaseBsReportFormProcessor)
+    assert issubclass(BsTenQFormProcessor, _BaseBsReportFormProcessor)
+    assert issubclass(BsTwentyFFormProcessor, _BaseBsReportFormProcessor)
 
 
 @pytest.mark.parametrize(
@@ -779,8 +1083,8 @@ def test_xbrl_execution_summary_local_filter_zero_is_successful() -> None:
     assert summary.failed_concepts == ()
 
 
-def test_xbrl_validator_allows_valid_zero_and_rejects_read_dedup_field() -> None:
-    """producer XBRL 契约允许正常零命中但拒绝 read-side dedup 字段。
+def test_xbrl_validator_allows_countless_zero_hit_and_preserves_raw_payload() -> None:
+    """producer XBRL 契约允许无 count 的正常零命中且不改写输入。
 
     Args:
         无。
@@ -789,24 +1093,149 @@ def test_xbrl_validator_allows_valid_zero_and_rejects_read_dedup_field() -> None
         无。
 
     Raises:
-        AssertionError: valid empty 被拒绝或 dedup owner 漂移时抛出。
+        AssertionError: valid empty 被拒绝或原始载荷被修改时抛出。
     """
 
     payload: dict[str, JsonValue] = {
         "query_params": {"concepts": ["Revenue"]},
         "facts": [],
-        "total": 0,
         "data_quality": "xbrl",
-        "reason": None,
+    }
+    before = deepcopy(payload)
+
+    validated = validate_xbrl_facts_result_payload(payload)
+
+    assert payload == before
+    assert validated.query_params == {"concepts": ["Revenue"]}
+    assert validated.facts == []
+    assert validated.data_quality == "xbrl"
+    assert validated.reason is None
+
+
+def test_xbrl_validator_rejects_unknown_result_and_query_param_fields() -> None:
+    """XBRL result 与 query params 键集必须同时 fail closed。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任一未知字段被接受时抛出。
+    """
+
+    result_field_payload: dict[str, JsonValue] = {
+        "query_params": {"concepts": ["Revenue"]},
+        "facts": [],
+        "data_quality": "xbrl",
+        "unexpected": 0,
+    }
+    with pytest.raises(ValueError, match="包含未知字段: unexpected"):
+        validate_xbrl_facts_result_payload(result_field_payload)
+
+    query_field_payload: dict[str, JsonValue] = {
+        "query_params": {"concepts": ["Revenue"], "nested_filters": {}},
+        "facts": [],
+        "data_quality": "xbrl",
+    }
+    with pytest.raises(ValueError, match="包含未知字段: nested_filters"):
+        validate_xbrl_facts_result_payload(query_field_payload)
+
+
+@pytest.mark.parametrize("fiscal_period", sorted(FISCAL_PERIODS))
+def test_xbrl_validator_consumes_shared_fiscal_period_values(
+    fiscal_period: FiscalPeriod,
+) -> None:
+    """XBRL 查询财期必须消费共享 ``FISCAL_PERIODS`` 真源。
+
+    Args:
+        fiscal_period: 共享闭集中的财期。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任一共享财期被拒绝时抛出。
+    """
+
+    payload: dict[str, JsonValue] = {
+        "query_params": {"concepts": ["Revenue"], "fiscal_period": fiscal_period},
+        "facts": [],
+        "data_quality": "xbrl",
     }
 
     validated = validate_xbrl_facts_result_payload(payload)
-    assert validated.total == 0
-    assert validated.data_quality == "xbrl"
 
-    payload["deduped_fact_count"] = 0
-    with pytest.raises(ValueError, match="不得包含.*deduped_fact_count"):
+    assert "fiscal_period" in validated.query_params
+    assert validated.query_params["fiscal_period"] == fiscal_period
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "expected_message"),
+    [
+        ("min_value", True, "min_value 不得为 bool"),
+        ("max_value", False, "max_value 不得为 bool"),
+        ("fiscal_period", "fy", "fiscal_period 非法"),
+    ],
+)
+def test_xbrl_validator_rejects_non_contract_filter_values(
+    field_name: str,
+    value: JsonValue,
+    expected_message: str,
+) -> None:
+    """XBRL 查询参数必须拒绝 bool number 与非精确财期。
+
+    Args:
+        field_name: 待验证字段。
+        value: 非法值。
+        expected_message: 期望错误片段。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法值未被拒绝时抛出。
+    """
+
+    query_params: dict[str, JsonValue] = {"concepts": ["Revenue"], field_name: value}
+    payload: dict[str, JsonValue] = {
+        "query_params": query_params,
+        "facts": [],
+        "data_quality": "xbrl",
+    }
+
+    with pytest.raises(ValueError, match=expected_message):
         validate_xbrl_facts_result_payload(payload)
+
+
+def test_xbrl_validator_accepts_flat_numbers_and_omits_absent_filters() -> None:
+    """XBRL 查询参数接受 int/float 并保持未提供字段缺席。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: number 被拒绝或缺席字段被补写时抛出。
+    """
+
+    payload: dict[str, JsonValue] = {
+        "query_params": {"concepts": ["Revenue"], "min_value": 1, "max_value": 2.5},
+        "facts": [],
+        "data_quality": "xbrl",
+    }
+
+    validated = validate_xbrl_facts_result_payload(payload)
+
+    assert validated.query_params == {
+        "concepts": ["Revenue"],
+        "min_value": 1,
+        "max_value": 2.5,
+    }
+    assert "fiscal_period" not in validated.query_params
 
 
 @pytest.mark.parametrize("processor_type", [_SecQueryHarness, _BsQueryHarness])
@@ -838,9 +1267,10 @@ def test_xbrl_callers_preserve_partial_execution_accounting(
 
     result = processor.query_xbrl_facts(["Revenue", "Assets"])
 
+    assert set(result) == {"query_params", "facts", "data_quality", "reason"}
     assert result["facts"] == []
-    assert result["total"] == 0
     assert result["data_quality"] == "partial"
+    assert "reason" in result
     assert result["reason"] == "query_partially_failed"
 
 
@@ -864,10 +1294,10 @@ def test_xbrl_callers_preserve_successful_zero_rows(
 
     result = processor.query_xbrl_facts(["Revenue"])
 
+    assert set(result) == {"query_params", "facts", "data_quality"}
     assert result["facts"] == []
-    assert result["total"] == 0
     assert result["data_quality"] == "xbrl"
-    assert result["reason"] is None
+    assert "reason" not in result
 
 
 @pytest.mark.parametrize("processor_type", [_SecQueryHarness, _BsQueryHarness])
@@ -890,10 +1320,51 @@ def test_xbrl_callers_preserve_unavailable_degradation(
 
     result = processor.query_xbrl_facts(["Revenue"])
 
+    assert set(result) == {"query_params", "facts", "data_quality", "reason"}
     assert result["facts"] == []
-    assert result["total"] == 0
     assert result["data_quality"] == "partial"
+    assert "reason" in result
     assert result["reason"] == "xbrl_not_available"
+
+
+@pytest.mark.parametrize("processor_type", [_SecQueryHarness, _BsQueryHarness])
+def test_xbrl_callers_emit_flat_typed_query_params(
+    processor_type: type[_SecQueryHarness] | type[_BsQueryHarness],
+) -> None:
+    """Sec 与 BS actual caller 必须仅输出实际提供的扁平查询参数。
+
+    Args:
+        processor_type: 待验证的 actual caller harness。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 参数被嵌套、补空或丢失时抛出。
+    """
+
+    processor = processor_type(None)
+
+    result = processor.query_xbrl_facts(
+        ["Revenue"],
+        statement_type="income",
+        period_end="2025-12-31",
+        fiscal_year=2025,
+        fiscal_period="FY",
+        min_value=1,
+        max_value=2.5,
+    )
+
+    assert result["query_params"] == {
+        "concepts": ["Revenue"],
+        "statement_type": "IncomeStatement",
+        "period_end": "2025-12-31",
+        "fiscal_year": 2025,
+        "fiscal_period": "FY",
+        "min_value": 1,
+        "max_value": 2.5,
+    }
+    assert validate_xbrl_facts_result_payload(result).query_params == result["query_params"]
 
 
 @pytest.mark.parametrize("processor_type", [_SecQueryHarness, _BsQueryHarness])
@@ -950,7 +1421,37 @@ def test_bs_common_statement_consumes_shared_scale_and_quality_owner(
     assert result is not None
     assert result["scale"] == ("millions" if include_decimals else None)
     assert result["data_quality"] == ("xbrl" if include_decimals else "partial")
-    assert result["reason"] == (None if include_decimals else "scale_unavailable")
+    if include_decimals:
+        assert "reason" not in result
+    else:
+        assert "reason" in result
+        assert result["reason"] == "scale_unavailable"
+    _assert_financial_result_contract(result)
+
+
+@pytest.mark.parametrize("processor_type", [_SecQueryHarness, _BsQueryHarness])
+def test_sec_and_bs_actual_producers_emit_exact_complete_contract(
+    processor_type: type[_SecQueryHarness] | type[_BsQueryHarness],
+) -> None:
+    """SEC generic 与 BS report actual producer 的完整结果必须省略 reason。
+
+    Args:
+        processor_type: 待验证的 actual processor harness。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: producer 输出非 exact contract 或显式空 reason 时抛出。
+    """
+
+    processor = processor_type(_statement_xbrl(include_decimals=True))
+
+    result = processor.get_financial_statement("income")
+
+    assert result["data_quality"] == "xbrl"
+    assert "reason" not in result
+    _assert_financial_result_contract(result)
 
 
 @pytest.mark.parametrize("include_decimals", [True, False])
@@ -979,7 +1480,12 @@ def test_bs_six_k_statement_consumes_shared_scale_and_quality_owner(
     assert result is not None
     assert result["scale"] == ("millions" if include_decimals else None)
     assert result["data_quality"] == ("xbrl" if include_decimals else "partial")
-    assert result["reason"] == (None if include_decimals else "scale_unavailable")
+    if include_decimals:
+        assert "reason" not in result
+    else:
+        assert "reason" in result
+        assert result["reason"] == "scale_unavailable"
+    _assert_financial_result_contract(result)
 
 
 def _statement_xbrl(*, include_decimals: bool) -> XBRL:
@@ -1049,7 +1555,9 @@ def test_bs_scale_probe_failure_keeps_rows_and_degrades_quality() -> None:
     assert result["rows"]
     assert result["scale"] is None
     assert result["data_quality"] == "partial"
+    assert "reason" in result
     assert result["reason"] == "scale_and_period_semantics_unavailable"
+    _assert_financial_result_contract(result)
 
 
 @pytest.mark.parametrize(
@@ -1090,7 +1598,12 @@ def test_html_caption_owns_scale_and_units_remain_measurement_only(
     assert result["scale"] == expected_scale
     assert result["units"] == "USD"
     assert result["data_quality"] == expected_quality
-    assert result["reason"] == expected_reason
+    if expected_reason is None:
+        assert "reason" not in result
+    else:
+        assert "reason" in result
+        assert result["reason"] == expected_reason
+    _assert_financial_result_contract(result)
 
 
 @pytest.mark.parametrize(
@@ -1127,7 +1640,9 @@ def test_html_missing_fiscal_evidence_uses_quality_owner(
     assert all(period["fiscal_year"] is None for period in result["periods"])
     assert all(period["fiscal_period"] is None for period in result["periods"])
     assert result["data_quality"] == "partial"
+    assert "reason" in result
     assert result["reason"] == expected_reason
+    _assert_financial_result_contract(result)
 
 
 def test_html_year_token_without_accepted_fiscal_period_clears_fiscal_year() -> None:
@@ -1159,7 +1674,9 @@ def test_html_year_token_without_accepted_fiscal_period_clears_fiscal_year() -> 
     assert all(period["fiscal_year"] is None for period in result["periods"])
     assert all(period["fiscal_period"] is None for period in result["periods"])
     assert result["data_quality"] == "partial"
+    assert "reason" in result
     assert result["reason"] == "period_semantics_unavailable"
+    _assert_financial_result_contract(result)
 
 
 def test_ocr_heading_owns_scale_and_units_remain_measurement_only() -> None:
@@ -1191,7 +1708,8 @@ Net income 10 8"""
     assert result["scale"] == "millions"
     assert result["units"] == "USD"
     assert result["data_quality"] == "extracted"
-    assert result["reason"] is None
+    assert "reason" not in result
+    _assert_financial_result_contract(result)
 
 
 @pytest.mark.parametrize(
@@ -1233,7 +1751,9 @@ Net income 10 8"""
     assert result is not None
     assert all(period["fiscal_period"] is None for period in result["periods"])
     assert result["data_quality"] == "partial"
+    assert "reason" in result
     assert result["reason"] == expected_reason
+    _assert_financial_result_contract(result)
 
 
 def test_ocr_income_summary_fallback_consumes_heading_scale_owner() -> None:
@@ -1269,4 +1789,475 @@ Net income 100"""
     assert result["scale"] == "millions"
     assert result["units"] == "USD"
     assert result["data_quality"] == "extracted"
-    assert result["reason"] is None
+    assert "reason" not in result
+    _assert_financial_result_contract(result)
+
+
+@pytest.mark.parametrize(
+    ("caption", "headers", "context", "expected"),
+    [
+        ("Consolidated Statements of Operations", ["Revenue"], "", "income"),
+        ("Consolidated Balance Sheets", ["Total assets"], "", "balance_sheet"),
+        ("Statements of Cash Flows", ["Operating activities"], "", "cash_flow"),
+        ("Statements of Shareholders' Equity", ["Common stock"], "", "equity"),
+        ("Statements of Comprehensive Income", ["Net income"], "", "comprehensive_income"),
+        ("Table of Contents", ["Statements of Operations"], "", None),
+        (None, None, "discussion of operations", None),
+    ],
+)
+def test_report_form_table_classification_uses_business_signals(
+    caption: str | None,
+    headers: list[str] | None,
+    context: str,
+    expected: str | None,
+) -> None:
+    """报告类表格分类必须组合标题、表头、上下文并排除噪声。
+
+    Args:
+        caption: 表格标题。
+        headers: 表头。
+        context: 表格前文。
+        expected: 预期报表类型。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 分类结果偏离业务信号时抛出。
+    """
+
+    assert classify_report_statement_type_for_table(
+        caption=caption,
+        headers=headers,
+        context_before=context,
+    ) == expected
+
+
+def test_report_form_selection_prefers_classification_then_row_signals() -> None:
+    """报告类候选选择必须过滤 layout 并按分类、严格行信号顺序返回。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: fallback reason 或候选顺序漂移时抛出。
+    """
+
+    classified = _ReportTableFixture(
+        caption="Consolidated Statements of Operations",
+        headers=["Revenue", "FY2025"],
+        is_financial=True,
+    )
+    layout = _ReportTableFixture(
+        caption="Consolidated Statements of Operations",
+        headers=["Revenue"],
+        is_financial=True,
+        table_type="layout",
+    )
+    row_signal = _ReportTableFixture(
+        caption="Quarterly data",
+        headers=["FY2025"],
+            is_financial=False,
+            dataframe=pd.DataFrame(
+                [
+                    ["Metric", "FY2025"],
+                    ["Revenue", 100],
+                    ["Gross profit", 50],
+                    ["Operating income", 20],
+                    ["Net income", 10],
+                    ["Earnings per share", 1],
+                    ["Cost of revenue", 50],
+                    ["Total revenue", 100],
+            ]
+        ),
+    )
+
+    assert select_report_statement_tables(
+        statement_type="income",
+        tables=[layout, row_signal, classified],
+        parse_table_dataframe=_parse_html_fixture_table,
+    ) == [classified]
+    assert select_report_statement_tables(
+        statement_type="income",
+        tables=[layout, row_signal],
+        parse_table_dataframe=_parse_html_fixture_table,
+    ) == [row_signal]
+    assert select_report_statement_tables(
+        statement_type="unsupported",
+        tables=[classified],
+        parse_table_dataframe=_parse_html_fixture_table,
+    ) == []
+    assert select_report_statement_tables(
+        statement_type="income",
+        tables=[layout],
+        parse_table_dataframe=_parse_html_fixture_table,
+    ) == []
+    assert should_apply_report_statement_html_fallback("xbrl_not_available")
+    assert should_apply_report_statement_html_fallback("statement_not_found")
+    assert not should_apply_report_statement_html_fallback("scale_unavailable")
+    assert not should_apply_report_statement_html_fallback(None)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("2025-09-28", "2025-09-28"),
+        ("28-Sep-2025", "2025-09-28"),
+        ("2025 Sep 28", "2025-09-28"),
+        ("09/28/2025", "2025-09-28"),
+        ("28/09/25", "2025-09-28"),
+        ("September 28, 2025", "2025-09-28"),
+        ("September 2025", "2025-09-30"),
+        ("not a date", None),
+    ],
+)
+def test_html_period_date_parser_accepts_supported_direct_formats(
+    text: str,
+    expected: str | None,
+) -> None:
+    """HTML 期间 owner 必须稳定解析已支持的直接日期格式。
+
+    Args:
+        text: 日期文本。
+        expected: 预期 ISO 日期。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 日期解析语义漂移时抛出。
+    """
+
+    parsed = _extract_first_date(text)
+    assert (parsed.isoformat() if parsed is not None else None) == expected
+
+
+def test_html_period_currency_scale_and_numeric_rule_owners_preserve_semantics() -> None:
+    """HTML owner 必须保持财期、币种、倍率与数值的稳定业务规则。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任一基础业务语义解析错误时抛出。
+    """
+
+    assert _extract_fiscal_period_year("Q1'25") == ("Q1", 2025)
+    assert _extract_fiscal_period_year("2025 H1") == ("H1", 2025)
+    assert _extract_fiscal_period_year("9M 2025") == ("Q3", 2025)
+    assert _extract_fiscal_period_year("FY 2025") == ("FY", 2025)
+    assert _extract_fiscal_period_year("third quarter 2025") == ("Q3", 2025)
+    assert _extract_fiscal_period_year("plain year 2025") is None
+    assert _extract_fiscal_period_from_direct_text(scope_text="year ended 2025") == "FY"
+    assert _extract_fiscal_period_from_direct_text(scope_text="as of 2025") is None
+    assert _normalize_period_end(scope_text="year ended", date_text="2025") == "2025-12-31"
+
+    assert _extract_currency_for_column(scope_text="US$ in millions", column_header_text="2025") == "US$"
+    assert _extract_currency_for_column(scope_text="RMB", column_header_text="") == "RMB"
+    assert _extract_currency_for_column(scope_text="EUR", column_header_text="") == "EUR"
+    assert _extract_currency_for_column(scope_text="", column_header_text="") is None
+    assert _infer_scale_from_caption("USD in billions") == "billions"
+    assert _infer_scale_from_caption("USD in thousands") == "thousands"
+    assert _infer_scale_from_caption("USD in units") == "units"
+    assert _infer_scale_from_caption(None) is None
+
+    assert _parse_optional_numeric("(1,234.5)") == -1234.5
+    assert _parse_optional_numeric("US$ 1.234,5") == 1234.5
+    assert _parse_optional_numeric("—") is None
+    assert _parse_optional_numeric("n/a") is None
+
+
+def test_real_sec_processor_reads_and_projects_aapl_fixture() -> None:
+    """真实 AAPL filing 必须贯穿 SEC parse、read、search、table 与 XBRL owner。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任一真实 processor public capability 失败时抛出。
+    """
+
+    fixture_path = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "aapl_xbrl"
+        / "fil_0000320193-24-000123"
+        / "aapl-20240928.htm"
+    )
+    source = LocalFileSource(
+        path=fixture_path,
+        uri="local://aapl-20240928.htm",
+        media_type="text/html",
+    )
+    assert SecProcessor.supports(source, form_type="10-K", media_type="text/html")
+    assert not SecProcessor.supports(source, form_type="6-K", media_type="text/html")
+    assert not SecProcessor.supports(source, form_type=None, media_type="text/html")
+
+    processor = SecProcessor(source, form_type="10-K", media_type="text/html")
+    sections = processor.list_sections()
+    tables = processor.list_tables()
+    assert sections
+    assert tables
+    first_section = processor.read_section(sections[0]["ref"])
+    assert first_section["content"]
+    assert processor.get_section_title(sections[0]["ref"]) == sections[0]["title"]
+    assert processor.get_section_title("missing") is None
+    assert processor.search("Apple")
+    assert processor.search("", within_ref=None) == []
+    assert processor.search("Apple", within_ref="missing") == []
+    assert processor.read_table(tables[0]["table_ref"])["table_ref"] == tables[0]["table_ref"]
+    assert processor.get_full_text()
+    assert processor.get_full_text_with_table_markers() == ""
+    with pytest.raises(KeyError):
+        processor.read_section("missing")
+    with pytest.raises(KeyError):
+        processor.read_table("missing")
+
+    financial_result = processor.get_financial_statement("income")
+    _assert_financial_result_contract(financial_result)
+    xbrl_result = processor.query_xbrl_facts(["NetIncomeLoss"])
+    assert validate_xbrl_facts_result_payload(xbrl_result).query_params == {
+        "concepts": ["NetIncomeLoss"]
+    }
+    assert processor.get_xbrl_taxonomy() == "us-gaap"
+
+
+def test_real_bs_six_k_processor_uses_html_and_ocr_fallbacks(tmp_path: Path) -> None:
+    """真实 BS 6-K HTML 必须覆盖结构化表格、分页与 OCR fallback owner。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 6-K 表格、分页或财务 terminal 行为错误时抛出。
+    """
+
+    page_text = " ".join(["Business results and outlook"] * 30)
+    html = f"""<html><body>
+<h1>Financial Results and Business Updates</h1><p>Business highlights and operating review.</p>
+<h2>FINANCIAL STATEMENTS</h2>
+<table><caption>Consolidated Statements of Operations (USD in millions)</caption>
+<tr><td>Metric</td><td>FY2025</td><td>FY2024</td></tr>
+<tr><td>Revenue</td><td>100</td><td>90</td></tr>
+<tr><td>Gross profit</td><td>50</td><td>45</td></tr>
+<tr><td>Operating income</td><td>20</td><td>18</td></tr>
+<tr><td>Net income</td><td>10</td><td>8</td></tr></table>
+<div id="Page1">{page_text}</div>
+<p style="page-break-before: always">{page_text}</p>
+<h2>About Example Holdings Limited</h2><p>Company profile and contacts.</p>
+</body></html>"""
+    fixture_path = tmp_path / "six-k-owner.html"
+    fixture_path.write_text(html, encoding="utf-8")
+    source = LocalFileSource(
+        path=fixture_path,
+        uri="local://six-k-owner.html",
+        media_type="text/html",
+    )
+
+    assert BsSixKFormProcessor.supports(source, form_type="6-K", media_type="text/html")
+    processor = BsSixKFormProcessor(source, form_type="6-K", media_type="text/html")
+    sections = processor.list_sections()
+    tables = processor.list_tables()
+    assert sections
+    assert tables
+    assert processor.read_section(sections[0]["ref"])["content"]
+    assert processor.read_table(tables[0]["table_ref"])["table_ref"] == tables[0]["table_ref"]
+    assert processor.search("Business outlook")
+
+    result = processor.get_financial_statement("income")
+    _assert_financial_result_contract(result)
+    assert result["periods"] == [
+        {"period_end": "2025-12-31", "fiscal_year": 2025, "fiscal_period": "FY"},
+        {"period_end": "2024-12-31", "fiscal_year": 2024, "fiscal_period": "FY"},
+    ]
+    assert [row["label"] for row in result["rows"]] == [
+        "Revenue",
+        "Gross profit",
+        "Operating income",
+        "Net income",
+    ]
+    assert result["scale"] == "millions"
+    assert result["data_quality"] == "extracted"
+
+    low_confidence_path = tmp_path / "six-k-low-confidence-owner.html"
+    low_confidence_path.write_text(
+        f"""<html><body>
+<h1>Financial Results and Business Updates</h1>
+<table><caption>Consolidated Statements of Operations (USD in millions)</caption>
+<tr><th>Metric</th><th>FY2025</th><th>FY2024</th></tr>
+<tr><td>Revenue</td><td>100</td><td>90</td></tr>
+<tr><td>Gross profit</td><td>50</td><td>45</td></tr>
+<tr><td>Operating income</td><td>20</td><td>18</td></tr>
+<tr><td>Net income</td><td>10</td><td>8</td></tr></table>
+<div id="Page1">{page_text}</div>
+<p style="page-break-before: always">{page_text}</p>
+<h2>About Example Holdings Limited</h2><p>Company profile.</p>
+</body></html>""",
+        encoding="utf-8",
+    )
+    low_confidence_processor = BsSixKFormProcessor(
+        LocalFileSource(
+            path=low_confidence_path,
+            uri="local://six-k-low-confidence-owner.html",
+            media_type="text/html",
+        ),
+        form_type="6-K",
+        media_type="text/html",
+    )
+    low_confidence = low_confidence_processor.get_financial_statement("income")
+    _assert_financial_result_contract(low_confidence)
+    assert low_confidence["rows"] == []
+    assert low_confidence["periods"] == []
+    assert "reason" in low_confidence
+    assert low_confidence["reason"] == "low_confidence_extraction"
+
+    unsupported = processor.get_financial_statement("unknown")
+    assert "reason" in unsupported
+    assert unsupported["reason"] == "unsupported_statement_type"
+    missing = processor.get_financial_statement("equity")
+    assert "reason" in missing
+    assert missing["reason"] == "statement_not_found"
+
+    hidden_ocr = """CONSOLIDATED STATEMENTS OF OPERATIONS
+(USD in millions)
+Year ended December 31, 2025 2024
+Revenue 100 90
+Operating income 20 15
+Net income 10 8"""
+    ocr_path = tmp_path / "six-k-ocr-owner.html"
+    ocr_path.write_text(
+        "<html><body><h1>FINANCIAL RESULTS</h1>"
+        f'<div style="font-size:1pt;color:white">{hidden_ocr}</div>'
+        "<h2>ABOUT COMPANY</h2><p>Issuer profile.</p></body></html>",
+        encoding="utf-8",
+    )
+    ocr_processor = BsSixKFormProcessor(
+        LocalFileSource(
+            path=ocr_path,
+            uri="local://six-k-ocr-owner.html",
+            media_type="text/html",
+        ),
+        form_type="6-K",
+        media_type="text/html",
+    )
+    ocr_result = ocr_processor.get_financial_statement("income")
+    _assert_financial_result_contract(ocr_result)
+    assert ocr_result["periods"] == [
+        {"period_end": "2025-12-31", "fiscal_year": 2025, "fiscal_period": "FY"},
+        {"period_end": "2024-12-31", "fiscal_year": 2024, "fiscal_period": "FY"},
+    ]
+    assert [row["values"] for row in ocr_result["rows"]] == [
+        [100.0, 90.0],
+        [20.0, 15.0],
+        [10.0, 8.0],
+    ]
+    assert ocr_result["scale"] == "millions"
+
+    report_path = tmp_path / "six-k-report-owner.html"
+    report_path.write_text(
+        "<html><body><h1>Table of Contents</h1>"
+        f"<p>{'directory entry ' * 140}</p>"
+        "<h2>About this report</h2><p>Reporting basis and scope.</p>"
+        "<h2>Overview</h2><p>Issuer overview.</p>"
+        "<h2>Governance</h2><p>Governance approach.</p>"
+        "<h2>Strategy</h2><p>Business strategy.</p>"
+        "<h2>Environment</h2><p>Environmental performance.</p>"
+        "</body></html>",
+        encoding="utf-8",
+    )
+    report_processor = BsSixKFormProcessor(
+        LocalFileSource(
+            path=report_path,
+            uri="local://six-k-report-owner.html",
+            media_type="text/html",
+        ),
+        form_type="6-K",
+        media_type="text/html",
+    )
+    report_sections = report_processor.list_sections()
+    report_titles = [section["title"] for section in report_sections]
+    assert report_titles == [
+        "Table of Contents",
+        "About this report",
+        "Overview",
+        "Governance",
+        "Strategy",
+        "Environment",
+    ]
+    assert report_processor.read_section(report_sections[2]["ref"])["content"] == "Issuer overview."
+
+
+def test_six_k_statement_classification_owner_rejects_navigation_noise() -> None:
+    """6-K 报表分类 owner 必须识别报表并排除导航噪声。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: marker、类型、期间、数值或单位解析漂移时抛出。
+    """
+
+    assert _classify_statement_type_for_table(
+        caption="Consolidated Statements of Operations",
+        headers=["Revenue", "Net income"],
+        context_before="",
+    ) == "income"
+    assert _classify_statement_type_for_table(
+        caption="Table of Contents",
+        headers=[],
+        context_before="",
+    ) is None
+
+
+def test_ocr_quarter_token_owner_projects_periods_values_currency_and_scale() -> None:
+    """OCR 公开提取必须从季度 token 产生可观察期间、金额、货币与倍率。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 季度 token 或业务数值投影漂移时抛出。
+    """
+
+    result = extract_statement_result_from_ocr_pages(
+        statement_type="income",
+        page_texts=[
+            """CONSOLIDATED STATEMENTS OF OPERATIONS
+Revenue Gross profit Net income
+Q1 2025 Q1 2024 USD in billions
+100 90 50 45 10 (8)"""
+        ],
+    )
+
+    assert result is not None
+    assert result["periods"] == [
+        {"period_end": "2025-03-31", "fiscal_year": 2025, "fiscal_period": "Q1"},
+        {"period_end": "2024-03-31", "fiscal_year": 2024, "fiscal_period": "Q1"},
+    ]
+    assert [row["values"] for row in result["rows"]] == [
+        [100.0, 90.0],
+        [50.0, 45.0],
+        [10.0, -8.0],
+    ]
+    assert result["currency"] == "USD"
+    assert result["units"] == "USD"
+    assert result["scale"] == "billions"
+    assert result["data_quality"] == "extracted"

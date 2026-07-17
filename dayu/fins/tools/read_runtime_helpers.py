@@ -13,7 +13,7 @@ import json
 import re
 from collections.abc import Mapping
 from html import unescape
-from typing import Any, NoReturn, Optional, Protocol, TypedDict, cast, runtime_checkable
+from typing import Any, NoReturn, Optional, Protocol, cast, runtime_checkable
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
@@ -28,9 +28,11 @@ from dayu.fins.domain.xbrl_result_contract import (
     validate_xbrl_facts_result_payload,
 )
 from dayu.fins.domain.financial_result_contract import infer_financial_scale_from_decimals
-from dayu.fins.domain.filing_semantics import FinancialDataQuality
-from dayu.fins.domain.xbrl_result_contract import XbrlQueryReason
-from .result_types import NotSupportedResult
+from .result_types import (
+    NotSupportedResult,
+    PublicXbrlQueryResult,
+    project_xbrl_query_result,
+)
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.domain.filing_semantics import normalize_sec_form_type_for_matching
 from .error_contract import ErrorCode
@@ -386,36 +388,6 @@ def _normalize_json_scalar_text(value: JsonValue | None) -> Optional[str]:
     if isinstance(value, list) or isinstance(value, Mapping):
         return None
     return normalize_optional_text(value)
-
-
-def _collect_available_document_types(documents: list[Mapping[str, JsonValue]]) -> list[str]:
-    """提取文档列表中出现的所有 document_type（去重、排序）。
-
-    对尚未附加 document_type 字段的原始文档（base_documents）也适用，
-    按需从 form_type / source_kind 实时推导。
-
-    Args:
-        documents: 文档摘要列表（来自仓储的原始条目）。
-
-    Returns:
-        去重后的 document_type 列表（字母序）。
-
-    Raises:
-        无。
-    """
-
-    doc_types: set[str] = set()
-    for doc in documents:
-        # 若已附加 document_type 字段则直接取；否则实时推导
-        raw_doc_type = doc.get("document_type")
-        dt = raw_doc_type if isinstance(raw_doc_type, str) else None
-        if dt is None:
-            dt = resolve_document_type_for_source(
-                form_type=doc.get("form_type"),
-                source_kind=doc.get("source_kind"),
-            )
-        doc_types.add(dt)
-    return sorted(doc_types)
 
 
 def _collect_parent_titles(
@@ -1167,85 +1139,51 @@ def _resolve_default_xbrl_concepts(*, form_type: Optional[str], taxonomy: Option
     return list(_GLOBAL_DEFAULT_XBRL_CONCEPTS)
 
 
-class NormalizedXbrlQueryPayload(TypedDict):
-    """read-side 去重后的 XBRL 公共投影核心字段。"""
-
-    query_params: dict[str, JsonValue]
-    facts: list[dict[str, JsonValue]]
-    total: int
-    deduped_fact_count: int
-    data_quality: FinancialDataQuality
-    reason: XbrlQueryReason | None
-
-
 def _normalize_xbrl_query_payload(
     *,
+    ticker: str,
+    document_id: str,
+    citation: Mapping[str, JsonValue],
     payload: XbrlFactsPayload,
-    default_concepts: list[str],
-) -> NormalizedXbrlQueryPayload:
-    """标准化 `query_xbrl_facts` 的输出载荷。
+) -> PublicXbrlQueryResult:
+    """校验、复制、标准化并投影 XBRL 查询结果。
 
     Args:
+        ticker: 当前 borrowed snapshot 对应的公司代码。
+        document_id: 当前 borrowed snapshot 对应的文档 ID。
+        citation: 当前 borrowed snapshot 产生的来源引用。
         payload: 处理器返回载荷。
-        default_concepts: 本次查询实际使用的概念列表。
 
     Returns:
-        结构稳定、已去重且文本已清洗的载荷。
+        结构稳定、已去重且文本已清洗的唯一公共投影。
 
     Raises:
-        RuntimeError: 标准化失败时抛出。
+        ValueError: producer 载荷违反领域契约时抛出。
     """
 
     validated = validate_xbrl_facts_result_payload(payload)
-    query_params: dict[str, JsonValue] = dict(validated.query_params)
-    normalized_concepts: list[JsonValue] = []
-    for concept in _normalize_concepts_for_query(query_params.get("concepts"), default_concepts):
-        normalized_concepts.append(concept)
-    query_params["concepts"] = normalized_concepts
+    query_params = validated.query_params.copy()
+    raw_facts_copy = [dict(raw_fact) for raw_fact in validated.facts]
 
     normalized_pairs: list[
         tuple[dict[str, JsonValue], dict[str, JsonValue], int]
     ] = []
-    for index, raw_fact in enumerate(validated.facts):
+    for index, raw_fact in enumerate(raw_facts_copy):
         normalized_fact = _normalize_single_fact(raw_fact)
         if normalized_fact is None:
             continue
-        normalized_pairs.append((normalized_fact, dict(raw_fact), index))
+        normalized_pairs.append((normalized_fact, raw_fact, index))
 
     deduped_facts = _deduplicate_xbrl_facts(normalized_pairs)
-    return NormalizedXbrlQueryPayload(
+    return project_xbrl_query_result(
+        ticker=ticker,
+        document_id=document_id,
+        citation=citation,
         query_params=query_params,
-        facts=deduped_facts,
-        total=validated.total,
-        deduped_fact_count=len(deduped_facts),
+        returned_facts=deduped_facts,
         data_quality=validated.data_quality,
-        reason=validated.reason,
+        optional_reason=validated.reason,
     )
-
-
-def _normalize_concepts_for_query(raw_concepts: Any, default_concepts: list[str]) -> list[str]:
-    """标准化查询概念列表。
-
-    Args:
-        raw_concepts: 原始概念字段。
-        default_concepts: 默认概念列表。
-
-    Returns:
-        标准化后的概念列表（保证非空）。
-
-    Raises:
-        RuntimeError: 标准化失败时抛出。
-    """
-
-    if not isinstance(raw_concepts, list):
-        return list(default_concepts)
-    normalized: list[str] = []
-    for item in raw_concepts:
-        concept = normalize_optional_text(item)
-        if concept is None:
-            continue
-        normalized.append(concept)
-    return normalized or list(default_concepts)
 
 
 def _normalize_single_fact(
@@ -1659,7 +1597,6 @@ def _build_search_hint(
             "下一步：直接读取最相关章节。"
         )
     # mixed
-    exact_count = sum(1 for m in matches if m.get("is_exact_phrase"))
     top_ref = _extract_top_section_ref(matches)
     next_step = f"下一步：先调用 read_section(ref='{top_ref}')。" if top_ref else "下一步：先读取最相关命中的章节。"
     return (

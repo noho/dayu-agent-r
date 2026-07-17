@@ -19,7 +19,6 @@ from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.financial_result_contract import (
     FinancialPeriod,
     FinancialScaleOutcome,
-    StatementLocator,
     infer_financial_scale_from_decimals,
 )
 from dayu.fins.domain.filing_semantics import FiscalPeriod, normalize_fiscal_period
@@ -49,13 +48,6 @@ _QUERY_STATEMENT_TYPES = {
     "equity": "StatementOfChangesInEquity",
     "comprehensive_income": "ComprehensiveIncome",
     "comprehensiveincome": "ComprehensiveIncome",
-}
-_STATEMENT_TITLE_BY_TYPE = {
-    "income": "Income Statement",
-    "balance_sheet": "Balance Sheet",
-    "cash_flow": "Cash Flow Statement",
-    "equity": "Statement of Changes in Equity",
-    "comprehensive_income": "Comprehensive Income",
 }
 _XBRL_CONCEPT_IDENTITY_MAX_CHARS = 128
 
@@ -220,90 +212,6 @@ def _build_period_summary(
     )
 
 
-def _format_statement_period_label(period_summary: FinancialPeriod) -> str:
-    """将期间摘要格式化为稳定的报表期间标签。
-
-    Args:
-        period_summary: `_build_period_summary` 生成的期间摘要。
-
-    Returns:
-        适合写入 statement locator 的期间标签；优先返回 `FY2025` 这类口径，
-        无法归一时退回原始 `period_end`。
-
-    Raises:
-        无。
-    """
-
-    fiscal_year = period_summary.get("fiscal_year")
-    fiscal_period = normalize_optional_dataframe_string(period_summary.get("fiscal_period"))
-    period_end = normalize_optional_dataframe_string(period_summary.get("period_end"))
-    if isinstance(fiscal_year, int) and fiscal_period:
-        return f"{fiscal_period}{fiscal_year}"
-    return period_end or ""
-
-
-def _extract_statement_row_labels(rows: list[dict[str, JsonValue]]) -> list[str]:
-    """从结构化报表行中提取去重后的行标签。
-
-    Args:
-        rows: 标准化报表行列表。
-
-    Returns:
-        去重且保序的行标签列表。
-
-    Raises:
-        无。
-    """
-
-    labels: list[str] = []
-    seen: set[str] = set()
-    for row in rows:
-        label = normalize_optional_dataframe_string(row.get("label")) or normalize_optional_dataframe_string(row.get("concept")) or ""
-        if not label or label in seen:
-            continue
-        seen.add(label)
-        labels.append(label)
-    return labels
-
-
-def build_statement_locator(
-    *,
-    statement_type: str,
-    periods: list[FinancialPeriod],
-    rows: list[dict[str, JsonValue]],
-    statement_title: Optional[str] = None,
-) -> StatementLocator:
-    """构建结构化报表定位信息。
-
-    该定位信息用于：
-    - 让 write 在"证据与出处"中稳定表达 `get_financial_statement` 来源；
-    - 让 confirm/repair 能以 statement + period + row 的粒度复核证据。
-
-    Args:
-        statement_type: 报表类型。
-        periods: 报表期间摘要列表。
-        rows: 报表行列表。
-        statement_title: 可选的人类可读报表标题；为空时按类型映射推断。
-
-    Returns:
-        结构化定位信息字典。
-
-    Raises:
-        无。
-    """
-
-    normalized_statement_type = statement_type.strip().lower()
-    resolved_title = statement_title or _STATEMENT_TITLE_BY_TYPE.get(normalized_statement_type) or statement_type
-    period_labels = [label for label in (_format_statement_period_label(period) for period in periods) if label]
-    row_labels = _extract_statement_row_labels(rows)
-    return StatementLocator(
-        statement_type=statement_type,
-        statement_title=resolved_title,
-        period_labels=period_labels,
-        row_labels=row_labels,
-    )
-
-
 def _to_optional_float(value: Any) -> Optional[float]:
     """将值转换为可选浮点数。
 
@@ -352,9 +260,9 @@ def _normalize_query_statement_type(statement_type: Optional[str]) -> Optional[s
 
 
 def _build_xbrl_value_filter(
-    min_value: Optional[float],
-    max_value: Optional[float],
-) -> Callable[[float], bool] | tuple[float, float] | None:
+    min_value: int | float | None,
+    max_value: int | float | None,
+) -> Callable[[float], bool] | tuple[int | float, int | float] | None:
     """构建 edgartools `FactQuery.by_value` 所需过滤参数。
 
     Args:
@@ -397,8 +305,8 @@ def _build_xbrl_value_filter(
 
 def _apply_xbrl_value_filter(
     query_obj: Any,
-    min_value: Optional[float],
-    max_value: Optional[float],
+    min_value: int | float | None,
+    max_value: int | float | None,
 ) -> Any:
     """兼容不同 edgartools `by_value` 签名应用数值过滤。
 
@@ -435,9 +343,9 @@ def _query_facts_rows(
     statement_type: Optional[str],
     period_end: Optional[str],
     fiscal_year: Optional[int],
-    fiscal_period: Optional[str],
-    min_value: Optional[float],
-    max_value: Optional[float],
+    fiscal_period: FiscalPeriod | None,
+    min_value: int | float | None,
+    max_value: int | float | None,
 ) -> XbrlConceptQuerySummary:
     """执行 XBRL facts 查询。
 
@@ -466,7 +374,6 @@ def _query_facts_rows(
     failed_concepts: list[str] = []
     last_failure: Exception | None = None
     normalized_period_end = normalize_optional_dataframe_string(period_end)
-    normalized_fiscal_period = normalize_optional_dataframe_string(fiscal_period)
     for concept in concepts:
         target_local_name = _extract_concept_local_name(concept)
         if not target_local_name:
@@ -479,8 +386,8 @@ def _query_facts_rows(
                 query_obj = query_obj.by_statement_type(statement_type)
             if fiscal_year is not None:
                 query_obj = query_obj.by_fiscal_year(fiscal_year)
-            if normalized_fiscal_period:
-                query_obj = query_obj.by_fiscal_period(normalized_fiscal_period.upper())
+            if fiscal_period is not None:
+                query_obj = query_obj.by_fiscal_period(fiscal_period)
             query_obj = _apply_xbrl_value_filter(
                 query_obj,
                 min_value=min_value,

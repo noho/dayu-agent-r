@@ -53,7 +53,6 @@ from .sec_xbrl_query import (
     _infer_period_semantics_from_xbrl_query,
     _infer_scale_from_xbrl_query,
     _infer_units_from_xbrl_query,
-    build_statement_locator,
 )
 from .sec_table_extraction import _safe_statement_dataframe
 from dayu.fins.xbrl_file_discovery import discover_xbrl_files
@@ -358,11 +357,6 @@ class BsSixKFormProcessor(_VirtualSectionProcessorMixin, FinsBSProcessor):
             "scale": None,
             "data_quality": "partial",
             "reason": "unsupported_statement_type",
-            "statement_locator": build_statement_locator(
-                statement_type=statement_type,
-                periods=[],
-                rows=[],
-            ),
         }
         if normalized_statement_type not in _SUPPORTED_STATEMENT_TYPES:
             return result
@@ -955,21 +949,18 @@ class BsSixKFormProcessor(_VirtualSectionProcessorMixin, FinsBSProcessor):
             scale=scale,
             complete_quality="xbrl",
         )
-        return {
-            "statement_type": statement_type,
-            "periods": periods,
-            "rows": rows,
-            "currency": currency,
-            "units": units,
-            "scale": scale,
-            "data_quality": quality.data_quality,
-            "reason": quality.reason,
-            "statement_locator": build_statement_locator(
-                statement_type=statement_type,
-                periods=periods,
-                rows=rows,
-            ),
-        }
+        result = FinancialStatementResult(
+            statement_type=statement_type,
+            periods=periods,
+            rows=rows,
+            currency=currency,
+            units=units,
+            scale=scale,
+            data_quality=quality.data_quality,
+        )
+        if quality.reason is not None:
+            result["reason"] = quality.reason
+        return result
 
     def _get_xbrl(self) -> Optional[XBRL]:
         """延迟加载并缓存 XBRL 对象。

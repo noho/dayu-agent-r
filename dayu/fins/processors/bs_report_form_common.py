@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Any, ClassVar, Optional
 
 from edgar.xbrl import XBRL
@@ -26,7 +25,8 @@ from dayu.fins.domain.financial_result_contract import (
     FinancialStatementResult,
     determine_financial_statement_quality,
 )
-from dayu.fins.domain.xbrl_result_contract import XbrlFactsResult
+from dayu.fins.domain.filing_semantics import FiscalPeriod
+from dayu.fins.domain.xbrl_result_contract import XbrlFactsResult, XbrlQueryParams
 from .financial_base import FinancialMeta
 from dayu.documents.processors.bs_processor import BSProcessor
 from dayu.documents.processors.source import Source
@@ -51,7 +51,6 @@ from .sec_xbrl_query import (
     _normalize_fact_row,
     _normalize_query_statement_type,
     _query_facts_rows,
-    build_statement_locator,
 )
 from .sec_table_extraction import _safe_statement_dataframe
 from dayu.fins.xbrl_file_discovery import discover_xbrl_files
@@ -233,11 +232,6 @@ class _BaseBsReportFormProcessor(_VirtualSectionProcessorMixin, FinsBSProcessor)
             "scale": None,
             "data_quality": "partial",
             "reason": "unsupported_statement_type",
-            "statement_locator": build_statement_locator(
-                statement_type=statement_type,
-                periods=[],
-                rows=[],
-            ),
         }
         if normalized_statement_type not in _STATEMENT_METHODS:
             return base_result
@@ -249,7 +243,9 @@ class _BaseBsReportFormProcessor(_VirtualSectionProcessorMixin, FinsBSProcessor)
         if xbrl_result is not None:
             return xbrl_result
 
-        base_result["reason"] = xbrl_reason or "xbrl_not_available"
+        if xbrl_reason is None:
+            raise RuntimeError("XBRL 报表失败结果缺少业务原因")
+        base_result["reason"] = xbrl_reason
         if normalized_statement_type not in REPORT_FORM_SUPPORTED_STATEMENT_TYPES:
             return base_result
         if not _should_apply_report_statement_html_fallback(base_result["reason"]):
@@ -273,9 +269,9 @@ class _BaseBsReportFormProcessor(_VirtualSectionProcessorMixin, FinsBSProcessor)
         statement_type: Optional[str] = None,
         period_end: Optional[str] = None,
         fiscal_year: Optional[int] = None,
-        fiscal_period: Optional[str] = None,
-        min_value: Optional[float] = None,
-        max_value: Optional[float] = None,
+        fiscal_period: FiscalPeriod | None = None,
+        min_value: int | float | None = None,
+        max_value: int | float | None = None,
     ) -> XbrlFactsResult:
         """查询 XBRL facts。
 
@@ -297,30 +293,27 @@ class _BaseBsReportFormProcessor(_VirtualSectionProcessorMixin, FinsBSProcessor)
 
         normalized_concepts = [str(item).strip() for item in concepts if str(item).strip()]
         normalized_statement_type = _normalize_query_statement_type(statement_type)
-        concept_values: list[JsonValue] = []
-        for concept in normalized_concepts:
-            concept_values.append(concept)
-        filters_applied: dict[str, JsonValue] = {
-            "period_end": period_end,
-            "fiscal_year": fiscal_year,
-            "fiscal_period": fiscal_period,
-            "min_value": min_value,
-            "max_value": max_value,
-        }
-        query_params: dict[str, JsonValue] = {
-            "concepts": concept_values,
-            "statement_type": normalized_statement_type or statement_type,
-            "filters_applied": filters_applied,
-        }
         if not normalized_concepts:
             raise ValueError("XBRL concepts 不能为空")
+        query_params = XbrlQueryParams(concepts=list(normalized_concepts))
+        if normalized_statement_type is not None:
+            query_params["statement_type"] = normalized_statement_type
+        if period_end is not None:
+            query_params["period_end"] = period_end
+        if fiscal_year is not None:
+            query_params["fiscal_year"] = fiscal_year
+        if fiscal_period is not None:
+            query_params["fiscal_period"] = fiscal_period
+        if min_value is not None:
+            query_params["min_value"] = min_value
+        if max_value is not None:
+            query_params["max_value"] = max_value
 
         xbrl = self._get_xbrl()
         if xbrl is None:
             return {
                 "query_params": query_params,
                 "facts": [],
-                "total": 0,
                 "data_quality": "partial",
                 "reason": "xbrl_not_available",
             }
@@ -337,13 +330,14 @@ class _BaseBsReportFormProcessor(_VirtualSectionProcessorMixin, FinsBSProcessor)
         )
         facts = [_normalize_fact_row(row) for row in summary.rows]
         is_partial = bool(summary.failed_concepts)
-        return {
-            "query_params": query_params,
-            "facts": facts,
-            "total": len(facts),
-            "data_quality": "partial" if is_partial else "xbrl",
-            "reason": "query_partially_failed" if is_partial else None,
-        }
+        result = XbrlFactsResult(
+            query_params=query_params,
+            facts=facts,
+            data_quality="partial" if is_partial else "xbrl",
+        )
+        if is_partial:
+            result["reason"] = "query_partially_failed"
+        return result
 
     def _get_statement_from_xbrl(
         self,
@@ -375,7 +369,7 @@ class _BaseBsReportFormProcessor(_VirtualSectionProcessorMixin, FinsBSProcessor)
         statements = getattr(xbrl, "statements", None)
         method = getattr(statements, method_name, None)
         if not callable(method):
-            return None, "statement_method_missing"
+            return None, "statement_not_found"
 
         statement_obj = method()
         if statement_obj is None:
@@ -383,12 +377,12 @@ class _BaseBsReportFormProcessor(_VirtualSectionProcessorMixin, FinsBSProcessor)
 
         statement_df = _safe_statement_dataframe(statement_obj)
         if statement_df is None or statement_df.empty:
-            return None, "statement_empty"
+            return None, "statement_not_found"
 
         period_columns = _extract_period_columns(statement_df.columns)
         rows = _build_statement_rows(statement_df, period_columns)
         if not rows:
-            return None, "statement_empty"
+            return None, "statement_not_found"
         period_evidence = _infer_period_semantics_from_xbrl_query(xbrl, period_columns)
         periods = [
             _build_period_summary(
@@ -408,24 +402,18 @@ class _BaseBsReportFormProcessor(_VirtualSectionProcessorMixin, FinsBSProcessor)
             scale=scale,
             complete_quality="xbrl",
         )
-        return (
-            {
-                "statement_type": statement_type,
-                "periods": periods,
-                "rows": rows,
-                "currency": currency,
-                "units": units,
-                "scale": scale,
-                "data_quality": quality.data_quality,
-                "reason": quality.reason,
-                "statement_locator": build_statement_locator(
-                    statement_type=statement_type,
-                    periods=periods,
-                    rows=rows,
-                ),
-            },
-            None,
+        result = FinancialStatementResult(
+            statement_type=statement_type,
+            periods=periods,
+            rows=rows,
+            currency=currency,
+            units=units,
+            scale=scale,
+            data_quality=quality.data_quality,
         )
+        if quality.reason is not None:
+            result["reason"] = quality.reason
+        return result, None
 
     def _get_report_statement_tables(self, statement_type: str) -> list[Any]:
         """获取报告类表单的财务报表候选表。

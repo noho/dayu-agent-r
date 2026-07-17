@@ -11,6 +11,7 @@ from typing import NotRequired, Protocol, TypedDict
 
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.financial_result_contract import FinancialStatementResult
+from dayu.fins.domain.filing_semantics import FiscalPeriod
 from dayu.fins.domain.xbrl_result_contract import XbrlFactsResult
 
 
@@ -53,9 +54,9 @@ class FinancialDataProcessor(Protocol):
         statement_type: str | None = None,
         period_end: str | None = None,
         fiscal_year: int | None = None,
-        fiscal_period: str | None = None,
-        min_value: float | None = None,
-        max_value: float | None = None,
+        fiscal_period: FiscalPeriod | None = None,
+        min_value: int | float | None = None,
+        max_value: int | float | None = None,
     ) -> XbrlFactsResult:
         """查询 XBRL facts。
 

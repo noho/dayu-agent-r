@@ -30,7 +30,6 @@ from dayu.fins.domain.financial_result_contract import (
     determine_financial_statement_quality,
 )
 from dayu.fins.domain.filing_semantics import normalize_fiscal_period
-from .sec_xbrl_query import build_statement_locator
 
 _CURRENCY_MAP = {
     "HK$": "HKD",
@@ -217,21 +216,18 @@ def build_html_statement_result_from_tables(
         complete_quality="extracted",
     )
     currency = _map_currency_code(primary_currency_raw)
-    return {
-        "statement_type": statement_type,
-        "periods": period_summaries,
-        "rows": rows,
-        "currency": currency,
-        "units": currency,
-        "scale": scale,
-        "data_quality": quality.data_quality,
-        "reason": quality.reason,
-        "statement_locator": build_statement_locator(
-            statement_type=statement_type,
-            periods=period_summaries,
-            rows=rows,
-        ),
-    }
+    result = FinancialStatementResult(
+        statement_type=statement_type,
+        periods=period_summaries,
+        rows=rows,
+        currency=currency,
+        units=currency,
+        scale=scale,
+        data_quality=quality.data_quality,
+    )
+    if quality.reason is not None:
+        result["reason"] = quality.reason
+    return result
 
 
 def select_html_statement_tables_by_row_signals(

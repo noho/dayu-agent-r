@@ -18,7 +18,6 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Optional
 
-import pandas as pd
 from edgar.documents import HTMLParser, ParserConfig
 from edgar.documents.exceptions import DocumentTooLargeError
 from edgar.xbrl import XBRL
@@ -36,7 +35,8 @@ from dayu.fins.domain.financial_result_contract import (
     FinancialStatementResult,
     determine_financial_statement_quality,
 )
-from dayu.fins.domain.xbrl_result_contract import XbrlFactsResult
+from dayu.fins.domain.filing_semantics import FiscalPeriod
+from dayu.fins.domain.xbrl_result_contract import XbrlFactsResult, XbrlQueryParams
 from .financial_base import FinancialMeta
 from dayu.documents.processors.text_utils import (
     append_missing_table_placeholders as _append_missing_placeholders,
@@ -63,7 +63,6 @@ from dayu.fins.processors.sec_xbrl_query import (
     _normalize_fact_row,
     _normalize_query_statement_type,
     _query_facts_rows,
-    build_statement_locator,
 )
 from dayu.fins.processors.sec_section_build import (
     _SectionBlock,
@@ -609,11 +608,6 @@ class SecProcessor:
             "scale": None,
             "data_quality": "partial",
             "reason": "unsupported_statement_type",
-            "statement_locator": build_statement_locator(
-                statement_type=statement_type,
-                periods=[],
-                rows=[],
-            ),
         }
         if method_name is None:
             return base_result
@@ -626,7 +620,7 @@ class SecProcessor:
         statements = getattr(xbrl, "statements", None)
         method = getattr(statements, method_name, None)
         if not callable(method):
-            base_result["reason"] = "statement_method_missing"
+            base_result["reason"] = "statement_not_found"
             return base_result
 
         statement_obj = method()
@@ -636,7 +630,7 @@ class SecProcessor:
 
         statement_df = _safe_statement_dataframe(statement_obj)
         if statement_df is None or statement_df.empty:
-            base_result["reason"] = "statement_empty"
+            base_result["reason"] = "statement_not_found"
             return base_result
 
         period_columns = _extract_period_columns(statement_df.columns)
@@ -655,7 +649,7 @@ class SecProcessor:
         scale_outcome = _infer_scale_from_xbrl_query(xbrl)
         scale = None if scale_outcome.query_failed else scale_outcome.scale
         if not rows:
-            base_result["reason"] = "statement_empty"
+            base_result["reason"] = "statement_not_found"
             return base_result
         quality = determine_financial_statement_quality(
             rows=rows,
@@ -664,21 +658,18 @@ class SecProcessor:
             complete_quality="xbrl",
         )
 
-        return {
-            "statement_type": statement_type,
-            "periods": periods,
-            "rows": rows,
-            "currency": currency,
-            "units": units,
-            "scale": scale,
-            "data_quality": quality.data_quality,
-            "reason": quality.reason,
-            "statement_locator": build_statement_locator(
-                statement_type=statement_type,
-                periods=periods,
-                rows=rows,
-            ),
-        }
+        result = FinancialStatementResult(
+            statement_type=statement_type,
+            periods=periods,
+            rows=rows,
+            currency=currency,
+            units=units,
+            scale=scale,
+            data_quality=quality.data_quality,
+        )
+        if quality.reason is not None:
+            result["reason"] = quality.reason
+        return result
 
     def query_xbrl_facts(
         self,
@@ -686,9 +677,9 @@ class SecProcessor:
         statement_type: Optional[str] = None,
         period_end: Optional[str] = None,
         fiscal_year: Optional[int] = None,
-        fiscal_period: Optional[str] = None,
-        min_value: Optional[float] = None,
-        max_value: Optional[float] = None,
+        fiscal_period: FiscalPeriod | None = None,
+        min_value: int | float | None = None,
+        max_value: int | float | None = None,
     ) -> XbrlFactsResult:
         """查询 XBRL facts。
 
@@ -710,30 +701,27 @@ class SecProcessor:
 
         normalized_concepts = [str(item).strip() for item in concepts if str(item).strip()]
         normalized_statement_type = _normalize_query_statement_type(statement_type)
-        concept_values: list[JsonValue] = []
-        for concept in normalized_concepts:
-            concept_values.append(concept)
-        filters_applied: dict[str, JsonValue] = {
-            "period_end": period_end,
-            "fiscal_year": fiscal_year,
-            "fiscal_period": fiscal_period,
-            "min_value": min_value,
-            "max_value": max_value,
-        }
-        query_params: dict[str, JsonValue] = {
-            "concepts": concept_values,
-            "statement_type": normalized_statement_type or statement_type,
-            "filters_applied": filters_applied,
-        }
         if not normalized_concepts:
             raise ValueError("XBRL concepts 不能为空")
+        query_params = XbrlQueryParams(concepts=list(normalized_concepts))
+        if normalized_statement_type is not None:
+            query_params["statement_type"] = normalized_statement_type
+        if period_end is not None:
+            query_params["period_end"] = period_end
+        if fiscal_year is not None:
+            query_params["fiscal_year"] = fiscal_year
+        if fiscal_period is not None:
+            query_params["fiscal_period"] = fiscal_period
+        if min_value is not None:
+            query_params["min_value"] = min_value
+        if max_value is not None:
+            query_params["max_value"] = max_value
 
         xbrl = self._get_xbrl()
         if xbrl is None:
             return {
                 "query_params": query_params,
                 "facts": [],
-                "total": 0,
                 "data_quality": "partial",
                 "reason": "xbrl_not_available",
             }
@@ -750,13 +738,14 @@ class SecProcessor:
         )
         facts = [_normalize_fact_row(row) for row in summary.rows]
         is_partial = bool(summary.failed_concepts)
-        return {
-            "query_params": query_params,
-            "facts": facts,
-            "total": len(facts),
-            "data_quality": "partial" if is_partial else "xbrl",
-            "reason": "query_partially_failed" if is_partial else None,
-        }
+        result = XbrlFactsResult(
+            query_params=query_params,
+            facts=facts,
+            data_quality="partial" if is_partial else "xbrl",
+        )
+        if is_partial:
+            result["reason"] = "query_partially_failed"
+        return result
 
     def _get_xbrl(self) -> Optional[XBRL]:
         """延迟加载并缓存 XBRL 对象。

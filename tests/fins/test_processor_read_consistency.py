@@ -411,6 +411,65 @@ class _ReadProcessor:
         return self.label
 
 
+class _FinancialReadProcessor(_ReadProcessor):
+    """为 borrowed-snapshot 一致性测试提供财务报表能力。"""
+
+    def __init__(
+        self,
+        source: Source,
+        *,
+        form_type: str | None = None,
+        media_type: str | None = None,
+    ) -> None:
+        """读取 source 标签并初始化财务调用暂停点。
+
+        Args:
+            source: processor 输入 source。
+            form_type: 可选表单类型。
+            media_type: 可选媒体类型。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: source 无法读取时抛出。
+        """
+
+        super().__init__(source, form_type=form_type, media_type=media_type)
+        self.before_get_financial_statement: Callable[[], None] | None = None
+
+    def get_financial_statement(self, statement_type: str) -> dict[str, JsonValue]:
+        """返回携带当前 snapshot 标签的有效财务报表。
+
+        Args:
+            statement_type: 请求的报表类型。
+
+        Returns:
+            满足领域契约的财务报表载荷。
+
+        Raises:
+            AssertionError: 测试暂停点等待失败时抛出。
+        """
+
+        if self.before_get_financial_statement is not None:
+            self.before_get_financial_statement()
+        return {
+            "statement_type": statement_type,
+            "periods": [
+                {
+                    "period_end": "2024-09-28",
+                    "fiscal_year": 2024,
+                    "fiscal_period": "FY",
+                }
+            ],
+            "rows": [{"source_label": self.label, "value": 100}],
+            "currency": "USD",
+            "units": "USD",
+            "scale": "units",
+            "data_quality": "extracted",
+        }
+
+
 class _CountingProcessorRegistry(ProcessorRegistry):
     """记录 processor 构建次数的测试 registry。"""
 
@@ -430,6 +489,7 @@ class _CountingProcessorRegistry(ProcessorRegistry):
         super().__init__()
         self.create_count = 0
         self.created: list[_ReadProcessor] = []
+        self.processor_type: type[_ReadProcessor] = _ReadProcessor
         self.before_return: Callable[[], None] | None = None
         self.fixed_processor: DocumentProcessor | None = None
         self._guard = Lock()
@@ -466,7 +526,7 @@ class _CountingProcessorRegistry(ProcessorRegistry):
             self.before_return()
         with source.open() as stream:
             label = stream.read().decode("utf-8")
-        processor = _ReadProcessor(_MemorySource(label.encode("utf-8")))
+        processor = self.processor_type(_MemorySource(label.encode("utf-8")))
         self.created.append(processor)
         return processor
 
@@ -2147,6 +2207,80 @@ def test_citation_and_result_use_the_same_borrowed_snapshot_during_publication(
     new_result = runtime.read_section(ticker="AAPL", document_id="doc-1", ref="s_0001")
     assert new_result["content"] == "version-b"
     assert new_result["citation"]["source_provider"] == "USER_UPLOAD"
+
+
+def test_financial_projection_and_citation_share_borrowed_snapshot_during_publication(
+    tmp_path: Path,
+) -> None:
+    """财务结果与公共 citation 必须在并发 publication 中保持同一 snapshot。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 财务结果、citation 或可选原因发生混版时抛出。
+    """
+
+    runtime, repository, registry = _build_runtime(tmp_path)
+    registry.processor_type = _FinancialReadProcessor
+    result_ready = Event()
+    allow_result = Event()
+
+    with runtime._borrow_processor(ticker="AAPL", document_id="doc-1") as borrow:
+        processor = borrow.processor
+    assert isinstance(processor, _FinancialReadProcessor)
+
+    def _pause_financial_result() -> None:
+        """在旧 snapshot 产生业务结果前等待新版本完成发布。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 等待 publication 超时时抛出。
+        """
+
+        result_ready.set()
+        assert allow_result.wait(timeout=5.0)
+
+    processor.before_get_financial_statement = _pause_financial_result
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        old_future = executor.submit(
+            runtime.get_financial_statement,
+            ticker="AAPL",
+            document_id="doc-1",
+            statement_type="income",
+        )
+        assert result_ready.wait(timeout=5.0)
+        _update_source(
+            repository,
+            fingerprint="financial-b",
+            payload=b"version-b",
+            source_provider=FinsSourceProvider.USER_UPLOAD,
+        )
+        allow_result.set()
+        old_result = old_future.result(timeout=5.0)
+
+    assert "rows" in old_result
+    assert old_result["rows"][0]["source_label"] == "version-one"
+    assert old_result["citation"]["source_provider"] == "SEC_EDGAR"
+    assert "reason" not in old_result
+
+    new_result = runtime.get_financial_statement(
+        ticker="AAPL",
+        document_id="doc-1",
+        statement_type="income",
+    )
+    assert "rows" in new_result
+    assert new_result["rows"][0]["source_label"] == "version-b"
+    assert new_result["citation"]["source_provider"] == "USER_UPLOAD"
+    assert "reason" not in new_result
 
 
 def test_multi_query_search_keeps_result_and_citation_in_one_snapshot(tmp_path: Path) -> None:

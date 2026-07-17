@@ -60,7 +60,6 @@ from .html_financial_statement_common import (
     build_html_statement_result_from_tables as _build_shared_statement_result_from_tables,
     select_html_statement_tables_by_row_signals as _select_shared_statement_tables_by_row_signals,
 )
-from .sec_xbrl_query import build_statement_locator
 from .sec_form_section_common import _dedupe_markers
 from .sec_report_form_common import _find_table_of_contents_cutoff
 
@@ -991,21 +990,18 @@ def extract_statement_result_from_ocr_pages(
         scale=scale,
         complete_quality="extracted",
     )
-    return {
-        "statement_type": statement_type,
-        "periods": periods,
-        "rows": rows,
-        "currency": selected_payload.get("currency"),
-        "units": selected_payload.get("units"),
-        "scale": scale,
-        "data_quality": quality.data_quality,
-        "reason": quality.reason,
-        "statement_locator": build_statement_locator(
-            statement_type=statement_type,
-            periods=periods,
-            rows=rows,
-        ),
-    }
+    result = FinancialStatementResult(
+        statement_type=statement_type,
+        periods=periods,
+        rows=rows,
+        currency=selected_payload.get("currency"),
+        units=selected_payload.get("units"),
+        scale=scale,
+        data_quality=quality.data_quality,
+    )
+    if quality.reason is not None:
+        result["reason"] = quality.reason
+    return result
 
 
 def _extract_income_summary_result_from_ocr_pages(
@@ -1139,21 +1135,18 @@ def _build_income_summary_result_from_title_match(
         complete_quality="extracted",
     )
     currency = _map_ocr_currency_code(currency_raw) or _extract_income_summary_currency(page_body)
-    return {
-        "statement_type": "income",
-        "periods": [period_summary],
-        "rows": rows,
-        "currency": currency,
-        "units": currency,
-        "scale": scale,
-        "data_quality": quality.data_quality,
-        "reason": quality.reason,
-        "statement_locator": build_statement_locator(
-            statement_type="income",
-            periods=[period_summary],
-            rows=rows,
-        ),
-    }
+    result = FinancialStatementResult(
+        statement_type="income",
+        periods=[period_summary],
+        rows=rows,
+        currency=currency,
+        units=currency,
+        scale=scale,
+        data_quality=quality.data_quality,
+    )
+    if quality.reason is not None:
+        result["reason"] = quality.reason
+    return result
 
 
 def _extract_income_summary_period(

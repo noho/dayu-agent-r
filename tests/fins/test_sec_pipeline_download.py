@@ -84,31 +84,6 @@ class _FiscalXbrlResult:
 
 
 @dataclass(slots=True)
-class _FinancialStatementFixtureProcessor:
-    """按 statement type 返回预设结果的 fiscal processor。"""
-
-    results: dict[str, dict[str, JsonValue] | RuntimeError | str]
-
-    def get_financial_statement(self, *, statement_type: str) -> dict[str, JsonValue]:
-        """返回预设报表结果或抛出预设异常。
-
-        Args:
-            statement_type: 财务报表类型。
-
-        Returns:
-            预设报表 JSON。
-
-        Raises:
-            RuntimeError: 当前报表配置为失败时抛出。
-        """
-
-        result = self.results[statement_type]
-        if isinstance(result, RuntimeError):
-            raise result
-        return cast(dict[str, JsonValue], result)
-
-
-@dataclass(slots=True)
 class _XbrlQueryFixtureProcessor:
     """返回预设 XBRL facts payload 的 fiscal processor。"""
 
@@ -2075,8 +2050,8 @@ def test_sec_fiscal_files_consume_one_storage_snapshot(
         snapshots[0].get_primary_source()
 
 
-def test_sec_fiscal_financial_payload_and_quality_contracts() -> None:
-    """fiscal owner 应保留报表部分失败、XBRL 可用性与质量矩阵。
+def test_sec_fiscal_processed_quality_contract() -> None:
+    """fiscal owner 应仅保留 processed 文档质量矩阵。
 
     Args:
         无。
@@ -2085,52 +2060,9 @@ def test_sec_fiscal_financial_payload_and_quality_contracts() -> None:
         无。
 
     Raises:
-        AssertionError: fiscal payload 或质量矩阵发生漂移时抛出。
+        AssertionError: processed 质量矩阵发生漂移时抛出。
     """
 
-    processor = _FinancialStatementFixtureProcessor(
-        results={
-            "income": {
-                "statement_type": "income",
-                "rows": [{"label": "Revenue"}],
-                "data_quality": "xbrl",
-            },
-            "balance_sheet": "invalid",
-            "cash_flow": RuntimeError("cash unavailable"),
-            "equity": {
-                "statement_type": "equity",
-                "rows": [],
-                "data_quality": "partial",
-            },
-            "comprehensive_income": {
-                "statement_type": "comprehensive_income",
-                "rows": [],
-                "data_quality": "partial",
-            },
-        }
-    )
-
-    payload, has_xbrl = _sec_fiscal_fields._build_financials_payload(processor)
-
-    assert has_xbrl is True
-    assert payload is not None
-    statements = cast(dict[str, JsonValue], payload["statements"])
-    assert cast(dict[str, JsonValue], statements["balance_sheet"])["reason"] == "invalid_statement_result"
-    assert str(cast(dict[str, JsonValue], statements["cash_flow"])["reason"]).startswith("processor_error:")
-    assert _sec_fiscal_fields._build_financials_payload(None) == (None, False)
-    no_xbrl_payload, no_xbrl = _sec_fiscal_fields._build_financials_payload(
-        _FinancialStatementFixtureProcessor(
-            results={
-                statement_type: {
-                    "statement_type": statement_type,
-                    "rows": [],
-                    "data_quality": "partial",
-                }
-                for statement_type in _sec_fiscal_fields.FINANCIAL_STATEMENT_TYPES
-            }
-        )
-    )
-    assert (no_xbrl_payload, no_xbrl) == (None, False)
     assert _sec_fiscal_fields._resolve_processed_quality(True, True, "10-K") == "full"
     assert _sec_fiscal_fields._resolve_processed_quality(False, True, "10-K") == "partial"
     assert _sec_fiscal_fields._resolve_processed_quality(False, False, "10-K") == "fallback"
@@ -2152,11 +2084,9 @@ def test_sec_fiscal_processed_resolution_precedence_and_fallbacks() -> None:
 
     query_processor = _XbrlQueryFixtureProcessor(
         payload={
-            "query_params": {},
+            "query_params": {"concepts": ["Revenue"]},
             "facts": [{"fiscal_year": 2024, "fiscal_period": "FY"}],
-            "total": 1,
             "data_quality": "xbrl",
-            "reason": None,
         }
     )
     financials_payload: dict[str, JsonValue] = {
@@ -2374,25 +2304,21 @@ def test_sec_fiscal_payload_and_query_extractors_fail_closed() -> None:
     assert _sec_fiscal_fields._extract_fiscal_from_xbrl_query(
         _XbrlQueryFixtureProcessor(
             {
-                "query_params": {},
+                "query_params": {"concepts": ["Revenue"]},
                 "facts": [
                     {"period_end": "2023-12-31"},
                     {"fiscal_year": 2024, "fiscal_period": "Q1"},
                 ],
-                "total": 2,
                 "data_quality": "xbrl",
-                "reason": None,
             }
         )
     ) == (2024, "Q1")
     assert _sec_fiscal_fields._extract_fiscal_from_xbrl_query(
         _XbrlQueryFixtureProcessor(
             {
-                "query_params": {},
+                "query_params": {"concepts": ["Revenue"]},
                 "facts": [{"period_end": "2021-12-31"}],
-                "total": 1,
                 "data_quality": "xbrl",
-                "reason": None,
             }
         )
     ) == (2021, None)

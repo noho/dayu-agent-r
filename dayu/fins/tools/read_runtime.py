@@ -81,16 +81,16 @@ from .search_engine import (
 )
 from .result_types import (
     DocumentSectionsResult,
-    FinancialStatementResult,
     ListDocumentsResult,
     NotSupportedResult,
     PageContentResult,
+    PublicFinancialStatementResult,
+    PublicXbrlQueryResult,
     SearchDocumentResult,
     SectionContentResult,
     TableDetailResult,
     TablesListResult,
-    XbrlQueryParams,
-    XbrlQueryResult,
+    project_financial_statement_result,
 )
 from dayu.fins._converters import normalize_optional_text, require_non_empty_text
 from dayu.fins.ticker_normalization import try_normalize_ticker
@@ -1986,7 +1986,7 @@ class FinsReadRuntime:
         document_id: str,
         statement_type: str,
         cancellation_token: CancellationToken | None = None,
-    ) -> FinancialStatementResult | NotSupportedResult:
+    ) -> PublicFinancialStatementResult | NotSupportedResult:
         """读取标准财务报表。
 
         Args:
@@ -1996,9 +1996,7 @@ class FinsReadRuntime:
             cancellation_token: Host 注入的取消观察令牌。
 
         Returns:
-            财务报表结果；成功时除标准报表数据外，还包含 `statement_locator`
-            结构化定位信息，供写作链路生成可复核的“证据与出处”锚点；
-            不支持时返回 `not_supported` 结构。
+            财务报表公共结果；不支持时返回 `not_supported` 结构。
 
         Raises:
             FinsReadArgumentError: 参数非法时抛出。
@@ -2044,7 +2042,7 @@ class FinsReadRuntime:
         normalized_document_id: str,
         normalized_statement_type: str,
         cancellation_token: CancellationToken | None,
-    ) -> FinancialStatementResult | NotSupportedResult:
+    ) -> PublicFinancialStatementResult | NotSupportedResult:
         """在一个 active borrow 内完成财务报表读取与 citation 构造。
 
         Args:
@@ -2081,21 +2079,12 @@ class FinsReadRuntime:
         )
         for _row in statement_payload["rows"]:
             _raise_if_fins_cancelled(cancellation_token)
-        result: FinancialStatementResult = {
-            "ticker": normalized_ticker,
-            "document_id": normalized_document_id,
-            "citation": citation,
-            "statement_type": statement_payload["statement_type"],
-            "periods": statement_payload["periods"],
-            "rows": statement_payload["rows"],
-            "currency": statement_payload["currency"],
-            "units": statement_payload["units"],
-            "scale": statement_payload["scale"],
-            "data_quality": statement_payload["data_quality"],
-            "reason": statement_payload["reason"],
-            "statement_locator": statement_payload["statement_locator"],
-        }
-        return result
+        return project_financial_statement_result(
+            ticker=normalized_ticker,
+            document_id=normalized_document_id,
+            citation=citation,
+            producer_result=statement_payload,
+        )
 
     def query_xbrl_facts(
         self,
@@ -2110,7 +2099,7 @@ class FinsReadRuntime:
         min_value: Optional[float] = None,
         max_value: Optional[float] = None,
         cancellation_token: CancellationToken | None = None,
-    ) -> XbrlQueryResult | NotSupportedResult:
+    ) -> PublicXbrlQueryResult | NotSupportedResult:
         """查询 XBRL facts。
 
         Args:
@@ -2188,7 +2177,7 @@ class FinsReadRuntime:
         min_value: Optional[float],
         max_value: Optional[float],
         cancellation_token: CancellationToken | None,
-    ) -> XbrlQueryResult | NotSupportedResult:
+    ) -> PublicXbrlQueryResult | NotSupportedResult:
         """在一个 active borrow 内完成 XBRL 查询与 citation 构造。
 
         Args:
@@ -2249,54 +2238,16 @@ class FinsReadRuntime:
         for _raw_fact in payload["facts"]:
             _raise_if_fins_cancelled(cancellation_token)
         normalized_payload = _normalize_xbrl_query_payload(
+            ticker=normalized_ticker,
+            document_id=normalized_document_id,
+            citation=self._build_citation(
+                borrow=borrow,
+            ),
             payload=payload,
-            default_concepts=resolved_concepts,
         )
         for _fact in normalized_payload["facts"]:
             _raise_if_fins_cancelled(cancellation_token)
-        query_params: XbrlQueryParams = {
-            "concepts": resolved_concepts,
-        }
-        normalized_query_params = normalized_payload["query_params"]
-        if isinstance(normalized_query_params, Mapping):
-            statement_type_value = normalized_query_params.get("statement_type")
-            period_end_value = normalized_query_params.get("period_end")
-            fiscal_year_value = normalized_query_params.get("fiscal_year")
-            fiscal_period_value = normalized_query_params.get("fiscal_period")
-            min_value_value = normalized_query_params.get("min_value")
-            max_value_value = normalized_query_params.get("max_value")
-            query_params["statement_type"] = statement_type_value if isinstance(statement_type_value, str) else None
-            query_params["period_end"] = period_end_value if isinstance(period_end_value, str) else None
-            query_params["fiscal_year"] = (
-                fiscal_year_value
-                if isinstance(fiscal_year_value, int) and not isinstance(fiscal_year_value, bool)
-                else None
-            )
-            query_params["fiscal_period"] = fiscal_period_value if isinstance(fiscal_period_value, str) else None
-            query_params["min_value"] = (
-                float(min_value_value)
-                if isinstance(min_value_value, int | float) and not isinstance(min_value_value, bool)
-                else None
-            )
-            query_params["max_value"] = (
-                float(max_value_value)
-                if isinstance(max_value_value, int | float) and not isinstance(max_value_value, bool)
-                else None
-            )
-        result: XbrlQueryResult = {
-            "ticker": normalized_ticker,
-            "document_id": normalized_document_id,
-            "query_params": query_params,
-            "facts": normalized_payload["facts"],
-            "total": normalized_payload["total"],
-            "deduped_fact_count": normalized_payload["deduped_fact_count"],
-            "data_quality": normalized_payload["data_quality"],
-            "reason": normalized_payload["reason"],
-            "citation": self._build_citation(
-                borrow=borrow,
-            ),
-        }
-        return result
+        return normalized_payload
 
     def _normalize_document_identity(
         self,

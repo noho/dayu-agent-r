@@ -32,6 +32,7 @@ from dayu.contracts.tool_schema import (
     ToolTruncationStrategy,
 )
 from dayu.fins._log import Log
+from dayu.fins.domain.filing_semantics import FISCAL_PERIODS
 from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.tools.fins_limits import FinsToolLimits
 from dayu.runtime.tool_call_projection import (
@@ -47,6 +48,10 @@ from .read_runtime_helpers import (
     FinsReadArgumentError,
     FinsReadBusinessError,
     FinsReadCancelledError,
+)
+from .result_types import (
+    financial_statement_result_description,
+    xbrl_query_result_description,
 )
 
 MODULE: Final[str] = "FINS.FINS_TOOLS"
@@ -897,14 +902,7 @@ def _build_get_financial_statement_definition(
 
     @tool(
         name=GET_FINANCIAL_STATEMENT_TOOL_NAME,
-        description=(
-            "读取标准财务报表。返回 periods（元素含 period_end:string、"
-            "fiscal_year:int|null、fiscal_period:FY|H1|Q1|Q2|Q3|Q4|null）、"
-            "rows、currency、units、scale、data_quality 和 reason；scale 取 "
-            "units/thousands/millions/billions/null，表示数值倍率，units 表示货币或"
-            "计量单位。data_quality 取 xbrl/extracted/partial；partial 时 reason "
-            "说明缺失或降级原因。"
-        ),
+        description=financial_statement_result_description(),
         parameters=parameters,
         execution=ProcessBackedToolExecutionCapability(
             target_factory=process_target_factory,
@@ -974,13 +972,7 @@ def _build_query_xbrl_facts_definition(
 
     @tool(
         name=QUERY_XBRL_FACTS_TOOL_NAME,
-        description=(
-            "查询结构化 XBRL 数值 facts。返回 query_params、facts、total、"
-            "deduped_fact_count、data_quality 和 reason；total 是去重前的原始 fact "
-            "数，deduped_fact_count 是返回 facts 的去重后数量。data_quality=xbrl "
-            "表示 XBRL 查询正常执行，total=0 表示没有匹配 fact；partial 时 reason "
-            "说明 XBRL 不可用或部分概念查询失败。"
-        ),
+        description=xbrl_query_result_description(),
         parameters=parameters,
         execution=ProcessBackedToolExecutionCapability(
             target_factory=process_target_factory,
@@ -1728,6 +1720,9 @@ def _query_xbrl_facts_parameters() -> ToolParametersSchema:
         Exception: schema 构造失败时透出。
     """
 
+    fiscal_period_values: list[JsonValue] = [
+        fiscal_period for fiscal_period in sorted(FISCAL_PERIODS)
+    ]
     return ToolParametersSchema(
         type="object",
         properties={
@@ -1745,7 +1740,11 @@ def _query_xbrl_facts_parameters() -> ToolParametersSchema:
             },
             "period_end": {"type": "string", "description": "可选期末日期过滤，格式 YYYY-MM-DD。"},
             "fiscal_year": {"type": "integer", "description": "可选财年过滤。只在你已明确年份时填写。"},
-            "fiscal_period": {"type": "string", "description": "可选财期过滤，例如 FY、Q1、Q2。"},
+            "fiscal_period": {
+                "type": "string",
+                "description": "可选财期过滤。只在已明确 FY、H1 或季度归属时填写。",
+                "enum": fiscal_period_values,
+            },
             "min_value": {"type": "number", "description": "可选最小值过滤。只在你明确要排除过小数值时填写。"},
             "max_value": {"type": "number", "description": "可选最大值过滤。只在你明确要排除过大数值时填写。"},
         },

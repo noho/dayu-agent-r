@@ -32,9 +32,13 @@ from dayu.fins.domain.document_models import (
 )
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.domain.financial_result_contract import (
+    FinancialStatementResult as ProducerFinancialStatementResult,
     validate_financial_statement_result_payload,
 )
-from dayu.fins.domain.xbrl_result_contract import XbrlQueryExecutionError
+from dayu.fins.domain.xbrl_result_contract import (
+    XbrlQueryExecutionError,
+    XbrlQueryParams,
+)
 from dayu.fins.storage import (
     FsBatchingRepository,
     FsCompanyMetaRepository,
@@ -45,8 +49,20 @@ from dayu.fins.storage import (
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 from dayu.fins.storage.repository_protocols import SourceSnapshotProtocol
 from dayu.fins.tools.read_runtime import FinsReadRuntime, _parse_source_document_meta
-from dayu.fins.tools.read_runtime_helpers import FinsReadBusinessError, _resolve_processor_taxonomy
-from dayu.fins.tools.result_types import FinancialStatementResult, NotSupportedResult
+from dayu.fins.tools.read_runtime_helpers import (
+    FinsReadArgumentError,
+    FinsReadBusinessError,
+    _resolve_processor_taxonomy,
+    build_search_next_section_fields,
+    resolve_document_type_for_source,
+)
+from dayu.fins.tools.result_types import (
+    NotSupportedResult,
+    PublicFinancialStatementResult,
+    PublicXbrlQueryResult,
+    project_financial_statement_result,
+    project_xbrl_query_result,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _FINS_WAIT_ADAPTER_PATH = (_REPO_ROOT / "dayu" / "fins" / "ingestion" / "wait_adapter.py").resolve(strict=False)
@@ -418,6 +434,253 @@ class _FinancialStatementPayloadProcessor:
 
         del statement_type
         return self._payload
+
+
+class _SectionPayloadProcessor(_FinancialStatementPayloadProcessor):
+    """为 read_section 公共投影提供 typed 章节输入的测试 processor。"""
+
+    def __init__(
+        self,
+        source: Source,
+        *,
+        form_type: str | None = None,
+        media_type: str | None = None,
+    ) -> None:
+        """初始化固定章节载荷。
+
+        Args:
+            source: 文档来源。
+            form_type: 表单类型。
+            media_type: 媒体类型。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        super().__init__(source, form_type=form_type, media_type=media_type)
+        self._sections: dict[str, SectionContent] = {
+            "section-1": SectionContent(
+                ref="section-1",
+                title="Item 1. Business",
+                content="Revenue grew while operating costs remained controlled.",
+                tables=[],
+                word_count=7,
+                contains_full_text=True,
+                children=[
+                    SectionSummary(
+                        ref=" child-valid ",
+                        title=" Valid Child ",
+                        level=2,
+                        parent_ref="section-1",
+                        preview="有效子章节",
+                    ),
+                    SectionSummary(
+                        ref="   ",
+                        title="Invalid Child",
+                        level=2,
+                        parent_ref="section-1",
+                        preview="空 ref 必须被丢弃",
+                    ),
+                    SectionSummary(
+                        ref="child-without-title",
+                        title=None,
+                        level=2,
+                        parent_ref="section-1",
+                        preview="标题允许为空",
+                    ),
+                ],
+                page_range=[3, 5],
+            )
+        }
+
+    def read_section(self, ref: str) -> SectionContent:
+        """读取固定章节，并为未知 ref 产生 processor 协议的 KeyError 输入。
+
+        Args:
+            ref: 章节 ref。
+
+        Returns:
+            ref 对应的 typed 章节载荷。
+
+        Raises:
+            KeyError: ref 不存在时抛出，交由 public runtime 转换。
+        """
+
+        return self._sections[ref]
+
+
+class _TablePayloadProcessor(_FinancialStatementPayloadProcessor):
+    """为 get_table 公共投影提供三类 typed 表格输入的测试 processor。"""
+
+    def __init__(
+        self,
+        source: Source,
+        *,
+        form_type: str | None = None,
+        media_type: str | None = None,
+    ) -> None:
+        """初始化 records、Markdown 与普通文本表格载荷。
+
+        Args:
+            source: 文档来源。
+            form_type: 表单类型。
+            media_type: 媒体类型。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        super().__init__(source, form_type=form_type, media_type=media_type)
+        self._tables: dict[str, TableContent] = {
+            "records-table": TableContent(
+                table_ref="records-table",
+                caption="Revenue by quarter",
+                data_format="records",
+                data=[{" Quarter ": "Q1", "Revenue": 100}],
+                columns=[" Quarter ", "Revenue", "Revenue", "   "],
+                row_count=1,
+                col_count=2,
+                section_ref=None,
+                table_type=" FINANCIAL ",
+                page_no=7,
+                is_financial=True,
+            ),
+            "markdown-table": TableContent(
+                table_ref="markdown-table",
+                caption=None,
+                data_format="markdown",
+                data="| Metric | Value |\n| --- | ---: |\n| Revenue | 100 |",
+                columns=None,
+                row_count=1,
+                col_count=2,
+                section_ref=None,
+                table_type="data",
+            ),
+            "text-table": TableContent(
+                table_ref="text-table",
+                caption=None,
+                data_format="markdown",
+                data="Revenue was 100 in the reported period.",
+                columns=None,
+                row_count=0,
+                col_count=0,
+                section_ref=None,
+                table_type="unsupported-table-type",
+            ),
+        }
+
+    def read_table(self, table_ref: str) -> TableContent:
+        """读取固定表格，并为未知 table_ref 产生 processor 协议的 KeyError 输入。
+
+        Args:
+            table_ref: 表格 ref。
+
+        Returns:
+            table_ref 对应的 typed 表格载荷。
+
+        Raises:
+            KeyError: table_ref 不存在时抛出，交由 public runtime 转换。
+        """
+
+        return self._tables[table_ref]
+
+
+class _DefaultConceptsXbrlProcessor(_FinancialStatementPayloadProcessor):
+    """为 query_xbrl_facts 默认 concept 选择提供 typed 输入的测试 processor。"""
+
+    def __init__(
+        self,
+        source: Source,
+        *,
+        taxonomy: str = "US-GAAP",
+        fail_query: bool = False,
+        form_type: str | None = None,
+        media_type: str | None = None,
+    ) -> None:
+        """初始化 taxonomy 与可选 typed query failure。
+
+        Args:
+            source: 文档来源。
+            taxonomy: processor 识别出的 taxonomy 名称。
+            fail_query: 是否把实际收到的 concepts 投影为 typed 执行失败。
+            form_type: 表单类型。
+            media_type: 媒体类型。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        super().__init__(source, form_type=form_type, media_type=media_type)
+        self._taxonomy = taxonomy
+        self._fail_query = fail_query
+
+    def get_xbrl_taxonomy(self) -> str:
+        """返回 processor 的 typed taxonomy 业务事实。
+
+        Args:
+            无。
+
+        Returns:
+            初始化时提供的 taxonomy 名称。
+
+        Raises:
+            无。
+        """
+
+        return self._taxonomy
+
+    def query_xbrl_facts(
+        self,
+        *,
+        concepts: list[str],
+        statement_type: str | None = None,
+        period_end: str | None = None,
+        fiscal_year: int | None = None,
+        fiscal_period: str | None = None,
+        min_value: float | None = None,
+        max_value: float | None = None,
+    ) -> dict[str, JsonValue]:
+        """把实际收到的 concepts 原样写入 producer contract 或 typed failure。
+
+        Args:
+            concepts: runtime owner 选择的 concept 列表。
+            statement_type: 可选报表类型。
+            period_end: 可选期间结束日。
+            fiscal_year: 可选财年。
+            fiscal_period: 可选财期。
+            min_value: 可选最小值。
+            max_value: 可选最大值。
+
+        Returns:
+            query_params 与输入 concepts 同源的合法 XBRL producer 载荷。
+
+        Raises:
+            XbrlQueryExecutionError: 启用 typed failure 时，携带实际收到的 concepts 抛出。
+        """
+
+        del statement_type, period_end, fiscal_year, fiscal_period, min_value, max_value
+        if self._fail_query:
+            raise XbrlQueryExecutionError(tuple(concepts))
+        return {
+            "query_params": {"concepts": list(concepts)},
+            "facts": [
+                {
+                    "concept": concepts[0],
+                    "numeric_value": 100.0,
+                    "decimals": "0",
+                }
+            ],
+            "data_quality": "xbrl",
+        }
 
 
 class _AllFailedXbrlProcessor(_FinancialStatementPayloadProcessor):
@@ -822,13 +1085,7 @@ def test_storage_snapshot_resolves_explicit_kind_and_rejects_ambiguity(tmp_path:
                 "units": None,
                 "scale": None,
                 "data_quality": "partial",
-                "reason": "statement_empty",
-                "statement_locator": {
-                    "statement_type": "income_statement",
-                    "statement_title": "Income Statement",
-                    "period_labels": [],
-                    "row_labels": [],
-                },
+                "reason": "statement_not_found",
             },
             "缺少必填字段: rows",
         ),
@@ -841,13 +1098,7 @@ def test_storage_snapshot_resolves_explicit_kind_and_rejects_ambiguity(tmp_path:
                 "units": None,
                 "scale": None,
                 "data_quality": "partial",
-                "reason": "statement_empty",
-                "statement_locator": {
-                    "statement_type": "income_statement",
-                    "statement_title": "Income Statement",
-                    "period_labels": [],
-                    "row_labels": [],
-                },
+                "reason": "statement_not_found",
             },
             "rows 必须为数组",
         ),
@@ -903,13 +1154,6 @@ def test_get_financial_statement_accepts_list_rows(tmp_path: Path) -> None:
                 "scale": "millions",
                 "rows": [{"concept": "Revenue", "label": "Revenue", "values": [100]}],
                 "data_quality": "xbrl",
-                "reason": None,
-                "statement_locator": {
-                    "statement_type": "income_statement",
-                    "statement_title": "Income Statement",
-                    "period_labels": ["FY2025"],
-                    "row_labels": ["Revenue"],
-                },
         }
     )
     runtime, _source_repository = _build_runtime_with_source_documents(
@@ -926,13 +1170,162 @@ def test_get_financial_statement_accepts_list_rows(tmp_path: Path) -> None:
     assert result["units"] == "USD"
     assert result["scale"] == "millions"
     assert result["data_quality"] == "xbrl"
-    assert result["reason"] is None
-    assert result["statement_locator"] == {
-        "statement_type": "income_statement",
-        "statement_title": "Income Statement",
-        "period_labels": ["FY2025"],
-        "row_labels": ["Revenue"],
+    assert "reason" not in result
+    assert set(result) == {
+        "ticker",
+        "document_id",
+        "citation",
+        "statement_type",
+        "periods",
+        "rows",
+        "currency",
+        "units",
+        "scale",
+        "data_quality",
     }
+
+
+def test_public_result_builders_copy_inputs_and_preserve_optional_reason() -> None:
+    """两个公共 builder 必须复制引用容器并只机械投影存在的业务原因。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 公共字段、容器独立性或可选原因发生漂移时抛出。
+    """
+
+    citation: dict[str, JsonValue] = {
+        "source_type": "SEC_EDGAR",
+        "document_id": "doc-1",
+        "ticker": "AAPL",
+        "source_provider": "SEC_EDGAR",
+    }
+    producer_result = ProducerFinancialStatementResult(
+        statement_type="income",
+        periods=[],
+        rows=[],
+        currency=None,
+        units=None,
+        scale=None,
+        data_quality="partial",
+        reason="statement_not_found",
+    )
+
+    financial_result: PublicFinancialStatementResult = project_financial_statement_result(
+        ticker="AAPL",
+        document_id="doc-1",
+        citation=citation,
+        producer_result=producer_result,
+    )
+
+    assert financial_result["citation"] == citation
+    assert financial_result["citation"] is not citation
+    assert "reason" in financial_result
+    assert financial_result["reason"] == "statement_not_found"
+    assert set(financial_result) == {
+        "ticker",
+        "document_id",
+        "citation",
+        "statement_type",
+        "periods",
+        "rows",
+        "currency",
+        "units",
+        "scale",
+        "data_quality",
+        "reason",
+    }
+
+    query_params = XbrlQueryParams(concepts=["Revenue"], min_value=1)
+    returned_facts: list[dict[str, JsonValue]] = [
+        {"concept": "Revenue", "numeric_value": 100.0}
+    ]
+    xbrl_result: PublicXbrlQueryResult = project_xbrl_query_result(
+        ticker="AAPL",
+        document_id="doc-1",
+        citation=citation,
+        query_params=query_params,
+        returned_facts=returned_facts,
+        data_quality="partial",
+        optional_reason="query_partially_failed",
+    )
+
+    assert xbrl_result["citation"] == citation
+    assert xbrl_result["citation"] is not citation
+    assert xbrl_result["query_params"] == query_params
+    assert xbrl_result["query_params"] is not query_params
+    assert xbrl_result["facts"] == returned_facts
+    assert xbrl_result["facts"] is not returned_facts
+    assert xbrl_result["facts"][0] is not returned_facts[0]
+    assert xbrl_result["fact_count"] == len(xbrl_result["facts"])
+    assert "reason" in xbrl_result
+    assert xbrl_result["reason"] == "query_partially_failed"
+
+
+def test_public_projection_ast_has_new_types_and_single_count_assignment() -> None:
+    """公共投影 AST 必须只暴露新类型并保持唯一计数赋值 owner。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 旧类型、弱签名或第二个计数赋值 owner 出现时抛出。
+    """
+
+    result_types_path = Path("dayu/fins/tools/result_types.py")
+    result_types_tree = _parse_module(result_types_path)
+    class_names = {
+        node.name for node in result_types_tree.body if isinstance(node, ast.ClassDef)
+    }
+    assert "PublicFinancialStatementResult" in class_names
+    assert "PublicXbrlQueryResult" in class_names
+    assert "FinancialStatementResult" not in class_names
+    assert "XbrlQueryResult" not in class_names
+
+    builder_names = {
+        "project_financial_statement_result",
+        "project_xbrl_query_result",
+    }
+    builders = [
+        node
+        for node in result_types_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in builder_names
+    ]
+    assert {builder.name for builder in builders} == builder_names
+    for builder in builders:
+        annotations = [
+            _annotation_text(argument.annotation)
+            for argument in builder.args.kwonlyargs
+        ]
+        assert all("Any" not in annotation for annotation in annotations)
+
+    count_owners = [
+        node
+        for builder in builders
+        for node in ast.walk(builder)
+        if isinstance(node, ast.keyword) and node.arg == "fact_count"
+    ]
+    assert len(count_owners) == 1
+    assert isinstance(count_owners[0].value, ast.Call)
+    assert ast.unparse(count_owners[0].value.func) == "len"
+
+    for path in (
+        Path("dayu/fins/tools/read_runtime_helpers.py"),
+        Path("dayu/fins/tools/read_runtime.py"),
+        Path("dayu/fins/tools/fins_tools.py"),
+    ):
+        tree = _parse_module(path)
+        assert not any(
+            isinstance(node, ast.keyword) and node.arg == "fact_count"
+            for node in ast.walk(tree)
+        )
 
 
 def test_query_xbrl_facts_maps_all_failed_to_typed_business_failure(tmp_path: Path) -> None:
@@ -1086,6 +1479,520 @@ def test_list_documents_uses_two_typed_storage_lists_without_per_document_snapsh
     assert source_repository.snapshot_read_calls == 0
 
 
+def test_list_documents_projects_stable_document_type_and_filter_contract(
+    tmp_path: Path,
+) -> None:
+    """list_documents 公共投影统一拥有文档类型、过滤与无匹配建议语义。
+
+    Args:
+        tmp_path: pytest 临时目录，用于创建真实 filesystem repositories。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: canonical 类型、normalized filters、过滤结果、建议或 typed failure 漂移时抛出。
+        OSError: 真实 filesystem repository 写入失败时抛出。
+    """
+
+    runtime, source_repository = _build_runtime_with_source_documents(
+        tmp_path,
+        processor_cache_max_entries=4,
+    )
+    batch = source_repository._batching_repository.begin_batch("AAPL")
+    _create_source_document(
+        source_repository=source_repository,
+        blob_repository=source_repository._blob_repository,
+        batch=batch,
+        document_id="material-earnings-call",
+        source_kind=SourceKind.MATERIAL,
+        form_type="EARNINGS_CALLS",
+    )
+    source_repository._batching_repository.commit_batch(batch)
+
+    unfiltered_result = runtime.list_documents(ticker="AAPL")
+    document_types_by_id = {
+        document["document_id"]: document["document_type"]
+        for document in unfiltered_result["documents"]
+    }
+    assert document_types_by_id == {
+        "doc-1": "annual_report",
+        "doc-2": "annual_report",
+        "doc-3": "annual_report",
+        "material-earnings-call": "earnings_call",
+    }
+
+    filtered_result = runtime.list_documents(
+        ticker="AAPL",
+        document_types=[
+            " earnings_call ",
+            "earnings_call",
+            "unknown_document_type",
+        ],
+        fiscal_periods=["FY"],
+    )
+    assert filtered_result["filters"] == {
+        "document_types": ["earnings_call"],
+        "fiscal_years": None,
+        "fiscal_periods": ["FY"],
+    }
+    assert {
+        document["document_id"]: document["document_type"]
+        for document in filtered_result["documents"]
+    } == {"material-earnings-call": "earnings_call"}
+    assert filtered_result["matched"] == 1
+    assert filtered_result["match_status"] == "ok"
+    assert "suggestion" not in filtered_result
+
+    no_match_result = runtime.list_documents(
+        ticker="AAPL",
+        document_types=["proxy"],
+        fiscal_periods=["FY"],
+    )
+    assert no_match_result["documents"] == []
+    assert no_match_result["matched"] == 0
+    assert no_match_result["match_status"] == "no_match"
+    assert "suggestion" in no_match_result
+    assert no_match_result["suggestion"] == {
+        "action": "broaden_filter",
+        "available_document_types": ["annual_report", "earnings_call"],
+        "reason": "no_documents_matched_document_types",
+    }
+
+    with pytest.raises(FinsReadArgumentError) as error_info:
+        runtime.list_documents(ticker="   ")
+    assert error_info.value.tool_name == "list_documents"
+    assert error_info.value.arg_name == "ticker"
+
+
+def test_read_section_projects_minimal_navigation_payload_and_rejects_unknown_ref(
+    tmp_path: Path,
+) -> None:
+    """read_section 公共 owner 投影最小导航载荷并转换未知 ref failure。
+
+    Args:
+        tmp_path: pytest 临时目录，用于创建真实 filesystem repositories。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: children、page range、identity、citation 或 public typed failure 漂移时抛出。
+        OSError: 真实 filesystem repository 读取或写入失败时抛出。
+    """
+
+    processor = _SectionPayloadProcessor(_FakeSource())
+    runtime, _source_repository = _build_runtime_with_source_documents(
+        tmp_path,
+        processor_cache_max_entries=4,
+        processor_registry=_FixedProcessorRegistry(processor),
+    )
+
+    result = runtime.read_section(
+        ticker="AAPL",
+        document_id="doc-1",
+        ref="section-1",
+    )
+
+    assert set(result) == {
+        "ticker",
+        "document_id",
+        "ref",
+        "title",
+        "item",
+        "topic",
+        "content",
+        "children",
+        "page_range",
+        "content_word_count",
+        "citation",
+    }
+    assert result["ticker"] == "AAPL"
+    assert result["document_id"] == "doc-1"
+    assert result["ref"] == "section-1"
+    assert result["title"] == "Item 1. Business"
+    assert result["content"] == "Revenue grew while operating costs remained controlled."
+    assert result["children"] == [
+        {"ref": "child-valid", "title": "Valid Child"},
+        {"ref": "child-without-title", "title": None},
+    ]
+    assert result["page_range"] == [3, 5]
+    assert result["content_word_count"] == 7
+    assert result["citation"]["ticker"] == "AAPL"
+    assert result["citation"]["document_id"] == "doc-1"
+    assert result["citation"]["source_type"] == "SEC_EDGAR"
+    assert result["citation"]["source_provider"] == "SEC_EDGAR"
+
+    with pytest.raises(FinsReadArgumentError) as error_info:
+        runtime.read_section(
+            ticker="AAPL",
+            document_id="doc-1",
+            ref="missing-section",
+        )
+    assert error_info.value.tool_name == "read_section"
+    assert error_info.value.arg_name == "ref"
+    assert error_info.value.arg_value == "missing-section"
+
+
+def test_get_table_projects_self_describing_data_shapes_and_rejects_unknown_ref(
+    tmp_path: Path,
+) -> None:
+    """get_table 公共 owner 投影三类自描述数据并转换未知 table_ref failure。
+
+    Args:
+        tmp_path: pytest 临时目录，用于创建真实 filesystem repositories。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: data shape、table identity、citation 或 public typed failure 漂移时抛出。
+        OSError: 真实 filesystem repository 读取或写入失败时抛出。
+    """
+
+    processor = _TablePayloadProcessor(_FakeSource())
+    runtime, _source_repository = _build_runtime_with_source_documents(
+        tmp_path,
+        processor_cache_max_entries=4,
+        processor_registry=_FixedProcessorRegistry(processor),
+    )
+
+    records_result = runtime.get_table(
+        ticker="AAPL",
+        document_id="doc-1",
+        table_ref="records-table",
+    )
+    markdown_result = runtime.get_table(
+        ticker="AAPL",
+        document_id="doc-1",
+        table_ref="markdown-table",
+    )
+    text_result = runtime.get_table(
+        ticker="AAPL",
+        document_id="doc-1",
+        table_ref="text-table",
+    )
+
+    assert records_result["data"] == {
+        "kind": "records",
+        "description": "Structured table data; rows are row-level objects, columns define column order.",
+        "columns": ["Quarter", "Revenue"],
+        "rows": [{"Quarter": "Q1", "Revenue": 100}],
+    }
+    assert records_result["row_count"] == 1
+    assert records_result["col_count"] == 2
+    assert records_result["is_financial"] is True
+    assert records_result["table_type"] == "financial"
+    assert "caption" in records_result
+    assert records_result["caption"] == "Revenue by quarter"
+    assert "page_no" in records_result
+    assert records_result["page_no"] == 7
+
+    assert markdown_result["data"] == {
+        "kind": "markdown",
+        "description": "Markdown table text, ready to render.",
+        "markdown": "| Metric | Value |\n| --- | ---: |\n| Revenue | 100 |",
+    }
+    assert markdown_result["table_type"] == "data"
+
+    assert text_result["data"] == {
+        "kind": "raw_text",
+        "description": "Raw text content; does not meet standard Markdown table structure.",
+        "text": "Revenue was 100 in the reported period.",
+    }
+    assert text_result["table_type"] is None
+
+    results_by_ref = {
+        result["table_ref"]: result
+        for result in (records_result, markdown_result, text_result)
+    }
+    assert set(results_by_ref) == {
+        "records-table",
+        "markdown-table",
+        "text-table",
+    }
+    for table_ref, result in results_by_ref.items():
+        assert result["ticker"] == "AAPL"
+        assert result["document_id"] == "doc-1"
+        assert result["table_ref"] == table_ref
+        assert result["citation"]["ticker"] == "AAPL"
+        assert result["citation"]["document_id"] == "doc-1"
+        assert result["citation"]["source_type"] == "SEC_EDGAR"
+        assert result["citation"]["source_provider"] == "SEC_EDGAR"
+
+    with pytest.raises(FinsReadArgumentError) as error_info:
+        runtime.get_table(
+            ticker="AAPL",
+            document_id="doc-1",
+            table_ref="missing-table",
+        )
+    assert error_info.value.tool_name == "get_table"
+    assert error_info.value.arg_name == "table_ref"
+    assert error_info.value.arg_value == "missing-table"
+
+
+def test_query_xbrl_facts_selects_default_concepts_from_typed_taxonomy(
+    tmp_path: Path,
+) -> None:
+    """query_xbrl_facts 公共 owner 按 form/taxonomy 选择默认 concepts 并保留 typed failure。
+
+    Args:
+        tmp_path: pytest 临时目录，用于创建相互独立的真实 filesystem repositories。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 默认 concept 选择、public query_params 或 typed business failure 漂移时抛出。
+        OSError: 真实 filesystem repository 读取或写入失败时抛出。
+    """
+
+    us_gaap_processor = _DefaultConceptsXbrlProcessor(
+        _FakeSource(),
+        taxonomy="US-GAAP 2024",
+    )
+    us_gaap_runtime, _us_gaap_source_repository = _build_runtime_with_source_documents(
+        tmp_path / "us-gaap",
+        processor_cache_max_entries=4,
+        processor_registry=_FixedProcessorRegistry(us_gaap_processor),
+    )
+
+    us_gaap_result = us_gaap_runtime.query_xbrl_facts(
+        ticker="AAPL",
+        document_id="doc-1",
+    )
+    assert _is_xbrl_query_result(us_gaap_result)
+    expected_annual_us_gaap_concepts = [
+        "Revenues",
+        "NetIncomeLoss",
+        "Assets",
+        "Liabilities",
+        "StockholdersEquity",
+        "NetCashProvidedByUsedInOperatingActivities",
+    ]
+    assert us_gaap_result["query_params"] == {
+        "concepts": expected_annual_us_gaap_concepts,
+    }
+    assert us_gaap_result["facts"][0]["concept"] == expected_annual_us_gaap_concepts[0]
+    assert us_gaap_result["fact_count"] == 1
+
+    unknown_taxonomy_processor = _DefaultConceptsXbrlProcessor(
+        _FakeSource(),
+        taxonomy="custom-financial-taxonomy",
+    )
+    unknown_taxonomy_runtime, _unknown_source_repository = _build_runtime_with_source_documents(
+        tmp_path / "unknown-taxonomy",
+        processor_cache_max_entries=4,
+        processor_registry=_FixedProcessorRegistry(unknown_taxonomy_processor),
+    )
+
+    unknown_taxonomy_result = unknown_taxonomy_runtime.query_xbrl_facts(
+        ticker="AAPL",
+        document_id="doc-1",
+    )
+    assert _is_xbrl_query_result(unknown_taxonomy_result)
+    expected_global_concepts = ["Revenues", "NetIncomeLoss", "Assets"]
+    assert unknown_taxonomy_result["query_params"] == {
+        "concepts": expected_global_concepts,
+    }
+    assert unknown_taxonomy_result["facts"][0]["concept"] == expected_global_concepts[0]
+    assert unknown_taxonomy_result["fact_count"] == 1
+
+    failing_processor = _DefaultConceptsXbrlProcessor(
+        _FakeSource(),
+        taxonomy="custom-financial-taxonomy",
+        fail_query=True,
+    )
+    failing_runtime, _failing_source_repository = _build_runtime_with_source_documents(
+        tmp_path / "failing-taxonomy-query",
+        processor_cache_max_entries=4,
+        processor_registry=_FixedProcessorRegistry(failing_processor),
+    )
+
+    with pytest.raises(FinsReadBusinessError) as error_info:
+        failing_runtime.query_xbrl_facts(
+            ticker="AAPL",
+            document_id="doc-1",
+        )
+    assert error_info.value.code == "xbrl_query_failed"
+    assert isinstance(error_info.value.__cause__, XbrlQueryExecutionError)
+    assert error_info.value.__cause__.failed_concepts == tuple(expected_global_concepts)
+
+
+def test_search_next_section_projection_ranks_business_evidence_per_query() -> None:
+    """search next-step owner 只按稳定业务 evidence 投影单/多查询下一章节。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 排名、按查询映射、业务字段清洗或 malformed input 处理漂移时抛出。
+    """
+
+    matches = [
+        {
+            "section": {
+                "ref": " risk-section ",
+                "title": " Risk Factors ",
+                "item": " Item 1A ",
+                "topic": " risk_factors ",
+            },
+            "matched_query": "risk",
+            "is_exact_phrase": True,
+        },
+        {
+            "section": {
+                "ref": "risk-section",
+                "title": "Risk Factors",
+                "item": "Item 1A",
+                "topic": "risk_factors",
+            },
+            "matched_query": "risk",
+            "is_exact_phrase": False,
+        },
+        {
+            "section": {
+                "ref": "liquidity-section",
+                "title": "Liquidity",
+                "item": "Item 7",
+                "topic": "liquidity",
+            },
+            "matched_query": "risk",
+            "is_exact_phrase": False,
+        },
+        {
+            "section": {
+                "ref": "business-section",
+                "title": "Business",
+                "item": "Item 1",
+                "topic": "business",
+            },
+            "matched_query": "revenue",
+            "is_exact_phrase": False,
+        },
+        {
+            "section": {
+                "ref": "business-section",
+                "title": "Business",
+                "item": "Item 1",
+                "topic": "business",
+            },
+            "matched_query": "revenue",
+            "is_exact_phrase": True,
+        },
+        {
+            "section": {
+                "ref": "risk-section",
+                "title": "Risk Factors",
+                "item": "Item 1A",
+                "topic": "risk_factors",
+            },
+            "matched_query": "revenue",
+            "is_exact_phrase": False,
+        },
+        {
+            "section": {"ref": "   ", "title": "Invalid blank ref"},
+            "matched_query": "risk",
+            "is_exact_phrase": True,
+        },
+        {
+            "section": {"title": "Missing ref"},
+            "matched_query": "revenue",
+            "is_exact_phrase": True,
+        },
+        {
+            "matched_query": "risk",
+            "is_exact_phrase": True,
+        },
+    ]
+
+    next_section, next_section_by_query = build_search_next_section_fields(
+        matches=matches,
+    )
+    assert next_section == {
+        "section": {
+            "ref": "risk-section",
+            "title": "Risk Factors",
+            "item": "Item 1A",
+            "topic": "risk_factors",
+        },
+        "evidence_hit_count": 3,
+    }
+    assert next_section_by_query is None
+
+    reversed_next_section, reversed_by_query = build_search_next_section_fields(
+        matches=list(reversed(matches)),
+    )
+    assert reversed_next_section == next_section
+    assert reversed_by_query is None
+
+    multi_next_section, multi_by_query = build_search_next_section_fields(
+        matches=matches,
+        queries=["risk", "revenue", "no evidence", "   "],
+    )
+    assert multi_next_section is None
+    assert multi_by_query == {
+        "risk": {
+            "section": {
+                "ref": "risk-section",
+                "title": "Risk Factors",
+                "item": "Item 1A",
+                "topic": "risk_factors",
+            },
+            "evidence_hit_count": 2,
+        },
+        "revenue": {
+            "section": {
+                "ref": "business-section",
+                "title": "Business",
+                "item": "Item 1",
+                "topic": "business",
+            },
+            "evidence_hit_count": 2,
+        },
+        "no evidence": None,
+    }
+
+
+def test_document_type_resolver_projects_material_other_and_cn_categories() -> None:
+    """文档类型 public owner 投影材料、其它 filing 与中国财期分类。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任一文档类型业务分类漂移时抛出。
+    """
+
+    assert (
+        resolve_document_type_for_source(
+            form_type="UNLISTED_MATERIAL",
+            source_kind=SourceKind.MATERIAL.value,
+        )
+        == "material"
+    )
+    assert (
+        resolve_document_type_for_source(
+            form_type=None,
+            source_kind=SourceKind.FILING.value,
+        )
+        == "other"
+    )
+    assert (
+        resolve_document_type_for_source(
+            form_type="FY",
+            source_kind=SourceKind.FILING.value,
+        )
+        == "annual_report"
+    )
+
+
 def test_fins_import_boundary_keeps_host_exception_narrow() -> None:
     """Fins import boundary 只允许 wait adapter 依赖 Host wait contract。
 
@@ -1229,8 +2136,8 @@ def _create_source_document(
 
 
 def _is_financial_statement_result(
-    result: FinancialStatementResult | NotSupportedResult,
-) -> TypeGuard[FinancialStatementResult]:
+    result: PublicFinancialStatementResult | NotSupportedResult,
+) -> TypeGuard[PublicFinancialStatementResult]:
     """判断结果是否为财务报表成功载荷。
 
     Args:
@@ -1244,6 +2151,24 @@ def _is_financial_statement_result(
     """
 
     return "rows" in result
+
+
+def _is_xbrl_query_result(
+    result: PublicXbrlQueryResult | NotSupportedResult,
+) -> TypeGuard[PublicXbrlQueryResult]:
+    """判断结果是否为 XBRL 查询成功载荷。
+
+    Args:
+        result: read runtime 返回结果。
+
+    Returns:
+        包含 facts 业务字段时返回 ``True``。
+
+    Raises:
+        无。
+    """
+
+    return "facts" in result
 
 
 def _parse_module(path: Path) -> ast.Module:
