@@ -1,17 +1,23 @@
 # WU-SEMANTIC-OWNERSHIP-01 / R11 upload script 与 placeholder surface remediation 独立实施计划
 
-## 1. Gate、第一性原理结论与停点
+## 1. Plan artifact identity、第一性原理结论与授权边界
 
 - umbrella：既有 `WU-SEMANTIC-OWNERSHIP-01` overdesign remediation continuation。
 - 内部 remediation：`R11 — OLD-aligned upload shell/cmd workflow 与 placeholder surface 删除`。
-- 当前 gate：R11 独立 plan-only accepted-finding fix gate；不是新 WU、issue 或 feature，不创建替代 WU，不进入 R12。
-- baseline：branch `phaseflow/host-issues-control`，HEAD
-  `2b14b2fbc89654267e3d33daa2ae410ceff45e68`，staged tree 为空。
-- 并行所有权：`docs/host/issues-implementation-control.md` 是 Controller-owned 有意 dirty 文件；本计划及后续
-  implementation/review Agent 均不得修改、覆盖、stage 或提交它。
-- 当前授权只允许修复本 plan artifact 并新增对应 plan-fix evidence；本计划本身不授权代码、测试、README、design、CI、
-  commit、push、PR 或 R12。
-- 本 gate 完成后停在 `READY_FOR_CONTROLLER_PLAN_FIX_VALIDATION`。
+- artifact identity：本文件是既有 R11 accepted-plan amendment artifact；不是新 WU、issue 或 feature，不创建替代 WU，
+  不进入 R12。实时 gate truth 只由 `docs/host/issues-implementation-control.md` 拥有，本计划不声明或镜像当前 gate。
+- accepted-plan commit：`f7b452f992b4797b32fea7c6f7212b5ec4345ec1`；R11 product diff 的既有 R10 completion
+  baseline 仍为 `2b14b2fbc89654267e3d33daa2ae410ceff45e68`。branch 为
+  `phaseflow/host-issues-control`，staged tree 必须保持为空。
+- 并行所有权：`docs/host/issues-implementation-control.md`、S1 authorization/stop/adjudication artifacts 是
+  Controller-owned 或有意 dirty/untracked 文件；本计划及后续 implementation/review Agent 均不得修改、覆盖、删除、stage
+  或提交它们。
+- write authorization：本计划不自行授权任何 write；执行 Agent 只消费 Controller 当次 exact authorization/adjudication
+  明确给出的 write scope。本计划中的 implementation allowlist 仅约束另行获授权后的实施边界，不构成当前或未来写授权。
+- `R11-IMP-BF01` 的 owner 是本计划的 producer-consumer cutover boundary：原 Fins producer 与原 CLI
+  consumer/renderer 必须合并为一个 atomic implementation slice；原 packaging slice 成为第二 slice，产品范围不变。
+- implementation authorization boundary：accepted-plan amendment commit 与 separate Controller implementation authorization
+  是进入 implementation 前必须同时满足的条件；在两者完成前，implementation 未授权。
 
 动机成立且严重性评估准确。直接 owner-side 证据不是“README 不一致”，而是：
 
@@ -37,10 +43,11 @@ fixture 或 Service 下游补 OLD 规则，也不得让 Fins 拼 executable/flag
 1. `AGENTS.md` 的语义所有权、分层、类型、测试、README 与安全约束；
 2. `docs/fins/design.md` §10 与 `docs/ui/design.md` §1—2；
 3. Controller discussion Topic 7 final adjudication；
-4. umbrella remediation plan §7、§18、§20—22；
+4. `docs/host/wu-semantic-ownership-01-overdesign-remediation-plan.md` §7、§18、§20—22；
 5. `docs/phaseflow-umbrella-optimization-control.md` 与当前 Controller control truth；
 6. 当前 CURRENT production code/tests/READMEs；
-7. 两个指定 OLD 文件只作为用户工作流与分类规则证据。
+7. 两个指定 OLD 文件 `/Users/leo/workspace/dayu-agent/dayu/fins/cli_support.py` 与
+   `/Users/leo/workspace/dayu-agent/dayu/fins/upload_recognition.py` 只作为用户工作流与分类规则证据。
 
 已裁决产品问题不重开。OLD 不拥有当前架构、API、类型或兼容需求；不得复制其 dict/`Any`、CLI/IO 混层、
 `subprocess.list2cmdline`、非原子写或其它历史实现。
@@ -54,16 +61,16 @@ fixture 或 Service 下游补 OLD 规则，也不得让 Fins 拼 executable/flag
 | umbrella optimization control | 302 | `6d924e919a4ba797e6213879aadca7bdd4f47a37418630e1ee43cb1995e461db` |
 | Controller discussion | 731 | `cd26760d626415c52caa13a724144b4d98f2a2b2fc159772e6d807833c01533a` |
 | Host / Engine / Tool / Fins / UI design | 3696 / 553 / 134 / 123 / 111 | `276d35e1...43e9` / `f2091260...f31` / `ddc6efc0...ea7c` / `97033cf1...7abdd` / `5a19c829...ed973` |
-| umbrella remediation plan | 1269 | `30c27562ece3360c7d25e55a6f2b0b189999d35cca8004e83d42de3c8ccda838` |
+| `docs/host/wu-semantic-ownership-01-overdesign-remediation-plan.md` | 1269 | `30c27562ece3360c7d25e55a6f2b0b189999d35cca8004e83d42de3c8ccda838` |
 | CURRENT `dayu/fins/upload_batch.py` | 376 | `6767d30cfd788e584cef22e5109b1ae0b787ecaedc8581a4cfcf2c49d5ad6178` |
 | CURRENT `dayu/cli/commands/fins.py` | 1057 | `0db8ff2dedf541c2b58bc11342a02cd0bf4098bc9fcc19d948efa5cf4afc95a6` |
 | CURRENT `dayu/cli/arg_parsing.py` | 932 | `a0e25ad6c58f3f266ef1afc4447c4a7e875d18c23ad346550ccf8cfd283c1c2c` |
-| CURRENT FMP resolver | 394 | `c2abfbe03227d8b98ea639c374cb7aa9c41c98214b0b004cfb7de492be7c46fa` |
+| CURRENT `dayu/fins/resolver/fmp_company_info.py` | 394 | `c2abfbe03227d8b98ea639c374cb7aa9c41c98214b0b004cfb7de492be7c46fa` |
 | CURRENT `pyproject.toml` | 152 | `e076606fd68ab911291be92cdba1bda9df05835baf8db7f81b1d33d517ce6a25` |
-| root / `dayu/` / Fins / tests README | 348 / 111 / 793 / 293 | `2f5cebfd...a6e6a` / `1534bcfd...d9a74` / `a4805995...9767` / `15bb09f8...1fba9` |
-| CURRENT `requirements.txt` | 12 | `7e8c14d6...79c93` |
-| OLD `dayu/fins/cli_support.py` | 2267 | `248cc859d4dd0fdf8ed7829cc27dad48349227dfbd43f076414770166c93da45` |
-| OLD `dayu/fins/upload_recognition.py` | 555 | `5a45618b2545ad0ee024efb428de7e614c96b2c5bb0a222bf1586febc1dff816` |
+| root / `dayu/` / Fins / tests README | 348 / 265 / 793 / 293 | `2f5cebfd...a6e6a` / `16bbdc87da05f68ad7787086cf5e4646e011a8e8304991cb360916487fa85367` / `a4805995...9767` / `15bb09f8...1fba9` |
+| CURRENT `requirements.txt` | 12 | `d15176134f7e1cf651b77175450dba526a5e82ff7c7f60cf15356c1532215d3a` |
+| OLD `/Users/leo/workspace/dayu-agent/dayu/fins/cli_support.py` | 2267 | `248cc859d4dd0fdf8ed7829cc27dad48349227dfbd43f076414770166c93da45` |
+| OLD `/Users/leo/workspace/dayu-agent/dayu/fins/upload_recognition.py` | 555 | `5a45618b2545ad0ee024efb428de7e614c96b2c5bb0a222bf1586febc1dff816` |
 
 进入 implementation 前，Controller 必须以 accepted-plan commit 的 parent 重新锁定所有 production/test/README/CI
 输入。Controller-owned control 文件可因 gate transition 合法变化；任一 production contract、owner、allowlist 或依赖
@@ -87,15 +94,14 @@ fixture 或 Service 下游补 OLD 规则，也不得让 Fins 拼 executable/flag
 
 | Umbrella mandatory baseline | 本计划 disposition | 直接证据与 exact replacement/refinement |
 |---|---|---|
-| R11-S1 Fins typed classification owner | 保留 | CURRENT `upload_batch.py` 仍只有 generic `entries`/path-only skips；§5 固定 OLD 分类、同期优先级、caps 与三分 typed plan。 |
-| R11-S2 CLI/script contract 与 POSIX/Windows real smoke | 基于直接代码证据细化 | CURRENT CLI 仍输出 JSON v1；§6 固定 current grammar、唯一 renderer/publisher、真实 `/bin/sh` recorder 与真实 CLI/temp-storage node；§7 固定唯一 Windows workflow、真实 `cmd.exe` 两个 release-blocking node。 |
-| R11-S3 `pyproject.toml`、placeholder packages/tests、根/Fins/tests README | 基于直接代码证据细化 | `requirements.txt:3,7,9,12` 仍消费 `[web]` 并宣称 Streamlit/dayu-web；`dayu/README.md:72` 仍把三 placeholder 写成稳定边界；`pyproject.toml:74-78,130-137` 还有 web extra/comment 与 `dayu.render` package-data。它们是删除 public/package surface 的直接传播点，故加入 closed allowlist；这不是新产品范围。 |
+| R11-I1 atomic Fins producer + CLI consumer/renderer cutover | 合并原 producer/consumer slices，不改 owner 或产品裁决 | CURRENT `upload_batch.py` 仍只有 generic `entries`/path-only skips，而 CURRENT CLI 同时静态 import/消费该 generic surface；§5/§6 固定同一 atomic slice 的 WP-A/WP-B、OLD 分类、current grammar、唯一 renderer/publisher、真实 `/bin/sh` recorder 与真实 CLI/temp-storage node。两 work packages 之间无 checkpoint/accept/commit/full validation 或 broken-tree handoff。 |
+| R11-I2 `pyproject.toml`、placeholder packages/tests、根/Fins/tests README | 原 packaging slice 原样后移，不扩 scope | `requirements.txt:3,7,9,12` 仍消费 `[web]` 并宣称 Streamlit/dayu-web；`dayu/README.md:72` 仍把三 placeholder 写成稳定边界；`pyproject.toml:74-78,130-137` 还有 web extra/comment 与 `dayu.render` package-data。它们是删除 public/package surface 的直接传播点，故加入 closed allowlist；§7 仍固定唯一 Windows workflow与真实 `cmd.exe` 两个 release-blocking node。 |
 | constraints/lock 中 Streamlit/watchdog pin | 保留、no-touch | constraints 只限制“若 dependency graph 选择该依赖时的版本”，不会自行安装，也不发布 script/package。删除 `pyproject` web extra 与 `requirements.txt` 的 `[web]` 消费后，wheel `METADATA`/临时安装必须证明无 `Provides-Extra: web`、无 Streamlit requirement；不机械清理历史 pin。若 build/install 证明仍被 graph 消费则 stop，而非扩域改 lock。 |
 | R11 placeholder/source 零残留 scan | 基于直接代码证据细化 | `tests/tools/web/test_web_tools_provider.py` 与 `test_diagnose_web_access.py` 的 `"dayu.web"` 是禁止恢复旧 UI import 的负向 boundary sentinel，必须保留；§8 只扫 public scripts/package files/importable archive/README unavailable claims，并对两个 sentinel 做正向精确断言，不做全仓裸 `dayu.web` 零命中。 |
 | upload JSON 零残留 scan | 基于直接代码证据细化 | 仓库其它 ingestion/storage `schema_version` 合法；§8 仅扫 `_UPLOAD_BATCH_SCHEMA*`、`_render_upload_batch_plan`、相邻 `schema_version/commands/argv` 与 JSON-argv 文案。 |
 | changed production coverage `>=80%` | 保留并纠偏为 line coverage | AGENTS/umbrella §7 要求每个实际 changed production Python file 的普通 line coverage；§8 不使用 `--branch`，逐文件读取 coverage JSON `summary.percent_covered >= 80.00`。 |
 | generic build frontend smoke | 以可执行 wheel 验证替换 | 锁定 `.venv` 缺少额外 build frontend，且 R11 不授权增加 build 依赖；当前 `python -m pip wheel` 可用。§7/§8 使用 `pip wheel --no-deps --no-build-isolation`，直接检查 wheel metadata/archive并做隔离安装 smoke；不虚构未验证的 source archive owner。 |
-| sub-WU slices/review/accepted commit | 保留 umbrella Gateflow | accepted-plan commit 后顺序实施三个 slices，每 slice 只做 Controller checkpoint；S3 后对完整 cumulative diff 做固定双 review/fix/re-review并只创建一个 accepted sub-WU commit，详见 §9，不发明 slice commit 或旁路 review。 |
+| sub-WU slices/review/accepted commit | 依 R11-IMP-BF01 收窄为两个可验证 slices | accepted-plan amendment commit 后顺序实施 `R11-I1 atomic cutover -> R11-I2 packaging`；I1 仅在 WP-A+WP-B 一起 cutover 并完成全部 cumulative validation 后做一次 Controller checkpoint，I2 后再做一次 checkpoint；随后对完整 cumulative diff 做固定双 review/fix/re-review并只创建一个 accepted sub-WU commit，详见 §9，不发明 work-package/slice commit 或旁路 review。 |
 
 ## 3. Goal、success signals 与 forbidden scope
 
@@ -188,14 +194,41 @@ transition 不计入 product allowlist。除此以外任何 tracked diff 都立�
 是只读验证输入，不在修改 allowlist。`test_public_package_entrypoints.py` 还拥有非 placeholder 的 Docling dependency/lock
 测试，必须只删除/改写 placeholder 部分，不能机械删除整个文件。
 
-## 5. Slice 1 — Fins OLD batch classification owner
+两个 implementation slices 对上述 cumulative allowlist 的唯一分配如下；不得以 work package 为由缩窄或扩张 slice
+allowlist：
 
-### 5.1 Exact allowlist、flow 与 contract
+- `R11-I1 atomic cutover` 合并 §5 WP-A 与 §6 WP-B：`dayu/fins/upload_batch.py`、
+  `tests/fins/test_upload_batch.py`、`dayu/cli/commands/fins.py`、`dayu/cli/arg_parsing.py`、新增
+  `dayu/cli/upload_script.py`、`tests/cli/test_upload_filings_from_command.py`、`tests/cli/test_fins_commands.py`、
+  `tests/cli/test_arg_parsing.py`。`tests/fins/test_fmp_company_info_resolver.py` 仍仅为只读验证输入。
+- `R11-I2 packaging` 精确使用 §7 列出的 packaging/CI/deletion/test/README 路径；内容与原 packaging slice 相同，不把
+  producer、consumer、Service/storage/runtime、其它 README 或新产品能力带入该 slice。
 
-本 slice 只允许修改：
+`R11-I1` 的合并只修复 contract cutover sequencing，不改变 semantic owner：Fins 仍唯一产生分类/财期/material/skip
+facts，CLI 仍只消费 typed plan 并拥有 argv/renderer/publisher/summary。严禁为形成中间 tree 保留 old/new dual surface、
+generic alias/property/wrapper、CLI loose parsing/fallback/重算、下游 adapter 或放宽 full pyright。
+
+## 5. Atomic slice R11-I1 / WP-A — Fins OLD batch classification owner
+
+### 5.1 Work-package allowlist、flow 与 contract
+
+本 work package 的 owner 路径是：
 
 - `dayu/fins/upload_batch.py`
 - `tests/fins/test_upload_batch.py`
+
+它与 §6 WP-B 共同使用 §4 的 `R11-I1` merged exact allowlist；本列表不是独立 slice allowlist。WP-A 先定义 Fins typed
+producer contract，WP-B 紧接着完成所有静态/runtime consumer cutover。implementation 必须在 mutation 前完成并记录全部
+material preflight，包括 accepted input/source locks、merged exact allowlist、design/owner/security constraints 与 Ruff version
+oracle。实现 Agent 可在同一 uninterrupted task 内顺序编辑 `R11-I1` 多个文件；这里的 atomic cutover 只定义 gate truth，
+不要求编辑工具提供跨文件事务原子写。
+
+顺序编辑期间可以短暂出现“新 producer + 旧 consumer”等 transient inconsistency，但它不是合法 intermediate tree，也不是
+pass/failure baseline。在 WP-A/WP-B 全部 coordinated edits 完成前，不得运行或宣称 tests、pyright、coverage、Ruff、
+diff/diffcheck/scans validation，不得 checkpoint、acceptance、stage、commit、handoff、review 或 next-slice transition；
+也不得以 compatibility seam 缓解 transient inconsistency。首次 validation 只能在全部 `R11-I1` coordinated edits 完成后运行。
+若编辑期间出现真实 allowlist/source/design/security blocker，必须立即 stop 并按 §5.3/§9.1 报告 failed working evidence；
+不得继续冒险，也不得把这一 safety stop 解释为 checkpoint/pass 许可。
 
 Flow：
 
@@ -237,8 +270,11 @@ UploadBatchPlanRequest
 3. 候选 symlink、resolved escape 或非普通文件不得读取；进入 `skipped` 并给出明确安全原因。unsupported suffix 不进入
    recognized/material；测试固定其可读 skip/ignore contract，不能在 CLI 二次判定。
 4. fiscal year 使用首个 `20YY`；period 依 OLD patterns 支持 `Q1..Q4`、`1Q..4Q`、中文一至四季度、`H1` /
-   half-year/半年/中报/中期报告、`FY`/annual/年度报告/年报。Q4 含“季报”保留 Q4，否则为 FY。先看文件名；
-   文件名不足时只允许从直接 structured parent `20YYQn`/`20YYH1` 补齐，纯年份 parent 不能猜 period。
+   half-year/半年/中报/中期报告、`FY`/annual/年度报告/年报。Q4 marker 只检查 child 完整 filename，不检查
+   ancestor/path；quarterly marker 只认 exact contiguous literal substring `季报`，不把 `季度报告` 当 alias 或宽松
+   pattern；`FY`/annual/年度报告/年报在 Q1—Q4 前判定。先看 child 完整 filename；文件名不足时只允许从直接
+   structured parent `20YYQn`/`20YYH1` 补齐，纯年份 parent 不能猜 period；direct `20YYQ4` parent fallback 仍只检查
+   child filename 的 exact `季报`，命中为 Q4，否则为 FY。
 5. 当前 `upload_filings_from` 已有 explicit `--fiscal-year` / `--fiscal-period` 是用户事实：对应字段有值时逐字段覆盖
    推断值，无值时才用 OLD inference。filing 最终缺 year 或 period 则 skipped；material 可保留可选 fiscal fields。
    不从 mtime、排序、文件内容或 sibling 猜 metadata。
@@ -263,9 +299,12 @@ UploadBatchPlanRequest
 12. recognized/material 均为空时抛现有语义对应的 typed empty error，同时保留 skipped evidence；不得生成空脚本、
     JSON fallback 或把 unsupported 文件伪装成 material。
 
-### 5.3 Tests、real smoke 与 stop conditions
+### 5.3 Post-cutover owner validation、intra-slice correction 与 stop conditions
 
-Focused tests：
+以下 focused owner tests 与 real filesystem smoke 是 `R11-I1` cumulative validation 的 producer 部分，只能在 §5 WP-A 与
+§6 WP-B 的全部 coordinated edits 已完成、tree 不再依赖旧 generic contract 后运行；它们不是 WP-A checkpoint，也不得
+替代 §6.6 与 §8 的 producer+consumer full validation。此前顺序编辑产生的 transient inconsistency 不是合法 intermediate
+tree 或 pass/failure baseline，不能作为这些命令的输入：
 
 ```bash
 source .venv/bin/activate
@@ -273,7 +312,9 @@ pytest tests/fins/test_upload_batch.py -q
 ```
 
 owner tests 必须覆盖：supported/unsupported、non-recursive/explicit recursive/structured auto-recursive、文件名与父目录
-推断、Q4 分流、material routing precedence/name、explicit fiscal precedence、annual=5、periodic=latest-year/max6、
+推断、Q4 分流（至少精确断言 `2024Q4季报.pdf -> Q4`、`2024Q4季度报告.pdf -> FY`、`2024Q4年报.pdf -> FY`、
+`2021Q4/季报.pdf -> Q4`、`2021Q4/季度报告.pdf -> FY`）、material routing precedence/name、explicit fiscal
+precedence、annual=5、periodic=latest-year/max6、
 presentation=6、call=count(filtered reports)、zero recognized filings 时全部 call candidates typed skipped、financial
 statements no cap、同期优先级/tie、stable ordering、每类 skip reason、external-ancestor symlink allowed、source root-self
 symlink rejected、root 内 component/candidate symlink rejected、escape rejected、auto/create/update、
@@ -288,36 +329,47 @@ source .venv/bin/activate
 python -m pytest tests/fins/test_upload_batch.py::test_real_filesystem_builds_typed_old_aligned_plan -q
 ```
 
-S1 checkpoint 必须由 Controller 按以下 S2 consumer mapping checklist 逐字段冻结 producer contract；任何字段、枚举或
-optional 规则不能留给 S2 adapter、renderer 或 fixture 推断：
+`R11-I1` atomic checkpoint 必须由 Controller 按以下 producer-consumer mapping checklist 逐字段冻结 contract；任何字段、
+枚举或 optional 规则不能留给 CLI adapter、renderer 或 fixture 推断：
 
-| S1 typed fact | S2 current command / flag mapping | enum / optional lock |
+| Fins typed fact | CLI current command / flag mapping | enum / optional lock |
 |---|---|---|
 | `UploadBatchFilingEntry` / `UploadBatchMaterialEntry` | 分别固定为 `upload_filing` / `upload_material` | entry type 是唯一 command discriminator；renderer 不再判型 |
 | canonical ticker + aliases tuple | 单一 `--ticker` CSV，canonical 在首位，其后按 tuple 顺序 | aliases 为空时只传 canonical；不得另造 alias flag |
-| `action` | `auto` 省略 `--action`；`create/update` 传对应值 | 只允许 `auto|create|update`；S2 不接受或产生 `delete` |
+| `action` | `auto` 省略 `--action`；`create/update` 传对应值 | 只允许 `auto|create|update`；CLI 不接受或产生 batch `delete` |
 | 单一 `file` | `--files <path>` | 每 entry 精确一个 path；不得合并、重扫或重排 |
-| `fiscal_year` / `fiscal_period` | 非 `None` 时分别传 `--fiscal-year` / `--fiscal-period` | `fiscal_period` 由 S1 归一为 `FY|H1|Q1|Q2|Q3|Q4`；filing checkpoint 必须二者都有值；material 可独立为 `None`，无值不传 |
+| `fiscal_year` / `fiscal_period` | 非 `None` 时分别传 `--fiscal-year` / `--fiscal-period` | `fiscal_period` 由 Fins 归一为 `FY|H1|Q1|Q2|Q3|Q4`；filing atomic checkpoint 必须二者都有值；material 可独立为 `None`，无值不传 |
 | `amended` | `True` 时传 `--amended` | `False` 时不传，不生成字符串默认值 |
-| `filing_date` / `report_date` / `company_name` | 非 `None` 时分别传 `--filing-date` / `--report-date` / `--company-name` | 无值不传；不得由 S2 再推断 |
+| `filing_date` / `report_date` / `company_name` | 非 `None` 时分别传 `--filing-date` / `--report-date` / `--company-name` | 无值不传；不得由 CLI 再推断 |
 | `overwrite` | `True` 时传 direct command 的 `--overwrite` | `False` 时不传；只表示 storage overwrite，不影响 publisher |
-| material `form_type` / `material_name` | 分别传单值 `--forms` / `--material-name` | `form_type` 由 S1 归一为 `FINANCIAL_STATEMENTS|EARNINGS_CALL|EARNINGS_PRESENTATION`；二者只属于 material |
+| material `form_type` / `material_name` | 分别传单值 `--forms` / `--material-name` | `form_type` 由 Fins 归一为 `FINANCIAL_STATEMENTS|EARNINGS_CALL|EARNINGS_PRESENTATION`；二者只属于 material |
 | filing/material 不拥有的 fields | 不产生对应 flag | filing 不带 material fields；batch material 不臆造 `--document-id` / `--internal-document-id` |
-| skipped `path` / reason code / readable reason | 只进入 human summary，不生成 argv | 三项均由 S1 owner 产生；S2 不重算 display fact 或 reason |
+| skipped `path` / reason code / readable reason | 只进入 human summary，不生成 argv | 三项均由 Fins owner 产生；CLI 不重算 display fact 或 reason |
 
-若 checklist 暴露 typed fact 缺失、enum 与 current grammar 不一致，或 optional ownership 仍需消费者猜测，S1 checkpoint
-不得通过。若同类 gap 在 S2 开始后才由首个真实 consumer 暴露，则按 §9.1 的唯一回返路径处理，禁止 S2 补偿。
+若 WP-B 首个真实 consumer 暴露 typed fact 缺失、enum 与 current grammar 不一致，或 optional ownership 仍需消费者猜测，
+不得 checkpoint、不得在 CLI 补偿，也不得退出 atomic slice 回到一个虚构的 producer-only state。按 §9.1 在同一
+`R11-I1` 内对 `dayu/fins/upload_batch.py` 与 `tests/fins/test_upload_batch.py` 做 Fins owner targeted correction，再重跑
+producer+consumer 全部 cumulative contract/tests/scans/smoke/full validation；不得扩大 allowlist、建立兼容 seam或创建新
+sub-WU/slice/commit。
 
-Slice stop：任何 OLD rule 不能映射为当前 typed upload fact、current suffix owner 与实际 runtime 冲突、需要 Service/
-storage/CLI classifier 才能完成、source containment 无法在 Fins boundary 保证，或 slice diff 越出两路径时立即 stop。
-S1 通过 Controller exact allowlist/contract/test/smoke checkpoint 后才进入 S2；不做 slice acceptance 或中间
-implementation commit。
+所有 material preflight 必须在 mutation 前完成。Atomic slice stop：任何 OLD rule 不能映射为当前 typed upload fact、current
+suffix owner 与实际 runtime 冲突、需要 Service/storage/CLI classifier 才能完成、source containment 无法在 Fins boundary
+保证，或 Fins owner targeted correction 越出上述两个 owner 路径时立即 stop；`R11-I1` 的合法 CLI 路径由 §4/§6 另行列明。
+任何需要 §4 `R11-I1` allowlist 外 product/test 路径的事实同样 stop 并交 Controller 裁决。
 
-## 6. Slice 2 — Current CLI grammar、FMP 与 shell/cmd renderer
+若上述真实 allowlist/source/design/security blocker 在顺序编辑期间才出现，Agent 必须停止 mutation，保留并报告当前 diff
+作为 failed working evidence；不得继续冒险，不得宣称 pass/checkpoint，不得自行 rollback，也不得扩大 scope。该 safety stop
+不把 transient inconsistency 变成合法 intermediate tree 或 failure baseline，也不创建 acceptance、handoff、review、commit
+或 next-slice transition。没有 blocker 时，WP-A/WP-B 全部 coordinated edits 完成前同样不得运行或宣称 tests、pyright、
+coverage、Ruff、diff/diffcheck/scans validation。首次 validation 只在全部 edits 完成后运行；只有上述 correction loop 收敛
+并对 producer+consumer 完成 combined revalidation，且 §5.3、§6.6、§8 的合并 gate（包括 full pyright `0 errors` 与其它既有
+产品/security/deferred/Windows/Ruff gates）全部通过后，Controller 才可做一次 `R11-I1` atomic checkpoint。
 
-### 6.1 Exact allowlist 与 input/output contract
+## 6. Atomic slice R11-I1 / WP-B — Current CLI grammar、FMP 与 shell/cmd renderer
 
-本 slice 只允许修改/新增：
+### 6.1 Work-package allowlist 与 input/output contract
+
+本 work package 的 owner 路径是：
 
 - `dayu/cli/commands/fins.py`
 - `dayu/cli/arg_parsing.py`
@@ -325,6 +377,10 @@ implementation commit。
 - `tests/cli/test_upload_filings_from_command.py`
 - `tests/cli/test_fins_commands.py`
 - `tests/cli/test_arg_parsing.py`
+
+它与 §5 WP-A 共同使用 §4 的 `R11-I1` merged exact allowlist；本列表不是第二个 slice，也不允许在开始 WP-B 前形成
+producer-only checkpoint。WP-B 必须删除所有旧 generic consumer surface并直接消费 Fins typed contract；不得 dual-read
+old/new plan、保留旧 import/field/property、使用 `hasattr/getattr`/loose parsing，或在 renderer/fixture 重算 owner fact。
 
 Flow：
 
@@ -361,10 +417,10 @@ ParsedCliArgs
    显式 `--company-name` 非空时优先，否则使用 resolver company name。resolver canonical 与请求 canonical 不一致是
    typed generation failure，不静默改 ticker。provider failure 无 fallback；用户消息不得输出 API key、含 key URL、
    raw response 或 exception cause repr。
-6. source command 当前 explicit fiscal/amended/dates/company/material/overwrite 字段精确进入 S1 request。为完成 current
+6. source command 当前 explicit fiscal/amended/dates/company/material/overwrite 字段精确进入 Fins WP-A request。为完成 current
    metadata 传播，`upload_filings_from` grammar 必须显式加入 `--overwrite`，精确为 `action="store_true"`、
    `default=False`；help 必须自解释为“允许每条生成的上传命令覆盖已有存储文档；不控制脚本文件替换”。它只传播到
-   S1 request/entry 并投影为每条 direct upload 的 storage overwrite fact，不控制 publisher existing-target replacement，
+   Fins request/entry 并投影为每条 direct upload 的 storage overwrite fact，不控制 publisher existing-target replacement，
    也不新增 `--force-output`。保留既有 fiscal/year、amended、dates、company 与 `--material-forms`，不新增 runtime 不拥有
    的字段。
 7. 单一 argv builder 以 `("python", "-m", "dayu.cli", command, ...)` 开头，`command` 只能是 `upload_filing` 或
@@ -421,14 +477,17 @@ typed argv
   `replace`；不得使用 `subprocess.list2cmdline` 作为 batch owner、安全证明或 fallback。
 
 script 固定以 `@echo off`、`chcp 65001 >nul`、`setlocal DisableDelayedExpansion` 开始，直到结束不得 re-enable delayed
-expansion；CRLF。具体 quote/escape 算法不在无 Windows evidence 的 plan 中臆定。S2 实现顺序必须是：先把上述 adversarial
+expansion；CRLF。具体 quote/escape 算法不在无 Windows evidence 的 plan 中臆定。WP-B 实现顺序必须是：先把上述 adversarial
 matrix 写成 renderer unit + real-recorder oracle；再在唯一 renderer 内实现一个候选算法；任何反例即修改同一算法并重跑，
-直到真实 `cmd.exe` 通过后才锁定。禁止 compat/fallback/双算法/platform test shim。Windows 本地不可用时 S2 可以完成
-非 Windows review，但必须明确标记 release gate pending，不能声称 quoting closed。
+直到真实 `cmd.exe` 通过后才锁定。禁止 compat/fallback/双算法/platform test shim。Windows 本地不可用时 R11-I1 可以完成
+非 Windows local validation，但必须明确标记 release gate pending，不能声称 quoting closed；这不提前触发 §9.2 cumulative
+code review。
 
-### 6.6 Tests 与两类真实 smoke
+### 6.6 Post-cutover cumulative tests 与两类真实 smoke
 
-Focused tests：
+以下 tests/smokes 只能在 WP-A+WP-B 已共同 cutover 后运行，并与 §5.3 producer owner tests及 §8 full
+pyright/test/coverage/Ruff/scans 组成同一次 `R11-I1` cumulative validation；不得在两个 work packages 之间运行一套删减的
+full gate，也不得以 CLI focused pass 掩盖 producer contract 失败：
 
 ```bash
 source .venv/bin/activate
@@ -467,10 +526,12 @@ python -m pytest tests/cli/test_upload_filings_from_command.py::test_posix_gener
 
 Slice stop：需要修改 Service/runtime/FMP resolver/ticker normalizer；真实 grammar 不能机械表达 typed entry；quote owner
 泄漏到 builder/fixture；publisher 不能守 containment/symlink/atomicity；secret 出现在脚本/summary；或任何 JSON fallback
-出现时立即 stop。S2 通过 Controller exact allowlist/contract/test/smoke checkpoint 后才能进入 S3；不做 slice acceptance
-或中间 implementation commit。
+出现时立即 stop。WP-B 首次消费暴露的 Fins typed gap 不是下游 stop/fallback 许可，必须按 §5.3/§9.1 在同一 atomic
+slice 回到 Fins owner targeted correction，再重跑 producer+consumer 全部 cumulative validation。只有 `R11-I1` merged exact
+allowlist/contract/tests/smokes/coverage/full pyright/Ruff/scans 全部通过，Controller 才可做一次 atomic checkpoint并授权进入
+`R11-I2`；不做 work-package acceptance、work-package checkpoint 或中间 implementation commit。
 
-## 7. Slice 3 — Placeholder/package/README closure 与 Windows release evidence
+## 7. Slice R11-I2 — Placeholder/package/README closure 与 Windows release evidence
 
 ### 7.1 Exact allowlist 与 changes
 
@@ -581,12 +642,29 @@ wildcard 展开。importability assertion 也必须 exit 0。archive/RECORD orac
 
 Slice stop：删除项仍被 production import/entrypoint 引用、optional dependency 兼有真实非-placeholder owner、wheel 仍含
 package/extra/requirement、需要实现 tracker 能力、Windows workflow 需 secrets或无法运行真实 cmd、或 README 职责越界时
-立即 stop。S3 通过 Controller exact allowlist/contract/test/smoke checkpoint 后进入一次 cumulative review，不做 slice
-acceptance 或中间 implementation commit。
+立即 stop。`R11-I2` 通过 Controller exact allowlist/contract/test/smoke checkpoint 后进入一次 cumulative review，不做
+slice acceptance 或中间 implementation commit；本 slice 不回改或扩张 `R11-I1` 产品范围。
 
 ## 8. Cumulative validation、coverage、scans 与 security gates
 
 ### 8.1 Mandatory local validation
+
+Validation sequencing 是 atomic boundary 的一部分，但不要求跨文件事务原子写：实现 Agent 可在同一 uninterrupted task 内
+顺序编辑 WP-A/WP-B 文件。全部 coordinated edits 完成前的 transient inconsistency 不是合法 intermediate tree，也不是
+pass/failure baseline；不得对它运行或宣称 tests、pyright、coverage、Ruff、diff/diffcheck/scans validation，不得形成
+checkpoint、acceptance、stage、commit、handoff、review 或 next-slice transition，也不得用 compatibility seam 缓解。
+首次 validation 只能在 WP-A/WP-B 全部 coordinated edits 完成后运行。
+
+所有 material preflight 必须在 mutation 前完成；若编辑期间出现真实 allowlist/source/design/security blocker，仍必须 stop，
+保留并报告当前 diff 作为 failed working evidence，不得继续冒险、不宣称 pass/checkpoint、不自行 rollback或扩大 scope。该
+safety stop 不把当前 transient tree 升格为 validation baseline 或合法 state-machine node。全部 coordinated edits 完成后，
+且任何 Fins owner targeted correction 完成时，必须运行 §5.3、§6.6、§8.1—§8.3 中覆盖 `R11-I1` producer+consumer 的全部
+focused/full tests、real smokes、逐文件 coverage、full pyright、scoped/full-baseline Ruff、diffcheck、JSON/owner/
+propagation/security/deferred scans；correction 后必须 combined revalidation，不能只复用此前结果。`R11-I1` 只有这套
+cumulative validation 全通过才可 checkpoint。`R11-I2` 完成后必须对最终 cumulative tree 重跑以下完整 validation，并加入
+packaging/wheel/README/placeholder/Windows evidence；不得复用 I1 结果冒充 final pass。仅在 I1 尚未修改的 packaging
+placeholder negative oracle 会保留到 I2 后判零，其余 I1-scope gate 均不得推迟。任何时点都不得放宽当前 full pyright
+`0 errors` 要求；其余产品、security、deferred、Windows 与 Ruff gates 同样保持不变。
 
 ```bash
 source .venv/bin/activate
@@ -610,7 +688,10 @@ git diff --check 2b14b2fbc89654267e3d33daa2ae410ceff45e68
 
 测试数量、skip 与 baseline delta 记录到 implementation/aggregate evidence；既有 unrelated skip 不得冒充 R11 smoke。Controller
 在 accepted-plan parent 锁 `workspace/tmp/r11-ruff-baseline.json` 时，必须在同一已激活 `.venv` 用完全相同命令
-`python -m ruff --version` 记录 verbatim version oracle。implementation 与 aggregate 开始时也运行这一命令，并在执行任何
+`python -m ruff --version` 记录 verbatim version oracle。当前 accepted implementation input 的 oracle 必须逐字保持
+`ruff 0.15.11`，full baseline 为 144 findings、SHA-256
+`051bd6cc84fcd32adbd792c81c9e524438dd0532a92c7504ea2edf8234ec1cea`；不得因 atomic slice 合并而更新、删减或放宽。
+implementation 与 aggregate 开始时也运行这一命令，并在执行任何
 Ruff delta 比较前逐字匹配该 oracle；版本漂移立即 stop，由 Controller 在同一 implementation 输入树上同时重新锁 version
 oracle 与 full baseline，不能把 Ruff 版本/规则漂移算作 current finding。Ruff scoped command 必须零错误；full command 的
 退出码与 JSON 原样记录，并与锁定的 baseline 按 relative filename/code/row/column/message 精确做 set difference，
@@ -694,29 +775,57 @@ auto contract，由人工逐 README 对照各自 `Agent更新约束`，不得只
 
 ### 9.1 Slice state machine
 
-严格顺序最多三个 slices：`R11-S1 -> R11-S2 -> R11-S3`。每个 slice 只经历：
+严格顺序精确两个 implementation slices：`R11-I1 atomic Fins+CLI cutover -> R11-I2 packaging/README/Windows gate`。
+`R11-I1` 的两个 ordered work packages 不构成 slices 或 state-machine nodes：
 
 ```text
-implementation
- -> Controller exact allowlist/contract/test/smoke validation
- -> next slice（仅 checkpoint pass 时）
+R11-I1 coordinated implementation
+  全部 material preflight（必须在 mutation 前完成）
+  WP-A Fins owner contract + WP-B CLI consumer/renderer cutover
+  （同一 uninterrupted Agent task 内可顺序编辑；无跨文件事务原子写要求）
+  （全部 coordinated edits 完成前的 transient inconsistency 不是 gate truth，不运行 validation、不做 gate transition）
+  （若出现真实 blocker：stop + 报告当前 diff 为 failed working evidence；不宣称 pass/checkpoint、不 rollback/扩 scope）
+ -> 全部 coordinated edits 完成后的首次 producer+consumer validation
+ -> 若真实 consumer 暴露 owner gap：同一 slice 内 Fins owner targeted correction + combined revalidation
+ -> producer+consumer cumulative tests/smokes/coverage/full pyright/Ruff/scans
+ -> Controller R11-I1 atomic checkpoint
+ -> R11-I2 packaging/README/Windows implementation（仅 I1 checkpoint pass）
+ -> final cumulative tests/smokes/coverage/full pyright/Ruff/scans + packaging/Windows gate evidence
+ -> Controller R11-I2 checkpoint
+ -> one cumulative code-review gate
 ```
 
-任一 source drift、stop condition、checkpoint failure 或 blocker 均禁止下一 slice。唯一允许的 owner 回返是：S2 首个真实
-consumer 若发现 §5.3 checklist 未捕获的 S1 typed fact 缺失、enum mismatch 或 optional ownership gap，S2 立即 stop 并提交
-direct contract evidence；只有 Controller 可以只授权 `dayu/fins/upload_batch.py` 与 `tests/fins/test_upload_batch.py` 内的 S1
-owner targeted fix。修复后必须从 S1 checkpoint 重新开始，并重跑 S1+S2 全部 cumulative contract/tests/scans/smoke 后才可
-继续。严禁在 S2 builder/renderer/adapter/test fixture 加 fallback、重算或兼容 seam，严禁为回返创建新 sub-WU、slice 或
-中间 commit，也不得扩大 S1/S2 allowlist。三个 slice 之间不做 slice acceptance、code-review gate 或 commit；每个 checkpoint
-重跑所有已完成 slice 的 cumulative tests/scans，防止后 slice 破坏前 slice owner contract。
+`R11-I1` mutation 必须在同一 uninterrupted Agent task 内协调应用 producer 与全部 consumer 变更，但可以顺序编辑文件，
+不要求跨文件事务原子写。顺序编辑中的 transient inconsistency 不是合法 intermediate tree 或 pass/failure baseline；在
+WP-A/WP-B 全部 coordinated edits 完成前，不得运行或宣称 tests、pyright、coverage、Ruff、diff/diffcheck/scans validation，
+不得记录 checkpoint、请求 acceptance、stage、commit、handoff、review、产生“next work package authorization”或进入
+next slice。首次 validation 只能在全部 coordinated edits 完成后运行。
+
+禁止把“先删除 old producer surface、consumer 尚未切换”的 transient tree 呈交为 gate input、checkpoint 或 handoff，也
+禁止以 old/new dual surface、compatibility alias/property/wrapper、dead dataclass、union adapter、`hasattr/getattr`、loose
+parsing 或下游 fallback 缓解该状态。所有 material preflight 必须在 mutation 前完成；若编辑期间出现真实 allowlist/source/
+design/security blocker，必须 stop 并报告当前 diff 为 failed working evidence，不得继续冒险、不宣称 pass/checkpoint、不自行
+rollback或扩大 scope。该 safety stop 不构成合法 intermediate state、failure baseline、acceptance、commit、review 或
+next-slice transition。
+
+若 WP-B 首个真实 consumer 发现 §5.3 checklist 未捕获的 typed fact 缺失、enum mismatch 或 optional ownership gap，状态保持在
+`R11-I1 coordinated implementation`：只在 Fins owner 路径 `dayu/fins/upload_batch.py` 与
+`tests/fins/test_upload_batch.py` 做 targeted correction，CLI 继续机械消费同一 source of truth。修复后必须重跑 §5.3、
+§6.6、§8 对 producer+consumer 的全部 cumulative contract/tests/scans/smoke/coverage/full pyright/Ruff；不得只重跑 owner
+tests，严禁在 builder/renderer/adapter/test fixture 补偿，严禁创建新 sub-WU/slice/commit或扩大 `R11-I1` allowlist。
+
+任一 material source drift、merged allowlist 外依赖、stop condition、atomic checkpoint failure 或 blocker 均禁止进入
+`R11-I2`。两个 slices 之间不做 slice acceptance、code-review gate 或 commit；`R11-I2` checkpoint 必须重跑最终 cumulative
+tests/scans，防止 packaging 破坏 `R11-I1` owner contract。code review 仍只在两个 implementation slices 全部完成后对完整
+cumulative diff 执行一次。
 
 ### 9.2 Aggregate gate
 
-S3 checkpoint pass 后执行一次 cumulative aggregate：
+`R11-I2` checkpoint pass 后执行一次 cumulative aggregate：
 
 - 从 R10 completion baseline 到最终 tree 的 sorted path manifest、blob SHA、product/test/README/CI binary diff；
-- 三 slice owner/contracts、所有 accepted/rejected findings 与 stop conditions ledger；
-- S1 filesystem、S2 POSIX recorder、POSIX real upload、S3 wheel smokes原始证据；
+- 两 slice owner/contracts、所有 accepted/rejected findings 与 stop conditions ledger；
+- R11-I1 Fins filesystem/POSIX recorder/POSIX real upload 与 R11-I2 wheel smokes原始证据；
 - focused/full related/full tests、per-file line coverage、full pyright、scoped/full-baseline Ruff、diffcheck 与全部 scans；
 - README trigger matrix与安全/deferred matrix；
 - Windows gate 状态与 artifact locator。若尚未运行，只能写 `PENDING_RELEASE_BLOCKER`，不能写 pass/residual。
@@ -757,17 +866,24 @@ Windows release blocker；真正 release closeout 时三者均为 0。
 
 ## 10. Plan acceptance checklist
 
-- [ ] baseline/source locks 由 Controller 复核；唯一既有 dirty control doc未被触碰。
+- [ ] accepted-plan/product baseline source locks 由 Controller 复核；Controller-owned dirty/untracked control、authorization、
+      stop/adjudication artifacts 均未被触碰、删除或 stage。
 - [ ] Fins typed plan 与 CLI/renderer/package owner 边界无重叠。
-- [ ] 三个 dependency-ordered slices 的 allowlist、contract、tests、real smoke、stop conditions均被接受。
+- [ ] 精确两个 dependency-ordered slices 的 allowlist、contract、tests、real smoke、stop conditions均被接受；原 packaging
+      内容未扩 scope。
+- [ ] `R11-I1` 精确合并原 producer+consumer allowlists；同一 uninterrupted Agent task 可顺序编辑且不要求跨文件事务原子写；
+      全部 coordinated edits 完成前的 transient inconsistency 不是合法 intermediate tree 或 pass/failure baseline，不运行/
+      宣称 validation，不做 checkpoint、acceptance、stage、commit、handoff、review 或 next-slice transition；真实 blocker
+      仍按 failed working evidence 安全 stop，只有共同 cutover 与 combined revalidation 后的 atomic checkpoint。
 - [ ] current direct grammar、action auto、ticker CSV、single FMP resolve、metadata projection逐字段审阅。
-- [ ] S1 checkpoint 已按 S2 consumer field/enum/optional-to-current-flag checklist 冻结；owner gap 唯一回返路径可审计。
+- [ ] producer-consumer field/enum/optional-to-current-flag checklist 在 atomic checkpoint 冻结；consumer 暴露 gap 时只在同一
+      slice 做 Fins owner targeted correction并重跑 producer+consumer cumulative validation。
 - [ ] POSIX recorder + real Service/Fins storage smoke可执行。
 - [ ] repo/GitHub 无 workflow事实与最小 Windows workflow filename/triggers/artifact locator被接受。
 - [ ] Windows outcome/invariants/oracle固定；具体 algorithm 保留给真实 runner反证，不存在 `list2cmdline`/fallback/shim。
 - [ ] placeholder deletion、wheel metadata/extracted names/RECORD、README触发、line coverage、full tests/pyright/Ruff 同版本
       baseline/scans完整。
+- [ ] full pyright 保持零新增/扩散且不放宽；old/new dual surface、compatibility seam、CLI fallback/重算均为零。
 - [ ] security保留项与 deferred/no-touch边界完整；R12与 tracker能力未进入。
-- [ ] accepted implementation、aggregate、completion与 Windows release blocker gate可审计。
-
-READY_FOR_CONTROLLER_PLAN_FIX_VALIDATION
+- [ ] 两个 implementation slices 全部完成后才执行一次 cumulative code review；accepted implementation、aggregate、
+      completion与 Windows `PENDING_RELEASE_BLOCKER`/release gate可审计。
