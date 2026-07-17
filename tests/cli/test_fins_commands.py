@@ -732,7 +732,7 @@ def test_download_command_maps_args_to_service(
         (
             "download",
             "--ticker",
-            "AAPL,Apple Inc.",
+            "AAPL,MSFT",
             "--forms",
             "10-K,10-Q",
             "--start",
@@ -772,7 +772,7 @@ def test_upload_commands_map_args_and_validate_files(
         (
             "upload_filing",
             "--ticker",
-            "AAPL,Apple Inc.",
+            "AAPL,MSFT",
             "--action",
             "update",
             "--files",
@@ -795,7 +795,7 @@ def test_upload_commands_map_args_and_validate_files(
         (
             "upload_material",
             "--ticker",
-            "MSFT,Microsoft",
+            "MSFT,GOOG",
             "--forms",
             "8-K",
             "--material-name",
@@ -820,14 +820,14 @@ def test_upload_commands_map_args_and_validate_files(
             filing_date="2025-01-30",
             report_date="2024-12-31",
             company_name="Apple",
-            ticker_aliases=("Apple Inc.",),
+            ticker_aliases=("MSFT",),
             overwrite=True,
         )
     ]
     assert fake_service.upload_material_requests == [
         _UploadMaterialCall(
             ticker="MSFT",
-            action="create",
+            action="auto",
             files=(material_file.resolve(),),
             form_type="8-K",
             material_name="Investor Day",
@@ -839,7 +839,7 @@ def test_upload_commands_map_args_and_validate_files(
             filing_date=None,
             report_date=None,
             company_name=None,
-            ticker_aliases=("Microsoft",),
+            ticker_aliases=("GOOG",),
             overwrite=False,
         )
     ]
@@ -854,7 +854,7 @@ def test_process_commands_map_to_service(
         (
             "process",
             "--ticker",
-            "AAPL,Apple",
+            "AAPL,MSFT",
             "--document-id",
             "doc-1,doc-2",
             "--document-id",
@@ -1550,19 +1550,32 @@ def test_upload_filings_from_does_not_start_live_stream(
     fake_service: _FakeFinsDirectService,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """upload_filings_from 只生成 JSON argv 计划，不启动 direct stream。"""
+    """upload_filings_from 只生成可执行脚本，不启动 direct stream。"""
 
     source_dir = tmp_path / "source"
     source_dir.mkdir()
-    (source_dir / "AAPL 10-K 2024.pdf").write_text("filing", encoding="utf-8")
+    (source_dir / "2024FY AAPL Annual Report.pdf").write_text(
+        "filing", encoding="utf-8"
+    )
 
     assert cli_main.main(
-        ("upload_filings_from", "--ticker", "AAPL", "--from", str(source_dir))
+        (
+            "upload_filings_from",
+            "--base",
+            str(tmp_path / "workspace"),
+            "--ticker",
+            "AAPL",
+            "--from",
+            str(source_dir),
+        )
     ) == EXIT_SUCCESS
 
     captured = capsys.readouterr()
-    assert '"schema_version": 1' in captured.out
-    assert '"upload_filing"' in captured.out
+    script = tmp_path / "workspace" / "upload_filings_AAPL.sh"
+    assert "Generated upload script:" in captured.out
+    assert "Recognized filings: 1" in captured.out
+    assert "upload_filing" in script.read_text(encoding="utf-8")
+    assert "schema_version" not in script.read_text(encoding="utf-8")
     assert "Fins progress" not in captured.out
     assert fake_service.stream_calls == []
 

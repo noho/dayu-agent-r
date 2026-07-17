@@ -4,11 +4,6 @@
 `dayu-cli`：可以初始化工作区、下载或上传财报、预处理文档、进行单次问答、
 多轮交互，以及查看和清理 CLI Session。
 
-当前限制：
-
-- `dayu-web`、`dayu-wechat` 和 `dayu-render` 只提供 `--help` 与受控的“尚未实现”诊断。
-- 当前 CLI 没有报告写作命令，也没有 Web provider、alias inference 或 CI snapshot 开关。
-
 本文档面向最终使用者。
 
 ## Agent更新约束【必须遵守】
@@ -38,7 +33,7 @@
 ```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e ".[test,dev,browser,web]" \
+python -m pip install -e ".[test,dev,browser]" \
   -c constraints/lock-macos-arm64-py311.txt
 ```
 
@@ -64,9 +59,6 @@ python3.11 -m pip install /path/to/dayu_agent-<version>-py3-none-any.whl
 
 ```bash
 dayu-cli --help
-dayu-web --help
-dayu-wechat --help
-dayu-render --help
 ```
 
 ## 2. 初始化工作区
@@ -127,7 +119,7 @@ dayu-cli <command> --help
 | `download` | 下载指定主体的财报 |
 | `upload_filing` | 上传或管理单份 filing |
 | `upload_material` | 上传或管理补充材料 |
-| `upload_filings_from` | 扫描目录并生成结构化批量上传计划 |
+| `upload_filings_from` | 扫描目录并生成可执行的批量上传脚本 |
 | `process` | 预处理某主体的文档 |
 | `process_filing` | 预处理单份 filing |
 | `process_material` | 预处理单份 material |
@@ -229,52 +221,63 @@ dayu-cli upload_filing --help
 dayu-cli upload_material --help
 ```
 
-### 5.3 从目录生成批量上传计划
+三个上传命令的 `--action` 默认都是 `auto`。单份上传还可显式使用
+`create`、`update` 或 `delete`；批量脚本只会生成 `auto`、`create` 或 `update`。
 
-`upload_filings_from` 只扫描和分类文件，不直接上传：
+### 5.3 从目录生成批量上传脚本
+
+`upload_filings_from` 扫描和分类本地文件，生成当前平台可直接执行的脚本；生成阶段不上传文件：
+
+```bash
+mkdir -p ./workspace/scripts
+dayu-cli upload_filings_from \
+  --base ./workspace \
+  --ticker AAPL,APPL \
+  --from ./filings \
+  --recursive
+```
+
+`--ticker` 接受逗号分隔值：首项是规范 ticker，其余项作为 aliases，脚本中的每条上传命令都使用同一组值。
+`--action` 默认 `auto`；需要固定动作时可显式传 `--action create` 或 `--action update`。
+
+未传 `--output` 时，脚本写到 `--base` 工作区根目录：POSIX 使用
+`upload_filings_<TICKER>.sh`，Windows 使用 `upload_filings_<TICKER>.cmd`。`--output`
+可以指向工作区内的既有目录，此时仍使用默认文件名；也可以指向工作区内的精确文件路径，命令不会替它补后缀。
+显式文件的父目录必须已经存在。例如：
 
 ```bash
 dayu-cli upload_filings_from \
+  --base ./workspace \
   --ticker AAPL \
   --from ./filings \
-  --recursive \
-  --output ./upload-plan.json
+  --output ./workspace/scripts/upload-aapl.script
 ```
 
-未传 `--output` 时 JSON 写到 stdout。公开格式固定为带版本的 argv 数组：
+需要补全公司名称和 ticker aliases 时，先在当前环境设置 `FMP_API_KEY`，再显式传
+`--infer`。resolver 只在生成阶段调用；API key 不会写入脚本。生成成功后，stdout
+会显示脚本绝对路径、recognized filing、material 和 skipped 数量，并逐项显示业务可读的跳过原因。
 
-```json
-{
-  "schema_version": 1,
-  "commands": [
-    [
-      "dayu-cli",
-      "upload_filing",
-      "--ticker",
-      "AAPL",
-      "--action",
-      "create",
-      "--files",
-      "/absolute/path/AAPL-2024-10K.pdf"
-    ]
-  ]
-}
+执行前先打开脚本检查文件与参数，再按平台运行：
+
+```bash
+# POSIX
+/bin/sh ./workspace/upload_filings_AAPL.sh
+
+# Windows
+cmd.exe /d /c .\workspace\upload_filings_AAPL.cmd
 ```
 
-每个 `commands` 元素是一条完整 argv；文件路径即使包含空格、引号、`&`、`%`
-等字符，也必须作为一个数组元素交给进程执行器。该命令不生成 shell、`.sh` 或
-`.cmd` 文本。跨平台执行时逐条调用 argv，不要拼接后交给 shell：
+脚本把调用者追加的参数逐元素追加到每一条上传命令。例如以下 POSIX 调用会让每条命令都收到
+`--overwrite`；Windows 同样把参数放在 `.cmd` 路径之后：
 
-```python
-import json
-import subprocess
-
-with open("upload-plan.json", encoding="utf-8") as plan_file:
-    plan = json.load(plan_file)
-
-for argv in plan["commands"]:
-    subprocess.run(argv, check=True)
+```bash
+/bin/sh ./workspace/upload_filings_AAPL.sh --overwrite
 ```
+
+脚本输出必须留在 `--base` 工作区内，工作区自身、内部目录和既有目标不能是 symlink。
+如果没有生成脚本，先查看摘要中的跳过原因并核对文件名是否含可识别的财年/财期；如果报 output
+错误，确认目标父目录已存在且位于工作区内。`upload_filings_from --overwrite` 控制每条上传命令的
+存储覆盖语义，不控制脚本文件替换。
 
 ### 5.4 预处理
 
@@ -343,6 +346,8 @@ Host 状态时再同时使用 `--reset`。
 这是当前设计：未传 `--log-file` 的诊断流在进程结束时自动清理。重现问题时加上
 `--debug --log-file <path>`；排查高频流式链路时改用 `--debug-stream`。
 
-### Web、微信或渲染命令没有启动服务
+### 批量上传脚本没有生成
 
-这三个入口当前尚未提供实际功能，只支持查看帮助和输出受控诊断。
+先运行 `dayu-cli upload_filings_from --help` 核对 source、ticker 和 output 参数。源目录必须存在且不能是
+symlink；脚本 output 必须位于工作区内。命令输出的 skipped reason 会说明文件因财期信息缺失、同期去重、
+数量限制或路径安全检查而未进入脚本的原因。

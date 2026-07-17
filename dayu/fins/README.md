@@ -183,7 +183,20 @@ parser，并把 typed mode 保存到独立私有 metadata，而不是改写 raw 
 
 ### Batch upload plan
 
-`dayu.fins.upload_batch` 提供本地批量上传计划生成能力。它接收 `UploadBatchPlanRequest`，扫描调用方显式传入的本地源目录，并返回 `UploadBatchPlanResult` 与结构化 `UploadBatchPlanEntry` 条目。该 helper 通过公开常量 `FINS_UPLOAD_FILE_SUFFIXES` 固定 upload 输入后缀真源，只识别可作为 upload 输入的普通文件，并基于文件名中的 filing form token 或调用方传入的 `material_forms` 生成 `upload_filing` / `upload_material` 计划；它不启动 ingestion job、不读取 Fins storage、不创建 Host Run，也不输出 shell 文本。
+`dayu.fins.upload_batch` 是本地批量上传领域事实的唯一 owner。它接收不可变的
+`UploadBatchPlanRequest`，在 lexical / resolved containment 与内部 symlink fail-closed 边界内扫描调用方显式传入的
+源目录，并返回由 `UploadBatchFilingEntry`、`UploadBatchMaterialEntry` 和 `UploadBatchSkippedEntry` 组成的
+`UploadBatchPlan`。公开常量 `FINS_UPLOAD_FILE_SUFFIXES` 是 upload 输入后缀真源；默认只扫描直属文件，显式
+recursive 或直接存在 `20YY` / `20YYQn` / `20YYH1` 结构目录时才递归。
+
+Fins 根据文件名与直接结构父目录产生财年、财期、material routing/name、同期优先级、去重、数量限制和业务可读
+skip reason。年度 filing 最多保留 5 份；周期 filing 只保留最新财年并最多 6 份；presentation 最多 6 份；
+earnings-call 上限等于过滤后的 filing 数量；financial statements 不设数量上限。显式 fiscal metadata 只覆盖对应
+推断字段，material 与 filing 保持互斥，所有裁剪与安全拒绝都进入 typed skipped facts。
+
+该模块不构造 argv、不渲染平台脚本、不读取环境或 FMP、不启动 ingestion job、不读取 storage，也不创建 Host Run。
+CLI 只能机械消费 typed plan，把 filing/material entry 投影为当前 direct upload grammar，并把 skipped facts投影为人类可读
+摘要；文件名规则、caps 和 skip reason 不得在 CLI renderer 或测试 fixture 中重算。
 
 ### Ingestion runtime 与 awaiting observation
 

@@ -60,8 +60,8 @@ EXCLUDED_COMMAND_NAMES: tuple[str, ...] = (
     "cancel",
     "conv",
 )
-FILING_ACTION_CHOICES: tuple[str, ...] = ("create", "update", "delete")
-BATCH_UPLOAD_ACTION_CHOICES: tuple[str, ...] = ("create", "update")
+FILING_ACTION_CHOICES: tuple[str, ...] = ("auto", "create", "update", "delete")
+BATCH_UPLOAD_ACTION_CHOICES: tuple[str, ...] = ("auto", "create", "update")
 
 
 class CommandSubparserRegistry(Protocol):
@@ -166,6 +166,7 @@ class ParsedCliArgs(argparse.Namespace):
     output: str | None
     recursive: bool
     material_forms: list[str] | None
+    infer: bool
     session_action: str | None
     session_id: str | None
     kind: str | None
@@ -254,7 +255,7 @@ def _new_default_namespace() -> ParsedCliArgs:
     namespace.reset = False
     namespace.overwrite = False
     namespace.rebuild = False
-    namespace.action = "create"
+    namespace.action = "auto"
     namespace.files = None
     namespace.fiscal_year = None
     namespace.fiscal_period = None
@@ -269,6 +270,7 @@ def _new_default_namespace() -> ParsedCliArgs:
     namespace.output = None
     namespace.recursive = False
     namespace.material_forms = None
+    namespace.infer = False
     namespace.session_action = None
     namespace.session_id = None
     namespace.kind = None
@@ -794,15 +796,30 @@ def _register_upload_filings_from_command(
         subparsers,
         global_parent,
         command_name=COMMAND_UPLOAD_FILINGS_FROM,
-        help_text="从目录生成批量上传计划。",
+        help_text="从目录生成可执行的批量上传脚本。",
     )
     _add_required_ticker_argument(parser)
     parser.add_argument("--from", dest="source_dir", required=True, help="待扫描目录。")
     _add_upload_action_argument(parser, choices=BATCH_UPLOAD_ACTION_CHOICES)
-    parser.add_argument("--output", help="结构化 JSON argv 计划输出路径。")
+    parser.add_argument(
+        "--output",
+        help="脚本输出文件或既有目录；未提供时写入 --base 工作区根目录。",
+    )
     parser.add_argument("--recursive", action="store_true", help="递归扫描目录。")
     _add_filing_metadata_arguments(parser)
     parser.add_argument("--material-forms", nargs="+", help="补充材料关联报表类型。")
+    parser.add_argument(
+        "--infer",
+        action="store_true",
+        default=False,
+        help="使用 FMP 公司信息补全公司名称与 ticker aliases（需要 FMP_API_KEY）。",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        default=False,
+        help="允许每条生成的上传命令覆盖已有存储文档；不控制脚本文件替换。",
+    )
 
 
 def _register_process_command(
@@ -901,7 +918,7 @@ def _add_upload_action_argument(parser: argparse.ArgumentParser, *, choices: tup
     parser.add_argument(
         "--action",
         choices=choices,
-        default="create",
+        default="auto",
         help="上传动作。",
     )
 

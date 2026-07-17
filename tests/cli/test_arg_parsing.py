@@ -79,6 +79,8 @@ COMMAND_HELP_EXPECTATIONS: dict[str, tuple[str, ...]] = {
         "--output",
         "--recursive",
         "--material-forms",
+        "--infer",
+        "--overwrite",
     ),
     "process": ("--ticker", "--document-id", "--overwrite"),
     "process_filing": ("--ticker", "--document-id", "--overwrite"),
@@ -273,6 +275,58 @@ def test_interactive_help_contains_optional_ticker(
     assert "--ticker" in help_text
 
 
+def test_upload_actions_default_to_auto_and_batch_rejects_delete() -> None:
+    """三个 upload parser 默认 auto，direct 可 delete，batch 必须拒绝 delete。"""
+
+    filing = parse_cli_args(("upload_filing", "--ticker", "AAPL"))
+    material = parse_cli_args(("upload_material", "--ticker", "AAPL"))
+    batch = parse_cli_args(
+        ("upload_filings_from", "--ticker", "AAPL", "--from", "source")
+    )
+    direct_delete = parse_cli_args(
+        ("upload_filing", "--ticker", "AAPL", "--action", "delete")
+    )
+
+    assert filing.action == "auto"
+    assert material.action == "auto"
+    assert batch.action == "auto"
+    assert batch.infer is False
+    assert batch.overwrite is False
+    assert direct_delete.action == "delete"
+    with pytest.raises(SystemExit) as raised:
+        parse_cli_args(
+            (
+                "upload_filings_from",
+                "--ticker",
+                "AAPL",
+                "--from",
+                "source",
+                "--action",
+                "delete",
+            )
+        )
+    assert raised.value.code == EXIT_USAGE_ERROR
+
+
+def test_upload_filings_from_infer_and_overwrite_are_explicit_booleans() -> None:
+    """batch ``--infer``/``--overwrite`` 必须仅在显式传入时为 true。"""
+
+    explicit = parse_cli_args(
+        (
+            "upload_filings_from",
+            "--ticker",
+            "AAPL",
+            "--from",
+            "source",
+            "--infer",
+            "--overwrite",
+        )
+    )
+
+    assert explicit.infer is True
+    assert explicit.overwrite is True
+
+
 def test_interactive_help_omits_removed_new_session_flag(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -309,9 +363,14 @@ def test_root_readme_matches_current_cli_public_contract() -> None:
     """
 
     readme = _ROOT_README_PATH.read_text(encoding="utf-8")
+    direct_upload_section = readme.split(
+        "### 5.2 上传单份 filing 或材料", maxsplit=1
+    )[1].split("### 5.3 从目录生成批量上传脚本", maxsplit=1)[0]
+    batch_upload_section = readme.split(
+        "### 5.3 从目录生成批量上传脚本", maxsplit=1
+    )[1].split("### 5.4 预处理", maxsplit=1)[0]
     for removed_contract in (
         "`write`",
-        "--infer",
         "--ci",
         "--web-provider",
         "--new-session",
@@ -321,9 +380,20 @@ def test_root_readme_matches_current_cli_public_contract() -> None:
         assert removed_contract not in readme
     assert "`init` 是非交互式文件初始化命令" in readme
     assert "进程结束时自动清理" in readme
-    assert '"schema_version": 1' in readme
-    assert '"commands"' in readme
-    assert "不生成 shell" in readme
+    assert "dayu-cli upload_filings_from" in batch_upload_section
+    assert "--infer" in batch_upload_section
+    assert "`FMP_API_KEY`" in batch_upload_section
+    assert "--infer" not in direct_upload_section
+    assert "`upload_filings_<TICKER>.sh`" in batch_upload_section
+    assert "`upload_filings_<TICKER>.cmd`" in batch_upload_section
+    assert "/bin/sh" in batch_upload_section
+    assert "cmd.exe /d /c" in batch_upload_section
+    for removed_batch_contract in (
+        '"schema_version": 1',
+        '"commands"',
+        "不生成 shell",
+    ):
+        assert removed_batch_contract not in readme
     assert "interactive --ticker" in readme
 
 

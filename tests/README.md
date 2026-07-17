@@ -29,6 +29,25 @@ pytest tests/contracts tests/cli tests/documents tests/fins tests/tools tests/ho
 python -m pyright dayu/ tests/ utils/
 ```
 
+批量上传 owner、脚本 renderer/publisher 与 public packaging 的 focused 验证：
+
+```bash
+pytest tests/fins/test_upload_batch.py tests/cli/test_upload_filings_from_command.py \
+  tests/cli/test_fins_commands.py tests/cli/test_arg_parsing.py \
+  tests/cli/test_public_package_entrypoints.py -q
+```
+
+真实 Windows gate 由 `.github/workflows/r11-upload-script-windows.yml` 在 Python 3.11 / `windows-latest` 上运行：
+
+```bash
+python -m pytest tests/cli/test_upload_filings_from_command.py::test_windows_cmd_script_round_trips_adversarial_argv_with_real_cmd tests/cli/test_upload_filings_from_command.py::test_windows_generated_script_runs_real_cli_into_temp_storage tests/cli/test_arg_parsing.py::test_upload_actions_default_to_auto_and_batch_rejects_delete -q
+```
+
+前两个 node 必须实际经过 `cmd.exe /d /c`，分别验证对抗参数逐元素恢复和
+`python -m dayu.cli -> Service -> Fins -> temp storage` 闭环；非 Windows 本地环境只会明确 skip，不能替代 workflow 的
+真实 runner 证据。workflow 通过时的证据包包含 JUnit、生成脚本、recorder oracle、CLI storage oracle、stdout/stderr、环境与
+`cmd.exe /?` 输出；失败时仍通过 `if: always()` 发布已经产生的诊断证据。
+
 默认 pytest 配置会排除 `stress` marker，因此常规命令不会运行 Host production stress suite。显式运行 stress suite 时需要覆盖默认 `addopts`：
 
 ```bash
@@ -85,7 +104,7 @@ pytest tests/engine/test_smoke_async_agent_providers.py -q
 
 ### `tests/cli/`
 
-CLI UI adapter 测试，当前覆盖公开包入口 `dayu-web` / `dayu-wechat` / `dayu-render` 的 pyproject target import、help smoke、模块执行 help、可选重依赖 import 边界和当前不可用诊断；也覆盖 `dayu.cli` 的 parser factory、scoped command help、未纳入旧命令的 unknown command
+CLI UI adapter 测试当前覆盖 pyproject 只发布真实 `dayu-cli`、wheel metadata / entrypoints / archive 不包含已删除的 placeholder scripts、packages、Web extra 或 Streamlit requirement；也覆盖 `dayu.cli` 的 parser factory、scoped command help、未纳入旧命令的 unknown command
 用法错误、尚未实现命令的 not-implemented 退出、`KeyboardInterrupt` 到 130 的映射、全局参数位置，以及 `init`
 对 current schema workspace config / prompts 的 bootstrap、existing file / overwrite、reset 硬编码白名单、symlink
 escape fail-fast、普通复制路径拒绝顶层与嵌套 symlink、whole-tree staging 安装保留用户自管配置、旧配置文件不生成、生成配置可由 `ConfigLoader` 加载和复制阶段 SIGINT 130；
@@ -101,11 +120,12 @@ open/follow-up terminal path、fast terminal、outbox fallback、默认 detail �
 stdout/stderr 投影、CLI 输出中绝对路径可见但受长度控制、upload file 存在性 / 普通文件 / 非空前置校验、已删除 `--infer` / `--ci` 由 argparse 拒绝、
 默认日志不污染 progress 输出、`--verbose` 执行骨架日志与 `--debug` event detail 诊断写入默认临时日志文件，`--log-file` 只迁移诊断日志且 stdout/stderr 用户 UI 保持原通道、
 Fins owner stream / cancel failure 向上传播且 CLI 不重复记录同一 ERROR、stream 创建者在 success / protocol error / log-render error / 外部取消 / SIGINT 本地退出全部路径确定性关闭 raw source、既存 consumer primary 与 cleanup cause 保持、
-`upload_filings_from` 的本地目录扫描、filing / material 识别、version 1 JSON argv 结构、Windows shell 特殊字符保持单一参数、`--output` 写入、错误码、扫描期
-SIGINT 130、确认不启动 live event stream、terminal exit mapping、Fins-owned missing / duplicate protocol error 保持既有 CLI prefix/message/exit 1、typed error object 与 runtime `PREPROCESS` provenance 经 Service/CLI identity 传播、SIGINT 到 operation-scoped async cancellation、
+`upload_filings_from` 的 typed 本地目录扫描、filing / material / skipped 三分、POSIX `.sh` 与 Windows `.cmd` renderer、default / explicit output、
+ticker CSV、single FMP infer、human summary、调用者追加参数、atomic publisher、真实 POSIX recorder 与真实 CLI/temp-storage smoke、Windows 对抗参数与真实 CLI nodes、错误码、扫描期
+SIGINT 130、确认生成阶段不启动 live event stream、terminal exit mapping、Fins-owned missing / duplicate protocol error 保持既有 CLI prefix/message/exit 1、typed error object 与 runtime `PREPROCESS` provenance 经 Service/CLI identity 传播、SIGINT 到 operation-scoped async cancellation、
 cancel race 收口、第二次 SIGINT 本地 130，以及 CLI 不直接 import `dayu.fins.storage`。
 CLI runtime display controller 独立测试覆盖 prompt activity renderer 与 interactive run view 共用的 thinking guard、
-terminal 前清理、取消前 thinking 关闭、guard 清除、display close 生命周期、None display no-op 和二次中断本地退出提示前清理时序。CLI 测试不得启动真实 Host / Fins 业务路径；涉及 Host 状态机时使用 Service helper 与 mocked Host public API。
+terminal 前清理、取消前 thinking 关闭、guard 清除、display close 生命周期、None display no-op 和二次中断本地退出提示前清理时序。除本节明确列出的真实 POSIX / Windows CLI 到 Fins 临时仓储 smoke 外，CLI 单元测试不启动真实 Host / Fins 业务路径；涉及 Host 状态机时使用 Service helper 与 mocked Host public API。
 CLI import boundary 测试通过 AST 阻止 `session` command 从 `prompt` / `interactive` command 导入下划线私有符号。
 
 ### `tests/runtime/`

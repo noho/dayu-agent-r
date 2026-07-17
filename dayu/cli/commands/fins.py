@@ -9,8 +9,8 @@ runtime，不读取 Fins storage，也不把 direct operation 伪装成 Host Run
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+import os
 import shlex
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -42,7 +42,11 @@ from dayu.cli.output import (
     render_fins_direct_event,
     render_fins_direct_local_exit_after_cancel,
 )
-from dayu.contracts import JsonValue
+from dayu.cli.upload_script import (
+    current_upload_script_platform,
+    publish_upload_script,
+    render_upload_script,
+)
 from dayu.fins.direct_events import (
     FinsDirectStreamProtocolError,
     FinsEvent,
@@ -51,13 +55,18 @@ from dayu.fins.direct_events import (
 )
 from dayu.fins.direct_stream import ValidatedFinsEventStream
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.domain.filing_semantics import FiscalPeriod
+from dayu.fins.resolver import FmpCompanyInfoResolver
+from dayu.fins.ticker_normalization import normalize_ticker
 from dayu.fins.upload_batch import (
     FINS_UPLOAD_FILE_SUFFIXES,
     BatchUploadAction,
+    UploadBatchFilingEntry,
+    UploadBatchMaterialEntry,
     UploadBatchPlanEmptyError,
-    UploadBatchPlanEntry,
     UploadBatchPlanRequest,
     UploadBatchPlanUsageError,
+    UploadBatchSkippedEntry,
     generate_upload_batch_plan,
 )
 from dayu.service.fins_direct import (
@@ -67,10 +76,11 @@ from dayu.service.fins_direct import (
 
 _BASE_OPTION: Final[str] = "--base"
 _TICKER_OPTION: Final[str] = "--ticker"
-_UPLOAD_BATCH_SCHEMA_VERSION: Final[int] = 1
-_UPLOAD_BATCH_SCHEMA_VERSION_FIELD: Final[str] = "schema_version"
-_UPLOAD_BATCH_COMMANDS_FIELD: Final[str] = "commands"
 _MULTIPLE_MATERIAL_FORMS_MESSAGE: Final[str] = "当前 Fins upload_material request 只支持单个 --forms 值"
+_MULTIPLE_BATCH_MATERIAL_FORMS_MESSAGE: Final[str] = (
+    "upload_filings_from 的 --material-forms 最多接受一个值"
+)
+_FMP_API_KEY_ENV: Final[str] = "FMP_API_KEY"
 _EMPTY_TICKER_MESSAGE: Final[str] = "--ticker must not be empty"
 _EMPTY_DOCUMENT_ID_MESSAGE: Final[str] = "--document-id must not contain empty item"
 _EMPTY_FORM_MESSAGE: Final[str] = "--forms must not contain empty item"
@@ -273,92 +283,137 @@ async def _raise_primary_after_fins_stream_close(
 
 
 def _run_upload_filings_from(args: ParsedCliArgs) -> int:
-    """执行 ``upload_filings_from`` 本地计划生成。
+    """生成并安全发布 ``upload_filings_from`` 可执行脚本。
 
     :param args: argparse 已解析的 upload_filings_from 参数。
     :returns: CLI 退出码。
-    :raises CliFinsUsageError: ticker 或 source dir 参数非法时抛出。
+    :raises CliFinsUsageError: ticker、source、material form 或 FMP 输入非法时抛出。
     :raises UploadBatchPlanUsageError: Fins batch helper 判断输入非法时抛出。
     :raises UploadBatchPlanEmptyError: 源目录无可识别文件时抛出。
-    :raises OSError: 输出文件写入失败时由底层抛出。
+    :raises RuntimeError: FMP 结果与用户 canonical ticker 冲突时抛出。
+    :raises OSError: 脚本发布失败时由底层抛出。
     """
 
-    ticker = _parse_ticker_csv(args.ticker)
     if args.source_dir is None or args.source_dir.strip() == "":
         raise CliFinsUsageError("--from must not be empty")
+    ticker = _parse_ticker_csv(args.ticker)
+    explicit_company_name = _optional_stripped_text(args.company_name)
+    aliases = ticker.aliases
+    company_name = explicit_company_name
+    if args.infer:
+        api_key = os.environ.get(_FMP_API_KEY_ENV)
+        if api_key is None or api_key.strip() == "":
+            raise CliFinsUsageError("--infer requires non-empty FMP_API_KEY")
+        resolved_info = FmpCompanyInfoResolver(api_key=api_key).resolve_company_info(
+            ticker.canonical
+        )
+        if resolved_info.canonical_ticker != ticker.canonical:
+            raise RuntimeError(
+                "FMP resolved canonical ticker does not match the requested ticker"
+            )
+        aliases = _merge_ticker_aliases(
+            canonical=ticker.canonical,
+            explicit_aliases=ticker.aliases,
+            resolved_aliases=resolved_info.ticker_aliases,
+        )
+        if company_name is None:
+            company_name = resolved_info.company_name
+    material_form = _single_batch_material_form(args.material_forms)
+    workspace_root = _resolve_workspace_root(args.workspace_root)
+    source_dir = Path(args.source_dir)
     plan = generate_upload_batch_plan(
         UploadBatchPlanRequest(
             ticker=ticker.canonical,
-            source_dir=Path(args.source_dir),
+            aliases=aliases,
+            source_dir=source_dir,
             action=cast(BatchUploadAction, args.action),
             recursive=args.recursive,
             fiscal_year=args.fiscal_year,
-            fiscal_period=_optional_stripped_text(args.fiscal_period),
+            fiscal_period=cast(
+                FiscalPeriod | None,
+                _optional_stripped_text(args.fiscal_period),
+            ),
             amended=args.amended,
             filing_date=_optional_stripped_text(args.filing_date),
             report_date=_optional_stripped_text(args.report_date),
-            company_name=_optional_stripped_text(args.company_name),
-            material_forms=_normalized_text_tuple(
-                args.material_forms,
-                field_name="--material-forms",
-            ),
+            company_name=company_name,
+            overwrite=args.overwrite,
+            material_form=material_form,
         )
     )
-    serialized_plan = _render_upload_batch_plan(plan.entries)
-    if args.output is None:
-        print(serialized_plan, end="")
-        return EXIT_SUCCESS
-    output_path = Path(args.output).expanduser().resolve(strict=False)
-    output_path.write_text(serialized_plan, encoding="utf-8")
+    commands = tuple(
+        _upload_batch_command_argv(entry, workspace_root=workspace_root)
+        for entry in (*plan.recognized_entries, *plan.material_entries)
+    )
+    platform = current_upload_script_platform()
+    content = render_upload_script(
+        commands,
+        regeneration_argv=_upload_batch_regeneration_argv(
+            args=args,
+            ticker=ticker,
+            source_dir=source_dir,
+            explicit_company_name=explicit_company_name,
+            material_form=material_form,
+        ),
+        platform=platform,
+    )
+    script_path = publish_upload_script(
+        workspace_root=workspace_root,
+        output=Path(args.output) if args.output is not None else None,
+        canonical_ticker=ticker.canonical,
+        platform=platform,
+        content=content,
+    )
+    _render_upload_batch_summary(
+        script_path=script_path,
+        recognized_count=len(plan.recognized_entries),
+        material_count=len(plan.material_entries),
+        skipped_entries=plan.skipped_entries,
+    )
     return EXIT_SUCCESS
 
 
-def _render_upload_batch_plan(entries: tuple[UploadBatchPlanEntry, ...]) -> str:
-    """把上传计划序列化为跨平台 JSON argv 公共契约。
+def _upload_batch_command_argv(
+    entry: UploadBatchFilingEntry | UploadBatchMaterialEntry,
+    *,
+    workspace_root: Path,
+) -> tuple[str, ...]:
+    """把单条 Fins typed entry 机械投影为 current CLI argv。
 
-    :param entries: Fins batch helper 返回的结构化计划条目。
-    :returns: 含 schema version 与 argv 数组的 JSON 文本。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    commands: list[JsonValue] = [list(_upload_batch_command_argv(entry)) for entry in entries]
-    payload: dict[str, JsonValue] = {
-        _UPLOAD_BATCH_SCHEMA_VERSION_FIELD: _UPLOAD_BATCH_SCHEMA_VERSION,
-        _UPLOAD_BATCH_COMMANDS_FIELD: commands,
-    }
-    return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-
-
-def _upload_batch_command_argv(entry: UploadBatchPlanEntry) -> tuple[str, ...]:
-    """构造单条上传命令的结构化 argv。
-
-    :param entry: 结构化上传计划条目。
+    :param entry: Fins owner 产生的 filing 或 material entry。
+    :param workspace_root: 每条 direct upload 使用的 workspace root。
     :returns: 不经过 shell quoting 的 argv 元组。
     :raises Exception: 不主动抛出异常。
     """
 
+    command_name = (
+        COMMAND_UPLOAD_FILING
+        if isinstance(entry, UploadBatchFilingEntry)
+        else COMMAND_UPLOAD_MATERIAL
+    )
     parts = [
-        "dayu-cli",
-        entry.command_name,
+        "python",
+        "-m",
+        "dayu.cli",
+        command_name,
+        _BASE_OPTION,
+        str(workspace_root),
         "--ticker",
-        entry.ticker,
-        "--action",
-        entry.action,
+        ",".join((entry.ticker, *entry.aliases)),
     ]
-    if entry.command_name == COMMAND_UPLOAD_MATERIAL:
-        if entry.form_type is not None:
-            parts.extend(("--forms", entry.form_type))
-        if entry.material_name is not None:
-            parts.extend(("--material-name", entry.material_name))
-    parts.append("--files")
-    parts.extend(str(path) for path in entry.files)
+    if entry.action != "auto":
+        parts.extend(("--action", entry.action))
+    if isinstance(entry, UploadBatchMaterialEntry):
+        parts.extend(("--forms", entry.form_type))
+        parts.extend(("--material-name", entry.material_name))
+    parts.extend(("--files", str(entry.file)))
     _append_optional_entry_metadata(parts, entry)
     return tuple(parts)
 
 
 def _append_optional_entry_metadata(
     parts: list[str],
-    entry: UploadBatchPlanEntry,
+    entry: UploadBatchFilingEntry | UploadBatchMaterialEntry,
 ) -> None:
     """向命令参数列表追加可选 metadata flags。
 
@@ -380,6 +435,94 @@ def _append_optional_entry_metadata(
         parts.extend(("--report-date", entry.report_date))
     if entry.company_name is not None:
         parts.extend(("--company-name", entry.company_name))
+    if entry.overwrite:
+        parts.append("--overwrite")
+
+
+def _upload_batch_regeneration_argv(
+    *,
+    args: ParsedCliArgs,
+    ticker: CliTickerInput,
+    source_dir: Path,
+    explicit_company_name: str | None,
+    material_form: str | None,
+) -> tuple[str, ...]:
+    """从用户显式生成参数构造无 secret 的再生成 argv。
+
+    :param args: argparse 解析结果。
+    :param ticker: 已规范化的用户 ticker CSV。
+    :param source_dir: 用户 source directory。
+    :param explicit_company_name: 用户显式 company name，不含 FMP 推断值。
+    :param material_form: 已规范化单一 material form 候选。
+    :returns: 可安全写入注释的 argv。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    parts = [
+        "python",
+        "-m",
+        "dayu.cli",
+        COMMAND_UPLOAD_FILINGS_FROM,
+        _BASE_OPTION,
+        args.workspace_root,
+        "--ticker",
+        ",".join((ticker.canonical, *ticker.aliases)),
+        "--from",
+        str(source_dir),
+    ]
+    if args.action != "auto":
+        parts.extend(("--action", args.action))
+    if args.output is not None:
+        parts.extend(("--output", args.output))
+    if args.recursive:
+        parts.append("--recursive")
+    if args.fiscal_year is not None:
+        parts.extend(("--fiscal-year", str(args.fiscal_year)))
+    fiscal_period = _optional_stripped_text(args.fiscal_period)
+    if fiscal_period is not None:
+        parts.extend(("--fiscal-period", fiscal_period))
+    if args.amended:
+        parts.append("--amended")
+    if args.filing_date is not None:
+        parts.extend(("--filing-date", args.filing_date))
+    if args.report_date is not None:
+        parts.extend(("--report-date", args.report_date))
+    if explicit_company_name is not None:
+        parts.extend(("--company-name", explicit_company_name))
+    if material_form is not None:
+        parts.extend(("--material-forms", material_form))
+    if args.infer:
+        parts.append("--infer")
+    if args.overwrite:
+        parts.append("--overwrite")
+    return tuple(parts)
+
+
+def _render_upload_batch_summary(
+    *,
+    script_path: Path,
+    recognized_count: int,
+    material_count: int,
+    skipped_entries: tuple[UploadBatchSkippedEntry, ...],
+) -> None:
+    """输出用户可读的脚本生成摘要。
+
+    :param script_path: 已发布脚本绝对路径。
+    :param recognized_count: filing 数量。
+    :param material_count: material 数量。
+    :param skipped_entries: Fins owner 跳过事实。
+    :returns: ``None``。
+    :raises OSError: stdout 写入失败时由 ``print`` 透传。
+    """
+
+    print(f"Generated upload script: {script_path}")
+    print(f"Recognized filings: {recognized_count}")
+    print(f"Material files: {material_count}")
+    print(f"Skipped files: {len(skipped_entries)}")
+    for skipped in skipped_entries:
+        print(
+            f"Skipped [{skipped.reason_code}] {skipped.path}: {skipped.reason}"
+        )
 
 
 def _open_direct_stream(
@@ -903,17 +1046,55 @@ def _parse_ticker_csv(raw_value: str | None) -> CliTickerInput:
 
     :param raw_value: ``--ticker`` 原始值。
     :returns: CLI ticker 输入。
-    :raises CliFinsUsageError: ticker 缺失或 canonical 为空时抛出。
+    :raises CliFinsUsageError: ticker 缺失、空项或任一 token 无法规范化时抛出。
     """
 
     if raw_value is None:
         raise CliFinsUsageError(_EMPTY_TICKER_MESSAGE)
     parts = tuple(part.strip() for part in raw_value.split(","))
-    canonical = parts[0] if parts else ""
-    if canonical == "":
+    if not parts or any(part == "" for part in parts):
         raise CliFinsUsageError(_EMPTY_TICKER_MESSAGE)
-    aliases = tuple(part for part in parts[1:] if part != "")
+    try:
+        canonical = normalize_ticker(parts[0]).canonical
+        normalized_aliases = tuple(
+            normalize_ticker(alias).canonical for alias in parts[1:]
+        )
+    except ValueError as exc:
+        raise CliFinsUsageError(str(exc)) from exc
+    aliases = _merge_ticker_aliases(
+        canonical=canonical,
+        explicit_aliases=normalized_aliases,
+        resolved_aliases=(),
+    )
     return CliTickerInput(canonical=canonical, aliases=aliases)
+
+
+def _merge_ticker_aliases(
+    *,
+    canonical: str,
+    explicit_aliases: tuple[str, ...],
+    resolved_aliases: tuple[str, ...],
+) -> tuple[str, ...]:
+    """按显式优先顺序合并已由各自 owner 规范化的 ticker aliases。
+
+    :param canonical: 用户 canonical ticker。
+    :param explicit_aliases: CLI strict normalizer 产生的显式 aliases。
+    :param resolved_aliases: FMP resolver public contract 产生的 aliases。
+    :returns: 排除 canonical 后的稳定去重 aliases。
+    :raises RuntimeError: resolver 返回空 alias 时抛出。
+    """
+
+    aliases: list[str] = []
+    seen = {canonical}
+    for raw_alias in (*explicit_aliases, *resolved_aliases):
+        alias = raw_alias.strip()
+        if alias == "":
+            raise RuntimeError("FMP resolver returned an empty ticker alias")
+        if alias in seen:
+            continue
+        seen.add(alias)
+        aliases.append(alias)
+    return tuple(aliases)
 
 
 def _validated_upload_files(raw_files: list[str] | None) -> tuple[Path, ...]:
@@ -980,6 +1161,24 @@ def _single_optional_form(values: list[str] | None) -> str | None:
     if not normalized:
         return None
     return normalized[0]
+
+
+def _single_batch_material_form(
+    values: list[str] | None,
+) -> str | None:
+    """读取 batch 可选单一 material form override。
+
+    :param values: ``--material-forms`` 输入。
+    :returns: 规范化的单一 material form 候选；未传入时返回 ``None``。
+    :raises CliFinsUsageError: 传入多个 form 时抛出。
+    """
+
+    normalized = _normalized_text_tuple(values, field_name="--material-forms")
+    if len(normalized) > 1:
+        raise CliFinsUsageError(_MULTIPLE_BATCH_MATERIAL_FORMS_MESSAGE)
+    if not normalized:
+        return None
+    return normalized[0].upper()
 
 
 def _document_ids_from_arg(raw_value: str | list[str] | None) -> tuple[str, ...]:
