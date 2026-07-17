@@ -100,7 +100,7 @@ fixture 或 Service 下游补 OLD 规则，也不得让 Fins 拼 executable/flag
 | R11 placeholder/source 零残留 scan | 基于直接代码证据细化 | `tests/tools/web/test_web_tools_provider.py` 与 `test_diagnose_web_access.py` 的 `"dayu.web"` 是禁止恢复旧 UI import 的负向 boundary sentinel，必须保留；§8 只扫 public scripts/package files/importable archive/README unavailable claims，并对两个 sentinel 做正向精确断言，不做全仓裸 `dayu.web` 零命中。 |
 | upload JSON 零残留 scan | 基于直接代码证据细化 | 仓库其它 ingestion/storage `schema_version` 合法；§8 仅扫 `_UPLOAD_BATCH_SCHEMA*`、`_render_upload_batch_plan`、相邻 `schema_version/commands/argv` 与 JSON-argv 文案。 |
 | changed production coverage `>=80%` | 保留并纠偏为 line coverage | AGENTS/umbrella §7 要求每个实际 changed production Python file 的普通 line coverage；§8 不使用 `--branch`，逐文件读取 coverage JSON `summary.percent_covered >= 80.00`。 |
-| generic build frontend smoke | 以可执行 wheel 验证替换 | 锁定 `.venv` 缺少额外 build frontend，且 R11 不授权增加 build 依赖；当前 `python -m pip wheel` 可用。§7/§8 使用 `pip wheel --no-deps --no-build-isolation`，直接检查 wheel metadata/archive并做隔离安装 smoke；不虚构未验证的 source archive owner。 |
+| generic build frontend smoke | 以可执行 wheel 验证替换 | 锁定 `.venv` 缺少额外 build frontend，且 R11 不授权增加 build 依赖；当前 `python -m pip wheel` 可用。§7/§8 使用 `pip wheel --no-deps --no-build-isolation` 只构建当前 project wheel并检查 metadata/archive；可运行性由 fresh venv 对 exact built wheel 做一次 macOS arm64 / Python 3.11 constrained normal install、`pip check`、真实 help 与 importability smoke。两类 oracle 分离，不虚构未验证的 source archive owner。 |
 | sub-WU slices/review/accepted commit | 依 R11-IMP-BF01 收窄为两个可验证 slices | accepted-plan amendment commit 后顺序实施 `R11-I1 atomic cutover -> R11-I2 packaging`；I1 仅在 WP-A+WP-B 一起 cutover 并完成全部 cumulative validation 后做一次 Controller checkpoint，I2 后再做一次 checkpoint；随后对完整 cumulative diff 做固定双 review/fix/re-review并只创建一个 accepted sub-WU commit，详见 §9，不发明 work-package/slice commit 或旁路 review。 |
 
 ## 3. Goal、success signals 与 forbidden scope
@@ -644,7 +644,8 @@ rm -rf workspace/tmp/r11-dist workspace/tmp/r11-wheel-extract workspace/tmp/r11-
 python -m pip wheel --no-deps --no-build-isolation --wheel-dir workspace/tmp/r11-dist .
 python -c "from pathlib import Path; import zipfile; wheels=tuple(Path('workspace/tmp/r11-dist').glob('dayu_agent-*.whl')); assert len(wheels) == 1, f'expected exactly one wheel, got: {wheels}'; zipfile.ZipFile(wheels[0]).extractall('workspace/tmp/r11-wheel-extract')"
 python -m venv workspace/tmp/r11-wheel-venv
-python -c "from pathlib import Path; import subprocess; wheels=tuple(Path('workspace/tmp/r11-dist').glob('dayu_agent-*.whl')); assert len(wheels) == 1, f'expected exactly one wheel, got: {wheels}'; subprocess.run(('workspace/tmp/r11-wheel-venv/bin/python', '-m', 'pip', 'install', '--no-deps', str(wheels[0])), check=True)"
+python -c "from pathlib import Path; import subprocess; wheels=tuple(Path('workspace/tmp/r11-dist').glob('dayu_agent-*.whl')); assert len(wheels) == 1, f'expected exactly one wheel, got: {wheels}'; subprocess.run(('workspace/tmp/r11-wheel-venv/bin/python', '-m', 'pip', 'install', '--constraint', 'constraints/lock-macos-arm64-py311.txt', str(wheels[0])), check=True)"
+workspace/tmp/r11-wheel-venv/bin/python -m pip check
 workspace/tmp/r11-wheel-venv/bin/python -m dayu.cli --help
 workspace/tmp/r11-wheel-venv/bin/python -m dayu.cli upload_filings_from --help
 workspace/tmp/r11-wheel-venv/bin/python -c "import importlib.util; assert all(importlib.util.find_spec(name) is None for name in ('dayu.web', 'dayu.wechat', 'dayu.render'))"
@@ -655,8 +656,11 @@ python -c "from pathlib import Path; import csv; root=Path('workspace/tmp/r11-wh
 ```
 
 wheel `METADATA` 必须无 `Provides-Extra: web` 与 Streamlit requirement，`entry_points.txt` 只含真实 scripts，archive 中必须零
-`dayu/web`、`dayu/wechat`、`dayu/render`；隔离安装后两个真实 help command 成功且无 placeholder/JSON claims。所有
-build/extract/install 只在 `workspace/tmp`。四个 Python negative oracle 均必须 exit 0，且 stdout 依次精确包含
+`dayu/web`、`dayu/wechat`、`dayu/render`。fresh venv 只允许对 exact built wheel 做上述一次 normal constrained install：
+constraints 真源固定为当前平台 `constraints/lock-macos-arm64-py311.txt`，不得先做 `--no-deps` install、重复安装同一 wheel
+或依赖 pip 的偶然重装行为；安装必须解析并安装 wheel 声明的 runtime dependencies，随后 `pip check`、两个真实 help command
+与 placeholder package importability oracle全部成功。所有 build/extract/install 输出只在 `workspace/tmp`。四个 Python
+archive negative oracle 均必须 exit 0，且 stdout 依次精确包含
 `wheel METADATA placeholder contracts: 0`、`wheel placeholder entry points: 0`、
 `wheel extracted placeholder paths: 0`、`wheel RECORD placeholder paths: 0`；任一命中、缺少或出现多个 wheel/dist-info
 文件都以 assertion 非零退出并打印 exact hits。wheel 与 dist-info 选择由 Python exact-one assertion 完成，不依赖 shell
@@ -664,8 +668,11 @@ wildcard 展开。importability assertion 也必须 exit 0。archive/RECORD orac
 治理 working tree untracked `__pycache__`，也不把合法 `top_level.txt=dayu` 当残留。
 
 Slice stop：删除项仍被 production import/entrypoint 引用、optional dependency 兼有真实非-placeholder owner、wheel 仍含
-package/extra/requirement、需要实现 tracker 能力、Windows workflow 需 secrets或无法运行真实 cmd、或 README 职责越界时
-立即 stop。`R11-I2` 通过 Controller exact allowlist/contract/test/smoke checkpoint 后进入一次 cumulative review，不做
+package/extra/requirement、fresh constrained dependency resolution/install 失败、`pip check` 非零、任一真实 help/importability
+oracle 失败、需要实现 tracker 能力、Windows workflow 需 secrets或无法运行真实 cmd、或 README 职责越界时立即 stop。
+这些 fresh-venv failure 是真实 packaging gate failure；不得改回 runtime `--no-deps` install，不得以 lazy import、fallback、
+fixture/sys.path shim、修改 constraints/lock 或扩大 I2 product/test 范围补偿。`R11-I2` 通过 Controller exact
+allowlist/contract/test/smoke checkpoint 后进入一次 cumulative review，不做
 slice acceptance 或中间 implementation commit；除上述唯一 root README contract-test node 外，本 slice 不回改或扩张
 `R11-I1` production/test 范围。
 
@@ -691,6 +698,13 @@ packaging/wheel/README/placeholder/Windows evidence；还必须验证 I2 exact `
 状态，不得复用 I1 结果冒充 final pass。仅在 I1 尚未修改的 packaging
 placeholder negative oracle 会保留到 I2 后判零，其余 I1-scope gate 均不得推迟。任何时点都不得放宽当前 full pyright
 `0 errors` 要求；其余产品、security、deferred、Windows 与 Ruff gates 同样保持不变。
+
+I2 local wheel runtime gate 必须保持两类证据分离：`pip wheel --no-deps --no-build-isolation` 与全部 archive/METADATA/
+entrypoint/RECORD 负向 oracle证明构建产物边界；fresh venv 则只对 exact built wheel做一次
+`constraints/lock-macos-arm64-py311.txt` constrained normal install，再按顺序运行 `pip check`、两个真实 help 与
+importability oracle。依赖解析、下载或安装失败、lock 冲突、`pip check` 非零或任一 runtime oracle 失败都是真实 final
+packaging validation failure，必须按 §7.3 stop；不得用 runtime `--no-deps`、重复 install、lazy import/fallback、fixture shim
+或 lock/workflow 修改绕过。本 local correction 不改变 §7.2 Windows workflow 的 install command或真实 Windows release gate。
 
 ```bash
 source .venv/bin/activate
@@ -915,8 +929,11 @@ Windows release blocker；真正 release closeout 时三者均为 0。
 - [ ] POSIX recorder + real Service/Fins storage smoke可执行。
 - [ ] repo/GitHub 无 workflow事实与最小 Windows workflow filename/triggers/artifact locator被接受。
 - [ ] Windows outcome/invariants/oracle固定；具体 algorithm 保留给真实 runner反证，不存在 `list2cmdline`/fallback/shim。
-- [ ] placeholder deletion、wheel metadata/extracted names/RECORD、README触发、line coverage、full tests/pyright/Ruff 同版本
-      baseline/scans完整。
+- [ ] placeholder deletion、wheel metadata/extracted names/RECORD archive 负向 oracle完整；wheel build 仍为
+      `--no-deps --no-build-isolation`，fresh venv 只对 exact built wheel做一次
+      `constraints/lock-macos-arm64-py311.txt` normal constrained install，随后 `pip check`、两个真实 help 与 importability
+      全部成功；dependency install/runtime oracle failure按真实 packaging gate stop，不以 runtime `--no-deps` 或 fallback绕过。
+- [ ] README触发、line coverage、full tests/pyright/Ruff 同版本 baseline/scans完整。
 - [ ] 根 README owner test 已删除旧全局 `--infer` 禁止与 JSON/no-shell 正向 assertions，改为 batch-only infer、no JSON argv、
       executable `.sh`/`.cmd` current contract；同文件其它 parser/help nodes 与另外七个 I1 paths保持 protected。
 - [ ] full pyright 保持零新增/扩散且不放宽；old/new dual surface、compatibility seam、CLI fallback/重算均为零。
