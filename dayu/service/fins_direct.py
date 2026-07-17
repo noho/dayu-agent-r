@@ -1,8 +1,8 @@
 """Fins direct command 的 Service 流式边界。
 
 本模块为 CLI、未来 GUI 或内部 product entrypoint 提供共享的 Fins direct
-执行语义：构造 typed Fins ingestion request，并把 runtime direct stream 作为
-``AsyncIterator[FinsEvent]`` 暴露给调用方。它不解析 CLI 参数，不处理
+执行语义：构造 typed Fins ingestion request，并把 runtime 返回的同一个
+``ValidatedFinsEventStream`` 暴露给调用方。它不解析 CLI 参数，不处理
 stdout/stderr，不读取 Fins storage，也不暴露后台 job id、sidecar cursor 或
 durable cancel API。
 """
@@ -10,7 +10,6 @@ durable cancel API。
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Protocol
@@ -21,12 +20,9 @@ from dayu.fins.direct_events import (
     FINS_RESULT_EXIT_CANCELLED,
     FINS_RESULT_EXIT_FAILURE,
     FINS_RESULT_EXIT_SUCCESS,
-    FinsDirectStreamProtocolError,
-    FinsDirectStreamProtocolErrorKind,
-    FinsEvent,
-    FinsEventType,
     FinsOperationKind,
 )
+from dayu.fins.direct_stream import ValidatedFinsEventStream
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ingestion_runtime import (
     FinsDownloadRequest,
@@ -56,12 +52,12 @@ class FinsDirectIngestionRuntime(Protocol):
         request: FinsDownloadRequest,
         *,
         cancellation_token: CancellationToken | None = None,
-    ) -> AsyncIterator[FinsEvent]:
+    ) -> ValidatedFinsEventStream:
         """执行下载 direct stream。
 
         :param request: 下载请求。
         :param cancellation_token: 可选 operation-scoped 取消 token。
-        :returns: Fins direct 事件异步迭代器。
+        :returns: Fins owner 已验证的 direct 事件流。
         :raises Exception: runtime 执行失败时由具体实现抛出。
         """
 
@@ -72,12 +68,12 @@ class FinsDirectIngestionRuntime(Protocol):
         request: FinsPreprocessRequest,
         *,
         cancellation_token: CancellationToken | None = None,
-    ) -> AsyncIterator[FinsEvent]:
+    ) -> ValidatedFinsEventStream:
         """执行预处理 direct stream。
 
         :param request: 预处理请求。
         :param cancellation_token: 可选 operation-scoped 取消 token。
-        :returns: Fins direct 事件异步迭代器。
+        :returns: Fins owner 已验证的 direct 事件流。
         :raises Exception: runtime 执行失败时由具体实现抛出。
         """
 
@@ -88,12 +84,12 @@ class FinsDirectIngestionRuntime(Protocol):
         request: FinsUploadRequest,
         *,
         cancellation_token: CancellationToken | None = None,
-    ) -> AsyncIterator[FinsEvent]:
+    ) -> ValidatedFinsEventStream:
         """执行上传 direct stream。
 
         :param request: filing 或 material 上传请求。
         :param cancellation_token: 可选 operation-scoped 取消 token。
-        :returns: Fins direct 事件异步迭代器。
+        :returns: Fins owner 已验证的 direct 事件流。
         :raises Exception: runtime 执行失败时由具体实现抛出。
         """
 
@@ -174,7 +170,7 @@ class FinsDirectCommandService:
         overwrite_existing: bool = False,
         rebuild_processed: bool = False,
         cancellation_token: CancellationToken | None = None,
-    ) -> AsyncIterator[FinsEvent]:
+    ) -> ValidatedFinsEventStream:
         """执行 Fins 下载 direct stream。
 
         :param ticker: canonical ticker 文本。
@@ -184,7 +180,7 @@ class FinsDirectCommandService:
         :param overwrite_existing: 是否覆盖已有 source document。
         :param rebuild_processed: 是否请求重建 processed 产物。
         :param cancellation_token: 可选 operation-scoped 取消 token。
-        :returns: Fins direct 事件异步迭代器。
+        :returns: runtime 返回的同一个 Fins owner 已验证事件流。
         :raises Exception: request 构造或 runtime 执行失败时由底层抛出。
         """
 
@@ -202,12 +198,9 @@ class FinsDirectCommandService:
             overwrite_existing=overwrite_existing,
             rebuild_processed=rebuild_processed,
         )
-        return _ensure_result_event(
-            self._runtime.download(request, cancellation_token=cancellation_token),
-            operation_kind=FinsOperationKind.DOWNLOAD,
-            ticker=ticker,
-            filing_kind=None,
-            document_label=None,
+        return self._runtime.download(
+            request,
+            cancellation_token=cancellation_token,
         )
 
     def process(
@@ -219,7 +212,7 @@ class FinsDirectCommandService:
         form_types: tuple[str, ...] = (),
         rebuild_processed: bool = False,
         cancellation_token: CancellationToken | None = None,
-    ) -> AsyncIterator[FinsEvent]:
+    ) -> ValidatedFinsEventStream:
         """执行通用 Fins 预处理 direct stream。
 
         :param ticker: canonical ticker 文本。
@@ -228,7 +221,7 @@ class FinsDirectCommandService:
         :param form_types: 可选表单过滤。
         :param rebuild_processed: 是否允许重建 processed 产物。
         :param cancellation_token: 可选 operation-scoped 取消 token。
-        :returns: Fins direct 事件异步迭代器。
+        :returns: runtime 返回的同一个 Fins owner 已验证事件流。
         :raises Exception: request 构造或 runtime 执行失败时由底层抛出。
         """
 
@@ -250,7 +243,7 @@ class FinsDirectCommandService:
         form_types: tuple[str, ...] = (),
         rebuild_processed: bool = False,
         cancellation_token: CancellationToken | None = None,
-    ) -> AsyncIterator[FinsEvent]:
+    ) -> ValidatedFinsEventStream:
         """执行 filing 预处理 direct stream。
 
         :param ticker: canonical ticker 文本。
@@ -258,7 +251,7 @@ class FinsDirectCommandService:
         :param form_types: 可选表单过滤。
         :param rebuild_processed: 是否允许重建 processed 产物。
         :param cancellation_token: 可选 operation-scoped 取消 token。
-        :returns: Fins direct 事件异步迭代器。
+        :returns: runtime 返回的同一个 Fins owner 已验证事件流。
         :raises Exception: request 构造或 runtime 执行失败时由底层抛出。
         """
 
@@ -280,7 +273,7 @@ class FinsDirectCommandService:
         form_types: tuple[str, ...] = (),
         rebuild_processed: bool = False,
         cancellation_token: CancellationToken | None = None,
-    ) -> AsyncIterator[FinsEvent]:
+    ) -> ValidatedFinsEventStream:
         """执行 material 预处理 direct stream。
 
         :param ticker: canonical ticker 文本。
@@ -288,7 +281,7 @@ class FinsDirectCommandService:
         :param form_types: 可选表单过滤。
         :param rebuild_processed: 是否允许重建 processed 产物。
         :param cancellation_token: 可选 operation-scoped 取消 token。
-        :returns: Fins direct 事件异步迭代器。
+        :returns: runtime 返回的同一个 Fins owner 已验证事件流。
         :raises Exception: request 构造或 runtime 执行失败时由底层抛出。
         """
 
@@ -317,7 +310,7 @@ class FinsDirectCommandService:
         ticker_aliases: tuple[str, ...] = (),
         overwrite: bool = False,
         cancellation_token: CancellationToken | None = None,
-    ) -> AsyncIterator[FinsEvent]:
+    ) -> ValidatedFinsEventStream:
         """执行 filing 上传 direct stream。
 
         :param ticker: canonical ticker 文本。
@@ -332,7 +325,7 @@ class FinsDirectCommandService:
         :param ticker_aliases: ticker 别名，仅传给支持该字段的 upload request。
         :param overwrite: 是否允许覆盖已有文档。
         :param cancellation_token: 可选 operation-scoped 取消 token。
-        :returns: Fins direct 事件异步迭代器。
+        :returns: runtime 返回的同一个 Fins owner 已验证事件流。
         :raises Exception: request 构造或 runtime 执行失败时由底层抛出。
         """
 
@@ -350,12 +343,9 @@ class FinsDirectCommandService:
             ticker_aliases=ticker_aliases,
             overwrite=overwrite,
         )
-        return _ensure_result_event(
-            self._runtime.upload(request, cancellation_token=cancellation_token),
-            operation_kind=FinsOperationKind.UPLOAD_FILING,
-            ticker=ticker,
-            filing_kind="filing",
-            document_label=None,
+        return self._runtime.upload(
+            request,
+            cancellation_token=cancellation_token,
         )
 
     def upload_material(
@@ -377,7 +367,7 @@ class FinsDirectCommandService:
         ticker_aliases: tuple[str, ...] = (),
         overwrite: bool = False,
         cancellation_token: CancellationToken | None = None,
-    ) -> AsyncIterator[FinsEvent]:
+    ) -> ValidatedFinsEventStream:
         """执行 material 上传 direct stream。
 
         :param ticker: canonical ticker 文本。
@@ -396,7 +386,7 @@ class FinsDirectCommandService:
         :param ticker_aliases: ticker 别名，仅传给支持该字段的 upload request。
         :param overwrite: 是否允许覆盖已有文档。
         :param cancellation_token: 可选 operation-scoped 取消 token。
-        :returns: Fins direct 事件异步迭代器。
+        :returns: runtime 返回的同一个 Fins owner 已验证事件流。
         :raises Exception: request 构造或 runtime 执行失败时由底层抛出。
         """
 
@@ -418,12 +408,9 @@ class FinsDirectCommandService:
             ticker_aliases=ticker_aliases,
             overwrite=overwrite,
         )
-        return _ensure_result_event(
-            self._runtime.upload(request, cancellation_token=cancellation_token),
-            operation_kind=FinsOperationKind.UPLOAD_MATERIAL,
-            ticker=ticker,
-            filing_kind=form_type,
-            document_label=material_name,
+        return self._runtime.upload(
+            request,
+            cancellation_token=cancellation_token,
         )
 
     def _preprocess(
@@ -436,7 +423,7 @@ class FinsDirectCommandService:
         form_types: tuple[str, ...],
         rebuild_processed: bool,
         cancellation_token: CancellationToken | None,
-    ) -> AsyncIterator[FinsEvent]:
+    ) -> ValidatedFinsEventStream:
         """构造预处理请求并返回 direct stream。
 
         :param operation_kind: Service direct command 对应的业务操作类型。
@@ -446,7 +433,7 @@ class FinsDirectCommandService:
         :param form_types: 可选表单过滤。
         :param rebuild_processed: 是否允许重建 processed 产物。
         :param cancellation_token: 可选 operation-scoped 取消 token。
-        :returns: Fins direct 事件异步迭代器。
+        :returns: runtime 返回的同一个 Fins owner 已验证事件流。
         :raises Exception: request 构造或 runtime 执行失败时由底层抛出。
         """
 
@@ -463,54 +450,10 @@ class FinsDirectCommandService:
             form_types=form_types,
             rebuild_processed=rebuild_processed,
         )
-        return _ensure_result_event(
-            self._runtime.preprocess(request, cancellation_token=cancellation_token),
-            operation_kind=operation_kind,
-            ticker=ticker,
-            filing_kind=None,
-            document_label=None,
+        return self._runtime.preprocess(
+            request,
+            cancellation_token=cancellation_token,
         )
-
-
-async def _ensure_result_event(
-    events: AsyncIterator[FinsEvent],
-    *,
-    operation_kind: FinsOperationKind,
-    ticker: str | None,
-    filing_kind: str | None,
-    document_label: str | None,
-) -> AsyncIterator[FinsEvent]:
-    """保证 direct stream 正常结束时存在唯一 RESULT。
-
-    :param events: runtime 返回的 direct event stream。
-    :param operation_kind: 当前 Service direct 操作类型。
-    :param ticker: 当前 ticker 文本。
-    :param filing_kind: 可选财报类型短标签。
-    :param document_label: 可选文档短标签。
-    :returns: Fins direct 事件异步迭代器。
-    :raises FinsDirectStreamProtocolError: runtime 未产出 RESULT 或产出重复 RESULT 时抛出。
-    :raises Exception: runtime stream 迭代失败时原样透传。
-    """
-
-    result_event: FinsEvent | None = None
-    async for event in events:
-        if event.event_type is FinsEventType.RESULT:
-            if result_event is not None:
-                raise FinsDirectStreamProtocolError(
-                    FinsDirectStreamProtocolErrorKind.DUPLICATE_RESULT,
-                    operation_kind,
-                    "Fins direct stream produced multiple RESULT events",
-                )
-            result_event = event
-            continue
-        yield event
-    if result_event is None:
-        raise FinsDirectStreamProtocolError(
-            FinsDirectStreamProtocolErrorKind.MISSING_RESULT,
-            operation_kind,
-            "Fins direct stream ended without RESULT",
-        )
-    yield result_event
 
 
 __all__: tuple[str, ...] = (

@@ -27,8 +27,6 @@ from dayu.fins.domain.enums import SourceKind
 from dayu.fins import ingestion_runtime
 from dayu.fins.direct_events import (
     FinsErrorKind,
-    FinsDirectStreamProtocolError,
-    FinsDirectStreamProtocolErrorKind,
     FinsEvent,
     FinsEventType,
     FinsOperationKind,
@@ -684,6 +682,67 @@ class _CancellationAwareDownloadAdapter(FinsSourceDownloadAdapter):
                 discovered_count=1,
                 downloaded_count=1,
                 written_document_ids=("aapl-cancel-aware-10k",),
+            ),
+        )
+
+
+class _ConsumerAbortDownloadAdapter(FinsSourceDownloadAdapter):
+    """以同步 barrier 观察 direct consumer abort 取消因果链的 adapter。"""
+
+    def __init__(self) -> None:
+        """初始化 adapter 的跨线程观察信号。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.entered = Event()
+        self.allow_cancellation_check = Event()
+        self.cancellation_checks: tuple[bool, ...] = ()
+        self.late_progress_returned = Event()
+
+    def download(self, request: FinsSourceDownloadAdapterRequest) -> FinsSourceDownloadAdapterResult:
+        """等待 consumer abort，再观察取消并尝试一次 late progress。
+
+        Args:
+            request: runtime 传入的下载请求。
+
+        Returns:
+            固定 persisted summary。
+
+        Raises:
+            TimeoutError: 测试没有在边界内释放 cancellation check 时抛出。
+            ValueError: late progress 事件违反 typed contract 时抛出。
+        """
+
+        self.entered.set()
+        if not self.allow_cancellation_check.wait(timeout=1.0):
+            raise TimeoutError("consumer abort cancellation check was not released")
+        self.cancellation_checks = self.cancellation_checks + (
+            request.cancellation_checker(),
+        )
+        if request.progress_sink is not None:
+            request.progress_sink(
+                FinsDownloadProgressEvent(
+                    stage="download.late_after_abort",
+                    message="consumer abort 后的迟到进度",
+                    document_id="fil-late-after-abort",
+                    file_name="late-after-abort.htm",
+                )
+            )
+        self.late_progress_returned.set()
+        return FinsSourceDownloadAdapterResult(
+            discovered_count=1,
+            persisted_summary=FinsDownloadResultSummary(
+                discovered_count=1,
+                downloaded_count=1,
+                written_document_ids=("fil-late-after-abort",),
             ),
         )
 
@@ -1856,157 +1915,6 @@ async def test_direct_download_unsupported_source_returns_failure_result(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_direct_stream_missing_result_raises_protocol_error(tmp_path: Path) -> None:
-    """direct producer 静默结束时 runtime 应抛 typed protocol error。"""
-
-    workspace_root = tmp_path / "fins-workspace"
-    ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
-    normalized = ticker_normalization.normalize_ticker("AAPL")
-
-    def quiet_producer(context: ingestion_runtime._FinsIngestionExecutionContext) -> None:
-        """模拟未产出 RESULT 的 producer。
-
-        Args:
-            context: direct stream 执行上下文。
-
-        Returns:
-            无。
-
-        Raises:
-            无。
-        """
-
-        del context
-
-    with pytest.raises(FinsDirectStreamProtocolError) as raised:
-        await _collect_direct_events(
-            ingestion._run_direct_stream(
-                operation_kind=FinsIngestionOperationKind.DOWNLOAD,
-                direct_operation_kind=FinsOperationKind.DOWNLOAD,
-                normalized=normalized,
-                source="fake",
-                source_kind=SourceKind.FILING,
-                cancellation_token=None,
-                producer=quiet_producer,
-            )
-        )
-
-    assert raised.value.reason is FinsDirectStreamProtocolErrorKind.MISSING_RESULT
-    assert raised.value.operation_kind is FinsOperationKind.DOWNLOAD
-
-
-@pytest.mark.asyncio
-async def test_direct_stream_duplicate_result_raises_protocol_error(tmp_path: Path) -> None:
-    """direct producer 重复投递 RESULT 时 runtime 应抛 typed protocol error。"""
-
-    workspace_root = tmp_path / "fins-workspace"
-    ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
-    normalized = ticker_normalization.normalize_ticker("AAPL")
-
-    def duplicate_result_producer(
-        context: ingestion_runtime._FinsIngestionExecutionContext,
-    ) -> None:
-        """模拟重复产出 RESULT 的 producer。
-
-        Args:
-            context: direct stream 执行上下文。
-
-        Returns:
-            无。
-
-        Raises:
-            无。
-        """
-
-        ingestion._emit_direct_result(
-            context,
-            status=FinsResultStatus.SUCCESS,
-            details=(),
-            error_kind=None,
-            error_message=None,
-        )
-        ingestion._emit_direct_result(
-            context,
-            status=FinsResultStatus.SUCCESS,
-            details=(),
-            error_kind=None,
-            error_message=None,
-        )
-
-    with pytest.raises(FinsDirectStreamProtocolError) as raised:
-        await _collect_direct_events(
-            ingestion._run_direct_stream(
-                operation_kind=FinsIngestionOperationKind.DOWNLOAD,
-                direct_operation_kind=FinsOperationKind.DOWNLOAD,
-                normalized=normalized,
-                source="fake",
-                source_kind=SourceKind.FILING,
-                cancellation_token=None,
-                producer=duplicate_result_producer,
-            )
-        )
-
-    assert raised.value.reason is FinsDirectStreamProtocolErrorKind.DUPLICATE_RESULT
-    assert raised.value.operation_kind is FinsOperationKind.DOWNLOAD
-
-
-@pytest.mark.asyncio
-async def test_direct_stream_drains_to_done_before_yielding_result(tmp_path: Path) -> None:
-    """正常 direct stream 通过 drain-until-sentinel 路径完成且不挂起。"""
-
-    workspace_root = tmp_path / "fins-workspace"
-    ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
-    normalized = ticker_normalization.normalize_ticker("AAPL")
-
-    def normal_producer(context: ingestion_runtime._FinsIngestionExecutionContext) -> None:
-        """模拟正常产出 progress 和 RESULT 的 producer。
-
-        Args:
-            context: direct stream 执行上下文。
-
-        Returns:
-            无。
-
-        Raises:
-            无。
-        """
-
-        ingestion._emit_context_progress(
-            context,
-            source_event_type="download_started",
-            message="下载已开始",
-            document_id=None,
-            payload={"ticker": "AAPL"},
-        )
-        ingestion._emit_direct_result(
-            context,
-            status=FinsResultStatus.SUCCESS,
-            details=(),
-            error_kind=None,
-            error_message=None,
-        )
-
-    events = await _collect_direct_events(
-        ingestion._run_direct_stream(
-            operation_kind=FinsIngestionOperationKind.DOWNLOAD,
-            direct_operation_kind=FinsOperationKind.DOWNLOAD,
-            normalized=normalized,
-            source="fake",
-            source_kind=SourceKind.FILING,
-            cancellation_token=None,
-            producer=normal_producer,
-        )
-    )
-
-    assert [event.event_type for event in events] == [
-        FinsEventType.PROGRESS,
-        FinsEventType.RESULT,
-    ]
-    assert events[-1].result is not None
-    assert events[-1].result.status is FinsResultStatus.SUCCESS
-
-
-@pytest.mark.asyncio
 async def test_direct_download_uses_operation_scoped_cancellation_token(tmp_path: Path) -> None:
     """direct download 取消应使用 operation-scoped token/checker 并返回 cancelled RESULT。"""
 
@@ -2032,6 +1940,49 @@ async def test_direct_download_uses_operation_scoped_cancellation_token(tmp_path
     assert events[-1].result is not None
     assert events[-1].result.status is FinsResultStatus.CANCELLED
     assert events[-1].result.exit_code == 130
+
+
+@pytest.mark.asyncio
+async def test_direct_consumer_abort_closes_raw_bridge_and_requests_cancellation(
+    tmp_path: Path,
+) -> None:
+    """consumer abort 必须经真实 raw generator finally 请求取消并阻止 late event。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: raw close、取消因果链或 late-publication fence 失效时抛出。
+    """
+
+    workspace_root = tmp_path / "fins-workspace"
+    adapter = _ConsumerAbortDownloadAdapter()
+    ingestion = _build_ingestion_runtime(
+        workspace_root,
+        executor=_HoldingExecutor(),
+        download_adapters={("abort", "US"): adapter},
+    )
+    stream = ingestion.download(
+        FinsDownloadRequest(ticker="AAPL", source="abort")
+    )
+
+    first_event = await anext(stream)
+    assert first_event.event_type is FinsEventType.PROGRESS
+    assert await asyncio.to_thread(adapter.entered.wait, 1.0)
+
+    await stream.aclose()
+    await stream.aclose()
+    adapter.allow_cancellation_check.set()
+
+    assert await asyncio.to_thread(adapter.late_progress_returned.wait, 1.0)
+    assert adapter.cancellation_checks == (True,)
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+    with pytest.raises(RuntimeError):
+        _ = stream.terminal_result
 
 
 def test_start_download_production_adapter_boundary_emits_progress_events(

@@ -189,9 +189,9 @@ parser，并把 typed mode 保存到独立私有 metadata，而不是改写 raw 
 
 `dayu.fins.ingestion_runtime.FinsIngestionRuntime` 是下载、预处理与上传的 typed runtime foundation。当前稳定入口分为 direct stream、awaiting observation 和 legacy durable job helpers：
 
-- `download(FinsDownloadRequest, *, cancellation_token: CancellationToken | None = None) -> AsyncIterator[FinsEvent]`
-- `preprocess(FinsPreprocessRequest, *, cancellation_token: CancellationToken | None = None) -> AsyncIterator[FinsEvent]`
-- `upload(FinsUploadRequest, *, cancellation_token: CancellationToken | None = None) -> AsyncIterator[FinsEvent]`
+- `def download(FinsDownloadRequest, *, cancellation_token: CancellationToken | None = None) -> ValidatedFinsEventStream`
+- `def preprocess(FinsPreprocessRequest, *, cancellation_token: CancellationToken | None = None) -> ValidatedFinsEventStream`
+- `def upload(FinsUploadRequest, *, cancellation_token: CancellationToken | None = None) -> ValidatedFinsEventStream`
 - `start_observed_download(...) -> FinsObservationHandle`
 - `start_observed_preprocess(...) -> FinsObservationHandle`
 - `start_observed_upload(...) -> FinsObservationHandle`
@@ -436,6 +436,8 @@ dayu.fins
 ├── pipelines                 # source-specific ingestion pipeline；当前包含 SEC 与 CN/HK download / upload pipeline
 ├── processors                # 财报处理器、SEC 表单专项处理器、registry
 ├── tools                     # read tools、download/preprocess/upload awaiting tools、providers、read runtime
+├── direct_events.py          # direct 事件、类型化协议错误与结果契约所有者
+├── direct_stream.py          # ValidatedFinsEventStream 恰好一个且最后一个 RESULT 校验所有者
 ├── ingestion_runtime.py      # download/preprocess/upload direct stream、observation 与 legacy job runtime
 ├── ingestion                 # direct stream、legacy job helper 与 lightweight observation contract
 ├── service_runtime.py        # DefaultFinsRuntime shared assembly root
@@ -508,7 +510,7 @@ Read、download、preprocess、upload 是四个独立 provider：
 
 Preprocess result summary 使用同一个 typed status helper 判定业务成功或失败。`skipped_count` 只表示已支持但因已有 processed 产物等原因跳过的文档；无可用 processor 的文档单独计入 `not_supported_count` 与 `not_supported_document_ids`，不会混入 skipped。
 
-Direct stream 入口 `download(...)` / `preprocess(...)` / `upload(...)` 返回 `AsyncIterator[FinsEvent]`。`PROGRESS` 表示运行中进度，唯一 terminal `RESULT` 携带 `FinsResultSummary`，成功、失败和取消都必须有明确终态；stream 正常结束但 producer 未产出 `RESULT`，或产出重复 `RESULT`，都会抛出 `FinsDirectStreamProtocolError`，不得合成业务 failure result。Download direct stream 的用户可见进度来自 source-specific downloader / pipeline 事件，再由 adapter 按业务对象粒度通过 runtime progress sink 投影为 direct progress；SEC 当前按 filing 输出，CN/HK 当前按报告下载与转换流程输出。CLI / Service 只展示 direct event 给出的 `stage`、`message` 和 `document_label`，不得从 summary、文件名或日志推断下载进度。Download terminal summary 的 `downloaded`、`skipped`、`rejected` 与 `failed` 是同一批候选 filing 的互斥分类；`total` / `discovered` 必须等于这些分类之和，除非后续 schema 显式增加非互斥指标并在 LLM-facing 文本中说明。Direct event 不包含 job id、sequence、cursor、resume token、sidecar path、绝对路径、provider raw payload 或财报正文。
+Direct stream 入口 `download(...)` / `preprocess(...)` / `upload(...)` 是 plain `def`，立即返回 `ValidatedFinsEventStream`。raw bridge 只转发 producer 事件；validator 是“恰好一个且最后一个 `RESULT`”的唯一 Fins owner：它缓存首个 `RESULT`，直到 raw source 正常耗尽后才发布，并在 clean exhaustion 后通过 `terminal_result` 返回同一个 `FinsResultSummary` 实例。缺少 `RESULT`、重复 `RESULT` 或 `RESULT` 后仍出现事件分别抛出同一 typed `FinsDirectStreamProtocolError` contract，Service 与 CLI 只机械消费，不再次扫描或重建错误。成功、失败和取消的合法业务 `RESULT` 仍保持明确终态，不会被改写成 protocol error。Download direct stream 的用户可见进度来自 source-specific downloader / pipeline 事件，再由 adapter 按业务对象粒度通过 runtime progress sink 投影为 direct progress；SEC 当前按 filing 输出，CN/HK 当前按报告下载与转换流程输出。CLI / Service 只展示 direct event 给出的 `stage`、`message` 和 `document_label`，不得从 summary、文件名或日志推断下载进度。Download terminal summary 的 `downloaded`、`skipped`、`rejected` 与 `failed` 是同一批候选 filing 的互斥分类；`total` / `discovered` 必须等于这些分类之和，除非后续 schema 显式增加非互斥指标并在 LLM-facing 文本中说明。Direct event 不包含 job id、sequence、cursor、resume token、sidecar path、绝对路径、provider raw payload 或财报正文。
 
 Legacy job helpers 仍保留 `start_*`、`read_job(...)`、`read_job_events(...)` 和 `request_cancel(...)`。每个 legacy ingestion job 可追加 JSONL event sidecar，路径与 job record 同属 `<workspace_root>/.dayu/fins_ingestion/jobs`。该路径是 legacy runtime foundation，不是 Service direct 或 awaiting tool 的公共观察边界。
 

@@ -83,6 +83,7 @@ class FinsDirectStreamProtocolErrorKind(str, Enum):
 
     MISSING_RESULT = "missing_result"
     DUPLICATE_RESULT = "duplicate_result"
+    EVENT_AFTER_RESULT = "event_after_result"
 
 
 class FinsDirectStreamProtocolError(ValueError):

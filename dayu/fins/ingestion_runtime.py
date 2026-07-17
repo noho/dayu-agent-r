@@ -15,7 +15,7 @@ import os
 import re
 import sys
 import uuid
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -34,8 +34,6 @@ from dayu.fins.direct_events import (
     FINS_RESULT_EXIT_CANCELLED,
     FINS_RESULT_EXIT_FAILURE,
     FINS_RESULT_EXIT_SUCCESS,
-    FinsDirectStreamProtocolError,
-    FinsDirectStreamProtocolErrorKind,
     FinsErrorKind,
     FinsEvent,
     FinsEventDetail,
@@ -45,6 +43,7 @@ from dayu.fins.direct_events import (
     FinsResultStatus,
     FinsResultSummary,
 )
+from dayu.fins.direct_stream import ValidatedFinsEventStream
 from dayu.fins.direct_event_text import (
     direct_download_no_source_documents_message,
     direct_failure_message,
@@ -2143,12 +2142,12 @@ class FinsIngestionRuntime:
             _observations={},
         )
 
-    async def download(
+    def download(
         self,
         request: FinsDownloadRequest,
         *,
         cancellation_token: CancellationToken | None = None,
-    ) -> AsyncIterator[FinsEvent]:
+    ) -> ValidatedFinsEventStream:
         """执行下载 direct stream。
 
         Args:
@@ -2156,7 +2155,7 @@ class FinsIngestionRuntime:
             cancellation_token: 可选 operation-scoped 取消 token。
 
         Returns:
-            Fins direct 事件异步迭代器。
+            Fins 唯一 owner 校验后的 direct 事件流。
 
         Raises:
             ValueError: ticker、来源或请求字段非法时抛出。
@@ -2165,27 +2164,29 @@ class FinsIngestionRuntime:
 
         normalized = ticker_normalization.normalize_ticker(request.ticker)
         source = _normalize_download_source(request.source)
-        async for event in self._run_direct_stream(
-            operation_kind=FinsIngestionOperationKind.DOWNLOAD,
-            direct_operation_kind=FinsOperationKind.DOWNLOAD,
-            normalized=normalized,
-            source=source,
-            source_kind=None,
-            cancellation_token=cancellation_token,
-            producer=_DirectDownloadProducer(
-                runtime=self,
+        return ValidatedFinsEventStream(
+            self._run_direct_stream(
+                operation_kind=FinsIngestionOperationKind.DOWNLOAD,
+                direct_operation_kind=FinsOperationKind.DOWNLOAD,
                 normalized=normalized,
-                request=replace(request, source=source),
+                source=source,
+                source_kind=None,
+                cancellation_token=cancellation_token,
+                producer=_DirectDownloadProducer(
+                    runtime=self,
+                    normalized=normalized,
+                    request=replace(request, source=source),
+                ),
             ),
-        ):
-            yield event
+            operation_kind=FinsOperationKind.DOWNLOAD,
+        )
 
-    async def preprocess(
+    def preprocess(
         self,
         request: FinsPreprocessRequest,
         *,
         cancellation_token: CancellationToken | None = None,
-    ) -> AsyncIterator[FinsEvent]:
+    ) -> ValidatedFinsEventStream:
         """执行预处理 direct stream。
 
         Args:
@@ -2193,7 +2194,7 @@ class FinsIngestionRuntime:
             cancellation_token: 可选 operation-scoped 取消 token。
 
         Returns:
-            Fins direct 事件异步迭代器。
+            Fins 唯一 owner 校验后的 direct 事件流。
 
         Raises:
             FileNotFoundError: ticker 或源文档不存在时抛出。
@@ -2202,26 +2203,28 @@ class FinsIngestionRuntime:
         """
 
         normalized = ticker_normalization.normalize_ticker(request.ticker)
-        async for event in self._run_direct_stream(
-            operation_kind=FinsIngestionOperationKind.PREPROCESS,
-            direct_operation_kind=FinsOperationKind.PREPROCESS,
-            normalized=normalized,
-            source=None,
-            source_kind=request.source_kind,
-            cancellation_token=cancellation_token,
-            producer=_DirectPreprocessProducer(
-                runtime=self,
-                request=request,
+        return ValidatedFinsEventStream(
+            self._run_direct_stream(
+                operation_kind=FinsIngestionOperationKind.PREPROCESS,
+                direct_operation_kind=FinsOperationKind.PREPROCESS,
+                normalized=normalized,
+                source=None,
+                source_kind=request.source_kind,
+                cancellation_token=cancellation_token,
+                producer=_DirectPreprocessProducer(
+                    runtime=self,
+                    request=request,
+                ),
             ),
-        ):
-            yield event
+            operation_kind=FinsOperationKind.PREPROCESS,
+        )
 
-    async def upload(
+    def upload(
         self,
         request: FinsUploadRequest,
         *,
         cancellation_token: CancellationToken | None = None,
-    ) -> AsyncIterator[FinsEvent]:
+    ) -> ValidatedFinsEventStream:
         """执行上传 direct stream。
 
         Args:
@@ -2229,7 +2232,7 @@ class FinsIngestionRuntime:
             cancellation_token: 可选 operation-scoped 取消 token。
 
         Returns:
-            Fins direct 事件异步迭代器。
+            Fins 唯一 owner 校验后的 direct 事件流。
 
         Raises:
             ValueError: ticker、source_kind、action 或上传请求字段非法时抛出。
@@ -2238,19 +2241,22 @@ class FinsIngestionRuntime:
 
         normalized = ticker_normalization.normalize_ticker(request.ticker)
         normalized_request = _normalize_upload_request(request)
-        async for event in self._run_direct_stream(
-            operation_kind=FinsIngestionOperationKind.UPLOAD,
-            direct_operation_kind=_direct_upload_operation_kind(normalized_request),
-            normalized=normalized,
-            source=None,
-            source_kind=normalized_request.source_kind,
-            cancellation_token=cancellation_token,
-            producer=_DirectUploadProducer(
-                runtime=self,
-                request=normalized_request,
+        direct_operation_kind = _direct_upload_operation_kind(normalized_request)
+        return ValidatedFinsEventStream(
+            self._run_direct_stream(
+                operation_kind=FinsIngestionOperationKind.UPLOAD,
+                direct_operation_kind=direct_operation_kind,
+                normalized=normalized,
+                source=None,
+                source_kind=normalized_request.source_kind,
+                cancellation_token=cancellation_token,
+                producer=_DirectUploadProducer(
+                    runtime=self,
+                    request=normalized_request,
+                ),
             ),
-        ):
-            yield event
+            operation_kind=direct_operation_kind,
+        )
 
     def start_observed_download(
         self,
@@ -2703,7 +2709,7 @@ class FinsIngestionRuntime:
         source_kind: SourceKind | None,
         cancellation_token: CancellationToken | None,
         producer: Callable[[_FinsIngestionExecutionContext], None],
-    ) -> AsyncIterator[FinsEvent]:
+    ) -> AsyncGenerator[FinsEvent, None]:
         """在线程桥中执行同步 ingestion helper 并产出 direct events。
 
         Args:
@@ -2716,10 +2722,9 @@ class FinsIngestionRuntime:
             producer: 同步业务 producer。
 
         Returns:
-            Fins direct 事件异步迭代器。
+            未解释 terminal 协议的 raw Fins direct 事件 async generator。
 
         Raises:
-            FinsDirectStreamProtocolError: producer 未产出 RESULT 或产出重复 RESULT 时抛出。
             Exception: producer 异常转换失败时由底层构造或 queue 操作抛出。
         """
 
@@ -2749,7 +2754,6 @@ class FinsIngestionRuntime:
         )
         thread.start()
         try:
-            result_event: FinsEvent | None = None
             while True:
                 item = await asyncio.to_thread(
                     _direct_queue_get,
@@ -2760,23 +2764,7 @@ class FinsIngestionRuntime:
                     continue
                 if isinstance(item, _DirectStreamProducerDone):
                     break
-                if item.event_type is FinsEventType.RESULT:
-                    if result_event is not None:
-                        raise FinsDirectStreamProtocolError(
-                            FinsDirectStreamProtocolErrorKind.DUPLICATE_RESULT,
-                            direct_operation_kind,
-                            "Fins direct stream produced multiple RESULT events",
-                        )
-                    result_event = item
-                    continue
                 yield item
-            if result_event is None:
-                raise FinsDirectStreamProtocolError(
-                    FinsDirectStreamProtocolErrorKind.MISSING_RESULT,
-                    direct_operation_kind,
-                    "Fins direct stream ended without RESULT",
-                )
-            yield result_event
         finally:
             cancellation_state.request_cancel()
 

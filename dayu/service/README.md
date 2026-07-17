@@ -12,7 +12,7 @@
 - `dayu.service.wait_callback_endpoint.handle_wait_callback_completion(...)`：framework-neutral wait callback completion transport mapper；真实 Web router 只把 path wait id、headers 与已解析 JSON body 传入该函数，mapper 负责 transport 校验、Host callback envelope 构造和 HTTP-like status/body 映射，不注册真实路由。
 - `dayu.service.entrypoint_runtime`：为 product entrypoint 提供 reusable Agent runtime helper，覆盖 runtime 准备、Session ensure/create、submit 前 live watcher attach、terminal observation outbox fallback、interactive existing-session startup reconnect、cancel request 构造与 watcher failure 诊断；该模块不解析 CLI 参数，不保存 CLI cursor，不处理 stdout/stderr，也不安装 signal handler。
 - `dayu.service.scene_context`：为 product entrypoint 生成 LLM-facing context slot 文本，覆盖财报分析对象、当前时间、显式 FMP key 下的公司名增强和 FMP 失败时的 ticker-only fallback；该模块不读取 CLI 参数，不向 LLM 投影 FMP 错误文本。
-- `dayu.service.fins_direct`：为 product entrypoint 提供 reusable Fins direct stream helper，覆盖 download / preprocess / upload 的 typed request 构造、`AsyncIterator[FinsEvent]` 透传、terminal result 收口和 operation-scoped cancellation；该模块不解析 CLI 参数，不处理 stdout/stderr，也不读取 Fins storage。
+- `dayu.service.fins_direct`：为 product entrypoint 提供 reusable Fins direct stream helper，覆盖 download / preprocess / upload 的 typed request 构造、同一个 `ValidatedFinsEventStream` identity 透传和 operation-scoped cancellation；terminal 协议由 Fins validator 唯一拥有，该模块不解析 CLI 参数、不处理 stdout/stderr，也不读取 Fins storage。
 - `dayu.service.fins_wait_adapter`：为 Host production wait poller 提供 Fins awaiting observation integration，负责把 Host `WaitAdapterSnapshot` 映射到 Fins `FinsObservationRuntime` 的 activate / poll / cancel / abandon 入口；该模块不读取 Host durable row / store / state mutator，也不读取 Fins storage。
 
 `compose_open_host_options(request)` 会把选中的 execution profile 映射为 Host typed inputs：`tool_truncation_policy` 决定 ToolRuntime 截断默认值，`tool_duplicate_governance_policy` 决定 `HostToolingOptions.duplicate_governance_policy`，`agent_policy` 决定 ordinary run baseline 的 Agent loop policy。
@@ -32,7 +32,7 @@ Service 从模型配置构造 `RunnerSpec` 时默认启用 OpenAI-compatible cli
 
 `wait_callback_endpoint` 只做 Service/Web transport 映射：method、content-type 与 path/body wait id 错误在 Service 层拒绝；JSON body 与 outcome shape 错误在 Service 层返回 malformed payload；认证结果、wait 状态、replay、digest 与 late callback 语义来自注入的 Host callback adapter。响应体只包含 typed status、diagnostic、retryable 与可选 Run 摘要，不回显 outcome payload。
 
-`fins_direct` 的 upload helper 只通过 `FinsIngestionRuntime.upload(...)` 提交 `FinsUploadFilingRequest` 或 `FinsUploadMaterialRequest` 并消费 direct event stream，不要求 runtime 存在 `upload_filing(...)` / `upload_material(...)` 方法。调用方通过 `async for` 消费 `PROGRESS` 与唯一 terminal `RESULT`；若 runtime stream 正常结束但未产出 `RESULT`，或产出重复 `RESULT`，Service 会抛出 `FinsDirectStreamProtocolError`，避免把 direct stream 协议错误伪造成业务失败。调用方收到用户中断时关闭当前 stream / 取消当前 task，并通过 operation-scoped cancellation 传播；Service direct API 不暴露 job id、event sidecar、cursor 或 `request_cancel(job_id)`。
+`fins_direct` 的 upload helper 只通过 `FinsIngestionRuntime.upload(...)` 提交 `FinsUploadFilingRequest` 或 `FinsUploadMaterialRequest`，不要求 runtime 存在 `upload_filing(...)` / `upload_material(...)` 方法。Service 的 protocol、public 与 private direct methods 都以 plain `def` 直接返回 runtime 提供的同一个 `ValidatedFinsEventStream`，不 `await`、迭代、包装或重建 stream；missing、duplicate、event-after-result 与 terminal availability 均由 Fins validator 判定一次。调用方通过 `async for` 消费 `PROGRESS` 与唯一 terminal `RESULT`，并在 clean exhaustion 后读取 validator 的 terminal result。用户中断仍通过关闭当前 stream / 取消当前 task和 operation-scoped cancellation 传播；Service direct API 不暴露 job id、event sidecar、cursor 或 `request_cancel(job_id)`。
 
 边界约束：
 
