@@ -6,11 +6,12 @@
 |---|---|
 | umbrella | `WU-SEMANTIC-OWNERSHIP-01` |
 | sub-WU | 既有 remediation `R08`；不是新 WU、feature 或 issue |
-| gate | 同一 R08 cumulative validation plan-correction review fix；完成后停回 Controller，由 Controller 派发两路完整 re-review |
-| accepted plan / S1 transition | `19cbe8a054784297a593cfd6ea823bac40109b99` / `c433b21a881ff10311a3bdf8ac77a583a98184aa` |
+| gate | 同一 R08 code-review fix plan-only correction；完成后停回 Controller，由 Controller 派发两路完整 corrected-plan review |
+| accepted plan lineage / 当前 correction 前 plan SHA-256 | `1eb896325d0d7d3ccaff1e5412b7da490f3a4485` / `87cc332828640de8b4cb4550f29251894111ef3471621bebbef828b66a3ce23d` |
 | R07 completion commit | `28b6fc1956bd3832489a471fa29bfe354b319860` |
 | 固定 slices | S1 producer domain contracts + all actual processors；S2 read/tool/LLM single projection |
-| 本 gate 授权 | 只修改本计划并新增 cumulative-validation plan-correction review-fix artifact；不修改当前 production/tests/S1 artifact/control/controller/reviewer artifacts/README/design，不实施 S2，不 stage、不 commit、不 push、不建 PR |
+| 受保护 implementation/test/README tree | 23-path `dayu/fins + tests` tracked binary diff SHA-256 固定为 `7a7ebf939b758ce8fdd92413210743e5a90b65272df62e466bf70332eb771d6d`；staged 为空 |
+| 本 gate 授权 | 只修改本计划并新增 `docs/reviews/wu-semantic-ownership-01-r08-code-review-fix-plan-correction-codex.md`；不修改当前 production/tests/README、S1/S2/fix artifact、control/design/prior artifacts，不运行 implementation，不 stage、不 commit、不 push、不建 PR |
 
 R08 只落实 umbrella remediation plan §15 已裁决的 Topic 6.4：收窄 financial/XBRL 的 LLM-facing contract，并建立单一 public typed projection。R06 transaction/publication owner 与 R07 identity/revision/snapshot/citation/provenance owner 已完成，本计划只消费它们，不回改。
 
@@ -23,6 +24,7 @@ R08 只落实 umbrella remediation plan §15 已裁决的 Topic 6.4：收窄 fin
 3. Producer 当前将可选 XBRL filters 放在 `query_params.filters_applied`，read 却从 `query_params` 顶层读取同名键并补 `None`，已经形成直接可证的 shape drift。
 4. Tool description 手写第三份字段定义，公开 raw total / dedupe diagnostic，且没有自足说明必填性、完整枚举和最小示例。
 5. `dayu/fins/pipelines/sec_fiscal_fields.py::_build_financials_payload` 没有 production caller，却作为替代 owner 发明 `processor_error:<message>` 与 `invalid_statement_result` reason；它不能以“兼容”名义保留。
+6. `R08-CR-CF01` 删除四个越界 omnibus/compatibility 节点及九个专用 imports 后，累计 coverage 实测为 `386 passed`，15 个 changed production 文件中 14 个过线，`read_runtime_helpers.py` 只有 `320/494 = 64.78%`；R08 normalize/dedup changed-owner 完整调用闭包即使全部覆盖也至多 `351/494 = 71.05%`。因此当前 whole-file 80% gate 与稳定 owner 测试授权数学上冲突，必须修计划的测试授权，而不是恢复越界节点、弱化阈值或改 production 迎合 coverage。
 
 所以正确路径是先在 producer owner 收紧 contract，再由一个 typed public projection 机械投影。只改 tool 文案、在 read 补默认、保留双 contract 或给旧测试加 shim 都不是 root-cause 修复。
 
@@ -38,6 +40,7 @@ R08 只落实 umbrella remediation plan §15 已裁决的 Topic 6.4：收窄 fin
 - Public XBRL 只有一个 `fact_count`，且唯一赋值 owner 执行 `len(returned_facts)`。
 - Tool description、result serializer 与 LLM-facing 字段说明从同一 typed projection/helper 派生，自足说明字段、类型、必填性、枚举与最小示例。
 - 真实 AAPL XBRL fixture、真实 HTML 财务表 smoke、owner tests、逐文件 coverage、pyright、Ruff、diff/source/propagation scans 全部通过。
+- `test_fins_read_runtime.py` 保持 §5.1 固定 symbol boundary；四个已删除越界节点与九个专用 imports 永久不恢复。只允许在既有 S2 test path `test_read_runtime_semantic_ownership_guards.py` 按 §6.1 的 owner-family 顺序补最小 stable-owner evidence，并在 `read_runtime_helpers.py` 首次达到 whole-file exact-key `>=80.00%` 后立即停止新增测试。
 - S1→S2 保持 producer→consumer 的实现依赖顺序，但两步属于同一累计 destructive cutover；S1 不再是独立 validation/review gate，只有累计 S1+S2 tree 全绿后才进入一次 immutable dual code review、fix/re-review 与 aggregate deepreview。R08 后仍需 R09-R12 与 umbrella aggregate deepreview。
 
 ### 2.2 不可回改的 owner
@@ -156,7 +159,7 @@ Registry 的 BS 10-K/10-Q/20-F/6-K、SEC 10-K/10-Q/20-F 与 generic `SecProcesso
 - `tests/fins/test_financial_read_contracts.py`：S1 owner contract、SEC/BS/6-K/HTML/OCR actual producers。
 - `tests/fins/test_sec_pipeline_download.py`：S1删除alternate reasons与invalid-total旧断言，保留真实fiscal语义。
 - `tests/fins/test_fins_read_runtime.py`：S1 只迁移 `_extract_fiscal_from_xbrl_query` 直接消费的 XBRL producer-contract fixture/node；S2 再迁移同文件的 read normalize/dedup/query params/唯一 count nodes，具体 symbol 边界见§5.1。
-- `tests/fins/test_read_runtime_semantic_ownership_guards.py`：S2 exact projection与R07 citation/snapshot guards。
+- `tests/fins/test_read_runtime_semantic_ownership_guards.py`：S2 exact projection与R07 citation/snapshot guards；`R08-CR-PCF01` 只在此既有 allowlisted path 追加 §6.1 分 owner-family 的最小 `read_runtime_helpers.py` stable-owner coverage evidence。
 - `tests/fins/test_processor_read_consistency.py`：S2同snapshot processor/result/citation一致性。
 - `tests/fins/test_fins_storage_provider.py`：S2真实HTML、AAPL fixture、tool description、process outcome。
 - `tests/fins/test_processor_registry.py`、`tests/fins/test_fins_ingestion_tools.py`：必跑回归，除直接旧fixture证据外预期零diff。
@@ -373,6 +376,29 @@ tests/fins/test_fins_read_runtime.py
 - S2 只允许迁移 `_normalize_xbrl_query_payload` 的 import 与当前 `test_xbrl_query_payload_missing_total_fails_closed`、`test_xbrl_query_payload_non_int_total_fails_closed`、`test_xbrl_query_payload_mismatched_raw_total_fails_closed_before_dedup`、`test_xbrl_query_payload_preserves_processor_total_after_dedup`、`test_xbrl_query_payload_always_projects_dedup_count_and_owner_quality`、`test_xbrl_query_payload_rejects_producer_dedup_count` 这组 read normalize/dedup nodes。
 - 两个 implementation step 都不得修改该文件的 generic LRU、form matching nodes；共享 import 行只能作与上述各自 symbols 直接相关的机械调整。六个 normalize/dedup nodes 仍由 S2 完整迁移，并与 S1 fiscal node 一起在累计 S1+S2 tree 上运行和验收；不得对任一 node 加 `skip` / `xfail`、兼容 fixture 或 production shim 伪造绿色。
 
+`R08-CR-CF01` 已从该共享文件删除下列四个越界节点，后续不得恢复、改名、参数化或搬运其结构：
+
+```text
+test_read_helper_document_discovery_rules_preserve_public_semantics
+test_search_next_section_owner_ranks_exact_hits_per_query
+test_table_data_projection_owner_emits_self_describing_shapes
+test_navigation_and_xbrl_default_rule_owners_fail_closed
+```
+
+下列九个只服务这些节点的 imports 同样不得恢复到该文件，也不得以 alias 或局部 import 规避边界：
+
+```text
+_build_table_data_payload
+_normalize_document_types
+_normalize_periods
+_normalize_section_children
+_normalize_taxonomy_name
+_resolve_default_xbrl_concepts
+build_search_next_section_fields
+resolve_document_type_for_source
+resolve_has_financial_data
+```
+
 ### 5.2 实施顺序
 
 1. Financial owner删除locator类型/字段和两个内部reason；reason改为optional并验证complete/partial组合。
@@ -458,6 +484,15 @@ S1与S2是同一次破坏性contract cutover；中间commit会把旧public consu
 
 进入条件：S1 producer/processor implementation 与 blocked intermediate artifact 已完成；当前 11 个 production、3 个 tests 的受保护 binary diff SHA-256 仍为 `0d985b85aa65d7c4b06d9ee464cd73fc4a39ef2ee0934f376b0b845a09b20f57`；tree 未 stage/commit 且未混入其它scope。S1 独立 validation/review 不再是 S2 前置条件。
 
+Code-review fix continuation 的新 re-entry lock 取代上述历史 S2 entry hash：23-path
+`dayu/fins + tests` tracked binary diff 必须为
+`7a7ebf939b758ce8fdd92413210743e5a90b65272df62e466bf70332eb771d6d`，
+`test_fins_read_runtime.py` 内容 SHA-256 必须为
+`01db5538c870b672775425c2204a2d7038ab000b6d9829d0d7edce1ea25b6692`，
+`test_read_runtime_semantic_ownership_guards.py` correction-entry SHA-256 必须为
+`4a076ca6c6efb5df986104833d9816e5bdfdda53ac0c292081a9be49223bc1ff`，且 staged 为空。
+任一不匹配先停回 Controller；不得在未知 drift 上追加 coverage tests。
+
 S2 production diff闭集：
 
 ```text
@@ -477,6 +512,39 @@ tests/fins/test_read_runtime_semantic_ownership_guards.py
 tests/fins/test_processor_read_consistency.py
 tests/fins/test_fins_storage_provider.py
 ```
+
+`R08-CR-PCF01` 不增加任何 test path。它只对上述闭集内既有
+`tests/fins/test_read_runtime_semantic_ownership_guards.py` 增加下表候选 owner-family
+授权；候选按表中顺序一次只实现一个 exact node，并按 §6.6 记录增量 coverage，首次达到
+`read_runtime_helpers.py >=80.00%` 后立即停止，后续候选保持未实现。不得为“凑齐表格”全部实现。
+
+| 顺序 / stable owner family | 建议 exact test node | 必须使用的 production seam | 业务输入、输出与 failure signal |
+|---|---|---|---|
+| 1. document-type/filter public projection | `test_list_documents_projects_stable_document_type_and_filter_contract` | `FinsReadRuntime.list_documents` public seam | 用真实 filesystem repositories 创建 filing/material source facts，传入去空、去重且含一个未知值的 `document_types` 与合法 `fiscal_periods`；按 `document_id` 键控断言 canonical `document_type`、normalized `filters`、filtered documents 与无匹配时的 `broaden_filter` suggestion。不得依赖 repository 返回顺序，不得输入或断言任何 compatibility availability/capability 字段；参数类型/空 ticker 等既有 public failure 必须继续抛 typed `FinsReadArgumentError`/business error，不得被新 fixture 吞掉。 |
+| 2. section public payload projection | `test_read_section_projects_minimal_navigation_payload_and_rejects_unknown_ref` | `FinsReadRuntime.read_section` public seam | 通过真实 repository + typed `DocumentProcessor` protocol fixture 提供含合法/非法 children、page range、content/title 的 section；断言 public `children` 只含有效 `ref/title`、page range 与 citation/identity 来自 runtime。对于未知 `ref` 输入，typed fixture 的 `read_section` 必须抛 `KeyError`，再由 `FinsReadRuntime.read_section` public seam 精确转换为 `FinsReadArgumentError`；测试只观察该 public runtime failure，不直接断言 fixture 或其 `KeyError`。不得断言 processor 私有状态、父标题调用次数或其它偶然顺序。 |
+| 3. table public payload projection | `test_get_table_projects_self_describing_data_shapes_and_rejects_unknown_ref` | `FinsReadRuntime.get_table` public seam | 通过同类 repository-backed typed processor inputs 分别给出 records、合法 Markdown 与普通文本；断言 public `data.kind` 及各 shape exact keys/values、table identity/citation。对于未知 `table_ref` 输入，typed fixture 的 `read_table` 必须抛 `KeyError`，再由 `FinsReadRuntime.get_table` public seam 精确转换为 `FinsReadArgumentError`；测试只观察该 public runtime failure，不直接断言 fixture 或其 `KeyError`。typed fixture 只提供协议输入，不得成为被断言对象；不得读 processor private method/state。 |
+| 4. XBRL taxonomy/default-concept selection | `test_query_xbrl_facts_selects_default_concepts_from_typed_taxonomy` | `FinsReadRuntime.query_xbrl_facts` public seam | concepts 缺席时，用 typed taxonomy-capable processor 与明确 form/taxonomy business facts，断言 processor 收到 owner-selected、非空且与该 form/taxonomy 对应的 concepts，public result 的 `query_params.concepts` 与之同源；unknown taxonomy 必须走 global defaults，processor typed failure 继续投影既有 typed business failure。不得直接调用 `_normalize_taxonomy_name` 或 `_resolve_default_xbrl_concepts`，不得断言 mapping 的内部遍历顺序。 |
+| 5. search next-step public projection | `test_search_next_section_projection_ranks_business_evidence_per_query` | **唯一 module-helper 例外**：`build_search_next_section_fields` | 只有前四个 public-seam node 依次完成后仍低于 80% 才可新增。输入含单/多 query、明确非平手的 evidence count/exact facts、malformed/no-section matches；断言 exact `next_section_to_read` / `next_section_by_query`、只保留业务字段、无候选 query 映射 `None`，malformed input 不能伪造 ref。不得构造平手后断言 first-index 偶然顺序。 |
+
+Public seam 是前四个 family 的硬边界；不得因测试装配不便改为直接调用
+`_normalize_document_types`、`_normalize_periods`、`_normalize_section_children`、
+`_build_table_data_payload`、`_normalize_taxonomy_name`、`_resolve_default_xbrl_concepts` 或其它
+私有 helper。唯一直接 module-helper 例外是表中第 5 项
+`build_search_next_section_fields`：next-step projection 没有独立 public callable，强行走完整
+search 会把检索/ranking owners 混入同一证据；该例外不扩展到 private cache、snapshot
+internals、processor private method 或 Host private truncation state。
+
+每个实际新增 node 必须有完整中文 docstring，明确 owner、业务 contract、输入、返回与
+failure signal；测试必须穿过 production seam 并断言业务可观察 exact output/typed failure。
+只调用不验证、只断言非空、fake 自证、空执行、覆盖私有分支、偶然顺序与为了 coverage
+改 production 都失败。可用 typed processor fixture 驱动协议输入，但必须组合真实 repository
+与 public runtime，且断言对象只能是 production public output/failure；不得形成 fake-only test。
+
+本授权不允许新增或恢复 `resolve_has_financial_data` 的 compatibility evidence。新增 diff 中
+禁止输入、断言、fixture key 或直接 helper 调用：`availability`、
+`has_structured_financial_statements`、`has_financial_statement_sections`、
+`has_financial_statement`、`has_xbrl`。也不得复制原四节点的 omnibus 结构、只改 test 名搬运，
+或在一个 node 中拼接两个无依赖 owner family。
 
 必跑零diff回归：
 
@@ -504,6 +572,7 @@ tests/README.md
 5. `fins_tools.py`让两项tool descriptions消费owner helper；输入parameters仍只拥有调用参数。`fiscal_period.enum` 从 `FISCAL_PERIODS` 同源派生 `FY|H1|Q1|Q2|Q3|Q4`，`min_value` / `max_value` 保持 `type: number`；callable/schema tests 证明该 enum、字段缺席不补 `None` 与 bool 拒绝均成立。
 6. 保留R07 borrowed snapshot/citation flow原样，通过guard tests证明同一snapshot context进入projection。
 7. 按触发规则更新两份README。
+8. Code-review fix continuation 先确认 §5.1 四节点/九 imports 删除仍在；随后只在 `test_read_runtime_semantic_ownership_guards.py` 按 §6.1 表格顺序一次新增一个 owner-family node。每新增一个 node 都先运行 §6.6 增量 ledger；首次达到 80% 立即停止新增，随后从零开始完整重跑 §6.6/§6.7。此步骤不再修改 production、README、其它 tests 或 artifacts。
 
 ### 6.3 Input/output mapping与失败语义
 
@@ -559,6 +628,12 @@ Owner/public tests必须覆盖：
 
 `tests/fins/test_fins_read_runtime.py` 的六个 normalize/dedup nodes 在 S2 必须全部迁移，并在 §6.6 累计 focused、coverage 与完整验证中和 S1 fiscal node 一起收集；不得 `skip` / `xfail`、删 node、改名逃避收集或用 compatibility fixture/production shim 保留旧 count contract。
 
+Code-review fix continuation 只允许在 `test_read_runtime_semantic_ownership_guards.py` 实现
+§6.1 候选表的连续最短前缀。每个新增 node 只覆盖一个 owner family，使用表中指定 seam 与
+exact business assertions；不得把未实现候选改名塞入同一参数化 node，也不得把多个 family
+放进一个 shared helper 后以单一 node 掩盖。实现 artifact 必须逐 node 记录新增前后
+`read_runtime_helpers.py` 的 covered/statement/percent，并列明因首次过线而未实现的剩余候选。
+
 必须复用`tests/fins/test_fins_storage_provider.py`现有真实仓储构造，不以简化fake替代：
 
 1. 真实AAPL XBRL fixture：fixture→workspace→processor→read→tool business value；断言raw输入不变、facts已dedup、唯一count同源、citation来自同一snapshot。
@@ -583,7 +658,49 @@ pytest tests/fins/test_fins_storage_provider.py::test_fins_read_aapl_xbrl_query_
 
 ### 6.6 累计 S1+S2 validation gate
 
-S2 完成后只执行一次累计 validation gate；它同时验收 S1 producer/processor 与 S2 public consumer/projection，不存在 S1-only 或 S2-only acceptance session。所有命令都在同一未提交 tree 上运行：
+S2 初始实现后的累计 validation 仍是唯一 acceptance validation。`R08-CR-PCF01` 的增量
+coverage closure 是 code-review fix 的测试选择 ledger，不是新的 slice/acceptance gate：它
+必须先于最终完整重跑执行，且只决定需要实现 §6.1 候选表的多短前缀。
+
+增量 ledger 的 step 0 固定记录当前删除后基线：`320/494 = 64.78%`。从候选 1 开始，每次
+只新增一个 exact node，随后从 repository root 执行同一个累计 coverage 集：
+
+```bash
+source .venv/bin/activate
+python -m coverage erase
+python -m coverage run -m pytest \
+  tests/fins/test_financial_read_contracts.py \
+  tests/fins/test_sec_pipeline_download.py \
+  tests/fins/test_fins_read_runtime.py \
+  tests/fins/test_read_runtime_semantic_ownership_guards.py \
+  tests/fins/test_processor_read_consistency.py \
+  tests/fins/test_processor_registry.py \
+  tests/fins/test_fins_ingestion_tools.py \
+  tests/fins/test_fins_storage_provider.py
+python -m coverage json -o workspace/tmp/r08-code-review-fix-incremental-coverage.json
+python - workspace/tmp/r08-code-review-fix-incremental-coverage.json <<'PY'
+import json
+from pathlib import Path
+import sys
+
+target = "dayu/fins/tools/read_runtime_helpers.py"
+summary = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))["files"][target]["summary"]
+covered = summary["covered_lines"]
+statements = summary["num_statements"]
+percent = summary["percent_covered"]
+decision = "STOP_ADDING_TESTS" if percent >= 80.0 else "CONTINUE_NEXT_OWNER_FAMILY"
+print(f"{decision} {target}: {covered}/{statements} = {percent:.2f}%")
+PY
+```
+
+实现 artifact 必须把每次输出按 `step / exact node / public seam or sole helper exception /
+covered / statements / percent / decision` 追加到 ledger。percent 首次 `>=80.00` 时必须立即
+停止新增测试，不实现后续候选、不追求 100%、不补其它 missing line；若五个候选均完成仍低于
+80%，立即 stop 回 Controller。增量 JSON 或早期过线结果不能替代最终 15-file checker。
+
+达到首次阈值后，先 `coverage erase`，再从头完整执行以下累计 validation；它同时验收 S1
+producer/processor、S2 public consumer/projection 与 code-review fix，不存在 S1-only、S2-only
+或增量 ledger acceptance session。所有命令都在同一未提交 tree 上运行：
 
 ```bash
 source .venv/bin/activate
@@ -770,6 +887,42 @@ rg -n 'fact_count' \
 - retained-security/no-touch scan 必须证明 R06/R07 storage、identity、revision、snapshot、citation、containment、symlink、atomic publication/recovery、Host truncation owner均无语义 diff；
 - exact allowlist scan 必须拒绝 S1/S2 production/test/README allowlist外路径，以及 R09-R12、Issues 142/151/175/177/178、Host/Engine/Service/UI、`dayu/config/prompts/**` 或统一 authorization 实现。
 
+#### F. `R08-CR-PCF01` correction-specific source/AST scans
+
+共享文件删除边界必须零命中：
+
+```bash
+rg -n \
+  'test_read_helper_document_discovery_rules_preserve_public_semantics|test_search_next_section_owner_ranks_exact_hits_per_query|test_table_data_projection_owner_emits_self_describing_shapes|test_navigation_and_xbrl_default_rule_owners_fail_closed|_build_table_data_payload|_normalize_document_types|_normalize_periods|_normalize_section_children|_normalize_taxonomy_name|_resolve_default_xbrl_concepts|build_search_next_section_fields|resolve_document_type_for_source|resolve_has_financial_data' \
+  tests/fins/test_fins_read_runtime.py
+```
+
+`test_fins_read_runtime.py` final SHA-256 必须仍为
+`01db5538c870b672775425c2204a2d7038ab000b6d9829d0d7edce1ea25b6692`；复用 blocked-fix
+artifact 的 top-level AST 比较，证明 common function AST 零变化、generic LRU/form-matching
+nodes unchanged，且文件只保留两个未改 generic nodes、六个 S2 normalize/dedup nodes和一个
+S1 fiscal node。任何漂移都失败，不能用“新 coverage”解释。
+
+新 stable-owner 测试文件必须通过以下 compatibility/private-helper negative scan：
+
+```bash
+rg -n \
+  'availability|has_structured_financial_statements|has_financial_statement_sections|has_financial_statement|has_xbrl|resolve_has_financial_data|_build_table_data_payload|_normalize_document_types|_normalize_periods|_normalize_section_children|_normalize_taxonomy_name|_resolve_default_xbrl_concepts' \
+  tests/fins/test_read_runtime_semantic_ownership_guards.py
+```
+
+预期零命中。AST import assertion 必须证明相对 correction-entry tree 新增的
+`read_runtime_helpers.py` production symbol import 为空；只有确实执行到 §6.1 第 5 个候选时，
+才允许它精确等于 `{build_search_next_section_fields}`。`FinsReadArgumentError` 作为 public typed
+failure assertion 可机械加入既有 import；不得加入其它 helper、private cache/processor/Host
+state import。AST node assertion还必须证明实际新增 tests 精确等于候选表的连续最短前缀，
+每个 node 只有一个 owner family，没有 `skip` / `xfail` marker，也没有 coverage pragma/omit。
+
+对 23-path correction-entry manifest 做 exact diff scan：code-review fix continuation 除
+`tests/fins/test_read_runtime_semantic_ownership_guards.py` 外不得再改变任何受保护 path；最终
+仍须在新 aggregate binary diff 上执行 §6.6 全部 15-file exact-key ledger 与完整 §6.7，不能
+复用 `7a7ebf...1d6d` 上的 coverage、validation、review lock 或 reviewer verdict。
+
 ### 6.8 README同步
 
 - `dayu/fins/README.md`删除mandatory locator、producer total、dedup count说明，写入最小producer contract、optional actionable reason、独立public dedup projection和唯一fact_count。
@@ -778,7 +931,32 @@ rg -n 'fact_count' \
 
 ### 6.9 S2 review与commit边界
 
-顺序固定：AgentCodex S2 implementation/self-check → §6.6/§6.7 累计 validation 全绿 → Controller 记录完整 changed-path manifest、每个 changed path content SHA-256 与完整累计 `git diff --binary` SHA-256 → AgentMiMo与AgentDS对同一 immutable S1+S2 cumulative tree 并发完整 code review并各自重算 hash → Controller adjudication → AgentCodex 修复全部 accepted findings → 在新 hash 上重跑完整累计 validation → 两路完整 re-review → Controller逐条关闭。
+原始顺序固定：AgentCodex S2 implementation/self-check → §6.6/§6.7 累计 validation 全绿 → Controller 记录完整 changed-path manifest、每个 changed path content SHA-256 与完整累计 `git diff --binary` SHA-256 → AgentMiMo与AgentDS对同一 immutable S1+S2 cumulative tree 并发完整 code review并各自重算 hash → Controller adjudication → AgentCodex 修复全部 accepted findings → 在新 hash 上重跑完整累计 validation → 两路完整 re-review → Controller逐条关闭。
+
+`R08-CR-CF01` 已使原 review lock `4d346f2b...d4b`、原 Controller validation 与两路 code
+review失效；四节点/九 imports 删除后的 `7a7ebf...1d6d` tree 又因 coverage stop 没有完成
+§6.6/§6.7，不能复用旧绿色。corrected continuation 的顺序精确为：
+
+```text
+AgentCodex plan-only correction
+-> Controller plan-diff/protected-tree validation
+-> AgentMiMo + AgentDS complete corrected-plan review
+-> accepted plan findings fix（若有）
+-> complete corrected-plan re-review / Controller adjudication
+-> corrected-plan accepted local commit
+-> AgentCodex 从 7a7ebf...1d6d protected tree 继续 test-only code-review fix
+-> §6.6 incremental coverage ledger，首次 >=80 即停止新增
+-> 从零完整重跑 §6.6/§6.7
+-> Controller 锁定新的 changed-path content manifest / binary diff hash
+-> AgentMiMo + AgentDS 对完整 S1+S2+fix tree code re-review
+-> Controller 逐条关闭
+-> aggregate deepreview
+```
+
+Corrected plan 未经双路 review/re-review 与 accepted-plan commit 前，不得继续 tests；新的
+stable-owner tests 使 `7a7ebf...1d6d` 再次失效，Controller 必须只在最终全绿 tree 上建立新
+lock。code re-review 必须审完整累计 diff，包括原 S1/S2、四节点/九 imports 删除和最终
+`test_read_runtime_semantic_ownership_guards.py` 连续最短前缀；不得只审新增 tests。
 
 Controller 只能在累计 validation 全绿后锁 tree；任一 production、test、README、artifact 或其它 reviewed path 变化都会使先前 lock/review 失效，必须在新 content manifest 与 binary diff hash 上重跑。两路 reviewer 必须审查完整累计 diff，不得把 S1 当作已单独接受的历史或只审 S2 增量。
 
@@ -790,7 +968,7 @@ S1/S2 都不单独commit，也不建立中间 checkpoint commit。只有累计 c
 
 已审计baseline仅用于增量判定：focused contract/read/ownership/consistency matrix为`111 passed`；真实AAPL/HTML/description/failed-outcome/fiscal exact nodes为`5 passed`；full pyright为零；full Ruff有150个继承问题。R08不承担全仓Ruff，但所有实际修改文件scoped Ruff必须归零；S1必改producer中已有两个F401随本切片清除。不得新增warning类别或pyright错误。
 
-累计 immutable dual code review 闭环后，aggregate deepreview必须再次检查：owner唯一性、reason动作性、count单一同源、raw immutability、query params单一shape、tool/serializer drift、R07 no-touch、compat/shim、allowlist/README/tests越界，以及 S1/S2 累计变更之间的 semantic ownership drift。
+累计 immutable dual code re-review 闭环后，aggregate deepreview必须再次检查：owner唯一性、reason动作性、count单一同源、raw immutability、query params单一shape、tool/serializer drift、R07 no-touch、compat/shim、allowlist/README/tests越界、四节点/九 imports 删除、stable-owner test 最小性与首次过线 ledger，以及 S1/S2/fix 累计变更之间的 semantic ownership drift。
 
 任一 aggregate deepreview accepted finding 的修复只要改变 reviewed tree，旧累计 validation、changed-path content manifest、binary diff hash 与两路 aggregate deepreview 即全部失效。必须在新 hash 上重跑完整 §6.6 与 §6.7，包括全部 focused/aggregate/full Fins tests、real smokes、逐文件 coverage checker、full pyright、实际 changed Python scoped Ruff、全部 scans 与 `git diff --check`；全绿并锁定新 hash 后，再由两路 reviewer 对完整 aggregate tree 进行 re-review。只有两路 aggregate re-review 与 Controller 逐条 adjudication 全部关闭后，才可授权 accepted local implementation commit。
 
@@ -808,6 +986,11 @@ R08 completion后umbrella仍active；依次继续R09、R10、R11、R12，之后�
 | Description需要字段清单 | 消费result_types owner helper | 手写第二份contract |
 | Host截断产生cursor envelope | 按第6.4节验证或stop回Controller | Fins私造fetch_more、静默drop、越界改Host |
 | 旧测试期待locator/count/internal reason | 迁移fixture/assertion | 生产兼容分支保旧测试 |
+| Correction-entry hash、共享文件 hash 或 staged 状态不匹配 | 不追加测试，立即回 Controller 澄清 drift | 在未知 tree 上继续；重建/恢复已删节点 |
+| 一个 public-seam candidate 需要 private cache/processor method/Host state、fake-only 或 compatibility input 才能驱动 | 立即 stop 回 Controller；只有 search family 可用表中唯一 module-helper 例外 | 新增第二个 helper 例外、monkeypatch 私有状态、loose fixture |
+| 增量 ledger 首次达到 `read_runtime_helpers.py >=80.00%` | 立即停止新增 owner family，清空 coverage 后完整重跑 §6.6/§6.7 | 追求 100%、补剩余候选、覆盖无业务断言分支 |
+| 五个授权 owner family 仍低于 80% | 记录逐步 ledger 并 stop 回 Controller | 扩 path/production allowlist；compatibility/omnibus/空执行；阈值/omit/pragma豁免 |
+| 新 stable-owner test 后任一 §6.6/§6.7 gate 失败 | 在原 owner/failure boundary 修复并从零完整重跑；若需越界则 stop | 复用旧 hash/validation/review；skip/xfail；只重跑失败子集即宣称通过 |
 | 发现R09-R12/deferred issue | 记录out-of-scope并停止扩张 | 顺手实现 |
 
 ## 9. Code-generation handoff checklist
@@ -826,6 +1009,11 @@ R08 completion后umbrella仍active；依次继续R09、R10、R11、R12，之后�
 ### S2 / aggregate
 
 - [ ] S1 blocked intermediate tree受保护且无compat/shim；S2按既有allowlist直接继续；
+- [ ] Code-review fix re-entry 精确匹配 23-path `7a7ebf...1d6d`、共享测试 `01db...6692`、guards entry `4a07...1ff`，staged 为空；
+- [ ] `test_fins_read_runtime.py` 固定 symbol boundary不变，四个删除节点与九 imports未恢复、改名、参数化或搬运；generic LRU/form-matching AST unchanged；
+- [ ] Stable-owner tests 只修改既有 allowlisted `test_read_runtime_semantic_ownership_guards.py`，实际 node 是 §6.1 候选顺序的连续最短前缀；前四项走 public runtime，只有必要时第5项直接调用唯一 module helper；
+- [ ] 每个新增 node 单 owner、完整中文 docstring、repository-backed public exact input/output/typed failure assertions；无 compatibility inputs、private cache/processor/Host state、偶然顺序、fake-only、空执行、omnibus 改名搬运；
+- [ ] 增量 coverage ledger 从 `320/494=64.78%` 开始逐 node 记录，并在首次 `>=80.00%` 后立即停止；未实现候选明确列出；
 - [ ] Single typed public projection/helper完成；
 - [ ] Public types 精确命名为 `PublicFinancialStatementResult` / `PublicXbrlQueryResult`，旧 tools 名称无 alias/re-export/wrapper；
 - [ ] Citation 使用 `Mapping[str, JsonValue]` 输入和独立 `dict[str, JsonValue]` 输出，同 borrowed snapshot 内容一致且 R07 no-touch；
@@ -838,23 +1026,39 @@ R08 completion后umbrella仍active；依次继续R09、R10、R11、R12，之后�
 - [ ] 两份README按自身约束更新；
 - [ ] S1+S2全部focused/aggregate tests与完整Fins regression通过；
 - [ ] Full pyright零、全部实际修改Python文件Ruff零、每个实际changed production文件逐文件coverage>=80%，无changed-line/aggregate/豁免；
-- [ ] Positive/negative/source/AST/LLM/README/security/unique-count/no-touch scans通过；
+- [ ] 完整 §6.6/§6.7 从零重跑；15-file whole-file exact-key coverage全部 `>=80.00%`，positive/negative/source/AST/LLM/README/security/unique-count/no-touch/correction scans通过；
+- [ ] 旧 plan SHA/reviews、`4d346f...d4b` review lock、`7a7ebf...1d6d` coverage/validation/reviews均标记失效，不作通过证据；
 - [ ] Controller在全绿后锁定累计changed-path content hashes与binary diff hash；MiMo/DS对同一immutable累计tree完成完整code review；
 - [ ] 全部accepted findings由AgentCodex修复并经完整累计validation与双路re-review关闭；aggregate双路deepreview关闭；
 - [ ] 任一 aggregate deepreview accepted fix 后在新 hash 上完整重跑 §6.6/§6.7，并经双路 aggregate re-review 与 Controller adjudication 关闭；
 - [ ] 未stage/commit，等待Controller另行授权。
 
-## 10. 本 cumulative validation plan-correction review-fix gate 自检要求
+## 10. 本 code-review fix plan-only correction gate 自检要求
 
 本gate唯一允许新增/修改artifact：
 
 ```text
 docs/host/wu-semantic-ownership-01-r08-fins-financial-xbrl-contract-plan.md
-docs/reviews/wu-semantic-ownership-01-r08-cumulative-validation-plan-correction-review-fix-codex.md
+docs/reviews/wu-semantic-ownership-01-r08-code-review-fix-plan-correction-codex.md
 ```
 
-交付前必须完整核对 `git status --short --untracked-files=all`，证明本次只增加上述两个 allowed-path delta，未修改当前 11 个 production、3 个 tests、S1 implementation artifact、control/controller/reviewer artifacts、README/design。以 corrected plan SHA-256 `4ff2c00c5999cf20ff314afd7e9a0fa041c32d2f36c23566d21752887c997e3d` 为 before hash，计算 final plan SHA-256，只在 review-fix artifact/handoff 中报告，不自嵌入 plan。
+交付前必须完整核对 `git status --short --untracked-files=all`，证明本次只增加上述两个
+allowed-path delta，未修改当前 23-path production/test/README protected tree、S1/S2/fix
+implementation artifacts、control/design/controller/reviewer/prior artifacts。以当前 accepted
+plan SHA-256 `87cc332828640de8b4cb4550f29251894111ef3471621bebbef828b66a3ce23d`
+为 before hash，计算 final plan SHA-256，只在新 Codex artifact/handoff 中报告，不自嵌入 plan。
 
-必须重算当前受保护 14-path 完整 `git diff --binary` SHA-256 并精确等于 `0d985b85aa65d7c4b06d9ee464cd73fc4a39ef2ee0934f376b0b845a09b20f57`；任何 drift 使 review-fix gate 失败。Review-fix artifact 必须给出 `R08-CVPF-01..03` 逐项 closure、rejected/no-fix 缺席证据、before/after section、final plan SHA、protected diff command/result、`git diff --check`、modified plan 与新增 artifact 的 whitespace check、完整 status 与 staged-empty 证据。
+必须在修改前后都用 `git diff --binary -- dayu/fins tests | sha256sum`（平台等价
+`shasum -a 256` 可接受）重算当前 23-path protected diff，并精确等于
+`7a7ebf939b758ce8fdd92413210743e5a90b65272df62e466bf70332eb771d6d`；任何 drift
+使本 gate 失败。新 artifact 必须记录：修正动机、`R08-CR-PCF01` 修改段落、before/final plan
+SHA、protected diff before/after、exact changed-path count、`git diff --check`、仅两条 authored
+doc paths 的 whitespace check、完整 status、staged-empty、无 product/test/README/control/design/
+prior-artifact 改动与本 turn 未运行测试/pyright/implementation 的事实。
 
-确认 `R08-CVPF-01..03` 全部且仅按 Controller 裁决关闭，§4 product contracts、S1/S2 production/test/README allowlists、R07 no-touch、Host truncation owner、Topic 8-9 no-code、Issues 142/151/175/177/178 与 R09-R12 deferred boundaries 均未改变后，停止回 Controller，由 Controller 派发两路完整 re-review；不得进入 S2 implementation、commit 或任何后续 gate。
+确认 `R08-CR-PCF01` 已 code-generation-ready 写入 allowlist、implementation step、validation、
+source/AST scans、checklist、stop conditions 与 aggregate handoff，同时 §4 product contracts、
+S1/S2 path allowlists、R07 no-touch、Host truncation owner、Topic 8-9 no-code、
+Issues 142/151/175/177/178 与 R09-R12 deferred boundaries均未改变后，停止回 Controller。
+下一 gate 只能是两路完整 corrected-plan review；不得进入 test implementation、code re-review、
+aggregate deepreview、commit 或任何后续 gate。
