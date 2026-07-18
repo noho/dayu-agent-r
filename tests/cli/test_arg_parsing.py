@@ -356,7 +356,7 @@ def test_interactive_new_session_flag_exits_with_usage_error() -> None:
 
 
 def test_root_readme_matches_current_cli_public_contract() -> None:
-    """根用户手册不得重新承诺 parser 中已删除或未实现的行为。
+    """根用户手册必须投影当前 CLI init 与其它公开行为。
 
     :returns: ``None``。
     :raises AssertionError: README 与当前 CLI command/输出契约漂移时抛出。
@@ -369,6 +369,9 @@ def test_root_readme_matches_current_cli_public_contract() -> None:
     batch_upload_section = readme.split(
         "### 5.3 从目录生成批量上传脚本", maxsplit=1
     )[1].split("### 5.4 预处理", maxsplit=1)[0]
+    init_section = readme.split("## 2. 初始化工作区", maxsplit=1)[1].split(
+        "## 3. CLI 公共命令", maxsplit=1
+    )[0]
     for removed_contract in (
         "`write`",
         "--ci",
@@ -378,7 +381,19 @@ def test_root_readme_matches_current_cli_public_contract() -> None:
         "--fins-limits-json",
     ):
         assert removed_contract not in readme
-    assert "`init` 是非交互式文件初始化命令" in readme
+    assert "`init` 是非交互式文件初始化命令" not in readme
+    for init_mode in ("FIRST：", "PRESERVE：", "OVERWRITE：", "RESET："):
+        assert init_mode in init_section
+    assert "RESET 优先于 `--overwrite`" in init_section
+    assert "POSIX 写入当前 shell" in init_section
+    assert "Windows 使用当前用户的 `setx`" in init_section
+    assert "secret 值不写入 workspace" in init_section
+    assert "`.dayu-init.lock` 只用于串行多个 `init`" in init_section
+    assert "执行 RESET 前必须先停止" in init_section
+    assert "FIRST/RESET 发布成功后" in init_section
+    assert "`prompt` 与 `interactive`" in init_section
+    assert "不联网" in init_section
+    assert "prewarm warning" in init_section
     assert "进程结束时自动清理" in readme
     assert "dayu-cli upload_filings_from" in batch_upload_section
     assert "--infer" in batch_upload_section
@@ -1117,6 +1132,26 @@ def test_default_namespace_initializes_reset_false() -> None:
     assert init_args.overwrite is False
     assert prompt_args.reset is False
     assert prompt_args.detail is True
+
+
+def test_init_help_describes_reset_precedence_and_overwrite_boundary(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Init help 必须描述真实四态中 RESET 与 OVERWRITE 的不同 owner boundary。
+
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: None。
+    :raises AssertionError: help 仍承诺旧逐文件覆盖语义时抛出。
+    """
+
+    with pytest.raises(SystemExit) as raised:
+        build_parser().parse_args(("init", "--help"))
+
+    help_text = capsys.readouterr().out
+    assert raised.value.code == 0
+    assert "优先于 --overwrite" in help_text
+    assert "重建 .dayu 与 config" in help_text
+    assert "保留 .dayu" in help_text
 
 
 def test_prompt_detail_defaults_to_detail() -> None:

@@ -514,6 +514,7 @@ async def prepare_entrypoint_runtime(
         assemble_effective_tool_provider_configs(
             tuple(runtime_config.tool_discovery.providers.values()),
             workspace_root=request.workspace_root,
+            fins_workspace_root_override=None,
         )
     )
     scene_inputs = prepare_scene(

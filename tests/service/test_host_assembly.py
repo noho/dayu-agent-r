@@ -199,7 +199,7 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
             context_slot_values={
                 "current_time": _CURRENT_TIME_TEXT,
                 "fins_default_subject": "测试财报主体",
-                },
+            },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
     )
@@ -241,10 +241,7 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
     assert result.options.memory_projection_policy.evidence_fact_item_cap == 256
     context_budget_policy = result.options.context_budget_policy
     assert context_budget_policy is not None
-    assert (
-        context_budget_policy.max_compaction_attempts_per_operation
-        == _EXPECTED_COMPACTION_ATTEMPTS_PER_OPERATION
-    )
+    assert context_budget_policy.max_compaction_attempts_per_operation == _EXPECTED_COMPACTION_ATTEMPTS_PER_OPERATION
     assert result.options.ordinary_run_baseline.runner_spec.headers["Authorization"] == f"Bearer {_API_KEY}"
     assert (
         result.options.ordinary_run_baseline.runner_spec.client_correlation_policy
@@ -268,7 +265,7 @@ def test_compose_open_host_options_uses_runtime_tuning_from_config(
         tool_execution_timeout_seconds=1.0,
         fallback_mode=AgentFallbackMode.RAISE_ERROR,
         fallback_prompt="Compactor is not allowed to fallback-answer.",
-        continuation_prompt=("Continue the strict JSON object without repeating content " "already emitted."),
+        continuation_prompt=("Continue the strict JSON object without repeating content already emitted."),
         max_consecutive_failed_tool_batches=1,
     )
     assert "compaction_request" in compactor_baseline.compactor_system_prompt
@@ -386,22 +383,16 @@ def test_replacing_discovered_bundle_preserves_host_wait_composition(
     )
 
     original_result = compose_open_host_options(request)
-    replaced_result = compose_open_host_options(
-        replace(request, discovered_tools=replaced_discovered_tools)
-    )
+    replaced_result = compose_open_host_options(replace(request, discovered_tools=replaced_discovered_tools))
 
     assert original_result.options.wait_poller_policy is not None
-    assert (
-        replaced_result.options.wait_poller_policy
-        == original_result.options.wait_poller_policy
-    )
+    assert replaced_result.options.wait_poller_policy == original_result.options.wait_poller_policy
     original_tooling = original_result.options.tooling_options
     replaced_tooling = replaced_result.options.tooling_options
     assert original_tooling is not None
     assert replaced_tooling is not None
     assert _DISCOVERY_REPLACEMENT_TOOL_NAME in {
-        definition.name
-        for definition in replaced_tooling.business_tool_bundle.definitions
+        definition.name for definition in replaced_tooling.business_tool_bundle.definitions
     }
     original_bindings = original_tooling.wait_adapter_registry
     replaced_bindings = replaced_tooling.wait_adapter_registry
@@ -419,16 +410,16 @@ def test_replacing_discovered_bundle_preserves_host_wait_composition(
     replaced_activation = replaced_tooling.wait_activation_registry
     assert original_activation is not None
     assert replaced_activation is not None
-    assert replaced_activation.resolve_adapter(
+    assert replaced_activation.resolve_adapter(FINS_INGESTION_WAIT_ADAPTER_KEY) == original_activation.resolve_adapter(
         FINS_INGESTION_WAIT_ADAPTER_KEY
-    ) == original_activation.resolve_adapter(FINS_INGESTION_WAIT_ADAPTER_KEY)
+    )
     original_poll = original_tooling.wait_poll_adapter_registry
     replaced_poll = replaced_tooling.wait_poll_adapter_registry
     assert original_poll is not None
     assert replaced_poll is not None
-    assert replaced_poll.resolve_adapter(
+    assert replaced_poll.resolve_adapter(FINS_INGESTION_WAIT_ADAPTER_KEY) == original_poll.resolve_adapter(
         FINS_INGESTION_WAIT_ADAPTER_KEY
-    ) == original_poll.resolve_adapter(FINS_INGESTION_WAIT_ADAPTER_KEY)
+    )
 
 
 @pytest.mark.parametrize(
@@ -865,7 +856,7 @@ def test_compose_open_host_options_reads_compactor_scene_id_from_profile(
             context_slot_values={
                 "current_time": _CURRENT_TIME_TEXT,
                 "fins_default_subject": "测试财报主体",
-                },
+            },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
     )
@@ -941,7 +932,7 @@ def test_compose_submit_followup_request_uses_prepared_system_prompt(
             context_slot_values={
                 "current_time": _CURRENT_TIME_TEXT,
                 "fins_default_subject": "测试财报主体",
-                },
+            },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
     )
@@ -974,9 +965,7 @@ def test_compose_submit_followup_request_with_overrides_sets_typed_fields(
     config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
         workspace_config_dir=locations.config_overlay_dir
     )
-    discovered_tools = _discover_service_tools_for_workspace(
-        config, workspace_root=tmp_path
-    )
+    discovered_tools = _discover_service_tools_for_workspace(config, workspace_root=tmp_path)
     scene_inputs = prepare_scene(
         ScenePrepareRequest(
             scene_id=_SCENE_ID,
@@ -985,7 +974,7 @@ def test_compose_submit_followup_request_with_overrides_sets_typed_fields(
             context_slot_values={
                 "current_time": _CURRENT_TIME_TEXT,
                 "fins_default_subject": "测试财报主体",
-                },
+            },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
     )
@@ -1028,10 +1017,7 @@ def test_compose_submit_followup_request_with_overrides_sets_typed_fields(
 
     assert request.runner_options is not None
     assert request.runner_options.temperature == 0.17
-    assert (
-        request.runner_options.top_p
-        == host_assembly.ordinary_selection.runner_option_hint.top_p
-    )
+    assert request.runner_options.top_p == host_assembly.ordinary_selection.runner_option_hint.top_p
     assert request.agent_policy is not None
     assert request.agent_policy.max_iterations == 7
     assert request.agent_policy.tool_execution_timeout_seconds == 3.5
@@ -1218,10 +1204,7 @@ def test_runner_spec_from_ollama_model_skips_api_key_header() -> None:
 
     assert spec.api_key_ref is None
     assert spec.headers == {"Content-Type": "application/json"}
-    assert (
-        spec.client_correlation_policy
-        is ClientCorrelationPolicy.OPENAI_X_CLIENT_REQUEST_ID
-    )
+    assert spec.client_correlation_policy is ClientCorrelationPolicy.OPENAI_X_CLIENT_REQUEST_ID
 
 
 def test_runner_spec_rejects_static_client_request_id_header() -> None:
@@ -1362,14 +1345,10 @@ def test_tooling_options_binds_fins_wait_adapter_registry_for_enabled_awaiting_p
     assert download_binding.adapter_key == FINS_INGESTION_WAIT_ADAPTER_KEY
     assert preprocess_binding.adapter_key == FINS_INGESTION_WAIT_ADAPTER_KEY
     assert upload_binding.adapter_key == FINS_INGESTION_WAIT_ADAPTER_KEY
-    activation_adapter = tooling_options.wait_activation_registry.resolve_adapter(
-        FINS_INGESTION_WAIT_ADAPTER_KEY
-    )
+    activation_adapter = tooling_options.wait_activation_registry.resolve_adapter(FINS_INGESTION_WAIT_ADAPTER_KEY)
     assert isinstance(activation_adapter, FinsIngestionWaitActivationAdapter)
     assert activation_adapter.runtime is discovered_tools.fins_awaiting_runtime
-    poll_adapter = tooling_options.wait_poll_adapter_registry.resolve_adapter(
-        FINS_INGESTION_WAIT_ADAPTER_KEY
-    )
+    poll_adapter = tooling_options.wait_poll_adapter_registry.resolve_adapter(FINS_INGESTION_WAIT_ADAPTER_KEY)
     assert isinstance(poll_adapter, FinsIngestionWaitPollAdapter)
     assert poll_adapter.runtime is discovered_tools.fins_awaiting_runtime
 
@@ -1407,15 +1386,11 @@ async def test_service_fins_awaiting_wiring_uses_shared_runtime_for_activation(
     callable_ = definition.callable
     assert definition.name == DOWNLOAD_TOOL_NAME
     assert isinstance(callable_, FinsDownloadToolCallable)
-    activation_adapter = tooling_options.wait_activation_registry.resolve_adapter(
-        FINS_INGESTION_WAIT_ADAPTER_KEY
-    )
+    activation_adapter = tooling_options.wait_activation_registry.resolve_adapter(FINS_INGESTION_WAIT_ADAPTER_KEY)
     assert isinstance(activation_adapter, FinsIngestionWaitActivationAdapter)
     assert activation_adapter.runtime is discovered_tools.fins_awaiting_runtime
     assert activation_adapter.runtime is callable_.runtime
-    poll_adapter = tooling_options.wait_poll_adapter_registry.resolve_adapter(
-        FINS_INGESTION_WAIT_ADAPTER_KEY
-    )
+    poll_adapter = tooling_options.wait_poll_adapter_registry.resolve_adapter(FINS_INGESTION_WAIT_ADAPTER_KEY)
     assert isinstance(poll_adapter, FinsIngestionWaitPollAdapter)
     assert poll_adapter.runtime is discovered_tools.fins_awaiting_runtime
     assert poll_adapter.runtime is callable_.runtime
@@ -1774,9 +1749,7 @@ def test_default_web_storage_state_dir_resolves_under_workspace_root(
         workspace_root=tmp_path,
     )
     web_provider = next(
-        provider_config
-        for provider_config in effective_providers
-        if provider_config.provider_id == "web-tools"
+        provider_config for provider_config in effective_providers if provider_config.provider_id == "web-tools"
     )
 
     assert web_provider.config["playwright_storage_state_dir"] == str(
@@ -1876,10 +1849,176 @@ def test_fins_tool_discovery_spec_resolves_relative_workspace_root(
     )
     spec = _tool_discovery_spec(effective_providers[0])
 
-    assert spec.config["workspace_root"] == str(
-        (runtime_workspace / "fins-data").resolve(strict=False)
-    )
+    assert spec.config["workspace_root"] == str((runtime_workspace / "fins-data").resolve(strict=False))
     assert provider.config["workspace_root"] == "fins-data/"
+
+
+@pytest.mark.parametrize(
+    "raw_workspace_root",
+    (None, "/configured/fins", "relative/fins"),
+)
+@pytest.mark.parametrize(
+    ("provider_id", "import_path", "source_id"),
+    (
+        (
+            "financial-read-tools",
+            "dayu.fins.tools.provider:discover_tools",
+            "dayu.fins.tools.provider",
+        ),
+        (
+            "financial-download-tools",
+            "dayu.fins.tools.download_provider:discover_tools",
+            "dayu.fins.tools.download_provider",
+        ),
+    ),
+)
+def test_fins_validation_override_dominates_all_legal_raw_path_cases(
+    tmp_path: Path,
+    raw_workspace_root: str | None,
+    provider_id: str,
+    import_path: str,
+    source_id: str,
+) -> None:
+    """合法 raw 三态先过 grammar，再由 private absolute override 支配。
+
+    :param tmp_path: pytest 临时目录。
+    :param raw_workspace_root: 未配置、绝对或相对 raw Fins root。
+    :param provider_id: read 或 awaiting Fins provider id。
+    :param import_path: provider 当前 import path。
+    :param source_id: provider 当前 source id。
+    :returns: None。
+    :raises AssertionError: effective precedence 或 raw mapping 被改写时抛出。
+    """
+
+    raw_config: dict[str, JsonValue] = {"limits": {}}
+    if raw_workspace_root is not None:
+        raw_config["workspace_root"] = raw_workspace_root
+    original_raw_config = dict(raw_config)
+    provider = ToolDiscoveryProviderConfig(
+        provider_id=provider_id,
+        import_path=import_path,
+        entry_point=None,
+        source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
+        source_id=source_id,
+        enabled=True,
+        config=raw_config,
+    )
+    public_workspace = (tmp_path / "public").resolve(strict=False)
+    private_workspace = (tmp_path / "private").resolve(strict=False)
+
+    effective_provider = assemble_effective_tool_provider_configs(
+        (provider,),
+        workspace_root=public_workspace,
+        fins_workspace_root_override=private_workspace,
+    )[0]
+
+    assert effective_provider.config["workspace_root"] == str(private_workspace)
+    assert raw_config == original_raw_config
+    assert provider.config == original_raw_config
+
+
+@pytest.mark.parametrize("invalid_raw", (123, "", "   "))
+def test_fins_validation_override_does_not_mask_invalid_raw_grammar(
+    tmp_path: Path,
+    invalid_raw: JsonValue,
+) -> None:
+    """Private override 不得跳过现行 raw type/non-empty grammar。
+
+    :param tmp_path: pytest 临时目录。
+    :param invalid_raw: 非字符串或空白 raw root。
+    :returns: None。
+    :raises AssertionError: 非法 raw 被 override 掩盖时抛出。
+    """
+
+    provider = ToolDiscoveryProviderConfig(
+        provider_id="financial-read-tools",
+        import_path="dayu.fins.tools.provider:discover_tools",
+        entry_point=None,
+        source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
+        source_id="dayu.fins.tools.provider",
+        enabled=True,
+        config={"workspace_root": invalid_raw, "limits": {}},
+    )
+
+    with pytest.raises(ValueError, match="workspace_root must"):
+        assemble_effective_tool_provider_configs(
+            (provider,),
+            workspace_root=tmp_path / "public",
+            fins_workspace_root_override=(tmp_path / "private").resolve(strict=False),
+        )
+
+
+def test_fins_validation_override_requires_absolute_path(
+    tmp_path: Path,
+) -> None:
+    """Validation override 自身必须是 absolute path。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: None。
+    :raises AssertionError: relative override 未被拒绝时抛出。
+    """
+
+    provider = ToolDiscoveryProviderConfig(
+        provider_id="financial-read-tools",
+        import_path="dayu.fins.tools.provider:discover_tools",
+        entry_point=None,
+        source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
+        source_id="dayu.fins.tools.provider",
+        enabled=True,
+        config={"limits": {}},
+    )
+
+    with pytest.raises(ValueError, match="override must be absolute"):
+        assemble_effective_tool_provider_configs(
+            (provider,),
+            workspace_root=tmp_path,
+            fins_workspace_root_override=Path("relative-private"),
+        )
+
+
+def test_fins_validation_override_does_not_enter_non_fins_or_web_paths(
+    tmp_path: Path,
+) -> None:
+    """Override 只由既有 Fins classifier 消费，Web 仍用 ordinary root。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: None。
+    :raises AssertionError: 非 Fins config 或 Web storage root 被污染时抛出。
+    """
+
+    ordinary_provider = ToolDiscoveryProviderConfig(
+        provider_id="doc-tools",
+        import_path="dayu.tools.doc_provider:discover_tools",
+        entry_point=None,
+        source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
+        source_id="dayu.tools.doc_provider",
+        enabled=True,
+        config={"root": "ordinary"},
+    )
+    web_provider = ToolDiscoveryProviderConfig(
+        provider_id="web-tools",
+        import_path="dayu.tools.web:discover_tools",
+        entry_point=None,
+        source_kind=ToolBundleSourceKind.EXPLICIT_PROVIDER,
+        source_id="dayu.tools.web",
+        enabled=True,
+        config={"playwright_storage_state_dir": "web-state"},
+    )
+    public_workspace = (tmp_path / "public").resolve(strict=False)
+    private_workspace = (tmp_path / "private").resolve(strict=False)
+
+    ordinary_effective, web_effective = assemble_effective_tool_provider_configs(
+        (ordinary_provider, web_provider),
+        workspace_root=public_workspace,
+        fins_workspace_root_override=private_workspace,
+    )
+
+    assert ordinary_effective == ordinary_provider
+    assert "workspace_root" not in ordinary_effective.config
+    assert web_effective.config["playwright_storage_state_dir"] == str(
+        (public_workspace / "web-state").resolve(strict=False)
+    )
+    assert str(private_workspace) not in json.dumps(web_effective.config)
 
 
 def test_fins_tool_discovery_spec_rejects_non_string_workspace_root() -> None:
@@ -2056,9 +2195,7 @@ def test_discover_service_tools_carries_effective_fins_config_into_compose(
         workspace_root=tmp_path,
         package_config_root=_PACKAGE_CONFIG_ROOT,
     )
-    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
-        workspace_config_dir=overlay_dir
-    )
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(workspace_config_dir=overlay_dir)
     discovered_tools = _discover_service_tools_for_workspace(config, workspace_root=fins_workspace)
     discovered_provider = next(
         provider_config
@@ -2144,14 +2281,10 @@ def test_config_loader_and_service_discover_web_tools_with_overlay_config(
             }
         },
     )
-    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
-        workspace_config_dir=overlay_dir
-    )
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(workspace_config_dir=overlay_dir)
 
     discovered_tools = _discover_service_tools_for_workspace(config, workspace_root=tmp_path)
-    tool_names = tuple(
-        definition.name for definition in discovered_tools.tool_bundle.definitions
-    )
+    tool_names = tuple(definition.name for definition in discovered_tools.tool_bundle.definitions)
 
     assert "search_web" in tool_names
     assert "fetch_web_page" in tool_names
@@ -2197,7 +2330,7 @@ def test_truncation_manager_enabled_is_derived_from_execution_profile(
             context_slot_values={
                 "current_time": _CURRENT_TIME_TEXT,
                 "fins_default_subject": "测试财报主体",
-                },
+            },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
     )
@@ -2251,7 +2384,7 @@ def test_memory_projection_context_window_uses_effective_model_window(
             context_slot_values={
                 "current_time": _CURRENT_TIME_TEXT,
                 "fins_default_subject": "测试财报主体",
-                },
+            },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
     )
@@ -2275,9 +2408,7 @@ def test_memory_projection_context_window_uses_effective_model_window(
 
     assert config.models.models[_MODEL_ID].context_window_tokens == 1048576
     assert (
-        config.execution_profiles.execution_profiles[
-            "standard-256k"
-        ].memory_projection_policy.context_window_size
+        config.execution_profiles.execution_profiles["standard-256k"].memory_projection_policy.context_window_size
         == 262144
     )
     assert result.options.memory_projection_policy.context_window_size == 1048576
@@ -2315,7 +2446,7 @@ def test_tool_duplicate_governance_policy_is_derived_from_execution_profile(
             context_slot_values={
                 "current_time": _CURRENT_TIME_TEXT,
                 "fins_default_subject": "测试财报主体",
-                },
+            },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
     )
@@ -2341,14 +2472,8 @@ def test_tool_duplicate_governance_policy_is_derived_from_execution_profile(
     policy = result.options.tooling_options.duplicate_governance_policy
     assert policy.default_duplicate_decision is DuplicateDecisionKind.HINT
     assert policy.decisions_by_tool_name["lookup_fact"] is DuplicateDecisionKind.REUSE
-    assert (
-        policy.decisions_by_tool_name["explain_fact"]
-        is DuplicateDecisionKind.REQUIRE_JUSTIFICATION
-    )
-    assert (
-        policy.justification_argument_names_by_tool_name["explain_fact"]
-        == "duplicate_justification"
-    )
+    assert policy.decisions_by_tool_name["explain_fact"] is DuplicateDecisionKind.REQUIRE_JUSTIFICATION
+    assert policy.justification_argument_names_by_tool_name["explain_fact"] == "duplicate_justification"
     assert policy.messages.reuse == "请直接使用上一次工具结果继续推理，不要重复请求相同证据。"
 
 
@@ -2401,7 +2526,7 @@ def test_explicit_1m_profile_with_256k_model_fails_fast(
             context_slot_values={
                 "current_time": _CURRENT_TIME_TEXT,
                 "fins_default_subject": "测试财报主体",
-                },
+            },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
     )
@@ -2453,7 +2578,7 @@ def test_default_profile_does_not_auto_switch_for_1m_model(
             context_slot_values={
                 "current_time": _CURRENT_TIME_TEXT,
                 "fins_default_subject": "测试财报主体",
-                },
+            },
             available_tools=_scene_tool_catalog(discovered_tools),
         )
     )
@@ -2526,18 +2651,13 @@ def _duplicate_governance_policy_config() -> ToolDuplicateGovernancePolicyConfig
                 "指标或证据范围时，才重新调用工具并修改参数。"
             ),
             require_justification=(
-                "重复调用同一工具前，必须在参数中说明为什么上一次工具结果不足，"
-                "以及本次需要补充的不同证据范围。"
+                "重复调用同一工具前，必须在参数中说明为什么上一次工具结果不足，以及本次需要补充的不同证据范围。"
             ),
             hard_stop=(
-                "本次重复工具调用已被拒绝。请使用上一次工具结果继续推理；"
-                "如果信息不足，请说明不确定性，不要编造。"
+                "本次重复工具调用已被拒绝。请使用上一次工具结果继续推理；如果信息不足，请说明不确定性，不要编造。"
             ),
             attempt_scope_diagnostic="检测到当前推理步骤中重复请求相同工具证据。",
-            prior_accept_missing=(
-                "上一次相同工具请求没有产生可用结果。请说明信息不足，"
-                "或在改变证据范围后再调用工具。"
-            ),
+            prior_accept_missing=("上一次相同工具请求没有产生可用结果。请说明信息不足，或在改变证据范围后再调用工具。"),
         ),
     )
 
@@ -2729,8 +2849,7 @@ def _write_execution_profile_overlay(
                             ),
                             "attempt_scope_diagnostic": "检测到当前推理步骤中重复请求相同工具证据。",
                             "prior_accept_missing": (
-                                "上一次相同工具请求没有产生可用结果。请说明信息不足，"
-                                "或在改变证据范围后再调用工具。"
+                                "上一次相同工具请求没有产生可用结果。请说明信息不足，或在改变证据范围后再调用工具。"
                             ),
                         },
                     },
@@ -2740,11 +2859,9 @@ def _write_execution_profile_overlay(
                         "allow_tool_calls": True,
                         "tool_execution_timeout_seconds": 120.0,
                         "fallback_mode": "force_answer",
-                        "fallback_prompt": (
-                            "请基于已获得的信息直接回答问题。" "信息不足时必须说明不确定性，不得编造。"
-                        ),
+                        "fallback_prompt": ("请基于已获得的信息直接回答问题。信息不足时必须说明不确定性，不得编造。"),
                         "continuation_prompt": (
-                            "请从上一条回复被截断的位置继续输出，" "保持原有语言、格式和结构，不要重复已经输出的内容。"
+                            "请从上一条回复被截断的位置继续输出，保持原有语言、格式和结构，不要重复已经输出的内容。"
                         ),
                         "max_consecutive_failed_tool_batches": 2,
                     },
@@ -2785,9 +2902,7 @@ def _custom_compactor_scene_locations(workspace_root: Path) -> RuntimeLocations:
                 "tool_execution_timeout_seconds": 1.0,
                 "fallback_mode": "raise_error",
                 "fallback_prompt": "Compactor is not allowed to fallback-answer.",
-                "continuation_prompt": (
-                    "Continue the strict JSON object without repeating content " "already emitted."
-                ),
+                "continuation_prompt": ("Continue the strict JSON object without repeating content already emitted."),
                 "max_consecutive_failed_tool_batches": 1,
             },
             "tool_selection": {

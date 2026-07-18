@@ -1,8 +1,19 @@
-"""``dayu-cli init`` 工作区初始化测试。"""
+"""dayu.cli.commands.init 四态 orchestrator 测试。"""
 
 from __future__ import annotations
 
+import builtins
+import errno
+import getpass
+import importlib
+import os
+import platform
+import secrets
+import threading
 from pathlib import Path
+from types import ModuleType
+from typing import Final, TextIO
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -14,574 +25,1039 @@ from dayu.cli.exit_codes import (
     EXIT_SUCCESS,
     EXIT_USAGE_ERROR,
 )
-from dayu.runtime.config_loader import (
-    ConfigLoader,
-    config_file_names,
+from dayu.cli.init_environment import (
+    EnvironmentPersistenceEntry,
+    EnvironmentPersistenceError,
+    EnvironmentPersistenceInterrupted,
+    EnvironmentPersistenceResult,
+    EnvironmentPersistenceStatus,
+    PosixEnvironmentPersistencePlan,
+    WindowsEnvironmentPersistencePlan,
 )
-from dayu.runtime.location import resolve_runtime_locations
+from dayu.cli.init_workspace import PreparedWorkspaceTransaction
+from dayu.runtime.config_loader import ConfigLoader
+from dayu.runtime.filelock import file_lock
 
-_REMOVED_CONFIG_FILE_NAMES: frozenset[str] = frozenset(
-    {"llm_models.json", "run.json"}
-)
+_WAIT_TIMEOUT_SECONDS: Final[float] = 30.0
 
 
-def test_init_empty_workspace_copies_current_config(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """验证空 workspace init 会复制当前 schema 配置和 prompts。
+class _BrokenStderr:
+    """记录诊断尝试并以 ``OSError`` 拒绝 stderr 写入。"""
 
-    :param tmp_path: pytest 临时目录。
-    :param capsys: pytest 标准输出捕获夹具。
-    :returns: ``None``。
-    :raises AssertionError: 初始化结果不符合 current schema bootstrap 时抛出。
-    """
+    def __init__(self, events: list[str]) -> None:
+        """初始化 broken stderr。
 
-    workspace_root = tmp_path / "workspace"
-
-    exit_code = cli_main.main(("init", "--base", str(workspace_root)))
-    captured = capsys.readouterr()
-
-    assert exit_code == EXIT_SUCCESS
-    assert "initialized workspace config" in captured.out
-    workspace_config = workspace_root / "config"
-    for file_name in config_file_names():
-        assert (workspace_config / file_name).is_file()
-    assert (workspace_config / "prompts" / "manifests" / "prompt.json").is_file()
-    assert (workspace_config / "prompts" / "scenes" / "interactive.md").is_file()
-    for legacy_name in _REMOVED_CONFIG_FILE_NAMES:
-        assert not (workspace_config / legacy_name).exists()
-
-
-def test_init_existing_files_without_overwrite_fails(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """验证目标配置文件存在且未传 ``--overwrite`` 时失败。
-
-    :param tmp_path: pytest 临时目录。
-    :param capsys: pytest 标准输出捕获夹具。
-    :returns: ``None``。
-    :raises AssertionError: 退出码或文件内容不符合覆盖保护语义时抛出。
-    """
-
-    workspace_config = tmp_path / "workspace" / "config"
-    workspace_config.mkdir(parents=True)
-    target = workspace_config / "models.json"
-    target.write_text("user content", encoding="utf-8")
-
-    exit_code = cli_main.main(("init", "--base", str(tmp_path / "workspace")))
-    captured = capsys.readouterr()
-
-    assert exit_code == EXIT_FAILURE
-    assert "pass --overwrite" in captured.err
-    assert target.read_text(encoding="utf-8") == "user content"
-
-
-def test_init_overwrite_replaces_existing_config_file(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """验证 ``--overwrite`` 会替换已有配置文件。
-
-    :param tmp_path: pytest 临时目录。
-    :param capsys: pytest 标准输出捕获夹具。
-    :returns: ``None``。
-    :raises AssertionError: 文件没有被 current schema 配置替换时抛出。
-    """
-
-    workspace_config = tmp_path / "workspace" / "config"
-    workspace_config.mkdir(parents=True)
-    target = workspace_config / "models.json"
-    target.write_text("user content", encoding="utf-8")
-
-    exit_code = cli_main.main(
-        ("init", "--base", str(tmp_path / "workspace"), "--overwrite")
-    )
-    captured = capsys.readouterr()
-
-    assert exit_code == EXIT_SUCCESS
-    assert "initialized workspace config" in captured.out
-    assert '"models"' in target.read_text(encoding="utf-8")
-    assert target.read_text(encoding="utf-8") != "user content"
-
-
-def test_init_overwrite_preserves_unmanaged_config_file(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """验证 whole-tree staging 不会误删非 init 管理的用户配置文件。
-
-    :param tmp_path: pytest 临时目录。
-    :param capsys: pytest 标准输出捕获夹具。
-    :returns: ``None``。
-    :raises AssertionError: 用户文件被覆盖或删除时抛出。
-    """
-
-    workspace_root = tmp_path / "workspace"
-    user_file = workspace_root / "config" / "user-extension.json"
-    _write_text(user_file, '{"owner":"user"}')
-
-    exit_code = cli_main.main(
-        ("init", "--base", str(workspace_root), "--overwrite")
-    )
-    captured = capsys.readouterr()
-
-    assert exit_code == EXIT_SUCCESS
-    assert "initialized workspace config" in captured.out
-    assert user_file.read_text(encoding="utf-8") == '{"owner":"user"}'
-
-
-def test_init_copy_rejects_config_directory_symlink_without_writing_outside(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """验证普通 init 不会沿 ``workspace/config`` symlink 写出工作区。
-
-    :param tmp_path: pytest 临时目录。
-    :param capsys: pytest 标准输出捕获夹具。
-    :returns: ``None``。
-    :raises AssertionError: init 未拒绝 symlink 或写入外部目录时抛出。
-    """
-
-    workspace_root = tmp_path / "workspace"
-    outside_config = tmp_path / "outside-config"
-    workspace_root.mkdir()
-    outside_config.mkdir()
-    (workspace_root / "config").symlink_to(
-        outside_config,
-        target_is_directory=True,
-    )
-
-    exit_code = cli_main.main(("init", "--base", str(workspace_root)))
-    captured = capsys.readouterr()
-
-    assert exit_code == EXIT_USAGE_ERROR
-    assert "write destination path must not contain a symlink" in captured.err
-    assert tuple(outside_config.iterdir()) == ()
-    assert (workspace_root / "config").is_symlink()
-
-
-def test_init_copy_rejects_nested_symlink_without_writing_outside(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """验证普通 init 拒绝现存 config tree 内的嵌套 symlink。
-
-    :param tmp_path: pytest 临时目录。
-    :param capsys: pytest 标准输出捕获夹具。
-    :returns: ``None``。
-    :raises AssertionError: init 沿嵌套 symlink 写入外部目录时抛出。
-    """
-
-    workspace_root = tmp_path / "workspace"
-    outside_prompts = tmp_path / "outside-prompts"
-    config_dir = workspace_root / "config"
-    config_dir.mkdir(parents=True)
-    outside_prompts.mkdir()
-    (config_dir / "prompts").symlink_to(
-        outside_prompts,
-        target_is_directory=True,
-    )
-
-    exit_code = cli_main.main(
-        ("init", "--base", str(workspace_root), "--overwrite")
-    )
-    captured = capsys.readouterr()
-
-    assert exit_code == EXIT_USAGE_ERROR
-    assert "write destination path must not contain a symlink" in captured.err
-    assert tuple(outside_prompts.iterdir()) == ()
-    assert (config_dir / "prompts").is_symlink()
-
-
-def test_init_staged_install_failure_restores_existing_config(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """验证 staging 安装失败会恢复安装前的完整 config tree。
-
-    :param tmp_path: pytest 临时目录。
-    :param monkeypatch: pytest monkeypatch 夹具。
-    :returns: ``None``。
-    :raises AssertionError: 安装失败后旧配置未恢复或新配置泄漏时抛出。
-    """
-
-    workspace_root = tmp_path / "workspace"
-    config_dir = workspace_root / "config"
-    staging_dir = workspace_root / ".dayu-init-stage-test"
-    _write_text(config_dir / "old.json", "old")
-    _write_text(staging_dir / "new.json", "new")
-    real_replace = init_command.os.replace
-
-    def fail_staging_install(source: Path, destination: Path) -> None:
-        """只在 staging tree 安装步骤模拟 rename 失败。
-
-        :param source: rename 源路径。
-        :param destination: rename 目标路径。
-        :returns: 非 staging 安装路径正常完成 rename。
-        :raises OSError: staging tree 安装步骤始终抛出。
-        """
-
-        if source == staging_dir and destination == config_dir:
-            raise OSError("simulated staged install failure")
-        real_replace(source, destination)
-
-    monkeypatch.setattr(init_command.os, "replace", fail_staging_install)
-
-    with pytest.raises(OSError, match="simulated staged install failure"):
-        init_command._install_staged_config_tree(
-            workspace_root=workspace_root,
-            workspace_config_dir=config_dir,
-            staging_dir=staging_dir,
-        )
-
-    assert (config_dir / "old.json").read_text(encoding="utf-8") == "old"
-    assert not (config_dir / "new.json").exists()
-    assert (staging_dir / "new.json").read_text(encoding="utf-8") == "new"
-    assert not tuple(workspace_root.glob(".dayu-init-backup-*"))
-
-
-def test_init_staged_install_keyboard_interrupt_restores_existing_config(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """验证 staging 安装收到 SIGINT 时恢复旧 config tree。
-
-    :param tmp_path: pytest 临时目录。
-    :param monkeypatch: pytest monkeypatch 夹具。
-    :returns: ``None``。
-    :raises AssertionError: 中断安装后旧配置未恢复或新配置泄漏时抛出。
-    """
-
-    workspace_root = tmp_path / "workspace"
-    config_dir = workspace_root / "config"
-    staging_dir = workspace_root / ".dayu-init-stage-test"
-    _write_text(config_dir / "old.json", "old")
-    _write_text(staging_dir / "new.json", "new")
-    real_replace = init_command.os.replace
-
-    def interrupt_staging_install(source: Path, destination: Path) -> None:
-        """只在 staging tree 安装步骤模拟用户中断。
-
-        :param source: rename 源路径。
-        :param destination: rename 目标路径。
-        :returns: 非 staging 安装路径正常完成 rename。
-        :raises KeyboardInterrupt: staging tree 安装步骤始终抛出。
-        """
-
-        if source == staging_dir and destination == config_dir:
-            raise KeyboardInterrupt
-        real_replace(source, destination)
-
-    monkeypatch.setattr(init_command.os, "replace", interrupt_staging_install)
-
-    with pytest.raises(KeyboardInterrupt):
-        init_command._install_staged_config_tree(
-            workspace_root=workspace_root,
-            workspace_config_dir=config_dir,
-            staging_dir=staging_dir,
-        )
-
-    assert (config_dir / "old.json").read_text(encoding="utf-8") == "old"
-    assert not (config_dir / "new.json").exists()
-    assert (staging_dir / "new.json").read_text(encoding="utf-8") == "new"
-    assert not tuple(workspace_root.glob(".dayu-init-backup-*"))
-
-
-def test_init_reset_only_deletes_hardcoded_whitelist(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """验证 reset 只删除硬编码白名单路径并保留禁止删除路径。
-
-    :param tmp_path: pytest 临时目录。
-    :param capsys: pytest 标准输出捕获夹具。
-    :returns: ``None``。
-    :raises AssertionError: reset 删除越界或遗漏 current init 结果时抛出。
-    """
-
-    project_root = tmp_path
-    workspace_root = project_root / "workspace"
-    _write_text(workspace_root / "config" / "old.json", "old")
-    _write_text(workspace_root / ".dayu" / "host" / "old.txt", "old")
-    _write_text(workspace_root / ".dayu" / "artifacts" / "old.txt", "old")
-    _write_text(
-        workspace_root / ".dayu" / "web_tools_storage_states" / "old.txt",
-        "old",
-    )
-    _write_text(
-        workspace_root / ".dayu" / "runtime" / "runtime_lanes.sqlite3",
-        "runtime",
-    )
-    _write_text(project_root / ".dayu" / "fins_ingestion" / "jobs" / "job.json", "job")
-    _write_text(project_root / ".dayu" / "sec_cache" / "cache.txt", "cache")
-    _write_text(workspace_root / "fins" / "raw.txt", "fins")
-    _write_text(project_root / "fins" / "raw.txt", "root-fins")
-    _write_text(workspace_root / "user.txt", "user")
-
-    exit_code = cli_main.main(
-        ("init", "--base", str(workspace_root), "--reset", "--overwrite")
-    )
-    captured = capsys.readouterr()
-
-    assert exit_code == EXIT_SUCCESS
-    assert "reset 4 workspace path" in captured.out
-    assert (workspace_root / "config" / "models.json").is_file()
-    assert not (workspace_root / ".dayu" / "host").exists()
-    assert not (workspace_root / ".dayu" / "artifacts").exists()
-    assert not (workspace_root / ".dayu" / "web_tools_storage_states").exists()
-    assert (
-        workspace_root / ".dayu" / "runtime" / "runtime_lanes.sqlite3"
-    ).read_text(encoding="utf-8") == "runtime"
-    assert (
-        project_root / ".dayu" / "fins_ingestion" / "jobs" / "job.json"
-    ).read_text(encoding="utf-8") == "job"
-    assert (project_root / ".dayu" / "sec_cache" / "cache.txt").read_text(
-        encoding="utf-8"
-    ) == "cache"
-    assert (workspace_root / "fins" / "raw.txt").read_text(encoding="utf-8") == "fins"
-    assert (project_root / "fins" / "raw.txt").read_text(
-        encoding="utf-8"
-    ) == "root-fins"
-    assert (workspace_root / "user.txt").read_text(encoding="utf-8") == "user"
-
-
-def test_init_reset_symlink_escape_fails_fast_without_deleting(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """验证 reset 白名单路径为 symlink 时失败且不执行任何删除。
-
-    :param tmp_path: pytest 临时目录。
-    :param capsys: pytest 标准输出捕获夹具。
-    :returns: ``None``。
-    :raises AssertionError: symlink 逃逸未 fail fast 或其它白名单被删除时抛出。
-    """
-
-    workspace_root = tmp_path / "workspace"
-    outside_config = tmp_path / "outside-config"
-    outside_config.mkdir()
-    workspace_root.mkdir()
-    (workspace_root / "config").symlink_to(outside_config, target_is_directory=True)
-    _write_text(workspace_root / ".dayu" / "host" / "old.txt", "old")
-
-    exit_code = cli_main.main(("init", "--base", str(workspace_root), "--reset"))
-    captured = capsys.readouterr()
-
-    assert exit_code == EXIT_USAGE_ERROR
-    assert "symlink" in captured.err
-    assert (workspace_root / "config").is_symlink()
-    assert (outside_config).is_dir()
-    assert (workspace_root / ".dayu" / "host" / "old.txt").read_text(
-        encoding="utf-8"
-    ) == "old"
-
-
-def test_init_reset_parent_symlink_containment_escape_fails_fast(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """验证 reset 白名单父目录 symlink 逃逸时失败且不执行删除。
-
-    :param tmp_path: pytest 临时目录。
-    :param capsys: pytest 标准输出捕获夹具。
-    :returns: ``None``。
-    :raises AssertionError: resolve 后逃逸未 fail fast 或 config 被删除时抛出。
-    """
-
-    workspace_root = tmp_path / "workspace"
-    outside_dayu = tmp_path / "outside-dayu"
-    workspace_root.mkdir()
-    outside_dayu.mkdir()
-    (workspace_root / ".dayu").symlink_to(outside_dayu, target_is_directory=True)
-    _write_text(outside_dayu / "host" / "old.txt", "outside")
-    _write_text(workspace_root / "config" / "old.json", "config")
-
-    exit_code = cli_main.main(("init", "--base", str(workspace_root), "--reset"))
-    captured = capsys.readouterr()
-
-    assert exit_code == EXIT_USAGE_ERROR
-    assert "reset whitelist path must not contain a symlink" in captured.err
-    assert (workspace_root / ".dayu").is_symlink()
-    assert (outside_dayu / "host" / "old.txt").read_text(
-        encoding="utf-8"
-    ) == "outside"
-    assert (workspace_root / "config" / "old.json").read_text(
-        encoding="utf-8"
-    ) == "config"
-
-
-def test_init_generated_workspace_config_loads_with_config_loader(
-    tmp_path: Path,
-) -> None:
-    """验证 init 生成的 workspace config 可被 ``ConfigLoader`` 加载。
-
-    :param tmp_path: pytest 临时目录。
-    :returns: ``None``。
-    :raises AssertionError: ConfigLoader 无法加载生成配置时抛出。
-    """
-
-    workspace_root = tmp_path / "workspace"
-
-    assert cli_main.main(("init", "--base", str(workspace_root))) == EXIT_SUCCESS
-    config = ConfigLoader().load(workspace_config_dir=workspace_root / "config")
-
-    assert config.models.models
-    assert config.execution_profiles.default_execution_profile_id
-    assert config.host_runtime.default_host_runtime_id
-
-
-def test_init_base_workspace_aligns_with_runtime_location_default(
-    tmp_path: Path,
-) -> None:
-    """init 生成的 config 必须被 runtime location 默认 overlay 选中。
-
-    :param tmp_path: pytest 临时目录。
-    :returns: ``None``。
-    :raises AssertionError: resolver 未对齐 init 目录布局时抛出。
-    """
-
-    workspace_root = tmp_path / "workspace"
-
-    assert cli_main.main(("init", "--base", str(workspace_root))) == EXIT_SUCCESS
-    locations = resolve_runtime_locations(
-        workspace_root=workspace_root,
-        package_config_root=Path(__file__).resolve().parents[2] / "dayu" / "config",
-    )
-
-    assert locations.config_overlay_dir == workspace_root / "config"
-    assert locations.prompt_asset_root == workspace_root / "config" / "prompts"
-    assert not (workspace_root / "workspace").exists()
-
-
-def test_init_does_not_generate_legacy_config_files(tmp_path: Path) -> None:
-    """验证 init 不生成旧 ``llm_models.json`` / ``run.json``。
-
-    :param tmp_path: pytest 临时目录。
-    :returns: ``None``。
-    :raises AssertionError: 旧配置文件被生成时抛出。
-    """
-
-    workspace_root = tmp_path / "workspace"
-
-    assert cli_main.main(("init", "--base", str(workspace_root))) == EXIT_SUCCESS
-
-    for legacy_name in _REMOVED_CONFIG_FILE_NAMES:
-        assert not (workspace_root / "config" / legacy_name).exists()
-
-
-def test_init_rejects_legacy_top_level_config_asset(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """验证包内顶层旧配置文件不会被 init 复制到 workspace config。
-
-    :param tmp_path: pytest 临时目录。
-    :returns: ``None``。
-    :raises AssertionError: 旧顶层配置文件未被拒绝时抛出。
-    """
-
-    package_config_root = tmp_path / "package-config"
-    _write_minimal_current_config_assets(package_config_root)
-    _write_text(package_config_root / "llm_models.json", "{}")
-
-    def config_names_with_removed_file() -> tuple[str, ...]:
-        """模拟当前顶层配置白名单被错误加入旧 schema 文件。
-
-        :returns: 包含旧配置文件名的顶层配置文件名元组。
+        :param events: 与 abort wrapper 共用的顺序记录。
+        :returns: ``None``。
         :raises Exception: 不主动抛出异常。
         """
 
-        return (*config_file_names(), "llm_models.json")
+        self._events = events
 
-    monkeypatch.setattr(
-        init_command,
-        "config_file_names",
-        config_names_with_removed_file,
-    )
+    def write(self, text: str) -> int:
+        """记录非空写入并抛出 diagnostic I/O 错误。
 
-    with pytest.raises(
-        init_command.CliInitOperationError,
-        match="legacy config file must not be generated: llm_models.json",
-    ):
-        init_command._collect_current_config_assets(
-            workspace_config_dir=tmp_path / "workspace" / "config",
-            package_config_root=package_config_root,
-        )
-
-
-def test_init_allows_prompt_asset_with_removed_config_file_name(
-    tmp_path: Path,
-) -> None:
-    """验证旧配置名只拦截顶层配置资产，不误伤 prompt 子文件。
-
-    :param tmp_path: pytest 临时目录。
-    :returns: ``None``。
-    :raises AssertionError: prompt 子文件被错误拒绝时抛出。
-    """
-
-    package_config_root = tmp_path / "package-config"
-    _write_minimal_current_config_assets(package_config_root)
-    _write_text(package_config_root / "prompts" / "scenes" / "run.json", "{}")
-
-    assets = init_command._collect_current_config_assets(
-        workspace_config_dir=tmp_path / "workspace" / "config",
-        package_config_root=package_config_root,
-    )
-
-    assert any(asset.destination.name == "run.json" for asset in assets)
-
-
-def test_init_sigint_maps_to_130(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """验证复制阶段 ``KeyboardInterrupt`` 映射为 130 且不输出成功。
-
-    :param tmp_path: pytest 临时目录。
-    :param monkeypatch: pytest monkeypatch 夹具。
-    :param capsys: pytest 标准输出捕获夹具。
-    :returns: ``None``。
-    :raises AssertionError: SIGINT 退出码或输出不符合取消语义时抛出。
-    """
-
-    def raise_keyboard_interrupt(*, source: Path, destination: Path) -> None:
-        """测试替身：模拟复制阶段用户中断。
-
-        :param source: 源文件路径。
-        :param destination: 目标文件路径。
-        :returns: 正常路径不会返回。
-        :raises KeyboardInterrupt: 始终抛出以模拟 SIGINT。
+        :param text: ``print`` 尝试写入的文本。
+        :returns: 本函数不返回。
+        :raises OSError: 始终模拟 broken stderr。
         """
 
-        del source, destination
+        if text:
+            self._events.append("diagnostic")
+        raise OSError(errno.EIO, "stderr write fault")
+
+    def flush(self) -> None:
+        """提供 ``print``/解释器要求的无副作用 flush。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return
+
+
+class _PrewarmImportFailure:
+    """只在 prewarm exact root 上失败的真实 import wrapper。"""
+
+    def __init__(self, secret: str) -> None:
+        """初始化 wrapper。
+
+        :param secret: 只能进入异常对象、不得进入 diagnostic 的 sentinel。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._secret = secret
+        self._real_import_module = importlib.import_module
+
+    def __call__(self, name: str, package: str | None = None) -> ModuleType:
+        """真实导入其它模块，只拒绝第一个 prewarm root。
+
+        :param name: import root。
+        :param package: relative import package。
+        :returns: 真实导入模块。
+        :raises RuntimeError: 命中 exact prewarm root 时抛出 sentinel 异常。
+        """
+
+        if name == "dayu.cli.commands.interactive":
+            raise RuntimeError(self._secret)
+        return self._real_import_module(name, package)
+
+
+class _InputSequence:
+    """按顺序返回 input 响应并记录 prompts。"""
+
+    def __init__(self, responses: tuple[str, ...]) -> None:
+        """初始化响应序列。
+
+        :param responses: 按调用顺序返回的文本。
+        :returns: None。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._responses = list(responses)
+        self.prompts: list[str] = []
+
+    def __call__(self, prompt: str) -> str:
+        """返回下一项响应。
+
+        :param prompt: 用户可见 prompt。
+        :returns: 下一项响应。
+        :raises EOFError: 响应耗尽时抛出。
+        """
+
+        self.prompts.append(prompt)
+        if not self._responses:
+            raise EOFError
+        return self._responses.pop(0)
+
+
+class _GetpassSequence:
+    """按顺序返回隐藏输入；耗尽后默认返回空字符串。"""
+
+    def __init__(self, responses: tuple[str, ...] = ()) -> None:
+        """初始化隐藏输入。
+
+        :param responses: 显式响应。
+        :returns: None。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._responses = list(responses)
+        self.prompts: list[str] = []
+
+    def __call__(
+        self,
+        prompt: str = "Password: ",
+        stream: TextIO | None = None,
+    ) -> str:
+        """返回下一隐藏值或空字符串。
+
+        :param prompt: 用户可见变量名提示。
+        :param stream: getpass 兼容输出流；测试不消费。
+        :returns: 隐藏值。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        del stream
+        self.prompts.append(prompt)
+        if self._responses:
+            return self._responses.pop(0)
+        return ""
+
+
+class _EofInput:
+    """所有 input 调用都抛 EOF。"""
+
+    def __call__(self, prompt: str) -> str:
+        """模拟 stdin EOF。
+
+        :param prompt: 用户可见 prompt。
+        :returns: 本函数不返回。
+        :raises EOFError: 始终抛出。
+        """
+
+        del prompt
+        raise EOFError
+
+
+class _InterruptInput:
+    """所有 input 调用都抛 KeyboardInterrupt。"""
+
+    def __call__(self, prompt: str) -> str:
+        """模拟用户中断。
+
+        :param prompt: 用户可见 prompt。
+        :returns: 本函数不返回。
+        :raises KeyboardInterrupt: 始终抛出。
+        """
+
+        del prompt
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(
-        init_command,
-        "_copy_asset_to_staging",
-        raise_keyboard_interrupt,
+
+class _WaitingPrint:
+    """观察 public waiting notification，同时保持真实 print。"""
+
+    def __init__(self) -> None:
+        """初始化 waiting event。
+
+        :returns: None。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.waiting = threading.Event()
+        self._real_print = builtins.print
+
+    def __call__(self, *values: str, file: TextIO | None = None) -> None:
+        """转发 print 并在 waiting 文本出现时置 event。
+
+        :param values: print 文本项。
+        :param file: 可选输出流。
+        :returns: None。
+        :raises OSError: 真实 print 写入失败时透传。
+        """
+
+        if any("正在等待此 workspace lock" in value for value in values):
+            self.waiting.set()
+        self._real_print(*values, file=file)
+
+
+class _CompetingInitRunner:
+    """在线程中执行一个真实 init 并记录退出码。"""
+
+    def __init__(self, workspace_root: Path) -> None:
+        """初始化 runner。
+
+        :param workspace_root: 竞争同一 lock 的 workspace。
+        :returns: None。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._workspace_root = workspace_root
+        self.results: list[int] = []
+
+    def __call__(self) -> None:
+        """执行真实 CLI init。
+
+        :returns: None。
+        :raises Exception: CLI 未捕获异常时由线程框架报告。
+        """
+
+        self.results.append(cli_main.main(("init", "--base", str(self._workspace_root))))
+
+
+def _install_ollama_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    reset_answer: str | None = None,
+) -> _InputSequence:
+    """安装 Ollama 选择与空 optional integrations 输入。
+
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param reset_answer: RESET 时先返回的确认输入。
+    :returns: 可检查 prompts 的 input sequence。
+    :raises Exception: monkeypatch 失败时抛出。
+    """
+
+    responses = (
+        *((reset_answer,) if reset_answer is not None else ()),
+        "14",
+        "",
+        "",
+        "",
     )
-
-    exit_code = cli_main.main(("init", "--base", str(tmp_path / "workspace")))
-    captured = capsys.readouterr()
-
-    assert exit_code == EXIT_KEYBOARD_INTERRUPT
-    assert "initialized workspace config" not in captured.out
+    input_sequence = _InputSequence(responses)
+    monkeypatch.setattr(builtins, "input", input_sequence)
+    monkeypatch.setattr(getpass, "getpass", _GetpassSequence())
+    return input_sequence
 
 
 def _write_text(path: Path, value: str) -> None:
-    """写入测试文本文件并创建父目录。
+    """创建 parent 并写入 UTF-8 文本。
 
-    :param path: 目标路径。
-    :param value: 文件内容。
-    :returns: ``None``。
-    :raises OSError: 文件写入失败时抛出。
+    :param path: 目标文件。
+    :param value: 文本。
+    :returns: None。
+    :raises OSError: mkdir/write 失败时抛出。
     """
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(value, encoding="utf-8")
 
 
-def _write_minimal_current_config_assets(package_config_root: Path) -> None:
-    """写入 init 资产收集所需的最小 current schema 文件集合。
+def test_first_cli_flow_uses_real_lock_discovery_and_current_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """FIRST 必须经真实 lock/transaction 生成可加载当前配置。
 
-    :param package_config_root: 测试包内配置根目录。
-    :returns: ``None``。
-    :raises OSError: 文件写入失败时抛出。
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param capsys: pytest 输出捕获。
+    :returns: None。
+    :raises AssertionError: FIRST 路径或 ConfigLoader 校验失败时抛出。
     """
 
-    for file_name in config_file_names():
-        _write_text(package_config_root / file_name, "{}")
-    _write_text(package_config_root / "prompts" / "scenes" / "prompt.md", "prompt")
+    workspace_root = tmp_path / "workspace"
+    _install_ollama_inputs(monkeypatch)
+    prewarm = Mock()
+    monkeypatch.setattr(init_command, "_run_init_prewarm", prewarm)
+
+    exit_code = cli_main.main(("init", "--base", str(workspace_root)))
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_SUCCESS
+    assert "正在等待此 workspace lock" in captured.out
+    assert "mode=first" in captured.out
+    assert (workspace_root / ".dayu-init.lock").is_file()
+    assert not (workspace_root / ".dayu").exists()
+    assert not (workspace_root / "portfolio").exists()
+    prewarm.assert_called_once_with()
+    config = ConfigLoader().load(workspace_config_dir=workspace_root / "config")
+    assert config.models.models["ollama"].model == "qwen3:8b"
+
+
+def test_preserve_overwrite_and_reset_cli_matrix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """PRESERVE/OVERWRITE/RESET 与 reset+overwrite 按唯一 precedence 执行。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param capsys: pytest 输出捕获。
+    :returns: None。
+    :raises AssertionError: 四态 tree contract 或 precedence 漂移时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    _install_ollama_inputs(monkeypatch)
+    prewarm = Mock()
+    monkeypatch.setattr(init_command, "_run_init_prewarm", prewarm)
+    assert cli_main.main(("init", "--base", str(workspace_root))) == EXIT_SUCCESS
+    assert prewarm.call_count == 1
+    capsys.readouterr()
+    user_file = workspace_root / "config" / "user-extension.json"
+    _write_text(user_file, '{"owner":"user"}')
+
+    _install_ollama_inputs(monkeypatch)
+    assert cli_main.main(("init", "--base", str(workspace_root))) == EXIT_SUCCESS
+    assert "mode=preserve" in capsys.readouterr().out
+    assert user_file.is_file()
+    assert prewarm.call_count == 1
+
+    _install_ollama_inputs(monkeypatch)
+    assert cli_main.main(("init", "--base", str(workspace_root), "--overwrite")) == EXIT_SUCCESS
+    assert "mode=overwrite" in capsys.readouterr().out
+    assert not user_file.exists()
+    assert prewarm.call_count == 1
+    _write_text(workspace_root / ".dayu" / "state.txt", "state")
+    _write_text(workspace_root / "portfolio" / "sentinel.txt", "keep")
+
+    _install_ollama_inputs(monkeypatch, reset_answer="y")
+    assert (
+        cli_main.main(
+            (
+                "init",
+                "--base",
+                str(workspace_root),
+                "--reset",
+                "--overwrite",
+            )
+        )
+        == EXIT_SUCCESS
+    )
+    captured = capsys.readouterr()
+    assert "active Dayu" in captured.out
+    assert str(workspace_root / ".dayu") in captured.out
+    assert "mode=reset" in captured.out
+    assert not (workspace_root / ".dayu").exists()
+    assert (workspace_root / "portfolio" / "sentinel.txt").read_text(encoding="utf-8") == "keep"
+    assert prewarm.call_count == 2
+
+
+def test_prewarm_imports_exact_roots_without_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prewarm helper 只能按顺序调用 exact two import roots。
+
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: root、顺序、调用次数或 helper 入参漂移时抛出。
+    """
+
+    import_module = Mock()
+    monkeypatch.setattr(init_command.importlib, "import_module", import_module)
+
+    init_command._run_init_prewarm()
+
+    assert init_command._PREWARM_IMPORT_ROOTS == (
+        "dayu.cli.commands.interactive",
+        "dayu.cli.commands.prompt",
+    )
+    assert import_module.call_args_list == [
+        call("dayu.cli.commands.interactive"),
+        call("dayu.cli.commands.prompt"),
+    ]
+
+
+def test_prewarm_failure_warns_safely_after_successful_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Import failure 只能给出脱敏 warning，不能回滚已发布 FIRST config。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param capsys: pytest 输出捕获。
+    :returns: ``None``。
+    :raises AssertionError: publication、退出码或 warning 脱敏语义漂移时抛出。
+    """
+
+    secret = "prewarm-exception-secret"
+    workspace_root = tmp_path / "workspace"
+    _install_ollama_inputs(monkeypatch)
+    monkeypatch.setattr(
+        init_command.importlib,
+        "import_module",
+        _PrewarmImportFailure(secret),
+    )
+
+    exit_code = cli_main.main(("init", "--base", str(workspace_root)))
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_SUCCESS
+    assert (workspace_root / "config" / "models.json").is_file()
+    assert "prewarm warning" in captured.err
+    assert "error_type=RuntimeError" in captured.err
+    assert "normal command import remains available" in captured.err
+    assert secret not in captured.out
+    assert secret not in captured.err
+
+
+@pytest.mark.parametrize("answer", ("n", ""))
+def test_reset_default_no_has_zero_bootstrap_or_managed_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    answer: str,
+) -> None:
+    """RESET No/empty 不得创建 fresh workspace 或调用后续选择。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param answer: No 或默认空输入。
+    :returns: None。
+    :raises AssertionError: 取消 RESET 留下 workspace 时抛出。
+    """
+
+    workspace_root = tmp_path / "fresh"
+    monkeypatch.setattr(builtins, "input", _InputSequence((answer,)))
+
+    exit_code = cli_main.main(("init", "--base", str(workspace_root), "--reset"))
+
+    assert exit_code == EXIT_SUCCESS
+    assert not workspace_root.exists()
+
+
+def test_reset_eof_and_interrupt_have_zero_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RESET EOF 默认 No，SIGINT 返回 130，二者都不 bootstrap。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: None。
+    :raises AssertionError: 退出码或 zero-mutation contract 漂移时抛出。
+    """
+
+    eof_root = tmp_path / "eof"
+    monkeypatch.setattr(builtins, "input", _EofInput())
+    assert cli_main.main(("init", "--base", str(eof_root), "--reset")) == EXIT_SUCCESS
+    assert not eof_root.exists()
+
+    interrupt_root = tmp_path / "interrupt"
+    monkeypatch.setattr(builtins, "input", _InterruptInput())
+    assert cli_main.main(("init", "--base", str(interrupt_root), "--reset")) == EXIT_KEYBOARD_INTERRUPT
+    assert not interrupt_root.exists()
+
+
+def test_reset_confirmation_snapshot_drift_requires_rerun(
+    tmp_path: Path,
+) -> None:
+    """RESET 确认后 managed-root identity/content 漂移必须停止。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: None。
+    :raises AssertionError: 锁内继续消费旧确认时抛出。
+    """
+
+    workspace_root = (tmp_path / "workspace").resolve(strict=False)
+    _write_text(workspace_root / "config" / "value.txt", "before")
+    unlocked = init_command.snapshot_managed_roots(
+        workspace_root,
+        platform_system=platform.system(),
+    )
+    (workspace_root / "config" / "value.txt").write_text(
+        "after",
+        encoding="utf-8",
+    )
+    locked = init_command.snapshot_managed_roots(
+        workspace_root,
+        platform_system=platform.system(),
+    )
+
+    with pytest.raises(init_command.CliInitOperationError, match="changed"):
+        init_command._require_confirmed_snapshot(
+            unlocked_snapshot=unlocked,
+            locked_snapshot=locked,
+            requested_mode=init_command.InitMode.RESET,
+            locked_mode=init_command.InitMode.RESET,
+        )
+
+
+def test_required_secret_refusal_stops_before_transaction_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Required secret 批次拒绝时不得 publish config 或泄漏 value。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param capsys: pytest 输出捕获。
+    :returns: None。
+    :raises AssertionError: 拒绝后仍 publication 或输出 secret 时抛出。
+    """
+
+    secret = "sentinel-secret-value"
+    workspace_root = tmp_path / "workspace"
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(builtins, "input", _InputSequence(("6", "n")))
+    monkeypatch.setattr(
+        getpass,
+        "getpass",
+        _GetpassSequence((secret, "", "", "", "", "")),
+    )
+
+    exit_code = cli_main.main(("init", "--base", str(workspace_root)))
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_FAILURE
+    assert not (workspace_root / "config").exists()
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert os.environ.get("OPENAI_API_KEY") != secret
+
+
+@pytest.mark.parametrize("failure_kind", ("posix-error", "windows-partial"))
+def test_environment_persistence_failure_never_publishes_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure_kind: str,
+) -> None:
+    """POSIX writer error 与 Windows partial result 均停在 publication 前。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :param capsys: pytest 输出捕获。
+    :param failure_kind: POSIX exception 或 Windows partial result。
+    :returns: None。
+    :raises AssertionError: config 被发布、private tree 残留或 secret 泄漏时抛出。
+    """
+
+    secret = "persistence-failure-secret"
+    workspace_root = tmp_path / "workspace"
+    retained_path = tmp_path / ".dayu-init-env-retained"
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(builtins, "input", _InputSequence(("6", "y")))
+    monkeypatch.setattr(getpass, "getpass", _GetpassSequence((secret,)))
+    if failure_kind == "posix-error":
+        retained_path.write_text(secret, encoding="utf-8")
+        persistence = Mock(
+            side_effect=EnvironmentPersistenceError(
+                "profile replace failed",
+                retained_paths=(retained_path,),
+            )
+        )
+    else:
+        persistence = Mock(
+            return_value=EnvironmentPersistenceResult(
+                status=EnvironmentPersistenceStatus.PARTIAL_FAILURE,
+                target="setx",
+                written_names=("OPENAI_API_KEY",),
+                unwritten_names=("HF_TOKEN",),
+                retained_paths=(),
+            )
+        )
+    monkeypatch.setattr(init_command, "persist_environment", persistence)
+
+    exit_code = cli_main.main(("init", "--base", str(workspace_root)))
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_FAILURE
+    assert not (workspace_root / "config").exists()
+    assert not (workspace_root / ".dayu").exists()
+    assert not tuple(workspace_root.glob(".dayu-init-transaction-*"))
+    assert secret not in captured.out
+    assert secret not in captured.err
+    if failure_kind == "windows-partial":
+        assert "OPENAI_API_KEY" in captured.err
+        assert "HF_TOKEN" in captured.err
+    else:
+        assert str(retained_path) in captured.err
+
+
+@pytest.mark.parametrize("typed_interrupt", (False, True), ids=("plain", "typed"))
+def test_persistence_interrupt_aborts_real_prepared_transaction_and_exits_130(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    typed_interrupt: bool,
+) -> None:
+    """真实 staging 后 plain/typed persistence interrupt 必须清理并保持 exit 130。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: 注入 persistence interrupt 与隔离 secret 的 fixture。
+    :param capsys: 捕获 names-only CLI diagnostic。
+    :param typed_interrupt: 是否携带 Windows written/unwritten typed truth。
+    :returns: ``None``。
+    :raises AssertionError: exit、private cleanup、names truth 或脱敏不符合 contract 时抛出。
+    """
+
+    secret = "persistence-interrupt-secret"
+    workspace_root = tmp_path / "workspace"
+    retained_path = tmp_path / ".dayu-init-env-retained"
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(builtins, "input", _InputSequence(("6", "y")))
+    monkeypatch.setattr(getpass, "getpass", _GetpassSequence((secret,)))
+    if typed_interrupt:
+        retained_path.write_text(secret, encoding="utf-8")
+        side_effect: KeyboardInterrupt = EnvironmentPersistenceInterrupted(
+            EnvironmentPersistenceResult(
+                status=EnvironmentPersistenceStatus.INTERRUPTED,
+                target="setx",
+                written_names=("OPENAI_API_KEY",),
+                unwritten_names=("HF_TOKEN",),
+                retained_paths=(retained_path,),
+            )
+        )
+    else:
+        side_effect = KeyboardInterrupt()
+    monkeypatch.setattr(init_command, "persist_environment", Mock(side_effect=side_effect))
+
+    exit_code = cli_main.main(("init", "--base", str(workspace_root)))
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_KEYBOARD_INTERRUPT
+    assert not (workspace_root / "config").exists()
+    assert not (workspace_root / ".dayu").exists()
+    assert not tuple(workspace_root.glob(".dayu-init-transaction-*"))
+    assert secret not in captured.out
+    assert secret not in captured.err
+    if typed_interrupt:
+        assert "workspace 未发布" in captured.err
+        assert "OPENAI_API_KEY" in captured.err
+        assert "不能自动回滚" in captured.err
+        assert str(retained_path) in captured.err
+        assert retained_path.exists()
+    else:
+        assert "不能自动回滚" not in captured.err
+
+
+def test_persistence_interrupt_abort_failure_reports_retained_truth_and_exits_130(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Abort 失败必须保留 retained path truth，同时原中断仍映射 exit 130。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: 注入 typed interrupt 与 identity-safe abort failure。
+    :param capsys: 捕获 written names 与 retained transaction diagnostic。
+    :returns: ``None``。
+    :raises AssertionError: retained truth、exit、written names 或脱敏不符合 contract 时抛出。
+    """
+
+    secret = "abort-failure-secret"
+    workspace_root = tmp_path / "workspace"
+    interrupt = EnvironmentPersistenceInterrupted(
+        EnvironmentPersistenceResult(
+            status=EnvironmentPersistenceStatus.INTERRUPTED,
+            target="setx",
+            written_names=("OPENAI_API_KEY",),
+            unwritten_names=(),
+            retained_paths=(),
+        )
+    )
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(builtins, "input", _InputSequence(("6", "y")))
+    monkeypatch.setattr(getpass, "getpass", _GetpassSequence((secret,)))
+    monkeypatch.setattr(init_command, "persist_environment", Mock(side_effect=interrupt))
+
+    def fail_abort(prepared: PreparedWorkspaceTransaction) -> None:
+        """保留真实 prepared transaction 并返回现有 typed retained truth。
+
+        :param prepared: 已完成真实 staging/validation 的 transaction。
+        :returns: 本函数不返回。
+        :raises InitWorkspaceError: 始终报告真实 retained path。
+        """
+
+        raise init_command.InitWorkspaceError(
+            stage="pre_publication_abort_cleanup",
+            message="identity-safe abort failed",
+            retained_paths=(prepared.transaction_root,),
+            public_root_states=(".dayu=absent", "config=absent"),
+        )
+
+    monkeypatch.setattr(init_command, "abort_prepared_workspace_transaction", fail_abort)
+
+    exit_code = cli_main.main(("init", "--base", str(workspace_root)))
+    captured = capsys.readouterr()
+    retained = tuple(workspace_root.glob(".dayu-init-transaction-*"))
+
+    assert exit_code == EXIT_KEYBOARD_INTERRUPT
+    assert len(retained) == 1
+    assert "pre_publication_abort_cleanup" in captured.err
+    assert str(retained[0]) in captured.err
+    assert "OPENAI_API_KEY" in captured.err
+    assert ".dayu=absent" in captured.err
+    assert "config=absent" in captured.err
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert not (workspace_root / "config").exists()
+
+
+@pytest.mark.parametrize("typed_interrupt", (False, True), ids=("plain", "typed"))
+@pytest.mark.parametrize("abort_failure", (False, True), ids=("abort-success", "abort-failure"))
+def test_persistence_interrupt_aborts_before_broken_stderr_and_exits_130(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    typed_interrupt: bool,
+    abort_failure: bool,
+) -> None:
+    """Broken stderr 不得先于 abort 或覆盖 plain/typed 原始中断。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: 注入真实 prepared transaction 后的中断、abort 与 broken stderr。
+    :param typed_interrupt: 是否使用携带 retained path 的 typed interrupt。
+    :param abort_failure: 是否让 abort 返回 typed retained transaction truth。
+    :returns: ``None``。
+    :raises AssertionError: abort 顺序、private truth 或 exit 130 漂移时抛出。
+    """
+
+    secret = secrets.token_urlsafe(24)
+    workspace_root = tmp_path / "workspace"
+    retained_environment_path = tmp_path / ".dayu-init-env-retained"
+    retained_environment_path.write_text(secret, encoding="utf-8")
+    events: list[str] = []
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(builtins, "input", _InputSequence(("6", "y")))
+    monkeypatch.setattr(getpass, "getpass", _GetpassSequence((secret,)))
+    if typed_interrupt:
+        side_effect: KeyboardInterrupt = EnvironmentPersistenceInterrupted(
+            EnvironmentPersistenceResult(
+                status=EnvironmentPersistenceStatus.INTERRUPTED,
+                target=str(tmp_path / ".zshrc"),
+                written_names=("OPENAI_API_KEY",),
+                unwritten_names=(),
+                retained_paths=(retained_environment_path,),
+            )
+        )
+    else:
+        side_effect = KeyboardInterrupt()
+    monkeypatch.setattr(init_command, "persist_environment", Mock(side_effect=side_effect))
+    real_abort = init_command.abort_prepared_workspace_transaction
+
+    def record_abort(prepared: PreparedWorkspaceTransaction) -> None:
+        """记录 abort 顺序，并按参数完成或拒绝真实 transaction cleanup。
+
+        :param prepared: 已完成真实 staging/validation 的 transaction。
+        :returns: abort 成功时返回 ``None``。
+        :raises InitWorkspaceError: ``abort_failure=True`` 时保留真实 transaction。
+        """
+
+        events.append("abort")
+        if abort_failure:
+            raise init_command.InitWorkspaceError(
+                stage="pre_publication_abort_cleanup",
+                message="identity-safe abort fault",
+                retained_paths=(prepared.transaction_root,),
+                public_root_states=(".dayu=absent", "config=absent"),
+            )
+        real_abort(prepared)
+
+    monkeypatch.setattr(init_command, "abort_prepared_workspace_transaction", record_abort)
+    monkeypatch.setattr(init_command.sys, "stderr", _BrokenStderr(events))
+
+    exit_code = cli_main.main(("init", "--base", str(workspace_root)))
+    retained_transactions = tuple(workspace_root.glob(".dayu-init-transaction-*"))
+
+    assert exit_code == EXIT_KEYBOARD_INTERRUPT
+    assert events[0] == "abort"
+    assert retained_environment_path.exists()
+    assert not (workspace_root / "config").exists()
+    if abort_failure:
+        assert len(retained_transactions) == 1
+        assert "diagnostic" in events[1:]
+    else:
+        assert retained_transactions == ()
+        if typed_interrupt:
+            assert "diagnostic" in events[1:]
+
+
+def test_invalid_workspace_file_and_symlink_are_usage_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Workspace 普通文件/symlink 必须在交互前按 usage error 拒绝。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: None。
+    :raises AssertionError: 非目录或 symlink 被 bootstrap 时抛出。
+    """
+
+    file_root = tmp_path / "file-root"
+    file_root.write_text("file", encoding="utf-8")
+    monkeypatch.setattr(builtins, "input", _InterruptInput())
+    assert cli_main.main(("init", "--base", str(file_root))) == EXIT_USAGE_ERROR
+
+    target = tmp_path / "target"
+    target.mkdir()
+    symlink_root = tmp_path / "symlink-root"
+    symlink_root.symlink_to(target, target_is_directory=True)
+    assert cli_main.main(("init", "--base", str(symlink_root))) == EXIT_USAGE_ERROR
+
+
+def test_fresh_root_bootstrap_handles_concurrent_create_and_os_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fresh root owner 接受 concurrent directory，拒绝 type race 与 ENOSPC。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: None。
+    :raises AssertionError: bootstrap 未复核 identity/type 或吞掉 ENOSPC 时抛出。
+    """
+
+    concurrent_root = tmp_path / "concurrent"
+    concurrent_root.mkdir()
+    identity = init_command._bootstrap_workspace_root(concurrent_root)
+    assert identity.canonical_path == concurrent_root.resolve(strict=True)
+
+    type_race = tmp_path / "type-race"
+    type_race.write_text("file", encoding="utf-8")
+    with pytest.raises(init_command.CliInitUsageError):
+        init_command._bootstrap_workspace_root(type_race)
+
+    missing_root = tmp_path / "no-space"
+    monkeypatch.setattr(
+        init_command.Path,
+        "mkdir",
+        Mock(side_effect=OSError(errno.ENOSPC, "fault")),
+    )
+    with pytest.raises(init_command.CliInitUsageError, match="OSError"):
+        init_command._bootstrap_workspace_root(missing_root)
+
+
+def test_lock_path_rejects_symlink_dangling_symlink_and_directory(
+    tmp_path: Path,
+) -> None:
+    """Init lock path 的 root type contract 必须在 acquire 前 fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: None。
+    :raises AssertionError: 非普通 lock 文件被接受时抛出。
+    """
+
+    target = tmp_path / "target"
+    target.write_text("lock", encoding="utf-8")
+    linked = tmp_path / "linked-lock"
+    linked.symlink_to(target)
+    with pytest.raises(init_command.CliInitUsageError, match="ordinary"):
+        init_command._validate_lock_path(linked, allow_absent=True)
+
+    dangling = tmp_path / "dangling-lock"
+    dangling.symlink_to(tmp_path / "missing")
+    with pytest.raises(init_command.CliInitUsageError, match="dangling"):
+        init_command._validate_lock_path(dangling, allow_absent=True)
+
+    directory = tmp_path / "directory-lock"
+    directory.mkdir()
+    with pytest.raises(init_command.CliInitUsageError, match="ordinary"):
+        init_command._validate_lock_path(directory, allow_absent=True)
+
+
+def test_real_lock_competition_waits_without_early_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实 workspace lock 竞争必须在 release 前零 publish，之后成功。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: None。
+    :raises AssertionError: init 未等待、提前发布或释放后未完成时抛出。
+    """
+
+    workspace_root = (tmp_path / "workspace").resolve(strict=False)
+    workspace_root.mkdir()
+    lock_path = workspace_root / ".dayu-init.lock"
+    _install_ollama_inputs(monkeypatch)
+    waiting_print = _WaitingPrint()
+    monkeypatch.setattr(builtins, "print", waiting_print)
+    runner = _CompetingInitRunner(workspace_root)
+
+    parent_lock = file_lock(
+        lock_path,
+        timeout_seconds=None,
+        create_parent_dirs=False,
+    )
+    token = parent_lock.acquire()
+    thread = threading.Thread(target=runner)
+    thread.start()
+    assert waiting_print.waiting.wait(_WAIT_TIMEOUT_SECONDS)
+    assert not (workspace_root / "config").exists()
+    token.release()
+    thread.join(_WAIT_TIMEOUT_SECONDS)
+
+    assert not thread.is_alive()
+    assert runner.results == [EXIT_SUCCESS]
+    assert (workspace_root / "config" / "models.json").is_file()
+
+
+def test_model_choice_and_input_helpers_reject_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Selection/input helpers 必须拒绝空、越界、未知和非正 context。
+
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: None。
+    :raises AssertionError: 非法交互输入被接受时抛出。
+    """
+
+    assert init_command._parse_model_choice("1").choice_id == "mimo-token-plan"
+    assert init_command._parse_model_choice("ollama").choice_id == "ollama"
+    for invalid in ("", "0", "16", "unknown"):
+        with pytest.raises(init_command.CliInitOperationError):
+            init_command._parse_model_choice(invalid)
+
+    monkeypatch.setattr(builtins, "input", _InputSequence(("0",)))
+    with pytest.raises(init_command.CliInitOperationError):
+        init_command._read_positive_integer("context: ", default=1)
+    monkeypatch.setattr(builtins, "input", _InputSequence(("",)))
+    with pytest.raises(init_command.CliInitOperationError):
+        init_command._read_non_empty_input("value: ", default=None)
+    monkeypatch.setattr(builtins, "input", _InputSequence(("maybe",)))
+    with pytest.raises(init_command.CliInitUsageError):
+        init_command._confirm("confirm: ")
+
+
+def test_persistence_target_and_failure_message_use_names_only(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Typed plan target 与 partial failure 文本不得读取 secret values。
+
+    :param tmp_path: pytest 临时目录。
+    :param capsys: pytest 输出捕获。
+    :returns: None。
+    :raises AssertionError: target/diagnostic 泄漏 value 时抛出。
+    """
+
+    secret = "never-render-this-secret"
+    entry = EnvironmentPersistenceEntry(name="OPENAI_API_KEY", value=secret)
+    posix = PosixEnvironmentPersistencePlan(
+        entries=(entry,),
+        profile_path=tmp_path / ".zshrc",
+        confirmed=False,
+    )
+    windows = WindowsEnvironmentPersistencePlan(
+        entries=(entry,),
+        confirmed=False,
+    )
+    result = EnvironmentPersistenceResult(
+        status=EnvironmentPersistenceStatus.PARTIAL_FAILURE,
+        target="setx",
+        written_names=("OPENAI_API_KEY",),
+        unwritten_names=("HF_TOKEN",),
+        retained_paths=(),
+    )
+
+    assert init_command._persistence_target(posix) == str(tmp_path / ".zshrc")
+    assert init_command._persistence_target(windows) == "setx"
+    message = init_command._environment_failure_message(result)
+    assert "OPENAI_API_KEY" in message
+    assert "HF_TOKEN" in message
+    assert secret not in message
+    success = EnvironmentPersistenceResult(
+        status=EnvironmentPersistenceStatus.SUCCESS,
+        target="setx",
+        written_names=("OPENAI_API_KEY",),
+        unwritten_names=(),
+        retained_paths=(),
+    )
+    init_command._report_persisted_environment_names(success)
+    rendered = capsys.readouterr().err
+    assert "workspace 未发布" in rendered
+    assert "OPENAI_API_KEY" in rendered
+    assert secret not in rendered
+    init_command._report_persisted_environment_names(None)
+
+
+def test_operation_error_formats_truthful_retained_state(
+    tmp_path: Path,
+) -> None:
+    """Workspace error 输出必须包含 stage/retained/public/durability truth。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: None。
+    :raises AssertionError: retained state 被省略或误报时抛出。
+    """
+
+    retained = tmp_path / "private"
+    error = init_command.InitWorkspaceError(
+        stage="validation_parent_directory_sync",
+        message="sync failed",
+        retained_paths=(retained,),
+        public_root_states=(".dayu=absent", "config=present"),
+        deletion_durability_unconfirmed=True,
+    )
+
+    rendered = init_command._format_operation_error(error)
+
+    assert "validation_parent_directory_sync" in rendered
+    assert str(retained) in rendered
+    assert ".dayu=absent" in rendered
+    assert "deletion_durability_unconfirmed=True" in rendered
+
+
+def test_empty_base_is_usage_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """空白 --base 必须在 filesystem/interaction 前失败。
+
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: None。
+    :raises AssertionError: 空路径未返回 usage error 时抛出。
+    """
+
+    monkeypatch.setattr(builtins, "input", _InterruptInput())
+    assert cli_main.main(("init", "--base", "   ")) == EXIT_USAGE_ERROR
+
+
+def test_platform_value_is_current_runtime() -> None:
+    """测试 profile 必须在 fixed plan 支持的平台上运行。
+
+    :returns: None。
+    :raises AssertionError: 本地平台不在明确集合时抛出。
+    """
+
+    assert platform.system() in {"Darwin", "Linux", "Windows"}

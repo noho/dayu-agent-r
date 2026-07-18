@@ -529,13 +529,18 @@ def assemble_effective_tool_provider_configs(
     provider_configs: Sequence[ToolDiscoveryProviderConfig],
     *,
     workspace_root: pathlib.Path | None,
+    fins_workspace_root_override: pathlib.Path | None = None,
 ) -> tuple[ToolDiscoveryProviderConfig, ...]:
     """装配工具 provider 的 effective configs。
 
     :param provider_configs: ConfigLoader 产出的 raw provider typed configs。
     :param workspace_root: 当前运行时 workspace root；为 ``None`` 时不注入。
+    :param fins_workspace_root_override: 仅在调用方显式提供时强制作为
+        Fins provider 的绝对 effective workspace root。raw 配置仍先通过
+        现行类型与非空语法校验。
     :returns: provider config tuple，必要时替换为 effective config。
-    :raises Exception: 不主动抛出异常。
+    :raises ValueError: override 不是绝对路径，或 raw provider 路径语法
+        非法时抛出。
     """
 
     effective_configs: list[ToolDiscoveryProviderConfig] = []
@@ -543,6 +548,7 @@ def assemble_effective_tool_provider_configs(
         effective_config = _effective_tool_provider_config(
             provider_config,
             workspace_root=workspace_root,
+            fins_workspace_root_override=fins_workspace_root_override,
         )
         if effective_config == provider_config.config:
             effective_configs.append(provider_config)
@@ -1422,11 +1428,13 @@ def _effective_tool_provider_config(
     provider_config: ToolDiscoveryProviderConfig,
     *,
     workspace_root: pathlib.Path | None,
+    fins_workspace_root_override: pathlib.Path | None,
 ) -> Mapping[str, JsonValue]:
     """生成传给工具发现 provider 的 effective config。
 
     :param provider_config: ConfigLoader 产出的 provider typed config。
     :param workspace_root: 当前运行时 workspace root；为 ``None`` 时不注入。
+    :param fins_workspace_root_override: 显式 Fins effective workspace root override。
     :returns: provider 可直接消费的 effective config。
     :raises ValueError: Fins workspace root 或 Web storage state 目录配置类型
         非法，或相对路径缺少解析基准时抛出。
@@ -1438,6 +1446,7 @@ def _effective_tool_provider_config(
         effective_workspace_root = _effective_fins_workspace_root_config_value(
             provider_config,
             workspace_root=workspace_root,
+            fins_workspace_root_override=fins_workspace_root_override,
         )
         if effective_workspace_root is not None:
             effective_config[_FINS_WORKSPACE_ROOT_CONFIG_FIELD] = (
@@ -1462,12 +1471,15 @@ def _effective_fins_workspace_root_config_value(
     provider_config: ToolDiscoveryProviderConfig,
     *,
     workspace_root: pathlib.Path | None,
+    fins_workspace_root_override: pathlib.Path | None,
 ) -> str | None:
     """解析 Fins provider effective workspace root 配置值。
 
     :param provider_config: ConfigLoader 产出的 provider typed config。
     :param workspace_root: 当前运行时 workspace root；为 ``None`` 时无法解析
         相对路径。
+    :param fins_workspace_root_override: 已由调用方明确产生的 Fins 绝对
+        effective root；非 ``None`` 时在 raw 语法校验后支配路径选择。
     :returns: 需要写入 effective config 的绝对 workspace root 字符串；返回
         ``None`` 表示保留原始 config。
     :raises ValueError: 已配置 workspace root 不是字符串、为空字符串，或相对
@@ -1477,21 +1489,28 @@ def _effective_fins_workspace_root_config_value(
     configured_workspace_root = provider_config.config.get(
         _FINS_WORKSPACE_ROOT_CONFIG_FIELD
     )
-    if configured_workspace_root is None:
+    stripped_workspace_root: str | None = None
+    if configured_workspace_root is not None:
+        if not isinstance(configured_workspace_root, str):
+            raise ValueError(
+                "Fins provider "
+                f"{provider_config.provider_id} config.workspace_root must be a string"
+            )
+        stripped_workspace_root = configured_workspace_root.strip()
+        if stripped_workspace_root == "":
+            raise ValueError(
+                "Fins provider "
+                f"{provider_config.provider_id} config.workspace_root must be non-empty"
+            )
+    if fins_workspace_root_override is not None:
+        expanded_override = fins_workspace_root_override.expanduser()
+        if not expanded_override.is_absolute():
+            raise ValueError("Fins workspace root override must be absolute")
+        return str(expanded_override.resolve(strict=False))
+    if stripped_workspace_root is None:
         if workspace_root is None:
             return None
         return str(workspace_root.expanduser().resolve(strict=False))
-    if not isinstance(configured_workspace_root, str):
-        raise ValueError(
-            "Fins provider "
-            f"{provider_config.provider_id} config.workspace_root must be a string"
-        )
-    stripped_workspace_root = configured_workspace_root.strip()
-    if stripped_workspace_root == "":
-        raise ValueError(
-            "Fins provider "
-            f"{provider_config.provider_id} config.workspace_root must be non-empty"
-        )
     configured_path = pathlib.Path(stripped_workspace_root).expanduser()
     if configured_path.is_absolute():
         return str(configured_path.resolve(strict=False))

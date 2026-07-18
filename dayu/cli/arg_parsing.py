@@ -404,8 +404,16 @@ def _register_init_command(
         command_name=COMMAND_INIT,
         help_text="初始化当前工作区配置骨架。",
     )
-    parser.add_argument("--reset", action="store_true", help="重置已有工作区配置。")
-    parser.add_argument("--overwrite", action="store_true", help="覆盖已有配置文件。")
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="确认后重建 .dayu 与 config 两个受管根，并优先于 --overwrite。",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="从当前 package 默认值重建 config，但保留 .dayu 与其它 workspace 路径。",
+    )
 
 
 def _register_prompt_command(

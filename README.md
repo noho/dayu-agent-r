@@ -67,23 +67,44 @@ dayu-cli --help
 dayu-cli init
 ```
 
-`init` 是非交互式文件初始化命令。它把包内当前配置和 prompt assets 复制到
-`./workspace/config/`；它不会选择模型、询问或保存 API Key，也不会创建写作模板。
+`init` 会交互选择一组普通/思考模型，并把当前配置与 prompt assets 发布到
+`./workspace/config/`。Ollama 与 OpenAI-compatible 自定义模型会继续询问模型名、
+endpoint 和上下文窗口；其它选项使用内置的当前模型目录。初始化会用真实配置加载和
+scene 校验拒绝无效结果，但不会探测 endpoint、下载模型或发起网络请求。
 
 常用形式：
 
 ```bash
 dayu-cli init --base ./my-workspace
 dayu-cli init --base ./my-workspace --overwrite
-dayu-cli init --base ./my-workspace --reset --overwrite
+dayu-cli init --base ./my-workspace --reset
 ```
 
-- 未传 `--overwrite` 时，只要任一受管目标文件已存在，命令就失败且不会覆盖。
-- `--overwrite` 更新受管配置与 prompt 文件，同时保留 `config/` 下其它用户文件。
-- `--reset` 只删除可重建白名单：`config/`、`.dayu/host/`、`.dayu/artifacts/`、
-  `.dayu/web_tools_storage_states/`，随后重新复制当前配置。它不会删除整个 `.dayu/`、
-  `portfolio/` 或工作区其它文件。
-- 为防止写出工作区，`config/` 目标路径及其已有子树中不能包含 symlink。
+`init` 只有以下四种状态：
+
+- FIRST：`config/` 不存在且未传覆盖参数，从包内默认配置开始创建。
+- PRESERVE：`config/` 已存在且未传覆盖参数，保留用户配置、文件和自建 manifest；只补回
+  缺失的包内 prompt 文件，并把本次明确选择投影到已知模型/manifest 字段。
+- OVERWRITE：传 `--overwrite`，从包内默认配置完整重建 `config/`，不合并旧配置。
+- RESET：传 `--reset`，先列出实际存在的 `.dayu/`、`config/` 并默认选择 No；明确确认后
+  移走整个 `.dayu/` 与旧 `config/`，再从包内默认配置重建。RESET 优先于 `--overwrite`。
+
+四种状态都不会创建、删除或重建 public `portfolio/`、`assets/`。为防止写出工作区，
+workspace、锁文件、受管树或其子树中的 symlink / Windows reparse entry 会被拒绝。
+
+当所选模型需要 API Key 且当前进程没有对应变量时，`init` 会隐藏输入值，并在一次最终
+确认中只展示目标与变量名。POSIX 写入当前 shell 对应的 `~/.zshrc` 或 `~/.bashrc` 的唯一
+managed block；Windows 使用当前用户的 `setx`。可选集成只包括 `TAVILY_API_KEY`、
+`SERPER_API_KEY`、`FMP_API_KEY`、`HF_ENDPOINT`、`HF_TOKEN`。默认 No；拒绝或持久化失败
+时不会发布 workspace 配置。secret 值不写入 workspace，也不进入成功/失败输出。
+
+FIRST/RESET 发布成功后会在当前进程中导入 `prompt` 与 `interactive` 入口以减少首次冷启动；
+该步骤不读取 workspace/env、不装配运行时、不联网。若出现 `prewarm warning`，配置仍已成功
+发布，后续命令会按正常导入路径启动。
+
+`.dayu-init.lock` 只用于串行多个 `init`，不会锁住正在运行的 CLI/Web/WeChat/Host。
+执行 RESET 前必须先停止这个 workspace 的所有 active Dayu 进程；等待锁时可根据
+`正在等待此 workspace lock` 提示确认命令尚未进入发布阶段。
 
 初始化后的主要目录：
 
@@ -94,7 +115,7 @@ workspace/
 └── .dayu/        # Session、运行期状态与 artifacts
 ```
 
-API Key 由用户显式设置为环境变量。具体模型引用哪个变量，以
+也可以在运行 `init` 前自行设置 API Key。具体模型引用哪个变量，以
 `workspace/config/models.json` 为准。例如：
 
 ```bash
@@ -328,18 +349,33 @@ dayu-cli session purge --session-id <session-id> --yes
 
 ### 配置文件已存在
 
-`init` 默认拒绝覆盖。确认要更新受管配置时使用 `--overwrite`；需要清理可重建
-Host 状态时再同时使用 `--reset`。
+默认再次运行 `init` 会进入 PRESERVE：保留用户文件和自建 manifest，只补缺失的包内
+prompt。需要完全用包内默认配置替换 `config/` 时使用 `--overwrite`；需要同时移除整个
+`.dayu/` 时使用 `--reset`，并先停止所有 active Dayu 进程。
 
 ### init 报 symlink 错误
 
-为保证所有写入留在工作区，`workspace/config` 或其已有子树不能是 symlink。
-请改用工作区内真实目录后重试。
+为保证所有写入留在工作区，workspace、`.dayu-init.lock`、受管树及其子树都必须是普通
+目录/文件，不能是 symlink、dangling symlink 或 Windows junction/reparse entry。请改用
+工作区内真实目录后重试；不要通过链接绕过检查。
 
 ### 模型提示缺少 API Key
 
-检查所选模型在 `workspace/config/models.json` 中的 `api_key_ref`，并在启动
-`dayu-cli` 的同一环境中设置对应变量。`init` 不会代为保存 secret。
+检查所选模型在 `workspace/config/models.json` 中的 `api_key_ref`。可在运行 `init` 前设置
+对应变量，或按隐藏输入和最终确认写入 POSIX shell profile / Windows 用户环境。输出只会
+显示变量名；如果持久化失败，修复目标 profile/用户环境后重试，workspace 不会半发布。
+
+### init 一直显示正在等待 workspace lock
+
+另一个 `init` 正持有 `<workspace>/.dayu-init.lock`。等待方不会使用有限 production timeout，
+也不会提前发布配置；让前一个 `init` 正常完成即可。该锁不代表其它 Dayu 进程已停止，
+RESET 前仍必须自行停止 active CLI/Web/WeChat/Host。
+
+### init 显示 prewarm warning
+
+FIRST/RESET 的配置已经发布成功，warning 只表示本进程未完成两个 CLI 入口的 import-only
+预热，不会触发回滚，也不包含 provider 响应或环境变量值。可直接运行 `prompt` 或
+`interactive`；若正常导入仍失败，再使用 `--debug --log-file <path>` 收集诊断。
 
 ### 没有找到默认日志文件
 

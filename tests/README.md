@@ -48,6 +48,14 @@ python -m pytest tests/cli/test_upload_filings_from_command.py::test_windows_cmd
 真实 runner 证据。workflow 通过时的证据包包含 JUnit、生成脚本、recorder oracle、CLI storage oracle、stdout/stderr、环境与
 `cmd.exe /?` 输出；失败时仍通过 `if: always()` 发布已经产生的诊断证据。
 
+真实 init Windows gate 由 `.github/workflows/r12-init-windows.yml` 使用 Python 3.11 与
+`constraints/lock-windows-x64-py311.txt` 运行。它执行真实 FIRST→PRESERVE→OVERWRITE→
+RESET No→RESET Yes 与 `ConfigLoader`/scene 重载，验证 ordinary Windows transaction 不依赖
+POSIX directory fsync；还覆盖真实 nested junction/reparse 外部 sentinel、普通 symlink 的精确
+privilege skip、workspace root identity、replace rollback、scan-delete race、真实 `setx` 用户环境
+round-trip/cleanup，以及 R11 的两个真实 cmd/upload nodes。上传 artifact 只包含 JUnit、版本、
+capability、source hashes 和环境变量名，不保存 environment/registry values。
+
 默认 pytest 配置会排除 `stress` marker，因此常规命令不会运行 Host production stress suite。显式运行 stress suite 时需要覆盖默认 `addopts`：
 
 ```bash
@@ -106,8 +114,13 @@ pytest tests/engine/test_smoke_async_agent_providers.py -q
 
 CLI UI adapter 测试当前覆盖 pyproject 只发布真实 `dayu-cli`、wheel metadata / entrypoints / archive 不包含已删除的 placeholder scripts、packages、Web extra 或 Streamlit requirement；也覆盖 `dayu.cli` 的 parser factory、scoped command help、未纳入旧命令的 unknown command
 用法错误、尚未实现命令的 not-implemented 退出、`KeyboardInterrupt` 到 130 的映射、全局参数位置，以及 `init`
-对 current schema workspace config / prompts 的 bootstrap、existing file / overwrite、reset 硬编码白名单、symlink
-escape fail-fast、普通复制路径拒绝顶层与嵌套 symlink、whole-tree staging 安装保留用户自管配置、旧配置文件不生成、生成配置可由 `ConfigLoader` 加载和复制阶段 SIGINT 130；
+的 typed model catalog、OS environment owner、`.dayu`/`config` 单一 managed-root transaction、
+FIRST/PRESERVE/OVERWRITE/RESET 四态、fresh-root/lock/identity/containment、真实 ConfigLoader/Service discovery/
+13-scene validation、private Fins side-effect isolation、publication/rollback/cleanup fault matrix、secret names-only
+diagnostic 与 SIGINT 130。`test_init_smoke.py` 进一步用隔离 subprocess 证明 FIRST/RESET-only exact-two-root
+import prewarm 的 transitive graph、连续稳定、零网络/零 workspace/env mutation，并在真实 POSIX 上覆盖完整四态、
+profile 0600/单 marker block/脱敏、user manifest 与缺失 prompt、portfolio/assets sentinel、RESET No 整树 hash、
+公开 waiting notification、真实 file_lock 单 waiter 与双 queued publisher 串行成功；
 `python -m dayu.cli --help` 入口，并覆盖 CLI main 把默认 log level、`--debug` / `--debug-stream` / `--verbose` / `--quiet` / `--log-level`
 解析结果和进程结束自动删除的默认临时日志流或全局 `--log-file` 诊断流交给 `dayu.runtime.log.set_level_from_flags(...)` 装配日志，且覆盖临时流工厂、日志文件打开失败、连续调用恢复 stderr、恢复 stderr 失败仍关闭日志流，以及异常 / `KeyboardInterrupt` 路径恢复 stderr handler 后再关闭文件。`prompt` 命令测试覆盖 CLI 参数到 Service entrypoint request 的转换、`--ticker` 到 LLM-facing `fins_default_subject` Markdown slot 的生成、非法 `--ticker` usage error、FMP 公司名增强与缺 key fallback、stable
 Host slot key、已移除执行参数走 argparse unknown、已删除旧 debug 参数走 argparse unknown、`--thinking` / `--no-thinking` 展示参数解析、thinking event 存在时 `--thinking` 与 `--no-thinking` 输出不同、真实 `prompt.json` required context slots、入口身份不进入 LLM context slots、mock Host public

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
+import getpass
 import io
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -10,6 +12,7 @@ from datetime import UTC, datetime
 from types import TracebackType
 from pathlib import Path
 from typing import cast
+from unittest.mock import Mock
 
 import pytest
 
@@ -1208,6 +1211,16 @@ def test_prompt_command_uses_init_generated_workspace_config(
     """
 
     workspace_root = tmp_path / "workspace"
+    monkeypatch.setattr(
+        builtins,
+        "input",
+        Mock(side_effect=("14", "", "", "")),
+    )
+    monkeypatch.setattr(
+        getpass,
+        "getpass",
+        Mock(side_effect=("", "", "", "", "")),
+    )
     assert cli_main.main(("init", "--base", str(workspace_root))) == EXIT_SUCCESS
     capsys.readouterr()
     fake_host = _FakeHost(submit_terminal=_terminal_event(status=HostTerminalStatus.SUCCEEDED))

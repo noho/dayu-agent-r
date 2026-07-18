@@ -10,11 +10,28 @@ Dayu runtime assembly 配置分两层：
 2. 工作区覆盖配置：`<workspace>/config/`
 
 `dayu-cli init --base <workspace>` 会创建目标 workspace，并把当前包内默认配置文件和 `prompts/`
-资产复制到 `<workspace>/config/`。该命令只生成当前 schema 所需的 `models.json`、
+资产发布到 `<workspace>/config/`。该命令会先交互选择普通/思考模型组合，只生成当前 schema 所需的 `models.json`、
 `execution_profiles.json`、`host_runtime.json`、`runtime_lanes.json`、`tool_discovery.json`
-和 prompts 资产；不会生成旧 `llm_models.json` / `run.json`，也不会写入明文 API key。
-目标配置文件已存在时默认失败，传 `--overwrite` 才会替换。`init` 在复制前会校验
-`<workspace>/config` 及其已有子树不包含 symlink，避免沿链接把配置写出工作区。
+和 prompts 资产；不会生成旧 `llm_models.json` / `run.json`，也不会把明文 API key 写入配置。
+
+配置 schema 与有效值的唯一 owner 仍是 `ConfigLoader` 和本目录当前 JSON；`init` 只构造
+transaction-private staging，再用真实 `ConfigLoader`、工具发现与 13 个 production scenes 校验，
+通过后才发布。它不实现第二套 loose parser，也不根据旧字段补默认。
+
+`init` 对 `<workspace>/config/` 的状态规则如下：
+
+- FIRST：目标不存在，从本目录默认值创建。
+- PRESERVE：目标已存在且无覆盖参数，完整保留用户配置、自建文件和自建 manifest，只补缺失的
+  package prompt 普通文件；随后只把本次选择写入相应模型记录和 16 个 package-known manifest
+  的 `model.default_model_id`，其它 manifest 字段保持不变。
+- OVERWRITE：`--overwrite` 从本目录默认值重建整个 `config/`，不合并旧树。
+- RESET：`--reset` 经默认 No 的明确确认后，从本目录默认值重建 `config/`；同时由 workspace
+  transaction 移除整个 `.dayu/`。RESET 优先于 `--overwrite`。
+
+四种状态都不把 `portfolio/` 或 `assets/` 纳入配置 manifest。`init` 会拒绝 workspace、
+受管树及其子树中的 symlink / Windows reparse entry，避免沿链接把配置或清理动作带出工作区。
+所选模型需要的 secret 仍只通过 `api_key_ref` 表达；用户确认后由 POSIX shell profile 或 Windows
+用户环境 owner 持久化，配置文件、异常和 CLI 输出都不保存 value。
 
 `dayu.runtime.location.resolve_runtime_locations` 负责把 workspace root 解析为 runtime assembly 位置：`<workspace>/config` 存在时输出 `config_overlay_dir`，不存在时输出 `None`；prompt assets 与 scene manifests 优先使用 workspace 中已存在的对应目录，否则使用包内默认资产。`ConfigLoader` 只接收调用方显式传入的配置目录，不猜测 workspace 路径。
 
