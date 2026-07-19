@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import io
 import os
 import platform
 import secrets
@@ -16,9 +17,12 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
+from collections.abc import Mapping
+from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Final, Protocol, cast
+from typing import BinaryIO, Final, Literal, Protocol, TypeAlias, cast
 
 import pytest
 
@@ -50,6 +54,20 @@ _OPTIONAL_ENVIRONMENT_NAMES: Final[tuple[str, ...]] = (
     "HF_TOKEN",
 )
 _WINDOWS_PRIVILEGE_NOT_HELD: Final[int] = 1314
+_GITHUB_ACTIONS_ENV_NAME: Final[str] = "GITHUB_ACTIONS"
+_GITHUB_RUN_ID_ENV_NAME: Final[str] = "GITHUB_RUN_ID"
+_GITHUB_ACTIONS_ENABLED: Final[str] = "true"
+_WINDOWS_CANARY_PREFIX: Final[str] = "sk-dayu-test-"
+_WINDOWS_CANARY_DOMAIN: Final[bytes] = b"dayu-ar-f07-win4-r12-canary-v1\x00"
+
+
+@dataclass(frozen=True, slots=True)
+class _InitProcessResult:
+    """真实 init 外层进程的最小可消费结果。"""
+
+    returncode: int
+    stdout: str
+    stderr: str
 
 
 class _WindowsOSError(Protocol):
@@ -113,6 +131,342 @@ class _ScriptedRegistryCommandRunner:
         )
 
 
+_WaitOutcome: TypeAlias = int | Literal["timeout"]
+
+
+class _TrackedTemporaryHandle(io.BytesIO):
+    """记录 read/flush/seek 且由 context 自动关闭的 anonymous binary handle。"""
+
+    def __init__(self) -> None:
+        """初始化空 binary handle 与调用计数。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__()
+        self.read_count = 0
+        self.flush_count = 0
+        self.seek_calls: list[tuple[int, int]] = []
+
+    def read(self, size: int | None = -1) -> bytes:
+        """从底层 handle 读取 bytes 并记录读取次数。
+
+        :param size: 最大读取字节数；``-1`` 表示读到结尾。
+        :returns: 读取到的 bytes。
+        :raises OSError: 底层读取失败时抛出。
+        """
+
+        self.read_count += 1
+        return super().read(size)
+
+    def flush(self) -> None:
+        """flush 底层 handle 并记录调用。
+
+        :returns: ``None``。
+        :raises OSError: flush 失败时抛出。
+        """
+
+        self.flush_count += 1
+        super().flush()
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        """移动底层 handle offset 并记录调用。
+
+        :param offset: 目标相对 offset。
+        :param whence: offset 参考点。
+        :returns: 移动后的绝对 offset。
+        :raises OSError: seek 失败时抛出。
+        """
+
+        self.seek_calls.append((offset, whence))
+        return super().seek(offset, whence)
+
+
+class _TemporaryHandleRecorder:
+    """记录 `_run_init` 创建的三个 anonymous handle 与精确 mode。"""
+
+    def __init__(self) -> None:
+        """初始化 mode 与 handle 记录。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.modes: list[str] = []
+        self.handles: list[_TrackedTemporaryHandle] = []
+
+    def __call__(self, *, mode: str) -> _TrackedTemporaryHandle:
+        """创建并记录一个真实 anonymous handle wrapper。
+
+        :param mode: 调用者显式选择的 temporary file mode。
+        :returns: tracked anonymous binary handle。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.modes.append(mode)
+        tracked = _TrackedTemporaryHandle()
+        self.handles.append(tracked)
+        return tracked
+
+
+class _ScriptedInitProcess:
+    """按脚本模拟 Popen wait/poll/kill，并验证 handles 生命周期。"""
+
+    def __init__(
+        self,
+        *,
+        wait_outcomes: tuple[_WaitOutcome, ...],
+        poll_outcomes: tuple[int | None, ...],
+        stdout: bytes,
+        stderr: bytes,
+        sensitive_value: str,
+    ) -> None:
+        """初始化 deterministic process state machine。
+
+        :param wait_outcomes: 每次 wait 的 returncode 或 timeout。
+        :param poll_outcomes: 每次 poll 的 returncode 或仍运行状态。
+        :param stdout: 模拟 child 写入的 stdout bytes。
+        :param stderr: 模拟 child 写入的 stderr bytes。
+        :param sensitive_value: 只放进 raw TimeoutExpired 的泄漏探针。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._wait_outcomes = list(wait_outcomes)
+        self._poll_outcomes = list(poll_outcomes)
+        self._stdout = stdout
+        self._stderr = stderr
+        self._sensitive_value = sensitive_value
+        self._stdin_handle: BinaryIO | None = None
+        self._stdout_handle: BinaryIO | None = None
+        self._stderr_handle: BinaryIO | None = None
+        self._output_written = False
+        self.wait_calls: list[float] = []
+        self.poll_calls = 0
+        self.kill_calls = 0
+        self.timeout_exceptions: list[subprocess.TimeoutExpired] = []
+
+    def attach_handles(
+        self,
+        *,
+        stdin: BinaryIO,
+        stdout: BinaryIO,
+        stderr: BinaryIO,
+    ) -> None:
+        """绑定 factory 收到的三个 binary handles。
+
+        :param stdin: child stdin handle。
+        :param stdout: child stdout handle。
+        :param stderr: child stderr handle。
+        :returns: ``None``。
+        :raises AssertionError: handles 在绑定前已经关闭时抛出。
+        """
+
+        if stdin.closed or stdout.closed or stderr.closed:
+            raise AssertionError("init handles closed before process creation")
+        self._stdin_handle = stdin
+        self._stdout_handle = stdout
+        self._stderr_handle = stderr
+
+    def _require_open_handles(self) -> tuple[BinaryIO, BinaryIO, BinaryIO]:
+        """返回已绑定且仍打开的三个 handles。
+
+        :returns: ``(stdin, stdout, stderr)``。
+        :raises AssertionError: handles 未绑定或提前关闭时抛出。
+        """
+
+        if self._stdin_handle is None or self._stdout_handle is None or self._stderr_handle is None:
+            raise AssertionError("init handles were not attached")
+        if self._stdin_handle.closed or self._stdout_handle.closed or self._stderr_handle.closed:
+            raise AssertionError("init handles closed during process lifecycle")
+        return self._stdin_handle, self._stdout_handle, self._stderr_handle
+
+    def _write_output_once(self) -> None:
+        """模拟 child 最多一次写入 stdout/stderr。
+
+        :returns: ``None``。
+        :raises OSError: handle 写入或 flush 失败时抛出。
+        """
+
+        _, stdout, stderr = self._require_open_handles()
+        if self._output_written:
+            return
+        stdout.write(self._stdout)
+        stdout.flush()
+        stderr.write(self._stderr)
+        stderr.flush()
+        self._output_written = True
+
+    def wait(self, timeout: float) -> int:
+        """返回下一 scripted wait 结果或抛出含探针的 raw timeout。
+
+        :param timeout: 调用者的 bounded wait 秒数。
+        :returns: scripted process returncode。
+        :raises subprocess.TimeoutExpired: 当前 scripted outcome 为 timeout 时抛出。
+        :raises AssertionError: wait 次数超出脚本时抛出。
+        """
+
+        self._require_open_handles()
+        self._write_output_once()
+        self.wait_calls.append(timeout)
+        if not self._wait_outcomes:
+            raise AssertionError("unexpected second init process wait")
+        outcome = self._wait_outcomes.pop(0)
+        if outcome == "timeout":
+            timeout_error = subprocess.TimeoutExpired(
+                cmd=("sensitive-cli-argv", self._sensitive_value),
+                timeout=timeout,
+                output=self._sensitive_value.encode("utf-8", errors="strict"),
+                stderr=self._sensitive_value.encode("utf-8", errors="strict"),
+            )
+            self.timeout_exceptions.append(timeout_error)
+            raise timeout_error
+        return outcome
+
+    def poll(self) -> int | None:
+        """返回下一 scripted nonblocking process observation。
+
+        :returns: scripted returncode 或 ``None``。
+        :raises AssertionError: poll 次数超出脚本时抛出。
+        """
+
+        self._require_open_handles()
+        self.poll_calls += 1
+        if not self._poll_outcomes:
+            raise AssertionError("unexpected second init process poll")
+        return self._poll_outcomes.pop(0)
+
+    def kill(self) -> None:
+        """记录 direct-process kill 并验证 handles 仍存活。
+
+        :returns: ``None``。
+        :raises AssertionError: handles 提前关闭时抛出。
+        """
+
+        self._require_open_handles()
+        self.kill_calls += 1
+
+
+class _ScriptedInitPopenFactory:
+    """记录 `_run_init` Popen contract 并返回单个 scripted process。"""
+
+    def __init__(self, process: _ScriptedInitProcess) -> None:
+        """保存本次唯一 scripted process。
+
+        :param process: 待返回的 deterministic process。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._process = process
+        self.call_count = 0
+        self.arguments: tuple[str, ...] | None = None
+        self.cwd: Path | None = None
+        self.environment: dict[str, str] | None = None
+        self.stdin_payload: bytes | None = None
+        self.shell: bool | None = None
+        self.close_fds: bool | None = None
+        self.text: bool | None = None
+
+    def __call__(
+        self,
+        arguments: tuple[str, ...],
+        *,
+        cwd: Path,
+        env: dict[str, str],
+        stdin: BinaryIO,
+        stdout: BinaryIO,
+        stderr: BinaryIO,
+        shell: bool,
+        close_fds: bool,
+        text: bool,
+    ) -> _ScriptedInitProcess:
+        """记录精确 Popen 输入并返回 scripted process。
+
+        :param arguments: outer real CLI argv。
+        :param cwd: 保留的 repository cwd。
+        :param env: 保留的隔离环境。
+        :param stdin: anonymous binary stdin handle。
+        :param stdout: anonymous binary stdout handle。
+        :param stderr: anonymous binary stderr handle。
+        :param shell: 必须为 ``False``。
+        :param close_fds: 必须为 ``True``。
+        :param text: 必须为 ``False``，保持 binary mode。
+        :returns: 本次唯一 scripted process。
+        :raises AssertionError: factory 被重复调用或 stdin 未 rewind 时抛出。
+        """
+
+        self.call_count += 1
+        if self.call_count != 1:
+            raise AssertionError("unexpected second init Popen call")
+        if stdin.tell() != 0:
+            raise AssertionError("init stdin was not rewound before Popen")
+        self.arguments = arguments
+        self.cwd = cwd
+        self.environment = env
+        self.stdin_payload = stdin.read()
+        stdin.seek(0)
+        self.shell = shell
+        self.close_fds = close_fds
+        self.text = text
+        self._process.attach_handles(stdin=stdin, stdout=stdout, stderr=stderr)
+        return self._process
+
+
+class _ScriptedTokenFactory:
+    """为 local-random owner test 返回顺序固定但互异的测试值。"""
+
+    def __init__(self, tokens: tuple[str, ...]) -> None:
+        """初始化 scripted token 序列。
+
+        :param tokens: 后续调用依次返回的 token。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._tokens = list(tokens)
+        self.calls: list[int] = []
+
+    def __call__(self, byte_count: int) -> str:
+        """记录请求字节数并返回下一 token。
+
+        :param byte_count: ``token_urlsafe`` 请求的随机字节数。
+        :returns: 下一 scripted token。
+        :raises AssertionError: 调用次数超过脚本时抛出。
+        """
+
+        self.calls.append(byte_count)
+        if not self._tokens:
+            raise AssertionError("unexpected extra local token request")
+        return self._tokens.pop(0)
+
+
+class _ForbiddenTokenFactory:
+    """证明 GitHub Actions 路径不会回退到随机 token。"""
+
+    def __init__(self) -> None:
+        """初始化零调用计数。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.calls = 0
+
+    def __call__(self, byte_count: int) -> str:
+        """拒绝任何 random fallback。
+
+        :param byte_count: 意外请求的随机字节数。
+        :returns: 本实现不会返回。
+        :raises AssertionError: 每次调用都抛出。
+        """
+
+        del byte_count
+        self.calls += 1
+        raise AssertionError("GitHub Actions canary attempted random fallback")
+
+
 def _write_text(path: Path, value: str) -> None:
     """创建 parent 并写入 UTF-8 文本。
 
@@ -159,48 +513,165 @@ def _subprocess_environment(
     return environment
 
 
+def _github_actions_canary(raw_run_id: str) -> str:
+    """从公开 GitHub Actions run id 派生固定的非秘密测试 canary。
+
+    :param raw_run_id: 未 canonicalize 的 ``GITHUB_RUN_ID``。
+    :returns: 带测试前缀与 64 位小写 SHA-256 hex 的 canary。
+    :raises AssertionError: run id 不是正 ASCII 十进制整数时抛出安全错误。
+    """
+
+    if not raw_run_id.isascii() or not raw_run_id.isdecimal():
+        raise AssertionError("GITHUB_RUN_ID must be a positive ASCII decimal integer")
+    run_id = int(raw_run_id)
+    if run_id <= 0:
+        raise AssertionError("GITHUB_RUN_ID must be a positive ASCII decimal integer")
+    canonical_run_id = str(run_id)
+    digest = hashlib.sha256(_WINDOWS_CANARY_DOMAIN + canonical_run_id.encode("ascii", errors="strict")).hexdigest()
+    return f"{_WINDOWS_CANARY_PREFIX}{digest}"
+
+
+def _select_windows_test_canary(environment: Mapping[str, str]) -> str:
+    """按运行环境选择 Windows real-setx 的非秘密测试 canary。
+
+    :param environment: 只读取 GitHub Actions 开关与公开 run id 的环境映射。
+    :returns: GitHub Actions 确定性 canary，或本地随机测试值。
+    :raises AssertionError: GitHub Actions 开启但 run id 缺失或非法时抛出安全错误。
+    """
+
+    if environment.get(_GITHUB_ACTIONS_ENV_NAME) == _GITHUB_ACTIONS_ENABLED:
+        raw_run_id = environment.get(_GITHUB_RUN_ID_ENV_NAME)
+        if raw_run_id is None:
+            raise AssertionError("GITHUB_RUN_ID must be set in GitHub Actions")
+        return _github_actions_canary(raw_run_id)
+    return secrets.token_urlsafe(32)
+
+
+def _render_init_timeout(
+    *,
+    returncode_at_timeout: int | None,
+    cleanup: Literal["completed", "timeout"],
+    cleanup_returncode: int | None,
+    process_state_after_cleanup_timeout: Literal["running", "exited"] | None,
+) -> str:
+    """渲染唯一的 outer init timeout 安全失败文本。
+
+    :param returncode_at_timeout: deadline 后首次非阻塞观察到的退出码。
+    :param cleanup: direct process 清理完成或超时。
+    :param cleanup_returncode: 清理阶段可用的退出码。
+    :param process_state_after_cleanup_timeout: 仅 cleanup timeout 后的单次 poll 投影。
+    :returns: 不含 argv、路径、输入或进程输出的安全失败文本。
+    :raises AssertionError: cleanup 与 post-timeout state 组合不符合状态机时抛出。
+    """
+
+    if cleanup == "completed" and process_state_after_cleanup_timeout is not None:
+        raise AssertionError("completed cleanup cannot have a post-timeout process state")
+    if cleanup == "timeout" and process_state_after_cleanup_timeout is None:
+        raise AssertionError("timed-out cleanup requires a post-timeout process state")
+    deadline_returncode = "not_exited" if returncode_at_timeout is None else str(returncode_at_timeout)
+    rendered_cleanup_returncode = "not_available" if cleanup_returncode is None else str(cleanup_returncode)
+    message = (
+        "category=dayu_cli_init_timeout "
+        f"timeout_seconds={_PROCESS_TIMEOUT_SECONDS:g} "
+        f"returncode_at_timeout={deadline_returncode} "
+        f"cleanup={cleanup} "
+        f"cleanup_returncode={rendered_cleanup_returncode}"
+    )
+    if process_state_after_cleanup_timeout is not None:
+        message = f"{message} process_state_after_cleanup_timeout={process_state_after_cleanup_timeout}"
+    return message
+
+
 def _run_init(
     workspace_root: Path,
     environment: dict[str, str],
     *,
     flags: tuple[str, ...] = (),
     input_text: str = _OLLAMA_INPUT,
-) -> subprocess.CompletedProcess[str]:
+) -> _InitProcessResult:
     """以真实 ``python -m dayu.cli`` 运行一次 init。
 
     :param workspace_root: 目标 workspace。
     :param environment: 隔离子进程环境。
     :param flags: init 追加 flags。
     :param input_text: 完整确定性 stdin。
-    :returns: 捕获输出的完成结果。
-    :raises subprocess.TimeoutExpired: CLI 超过 bounded test timeout 时抛出。
+    :returns: 只包含 returncode/stdout/stderr 的严格 UTF-8 结果。
+    :raises UnicodeEncodeError: stdin 不是可编码的严格 UTF-8 文本时抛出。
+    :raises UnicodeDecodeError: stdout/stderr 不是严格 UTF-8 时抛出。
+    :raises pytest.fail.Exception: CLI 超时且完成 bounded direct-process cleanup 后抛出安全失败。
     """
 
-    return subprocess.run(
-        (
-            sys.executable,
-            "-u",
-            "-m",
-            "dayu.cli",
-            "init",
-            "--base",
-            str(workspace_root),
-            *flags,
-        ),
-        cwd=_REPOSITORY_ROOT,
-        env=environment,
-        input=input_text,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="strict",
-        timeout=_PROCESS_TIMEOUT_SECONDS,
-        check=False,
-    )
+    with (
+        tempfile.TemporaryFile(mode="w+b") as stdin_handle,
+        tempfile.TemporaryFile(mode="w+b") as stdout_handle,
+        tempfile.TemporaryFile(mode="w+b") as stderr_handle,
+    ):
+        input_bytes = input_text.encode("utf-8", errors="strict")
+        stdin_handle.write(input_bytes)
+        stdin_handle.flush()
+        stdin_handle.seek(0)
+
+        # timeout failure 前主动清空 helper frame 中唯一的 input 文本与 bytes 所有者。
+        input_text = ""
+        input_bytes = b""
+        process: subprocess.Popen[bytes] = subprocess.Popen(
+            (
+                sys.executable,
+                "-u",
+                "-m",
+                "dayu.cli",
+                "init",
+                "--base",
+                str(workspace_root),
+                *flags,
+            ),
+            cwd=_REPOSITORY_ROOT,
+            env=environment,
+            stdin=stdin_handle,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            shell=False,
+            close_fds=True,
+            text=False,
+        )
+        try:
+            returncode = process.wait(timeout=_PROCESS_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            returncode_at_timeout = process.poll()
+            cleanup: Literal["completed", "timeout"] = "completed"
+            cleanup_returncode = returncode_at_timeout
+            process_state_after_cleanup_timeout: Literal["running", "exited"] | None = None
+            if returncode_at_timeout is None:
+                process.kill()
+                try:
+                    cleanup_returncode = process.wait(timeout=_PROCESS_TIMEOUT_SECONDS)
+                except subprocess.TimeoutExpired:
+                    cleanup = "timeout"
+                    cleanup_returncode = process.poll()
+                    process_state_after_cleanup_timeout = "running" if cleanup_returncode is None else "exited"
+            safe_message = _render_init_timeout(
+                returncode_at_timeout=returncode_at_timeout,
+                cleanup=cleanup,
+                cleanup_returncode=cleanup_returncode,
+                process_state_after_cleanup_timeout=process_state_after_cleanup_timeout,
+            )
+            pytest.fail(safe_message, pytrace=False)
+
+        stdout_handle.seek(0)
+        stderr_handle.seek(0)
+        stdout_bytes = stdout_handle.read()
+        stderr_bytes = stderr_handle.read()
+        stdout = stdout_bytes.decode("utf-8", errors="strict")
+        stderr = stderr_bytes.decode("utf-8", errors="strict")
+        return _InitProcessResult(
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
 
 
 def _assert_init_result(
-    result: subprocess.CompletedProcess[str],
+    result: _InitProcessResult,
     *,
     expected_returncode: int,
     expected_mode: str | None,
@@ -215,11 +686,458 @@ def _assert_init_result(
     """
 
     if result.returncode != expected_returncode:
-        raise AssertionError(
-            f"init return code mismatch: expected={expected_returncode} actual={result.returncode}"
-        )
+        raise AssertionError(f"init return code mismatch: expected={expected_returncode} actual={result.returncode}")
     if expected_mode is not None and f"mode={expected_mode}" not in result.stdout:
         raise AssertionError(f"init did not report expected mode name: {expected_mode}")
+
+
+def _install_scripted_init_process(
+    monkeypatch: pytest.MonkeyPatch,
+    process: _ScriptedInitProcess,
+) -> tuple[_ScriptedInitPopenFactory, _TemporaryHandleRecorder]:
+    """安装 deterministic Popen 与 tracked anonymous TemporaryFile owners。
+
+    :param monkeypatch: pytest 属性替换夹具。
+    :param process: 本次 `_run_init` 使用的 scripted process。
+    :returns: ``(Popen recorder, temporary-handle recorder)``。
+    :raises Exception: monkeypatch 安装失败时透传。
+    """
+
+    handle_recorder = _TemporaryHandleRecorder()
+    process_factory = _ScriptedInitPopenFactory(process)
+    monkeypatch.setattr(tempfile, "TemporaryFile", handle_recorder)
+    monkeypatch.setattr(subprocess, "Popen", process_factory)
+    return process_factory, handle_recorder
+
+
+def test_run_init_uses_binary_anonymous_handles_and_returns_typed_utf8_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """成功路径保留 argv/cwd/env、binary Popen 与 strict UTF-8 output contract。
+
+    :param monkeypatch: pytest 属性替换夹具。
+    :returns: ``None``。
+    :raises AssertionError: process、handle、typed result 或 UTF-8 contract 漂移时抛出。
+    """
+
+    process = _ScriptedInitProcess(
+        wait_outcomes=(0,),
+        poll_outcomes=(),
+        stdout="初始化成功 mode=first\n".encode("utf-8", errors="strict"),
+        stderr="严格错误通道\n".encode("utf-8", errors="strict"),
+        sensitive_value="unused-sensitive-probe",
+    )
+    process_factory, handle_recorder = _install_scripted_init_process(
+        monkeypatch,
+        process,
+    )
+    workspace_root = Path("/owner-test/workspace")
+    environment = {"OWNER_TEST": "1"}
+    input_text = "14\n输入\n"
+
+    result = _run_init(
+        workspace_root,
+        environment,
+        flags=("--overwrite",),
+        input_text=input_text,
+    )
+
+    assert result == _InitProcessResult(
+        returncode=0,
+        stdout="初始化成功 mode=first\n",
+        stderr="严格错误通道\n",
+    )
+    assert tuple(field.name for field in fields(_InitProcessResult)) == (
+        "returncode",
+        "stdout",
+        "stderr",
+    )
+    assert process_factory.arguments == (
+        sys.executable,
+        "-u",
+        "-m",
+        "dayu.cli",
+        "init",
+        "--base",
+        str(workspace_root),
+        "--overwrite",
+    )
+    assert process_factory.cwd == _REPOSITORY_ROOT
+    assert process_factory.environment is environment
+    assert process_factory.stdin_payload == input_text.encode("utf-8", errors="strict")
+    assert process_factory.shell is False
+    assert process_factory.close_fds is True
+    assert process_factory.text is False
+    assert process.wait_calls == [_PROCESS_TIMEOUT_SECONDS]
+    assert process.poll_calls == 0
+    assert process.kill_calls == 0
+    assert handle_recorder.modes == ["w+b", "w+b", "w+b"]
+    assert len(handle_recorder.handles) == 3
+    stdin_handle, stdout_handle, stderr_handle = handle_recorder.handles
+    assert stdin_handle.flush_count == 1
+    assert stdin_handle.seek_calls[0] == (0, 0)
+    assert stdout_handle.read_count == 1
+    assert stderr_handle.read_count == 1
+    assert all(handle.closed for handle in handle_recorder.handles)
+
+
+def test_run_init_returns_ordinary_nonzero_as_typed_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ordinary nonzero 不得被投影成 timeout 或丢弃 stdout/stderr。
+
+    :param monkeypatch: pytest 属性替换夹具。
+    :returns: ``None``。
+    :raises AssertionError: ordinary process result 被错误重分类时抛出。
+    """
+
+    process = _ScriptedInitProcess(
+        wait_outcomes=(7,),
+        poll_outcomes=(),
+        stdout=b"ordinary-output",
+        stderr=b"ordinary-error",
+        sensitive_value="unused-sensitive-probe",
+    )
+    _, handle_recorder = _install_scripted_init_process(monkeypatch, process)
+
+    result = _run_init(Path("/owner-test/nonzero"), {"OWNER_TEST": "1"})
+
+    assert result == _InitProcessResult(
+        returncode=7,
+        stdout="ordinary-output",
+        stderr="ordinary-error",
+    )
+    with pytest.raises(AssertionError, match="expected=0 actual=7") as raised:
+        _assert_init_result(result, expected_returncode=0, expected_mode=None)
+    assert "ordinary-output" not in str(raised.value)
+    assert "ordinary-error" not in str(raised.value)
+    assert all(handle.closed for handle in handle_recorder.handles)
+
+
+def test_run_init_strict_utf8_rejects_invalid_input_before_popen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """stdin strict UTF-8 encode 失败必须发生在 CLI 启动前并关闭三个 handles。
+
+    :param monkeypatch: pytest 属性替换夹具。
+    :returns: ``None``。
+    :raises AssertionError: 非法 input 启动 process 或遗留 handle 时抛出。
+    """
+
+    process = _ScriptedInitProcess(
+        wait_outcomes=(0,),
+        poll_outcomes=(),
+        stdout=b"",
+        stderr=b"",
+        sensitive_value="unused-sensitive-probe",
+    )
+    process_factory, handle_recorder = _install_scripted_init_process(
+        monkeypatch,
+        process,
+    )
+
+    with pytest.raises(UnicodeEncodeError):
+        _run_init(
+            Path("/owner-test/invalid-input"),
+            {"OWNER_TEST": "1"},
+            input_text="\ud800",
+        )
+
+    assert process_factory.call_count == 0
+    assert handle_recorder.modes == ["w+b", "w+b", "w+b"]
+    assert all(handle.closed for handle in handle_recorder.handles)
+
+
+def test_run_init_strict_utf8_rejects_invalid_output_after_reading_both_channels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """stdout/stderr 都从 handles 读取后按 strict UTF-8 解码，禁止 replacement。
+
+    :param monkeypatch: pytest 属性替换夹具。
+    :returns: ``None``。
+    :raises AssertionError: invalid UTF-8 被接受、漏读 channel 或遗留 handle 时抛出。
+    """
+
+    input_sentinel = secrets.token_urlsafe(32)
+    process = _ScriptedInitProcess(
+        wait_outcomes=(0,),
+        poll_outcomes=(),
+        stdout=b"\xff",
+        stderr=b"valid-stderr",
+        sensitive_value=input_sentinel,
+    )
+    _, handle_recorder = _install_scripted_init_process(monkeypatch, process)
+
+    with pytest.raises(UnicodeDecodeError) as raised:
+        _run_init(
+            Path("/owner-test/invalid-output"),
+            {"OWNER_TEST": "1"},
+            input_text=f"6\n{input_sentinel}\ny\n",
+        )
+
+    if input_sentinel in repr(raised.value):
+        raise AssertionError("strict UTF-8 failure retained the input sentinel")
+    _, stdout_handle, stderr_handle = handle_recorder.handles
+    assert stdout_handle.read_count == 1
+    assert stderr_handle.read_count == 1
+    assert all(handle.closed for handle in handle_recorder.handles)
+
+
+@pytest.mark.parametrize(
+    (
+        "wait_outcomes",
+        "poll_outcomes",
+        "expected_wait_calls",
+        "expected_poll_calls",
+        "expected_kill_calls",
+        "expected_message",
+    ),
+    (
+        (
+            ("timeout",),
+            (1,),
+            1,
+            1,
+            0,
+            "category=dayu_cli_init_timeout timeout_seconds=180 "
+            "returncode_at_timeout=1 cleanup=completed cleanup_returncode=1",
+        ),
+        (
+            ("timeout", -9),
+            (None,),
+            2,
+            1,
+            1,
+            "category=dayu_cli_init_timeout timeout_seconds=180 "
+            "returncode_at_timeout=not_exited cleanup=completed cleanup_returncode=-9",
+        ),
+        (
+            ("timeout", "timeout"),
+            (None, None),
+            2,
+            2,
+            1,
+            "category=dayu_cli_init_timeout timeout_seconds=180 "
+            "returncode_at_timeout=not_exited cleanup=timeout cleanup_returncode=not_available "
+            "process_state_after_cleanup_timeout=running",
+        ),
+        (
+            ("timeout", "timeout"),
+            (None, 23),
+            2,
+            2,
+            1,
+            "category=dayu_cli_init_timeout timeout_seconds=180 "
+            "returncode_at_timeout=not_exited cleanup=timeout cleanup_returncode=23 "
+            "process_state_after_cleanup_timeout=exited",
+        ),
+    ),
+)
+def test_run_init_timeout_has_safe_projection_and_single_bounded_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    wait_outcomes: tuple[_WaitOutcome, ...],
+    poll_outcomes: tuple[int | None, ...],
+    expected_wait_calls: int,
+    expected_poll_calls: int,
+    expected_kill_calls: int,
+    expected_message: str,
+) -> None:
+    """timeout 状态机锁定 deadline/cleanup事实且不泄漏 raw process material。
+
+    :param monkeypatch: pytest 属性替换夹具。
+    :param capsys: pytest stdout/stderr 捕获夹具。
+    :param wait_outcomes: initial/cleanup wait 的 scripted 结果。
+    :param poll_outcomes: deadline/post-cleanup poll 的 scripted 结果。
+    :param expected_wait_calls: 预期 bounded wait 次数。
+    :param expected_poll_calls: 预期 nonblocking poll 次数。
+    :param expected_kill_calls: 预期 direct process kill 次数。
+    :param expected_message: 精确的唯一 safe timeout projection。
+    :returns: ``None``。
+    :raises AssertionError: 状态投影、调用次数、handle lifetime 或 non-disclosure 漂移时抛出。
+    """
+
+    sentinel = secrets.token_urlsafe(32)
+    canary = _github_actions_canary("1")
+    sensitive_input = f"{canary}:{sentinel}"
+    process = _ScriptedInitProcess(
+        wait_outcomes=wait_outcomes,
+        poll_outcomes=poll_outcomes,
+        stdout=f"stdout-{sensitive_input}".encode("utf-8", errors="strict"),
+        stderr=f"stderr-{sensitive_input}".encode("utf-8", errors="strict"),
+        sensitive_value=sensitive_input,
+    )
+    _, handle_recorder = _install_scripted_init_process(monkeypatch, process)
+    workspace_root = Path(f"/owner-test/path-{sentinel}")
+
+    with pytest.raises(pytest.fail.Exception) as raised:
+        _run_init(
+            workspace_root,
+            {"SENSITIVE_ENV": sensitive_input},
+            flags=(f"--sensitive-{sentinel}",),
+            input_text=f"6\n{sensitive_input}\ny\n",
+        )
+
+    message = str(raised.value)
+    assert message == expected_message
+    forbidden_material = (
+        sentinel,
+        canary,
+        sensitive_input,
+        str(workspace_root),
+        str(_REPOSITORY_ROOT),
+        "sensitive-cli-argv",
+        "stdin",
+        "stdout",
+        "stderr",
+        "TimeoutExpired",
+    )
+    for forbidden in forbidden_material:
+        if forbidden in message or forbidden in repr(raised.value):
+            raise AssertionError("safe timeout projection exposed forbidden process material")
+    captured = capsys.readouterr()
+    if sentinel in captured.out or sentinel in captured.err or canary in captured.out or canary in captured.err:
+        raise AssertionError("timeout failure capture exposed the input sentinel")
+    assert process.wait_calls == [_PROCESS_TIMEOUT_SECONDS] * expected_wait_calls
+    assert process.poll_calls == expected_poll_calls
+    assert process.kill_calls == expected_kill_calls
+    assert len(process.timeout_exceptions) == sum(outcome == "timeout" for outcome in wait_outcomes)
+    for raw_timeout in process.timeout_exceptions:
+        raw_output = raw_timeout.output
+        if (
+            sentinel not in str(raw_timeout)
+            or canary not in str(raw_timeout)
+            or not isinstance(raw_output, bytes)
+            or sensitive_input.encode("utf-8", errors="strict") not in raw_output
+        ):
+            raise AssertionError("raw timeout probe did not contain the sensitive process material")
+    assert len(handle_recorder.handles) == 3
+    _, stdout_handle, stderr_handle = handle_recorder.handles
+    assert stdout_handle.read_count == 0
+    assert stderr_handle.read_count == 0
+    assert all(handle.closed for handle in handle_recorder.handles)
+
+
+def test_github_actions_canary_freezes_domain_vector_determinism_and_shape() -> None:
+    """冻结完整 domain bytes、single NUL、run-id canonicalization 与已知向量。
+
+    :returns: ``None``。
+    :raises AssertionError: canary bytes、算法、canonicalization、prefix 或 shape 漂移时抛出。
+    """
+
+    assert len(_WINDOWS_CANARY_DOMAIN) == 31
+    assert _WINDOWS_CANARY_DOMAIN[:-1] == ("dayu-ar-f07-win4-r12-canary-v1".encode("ascii", errors="strict"))
+    assert _WINDOWS_CANARY_DOMAIN[-1] == 0
+    assert _WINDOWS_CANARY_DOMAIN.count(bytes((0,))) == 1
+    known_vector = _github_actions_canary("1")
+    assert known_vector == ("sk-dayu-test-b8f2210d1ead3aac3a52408adb9de03c4e848d4c101f790e218ecc76e3350b97")
+    assert _github_actions_canary("0001") == known_vector
+    assert _github_actions_canary("1") == known_vector
+    second_vector = _github_actions_canary("2")
+    assert second_vector != known_vector
+    assert second_vector.startswith(_WINDOWS_CANARY_PREFIX)
+    digest = second_vector.removeprefix(_WINDOWS_CANARY_PREFIX)
+    assert len(digest) == 64
+    assert set(digest) <= set("0123456789abcdef")
+
+
+@pytest.mark.parametrize(
+    "environment",
+    (
+        {_GITHUB_ACTIONS_ENV_NAME: _GITHUB_ACTIONS_ENABLED},
+        {
+            _GITHUB_ACTIONS_ENV_NAME: _GITHUB_ACTIONS_ENABLED,
+            _GITHUB_RUN_ID_ENV_NAME: "",
+        },
+        {
+            _GITHUB_ACTIONS_ENV_NAME: _GITHUB_ACTIONS_ENABLED,
+            _GITHUB_RUN_ID_ENV_NAME: "abc",
+        },
+        {
+            _GITHUB_ACTIONS_ENV_NAME: _GITHUB_ACTIONS_ENABLED,
+            _GITHUB_RUN_ID_ENV_NAME: "0",
+        },
+        {
+            _GITHUB_ACTIONS_ENV_NAME: _GITHUB_ACTIONS_ENABLED,
+            _GITHUB_RUN_ID_ENV_NAME: "-1",
+        },
+        {
+            _GITHUB_ACTIONS_ENV_NAME: _GITHUB_ACTIONS_ENABLED,
+            _GITHUB_RUN_ID_ENV_NAME: "１２",
+        },
+    ),
+)
+def test_github_actions_canary_fails_closed_without_random_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    environment: dict[str, str],
+) -> None:
+    """GitHub Actions 缺失/空/非十进制/非正 run id 必须在 CLI 前 fail closed。
+
+    :param monkeypatch: pytest 属性替换夹具。
+    :param environment: 当前 invalid workflow environment。
+    :returns: ``None``。
+    :raises AssertionError: selector 随机 fallback、暴露 raw value 或接受非法值时抛出。
+    """
+
+    forbidden_random = _ForbiddenTokenFactory()
+    monkeypatch.setattr(secrets, "token_urlsafe", forbidden_random)
+
+    with pytest.raises(AssertionError, match="GITHUB_RUN_ID") as raised:
+        _select_windows_test_canary(environment)
+
+    raw_run_id = environment.get(_GITHUB_RUN_ID_ENV_NAME)
+    if raw_run_id and raw_run_id in str(raised.value):
+        raise AssertionError("workflow canary validation exposed the invalid run id")
+    assert forbidden_random.calls == 0
+
+
+def test_github_actions_canary_uses_public_run_id_without_random_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """合法 workflow path 只使用公开 run id 的 deterministic canary。
+
+    :param monkeypatch: pytest 属性替换夹具。
+    :returns: ``None``。
+    :raises AssertionError: workflow path 使用 random fallback 或结果不确定时抛出。
+    """
+
+    forbidden_random = _ForbiddenTokenFactory()
+    monkeypatch.setattr(secrets, "token_urlsafe", forbidden_random)
+    environment = {
+        _GITHUB_ACTIONS_ENV_NAME: _GITHUB_ACTIONS_ENABLED,
+        _GITHUB_RUN_ID_ENV_NAME: "0001",
+    }
+
+    selected = _select_windows_test_canary(environment)
+
+    assert selected == _github_actions_canary("1")
+    assert forbidden_random.calls == 0
+
+
+def test_local_windows_canary_remains_random_and_ignores_run_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """非 GitHub Actions local path 每次继续请求 32 bytes 的随机 token。
+
+    :param monkeypatch: pytest 属性替换夹具。
+    :returns: ``None``。
+    :raises AssertionError: local path 使用 run id 或不再请求随机 token 时抛出。
+    """
+
+    token_factory = _ScriptedTokenFactory(("local-token-one", "local-token-two"))
+    monkeypatch.setattr(secrets, "token_urlsafe", token_factory)
+    environment = {
+        _GITHUB_ACTIONS_ENV_NAME: "false",
+        _GITHUB_RUN_ID_ENV_NAME: "1",
+    }
+
+    first = _select_windows_test_canary(environment)
+    second = _select_windows_test_canary(environment)
+
+    assert first == "local-token-one"
+    assert second == "local-token-two"
+    assert first != second
+    assert token_factory.calls == [32, 32]
 
 
 def _tree_digest(root: Path) -> str:
@@ -239,9 +1157,7 @@ def _tree_digest(root: Path) -> str:
         path_stat = path.lstat()
         relative = "." if path == root else path.relative_to(root).as_posix()
         digest.update(relative.encode("utf-8"))
-        digest.update(
-            f"|{path_stat.st_mode}|{path_stat.st_dev}|{path_stat.st_ino}|".encode("ascii")
-        )
+        digest.update(f"|{path_stat.st_mode}|{path_stat.st_dev}|{path_stat.st_ino}|".encode("ascii"))
         if stat.S_ISREG(path_stat.st_mode):
             digest.update(path.read_bytes())
     return digest.hexdigest()
@@ -356,9 +1272,7 @@ def _wait_for_lock_notification(process: subprocess.Popen[str]) -> None:
                 raise AssertionError("timed out waiting for public workspace lock notification")
             line = stdout.readline()
             if line == "":
-                raise AssertionError(
-                    f"init exited before lock notification: returncode={process.poll()}"
-                )
+                raise AssertionError(f"init exited before lock notification: returncode={process.poll()}")
             if "正在等待此 workspace lock" in line:
                 return
     finally:
@@ -397,7 +1311,7 @@ def test_prewarm_subprocess_has_exact_imports_and_zero_external_mutation(
     sentinel_root = tmp_path / "sentinel-workspace"
     _write_text(sentinel_root / "nested" / "value.txt", "unchanged")
     environment = _subprocess_environment(tmp_path / "home")
-    script = r'''
+    script = r"""
 import hashlib
 import importlib
 import os
@@ -464,7 +1378,7 @@ assert network_resolve.call_count == 0
 assert before_tree == digest_tree()
 assert before_environment == dict(os.environ)
 print("PREWARM_SMOKE_PASS")
-'''
+"""
 
     result = subprocess.run(
         (sys.executable, "-u", "-c", script, str(sentinel_root)),
@@ -509,9 +1423,10 @@ def test_posix_real_four_state_config_scene_and_reset_sentinels(tmp_path: Path) 
     _assert_init_result(preserve, expected_returncode=0, expected_mode="preserve")
     assert user_file.read_text(encoding="utf-8") == "user-file"
     assert user_manifest.read_text(encoding="utf-8") == '{"owner":"user"}'
-    assert missing_prompt.read_bytes() == (
-        _REPOSITORY_ROOT / "dayu" / "config" / "prompts" / "base" / "fact_rules.md"
-    ).read_bytes()
+    assert (
+        missing_prompt.read_bytes()
+        == (_REPOSITORY_ROOT / "dayu" / "config" / "prompts" / "base" / "fact_rules.md").read_bytes()
+    )
 
     overwrite = _run_init(workspace_root, environment, flags=("--overwrite",))
     _assert_init_result(overwrite, expected_returncode=0, expected_mode="overwrite")
@@ -925,7 +1840,7 @@ def test_windows_real_setx_round_trip_is_name_safe_and_cleaned(tmp_path: Path) -
         registry_key=registry_key,
         value_name=_OPENAI_ENV_NAME,
     )
-    sentinel = secrets.token_urlsafe(32)
+    sentinel = _select_windows_test_canary(os.environ)
     environment = _subprocess_environment(
         tmp_path / "home",
         absent_names=(_OPENAI_ENV_NAME,),

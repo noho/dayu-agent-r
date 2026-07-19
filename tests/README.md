@@ -53,7 +53,9 @@ python -m pytest tests/cli/test_run_keys.py::test_new_running_key_monitor_uses_n
 CLI process owner 会在解析参数和输出前，把真实 stdout/stderr `TextIOWrapper` 明确配置为 strict UTF-8，保证 redirected
 init/upload 中文输出仍可编码；直接消费 Dayu CLI 或生成脚本所转发输出的测试 subprocess 同样显式使用
 `encoding="utf-8", errors="strict"` 解码，不依赖 Windows ambient code page。内存 capture 等非 OS wrapper 保持调用方自己的
-语义，纯 recorder、`reg.exe` 与 junction native 命令继续使用各自的平台输出契约。
+语义，纯 recorder、`reg.exe` 与 junction native 命令继续使用各自的平台输出契约。产品 `setx` persistence 调用的 native
+output 没有消费者，因此不由产品捕获；real-init gate 的 outer CLI 仍通过 anonymous binary handles 捕获 stdout/stderr，并在
+process 成功结束后 strict UTF-8 解码。
 
 真实 init Windows gate 由 `.github/workflows/r12-init-windows.yml` 使用 Python 3.11 与
 `constraints/lock-windows-x64-py311.txt` 运行。它执行真实 FIRST→PRESERVE→OVERWRITE→
@@ -61,8 +63,10 @@ RESET No→RESET Yes 与 `ConfigLoader`/scene 重载，验证 ordinary Windows t
 POSIX directory fsync；还覆盖真实 nested junction/reparse 外部 sentinel、普通 symlink 的精确
 privilege skip、workspace root identity、replace rollback、scan-delete race、真实 `setx` 用户环境
 round-trip/幂等 absent cleanup、非 POSIX TTY no-op owner boundary，以及 R11 的两个真实 cmd/upload nodes。
-上传 artifact 只包含 JUnit、版本、
-capability、source hashes 和环境变量名，不保存 environment/registry values。
+outer CLI timeout 失败只投影 `category`、`timeout_seconds`、`returncode_at_timeout`、`cleanup`、
+`cleanup_returncode`，cleanup timeout 时再投影 `process_state_after_cleanup_timeout`；artifact 可记录环境变量名，但不记录
+stdin input value。上传 artifact 只包含 JUnit、版本、capability、source hashes 和环境变量名，不保存
+environment/registry values。
 
 默认 pytest 配置会排除 `stress` marker，因此常规命令不会运行 Host production stress suite。显式运行 stress suite 时需要覆盖默认 `addopts`：
 
