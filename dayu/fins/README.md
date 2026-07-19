@@ -502,6 +502,8 @@ Processors 在 `dayu.documents.processors` 通用能力上增加财报语义：
 - SEC 表单专项处理器通过虚拟章节 mixin 处理 `10-K`、`10-Q`、`20-F`、`8-K`、`DEF 14A`、`SC 13D/G`、`6-K` 等表单的章节切分、搜索和财务表回退。
 - `build_fins_processor_registry()` 在 documents 默认处理器注册表基础上覆盖注册 Fins 增强处理器，并按优先级注册 SEC 表单专项主路径、回退路径和通用 SEC 兜底。
 
+虚拟章节 mixin 是表单专项 section / table 发布语义的唯一 owner。刷新时先校验原始表格标记、章节树和同一份候选双向映射，再一次性发布结果：完整映射（包括零表格）发布虚拟章节；没有矛盾但映射缺失或不完整时整体发布基础处理器结果；悬空、重复或双向不一致等矛盾直接失败关闭。已发布模式是终态，重复刷新保持幂等；章节列表、章节读取、搜索、表格列表和表格读取五个公共消费者只读取同一已发布模式与映射，不按可用性静默过滤，也不按位置猜测归属。
+
 `dayu.fins.domain.filing_semantics` 是 fiscal year、fiscal period 与财期 recency rank 的 domain 真源；processor 和 pipeline 负责产生直接 fiscal 事实，read runtime 只校验、排序和投影。`dayu.fins.processors.value_normalization.normalize_optional_dataframe_string(...)` 是 dataframe 可选字符串真源：`None`、空白、NaN、`pd.NA` 与 `pd.NaT` 表示缺失，数字 `0` 与 bool `False` 保留为文本。SEC section、table 与 XBRL processor 直接消费该 helper，不维护本地 wrapper。
 
 ### FinsReadRuntime

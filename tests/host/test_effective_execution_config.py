@@ -23,7 +23,17 @@ from dayu.engine.contracts.engine_events import (
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import AgentMessageRole
 from dayu.engine.contracts.runner_spec import (
+    AnthropicThinkingExtension,
     ClientCorrelationPolicy,
+    DeepSeekReasoningEffort,
+    DeepSeekThinkingExtension,
+    GeminiThinkingExtension,
+    GeminiThinkingLevel,
+    MimoThinkingExtension,
+    OpenAIReasoningEffort,
+    OpenAIReasoningExtension,
+    ProviderRequestExtension,
+    QwenThinkingExtension,
     RunnerCallOptions,
     RunnerSpec,
 )
@@ -47,9 +57,20 @@ from dayu.host import (
 from dayu.host.api import HostCommandHandleOptions
 from dayu.host.command import create_host_command_handle
 from dayu.host._execution_config_projection import (
+    agent_policy_from_json,
+    agent_policy_json,
     effective_execution_config_json,
     effective_execution_snapshot_from_json,
+    optional_agent_policy_json,
+    optional_runner_options_json,
+    optional_runner_spec_json,
+    provider_request_from_json,
+    provider_request_json,
     required_json_mapping as _required_json_mapping,
+    runner_options_from_json,
+    runner_options_json,
+    runner_spec_from_json,
+    runner_spec_json,
 )
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.codec import sha256_digest_json
@@ -451,6 +472,131 @@ def test_effective_execution_snapshot_rejects_unknown_provider_request_with_dura
     }
     with pytest.raises(HostDurableError, match="provider_request"):
         effective_execution_snapshot_from_json(_effective_execution_envelope(config))
+
+
+@pytest.mark.parametrize(
+    "extension",
+    (
+        OpenAIReasoningExtension(reasoning_effort=OpenAIReasoningEffort.HIGH),
+        AnthropicThinkingExtension(enabled=True, budget_tokens=4096),
+        DeepSeekThinkingExtension(
+            enabled=True,
+            reasoning_effort=DeepSeekReasoningEffort.MAX,
+        ),
+        MimoThinkingExtension(enabled=False),
+        GeminiThinkingExtension(
+            include_thoughts=True,
+            thinking_level=GeminiThinkingLevel.MEDIUM,
+        ),
+        QwenThinkingExtension(enable_thinking=True, thinking_budget=2048),
+    ),
+)
+def test_provider_request_projection_round_trips_every_supported_extension(
+    extension: ProviderRequestExtension,
+) -> None:
+    """Host 冻结投影必须无损还原每种受支持的 provider request。
+
+    :param extension: 一个有效的 provider request 强类型扩展。
+    :returns: ``None``。
+    :raises AssertionError: JSON 投影不能还原为同一扩展时抛出。
+    """
+
+    assert provider_request_from_json(provider_request_json(extension)) == extension
+
+
+def test_execution_projection_round_trips_complete_owner_contract() -> None:
+    """RunnerSpec、调用选项与 AgentPolicy 必须由各自 owner 无损往返。
+
+    :returns: ``None``。
+    :raises AssertionError: 任一冻结字段在还原后漂移时抛出。
+    """
+
+    runner_spec = dataclasses.replace(
+        _runner_spec("complete-projection-model"),
+        headers={"X-Zeta": "last", "X-Alpha": "first"},
+        supports_tool_calling=True,
+        supports_streaming=True,
+        supports_stream_usage=True,
+        provider_request=GeminiThinkingExtension(
+            thinking_budget=1024,
+            include_thoughts=False,
+        ),
+        stream_idle_timeout_seconds=30.0,
+        stream_idle_heartbeat_seconds=5.0,
+    )
+    runner_options = RunnerCallOptions(
+        temperature=0.25,
+        max_tokens=512,
+        top_p=0.8,
+        stream=True,
+    )
+    agent_policy = AgentPolicy(
+        max_iterations=5,
+        continuation_max_attempts=2,
+        allow_tool_calls=True,
+        tool_execution_timeout_seconds=12.5,
+        fallback_prompt="请基于现有证据回答",
+        continuation_prompt="继续完成当前回答",
+        max_consecutive_failed_tool_batches=3,
+    )
+
+    runner_spec_value = _required_json_mapping(
+        runner_spec_json(runner_spec),
+        field_name="runner_spec",
+    )
+    runner_options_value = _required_json_mapping(
+        runner_options_json(runner_options),
+        field_name="runner_options",
+    )
+    agent_policy_value = _required_json_mapping(
+        agent_policy_json(agent_policy),
+        field_name="agent_policy",
+    )
+    headers_value = _required_json_mapping(
+        runner_spec_value["headers"],
+        field_name="headers",
+    )
+
+    assert list(headers_value) == ["X-Alpha", "X-Zeta"]
+    assert runner_spec_from_json(runner_spec_value) == runner_spec
+    assert runner_options_from_json(runner_options_value) == runner_options
+    assert agent_policy_from_json(agent_policy_value) == agent_policy
+
+
+def test_optional_execution_projection_preserves_absence() -> None:
+    """三个可选 override 缺席时必须稳定投影为 JSON ``null``。
+
+    :returns: ``None``。
+    :raises AssertionError: 缺席语义被补成默认配置时抛出。
+    """
+
+    assert optional_runner_spec_json(None) is None
+    assert optional_runner_options_json(None) is None
+    assert optional_agent_policy_json(None) is None
+
+
+@pytest.mark.parametrize(
+    "provider_request",
+    (
+        {"kind": "openai_reasoning", "reasoning_effort": "turbo"},
+        {"kind": "anthropic_thinking", "enabled": "yes", "budget_tokens": 1024},
+        {"kind": "deepseek_thinking", "enabled": False, "reasoning_effort": "max"},
+        {"kind": "gemini_thinking", "thinking_budget": True},
+        {"kind": "qwen_thinking", "enable_thinking": False, "thinking_budget": 1},
+    ),
+)
+def test_provider_request_projection_fails_closed_on_invalid_supported_payloads(
+    provider_request: Mapping[str, JsonValue],
+) -> None:
+    """已知 extension 的错误类型、枚举或字段组合必须 fail closed。
+
+    :param provider_request: kind 已知但字段语义非法的冻结 payload。
+    :returns: ``None``。
+    :raises AssertionError: 非法 payload 未抛出 owner 异常时抛出。
+    """
+
+    with pytest.raises((HostDurableError, ValueError)):
+        provider_request_from_json(provider_request)
 
 
 @pytest.mark.asyncio

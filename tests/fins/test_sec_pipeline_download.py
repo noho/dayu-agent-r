@@ -39,6 +39,7 @@ from dayu.fins.ingestion_runtime import FinsSourceDownloadAdapterRequest
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.pipelines import sec_download_filing_workflow as _sec_download_filing_workflow
 from dayu.fins.pipelines import sec_download_state as _sec_download_state
+from dayu.fins.pipelines import sec_6k_rules as _sec_6k_rules
 from dayu.fins.pipelines import sec_6k_primary_document_repair as _sec_6k_primary_repair
 from dayu.fins.pipelines import sec_fiscal_fields as _sec_fiscal_fields
 from dayu.fins.pipelines import sec_pipeline
@@ -250,6 +251,180 @@ def test_sec_6k_preview_rejects_invalid_utf8() -> None:
 
     assert "\\xff" not in str(error_info.value)
     assert isinstance(error_info.value.__cause__, UnicodeDecodeError)
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("", "NO_MATCH"),
+        ("   \n\t", "NO_MATCH"),
+        ("Company will announce second quarter results next week.", "EXCLUDE_NON_QUARTERLY"),
+        (
+            "Notice of board meeting to consider and approve unaudited financial results for the quarter.",
+            "EXCLUDE_NON_QUARTERLY",
+        ),
+        (
+            "Results for announcement to the market. Earnings release and Appendix 4E.",
+            "EXCLUDE_NON_QUARTERLY",
+        ),
+        ("Response to ASX aware letter from ASX compliance.", "EXCLUDE_NON_QUARTERLY"),
+        ("Operating results for June 2025. Contents: monthly sales.", "EXCLUDE_NON_QUARTERLY"),
+        (
+            "Preliminary expected financial results are subject to revision.",
+            "EXCLUDE_NON_QUARTERLY",
+        ),
+        (
+            "Management will present at the investor conference; presentation slides are attached.",
+            "EXCLUDE_NON_QUARTERLY",
+        ),
+        ("Annual general meeting voting results.", "EXCLUDE_NON_QUARTERLY"),
+        (
+            "Consolidated financial statements for the years ended December 31. "
+            "Report of independent registered public accounting firm.",
+            "EXCLUDE_NON_QUARTERLY",
+        ),
+        (
+            "Group reporting changes and segmental reporting data pack in advance of the publication "
+            "of the earnings release.",
+            "EXCLUDE_NON_QUARTERLY",
+        ),
+        ("Transcript of the earnings call.", "EXCLUDE_NON_QUARTERLY"),
+        ("Appendix 3A.1 - Notification of dividend / distribution.", "EXCLUDE_NON_QUARTERLY"),
+        ("Transaction in own shares.", "EXCLUDE_NON_QUARTERLY"),
+        (
+            "Minutes of the Board of Directors Meeting to approve the financial statements.",
+            "EXCLUDE_NON_QUARTERLY",
+        ),
+        ("Update Note scheduled to be published on 1 August.", "EXCLUDE_NON_QUARTERLY"),
+        (
+            "In response to the official letter, Dear Sirs, regarding the news article.",
+            "EXCLUDE_NON_QUARTERLY",
+        ),
+        ("Operating statistics: production ounces and reporting method.", "EXCLUDE_NON_QUARTERLY"),
+        (
+            "Investor day provided an update on the company's business and reaffirmed guidance.",
+            "EXCLUDE_NON_QUARTERLY",
+        ),
+        ("Presentation for the Mining Forum with forward-looking statements.", "EXCLUDE_NON_QUARTERLY"),
+        (
+            "Adjustment to exercise price of convertible senior notes.",
+            "EXCLUDE_NON_QUARTERLY",
+        ),
+        ("Our strategy agenda, Q & A and summary and conclusions.", "EXCLUDE_NON_QUARTERLY"),
+        ("Trading statement: will publish financial results.", "EXCLUDE_NON_QUARTERLY"),
+        ("Operating update: production per metal and guidance.", "EXCLUDE_NON_QUARTERLY"),
+        (
+            "TCOM Announces Second Quarter 2025 Unaudited Financial Results.",
+            "RESULTS_RELEASE",
+        ),
+        (
+            "RECONCILIATION BETWEEN U.S. GAAP AND IFRS.",
+            "IFRS_RECON",
+        ),
+        (
+            "xbrli: iso4217: ifrs-full: 2025Q1true 2025-01-012025-03-31",
+            "RESULTS_RELEASE",
+        ),
+        ("Investor presentation for an investor meeting.", "NO_MATCH"),
+    ],
+)
+def test_sec_6k_classification_owner_covers_business_signal_matrix(
+    content: str,
+    expected: str,
+) -> None:
+    """6-K 分类真源应区分结果正文、治理材料、运营更新与中性材料。
+
+    Args:
+        content: 待分类的最小业务文本。
+        expected: 预期稳定分类。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 分类真源与业务信号不一致时抛出。
+    """
+
+    assert _sec_6k_rules._classify_6k_text(content) == expected
+
+
+def test_sec_6k_candidate_owner_uses_type_filename_and_positive_classification() -> None:
+    """6-K 候选 owner 应统一使用类型、文件名优先级和正向分类选择正文。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 候选收集、排序或正向选择漂移时抛出。
+    """
+
+    entries: list[dict[str, JsonValue]] = [
+        {"uri": "https://example.com/cover.htm", "type": "6-K"},
+        {"name": "release.htm", "sec_document_type": "EX-99.1"},
+        {"name": "release.htm", "sec_document_type": ""},
+        {"name": "ignored.pdf", "sec_document_type": "EX-99.2"},
+    ]
+
+    assert _sec_6k_rules._infer_filename_from_uri("") == ""
+    assert _sec_6k_rules._infer_filename_from_uri("https://example.com/path/cover.htm") == "cover.htm"
+    assert _sec_6k_rules._collect_6k_candidate_entries(entries, "cover.htm") == [
+        ("cover.htm", "6-K"),
+        ("release.htm", "EX-99.1"),
+    ]
+    assert _sec_6k_rules._select_6k_target_name(entries, "cover.htm") == "release.htm"
+    with pytest.raises(ValueError, match="文件列表为空"):
+        _sec_6k_rules._select_6k_target_name([], "")
+
+    diagnoses = [
+        _sec_6k_rules._SixKCandidateDiagnosis(
+            filename="cover.htm",
+            filename_priority=3,
+            classification="EXCLUDE_NON_QUARTERLY",
+            is_primary_document=True,
+        ),
+        _sec_6k_rules._SixKCandidateDiagnosis(
+            filename="release-b.htm",
+            filename_priority=1,
+            classification="RESULTS_RELEASE",
+            is_primary_document=False,
+        ),
+        _sec_6k_rules._SixKCandidateDiagnosis(
+            filename="release-a.htm",
+            filename_priority=1,
+            classification="IFRS_RECON",
+            is_primary_document=False,
+        ),
+    ]
+    selected = _sec_6k_rules._select_best_positive_6k_candidate(diagnoses)
+    assert selected is not None
+    assert selected.filename == "release-a.htm"
+    assert _sec_6k_rules._select_best_positive_6k_candidate(diagnoses[:1]) is None
+
+    remote_files = [
+        RemoteFileDescriptor(
+            name="release.htm",
+            source_url="https://example.com/release.htm",
+            http_etag=None,
+            http_last_modified=None,
+            remote_size=1,
+            http_status=200,
+            sec_document_type="EX-99.1",
+        ),
+        RemoteFileDescriptor(
+            name="issuer-2025_htm.xml",
+            source_url="https://example.com/issuer-2025_htm.xml",
+            http_etag=None,
+            http_last_modified=None,
+            remote_size=1,
+            http_status=200,
+        ),
+    ]
+    assert _sec_6k_rules._has_6k_exhibit_candidate(remote_files) is True
+    assert _sec_6k_rules._has_6k_xbrl_instance(remote_files) is True
+    assert _sec_6k_rules._remote_files_have_xbrl_instance(remote_files) is True
 
 
 class _RecordingSecPipelineForAdapter:

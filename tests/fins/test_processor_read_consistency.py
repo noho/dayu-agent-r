@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
 from io import BytesIO
@@ -13,6 +14,7 @@ from threading import Barrier, Event, Lock
 from typing import Final
 
 import pytest
+import pandas as pd
 
 import dayu.fins.storage._fs_source_snapshot as source_snapshot_module
 from dayu.contracts.cancellation import CancellationToken
@@ -40,10 +42,23 @@ from dayu.fins.processors.bs_ten_q_processor import BsTenQFormProcessor
 from dayu.fins.processors.bs_ten_k_processor import BsTenKFormProcessor
 from dayu.fins.processors.sec_form_section_common import (
     _VirtualSection,
+    _VirtualSectionPublicationMode,
     _VirtualSectionProcessorMixin,
 )
-from dayu.fins.processors.sec_processor import _load_text
-from dayu.fins.processors.sec_report_form_common import _extract_source_text_preserving_lines
+from dayu.fins.processors.sec_processor import SecProcessor, _load_text
+from dayu.fins.processors.sec_report_form_common import (
+    _EdgarSectionLike,
+    _extract_source_text_preserving_lines,
+    _find_table_of_contents_cutoff,
+    _looks_like_inline_toc_snippet,
+    _rebuild_virtual_sections_from_edgartools,
+)
+from dayu.fins.processors.sec_section_build import _build_sections
+from dayu.fins.processors.sec_table_extraction import (
+    _render_records_from_markdown_table,
+    _render_records_table,
+    _replace_table_with_placeholder,
+)
 from dayu.fins.processors.source_text import (
     FinsSourceDecodeError,
     decode_source_bytes,
@@ -191,6 +206,89 @@ class _MemorySource:
 
         del suffix
         raise OSError("materialize sentinel path")
+
+
+@dataclass(slots=True)
+class _DataFrameTableFixture:
+    """提供稳定 DataFrame 的 SEC 表格 owner fixture。"""
+
+    dataframe: pd.DataFrame
+    col_count: int
+
+    def to_dataframe(self) -> pd.DataFrame:
+        """返回独立 DataFrame；参数：无；返回：表格副本；异常：无。"""
+
+        return self.dataframe.copy()
+
+    def to_dict(self) -> dict[str, str]:
+        """返回最小字典表示；参数：无；返回：fixture 标识；异常：无。"""
+
+        return {"fixture": "dataframe"}
+
+
+@dataclass(frozen=True, slots=True)
+class _HtmlTableFixture:
+    """只提供 HTML 结构的 SEC 表格 owner fixture。"""
+
+    html: str
+    col_count: int
+
+    def to_dict(self) -> dict[str, str]:
+        """返回最小字典表示；参数：无；返回：fixture 标识；异常：无。"""
+
+        return {"fixture": "html"}
+
+
+@dataclass(frozen=True, slots=True)
+class _MarkdownTableFixture:
+    """只允许 fallback Markdown 的 SEC 表格 owner fixture。"""
+
+    col_count: int
+
+    def to_dict(self) -> dict[str, str]:
+        """返回最小字典表示；参数：无；返回：fixture 标识；异常：无。"""
+
+        return {"fixture": "markdown"}
+
+
+@dataclass(frozen=True, slots=True)
+class _EdgarSectionFixture:
+    """提供文本、标题与空表集合的 edgartools section fixture。"""
+
+    content: str
+    title: str | None
+    name: str | None = None
+    part: str | None = None
+    item: str | None = None
+
+    def text(self) -> str:
+        """返回章节文本；参数：无；返回：固定内容；异常：无。"""
+
+        return self.content
+
+    def tables(self) -> tuple[_DataFrameTableFixture, ...]:
+        """返回空表集合；参数：无；返回：空 tuple；异常：无。"""
+
+        return ()
+
+
+@dataclass(slots=True)
+class _EdgarDocumentFixture:
+    """提供 sections、全文和稳定 anchor sequence 的 edgartools 文档 fixture。"""
+
+    sections: dict[str, _EdgarSectionLike]
+    full_text: str
+
+    def text(self) -> str:
+        """返回文档全文；参数：无；返回：固定全文；异常：无。"""
+
+        return self.full_text
+
+    def get_sec_section_info(self, section_key: str) -> dict[str, str]:
+        """返回章节 anchor；参数：章节键；返回：稳定 anchor id；异常：无。"""
+
+        sequence = "2" if section_key == "first" else "1"
+        return {"anchor_id": f"section_{sequence}"}
 
 
 class _ReadProcessor:
@@ -688,6 +786,9 @@ class _VirtualBaseProcessor:
     """虚拟章节 mixin 的测试下一跳。"""
 
     _base_tables: list[TableSummary]
+    _base_sections: list[SectionSummary]
+    _base_section_contents: dict[str, SectionContent]
+    base_list_tables_call_count: int
 
     def list_sections(self) -> list[SectionSummary]:
         """返回空底层章节。
@@ -702,7 +803,7 @@ class _VirtualBaseProcessor:
             无。
         """
 
-        return []
+        return [section.copy() for section in self._base_sections]
 
     def read_section(self, ref: str) -> SectionContent:
         """拒绝底层章节读取。
@@ -717,7 +818,10 @@ class _VirtualBaseProcessor:
             KeyError: 始终抛出。
         """
 
-        raise KeyError(ref)
+        payload = self._base_section_contents.get(ref)
+        if payload is None:
+            raise KeyError(ref)
+        return payload.copy()
 
     def list_tables(self) -> list[TableSummary]:
         """返回 harness 配置的底层表格。
@@ -732,7 +836,8 @@ class _VirtualBaseProcessor:
             无。
         """
 
-        return list(self._base_tables)
+        self.base_list_tables_call_count += 1
+        return [table.copy() for table in self._base_tables]
 
     def get_section_title(self, ref: str) -> str | None:
         """返回空标题。
@@ -747,7 +852,9 @@ class _VirtualBaseProcessor:
             无。
         """
 
-        del ref
+        for section in self._base_sections:
+            if section["ref"] == ref:
+                return section["title"]
         return None
 
     def search(self, query: str, within_ref: str | None = None) -> list[SearchHit]:
@@ -764,18 +871,46 @@ class _VirtualBaseProcessor:
             无。
         """
 
-        del query, within_ref
-        return []
+        normalized_query = query.casefold()
+        hits: list[SearchHit] = []
+        for section in self._base_sections:
+            section_ref = section["ref"]
+            if within_ref is not None and section_ref != within_ref:
+                continue
+            payload = self._base_section_contents[section_ref]
+            content = str(payload["content"])
+            if normalized_query not in content.casefold():
+                continue
+            hits.append(
+                {
+                    "section_ref": section_ref,
+                    "section_title": section["title"],
+                    "snippet": content,
+                }
+            )
+        return hits
 
 
 class _VirtualHarness(_VirtualSectionProcessorMixin, _VirtualBaseProcessor):
     """直接测试 virtual section refresh owner 的 harness。"""
 
-    def __init__(self, *, include_table_marker: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        include_table_marker: bool = True,
+        base_table_refs: tuple[str, ...] = ("t_0001",),
+        marked_text: str | None = None,
+        marked_markers: list[tuple[int, str | None]] | None = None,
+        virtual_sections: list[_VirtualSection] | None = None,
+    ) -> None:
         """初始化两章节 harness。
 
         Args:
-            include_table_marker: marked text 是否包含底层 table ref。
+            include_table_marker: 默认 marked text 是否包含首张底层 table ref。
+            base_table_refs: 底层公开 table refs，按公开顺序提供。
+            marked_text: 可选的精确 marker material。
+            marked_markers: 可选的精确章节 marker ranges 输入。
+            virtual_sections: 可选的候选虚拟章节。
 
         Returns:
             无。
@@ -784,26 +919,65 @@ class _VirtualHarness(_VirtualSectionProcessorMixin, _VirtualBaseProcessor):
             无。
         """
 
-        self._virtual_sections = [
-            _VirtualSection("s_alpha", "Alpha", "alpha", "alpha", [], start=0, end=20),
-            _VirtualSection("s_beta", "Beta", "beta", "beta", [], start=20, end=40),
+        self._virtual_section_publication_mode = _VirtualSectionPublicationMode.BUILDING
+        self._virtual_sections = virtual_sections or [
+            _VirtualSection("s_alpha", "Alpha", "alpha body", "alpha", [], start=0, end=20),
+            _VirtualSection("s_beta", "Beta", "beta body", "beta", [], start=20, end=40),
         ]
         self._virtual_section_by_ref = {}
         self._table_ref_to_virtual_ref = {}
-        marker = "[[t_0001]]\n" if include_table_marker else ""
-        self._marked_text = f"Alpha\n{marker}Beta\n"
-        self._base_tables: list[TableSummary] = [
+        default_marker = f"[[{base_table_refs[0]}]]\n" if include_table_marker and base_table_refs else ""
+        self._marked_text = marked_text if marked_text is not None else f"Alpha\n{default_marker}Beta\n"
+        self._marked_markers = marked_markers
+        self.marker_call_count = 0
+        self.base_list_tables_call_count = 0
+        self._base_sections = [
             {
-                "table_ref": "t_0001",
+                "ref": "base_alpha",
+                "title": "Base Alpha",
+                "level": 1,
+                "parent_ref": None,
+                "preview": "base alpha",
+            },
+            {
+                "ref": "base_beta",
+                "title": "Base Beta",
+                "level": 1,
+                "parent_ref": None,
+                "preview": "base beta",
+            },
+        ]
+        self._base_tables = [
+            {
+                "table_ref": table_ref,
                 "caption": None,
                 "context_before": "",
                 "row_count": 1,
                 "col_count": 1,
                 "table_type": "data",
                 "headers": None,
-                "section_ref": None,
+                "section_ref": "base_alpha" if index == 0 else "base_beta",
             }
+            for index, table_ref in enumerate(base_table_refs)
         ]
+        self._base_section_contents = {
+            "base_alpha": {
+                "ref": "base_alpha",
+                "title": "Base Alpha",
+                "content": "base alpha content",
+                "tables": [base_table_refs[0]] if base_table_refs else [],
+                "word_count": 3,
+                "contains_full_text": False,
+            },
+            "base_beta": {
+                "ref": "base_beta",
+                "title": "Base Beta",
+                "content": "base beta content",
+                "tables": list(base_table_refs[1:]),
+                "word_count": 3,
+                "contains_full_text": False,
+            },
+        }
 
     def _build_markers(self, full_text: str) -> list[tuple[int, str | None]]:
         """按 Alpha/Beta 标题返回测试 marker。
@@ -818,6 +992,8 @@ class _VirtualHarness(_VirtualSectionProcessorMixin, _VirtualBaseProcessor):
             ValueError: 测试全文缺少 Beta 时抛出。
         """
 
+        if self._marked_markers is not None:
+            return list(self._marked_markers)
         return [(0, "Alpha"), (full_text.index("Beta"), "Beta")]
 
     def get_full_text(self) -> str:
@@ -848,7 +1024,39 @@ class _VirtualHarness(_VirtualSectionProcessorMixin, _VirtualBaseProcessor):
             无。
         """
 
+        self.marker_call_count += 1
         return self._marked_text
+
+
+def _assert_virtual_harness_matches_base_contract(harness: _VirtualHarness) -> None:
+    """逐值验证 harness 的五个 public consumers 委托同一 base contract。
+
+    Args:
+        harness: 已发布 whole-base fallback 的 owner harness。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任一 public consumer 未完整委托底层真源时抛出。
+    """
+
+    base_sections = _VirtualBaseProcessor.list_sections(harness)
+    base_tables = _VirtualBaseProcessor.list_tables(harness)
+    assert harness.list_sections() == base_sections
+    assert harness.list_tables() == base_tables
+    for section in base_sections:
+        section_ref = section["ref"]
+        assert harness.get_section_title(section_ref) == _VirtualBaseProcessor.get_section_title(
+            harness,
+            section_ref,
+        )
+        assert harness.read_section(section_ref) == _VirtualBaseProcessor.read_section(harness, section_ref)
+        assert harness.search("alpha", within_ref=section_ref) == _VirtualBaseProcessor.search(
+            harness,
+            "alpha",
+            within_ref=section_ref,
+        )
 
 
 def _build_runtime(
@@ -1143,9 +1351,12 @@ def _build_virtual_postprocess_probe(
         processor = BsTenKFormProcessor.__new__(BsTenKFormProcessor)
     else:
         raise ValueError("未知 report-form processor 类型")
+    if harness._virtual_section_publication_mode is _VirtualSectionPublicationMode.BUILDING:
+        harness._refresh_virtual_section_state()
     processor._virtual_sections = harness._virtual_sections
-    processor._virtual_section_by_ref = {}
-    processor._table_ref_to_virtual_ref = {}
+    processor._virtual_section_by_ref = dict(harness._virtual_section_by_ref)
+    processor._table_ref_to_virtual_ref = dict(harness._table_ref_to_virtual_ref)
+    processor._virtual_section_publication_mode = harness._virtual_section_publication_mode
     monkeypatch.setattr(processor, "_get_base_processor", harness._get_base_processor)
     monkeypatch.setattr(processor, "_collect_marked_text", harness._collect_marked_text)
     monkeypatch.setattr(processor, "_build_markers", harness._build_markers)
@@ -1354,6 +1565,394 @@ def test_report_fallback_and_source_validation_share_strict_decoder(tmp_path: Pa
     validate_source_utf8_text(binary_source)
 
 
+def test_report_form_line_preserving_text_and_lazy_section_rebuild_share_owner(
+    tmp_path: Path,
+) -> None:
+    """报告表单 fallback 应保留业务换行并从同源 edgartools sections 惰性重建。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: HTML 文本或惰性章节 owner 契约漂移时抛出。
+    """
+
+    html_path = tmp_path / "line-preserving.html"
+    html_path.write_text(
+        """<html><head><style>hidden style</style><script>hidden script</script></head>
+<body><h1>Item 1. Business</h1><p>Revenue&nbsp;grew.</p>
+<table><tr><th>Metric</th><th>2025</th></tr><tr><td>Revenue</td><td>100</td></tr></table>
+<noscript>hidden fallback</noscript><h2>Item 1A. Risk Factors</h2><p>Market risk.</p></body></html>""",
+        encoding="utf-8",
+    )
+    source = LocalFileSource(
+        path=html_path,
+        uri="local://line-preserving.html",
+        media_type="text/html",
+    )
+
+    extracted = _extract_source_text_preserving_lines(source)
+
+    assert extracted.splitlines() == [
+        "Item 1. Business",
+        "Revenue grew.",
+        "Metric",
+        "2025",
+        "Revenue",
+        "100",
+        "Item 1A. Risk Factors",
+        "Market risk.",
+    ]
+    assert "hidden" not in extracted
+
+    document = _EdgarDocumentFixture(
+        sections={
+            "first": _EdgarSectionFixture(
+                content="First section body with operating details. PART II",
+                title="First Section",
+            ),
+            "empty": _EdgarSectionFixture(content="", title="Empty"),
+            "second": _EdgarSectionFixture(
+                content="Second section body with financial details.",
+                title=None,
+                part="I",
+                item="2",
+            ),
+        },
+        full_text="First section body. Second section body.",
+    )
+
+    rebuilt = _rebuild_virtual_sections_from_edgartools(document)
+    assert [section.ref for section in rebuilt] == ["s_0001", "s_0003"]
+    assert rebuilt[0].title == "First Section"
+    assert rebuilt[0].content == "First section body with operating details."
+    assert rebuilt[1].title == "Part I Item 2"
+
+    fast_sections = _build_sections(document, fast_mode=True)
+    assert [section.title for section in fast_sections] == ["Empty", "Part I Item 2", "First Section"]
+    assert fast_sections[0].contains_full_text is False
+
+
+def test_report_form_toc_detection_distinguishes_front_matter_and_late_notes() -> None:
+    """报告表单 TOC owner 应跳过前置目录，但不误伤 notes 中的目录短语。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: TOC 截断或单行目录判断漂移时抛出。
+    """
+
+    front_matter = "Cover\nTable of Contents\n" + ("x" * 2000) + "\nItem 1. Business"
+    late_notes = "Notes to the consolidated financial statements " + ("x" * 40) + " table of contents"
+
+    assert _find_table_of_contents_cutoff("No directory marker") == 0
+    assert _find_table_of_contents_cutoff(front_matter) > front_matter.index("Table of Contents")
+    assert _find_table_of_contents_cutoff(late_notes) == 0
+    assert _looks_like_inline_toc_snippet("Management Discussion 7 Item 7A Risk Factors", 0) is True
+    assert _looks_like_inline_toc_snippet("Narrative without a page locator", 0) is False
+    assert _looks_like_inline_toc_snippet("", 0) is False
+
+
+def test_sec_table_records_owner_recovers_dataframe_index_multiheaders_and_ghost_columns() -> None:
+    """SEC records owner 应恢复行标签、展平多级表头并合并 colspan 幽灵列。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: DataFrame 到 records 的业务投影丢失时抛出。
+    """
+
+    dataframe = pd.DataFrame(
+        [
+            ["Revenue", "$", "1,200[1]"],
+            ["Costs", None, "(300)"],
+        ],
+        index=pd.Index(["North", "South"], name="Region"),
+        columns=pd.MultiIndex.from_tuples(
+            [
+                ("Metric", ""),
+                ("2025", "USD"),
+                ("2025", "USD"),
+            ]
+        ),
+    )
+    fixture = _DataFrameTableFixture(dataframe=dataframe, col_count=4)
+
+    payload = _render_records_table(
+        fixture,
+        allow_generated_columns=False,
+        aggressive_fallback=False,
+    )
+
+    assert payload is not None
+    assert payload["columns"] == ["Region", "Metric", "2025 | USD"]
+    assert payload["data"] == [
+        {"Region": "North", "Metric": "Revenue", "2025 | USD": "1200"},
+        {"Region": "South", "Metric": "Costs", "2025 | USD": "-300"},
+    ]
+
+
+def test_sec_table_records_owner_uses_structured_html_and_markdown_fallbacks() -> None:
+    """SEC records owner 应在 DataFrame 不可用时保留 HTML/Markdown 结构和数值语义。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 结构化 fallback 的列或记录漂移时抛出。
+    """
+
+    html_fixture = _HtmlTableFixture(
+        html=(
+            "<table><tr><th>Metric</th><th>Current Year</th></tr>"
+            "<tr><td>Revenue</td><td>$1,200[1]</td></tr>"
+            "<tr><td>Margin</td><td>12%</td></tr></table>"
+        ),
+        col_count=2,
+    )
+    html_payload = _render_records_table(
+        html_fixture,
+        allow_generated_columns=False,
+        aggressive_fallback=True,
+    )
+    assert html_payload == {
+        "columns": ["Metric", "Current Year"],
+        "data": [
+            {"Metric": "Revenue", "Current Year": "1200"},
+            {"Metric": "Margin", "Current Year": "12%"},
+        ],
+    }
+
+    markdown_payload = _render_records_table(
+        _MarkdownTableFixture(col_count=2),
+        fallback_text="| Metric | Prior Year |\n| --- | ---: |\n| Costs | (300) |",
+        allow_generated_columns=False,
+        aggressive_fallback=False,
+    )
+    assert markdown_payload == {
+        "columns": ["Metric", "Prior Year"],
+        "data": [{"Metric": "Costs", "Prior Year": "-300"}],
+    }
+
+
+def test_sec_table_fallback_owner_rejects_unstructured_markdown_and_short_placeholders() -> None:
+    """SEC table fallback 不得把短文本或无结构 Markdown 伪造成可用表格。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非结构化输入被误发布为表格时抛出。
+    """
+
+    content = "Narrative before a sufficiently long financial table payload and narrative after."
+    table_text = "Revenue Current Year Prior Year 1200 1000"
+
+    assert _replace_table_with_placeholder(content, "short table", "t_0001") == {
+        "content": content,
+        "replaced": False,
+    }
+    assert _replace_table_with_placeholder(content, table_text, "t_0001")["replaced"] is False
+    embedded_content = f"Narrative {table_text} narrative"
+    replaced = _replace_table_with_placeholder(embedded_content, table_text, "t_0001")
+    assert replaced == {"content": "Narrative [[t_0001]] narrative", "replaced": True}
+
+    assert _render_records_from_markdown_table(markdown_text="", allow_generated_columns=False) is None
+    assert _render_records_from_markdown_table(markdown_text="plain text", allow_generated_columns=False) is None
+    assert (
+        _render_records_from_markdown_table(
+            markdown_text="Metric | Value\nnot a separator | row\nRevenue | 100",
+            allow_generated_columns=False,
+        )
+        is None
+    )
+    assert (
+        _render_records_from_markdown_table(
+            markdown_text="| Metric | Value |\n| --- | ---: |",
+            allow_generated_columns=False,
+        )
+        is None
+    )
+    incomplete_header = "| | Value |\n| --- | ---: |\n| Revenue | 100 |"
+    assert (
+        _render_records_from_markdown_table(
+            markdown_text=incomplete_header,
+            allow_generated_columns=False,
+        )
+        is None
+    )
+    assert _render_records_from_markdown_table(
+        markdown_text=incomplete_header,
+        allow_generated_columns=True,
+    ) == {
+        "columns": ["col_1", "Value"],
+        "data": [{"col_1": "Revenue", "Value": "100"}],
+    }
+
+
+def _assert_processor_matches_base_public_contract(
+    processor: SecProcessor,
+) -> None:
+    """逐值验证 form processor 完整消费同源 base public contract。
+
+    Args:
+        processor: 已发布 base fallback 的 SEC form processor。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任一 section/table/title/read/search 事实不一致时抛出。
+    """
+
+    base_sections = SecProcessor.list_sections(processor)
+    base_tables = SecProcessor.list_tables(processor)
+    assert processor.list_sections() == base_sections
+    assert processor.list_tables() == base_tables
+    assert [table["table_ref"] for table in processor.list_tables()] == [
+        table["table_ref"] for table in base_tables
+    ]
+    assert [table["section_ref"] for table in processor.list_tables()] == [
+        table["section_ref"] for table in base_tables
+    ]
+    for section in base_sections:
+        section_ref = section["ref"]
+        assert processor.get_section_title(section_ref) == SecProcessor.get_section_title(processor, section_ref)
+        assert processor.read_section(section_ref) == SecProcessor.read_section(processor, section_ref)
+        assert processor.search("Business", within_ref=section_ref) == SecProcessor.search(
+            processor,
+            "Business",
+            section_ref,
+        )
+
+
+def test_ten_k_public_processor_assigns_tables_without_marker_capability(
+    tmp_path: Path,
+) -> None:
+    """公开 10-K fallback 处理器必须为合法表格建立章节 ownership。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 合法 10-K 的公开 section/table 关系不完整时抛出。
+    """
+
+    filing_path = tmp_path / "minimal-10k.htm"
+    filing_path.write_text(
+        """<html><body>
+<h1>UNITED STATES SECURITIES AND EXCHANGE COMMISSION</h1>
+<h2>PART I</h2>
+<h2>ITEM 1. BUSINESS</h2><p>Business operations and customers.</p>
+<table><tr><th>Segment</th><th>Revenue</th></tr><tr><td>Cloud</td><td>100</td></tr></table>
+<h2>ITEM 1A. RISK FACTORS</h2><p>Competition and market risk.</p>
+<h2>ITEM 1B. UNRESOLVED STAFF COMMENTS</h2><p>None.</p>
+<h2>ITEM 2. PROPERTIES</h2><p>Principal offices.</p>
+<h2>PART II</h2>
+<h2>ITEM 5. MARKET FOR REGISTRANT COMMON EQUITY</h2><p>Market information.</p>
+<h2>ITEM 6. RESERVED</h2><p>Reserved.</p>
+<h2>ITEM 7. MANAGEMENT'S DISCUSSION AND ANALYSIS</h2><p>Operating results.</p>
+<h2>ITEM 8. FINANCIAL STATEMENTS AND SUPPLEMENTARY DATA</h2><p>Financial statements.</p>
+<h2>SIGNATURES</h2><p>Signed.</p>
+</body></html>""",
+        encoding="utf-8",
+    )
+    source = LocalFileSource(
+        path=filing_path,
+        uri="local://minimal-10k.htm",
+        media_type="text/html",
+    )
+    assert TenKFormProcessor.supports(
+        source,
+        form_type="10-K",
+        media_type="text/html",
+    )
+
+    processor = TenKFormProcessor(
+        source,
+        form_type="10-K",
+        media_type="text/html",
+    )
+    sections = processor.list_sections()
+    tables = processor.list_tables()
+
+    assert sections
+    assert len(tables) == 1
+    assert tables[0]["section_ref"] in {section["ref"] for section in sections}
+    assert tables[0]["table_ref"] in {
+        table_ref
+        for section in sections
+        for table_ref in processor.read_section(section["ref"])["tables"]
+    }
+    _assert_processor_matches_base_public_contract(processor)
+
+
+def test_ten_q_public_processor_keeps_base_fallback_through_second_postprocess(
+    tmp_path: Path,
+) -> None:
+    """公开 10-Q 二次 postprocess 必须保持首次 whole-base fallback。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 10-Q 二次 postprocess 重生 partial virtual state 时抛出。
+    """
+
+    filing_path = tmp_path / "minimal-10q.htm"
+    filing_path.write_text(
+        """<html><body>
+<h1>UNITED STATES SECURITIES AND EXCHANGE COMMISSION</h1>
+<h2>PART I</h2>
+<h2>ITEM 1. FINANCIAL STATEMENTS</h2><p>Quarterly statements.</p>
+<table><tr><th>Metric</th><th>Value</th></tr><tr><td>Revenue</td><td>25</td></tr></table>
+<h2>ITEM 2. MANAGEMENT'S DISCUSSION AND ANALYSIS</h2><p>Business performance.</p>
+<h2>ITEM 3. QUANTITATIVE AND QUALITATIVE DISCLOSURES</h2><p>Market risk.</p>
+<h2>ITEM 4. CONTROLS AND PROCEDURES</h2><p>Controls.</p>
+<h2>PART II</h2>
+<h2>ITEM 1. LEGAL PROCEEDINGS</h2><p>None.</p>
+<h2>ITEM 1A. RISK FACTORS</h2><p>Business risk.</p>
+<h2>ITEM 2. UNREGISTERED SALES OF EQUITY SECURITIES</h2><p>None.</p>
+<h2>ITEM 6. EXHIBITS</h2><p>Exhibits.</p>
+<h2>SIGNATURES</h2><p>Signed.</p>
+</body></html>""",
+        encoding="utf-8",
+    )
+    source = LocalFileSource(
+        path=filing_path,
+        uri="local://minimal-10q.htm",
+        media_type="text/html",
+    )
+    assert TenQFormProcessor.supports(source, form_type="10-Q", media_type="text/html")
+
+    processor = TenQFormProcessor(source, form_type="10-Q", media_type="text/html")
+    assert len(processor.list_tables()) == 1
+    _assert_processor_matches_base_public_contract(processor)
+
+
 def test_virtual_section_refresh_rebuilds_final_indexes_and_bidirectional_tables() -> None:
     """refresh 应让 section object/index/table 双向状态同源。
 
@@ -1378,6 +1977,166 @@ def test_virtual_section_refresh_rebuilds_final_indexes_and_bidirectional_tables
     assert harness._table_ref_to_virtual_ref == {"t_0001": "s_alpha"}
 
 
+def test_virtual_section_complete_mapping_publishes_deepest_bidirectional_candidate() -> None:
+    """完整 marker proof 应从同一 candidate 下钻并原子发布双向映射。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 最深章节 remap 与最终双向发布不一致时抛出。
+    """
+
+    sections = [
+        _VirtualSection(
+            "s_alpha",
+            "Alpha",
+            "alpha child body",
+            "alpha",
+            [],
+            child_refs=["s_alpha_child"],
+        ),
+        _VirtualSection(
+            "s_alpha_child",
+            "Child",
+            "child body",
+            "child",
+            [],
+            level=2,
+            parent_ref="s_alpha",
+        ),
+        _VirtualSection("s_beta", "Beta", "beta body", "beta", []),
+    ]
+    harness = _VirtualHarness(
+        base_table_refs=("t_0001", "t_0002"),
+        marked_text="Alpha\nChild\n[[t_0001]]\nBeta\n[[t_0002]]\n",
+        virtual_sections=sections,
+    )
+
+    harness._refresh_virtual_section_state()
+
+    assert [section["ref"] for section in harness.list_sections()] == [
+        "s_alpha",
+        "s_alpha_child",
+        "s_beta",
+    ]
+    assert [table["section_ref"] for table in harness.list_tables()] == ["s_alpha_child", "s_beta"]
+    assert harness.read_section("s_alpha")["tables"] == []
+    assert harness.read_section("s_alpha_child")["tables"] == ["t_0001"]
+    assert harness.read_section("s_beta")["tables"] == ["t_0002"]
+    first_result = (harness.list_sections(), harness.list_tables())
+    harness._refresh_virtual_section_state()
+    assert (harness.list_sections(), harness.list_tables()) == first_result
+
+
+def test_virtual_section_incomplete_proof_publishes_whole_base_fallback() -> None:
+    """无矛盾但缺失或标题范围不唯一的 proof 应整体回退 base contract。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: incomplete proof 发布 partial virtual state 时抛出。
+    """
+
+    partial = _VirtualHarness(
+        base_table_refs=("t_0001", "t_0002"),
+        marked_text="Alpha\n[[t_0001]]\nBeta\n",
+    )
+    partial._refresh_virtual_section_state()
+    _assert_virtual_harness_matches_base_contract(partial)
+
+    ambiguous = _VirtualHarness(
+        base_table_refs=("t_0001",),
+        marked_text="Gamma\n[[t_0001]]\n",
+        marked_markers=[(0, "Gamma")],
+    )
+    ambiguous._refresh_virtual_section_state()
+    _assert_virtual_harness_matches_base_contract(ambiguous)
+
+
+def test_virtual_section_contradictions_fail_before_incomplete_fallback() -> None:
+    """base/marker/tree 矛盾应在 atomic commit 前 fail closed。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任一矛盾被 incomplete fallback 吞掉时抛出。
+    """
+
+    missing_base_ref = _VirtualHarness(base_table_refs=("",), include_table_marker=False)
+    with pytest.raises(ValueError, match="缺失或为空"):
+        missing_base_ref._refresh_virtual_section_state()
+
+    duplicate_base_ref = _VirtualHarness(base_table_refs=("t_0001", "t_0001"))
+    with pytest.raises(ValueError, match="底层 table_ref 重复"):
+        duplicate_base_ref._refresh_virtual_section_state()
+
+    incomplete_and_dangling = _VirtualHarness(
+        base_table_refs=("t_0001", "t_0002"),
+        marked_text="Alpha\n[[t_0001]]\n[[t_9999]]\nBeta\n",
+    )
+    with pytest.raises(ValueError, match="marker table_ref 悬挂"):
+        incomplete_and_dangling._refresh_virtual_section_state()
+
+    duplicate_marker = _VirtualHarness(
+        marked_text="Alpha\n[[t_0001]]\n[[t_0001]]\nBeta\n",
+    )
+    with pytest.raises(ValueError, match="marker table_ref 重复"):
+        duplicate_marker._refresh_virtual_section_state()
+
+    contradictory_tree_sections = [
+        _VirtualSection("s_alpha", "Alpha", "alpha", "alpha", [], child_refs=["s_child"]),
+        _VirtualSection("s_child", "Child", "child", "child", [], level=2, parent_ref="s_beta"),
+        _VirtualSection("s_beta", "Beta", "beta", "beta", []),
+    ]
+    contradictory_tree = _VirtualHarness(virtual_sections=contradictory_tree_sections)
+    with pytest.raises(ValueError, match="反向关系不一致"):
+        contradictory_tree._refresh_virtual_section_state()
+
+    for harness in (
+        missing_base_ref,
+        duplicate_base_ref,
+        incomplete_and_dangling,
+        duplicate_marker,
+        contradictory_tree,
+    ):
+        assert harness._virtual_section_publication_mode is _VirtualSectionPublicationMode.BUILDING
+        assert harness.list_sections() == _VirtualBaseProcessor.list_sections(harness)
+
+
+def test_virtual_section_zero_table_document_publishes_virtual_projection() -> None:
+    """零表格文档应把空 mapping 视为完整 proof 并发布虚拟章节。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 零表格文档被无意义回退时抛出。
+    """
+
+    harness = _VirtualHarness(base_table_refs=(), include_table_marker=False)
+    harness._refresh_virtual_section_state()
+
+    assert [section["ref"] for section in harness.list_sections()] == ["s_alpha", "s_beta"]
+    assert harness.list_tables() == []
+    assert harness.read_section("s_alpha")["tables"] == []
+    assert [hit.get("section_ref") for hit in harness.search("alpha")] == ["s_alpha"]
+
+
 def test_virtual_section_refresh_fails_closed_for_duplicate_or_dangling_refs() -> None:
     """duplicate section 与无法分配 table 都应 fail closed。
 
@@ -1396,8 +2155,11 @@ def test_virtual_section_refresh_fails_closed_for_duplicate_or_dangling_refs() -
     with pytest.raises(ValueError, match="ref 重复"):
         duplicate._refresh_virtual_section_state()
 
-    dangling = _VirtualHarness(include_table_marker=False)
-    with pytest.raises(ValueError, match="无法分配"):
+    dangling = _VirtualHarness(
+        base_table_refs=("t_0001", "t_0002"),
+        marked_text="Alpha\n[[t_0001]]\n[[t_9999]]\nBeta\n",
+    )
+    with pytest.raises(ValueError, match="marker table_ref 悬挂"):
         dangling._refresh_virtual_section_state()
 
 
@@ -1499,6 +2261,58 @@ def test_both_ten_k_paths_migrate_to_shared_refresh_without_behavior_drift(
 
     assert processor._virtual_section_identity_multiset() == before
     assert processor._table_ref_to_virtual_ref == {"t_0001": "s_alpha"}
+
+
+@pytest.mark.parametrize(
+    "processor_type",
+    [TenKFormProcessor, BsTenKFormProcessor, TenQFormProcessor, BsTenQFormProcessor],
+)
+def test_report_form_second_postprocess_keeps_base_fallback_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    processor_type: (
+        type[TenKFormProcessor]
+        | type[BsTenKFormProcessor]
+        | type[TenQFormProcessor]
+        | type[BsTenQFormProcessor]
+    ),
+) -> None:
+    """四条 report-form 路径二次 postprocess 都不得重入 fallback proof。
+
+    Args:
+        monkeypatch: pytest monkeypatch fixture。
+        processor_type: 待验证的 10-K/10-Q processor 类型。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 二次 postprocess 重读 marker 或重生 partial state 时抛出。
+    """
+
+    harness = _VirtualHarness(include_table_marker=False)
+    processor = _build_virtual_postprocess_probe(processor_type, harness, monkeypatch)
+    marker_calls_after_first_publication = harness.marker_call_count
+    base_table_calls_after_first_publication = harness.base_list_tables_call_count
+
+    processor._postprocess_virtual_sections(harness.get_full_text())
+    processor._refresh_virtual_section_state()
+
+    assert harness.marker_call_count == marker_calls_after_first_publication
+    assert harness.base_list_tables_call_count == base_table_calls_after_first_publication
+    assert processor.list_sections() == _VirtualBaseProcessor.list_sections(harness)
+    assert processor.list_tables() == _VirtualBaseProcessor.list_tables(harness)
+    for section in _VirtualBaseProcessor.list_sections(harness):
+        section_ref = section["ref"]
+        assert processor.get_section_title(section_ref) == _VirtualBaseProcessor.get_section_title(
+            harness,
+            section_ref,
+        )
+        assert processor.read_section(section_ref) == _VirtualBaseProcessor.read_section(harness, section_ref)
+        assert processor.search("alpha", within_ref=section_ref) == _VirtualBaseProcessor.search(
+            harness,
+            "alpha",
+            within_ref=section_ref,
+        )
 
 
 def test_processor_cache_reuses_equal_revision_and_rebuilds_after_source_change(tmp_path: Path) -> None:

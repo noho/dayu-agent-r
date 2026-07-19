@@ -15,6 +15,7 @@ import pytest
 
 from docling_core.types.doc.document import (
     DoclingDocument,
+    ProvenanceItem,
     RefItem,
     SectionHeaderItem,
     TableCell,
@@ -22,6 +23,7 @@ from docling_core.types.doc.document import (
     TableItem,
     TextItem,
 )
+from docling_core.types.doc.base import BoundingBox
 from docling_core.types.doc.labels import DocItemLabel
 
 from dayu.documents.processors import build_documents_processor_registry
@@ -348,6 +350,154 @@ def _ref_item(ref: str) -> RefItem:
     """
 
     return RefItem.model_validate({"$ref": ref})
+
+
+def _caption_text_item(index: int, text: str) -> TextItem:
+    """构造真实 Docling caption 文本项。
+
+    Args:
+        index: 文本项在 ``DoclingDocument.texts`` 中的索引。
+        text: caption 原始文本。
+
+    Returns:
+        带稳定内部引用的 Docling 文本项。
+
+    Raises:
+        pydantic.ValidationError: 输入不能构成合法 Docling 文本项时抛出。
+    """
+
+    return TextItem(
+        self_ref=f"#/texts/{index}",
+        parent=_ref_item("#/body"),
+        orig=text,
+        text=text,
+        label=DocItemLabel.CAPTION,
+    )
+
+
+def _caption_test_table_data() -> TableData:
+    """构造 caption 公共契约测试共用的真实表格数据。
+
+    Args:
+        无。
+
+    Returns:
+        包含表头和一行数据的 Docling 表格数据。
+
+    Raises:
+        pydantic.ValidationError: 固定表格数据不符合 Docling 模型时抛出。
+    """
+
+    return TableData(
+        num_rows=2,
+        num_cols=2,
+        table_cells=[
+            TableCell(
+                start_row_offset_idx=0,
+                end_row_offset_idx=1,
+                start_col_offset_idx=0,
+                end_col_offset_idx=1,
+                text="Metric",
+                column_header=True,
+            ),
+            TableCell(
+                start_row_offset_idx=0,
+                end_row_offset_idx=1,
+                start_col_offset_idx=1,
+                end_col_offset_idx=2,
+                text="2025",
+                column_header=True,
+            ),
+            TableCell(
+                start_row_offset_idx=1,
+                end_row_offset_idx=2,
+                start_col_offset_idx=0,
+                end_col_offset_idx=1,
+                text="Revenue",
+            ),
+            TableCell(
+                start_row_offset_idx=1,
+                end_row_offset_idx=2,
+                start_col_offset_idx=1,
+                end_col_offset_idx=2,
+                text="100",
+            ),
+        ],
+    )
+
+
+def _save_docling_caption_document(
+    tmp_path: Path,
+    *,
+    name: str,
+    caption_items: list[TextItem],
+    caption_refs: list[RefItem],
+    table_provenance: list[ProvenanceItem] | None = None,
+) -> Path:
+    """通过公开 Docling 模型保存 caption 测试文档。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        name: 文档与输出文件的稳定名称。
+        caption_items: 保存在文档文本集合中的 caption 文本项。
+        caption_refs: 按作者顺序写入表格的 caption 引用。
+        table_provenance: 可选的真实表格页级来源信息。
+
+    Returns:
+        由 ``DoclingDocument.save_as_json`` 写出的 JSON 路径。
+
+    Raises:
+        OSError: 保存测试文档失败时抛出。
+        pydantic.ValidationError: 输入不能构成合法 Docling 文档时抛出。
+    """
+
+    docling_path = tmp_path / f"{name}_docling.json"
+    parent_ref = _ref_item("#/body")
+    header = SectionHeaderItem(
+        self_ref="#/texts/0",
+        parent=parent_ref,
+        orig="Financial Review",
+        text="Financial Review",
+        level=1,
+    )
+    table = TableItem(
+        self_ref="#/tables/0",
+        parent=parent_ref,
+        captions=caption_refs,
+        prov=[] if table_provenance is None else table_provenance,
+        data=_caption_test_table_data(),
+    )
+    document = DoclingDocument(
+        name=name,
+        texts=[header, *caption_items],
+        tables=[table],
+    )
+    document.body.children = [
+        _ref_item("#/texts/0"),
+        _ref_item("#/tables/0"),
+    ]
+    document.save_as_json(docling_path)
+    return docling_path
+
+
+def _caption_from_public_views(docling_path: Path) -> tuple[str | None, str | None]:
+    """从两个公开表格视图读取同一 caption 投影。
+
+    Args:
+        docling_path: 真实 Docling JSON 文档路径。
+
+    Returns:
+        ``list_tables`` 与 ``read_table`` 返回的 caption 二元组。
+
+    Raises:
+        RuntimeError: Docling 文档加载或公开表格读取失败时抛出。
+    """
+
+    processor = DoclingProcessor(_source_for(docling_path, "application/json"))
+    return (
+        processor.list_tables()[0]["caption"],
+        processor.read_table("t_0001")["caption"],
+    )
 
 
 def test_documents_processor_registry_registers_default_processors() -> None:
@@ -928,3 +1078,575 @@ def test_docling_json_processor_sections_tables_and_search(tmp_path: Path) -> No
     assert hits
     assert hits[0].get("section_ref") == "s_0001"
     assert "Revenue" in str(hits[0].get("snippet", ""))
+
+
+def test_docling_json_processor_projects_page_content_and_reuses_public_caches(
+    tmp_path: Path,
+) -> None:
+    """真实 Docling 页级来源应统一投影 section、table、全文与缓存结果。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任一公开页级或缓存契约漂移时抛出。
+    """
+
+    docling_path = tmp_path / "rich.json"
+    parent_ref = _ref_item("#/body")
+    provenance = [
+        ProvenanceItem(
+            page_no=1,
+            bbox=BoundingBox(l=0.0, t=0.0, r=1.0, b=1.0),
+            charspan=(0, 1),
+        )
+    ]
+    header = SectionHeaderItem(
+        self_ref="#/texts/0",
+        parent=parent_ref,
+        orig="Operating Review",
+        text="Operating Review",
+        level=1,
+        prov=provenance,
+    )
+    paragraph = TextItem(
+        self_ref="#/texts/1",
+        parent=parent_ref,
+        orig="Revenue expanded across regions.",
+        text="Revenue expanded across regions.",
+        label=DocItemLabel.TEXT,
+        prov=provenance,
+    )
+    page_number = TextItem(
+        self_ref="#/texts/2",
+        parent=parent_ref,
+        orig="1",
+        text="1",
+        label=DocItemLabel.PAGE_HEADER,
+        prov=provenance,
+    )
+    table = TableItem(
+        self_ref="#/tables/0",
+        parent=parent_ref,
+        prov=provenance,
+        data=_caption_test_table_data(),
+    )
+    document = DoclingDocument(
+        name="rich",
+        texts=[header, paragraph, page_number],
+        tables=[table],
+    )
+    document.body.children = [
+        _ref_item("#/texts/0"),
+        _ref_item("#/texts/1"),
+        _ref_item("#/texts/2"),
+        _ref_item("#/tables/0"),
+    ]
+    document.save_as_json(docling_path)
+    source = _source_for(docling_path, "application/json")
+
+    assert DoclingProcessor.supports(source, media_type="application/json") is True
+    assert DoclingProcessor.get_parser_version() == "docling_processor_v1.1.0"
+    processor = DoclingProcessor(source)
+    section_ref = processor.list_sections()[0]["ref"]
+
+    assert processor.get_section_title(section_ref) == "Operating Review"
+    assert processor.get_section_title("s_missing") is None
+    with pytest.raises(KeyError, match="Section not found"):
+        processor.read_section("s_missing")
+    with pytest.raises(KeyError, match="Table not found"):
+        processor.read_table("t_missing")
+    assert processor.read_section(section_ref) == processor.read_section(section_ref)
+    assert processor.get_full_text() == processor.get_full_text()
+    assert "Revenue expanded across regions." in processor.get_full_text()
+    assert processor.search("") == []
+    assert processor.search("Revenue", within_ref="s_missing") == []
+    assert processor.get_full_text_with_table_markers() == ""
+
+    page = processor.get_page_content(1)
+    assert page["has_content"] is True
+    assert page["sections"][0]["ref"] == section_ref
+    assert page["tables"][0]["table_ref"] == "t_0001"
+    assert "Revenue expanded across regions." in page["text_preview"]
+    assert " 1 " not in f" {page['text_preview']} "
+    assert processor.get_page_content(2)["has_content"] is False
+    with pytest.raises(ValueError, match="positive integer"):
+        processor.get_page_content(0)
+
+
+def test_docling_json_processor_publishes_empty_document_as_full_text_section(
+    tmp_path: Path,
+) -> None:
+    """空 Docling 文档应发布一个合法空全文 section，而不是缺失公共命名空间。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 空文档公共契约不完整时抛出。
+    """
+
+    docling_path = tmp_path / "empty.json"
+    DoclingDocument(name="empty").save_as_json(docling_path)
+
+    processor = DoclingProcessor(_source_for(docling_path, "application/json"))
+
+    assert processor.list_sections() == [
+        {
+            "ref": "s_0001",
+            "title": None,
+            "level": 1,
+            "parent_ref": None,
+            "preview": "",
+        }
+    ]
+    assert processor.read_section("s_0001")["contains_full_text"] is True
+    assert processor.read_section("s_0001")["content"] == ""
+    assert processor.list_tables() == []
+    assert processor.get_page_content(1)["has_content"] is False
+
+    headerless_path = tmp_path / "headerless.json"
+    paragraph = TextItem(
+        self_ref="#/texts/0",
+        parent=_ref_item("#/body"),
+        orig="Headerless filing narrative.",
+        text="Headerless filing narrative.",
+        label=DocItemLabel.TEXT,
+    )
+    headerless_document = DoclingDocument(name="headerless", texts=[paragraph])
+    headerless_document.body.children = [_ref_item("#/texts/0")]
+    headerless_document.save_as_json(headerless_path)
+
+    headerless = DoclingProcessor(_source_for(headerless_path, "application/json"))
+    assert headerless.list_sections()[0]["title"] is None
+    assert headerless.read_section("s_0001")["contains_full_text"] is True
+    assert headerless.read_section("s_0001")["content"] == "Headerless filing narrative."
+
+    empty_table_path = tmp_path / "empty-table.json"
+    empty_table = TableItem(
+        self_ref="#/tables/0",
+        parent=_ref_item("#/body"),
+        data=TableData(num_rows=0, num_cols=0, table_cells=[]),
+    )
+    empty_table_document = DoclingDocument(name="empty-table", tables=[empty_table])
+    empty_table_document.body.children = [_ref_item("#/tables/0")]
+    empty_table_document.save_as_json(empty_table_path)
+
+    empty_table_processor = DoclingProcessor(
+        _source_for(empty_table_path, "application/json")
+    )
+    empty_table_content = empty_table_processor.read_table("t_0001")
+    assert empty_table_content["data_format"] == "markdown"
+    assert empty_table_content["data"]
+
+    with pytest.raises(ValueError, match="Docling JSON 文件不存在"):
+        DoclingProcessor(_source_for(tmp_path / "missing.json", "application/json"))
+
+
+def test_docling_support_sniff_rejects_malformed_or_incomplete_json(tmp_path: Path) -> None:
+    """Docling public support 探测不得把非法或缺少核心字段的 JSON 误判为文档。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非 Docling JSON 被误判为支持时抛出。
+    """
+
+    payloads = [
+        "not-json",
+        "[]",
+        '{"pages": {}, "texts": []}',
+        '{"body": {}, "texts": []}',
+    ]
+    for index, payload in enumerate(payloads):
+        path = tmp_path / f"invalid-{index}.json"
+        path.write_text(payload, encoding="utf-8")
+        assert DoclingProcessor.supports(_source_for(path, "application/json")) is False
+
+    plain_path = tmp_path / "plain.txt"
+    plain_path.write_text("plain text", encoding="utf-8")
+    assert DoclingProcessor.supports(_source_for(plain_path, "text/plain")) is False
+    assert DoclingProcessor.supports(_source_for(plain_path, "application/json")) is False
+
+    conventional_path = tmp_path / "trusted_docling.json"
+    conventional_path.write_text("not-json", encoding="utf-8")
+    assert DoclingProcessor.supports(_source_for(conventional_path, "text/plain")) is True
+
+
+def test_docling_json_processor_projects_referenced_table_caption(
+    tmp_path: Path,
+) -> None:
+    """Docling 公共结果必须投影表格引用的业务标题。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 真实 Docling caption 引用未进入表格摘要时抛出。
+    """
+
+    docling_path = tmp_path / "caption_docling.json"
+    parent_ref = _ref_item("#/body")
+    header = SectionHeaderItem(
+        self_ref="#/texts/0",
+        parent=parent_ref,
+        orig="Financial Review",
+        text="Financial Review",
+        level=1,
+    )
+    caption = TextItem(
+        self_ref="#/texts/1",
+        parent=parent_ref,
+        orig="Consolidated statements of operations",
+        text="Consolidated statements of operations",
+        label=DocItemLabel.CAPTION,
+    )
+    table = TableItem(
+        self_ref="#/tables/0",
+        parent=parent_ref,
+        captions=[_ref_item("#/texts/1")],
+        data=TableData(
+            num_rows=2,
+            num_cols=2,
+            table_cells=[
+                TableCell(
+                    start_row_offset_idx=0,
+                    end_row_offset_idx=1,
+                    start_col_offset_idx=0,
+                    end_col_offset_idx=1,
+                    text="Metric",
+                    column_header=True,
+                ),
+                TableCell(
+                    start_row_offset_idx=0,
+                    end_row_offset_idx=1,
+                    start_col_offset_idx=1,
+                    end_col_offset_idx=2,
+                    text="2025",
+                    column_header=True,
+                ),
+                TableCell(
+                    start_row_offset_idx=1,
+                    end_row_offset_idx=2,
+                    start_col_offset_idx=0,
+                    end_col_offset_idx=1,
+                    text="Revenue",
+                ),
+                TableCell(
+                    start_row_offset_idx=1,
+                    end_row_offset_idx=2,
+                    start_col_offset_idx=1,
+                    end_col_offset_idx=2,
+                    text="100",
+                ),
+            ],
+        ),
+    )
+    document = DoclingDocument(
+        name="caption-sample",
+        texts=[header, caption],
+        tables=[table],
+    )
+    document.body.children = [
+        _ref_item("#/texts/0"),
+        _ref_item("#/texts/1"),
+        _ref_item("#/tables/0"),
+    ]
+    document.save_as_json(docling_path)
+
+    processor = DoclingProcessor(_source_for(docling_path, "application/json"))
+
+    assert processor.list_tables()[0]["caption"] == (
+        "Consolidated statements of operations"
+    )
+    assert processor.read_table("t_0001")["caption"] == (
+        "Consolidated statements of operations"
+    )
+
+
+def test_docling_json_processor_preserves_normalized_unique_caption_order(
+    tmp_path: Path,
+) -> None:
+    """多 caption 必须按引用顺序规范化、精确去重并确定性连接。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 顺序、空白规范化、大小写或去重语义不符合公共契约时抛出。
+    """
+
+    caption_items = [
+        _caption_text_item(1, "  Consolidated\n Results  "),
+        _caption_text_item(2, "Consolidated\t  Results"),
+        _caption_text_item(3, "  Unaudited "),
+        _caption_text_item(4, "unaudited"),
+    ]
+    ordered_path = _save_docling_caption_document(
+        tmp_path,
+        name="ordered-caption",
+        caption_items=caption_items,
+        caption_refs=[
+            _ref_item("#/texts/1"),
+            _ref_item("#/texts/2"),
+            _ref_item("#/texts/3"),
+            _ref_item("#/texts/4"),
+        ],
+    )
+    reversed_path = _save_docling_caption_document(
+        tmp_path,
+        name="reversed-caption",
+        caption_items=caption_items,
+        caption_refs=[
+            _ref_item("#/texts/4"),
+            _ref_item("#/texts/3"),
+            _ref_item("#/texts/2"),
+            _ref_item("#/texts/1"),
+        ],
+    )
+
+    assert _caption_from_public_views(ordered_path) == (
+        "Consolidated Results Unaudited unaudited",
+        "Consolidated Results Unaudited unaudited",
+    )
+    assert _caption_from_public_views(reversed_path) == (
+        "unaudited Unaudited Consolidated Results",
+        "unaudited Unaudited Consolidated Results",
+    )
+
+
+def test_docling_json_processor_returns_none_for_empty_or_blank_captions(
+    tmp_path: Path,
+) -> None:
+    """空 caption 列表与全空白 caption 必须投影为 ``None``。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 空语义被投影为空字符串或上下文替代值时抛出。
+    """
+
+    empty_path = _save_docling_caption_document(
+        tmp_path,
+        name="empty-caption",
+        caption_items=[],
+        caption_refs=[],
+    )
+    blank_path = _save_docling_caption_document(
+        tmp_path,
+        name="blank-caption",
+        caption_items=[_caption_text_item(1, " \n\t  ")],
+        caption_refs=[_ref_item("#/texts/1")],
+    )
+
+    assert _caption_from_public_views(empty_path) == (None, None)
+    assert _caption_from_public_views(blank_path) == (None, None)
+
+
+def test_docling_json_processor_skips_dangling_caption_references(
+    tmp_path: Path,
+) -> None:
+    """未知集合与越界 caption 引用只应被跳过并保留有效标题。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: dangling 引用污染或阻断公共 caption 投影时抛出。
+    """
+
+    caption_items = [_caption_text_item(1, "Valid caption")]
+    mixed_path = _save_docling_caption_document(
+        tmp_path,
+        name="mixed-dangling-caption",
+        caption_items=caption_items,
+        caption_refs=[
+            _ref_item("#/missing/0"),
+            _ref_item("#/texts/1"),
+            _ref_item("#/texts/999"),
+        ],
+    )
+    dangling_only_path = _save_docling_caption_document(
+        tmp_path,
+        name="dangling-only-caption",
+        caption_items=caption_items,
+        caption_refs=[
+            _ref_item("#/missing/0"),
+            _ref_item("#/texts/999"),
+        ],
+    )
+
+    assert _caption_from_public_views(mixed_path) == (
+        "Valid caption",
+        "Valid caption",
+    )
+    assert _caption_from_public_views(dangling_only_path) == (None, None)
+
+
+def test_docling_json_processor_skips_document_root_caption_reference(
+    tmp_path: Path,
+) -> None:
+    """Docling document-root 引用必须在解析前跳过且不影响有效标题。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: root 引用被解析或阻断其它有效 caption 时抛出。
+    """
+
+    caption_items = [_caption_text_item(1, "Root-safe caption")]
+    mixed_path = _save_docling_caption_document(
+        tmp_path,
+        name="mixed-root-caption",
+        caption_items=caption_items,
+        caption_refs=[_ref_item("#"), _ref_item("#/texts/1")],
+    )
+    root_only_path = _save_docling_caption_document(
+        tmp_path,
+        name="root-only-caption",
+        caption_items=caption_items,
+        caption_refs=[_ref_item("#")],
+    )
+
+    assert _caption_from_public_views(mixed_path) == (
+        "Root-safe caption",
+        "Root-safe caption",
+    )
+    assert _caption_from_public_views(root_only_path) == (None, None)
+
+
+def test_docling_json_processor_rejects_model_invalid_caption_reference(
+    tmp_path: Path,
+) -> None:
+    """serialized ``$ref`` 非法时必须在真实 Docling loader 边界失败。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法引用进入 caption resolver 或未暴露加载失败时抛出。
+        OSError: 读写临时 Docling JSON 失败时抛出。
+    """
+
+    docling_path = _save_docling_caption_document(
+        tmp_path,
+        name="model-invalid-caption",
+        caption_items=[_caption_text_item(1, "Loader boundary")],
+        caption_refs=[_ref_item("#/texts/1")],
+    )
+    serialized = docling_path.read_text(encoding="utf-8")
+    valid_ref = '"$ref": "#/texts/1"'
+    assert serialized.count(valid_ref) == 1
+    docling_path.write_text(
+        serialized.replace(valid_ref, '"$ref": "not-a-valid-cref"', 1),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="Docling JSON parsing failed") as raised:
+        DoclingProcessor(_source_for(docling_path, "application/json"))
+
+    assert raised.value.__cause__ is not None
+    assert "string_pattern_mismatch" in str(raised.value.__cause__)
+
+
+def test_docling_json_processor_skips_non_text_caption_references(
+    tmp_path: Path,
+) -> None:
+    """解析到真实非文本对象的 caption 引用必须被忽略。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非文本对象被误投影或阻断有效 caption 时抛出。
+    """
+
+    caption_items = [_caption_text_item(1, "Text caption")]
+    mixed_path = _save_docling_caption_document(
+        tmp_path,
+        name="mixed-non-text-caption",
+        caption_items=caption_items,
+        caption_refs=[_ref_item("#/tables/0"), _ref_item("#/texts/1")],
+    )
+    non_text_only_path = _save_docling_caption_document(
+        tmp_path,
+        name="non-text-only-caption",
+        caption_items=caption_items,
+        caption_refs=[_ref_item("#/tables/0")],
+    )
+
+    assert _caption_from_public_views(mixed_path) == (
+        "Text caption",
+        "Text caption",
+    )
+    assert _caption_from_public_views(non_text_only_path) == (None, None)
+
+
+def test_docling_json_processor_propagates_caption_to_public_table_views(
+    tmp_path: Path,
+) -> None:
+    """同一 caption 必须传播到 list、read 与页级三个公开表格视图。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 三个公开消费者未共享同一 caption 投影时抛出。
+    """
+
+    expected_caption = "Consolidated statements"
+    provenance = ProvenanceItem(
+        page_no=1,
+        bbox=BoundingBox(l=0.0, t=0.0, r=1.0, b=1.0),
+        charspan=(0, 1),
+    )
+    docling_path = _save_docling_caption_document(
+        tmp_path,
+        name="public-caption-views",
+        caption_items=[_caption_text_item(1, expected_caption)],
+        caption_refs=[_ref_item("#/texts/1")],
+        table_provenance=[provenance],
+    )
+
+    processor = DoclingProcessor(_source_for(docling_path, "application/json"))
+    page_content = processor.get_page_content(1)
+
+    assert processor.list_tables()[0]["caption"] == expected_caption
+    assert processor.read_table("t_0001")["caption"] == expected_caption
+    assert page_content["tables"][0]["caption"] == expected_caption

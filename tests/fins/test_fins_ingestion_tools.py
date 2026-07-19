@@ -940,6 +940,95 @@ def test_preprocess_tool_returns_external_job_awaiting_outcome(tmp_path: Path) -
     assert "finsjob_" not in outcome.snapshot.snapshot_id
 
 
+def test_preprocess_tool_accepts_material_filters_and_rebuild_flag(
+    tmp_path: Path,
+) -> None:
+    """公开工具契约必须接受 material、文档/表单过滤与重建开关。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 有效业务参数未创建 awaiting observation 时抛出。
+    """
+
+    workspace_root = _build_workspace(tmp_path)
+    runtime = DefaultFinsRuntime.create(
+        workspace_root=workspace_root
+    ).get_ingestion_runtime()
+
+    outcome = asyncio.run(
+        FinsPreprocessToolCallable(runtime=runtime)(
+            _call(
+                PREPROCESS_TOOL_NAME,
+                {
+                    "ticker": "AAPL",
+                    "source_kind": "material",
+                    "document_ids": ["aapl-earnings-call-2024-q4"],
+                    "form_types": ["earnings-call"],
+                    "rebuild_processed": True,
+                },
+            ),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolAwaitingOutcome)
+    assert outcome.await_spec.await_kind is ToolAwaitKind.EXTERNAL_JOB
+    _assert_resume_token_is_opaque(outcome.await_spec.resume_token)
+    assert outcome.snapshot is not None
+
+
+@pytest.mark.parametrize(
+    ("source_kind", "expected_message"),
+    (
+        (7, "source_kind must be a string"),
+        ("transcript", "source_kind must be one of"),
+    ),
+)
+def test_preprocess_tool_rejects_invalid_source_kind_before_creating_observation(
+    tmp_path: Path,
+    source_kind: JsonValue,
+    expected_message: str,
+) -> None:
+    """公开工具必须在 observation 创建前拒绝非法源文档类别。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        source_kind: 非字符串或未知的源文档类别。
+        expected_message: 预期的业务可读校验信息。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法参数未按 invalid_argument 失败时抛出。
+    """
+
+    workspace_root = _build_workspace(tmp_path)
+    runtime = DefaultFinsRuntime.create(
+        workspace_root=workspace_root
+    ).get_ingestion_runtime()
+
+    outcome = asyncio.run(
+        FinsPreprocessToolCallable(runtime=runtime)(
+            _call(
+                PREPROCESS_TOOL_NAME,
+                {"ticker": "AAPL", "source_kind": source_kind},
+            ),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "invalid_argument"
+    assert expected_message in outcome.result.message
+    assert not tuple(_job_store_root(workspace_root).glob("*.json"))
+
+
 def test_upload_tool_returns_external_job_awaiting_outcome(tmp_path: Path) -> None:
     """上传工具应返回基于 lightweight observation handle 的 awaiting outcome。"""
 

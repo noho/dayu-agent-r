@@ -22,6 +22,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from functools import lru_cache
 from typing import Optional, Protocol, cast
 
@@ -47,7 +48,6 @@ from dayu.documents.processors.text_utils import (
 )
 from dayu.fins._log import Log
 from dayu.fins.domain.filing_semantics import normalize_sec_form_type_for_matching as _parse_section_sec_form
-from dayu.fins.processors.sec_processor import SecProcessor
 
 # --- 跨 Form 共享的正则常量 ---
 
@@ -251,6 +251,14 @@ class _StructuredSplitCandidate:
     preview: str
 
 
+class _VirtualSectionPublicationMode(Enum):
+    """虚拟章节投影的 owner-private 发布状态。"""
+
+    BUILDING = auto()
+    VIRTUAL_PUBLISHED = auto()
+    BASE_FALLBACK_PUBLISHED = auto()
+
+
 class _VirtualSectionBaseProcessorProtocol(Protocol):
     """虚拟章节 mixin 下一跳处理器必须满足的最小协议。"""
 
@@ -327,6 +335,7 @@ class _VirtualSectionProcessorMixin:
     _virtual_sections: list[_VirtualSection]
     _virtual_section_by_ref: dict[str, _VirtualSection]
     _table_ref_to_virtual_ref: dict[str, str]
+    _virtual_section_publication_mode: _VirtualSectionPublicationMode
 
     # 子类设为 True 时，search() 在精确匹配无结果后自动启用 token OR 回退。
     # 适用于短文档/非标准化术语的特殊表单（8-K/6-K/DEF 14A/SC 13D 等）。
@@ -385,6 +394,7 @@ class _VirtualSectionProcessorMixin:
             RuntimeError: 构建失败时抛出。
         """
 
+        self._virtual_section_publication_mode = _VirtualSectionPublicationMode.BUILDING
         self._virtual_sections = []
         self._virtual_section_by_ref = {}
         self._table_ref_to_virtual_ref = {}
@@ -443,58 +453,104 @@ class _VirtualSectionProcessorMixin:
             RuntimeError: 底层 table 列表读取失败时抛出。
         """
 
+        if self._virtual_section_publication_mode is _VirtualSectionPublicationMode.BASE_FALLBACK_PUBLISHED:
+            return
+
         current_identity_multiset = self._virtual_section_identity_multiset()
         if expected_identity_multiset is not None and current_identity_multiset != expected_identity_multiset:
             raise ValueError("虚拟章节 expansion 不得创建、删除或替换 section/ref")
+        if self._virtual_section_publication_mode is _VirtualSectionPublicationMode.VIRTUAL_PUBLISHED:
+            published_identity_multiset = tuple(
+                sorted((id(section), section.ref) for section in self._virtual_section_by_ref.values())
+            )
+            if current_identity_multiset != published_identity_multiset:
+                raise ValueError("已发布虚拟章节刷新不得创建、删除或替换 section/ref")
 
-        section_by_ref: dict[str, _VirtualSection] = {}
+        if not self._virtual_sections:
+            if self._virtual_section_publication_mode is _VirtualSectionPublicationMode.BUILDING:
+                self._publish_base_fallback_state()
+            return
+
+        base_table_refs = _validate_base_table_refs(self._get_base_processor().list_tables())
+        base_table_ref_set = set(base_table_refs)
+        marked_text = self._collect_marked_text()
+        raw_marker_refs = _extract_raw_table_refs(marked_text)
+        _validate_raw_marker_refs(raw_marker_refs, base_table_ref_set)
+
+        section_by_ref = _validate_virtual_section_tree(self._virtual_sections)
+        candidate_mapping = self._assign_tables_to_virtual_sections(
+            marked_text=marked_text,
+            section_by_ref=section_by_ref,
+        )
+        section_table_refs = _build_candidate_section_table_refs(
+            sections=self._virtual_sections,
+            raw_marker_refs=raw_marker_refs,
+            table_ref_to_virtual_ref=candidate_mapping,
+        )
+        _validate_candidate_table_mapping(
+            base_table_refs=base_table_ref_set,
+            section_by_ref=section_by_ref,
+            section_table_refs=section_table_refs,
+            table_ref_to_virtual_ref=candidate_mapping,
+        )
+
+        missing_refs = base_table_ref_set - set(candidate_mapping)
+        if missing_refs:
+            if self._virtual_section_publication_mode is _VirtualSectionPublicationMode.BUILDING:
+                self._publish_base_fallback_state()
+                return
+            raise ValueError(f"已发布虚拟章节刷新后缺少 table_ref: {sorted(missing_refs)}")
+
+        self._publish_virtual_section_state(
+            section_by_ref=section_by_ref,
+            section_table_refs=section_table_refs,
+            table_ref_to_virtual_ref=candidate_mapping,
+        )
+
+    def _publish_base_fallback_state(self) -> None:
+        """原子发布完整底层 processor 回退状态。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self._virtual_sections = []
+        self._virtual_section_by_ref = {}
+        self._table_ref_to_virtual_ref = {}
+        self._virtual_section_publication_mode = _VirtualSectionPublicationMode.BASE_FALLBACK_PUBLISHED
+
+    def _publish_virtual_section_state(
+        self,
+        *,
+        section_by_ref: dict[str, _VirtualSection],
+        section_table_refs: dict[str, list[str]],
+        table_ref_to_virtual_ref: dict[str, str],
+    ) -> None:
+        """一次提交已完成双向验证的虚拟章节投影。
+
+        Args:
+            section_by_ref: 已验证的章节 ref 索引。
+            section_table_refs: 已验证的章节到表格引用映射。
+            table_ref_to_virtual_ref: 已验证的表格到章节反向映射。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
         for section in self._virtual_sections:
-            if section.ref in section_by_ref:
-                raise ValueError(f"虚拟章节 ref 重复: {section.ref}")
-            section_by_ref[section.ref] = section
-        for section in self._virtual_sections:
-            if section.parent_ref is not None and section.parent_ref not in section_by_ref:
-                raise ValueError(f"虚拟章节 parent_ref 悬挂: {section.parent_ref}")
-            for child_ref in section.child_refs:
-                child = section_by_ref.get(child_ref)
-                if child is None or child.parent_ref != section.ref:
-                    raise ValueError(f"虚拟章节 child_ref 悬挂或反向关系不一致: {child_ref}")
-
-        # 先清空全部派生状态，再以最终 section boundary/order 唯一重建。
-        self._virtual_section_by_ref = section_by_ref
-        self._table_ref_to_virtual_ref.clear()
-        for section in self._virtual_sections:
-            section.table_refs.clear()
-        self._assign_tables_to_virtual_sections()
-
-        base_table_refs: set[str] = set()
-        for table in self._get_base_processor().list_tables():
-            table_ref = _normalize_optional_string(table.get("table_ref"))
-            if table_ref is None:
-                continue
-            if table_ref in base_table_refs:
-                raise ValueError(f"底层 table_ref 重复: {table_ref}")
-            base_table_refs.add(table_ref)
-
-        section_table_refs: set[str] = set()
-        for section in self._virtual_sections:
-            for table_ref in section.table_refs:
-                if table_ref in section_table_refs:
-                    raise ValueError(f"虚拟章节 table_ref 重复分配: {table_ref}")
-                section_table_refs.add(table_ref)
-                if table_ref not in base_table_refs:
-                    raise ValueError(f"虚拟章节 table_ref 悬挂: {table_ref}")
-                if self._table_ref_to_virtual_ref.get(table_ref) != section.ref:
-                    raise ValueError(f"table 双向映射不一致: {table_ref}")
-
-        if set(self._table_ref_to_virtual_ref) != section_table_refs:
-            raise ValueError("table 反向映射包含未投影到 section 的引用")
-        for table_ref, section_ref in self._table_ref_to_virtual_ref.items():
-            if section_ref not in section_by_ref:
-                raise ValueError(f"table section_ref 悬挂: {section_ref}")
-        if base_table_refs != section_table_refs:
-            missing_refs = sorted(base_table_refs - section_table_refs)
-            raise ValueError(f"存在无法分配到最终虚拟章节的 table_ref: {missing_refs}")
+            section.table_refs[:] = section_table_refs[section.ref]
+        self._virtual_section_by_ref = dict(section_by_ref)
+        self._table_ref_to_virtual_ref = dict(table_ref_to_virtual_ref)
+        self._virtual_section_publication_mode = _VirtualSectionPublicationMode.VIRTUAL_PUBLISHED
 
     def _postprocess_virtual_sections(self, full_text: str) -> None:
         """对子类已构建的虚拟章节做可选后处理。
@@ -814,145 +870,79 @@ class _VirtualSectionProcessorMixin:
         except Exception:
             return ""
 
-    def _collect_available_table_refs_from_base(self) -> Optional[set[str]]:
-        """读取底层处理器可用的表格引用集合。
+    def _assign_tables_to_virtual_sections(
+        self,
+        *,
+        marked_text: str,
+        section_by_ref: dict[str, _VirtualSection],
+    ) -> dict[str, str]:
+        """从原始 marker material 构建 owner-local table 候选映射。
 
-        该集合用于在虚拟章节分配阶段过滤“仅存在于标记文本、但底层
-        ``list_tables()`` 未产出”的表格引用，避免 ``read_section.tables``
-        出现悬挂 ``table_ref``。
-
-        Returns:
-            可用表格引用集合；无法安全获取时返回 ``None``（表示不做过滤）。
-
-        Raises:
-            无。内部异常统一吞掉并降级为 ``None``。
-        """
-
-        try:
-            base_tables = self._get_base_processor().list_tables()
-        except Exception:
-            return None
-        refs: set[str] = set()
-        for table in base_tables:
-            ref = _normalize_optional_string(table.get("table_ref"))
-            if ref is not None:
-                refs.add(ref)
-        return refs
-
-    def _assign_tables_to_virtual_sections(self) -> None:
-        """将底层表格分配到虚拟章节。
-
-        通过在带 ``[[t_XXXX]]`` 占位符的全文中重新检测 marker 边界，
-        确定每个占位符落入哪个虚拟章节范围，从而建立双向映射：
-
-        1. 更新每个虚拟章节的 ``table_refs``（解决 ``read_section.tables``
-           为空的问题——方向 A）；
-        2. 构建 ``_table_ref_to_virtual_ref`` 反向映射，供 ``list_tables()``
-           重写 ``section_ref``（解决悬挂引用问题——方向 B）。
-
-        分配策略分两阶段：
-
-        - **Phase 1（标题匹配）**：在标记文本中重新运行 ``_build_markers``
-          检测 marker 边界，按标题精确匹配虚拟章节，将对应范围内的
-          ``[[t_XXXX]]`` 分配到匹配的虚拟章节。
-        - **Phase 2（位置回退）**：Phase 1 中未分配的 ``[[t_XXXX]]``
-          （通常因标记文本与原文产生了不同的 marker 标题——如 Proposal
-          编号在有/无表格内容时匹配不同），按位置回退分配到最近的前驱
-          已匹配虚拟章节边界。
-
-        位置回退确保即使 ``_build_markers`` 在标记文本上产生不同标题
-        （TOC 检测阈值、重扫逻辑受 ``[[t_XXXX]]`` 占位符插入的位移
-        影响），所有表格仍能映射到虚拟章节，彻底消除悬挂引用。
-
-        降级策略：若底层处理器未提供带标记全文，或标记文本中检测到的
-        marker 标题无法匹配虚拟章节标题，则跳过分配（保持现有行为）。
+        本方法只产生候选映射，不修改任何已发布字段。标题或范围不能唯一
+        证明归属时保留未映射事实，由 refresh owner 在矛盾校验后统一决定
+        whole-base fallback。
 
         Args:
-            无。
+            marked_text: 带原始 table marker 的全文；能力不支持时为空。
+            section_by_ref: 已验证的候选章节 ref 索引。
 
         Returns:
-            无。
+            table ref 到唯一虚拟章节 ref 的候选映射。
+
+        Raises:
+            ValueError: 同一 marker 位置同时归属多个章节时抛出。
         """
 
-        if not self._virtual_sections:
-            return
-
-        marked_text = self._collect_marked_text()
-        if not marked_text:
-            return
-
-        for section in self._virtual_sections:
-            section.table_refs.clear()
-        self._table_ref_to_virtual_ref.clear()
-        available_table_refs = self._collect_available_table_refs_from_base()
+        if not marked_text or not self._virtual_sections:
+            return {}
 
         top_sections = [section for section in self._virtual_sections if section.parent_ref is None]
-        top_section_by_ref = {section.ref: section for section in top_sections}
         if not top_sections:
-            return
+            return {}
 
-        # 在标记文本中重新检测 marker，按标题匹配虚拟章节
         marked_markers = self._build_markers(marked_text)
-        title_ranges = _build_marker_title_ranges(marked_text, marked_markers)
-        if not title_ranges:
-            return
+        title_range_candidates = _build_marker_title_range_candidates(marked_text, marked_markers)
+        deduped_markers = _dedupe_markers(marked_markers)
+        cover_end = deduped_markers[0][0] if deduped_markers else len(marked_text)
+        title_section_counts = _count_virtual_section_titles(top_sections)
+        candidate_mapping: dict[str, str] = {}
+        top_section_ranges: dict[str, tuple[int, int]] = {}
 
-        # Cover Page 的范围：第一个 marker 之前的全部文本
-        deduped_marked = _dedupe_markers(marked_markers)
-        cover_end = deduped_marked[0][0] if deduped_marked else len(marked_text)
-
-        # ----- Phase 1: 标题精确匹配 -----
-        for vs in top_sections:
-            if vs.title == "Cover Page":
-                segment = marked_text[:cover_end]
-            elif vs.title in title_ranges:
-                start, end = title_ranges[vs.title]
-                segment = marked_text[start:end]
-            else:
-                # 标题未匹配（Proposal 编号差异、SIGNATURE 未检测到等），跳过
+        for section in top_sections:
+            title = _normalize_optional_string(section.title)
+            if title is None or title_section_counts[title] != 1:
                 continue
-            tbl_refs = _filter_table_refs_by_availability(
-                _extract_table_refs(segment),
-                available_table_refs,
+            section_range = _select_unique_top_section_range(
+                title=title,
+                cover_end=cover_end,
+                title_range_candidates=title_range_candidates,
             )
-            # frozen dataclass 但 list 是可变对象，可就地更新
-            vs.table_refs.clear()
-            vs.table_refs.extend(tbl_refs)
-            for tbl_ref in tbl_refs:
-                self._table_ref_to_virtual_ref[tbl_ref] = vs.ref
+            if section_range is None:
+                continue
+            top_section_ranges[section.ref] = section_range
+            start, end = section_range
+            for table_ref in _extract_table_refs(marked_text[start:end]):
+                _record_candidate_table_mapping(
+                    table_ref=table_ref,
+                    section_ref=section.ref,
+                    table_ref_to_virtual_ref=candidate_mapping,
+                )
 
-        # ----- Phase 2: 位置回退——分配 Phase 1 未覆盖的表格 -----
-        # 构建已匹配虚拟章节在标记文本中的有序边界列表
-        _assign_unmapped_tables_by_position(
-            marked_text=marked_text,
-            title_ranges=title_ranges,
-            cover_end=cover_end,
-            virtual_sections=top_sections,
-            virtual_section_by_ref=top_section_by_ref,
-            table_ref_to_virtual_ref=self._table_ref_to_virtual_ref,
-            available_table_refs=available_table_refs,
-        )
-
-        # 若存在子章节，按“最深命中”规则重分配
         if any(section.child_refs for section in top_sections):
             _remap_tables_to_deepest_virtual_sections(
                 marked_text=marked_text,
-                title_ranges=title_ranges,
-                cover_end=cover_end,
+                top_section_ranges=top_section_ranges,
                 virtual_sections=top_sections,
-                virtual_section_by_ref=self._virtual_section_by_ref,
-                table_ref_to_virtual_ref=self._table_ref_to_virtual_ref,
+                virtual_section_by_ref=section_by_ref,
+                table_ref_to_virtual_ref=candidate_mapping,
             )
+        return candidate_mapping
 
     def list_tables(self) -> list[TableSummary]:
         """读取表格列表，重映射 ``section_ref`` 到虚拟章节。
 
-        当虚拟章节未启用时，直接透传底层表格列表。启用后：
-
-        1. 若 ``table_ref`` 已命中 ``_table_ref_to_virtual_ref``，直接使用该映射；
-        2. 否则若底层 ``section_ref`` 已是虚拟章节 ref，直接保留；
-        3. 否则回退到“最近一次已确认的虚拟章节 ref”（初值为第一个虚拟章节），
-           确保 ``section_ref`` 不会悬挂到虚拟章节集合之外。
+        只有完整虚拟投影已发布时才按 owner mapping 重写；其它发布模式
+        均直接透传底层表格 contract，不猜测表格归属。
 
         Args:
             无。
@@ -961,34 +951,24 @@ class _VirtualSectionProcessorMixin:
             表格摘要列表。
 
         Raises:
+            ValueError: 已发布 mapping 与底层表格 identity 漂移时抛出。
             RuntimeError: 读取失败时抛出。
         """
 
-        if not self._virtual_sections:
+        if self._virtual_section_publication_mode is not _VirtualSectionPublicationMode.VIRTUAL_PUBLISHED:
             return self._get_base_processor().list_tables()
         tables = self._get_base_processor().list_tables()
         if not tables:
             return tables
 
-        valid_virtual_refs = {section.ref for section in self._virtual_sections}
-        fallback_ref = self._virtual_sections[0].ref if self._virtual_sections else None
-        last_known_ref = fallback_ref
-
         for table in tables:
-            tbl_ref = _normalize_optional_string(table.get("table_ref"))
-            if tbl_ref and tbl_ref in self._table_ref_to_virtual_ref:
-                mapped_ref = self._table_ref_to_virtual_ref[tbl_ref]
-                table["section_ref"] = mapped_ref
-                last_known_ref = mapped_ref
-                continue
-
-            current_ref = _normalize_optional_string(table.get("section_ref"))
-            if current_ref is not None and current_ref in valid_virtual_refs:
-                last_known_ref = current_ref
-                continue
-
-            if last_known_ref is not None:
-                table["section_ref"] = last_known_ref
+            table_ref = _normalize_optional_string(table.get("table_ref"))
+            if table_ref is None:
+                raise ValueError("已发布虚拟章节遇到底层空 table_ref")
+            section_ref = self._table_ref_to_virtual_ref.get(table_ref)
+            if section_ref is None:
+                raise ValueError(f"已发布虚拟章节缺少 table_ref 映射: {table_ref}")
+            table["section_ref"] = section_ref
         return tables
 
     def list_sections(self) -> list[SectionSummary]:
@@ -1004,7 +984,7 @@ class _VirtualSectionProcessorMixin:
             RuntimeError: 读取失败时抛出。
         """
 
-        if not self._virtual_sections:
+        if self._virtual_section_publication_mode is not _VirtualSectionPublicationMode.VIRTUAL_PUBLISHED:
             return self._get_base_processor().list_sections()
         return [
             {
@@ -1027,8 +1007,11 @@ class _VirtualSectionProcessorMixin:
 
         Returns:
             章节标题字符串；ref 不存在时返回 None。
+
+        Raises:
+            RuntimeError: 底层标题读取失败时抛出。
         """
-        if not self._virtual_sections:
+        if self._virtual_section_publication_mode is not _VirtualSectionPublicationMode.VIRTUAL_PUBLISHED:
             return self._get_base_processor().get_section_title(ref)
         section = self._virtual_section_by_ref.get(ref)
         return section.title if section else None
@@ -1047,7 +1030,7 @@ class _VirtualSectionProcessorMixin:
             RuntimeError: 读取失败时抛出。
         """
 
-        if not self._virtual_sections:
+        if self._virtual_section_publication_mode is not _VirtualSectionPublicationMode.VIRTUAL_PUBLISHED:
             return self._get_base_processor().read_section(ref)
         section = self._virtual_section_by_ref.get(ref)
         if section is None:
@@ -1093,7 +1076,7 @@ class _VirtualSectionProcessorMixin:
             RuntimeError: 搜索失败时抛出。
         """
 
-        if not self._virtual_sections:
+        if self._virtual_section_publication_mode is not _VirtualSectionPublicationMode.VIRTUAL_PUBLISHED:
             return self._get_base_processor().search(query=query, within_ref=within_ref)
         normalized_query = str(query or "").strip()
         if not normalized_query:
@@ -2654,134 +2637,315 @@ def _build_marker_title_ranges(
     return ranges
 
 
-def _filter_table_refs_by_availability(
-    refs: list[str],
-    available_table_refs: Optional[set[str]],
-) -> list[str]:
-    """按底层可用表格集合过滤章节内的 ``table_ref``。
+def _validate_base_table_refs(tables: list[TableSummary]) -> tuple[str, ...]:
+    """验证并按底层公开顺序返回 table ref。
 
     Args:
-        refs: 原始表格引用列表（保持原顺序）。
-        available_table_refs: 底层 ``list_tables()`` 可见的引用集合；
-            ``None`` 表示无法获取，直接透传 ``refs``。
+        tables: 底层 processor 发布的表格摘要。
 
     Returns:
-        过滤后的表格引用列表。
+        非空且唯一的 table ref 元组。
+
+    Raises:
+        ValueError: 任一 table ref 缺失、为空或重复时抛出。
+    """
+
+    refs: list[str] = []
+    seen: set[str] = set()
+    for table in tables:
+        table_ref = _normalize_optional_string(table.get("table_ref"))
+        if table_ref is None:
+            raise ValueError("底层 table_ref 缺失或为空")
+        if table_ref in seen:
+            raise ValueError(f"底层 table_ref 重复: {table_ref}")
+        seen.add(table_ref)
+        refs.append(table_ref)
+    return tuple(refs)
+
+
+def _extract_raw_table_refs(marked_text: str) -> tuple[str, ...]:
+    """保留出现顺序与次数提取原始 table marker refs。
+
+    Args:
+        marked_text: 带 table marker 的原始全文；能力不支持时为空。
+
+    Returns:
+        未去重的 table ref 元组。
 
     Raises:
         无。
     """
 
-    if available_table_refs is None:
-        return refs
-    return [ref for ref in refs if ref in available_table_refs]
+    return tuple(match.group(1) for match in _TABLE_REF_PATTERN.finditer(marked_text))
 
 
-def _assign_unmapped_tables_by_position(
-    *,
-    marked_text: str,
-    title_ranges: dict[str, tuple[int, int]],
-    cover_end: int,
-    virtual_sections: list[_VirtualSection],
-    virtual_section_by_ref: dict[str, _VirtualSection],
-    table_ref_to_virtual_ref: dict[str, str],
-    available_table_refs: Optional[set[str]] = None,
+def _validate_raw_marker_refs(
+    raw_marker_refs: tuple[str, ...],
+    base_table_refs: set[str],
 ) -> None:
-    """将 Phase 1 未分配的 ``[[t_XXXX]]`` 回退分配到最近的前驱虚拟章节。
-
-    Phase 1（标题精确匹配）可能遗漏部分表格——当标记文本（带 ``[[t_XXXX]]``
-    占位符）上重新运行 ``_build_markers`` 产生与原虚拟章节不同的 marker 标题
-    时，对应 title_range 无法匹配任何虚拟章节，范围内的 ``[[t_XXXX]]`` 不会
-    被分配。典型场景：DEF 14A 的 Proposal 编号在有/无表格文本时正则匹配不同。
-
-    本函数作为 Phase 2 回退：
-
-    1. 收集 Phase 1 已分配的 ``tbl_ref`` 集合。
-    2. 构建"已匹配虚拟章节"在标记文本中的有序边界列表（Cover Page 用 0，
-       其余用 ``title_ranges`` 中对应标题的起始位置）。
-    3. 扫描标记文本中所有 ``[[t_XXXX]]``，对未分配的 ref 按位置查找
-       最近的前驱边界，将其分配到对应虚拟章节。
+    """按 contradiction-first 顺序验证原始 marker 引用。
 
     Args:
-        marked_text: 带 ``[[t_XXXX]]`` 占位符的文档全文。
-        title_ranges: ``_build_marker_title_ranges`` 返回的标题→范围映射。
-        cover_end: Cover Page 在标记文本中的结束位置。
-        virtual_sections: 虚拟章节列表。
-        virtual_section_by_ref: ref→虚拟章节 映射。
-        table_ref_to_virtual_ref: 已有的 tbl_ref→vs_ref 映射（会被更新）。
-        available_table_refs: 底层可用表格引用集合；为 ``None`` 时不做过滤。
+        raw_marker_refs: 保留出现顺序与次数的原始 marker refs。
+        base_table_refs: 已验证的底层公开 table refs。
 
     Returns:
-        无（就地更新 ``table_ref_to_virtual_ref`` 和虚拟章节的 ``table_refs``）。
+        无。
+
+    Raises:
+        ValueError: 出现 dangling 或重复 marker ref 时抛出。
     """
 
-    assigned_refs = set(table_ref_to_virtual_ref.keys())
+    dangling_refs = sorted({table_ref for table_ref in raw_marker_refs if table_ref not in base_table_refs})
+    if dangling_refs:
+        raise ValueError(f"原始 marker table_ref 悬挂: {dangling_refs}")
 
-    # 构建已匹配虚拟章节的有序边界：(position_in_marked_text, vs_ref)
-    matched_boundaries: list[tuple[int, str]] = []
-    for vs in virtual_sections:
-        if vs.title == "Cover Page":
-            matched_boundaries.append((0, vs.ref))
-        elif vs.title in title_ranges:
-            start, _ = title_ranges[vs.title]
-            matched_boundaries.append((start, vs.ref))
-    matched_boundaries.sort(key=lambda x: x[0])
+    seen: set[str] = set()
+    for table_ref in raw_marker_refs:
+        if table_ref in seen:
+            raise ValueError(f"原始 marker table_ref 重复: {table_ref}")
+        seen.add(table_ref)
 
-    if not matched_boundaries:
-        return
 
-    # 扫描所有 [[t_XXXX]]，对未分配的 ref 按位置回退分配
-    for match in _TABLE_REF_PATTERN.finditer(marked_text):
-        tbl_ref = match.group(1)
-        if available_table_refs is not None and tbl_ref not in available_table_refs:
+def _validate_virtual_section_tree(
+    sections: list[_VirtualSection],
+) -> dict[str, _VirtualSection]:
+    """验证候选虚拟章节树并建立唯一 ref 索引。
+
+    Args:
+        sections: 待发布的候选虚拟章节。
+
+    Returns:
+        章节 ref 到候选章节对象的唯一索引。
+
+    Raises:
+        ValueError: ref 重复、父子悬挂或双向关系矛盾时抛出。
+    """
+
+    section_by_ref: dict[str, _VirtualSection] = {}
+    for section in sections:
+        if section.ref in section_by_ref:
+            raise ValueError(f"虚拟章节 ref 重复: {section.ref}")
+        section_by_ref[section.ref] = section
+
+    for section in sections:
+        if section.parent_ref is not None and section.parent_ref not in section_by_ref:
+            raise ValueError(f"虚拟章节 parent_ref 悬挂: {section.parent_ref}")
+        child_refs_seen: set[str] = set()
+        for child_ref in section.child_refs:
+            if child_ref in child_refs_seen:
+                raise ValueError(f"虚拟章节 child_ref 重复: {child_ref}")
+            child_refs_seen.add(child_ref)
+            child = section_by_ref.get(child_ref)
+            if child is None or child.parent_ref != section.ref:
+                raise ValueError(f"虚拟章节 child_ref 悬挂或反向关系不一致: {child_ref}")
+    return section_by_ref
+
+
+def _build_candidate_section_table_refs(
+    *,
+    sections: list[_VirtualSection],
+    raw_marker_refs: tuple[str, ...],
+    table_ref_to_virtual_ref: dict[str, str],
+) -> dict[str, list[str]]:
+    """从同一候选反向映射投影章节到表格列表。
+
+    Args:
+        sections: 待发布的候选虚拟章节。
+        raw_marker_refs: 原始 marker refs，用于保持文档顺序。
+        table_ref_to_virtual_ref: owner-local 候选反向映射。
+
+    Returns:
+        每个候选章节 ref 对应的有序 table refs。
+
+    Raises:
+        ValueError: 候选映射指向不存在的章节时抛出。
+    """
+
+    section_table_refs = {section.ref: [] for section in sections}
+    for table_ref in raw_marker_refs:
+        section_ref = table_ref_to_virtual_ref.get(table_ref)
+        if section_ref is None:
             continue
-        if tbl_ref in assigned_refs:
+        refs = section_table_refs.get(section_ref)
+        if refs is None:
+            raise ValueError(f"候选 table section_ref 悬挂: {section_ref}")
+        refs.append(table_ref)
+    return section_table_refs
+
+
+def _validate_candidate_table_mapping(
+    *,
+    base_table_refs: set[str],
+    section_by_ref: dict[str, _VirtualSection],
+    section_table_refs: dict[str, list[str]],
+    table_ref_to_virtual_ref: dict[str, str],
+) -> None:
+    """验证候选 table→section 与 section→tables 双向一致。
+
+    Args:
+        base_table_refs: 已验证的底层公开 table refs。
+        section_by_ref: 已验证的候选章节索引。
+        section_table_refs: 候选章节到表格引用映射。
+        table_ref_to_virtual_ref: 候选表格到章节反向映射。
+
+    Returns:
+        无。
+
+    Raises:
+        ValueError: 候选 mapping 悬挂、重复或双向不一致时抛出。
+    """
+
+    projected_refs: set[str] = set()
+    for section_ref, table_refs in section_table_refs.items():
+        if section_ref not in section_by_ref:
+            raise ValueError(f"候选章节 table mapping 悬挂: {section_ref}")
+        for table_ref in table_refs:
+            if table_ref in projected_refs:
+                raise ValueError(f"候选虚拟章节 table_ref 重复分配: {table_ref}")
+            projected_refs.add(table_ref)
+            if table_ref not in base_table_refs:
+                raise ValueError(f"候选虚拟章节 table_ref 悬挂: {table_ref}")
+            if table_ref_to_virtual_ref.get(table_ref) != section_ref:
+                raise ValueError(f"候选 table 双向映射不一致: {table_ref}")
+
+    if set(table_ref_to_virtual_ref) != projected_refs:
+        raise ValueError("候选 table 反向映射包含未投影到 section 的引用")
+    for table_ref, section_ref in table_ref_to_virtual_ref.items():
+        if table_ref not in base_table_refs:
+            raise ValueError(f"候选 table_ref 不属于底层公开表格: {table_ref}")
+        if section_ref not in section_by_ref:
+            raise ValueError(f"候选 table section_ref 悬挂: {section_ref}")
+
+
+def _build_marker_title_range_candidates(
+    text: str,
+    markers: list[tuple[int, Optional[str]]],
+) -> dict[str, list[tuple[int, int]]]:
+    """保留同名 marker 的全部范围候选，避免 dict 覆盖制造唯一性。
+
+    Args:
+        text: 带 table marker 的全文。
+        markers: 在同一全文上检测出的章节 marker。
+
+    Returns:
+        标题到全部文本范围候选的映射。
+
+    Raises:
+        无。
+    """
+
+    deduped_markers = _dedupe_markers(markers)
+    ranges: dict[str, list[tuple[int, int]]] = {}
+    for index, (start, title) in enumerate(deduped_markers):
+        normalized_title = _normalize_optional_string(title)
+        if normalized_title is None:
             continue
+        end = deduped_markers[index + 1][0] if index + 1 < len(deduped_markers) else len(text)
+        ranges.setdefault(normalized_title, []).append((start, end))
+    return ranges
 
-        pos = match.start()
-        # 查找最近的前驱已匹配虚拟章节边界
-        target_vs_ref: Optional[str] = None
-        for boundary_pos, vs_ref in reversed(matched_boundaries):
-            if boundary_pos <= pos:
-                target_vs_ref = vs_ref
-                break
-        # 位于所有边界之前的表格（极罕见），分配到第一个虚拟章节
-        if target_vs_ref is None:
-            target_vs_ref = matched_boundaries[0][1]
 
-        table_ref_to_virtual_ref[tbl_ref] = target_vs_ref
-        target_vs = virtual_section_by_ref.get(target_vs_ref)
-        if target_vs is not None:
-            target_vs.table_refs.append(tbl_ref)
+def _count_virtual_section_titles(sections: list[_VirtualSection]) -> dict[str, int]:
+    """统计顶层候选章节的规范化标题出现次数。
+
+    Args:
+        sections: 顶层候选章节。
+
+    Returns:
+        非空标题到出现次数的映射。
+
+    Raises:
+        无。
+    """
+
+    counts: dict[str, int] = {}
+    for section in sections:
+        title = _normalize_optional_string(section.title)
+        if title is not None:
+            counts[title] = counts.get(title, 0) + 1
+    return counts
+
+
+def _select_unique_top_section_range(
+    *,
+    title: str,
+    cover_end: int,
+    title_range_candidates: dict[str, list[tuple[int, int]]],
+) -> tuple[int, int] | None:
+    """为唯一顶层标题选择唯一 marker range。
+
+    Args:
+        title: 已规范化且在候选章节中唯一的标题。
+        cover_end: Cover Page 的结束位置。
+        title_range_candidates: 标题到全部 marker ranges 的映射。
+
+    Returns:
+        唯一可证明的范围；缺失或不唯一时返回 ``None``。
+
+    Raises:
+        无。
+    """
+
+    if title == "Cover Page":
+        return (0, max(0, cover_end))
+    candidates = title_range_candidates.get(title, [])
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _record_candidate_table_mapping(
+    *,
+    table_ref: str,
+    section_ref: str,
+    table_ref_to_virtual_ref: dict[str, str],
+) -> None:
+    """把唯一 table ownership 写入 owner-local candidate mapping。
+
+    Args:
+        table_ref: 原始 marker 中的表格引用。
+        section_ref: 唯一匹配的候选章节引用。
+        table_ref_to_virtual_ref: 待更新的 owner-local mapping。
+
+    Returns:
+        无。
+
+    Raises:
+        ValueError: 同一 marker 同时落入多个候选章节范围时抛出。
+    """
+
+    existing_ref = table_ref_to_virtual_ref.get(table_ref)
+    if existing_ref is not None:
+        raise ValueError(f"原始 marker table_ref 落入多个虚拟章节: {table_ref}")
+    table_ref_to_virtual_ref[table_ref] = section_ref
 
 
 def _remap_tables_to_deepest_virtual_sections(
     *,
     marked_text: str,
-    title_ranges: dict[str, tuple[int, int]],
-    cover_end: int,
+    top_section_ranges: dict[str, tuple[int, int]],
     virtual_sections: list[_VirtualSection],
     virtual_section_by_ref: dict[str, _VirtualSection],
     table_ref_to_virtual_ref: dict[str, str],
 ) -> None:
-    """将表格映射从父章节下钻到最深命中子章节。
+    """在同一个 owner-local candidate mapping 内下钻最深子章节。
 
     Args:
         marked_text: 带表格占位符的全文。
-        title_ranges: 一级 marker 标题范围映射。
-        cover_end: Cover Page 的结束位置。
+        top_section_ranges: 已唯一证明的顶层章节范围。
         virtual_sections: 顶层虚拟章节列表。
         virtual_section_by_ref: 全量 ref→章节映射。
         table_ref_to_virtual_ref: 当前 tbl_ref→章节映射（会被就地更新）。
 
     Returns:
         无。
+
+    Raises:
+        ValueError: 一个 marker 同时命中多个候选子章节时抛出。
     """
 
     section_ranges = _build_virtual_section_ranges_in_marked_text(
         marked_text=marked_text,
-        title_ranges=title_ranges,
-        cover_end=cover_end,
+        top_section_ranges=top_section_ranges,
         top_sections=virtual_sections,
         virtual_section_by_ref=virtual_section_by_ref,
     )
@@ -2802,20 +2966,13 @@ def _remap_tables_to_deepest_virtual_sections(
         )
         if deepest_ref == current_ref:
             continue
-        current_section = virtual_section_by_ref.get(current_ref)
-        if current_section is not None and tbl_ref in current_section.table_refs:
-            current_section.table_refs.remove(tbl_ref)
-        target_section = virtual_section_by_ref.get(deepest_ref)
-        if target_section is not None and tbl_ref not in target_section.table_refs:
-            target_section.table_refs.append(tbl_ref)
         table_ref_to_virtual_ref[tbl_ref] = deepest_ref
 
 
 def _build_virtual_section_ranges_in_marked_text(
     *,
     marked_text: str,
-    title_ranges: dict[str, tuple[int, int]],
-    cover_end: int,
+    top_section_ranges: dict[str, tuple[int, int]],
     top_sections: list[_VirtualSection],
     virtual_section_by_ref: dict[str, _VirtualSection],
 ) -> dict[str, tuple[int, int]]:
@@ -2823,22 +2980,18 @@ def _build_virtual_section_ranges_in_marked_text(
 
     Args:
         marked_text: 带表格占位符的全文。
-        title_ranges: 一级 marker 标题范围映射。
-        cover_end: Cover Page 的结束位置。
+        top_section_ranges: 已唯一证明的顶层章节范围。
         top_sections: 顶层章节列表。
         virtual_section_by_ref: ref→章节映射。
 
     Returns:
         `section_ref -> (start, end)` 映射。
+
+    Raises:
+        无。
     """
 
-    ranges: dict[str, tuple[int, int]] = {}
-    for section in top_sections:
-        if section.title == "Cover Page":
-            ranges[section.ref] = (0, max(0, cover_end))
-        elif section.title in title_ranges:
-            ranges[section.ref] = title_ranges[section.title]
-
+    ranges = dict(top_section_ranges)
     for section in top_sections:
         if section.ref not in ranges or not section.child_refs:
             continue
@@ -2909,26 +3062,39 @@ def _find_deepest_virtual_section_ref(
     section_ranges: dict[str, tuple[int, int]],
     virtual_section_by_ref: dict[str, _VirtualSection],
 ) -> str:
-    """查找命中位置对应的最深章节 ref。"""
+    """查找命中位置对应的唯一最深章节 ref。
+
+    Args:
+        start_ref: 已唯一映射的起始章节 ref。
+        position: table marker 在标记全文中的位置。
+        section_ranges: 候选章节 ref 到文本范围的映射。
+        virtual_section_by_ref: 候选章节索引。
+
+    Returns:
+        唯一最深命中章节 ref；没有子章节命中时返回 ``start_ref``。
+
+    Raises:
+        ValueError: 同一层存在多个命中子章节时抛出。
+    """
 
     current_ref = start_ref
     while True:
         current_section = virtual_section_by_ref.get(current_ref)
         if current_section is None:
             return current_ref
-        matched_child_ref: Optional[str] = None
-        matched_start = -1
+        matched_child_refs: list[str] = []
         for child_ref in current_section.child_refs:
             child_range = section_ranges.get(child_ref)
             if child_range is None:
                 continue
             start, end = child_range
-            if start <= position < end and start >= matched_start:
-                matched_child_ref = child_ref
-                matched_start = start
-        if matched_child_ref is None:
+            if start <= position < end:
+                matched_child_refs.append(child_ref)
+        if not matched_child_refs:
             return current_ref
-        current_ref = matched_child_ref
+        if len(matched_child_refs) > 1:
+            raise ValueError(f"table marker 同时命中多个虚拟子章节: {matched_child_refs}")
+        current_ref = matched_child_refs[0]
 
 
 def _has_meaningful_text(content: str, min_len: int = 24) -> bool:

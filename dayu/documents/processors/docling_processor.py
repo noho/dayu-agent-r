@@ -11,9 +11,10 @@ import re
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Protocol, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Any, Final, Optional, Protocol, TypeVar, cast, overload
 
 import pandas as pd
+from docling_core.types.doc.document import TextItem
 
 if TYPE_CHECKING:
     from docling_core.types.doc.document import DoclingDocument, NodeItem, TableItem
@@ -47,6 +48,7 @@ from .perf_utils import ProcessorStageProfiler, is_processor_profile_enabled
 
 _LOW_INFO_TOKENS = {"", "-", "--", "—", "n/a", "na", "none", "nil"}
 _SECTION_CONTENT_CACHE_MAX_ENTRIES = 256
+_DOCLING_DOCUMENT_ROOT_REF: Final[str] = "#"
 
 _CellValueT = TypeVar("_CellValueT")
 
@@ -625,7 +627,7 @@ def _build_tables(
         row_count, col_count = _resolve_table_dimensions(table_item, document)
         headers = _extract_table_headers(table_item, document)
         context_before = _extract_table_context_before(table_item, linear_items)
-        caption = _extract_table_caption(table_item)
+        caption = _extract_table_caption(table_item, document)
         table_type = _classify_table_type(
             row_count=row_count,
             col_count=col_count,
@@ -1169,24 +1171,40 @@ def _extract_table_headers(
     return _deduplicate_headers(normalized_columns[:10])
 
 
-def _extract_table_caption(table_item: TableItem) -> Optional[str]:
+def _extract_table_caption(
+    table_item: TableItem,
+    document: DoclingDocument,
+) -> Optional[str]:
     """提取表格标题。
 
     Args:
         table_item: 表格对象。
+        document: 与表格对象同源的 Docling 文档。
 
     Returns:
         标题字符串；不存在时返回 `None`。
 
     Raises:
-        RuntimeError: 提取失败时抛出。
+        无。
     """
 
-    caption_obj = getattr(table_item, "caption", None)
-    if caption_obj is None:
-        return None
-    caption_text = getattr(caption_obj, "text", caption_obj)
-    return _normalize_optional_string(caption_text)
+    captions: list[str] = []
+    seen: set[str] = set()
+    for caption_ref in table_item.captions:
+        if caption_ref.cref == _DOCLING_DOCUMENT_ROOT_REF:
+            continue
+        try:
+            resolved = caption_ref.resolve(document)
+        except (AttributeError, IndexError):
+            continue
+        if not isinstance(resolved, TextItem):
+            continue
+        caption = _normalize_whitespace(resolved.text)
+        if not caption or caption in seen:
+            continue
+        seen.add(caption)
+        captions.append(caption)
+    return " ".join(captions) or None
 
 
 def _extract_table_context_before(
