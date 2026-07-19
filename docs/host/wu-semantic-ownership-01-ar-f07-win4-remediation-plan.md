@@ -1,15 +1,16 @@
-# WU-SEMANTIC-OWNERSHIP-01 / AR-F07 WIN4-F01..03 Remediation Plan
+# WU-SEMANTIC-OWNERSHIP-01 / AR-F07 WIN4 Remediation Plan
 
 ## 0. Gate identity and decision
 
 - Umbrella work unit：`WU-SEMANTIC-OWNERSHIP-01`。
 - Continuation：`AR-F07` 第四轮真实 Windows evidence remediation。
-- 当前 gate：同一remediation plan gate内的plan re-review finding fix；不是新WU。
-- Baseline HEAD：`54e2dcbf653fb8c37b0206bd7aabbbf329ef040e`。
-- 风险级别：High Risk。WIN4-F02 修改生产 Windows native process contract；WIN4-F01 与
-  WIN4-F03 修改 release-gate/test-evidence contract。
-- 当前结论：`PLAN_REREVIEW_FINDINGS_FIXED / READY_FOR_CONTROLLER_VALIDATION_AND_DUAL_COMPLETE_REREVIEW /
-  IMPLEMENTATION_NOT_AUTHORIZED`。
+- 当前 gate：同一remediation plan gate内的real-Windows diagnostic bounded amendment；不是新WU。
+- 原始 WIN4 baseline HEAD：`54e2dcbf653fb8c37b0206bd7aabbbf329ef040e`；本 amendment 的冻结 remote
+  code/evidence target：`b85def887e72dc69e972f42a82a18989523f8634`。
+- 风险级别：High Risk。既有 WIN4-F01..03 已实施并进入真实 Windows closure；新增
+  WIN4-RW-F01 修改 release-gate success oracle，WIN4-RW-F02 修改生产 CLI secret-input contract。
+- 当前结论：`TWO_REMOTE_ROOT_CAUSES_ESTABLISHED / BOUNDED_PLAN_AMENDMENT_COMPLETE /
+  READY_FOR_CONTROLLER_VALIDATION_AND_DUAL_COMPLETE_PLAN_REVIEW / IMPLEMENTATION_NOT_AUTHORIZED`。
 - 本文不是新 WU、sub-WU、implementation artifact、accepted-plan commit 或 control-doc transition。
 
 本轮动机成立，但三个 finding 的严重性不同：
@@ -671,3 +672,389 @@ domain，Tool Trace/audit/public/LLM-facing/operator log仍禁止API key/header�
 8. local Windows skip与真实 Windows pending状态，不得误报 closure；
 9. residual risks、owner/destination；
 10. 明确 stop在当前 implementation gate，不 commit/push/workflow dispatch/进入review，除非当轮另有授权。
+
+## 13. Real-Windows diagnostic bounded amendment
+
+### 13.0 Precedence, identity and authorization
+
+本节是 R11 workflow_dispatch run `29703932798`、R12 workflow_dispatch run `29703933666` 在冻结 remote target
+`b85def887e72dc69e972f42a82a18989523f8634` 上产生新 evidence 后的有界修订。两次 run 的 workflow identity、path、
+event、branch/ref 与 head SHA 已由 Controller 在读取 evidence 前唯一验证；push 自动触发的 pull-request run 不属于本次
+证据链。
+
+本节只覆盖既有计划中已经被新 evidence 证伪或需要延伸的内容：§0 当前 gate/target、§3 allowlist、§4 slice 顺序、
+§5 negative cases、§6 fresh validation、§7 README decision、§8 real-Windows closure、§9 failure/security gate、§11
+deferred invariant 与 §12 completion report。发生文字冲突时以本节为准；既有 WIN4-S1/S2/S3 的 accepted contracts、
+已关闭 findings 与非冲突约束继续有效，不重新实施、不回滚，也不建立新 WU/sub-WU。
+
+本 amendment 精确增加 `2` 个 implementation slices：`WIN4-RW-S1` 对应 `WIN4-RW-F01`，`WIN4-RW-S2` 对应
+`WIN4-RW-F02`。两者语义 owner、允许路径、blast radius 与独立验证矩阵不同，因此不得合并；也不得继续拆成按文件、
+测试类别或 reviewer comment 划分的更多 slices。当前只授权 plan amendment；在 amended plan 经 Controller validation、
+AgentMiMo/AgentDS 双路完整 plan review、finding fix 与双路完整 re-review，并形成 accepted amended-plan commit 前，
+不得 implementation、stage、commit、push、dispatch 或进入 PR review。
+
+### 13.1 First-principles motivation and root-cause lock
+
+#### 13.1.1 WIN4-RW-F01 — display assertion is not the upload-success owner
+
+动机成立，严重性限定为 release-gate/test contract blocker，不是 production upload defect：
+
+1. R11 four-node gate为 `3 passed, 1 failed`，R12 embedded R11为 `1 passed, 1 failed`；唯一失败节点都是
+   `test_windows_generated_script_runs_real_cli_into_temp_storage`。
+2. 该 test 先得到真实 `cmd.exe` execution exit `0`，随后才断言旧字面量 `Fins result`。锁定 target 的
+   `dayu/cli/output.py` 已由 output owner 把 terminal summary prefix 定义为 `Fins summary`；真实 stdout 同时包含
+   typed `status="ok"` summary。展示词漂移不会推翻已经完成的业务运行。
+3. 同一 standalone R11 artifact 的 Fins published tree 已包含 company meta、filing manifest、source meta、primary
+   source 与 Docling result；失败只阻止随后写出 `cli-grammar-oracle.json`。因此 company-name、Windows argv quoting、
+   CLI→Service→Fins、Docling、storage transaction/publication 都不是本轮根因。
+4. `execution.stdout` 的 display grammar 属于 CLI output owner；真实上传 test 消费者无权选择某个 prefix 作为业务成功
+   真源，也无权把旧词替换成当前或另一个硬编码词来继续耦合 display。
+
+唯一 remediation owner 是 `tests/cli/test_upload_filings_from_command.py` 的真实 Windows smoke success oracle。
+业务成功必须由两个同源事实共同证明：OS process exit `0` 与 `dayu.fins.storage` public repository 读取到的 published
+company/source facts。生成脚本中的 company-name pre-execution oracle，以及 workflow 对 generated-script hash、
+source artifact count 和 required artifact existence 的 integrity 校验继续保留。
+
+#### 13.1.2 WIN4-RW-F02 — redirected secret input is missing at the CLI owner boundary
+
+动机成立，严重性是生产 CLI input-boundary 缺陷，不是 setx/native process defect：
+
+1. R12 init gate为 `8 passed, 1 failed`；唯一失败 node 的 outer `180s` 到期时仍未退出，safe failure truth是
+   `returncode_at_timeout=not_exited / cleanup=completed / cleanup_returncode=1`。
+2. `_run_init()` 已在启动 child 前把完整交互逐行写入 anonymous redirected stdin handle；它没有使用 test-side
+   input shim，且 canary 未进入失败文本。
+3. 锁定 target 的 `dayu.cli.commands.init::_collect_environment_persistence_plan()` 对 required secret 和每个 optional
+   secret 直接调用 `getpass.getpass()`。
+4. CPython 3.11 Windows `win_getpass()` 只在 `sys.stdin is not sys.__stdin__` 时 fallback；OS-level redirected handle
+   并不替换 Python 的 `sys.__stdin__` 对象。因此该分支仍调用 console `msvcrt.getwch()`，忽略传入 stream，预置的
+   redirected stdin bytes 无消费者。
+5. timeout 位于第一个 required secret input，发生在确认、workspace staging、`setx` 与 registry round-trip 之前；
+   不能把它重新归因到 WIN4-S2 native timeout，也不能用 test harness 或 outer timeout掩盖。
+
+唯一 remediation owner 是 `dayu/cli/commands/init.py` 的 secret-input boundary。输入能力，而不是 OS 名称或 test
+身份，决定读取路径：interactive TTY 继续 hidden getpass；redirected stdin 明确一次读取一个 logical line。该边界只拥有
+secret value 的读取和 EOF/interrupt 语义，不拥有 environment persistence、registry、Config、Host durable state、
+authorization 或通用 secret lifecycle。
+
+### 13.2 Exact owner contracts
+
+#### 13.2.1 WIN4-RW-F01 success oracle
+
+1. 删除真实 Windows smoke 对 `"Fins result"` 的断言，不增加 `Fins summary`、`Fins succeeded` 或任何其它
+   stdout/stderr display 文本、generic message、prefix、substring、regex 或 parser 断言。
+2. 保留 `execution.returncode == 0`，且失败时只用既有 `execution.stderr` 帮助 test failure；不得从 stdout 文案推导
+   success、document id、stage 或 root cause。
+3. 通过 `dayu.fins.storage` public repository 实现读取 published tree，而不是 raw JSON、内部 core/private path 或
+   `rglob` 反推业务事实：
+   - `FsCompanyMetaRepository(storage).get_company_meta("AAPL")` 必须返回 exact ticker `AAPL` 与 company name
+     `Apple Inc.`；
+   - `FsSourceDocumentRepository(storage).list_source_document_ids("AAPL", SourceKind.FILING)` 必须返回唯一一个
+     published filing document id；
+   - 对该 id 必须使用 public context-manager lifecycle
+     `with source_repository.read_source_snapshot(..., materialize_files=False) as snapshot:`，并且只在 `with` 块内读取和确认
+     exact ticker、document id、`SourceKind.FILING`、primary filename等于本次 source basename、完整 descriptor集合非空且
+     包含该 primary。CLI test只正确消费既有 Fins public contract，不重复测试 Fins owner 自身的 close-after-use语义。
+4. 既有 filesystem `source_artifact_count` 只保留为 uploaded evidence package 的物理 integrity count，不再承担业务
+   success 语义；其值、generated-script SHA-256、`cmd_invocation`、`company_name_supplied=true` 与 test node/result
+   继续写入现有 `cli-grammar-oracle.json`，不得新增 output display 字段。
+5. 保留 `_assert_single_windows_upload_company_name()` 在执行前逐 token 证明唯一 company-name；不得改成 comment、
+   whole-file substring、execution result或 storage反推输入。
+
+#### 13.2.2 WIN4-RW-F02 secret-input boundary
+
+在 `dayu/cli/commands/init.py` 增加一个模块级私有 helper `_read_secret_input(prompt: str) -> str`，由 required 与
+optional secret 两处唯一复用；不新增 callback、factory、Protocol、class、runtime helper或跨模块 facade：
+
+1. 先检查当前 `sys.stdin.isatty()`。为 `True` 时只调用 `getpass.getpass(prompt)`；不得把 TTY secret 改成
+   `input()`/`readline()`，不得在 stdout/stderr 回显 value。
+2. 为 `False` 时，不调用 `getpass`，只把 prompt 写到 `sys.stderr` 并 flush，然后对当前 `sys.stdin` 调用恰好一次
+   `readline()`。非 EOF 返回值只移除一个 logical line ending：先判断并实际移除末尾单个 `\n`；只有该次确实移除了
+   `\n`，且移除后新末尾是 `\r` 时，才继续移除该单个 `\r`。没有伴随已移除 `\n` 的孤立 trailing `\r` 必须原样
+   保留；其它前导、尾随空白与字符也原样保留，由现有 required-empty/optional-empty contract决定。禁止使用会移除任意
+   数量尾随字符的 `rstrip` 或其它 strip操作实现该 contract。
+3. TTY path只捕获 `getpass.getpass()` 抛出的 `EOFError`；redirected path只把 `readline() == ""` 识别为 EOF。两者都在
+   helper 内收敛为同一个 value-free `CliInitOperationError("secret input ended before completion")`，不得把 prompt、secret、
+   raw buffer或 raw exception text投影到用户输出。`KeyboardInterrupt` 不捕获、不改写，继续由现有 CLI owner映射为 exit `130`。
+4. `_collect_environment_persistence_plan()` 只把两处 direct `getpass.getpass()` 换成该 helper。required 空行继续
+   value-free fail closed；optional 空行继续 skip；`OPTIONAL_ENVIRONMENT_NAMES` 顺序、已有环境跳过规则、names-only
+   preview、最终 `_confirm()` 与 confirmed typed plan顺序不变。
+5. 分流必须 capability-based 且平台中立；不得使用 `os.name`/`platform.system()` 特判 Windows，不得读取
+   `sys.__stdin__` identity模拟 CPython私有分支，不得在 test/runtime判断 GitHub Actions。
+
+### 13.3 Allowed and forbidden paths
+
+后续 implementation 必须由 Controller 先冻结 `AMENDED_PLAN_BASE`（accepted amended-plan commit）。相对该 base 的
+implementation diff 只允许：
+
+| Slice | Allowed paths | Ownership purpose |
+| --- | --- | --- |
+| WIN4-RW-S1 | `tests/cli/test_upload_filings_from_command.py` | 删除 display consumer耦合，以 process + public Fins storage owner facts证明业务成功，保留 company-name/oracle/artifact integrity |
+| WIN4-RW-S2 | `dayu/cli/commands/init.py`; `tests/cli/test_init_command.py`; `README.md`; `tests/README.md` | 实现并测试 TTY/redirected secret-input owner contract，更新最终用户与 test-gate说明 |
+
+明确禁止修改或新增：
+
+- `dayu/cli/output.py`、`dayu/cli/init_environment.py`、`tests/cli/test_init_smoke.py`；
+- `dayu/fins/` 下任何 production code、schema、storage protocol/implementation、pipeline、Docling或 renderer；
+- `.github/workflows/r11-upload-script-windows.yml`、`.github/workflows/r12-init-windows.yml`；
+- `docs/host/issues-implementation-control.md`、design doc、其它 control/review artifact；
+- `dayu.runtime` secret helper、统一 secret/credential/authorization infrastructure、compatibility wrapper/alias/fallback；
+- PowerShell、PTY、console wrapper、Win32 handle API、job object、process group、process-tree治理、test harness shim、
+  timeout增加、skip/xfail、mock替代 real node。
+
+若 implementation 发现必须越过上述 allowlist，立即停止并回 Controller 做新的 diagnostic-first plan amendment；不得自行
+扩大本节。
+
+### 13.4 Ordered implementation slices
+
+#### WIN4-RW-S1 — Process + storage-owned upload success
+
+Objective：关闭旧 display assertion，同时使真实 Windows smoke 的业务成功断言只依赖 OS exit 与 storage owner facts。
+
+Exact changes：严格执行 §13.2.1；更新 imports 与完整中文 docstring；不提取新的 production/test compatibility helper，
+不改变生成、执行、company-name preflight、artifact目录或 oracle schema既有字段。
+
+Dependencies：无代码依赖。先实施并单独 review，便于 R11 与 R12 embedded R11 failure和生产 input fix解耦。
+
+Independent acceptance：target test diff零新增 display assertion；非 Windows focused suite只能证明静态/helper/其它平台回归，
+真实 node closure必须等待 §13.8 的 fresh R11 与 R12 embedded R11。
+
+Stop condition：若 public storage repositories无法表达 published company/source facts，或必须改 production Fins、raw storage
+JSON/private core、CLI output、workflow才能让 test通过，停止并回 Controller。
+
+#### WIN4-RW-S2 — TTY-hidden and redirected line-oriented secret input
+
+Objective：让 CLI input owner根据 stdin capability选择 hidden TTY或 redirected logical-line读取，并锁定安全 failure语义。
+
+Exact changes：严格执行 §13.2.2；在 `tests/cli/test_init_command.py` 直接测试 owner。所有受影响既有 getpass tests必须把
+production实际读取的 `sys.stdin` 替换为 test-owned、严格 typed TTY fake：其 `isatty()` 恒为 `True`，`readline()` 一旦被调用
+立即 assertion失败；不得 mock production `_read_secret_input`，不得修改或依赖 `sys.__stdin__`，也不得依赖本机/CI ambient TTY。
+redirected owner tests必须使用真实 `io.StringIO` 或等价的严格 typed stream，并显式保证 `isatty() == False`。不得在
+`_run_init()`、workflow或 Windows-only test注入 shim。
+
+Dependencies：无 S1 代码依赖，但按 S1→S2 串行实施。只有两 slice均 accepted后才允许 aggregate validation和 remote rerun。
+
+Independent acceptance：owner tests在非 Windows也能确定性证明 capability分流、消费顺序、EOF/interrupt与零回显；真实 Windows
+closure仍必须由 §13.8 的 fresh R12 run证明。
+
+Stop condition：若需要修改 setx、outer harness、console/PTY/process tree、增加 timeout、共享 secret infrastructure或 test-only
+production seam，停止并回 Controller。
+
+### 13.5 Owner-test and negative-case matrix
+
+#### 13.5.1 WIN4-RW-S1
+
+- execution nonzero 必须在任何 storage success assertion和 oracle写入前失败；不得把已存在 artifact误报为本次成功。
+- exit `0` 但 company meta缺失/非法、filing document id为零或多个、snapshot identity/source kind/primary descriptor不一致时
+  必须失败。
+- source snapshot的 identity/source kind/primary filename/descriptors只在 public `with` lifecycle内读取；CLI test不得重复增加
+  Fins close-after-use owner test。
+- stdout 为空、prefix变化、summary字段顺序变化或新增 progress文案时，只要 exit与 storage owner facts成立，不得失败。
+- stdout含任意看似成功词但 exit非零或 storage owner facts缺失时，不得通过。
+- company-name pre-execution oracle仍必须证明 exact one `Apple Inc.`；comment-only、零条或多条业务命令继续 fail closed。
+- generated-script hash、artifact count与必需 oracle文件必须继续由现有 workflow integrity gate复核。
+
+#### 13.5.2 WIN4-RW-S2
+
+- redirected stdin：使用真实 `io.StringIO` 或等价严格 typed stream显式证明 `isatty() == False` 时，
+  `getpass.getpass()` 必须零调用；prompt可见，恰好一个 `readline()` 消费一行，secret value在 stdout/stderr/captured
+  exception/diagnostic中零命中。
+- TTY：受影响既有 getpass tests使用 test-owned严格 typed `sys.stdin` fake，`isatty()` 恒为 `True`，`readline()` 被调用即
+  assertion失败；只调用 hidden getpass，prompt与返回值传递不漂移，不 mock `_read_secret_input`，不依赖 `sys.__stdin__`
+  或 ambient TTY。
+- line endings：LF与CRLF各只移除一个 logical ending；空行得到空值；孤立 trailing `\r` 原样保留并有 bare-CR owner test；
+  其它空白不 strip，禁止 `rstrip` 或等价的过度删除。
+- EOF：TTY `getpass.getpass()` 抛出的 `EOFError`与 redirected `readline() == ""`都转成同一 value-free
+  `CliInitOperationError`，不进入 optional、confirmation、persistence或 workspace publication。
+- interrupt：TTY getpass与 redirected read的 `KeyboardInterrupt`都保持原类型；full CLI映射 exit `130`，后续输入与持久化零调用。
+- required：缺少现有环境且输入非空时形成首个 entry；空行保持 required missing failure。
+- optional：只按 `OPTIONAL_ENVIRONMENT_NAMES` 顺序询问缺失项；空行 skip，非空行按原顺序进入 entries，已有 env不消费输入。
+- confirmation：所有 secret收集完成后才显示 names-only preview并消费一次现有 yes/no确认；拒绝/EOF保持现有不发布语义；
+  confirmation不得提前、重复或读取 secret helper。
+- non-disclosure：required/optional values不得进入 stdout、stderr、exception text/repr、pytest capture、README示例或 artifact。
+
+### 13.6 Fresh local validation, coverage and source scans
+
+所有 implementation验证必须在 accepted amended-plan base上 fresh执行，不复用 b85 之前或旧 WIN4 slice的通过记录。命令先执行：
+
+```bash
+source .venv/bin/activate
+```
+
+#### 13.6.1 Per-slice focused tests
+
+WIN4-RW-S1：
+
+```bash
+pytest tests/cli/test_upload_filings_from_command.py -q
+pytest \
+  tests/cli/test_upload_filings_from_command.py::test_posix_generated_script_runs_real_cli_into_temp_storage \
+  -q
+```
+
+非 Windows 对 real Windows node 的 skip只能记录为平台事实。
+
+WIN4-RW-S2：
+
+```bash
+pytest tests/cli/test_init_command.py -q
+pytest tests/cli/test_init_smoke.py -q
+```
+
+至少单独选择新增 owner nodes运行一次，evidence中逐项报告 redirected/TTY test-owned stream、LF/CRLF/bare-CR、两种
+EOF表现、interrupt/order/non-disclosure结果。
+
+#### 13.6.2 Aggregate and broader regression
+
+```bash
+pytest \
+  tests/cli/test_upload_filings_from_command.py \
+  tests/cli/test_init_command.py \
+  tests/cli/test_init_smoke.py \
+  -q
+pytest tests/cli -q
+```
+
+#### 13.6.3 Coverage
+
+```bash
+pytest tests/cli/test_init_command.py \
+  --cov=dayu.cli.commands.init \
+  --cov-branch \
+  --cov-report=term-missing \
+  --cov-report=json:workspace/tmp/win4-rw-init-command-coverage.json \
+  -q
+```
+
+`dayu/cli/commands/init.py` 单文件 line coverage必须 `>=80%`；新增 TTY、redirected、LF、CRLF、bare-CR、EOF、interrupt、
+required/optional/confirmation branches必须被 owner tests直接命中。禁止 pragma/omit、降低阈值或以 real-Windows skip替代。
+
+#### 13.6.4 Pyright and Ruff
+
+```bash
+python -m pyright dayu/ tests/ utils/
+python -m ruff check \
+  dayu/cli/commands/init.py \
+  tests/cli/test_init_command.py \
+  tests/cli/test_upload_filings_from_command.py
+```
+
+full pyright与 scoped Ruff必须零诊断。implementation entry与最终 tree使用同一 Ruff版本执行：
+
+```bash
+python -m ruff check dayu tests utils --output-format json
+```
+
+若 full Ruff存在 accepted amended-plan base既有项，必须按
+`(filename, location, code, message, fix-applicability)` 精确比较，新增/扩散为零；不得用总数相同或顺手清理 unrelated
+baseline代替。
+
+#### 13.6.5 Diff, allowlist and README checks
+
+```bash
+git diff --check
+git status --short
+git diff --name-only AMENDED_PLAN_BASE
+git diff --cached --name-only
+```
+
+implementation完成前 staged tree必须为空；相对 `AMENDED_PLAN_BASE` 的 code/test/README diff只能属于 §13.3。必须显式证明
+两个 workflow、`tests/cli/test_init_smoke.py`、`dayu/cli/output.py`、`dayu/cli/init_environment.py` 与全部 Fins production
+paths零 diff。
+
+README在修改前重新读取各自 `Agent更新约束`，实现后验证：
+
+```bash
+rg -n 'TTY|重定向|stdin|隐藏|secret|API Key' README.md tests/README.md
+git diff -- README.md tests/README.md
+```
+
+只允许 §13.7 的当前行为说明；不得写未来方案、内部 canary公式、run-specific值、测试实现细节或治理流水账。
+
+#### 13.6.6 Ownership and forbidden-source scans
+
+```bash
+rg -n 'getpass\.getpass' dayu/cli/commands/init.py
+rg -n 'sys\.__stdin__|msvcrt|PowerShell|Start-Process|pty|PTY|JobObject|CREATE_NEW_PROCESS_GROUP|process.tree' \
+  dayu/cli/commands/init.py tests/cli/test_init_command.py tests/cli/test_upload_filings_from_command.py
+rg -n 'shell\s*=\s*True|errors\s*=\s*[^,)]*replace|hasattr\(|getattr\(' \
+  dayu/cli/commands/init.py tests/cli/test_init_command.py tests/cli/test_upload_filings_from_command.py
+git diff --unified=0 AMENDED_PLAN_BASE -- tests/cli/test_upload_filings_from_command.py | \
+  rg '^\+.*(Fins (result|summary|progress|succeeded|failure|cancelled)|execution\.(stdout|stderr))'
+rg -n 'Issue 142|Issue 151|Issue 175|Issue 177|Issue 178|authorization|secret infrastructure' \
+  dayu/cli/commands/init.py tests/cli/test_init_command.py tests/cli/test_upload_filings_from_command.py
+```
+
+第一条必须只命中 `_read_secret_input()` 的 TTY分支一次；第二、三条相对 base新增命中为零，且第二条完整输出应为零；
+display-added-diff scan必须零输出；最后一条新增命中为零。动态 owner tests，而不是固定 secret blacklist，负责证明 value
+在 stdout/stderr/exception/capture零命中。
+
+### 13.7 README and design decision
+
+- `README.md`：需要在 WIN4-RW-S2 更新。当前最终用户手册把 secret input概括为“隐藏输入”；应最小澄清真实 TTY仍使用
+  hidden input，redirected stdin每个 secret显式消费一行且 CLI不把 value写回 stdout/stderr，最终 names-only确认顺序不变。
+  不提供含真实/示例 API key的 pipe命令。
+- `tests/README.md`：需要在 WIN4-RW-S2 更新。补充 R12 real-init redirected-stdin owner gate与 TTY/EOF/interrupt/order/
+  non-disclosure owner-test覆盖；保留现有 artifact/value-free与 outer timeout说明。
+- `dayu/config/README.md`：不更新。Config schema、`api_key_ref`、environment persistence target与明文不入 config contract均不变。
+- `dayu/fins/README.md`：不更新。WIN4-RW-S1只迁移 test success oracle到既有 public storage owner，不改 storage contract。
+- `dayu/README.md`、`docs/fins/design.md`、`docs/ui/design.md`、`docs/host/design.md`：不更新。无分层、装配、Host/Engine、
+  durable schema或 LLM-facing语义变化。
+
+若实际实现引入新的用户可见 grammar、参数、output channel、持久化目标或架构边界，停止并回 plan review，不机械扩写 README。
+
+### 13.8 Fresh remote rerun and same-run canary closure
+
+只有两个 slices、per-slice review/fix/re-review、aggregate validation/deepreview全部 accepted并形成唯一 accepted
+implementation commit后，Controller才可重新 dispatch。当前 R11 `29703932798` 与 R12 `29703933666` 只证明本 amendment
+root cause，不得复用为 closure。
+
+| Gate | Fresh required result | Positive owner evidence | Failure/stop semantics |
+| --- | --- | --- | --- |
+| R11 identity | 本次 dispatch response返回唯一新 run id；metadata精确绑定 R11 workflow/path、`workflow_dispatch`、target ref 与 accepted implementation head SHA | 不从最近 run、时间或 artifact名反推 | 任一 missing/mismatch/ambiguous立即 fail |
+| R11 four nodes | `4/4 passed`，workflow exit `0` | real upload exit `0`；company-name oracle；public storage company/source snapshot facts；oracle存在 | 新 failure只记录 safe owner facts，不解析 display/generic message |
+| R11 artifact integrity | pass | generated script SHA-256与 oracle一致；physical artifact count一致且 >0；required recorder/script/oracle/JUnit/stdout/stderr存在 | path/hash/count/missing任一失败即gate fail |
+| R12 identity | 本次 dispatch response返回唯一新 run id；metadata精确绑定 R12 workflow/path、`workflow_dispatch`、target ref 与 accepted implementation head SHA | 与 R11 run独立锁定，不混用 | 任一 missing/mismatch/ambiguous立即 fail |
+| R12 init | `9/9 passed`，workflow exit `0` | real redirected stdin被 owner消费；setx round-trip、exact registry cleanup与其余8 nodes继续通过 | timeout仍只使用既有 safe category/returncode/cleanup projection，不读取 raw input |
+| R12 embedded R11 | `2/2 passed` | adversarial argv与 process+storage-owned real upload同时通过 | 同R11 safe failure contract |
+| R12 artifact integrity | pass | 同一 R12 run的 JUnit、source hashes、全部 downloaded artifacts与完整 workflow logs齐全并重新计算 hash | lineage不完整或跨 run混用即fail |
+| R12 same-run canary gate | pass | Controller按既有 §2.3/§9.3 frozen text独立派生，仅在进程内 exact scan同一 R12 run的全部 artifact files与全部 workflow log files，零命中 | 不读取/回显/落盘 run-specific canary；命中只记录 run/head、relative locator、category与status |
+
+R12 canary scan必须在读取 failure content前完成，且 scan、JUnit/source-hash/artifact integrity与 workflow conclusion必须属于
+同一 fresh R12 run。Test/production/Controller不得共享派生 helper、constant module或 needle artifact；standalone R11未消费
+R12 canary，仍只按自身 artifact integrity与无 secret input contract验收，不得声称由 R12 scan证明。
+
+只有 fresh R11 overall success、fresh R12 overall success、R12 embedded R11 success、全部 required artifacts完整且同 run、
+same-run canary gate通过，才能关闭 `WIN4-RW-F01/F02`、既有 WIN4 real-Windows blocker与 AR-F07。
+
+### 13.9 Security, deferred scope, residual risk and completion
+
+Security boundary保持：Config与 Host internal SQLite/EventLog是 trusted-local domain；只有 Tool Trace/audit以及 public/
+LLM-facing/operator diagnostics禁止 API key/header明文。本 amendment不读取、迁移、重写或扩大 durable secret范围，不把
+redirected stdin伪装成 encrypted transport，也不新增 zeroization、credential broker、unified authorization或 secret infra。
+
+明确 deferred/forbidden：Issue 142、151、175、177、178；Web/WeChat/render；通用 console/PTY/process isolation；
+setx redesign；统一 authorization/secret management；Fins generic diagnostic schema。Gemini low-budget继续是
+`EXPECTED_TEST_ACCOUNT_QUOTA / NO_CODE_ACTION / NON_BLOCKING`，不是 finding、blocker或验收输入。
+
+Residual risks及 owner/destination：
+
+1. 非 Windows本地无法证明 CPython 3.11 Windows console与 redirected handle的真实组合；owner unit tests只锁定 capability
+   contract，最终证据唯一 destination是 §13.8 fresh R12。
+2. caller-owned pipe、OS handle与当前 CLI process memory按输入本质会暂存 secret；本 WU只承诺 CLI不主动回显或投影，
+   不承诺外部 shell/process inspection安全。扩大 transport threat model需独立安全设计，不得在本 amendment实现。
+3. 若 fresh R11 exit/storage owner事实失败，或 fresh R12在 secret读取之后出现新 failure，立即进入 diagnostic-first stop；
+   不得沿用当前两个 root cause解释新证据。
+
+Open questions：`0`。当前 owner、输入能力分流、EOF/interrupt、slice allowlist、README、remote closure与 security boundary均已
+收敛；implementation agent无需重新设计。
+
+后续 implementation completion artifact除 §12 既有要求外，必须新增报告：
+
+1. `AMENDED_PLAN_BASE`、accepted implementation commit与两个 fresh dispatch-returned run ids/head SHA；
+2. exact `2` slices的 changed paths、owner tests、review与回滚边界；
+3. WIN4-RW-S1没有 display assertion、process exit与 public storage facts、company-name oracle和 artifact integrity结果；
+4. WIN4-RW-S2 test-owned TTY/redirected streams、LF/CRLF/bare-CR、两种 EOF表现、interrupt/required/optional/
+   confirmation/non-disclosure逐项结果；
+5. focused/aggregate/CLI regression、coverage、pyright、scoped/full Ruff baseline、diff/allowlist、README/source scans；
+6. fresh R11/R12 identity、node counts、artifact integrity与 Controller-owned same-run value-free canary scan结论；
+7. local platform skips、全部 residual risk与 diagnostic-first stop状态，不把 remote pending误报为 closure。
