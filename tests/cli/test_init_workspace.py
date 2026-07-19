@@ -1180,6 +1180,24 @@ def test_sync_staged_config_propagates_file_fsync_failure_or_interrupt(
         )
 
 
+def test_staged_file_sync_open_flags_match_platform_flush_contract() -> None:
+    """Windows 使用可 flush descriptor，POSIX 保留只读 no-follow 边界。
+
+    :returns: None。
+    :raises AssertionError: 平台 open flags 漂移时抛出。
+    """
+
+    assert init_workspace._staged_file_sync_open_flags("Windows") == os.O_RDWR
+    if os.name == "posix":
+        expected_posix_flags = os.O_RDONLY | os.O_NOFOLLOW
+        assert init_workspace._staged_file_sync_open_flags("Darwin") == expected_posix_flags
+        assert init_workspace._staged_file_sync_open_flags("Linux") == expected_posix_flags
+
+    with pytest.raises(InitWorkspaceError) as raised:
+        init_workspace._staged_file_sync_open_flags("UnknownOS")
+    assert raised.value.stage == "platform"
+
+
 @pytest.mark.parametrize("boundary", ("package-copy", "service-discovery"))
 @pytest.mark.parametrize(
     "failure",

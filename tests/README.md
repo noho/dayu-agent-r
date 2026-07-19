@@ -37,23 +37,26 @@ pytest tests/fins/test_upload_batch.py tests/cli/test_upload_filings_from_comman
   tests/cli/test_public_package_entrypoints.py -q
 ```
 
-真实 Windows gate 由 `.github/workflows/r11-upload-script-windows.yml` 在 Python 3.11 / `windows-latest` 上运行：
+真实 Windows gate 由 `.github/workflows/r11-upload-script-windows.yml` 在 Python 3.11 / `windows-latest` 上运行。
+workflow 先用 `cmd.exe /d /c ver` 的 exit 0 证明真实 cmd execution capability，并把 `cmd.exe /?` 的
+实际 0/1 help exit 分类为诊断证据；help exit 不再代替 execution gate：
 
 ```bash
-python -m pytest tests/cli/test_upload_filings_from_command.py::test_windows_cmd_script_round_trips_adversarial_argv_with_real_cmd tests/cli/test_upload_filings_from_command.py::test_windows_generated_script_runs_real_cli_into_temp_storage tests/cli/test_arg_parsing.py::test_upload_actions_default_to_auto_and_batch_rejects_delete -q
+python -m pytest tests/cli/test_run_keys.py::test_new_running_key_monitor_uses_noop_for_non_posix_tty tests/cli/test_upload_filings_from_command.py::test_windows_cmd_script_round_trips_adversarial_argv_with_real_cmd tests/cli/test_upload_filings_from_command.py::test_windows_generated_script_runs_real_cli_into_temp_storage tests/cli/test_arg_parsing.py::test_upload_actions_default_to_auto_and_batch_rejects_delete -q
 ```
 
-前两个 node 必须实际经过 `cmd.exe /d /c`，分别验证对抗参数逐元素恢复和
+其中两个 upload nodes 必须实际经过 `cmd.exe /d /c`，分别验证对抗参数逐元素恢复和
 `python -m dayu.cli -> Service -> Fins -> temp storage` 闭环；非 Windows 本地环境只会明确 skip，不能替代 workflow 的
-真实 runner 证据。workflow 通过时的证据包包含 JUnit、生成脚本、recorder oracle、CLI storage oracle、stdout/stderr、环境与
-`cmd.exe /?` 输出；失败时仍通过 `if: always()` 发布已经产生的诊断证据。
+真实 runner 证据。workflow 通过时的证据包包含 JUnit、生成脚本、recorder oracle、CLI storage oracle、stdout/stderr、环境、
+`cmd.exe /d /c ver` 输出与 `cmd.exe /?` 输出；失败时仍通过 `if: always()` 发布已经产生的诊断证据。
 
 真实 init Windows gate 由 `.github/workflows/r12-init-windows.yml` 使用 Python 3.11 与
 `constraints/lock-windows-x64-py311.txt` 运行。它执行真实 FIRST→PRESERVE→OVERWRITE→
 RESET No→RESET Yes 与 `ConfigLoader`/scene 重载，验证 ordinary Windows transaction 不依赖
 POSIX directory fsync；还覆盖真实 nested junction/reparse 外部 sentinel、普通 symlink 的精确
 privilege skip、workspace root identity、replace rollback、scan-delete race、真实 `setx` 用户环境
-round-trip/cleanup，以及 R11 的两个真实 cmd/upload nodes。上传 artifact 只包含 JUnit、版本、
+round-trip/幂等 absent cleanup、非 POSIX TTY no-op owner boundary，以及 R11 的两个真实 cmd/upload nodes。
+上传 artifact 只包含 JUnit、版本、
 capability、source hashes 和环境变量名，不保存 environment/registry values。
 
 默认 pytest 配置会排除 `stress` marker，因此常规命令不会运行 Host production stress suite。显式运行 stress suite 时需要覆盖默认 `addopts`：

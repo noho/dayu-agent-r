@@ -58,6 +58,61 @@ class _WindowsOSError(Protocol):
     winerror: int
 
 
+class _RegistryCommandRunner(Protocol):
+    """Windows registry test command runner 协议。"""
+
+    def __call__(
+        self,
+        arguments: tuple[str, ...],
+    ) -> subprocess.CompletedProcess[str]:
+        """执行一个不投影 value 的 registry command。
+
+        :param arguments: ``reg.exe`` 后的参数。
+        :returns: 捕获输出的完成结果。
+        :raises OSError: 进程创建失败时抛出。
+        """
+
+        ...
+
+
+class _ScriptedRegistryCommandRunner:
+    """按顺序返回指定退出码的 registry owner-test runner。"""
+
+    calls: list[tuple[str, ...]]
+
+    def __init__(self, returncodes: tuple[int, ...]) -> None:
+        """初始化 scripted runner。
+
+        :param returncodes: 每次调用依次返回的 exit codes。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._returncodes = list(returncodes)
+        self.calls = []
+
+    def __call__(
+        self,
+        arguments: tuple[str, ...],
+    ) -> subprocess.CompletedProcess[str]:
+        """记录参数并返回下一结果。
+
+        :param arguments: ``reg.exe`` 后的参数。
+        :returns: 带测试 secret 输出的完成结果，用于证明错误不回显命令输出。
+        :raises AssertionError: 调用次数超过脚本时抛出。
+        """
+
+        if not self._returncodes:
+            raise AssertionError("unexpected registry command invocation")
+        self.calls.append(arguments)
+        return subprocess.CompletedProcess(
+            args=("reg.exe", *arguments),
+            returncode=self._returncodes.pop(0),
+            stdout="test-secret-value",
+            stderr="test-secret-error",
+        )
+
+
 def _write_text(path: Path, value: str) -> None:
     """创建 parent 并写入 UTF-8 文本。
 
@@ -758,6 +813,100 @@ def _run_registry_command(arguments: tuple[str, ...]) -> subprocess.CompletedPro
     )
 
 
+def _delete_registry_value_and_verify_absent(
+    *,
+    registry_key: str,
+    value_name: str,
+    command_runner: _RegistryCommandRunner = _run_registry_command,
+) -> None:
+    """幂等删除 Windows registry value 并证明精确名称已不存在。
+
+    ``reg delete`` 对原本不存在的 value 返回 1，因此最终 cleanup truth 必须由
+    delete 后的精确 value query 与父 key 可访问 probe 共同决定，而不能只读取
+    delete return code 或把任意 query failure 当作 absent。
+
+    :param registry_key: 目标 registry key。
+    :param value_name: 只允许进入诊断的环境变量名。
+    :param command_runner: registry command owner；默认使用真实 ``reg.exe``。
+    :returns: ``None``。
+    :raises AssertionError: 命令返回未分类状态或 value 仍存在时抛出。
+    """
+
+    deletion = command_runner(("delete", registry_key, "/v", value_name, "/f"))
+    if deletion.returncode not in {0, 1}:
+        raise AssertionError(f"registry cleanup command failed for env name: {value_name}")
+    verification = command_runner(("query", registry_key, "/v", value_name))
+    if verification.returncode == 0:
+        raise AssertionError(f"registry cleanup left env name present: {value_name}")
+    if verification.returncode != 1:
+        raise AssertionError(f"registry cleanup verification failed for env name: {value_name}")
+    key_access = command_runner(("query", registry_key))
+    if key_access.returncode != 0:
+        raise AssertionError(f"registry cleanup key access failed for env name: {value_name}")
+
+
+@pytest.mark.parametrize("deletion_returncode", (0, 1))
+def test_registry_cleanup_accepts_deleted_or_already_absent_value(
+    deletion_returncode: int,
+) -> None:
+    """Cleanup 以 query absent 为真源，兼容实际删除与原本不存在。
+
+    :param deletion_returncode: ``reg delete`` 的成功或 missing exit code。
+    :returns: ``None``。
+    :raises AssertionError: helper 未执行精确 delete/query 或错误拒绝 absent 时抛出。
+    """
+
+    runner = _ScriptedRegistryCommandRunner((deletion_returncode, 1, 0))
+
+    _delete_registry_value_and_verify_absent(
+        registry_key=r"HKCU\Environment",
+        value_name=_OPENAI_ENV_NAME,
+        command_runner=runner,
+    )
+
+    assert runner.calls == [
+        ("delete", r"HKCU\Environment", "/v", _OPENAI_ENV_NAME, "/f"),
+        ("query", r"HKCU\Environment", "/v", _OPENAI_ENV_NAME),
+        ("query", r"HKCU\Environment"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("returncodes", "expected_message"),
+    (
+        ((2,), "registry cleanup command failed"),
+        ((0, 0), "registry cleanup left env name present"),
+        ((0, 2), "registry cleanup verification failed"),
+        ((0, 1, 1), "registry cleanup key access failed"),
+    ),
+)
+def test_registry_cleanup_rejects_unproved_absence_without_command_output(
+    returncodes: tuple[int, ...],
+    expected_message: str,
+) -> None:
+    """Cleanup 拒绝未分类状态或仍存在 value，且只投影变量名。
+
+    :param returncodes: scripted delete/query exit codes。
+    :param expected_message: 预期安全错误类别。
+    :returns: ``None``。
+    :raises AssertionError: helper 接受未证明 cleanup 或回显 command output 时抛出。
+    """
+
+    runner = _ScriptedRegistryCommandRunner(returncodes)
+
+    with pytest.raises(AssertionError) as raised:
+        _delete_registry_value_and_verify_absent(
+            registry_key=r"HKCU\Environment",
+            value_name=_OPENAI_ENV_NAME,
+            command_runner=runner,
+        )
+
+    message = str(raised.value)
+    assert expected_message in message
+    assert _OPENAI_ENV_NAME in message
+    assert "test-secret" not in message
+
+
 @pytest.mark.skipif(platform.system() != "Windows", reason="真实 Windows setx smoke")
 def test_windows_real_setx_round_trip_is_name_safe_and_cleaned(tmp_path: Path) -> None:
     """真实 setx/user-env read/cleanup 只向 CLI diagnostic 暴露变量名。
@@ -768,7 +917,10 @@ def test_windows_real_setx_round_trip_is_name_safe_and_cleaned(tmp_path: Path) -
     """
 
     registry_key = r"HKCU\Environment"
-    _run_registry_command(("delete", registry_key, "/v", _OPENAI_ENV_NAME, "/f"))
+    _delete_registry_value_and_verify_absent(
+        registry_key=registry_key,
+        value_name=_OPENAI_ENV_NAME,
+    )
     sentinel = secrets.token_urlsafe(32)
     environment = _subprocess_environment(
         tmp_path / "home",
@@ -788,9 +940,10 @@ def test_windows_real_setx_round_trip_is_name_safe_and_cleaned(tmp_path: Path) -
         if query.returncode != 0 or sentinel not in query.stdout:
             raise AssertionError(f"setx round-trip failed for env name: {_OPENAI_ENV_NAME}")
     finally:
-        cleanup = _run_registry_command(("delete", registry_key, "/v", _OPENAI_ENV_NAME, "/f"))
-        if cleanup.returncode != 0:
-            raise AssertionError(f"registry cleanup failed for env name: {_OPENAI_ENV_NAME}")
+        _delete_registry_value_and_verify_absent(
+            registry_key=registry_key,
+            value_name=_OPENAI_ENV_NAME,
+        )
 
 
 def test_platform_capability_is_explicit() -> None:

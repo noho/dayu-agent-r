@@ -973,9 +973,7 @@ def _sync_staged_config(
         current_path = Path(current_root)
         directories.extend(current_path / name for name in directory_names)
         regular_files.extend(current_path / name for name in file_names)
-    file_open_flags = _READ_ONLY_OPEN_FLAGS
-    if platform_system in _POSIX_PLATFORMS:
-        file_open_flags |= os.O_NOFOLLOW
+    file_open_flags = _staged_file_sync_open_flags(platform_system)
     for file_path in sorted(regular_files):
         file_descriptor = os.open(file_path, file_open_flags)
         try:
@@ -994,6 +992,23 @@ def _sync_staged_config(
             reverse=True,
         ):
             _sync_directory(directory)
+
+
+def _staged_file_sync_open_flags(platform_system: str) -> int:
+    """返回当前平台可执行真实 staged-file flush 的打开标志。
+
+    Windows 的 ``os.fsync`` 需要可写 descriptor；POSIX 继续以 no-follow
+    只读 descriptor 提交普通文件内容，避免沿链接打开。
+
+    :param platform_system: 明确的标准平台值。
+    :returns: 传给 ``os.open`` 的平台专属标志。
+    :raises InitWorkspaceError: 平台不受 init transaction 支持时抛出。
+    """
+
+    _validate_platform(platform_system)
+    if platform_system == _WINDOWS_PLATFORM:
+        return os.O_RDWR
+    return _READ_ONLY_OPEN_FLAGS | os.O_NOFOLLOW
 
 
 def _roots_replaced_by_mode(

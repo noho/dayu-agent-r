@@ -9,6 +9,7 @@ on:
       - "dayu/README.md"
       - "dayu/cli/arg_parsing.py"
       - "dayu/cli/commands/fins.py"
+      - "dayu/cli/run_keys.py"
       - "dayu/cli/upload_script.py"
       - "dayu/fins/README.md"
       - "dayu/fins/upload_batch.py"
@@ -24,6 +25,7 @@ on:
       - "tests/cli/test_arg_parsing.py"
       - "tests/cli/test_fins_commands.py"
       - "tests/cli/test_public_package_entrypoints.py"
+      - "tests/cli/test_run_keys.py"
       - "tests/cli/test_upload_filings_from_command.py"
       - "tests/fins/test_upload_batch.py"
 
@@ -48,7 +50,7 @@ jobs:
       - name: Install locked test environment
         run: python -m pip install -e ".[test,dev]" -c constraints/lock-windows-x64-py311.txt
 
-      - name: Capture runner environment and cmd help
+      - name: Capture runner environment and verify cmd execution
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force $env:DAYU_R11_WINDOWS_ARTIFACT_DIR | Out-Null
@@ -57,9 +59,15 @@ jobs:
             "platform=$([System.Environment]::OSVersion.Platform)"
             "python=$(python --version 2>&1)"
           ) | Set-Content -Path "$env:DAYU_R11_WINDOWS_ARTIFACT_DIR\environment.txt" -Encoding utf8
-          cmd.exe /? 2>&1 | Set-Content -Path "$env:DAYU_R11_WINDOWS_ARTIFACT_DIR\cmd-help.txt" -Encoding utf8
+          cmd.exe /d /c ver 2>&1 | Set-Content -Path "$env:DAYU_R11_WINDOWS_ARTIFACT_DIR\cmd-version.txt" -Encoding utf8
           if ($LASTEXITCODE -ne 0) {
-            throw "cmd.exe /? failed with exit code $LASTEXITCODE"
+            throw "cmd.exe execution failed with exit code $LASTEXITCODE"
+          }
+          cmd.exe /? 2>&1 | Set-Content -Path "$env:DAYU_R11_WINDOWS_ARTIFACT_DIR\cmd-help.txt" -Encoding utf8
+          $cmdHelpExitCode = $LASTEXITCODE
+          "cmd_help_exit_code=$cmdHelpExitCode" | Add-Content -Path "$env:DAYU_R11_WINDOWS_ARTIFACT_DIR\environment.txt" -Encoding utf8
+          if ($cmdHelpExitCode -notin @(0, 1)) {
+            throw "cmd.exe help returned unclassified exit code $cmdHelpExitCode"
           }
 
       - name: Run real cmd recorder and CLI storage gates
@@ -69,7 +77,7 @@ jobs:
           $stdoutPath = "$env:DAYU_R11_WINDOWS_ARTIFACT_DIR\pytest-stdout.txt"
           $stderrPath = "$env:DAYU_R11_WINDOWS_ARTIFACT_DIR\pytest-stderr.txt"
           $junitPath = "$env:DAYU_R11_WINDOWS_ARTIFACT_DIR\pytest-junit.xml"
-          python -m pytest tests/cli/test_upload_filings_from_command.py::test_windows_cmd_script_round_trips_adversarial_argv_with_real_cmd tests/cli/test_upload_filings_from_command.py::test_windows_generated_script_runs_real_cli_into_temp_storage tests/cli/test_arg_parsing.py::test_upload_actions_default_to_auto_and_batch_rejects_delete "--junitxml=$junitPath" -q 1> $stdoutPath 2> $stderrPath
+          python -m pytest tests/cli/test_run_keys.py::test_new_running_key_monitor_uses_noop_for_non_posix_tty tests/cli/test_upload_filings_from_command.py::test_windows_cmd_script_round_trips_adversarial_argv_with_real_cmd tests/cli/test_upload_filings_from_command.py::test_windows_generated_script_runs_real_cli_into_temp_storage tests/cli/test_arg_parsing.py::test_upload_actions_default_to_auto_and_batch_rejects_delete "--junitxml=$junitPath" -q 1> $stdoutPath 2> $stderrPath
           $pytestExitCode = $LASTEXITCODE
           Get-Content -Path $stdoutPath
           $stderrText = Get-Content -Path $stderrPath -Raw
