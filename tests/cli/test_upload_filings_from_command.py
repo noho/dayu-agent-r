@@ -24,7 +24,9 @@ from dayu.cli.exit_codes import (
     EXIT_SUCCESS,
     EXIT_USAGE_ERROR,
 )
+from dayu.fins.domain.enums import SourceKind
 from dayu.fins.resolver import FmpCompanyInfo, FmpCompanyInfoResolver
+from dayu.fins.storage import FsCompanyMetaRepository, FsSourceDocumentRepository
 from dayu.fins.upload_batch import (
     UploadBatchPlan,
     UploadBatchPlanRequest,
@@ -908,7 +910,21 @@ def test_windows_cmd_script_round_trips_adversarial_argv_with_real_cmd(
 
 @pytest.mark.skipif(os.name != "nt", reason="requires real cmd.exe")
 def test_windows_generated_script_runs_real_cli_into_temp_storage(tmp_path: Path) -> None:
-    """真实 Windows 脚本必须完成 CLI→Service→Fins temp-storage 闭环。"""
+    """真实 Windows 脚本必须以进程退出与公共仓储事实证明上传成功。
+
+    Args:
+        tmp_path: pytest 为当前测试分配的临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 生成、执行、公司名预检、仓储事实或物理产物不满足契约时抛出。
+        OSError: 子进程、脚本、仓储或 oracle artifact 访问失败时抛出。
+        RuntimeError: published snapshot 无法取得一致事实或资源生命周期失败时抛出。
+        UnicodeError: 脚本或子进程输出不是严格 UTF-8 时抛出。
+        ValueError: public repository 检测到非法 published metadata 时抛出。
+    """
 
     artifact_directory = _windows_test_artifact_directory(
         tmp_path,
@@ -918,7 +934,8 @@ def test_windows_generated_script_runs_real_cli_into_temp_storage(tmp_path: Path
     storage = artifact_directory
     source_dir.mkdir()
     fixture = _FIXTURE_SOURCE.read_bytes()
-    (source_dir / "2024FY_AAPL_Annual_Report.htm").write_bytes(fixture)
+    source_path = source_dir / "2024FY_AAPL_Annual_Report.htm"
+    source_path.write_bytes(fixture)
     generation = subprocess.run(
         (
             sys.executable,
@@ -962,7 +979,31 @@ def test_windows_generated_script_runs_real_cli_into_temp_storage(tmp_path: Path
     )
 
     assert execution.returncode == 0, execution.stderr
-    assert "Fins result" in execution.stdout
+    company_meta = FsCompanyMetaRepository(storage).get_company_meta("AAPL")
+    assert company_meta.ticker == "AAPL"
+    assert company_meta.company_name == _WINDOWS_REAL_SMOKE_COMPANY_NAME
+    source_repository = FsSourceDocumentRepository(storage)
+    document_ids = source_repository.list_source_document_ids(
+        "AAPL",
+        SourceKind.FILING,
+    )
+    assert len(document_ids) == 1
+    document_id = document_ids[0]
+    with source_repository.read_source_snapshot(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+        materialize_files=False,
+    ) as snapshot:
+        assert snapshot.ticker == "AAPL"
+        assert snapshot.document_id == document_id
+        assert snapshot.source_kind is SourceKind.FILING
+        descriptors = snapshot.files
+        assert descriptors
+        assert snapshot.primary_filename == source_path.name
+        assert snapshot.primary_filename in tuple(
+            descriptor.name for descriptor in descriptors
+        )
     source_artifacts = tuple(
         path for path in (storage / "portfolio").rglob("*") if path.is_file()
     )
