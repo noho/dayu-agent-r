@@ -2,16 +2,16 @@
 
 ## 0. Gate identity / verdict
 
-- 状态：`PLAN_ONLY / S3_CF01_CF05_PLAN_REVIEW_FIX_COMPLETE / DUAL_COMPLETE_PLAN_REREVIEW_PENDING / IMPLEMENTATION_NOT_AUTHORIZED`。
+- 状态：`PLAN_ONLY / S3_STOP_F02_SECOND_PLAN_REVIEW_FIX_COMPLETE / CONTROLLER_VALIDATION_AND_DUAL_COMPLETE_REREVIEW_PENDING / IMPLEMENTATION_NOT_AUTHORIZED`。
 - umbrella：`WU-SEMANTIC-OWNERSHIP-01`。本计划只处理既有 umbrella aggregate regression 的 Controller accepted findings，不创建新 WU，不改变原 WU 的目标、设计真源或 residual destination。
-- 当前 S3 plan-correction gate 基线：branch `phaseflow/host-issues-control`；immutable slice base / HEAD `9e7a4e9d4796b9c382d44494bb10efa64787b199`；parent `ba44bf877138235d53606d082341a7f7280af488`；tree `7dc759e3bde5f6a257c21b60434f8874d157771a`；aggregate parent仍为`3410d7422655c56bdf13c643f77c27f40b9d4550`。
-- 本次 correction authority 是 `docs/reviews/wu-semantic-ownership-01-aggregate-regression-fix-s3-production-defect-controller-adjudication.md`（entry SHA-256=`71a7a62fbee5272ea64815e85d673f1c13819e605d3a5f303d785d8728624d81`），其裁决为`S3-STOP-F01 = ACCEPTED / PRODUCTION_CORRECTNESS_DEFECT / PLAN_CORRECTION_REQUIRED`。entry plan SHA-256=`afaa18c5608e6eeae0046318865bd1b3dd2f9a176c4b0739aa5b099e0ae3a252`。
-- 本次plan-review-fix gate只允许修改本文件与`docs/reviews/wu-semantic-ownership-01-aggregate-regression-fix-s3-plan-correction-codex.md`，并新建`docs/reviews/wu-semantic-ownership-01-aggregate-regression-fix-s3-plan-review-fix-codex.md`。production、tests、utility、README、workflow、control、Controller artifacts与MiMo/DS review artifacts全部禁止修改；不得继续coverage implementation、运行implementation tests、stage、commit、push、开PR、进入re-review / code review / aggregate / closeout或启动subagent/reviewer。
-- Slice 3六个测试路径必须按 entry SHA-256 原样保护；其中当前实际delta是三个tracked modified与一个untracked added，另外两个授权路径仍为immutable base内容：`tests/documents/test_processors.py`=`75ca22edd531c27fc7ccf0ea1edc6f3ddf62e389a18af24f17bb6798713f2d1c`，`tests/fins/test_sec_pipeline_download.py`=`f82c1416deac4f95cbe3e3feb4547410d077d41139fa0d8ac1915ca6d44a0c21`，`tests/fins/test_processor_read_consistency.py`=`da55b5eb32a18eeef425a264fe9a172d888f9c2608dad9d9a0a098e4fe955459`，`tests/fins/test_fins_ingestion_tools.py`=`6ece9288834ab3953be8880276079a003f58a02629a2230459d728b95ff2f747`，`tests/host/test_effective_execution_config.py`=`e3a85caded7bda956e95d5ebd336cd60815ec1d227c134f46a9678d6a96c6acf`，`tests/runtime/test_argparse_exit.py`=`3aa607842a96b7425b964f3c030dc2b427e5bba0dd89abc65e20ed7306ce3f3d`。
-- 当前Controller-owned/protected dirty artifacts必须保持本gate entry hash：`docs/host/issues-implementation-control.md`=`00b40ad39ea86aaf95c01d2db89b2e4fdd3d8c38805b20328854897ff6bc6883`，S2 accepted-commit validation=`bf5842031abe4306fb50cfce918c6fd2ff90bb219584a42fc20f8d2bc8a208ed`，S3 implementation authorization=`7d8fb7e0723c98edd5a8aa20692fe61d084d2ff7552cf821d74410f4a80243dc`，S3 production-defect adjudication=`71a7a62fbee5272ea64815e85d673f1c13819e605d3a5f303d785d8728624d81`，S3 stop artifact=`addd3b10091bfbdb9294c26b570a1b1808e77c079d195c2d964eb384a27dd9f8`，S3 plan-correction Controller validation=`1f1d1f5ca8620d92aeec7925e6b0c007a1e14b5f3fc764db10edc615e9e823b7`，MiMo plan review=`f3d59d0ac7e6f5528fd90f3ab6104f504b08242093d2f658bd505371a620c1fa`，DS plan review=`c606f94e9353862ec30600360dfce2b21662cfbb13137d5c0b4422d0ed02fa3b`，Controller plan-review adjudication=`c83e76d7c2d95a1df3d4f969d39c4ca907183947a977b2150672e9e6f19ee450`。本gate entry plan SHA-256=`ef4a0832f1885e4013d673294b944a56280619baab1f97d438896af5c8cbedcf`，entry correction artifact SHA-256=`c5b788b03ab54638841a7bd58cb8d5978ef92de8ea120ff3a3408aedbaac2072`。
+- 当前第二次 S3 plan-review-fix gate 基线：branch `phaseflow/host-issues-control`；accepted corrected-plan base / HEAD `48c6cc5ef74f273b1b592682ae9ab3e14cb48cbe`；parent `9e7a4e9d4796b9c382d44494bb10efa64787b199`；tree `b4904404c43dd0c36132433af74dd6740d24c713`；aggregate parent仍为`3410d7422655c56bdf13c643f77c27f40b9d4550`。
+- 本次最高 plan-review-fix authority 是 `docs/reviews/wu-semantic-ownership-01-aggregate-regression-fix-s3-second-production-defect-plan-review-controller-adjudication.md`（SHA-256=`725db848f7fb0eb9a2418a55ae90008b74131b5b360e8948415d3bb17b88daeb`）。它接受并合并四组 plan-only fix：`S3-P2-PF01`—`S3-P2-PF04`；immutable reviewed plan SHA-256=`466fd5fd717c1ea35a4da0807ef425300ea7b4c855c400361805438681bcea6b`。MiMo review SHA-256=`6e747659183c0c59efed30e22129e3c5510802ae154be307d2d122f3449854dc`，DS review SHA-256=`6c7556f20c78901b188f01649184b2df7cd479ab3d2facd3bf9a1c3af56ed822`。
+- 本次plan-only fix gate只允许修改本文件，并新建`docs/reviews/wu-semantic-ownership-01-aggregate-regression-fix-s3-second-production-defect-plan-review-fix-codex.md`。production、tests、utility、README、workflow、control、既有continuation/correction/validation/Controller/review artifacts全部禁止修改；不得继续implementation或coverage、运行implementation tests、执行review、stage、commit、push、开PR、进入code review / aggregate / closeout或启动subagent/reviewer。
+- Slice 3已完成的Docling delta与六个测试路径现存delta必须按 entry SHA-256 原样保护：`dayu/documents/processors/docling_processor.py`=`e2ab00fd984a4c27c30254d62ce038fafb91b9bc88d03eb786ad29f27acfd649`，`tests/documents/test_processors.py`=`6aba755cdb920f2f427f8f0375886ce14eb7b32f521f2d5ecde3c20d58be8f0b`，`tests/fins/test_sec_pipeline_download.py`=`f82c1416deac4f95cbe3e3feb4547410d077d41139fa0d8ac1915ca6d44a0c21`，`tests/fins/test_processor_read_consistency.py`=`e3aec818f1a397b46c004de1e6dc2b58bd1eb334d8c9cc142f97baecdea09489`，`tests/fins/test_fins_ingestion_tools.py`=`6ece9288834ab3953be8880276079a003f58a02629a2230459d728b95ff2f747`，`tests/host/test_effective_execution_config.py`=`e3a85caded7bda956e95d5ebd336cd60815ec1d227c134f46a9678d6a96c6acf`，`tests/runtime/test_argparse_exit.py`=`3aa607842a96b7425b964f3c030dc2b427e5bba0dd89abc65e20ed7306ce3f3d`。
+- 当前Controller-owned/protected artifacts必须保持本plan-review-fix gate实际entry hash：S3 continuation=`3432724515aff3d1591a0c91ad83b31b7085fd01b39d7fe418ef68839951aaa7`；`docs/host/issues-implementation-control.md`=`7bcbacccf14b2b0d1fb73d935453709403a5887c1ed20e03dd475fc93659430b`；second-defect Controller=`9a7f640fad66a8e26edf86e8fea72d09dbadf1c8e80f7d12e6a14106a8a67fa8`；correction artifact=`15b53e8223883e572653eb4d26aa54390d2081ba84d986f10523722926da86a6`；correction validation=`36df4cedf04e01746446de96d92b1b5e6f035d9b601e54ea8b084cdd456d836f`；MiMo review=`6e747659183c0c59efed30e22129e3c5510802ae154be307d2d122f3449854dc`；DS review=`6c7556f20c78901b188f01649184b2df7cd479ab3d2facd3bf9a1c3af56ed822`；plan-review Controller adjudication=`725db848f7fb0eb9a2418a55ae90008b74131b5b360e8948415d3bb17b88daeb`；corrected-plan accepted-commit validation=`4d0b7b64544584be9dca8a57301cf3d27343130fad5664c9635681e45c88eba5`；resumed implementation authorization=`a21eaabc88885a5134f000a94e965e495fbcd9f79a9b080abb857ea31967eb3c`。Immutable reviewed plan entry SHA-256=`466fd5fd717c1ea35a4da0807ef425300ea7b4c855c400361805438681bcea6b`。
 - 本计划固定三个 implementation slices，精确关闭 `AR-F01`—`AR-F05`。`AR-F06` 保持 `RETAINED / UNFIXED / UNWAIVED / CURRENT_NO_FIX`，`AR-F07` 保持 `PENDING_RELEASE_BLOCKER`。
 - `S1-SEC-F01` 按 2026-07-19 用户产品裁决关闭为 no-code blocker：本地 Config 与 Host SQLite / EventLog 是同一受信任产品域，内部持久化 resolved provider headers / API key 不要求 production redesign；Tool Trace、audit、public / LLM-facing projection、日志、diff 与 review surface 仍要求 secret 明文为零。
-- 本次 corrected plan只有在AgentMiMo与AgentDS对完整修订版做双路完整plan review、Controller逐条裁决、AgentCodex只修accepted plan findings、两路对完整修订版做完整re-review且均通过，并由Controller明确重新授权后，才可恢复Slice 3 implementation；恢复入口必须先关闭S3-STOP-F01，再继续其余九owner coverage cases。
+- MiMo/DS双路完整plan review与Controller逐条裁决已经完成；本次只修`S3-P2-PF01`—`S3-P2-PF04`。唯一next gate是Controller validation与AgentMiMo/AgentDS对完整修订版及本次fix artifact的双路完整re-review；只有两路均通过且Controller明确重新授权后，才可恢复Slice 3 implementation。恢复入口必须先关闭`S3-STOP-F02`；已完成的`S3-STOP-F01` Docling delta与8-node caption matrix保持review-pending、不得回滚、重写、单独review或单独commit。
 
 ## 1. Source of truth 与已核对证据
 
@@ -38,6 +38,10 @@
 12. Slice 3 correction authority：`docs/reviews/wu-semantic-ownership-01-aggregate-regression-fix-s3-production-defect-controller-adjudication.md`。Controller已独立用真实Docling serialize/load与public `DoclingProcessor.list_tables()`复现caption丢失，并确认当前`docling-core==2.74.0`的`TableItem.captions: list[RefItem]`与`RefItem.resolve(doc)`是唯一第三方公共契约。该裁决只 supersede Slice 3“九production owners零diff”的旧假设，精确开放Docling table projection owner；其它owner、slice、security与deferred裁决不变。
 
 13. Slice 3 plan-review-fix authority：MiMo review SHA-256=`f3d59d0ac7e6f5528fd90f3ab6104f504b08242093d2f658bd505371a620c1fa`、DS review SHA-256=`c606f94e9353862ec30600360dfce2b21662cfbb13137d5c0b4422d0ed02fa3b`与Controller adjudication SHA-256=`c83e76d7c2d95a1df3d4f969d39c4ca907183947a977b2150672e9e6f19ee450`。本轮只实施Controller接受的`CF01`—`CF05`计划修正；warning/import统一、NaN `ValueError`、NBSP特例、`text_utils`抽取、context fallback及其它rejected/no-action提案不进入计划或实现。
+
+14. Slice 3 second production defect correction authority：`docs/reviews/wu-semantic-ownership-01-aggregate-regression-fix-s3-implementation-continuation-codex.md`记录同源stop evidence；`docs/reviews/wu-semantic-ownership-01-aggregate-regression-fix-s3-second-production-defect-controller-adjudication.md`作唯一owner裁决。该裁决只新增开放`dayu/fins/processors/sec_form_section_common.py`的虚拟章节构建/刷新/table ownership state machine；保持DocumentProcessor marker contract、`SecProcessor`空marker实现、已完成Docling delta、六测试路径、security、quota、deferred与219/219门禁不变。
+
+15. Slice 3 second production defect plan-review-fix authority：immutable plan SHA-256=`466fd5fd717c1ea35a4da0807ef425300ea7b4c855c400361805438681bcea6b`；MiMo review SHA-256=`6e747659183c0c59efed30e22129e3c5510802ae154be307d2d122f3449854dc`；DS review SHA-256=`6c7556f20c78901b188f01649184b2df7cd479ab3d2facd3bf9a1c3af56ed822`；Controller adjudication SHA-256=`725db848f7fb0eb9a2418a55ae90008b74131b5b360e8948415d3bb17b88daeb`。本轮只实施Controller接受的`S3-P2-PF01`—`S3-P2-PF04`；MiMo 05作为独立finding `rejected-as-duplicate`，其有效guard精确化已归入`S3-P2-PF01`；DS-F03的“空列表行为未知”事实判断`rejected-as-evidence-invalid`，但其zero-diff guard证据与public re-entry验证已归入`S3-P2-PF03`。不得新增第五组fix、public schema、production/test路径或allowlist。
 
 当前 correction 的 owner 结论是：ConfigLoader 仍只产生 typed config；Service / execution environment 解析 secret 并构造 resolved typed `RunnerSpec`；Host admission 持久化 exact effective execution canonical fact，dispatch / retry / replay / recovery 恢复该内部 truth；每个 Tool Trace、audit、HostEvent、memory / compact、runner-input / observation 与 log projection owner分别做显式安全字段选择。禁止 Host-safe / Engine-only split、header descriptor、secret resolver callback、secret manager或统一 tool authorization framework；本计划不扩张 CLI init secret 存储，也不进入 Issues 142、151、175、177、178。
 
@@ -69,7 +73,7 @@ Aggregate regression 不是重复验证。R01—R12 的 accepted evidence 只证
 | AR-F02 | Service 直接 import `dayu.fins.direct_stream` 与 `dayu.fins.tools._ingestion_tool_helpers`；现有 Service allowlist 已允许 `dayu.fins.direct_events` 与 `dayu.fins.ingestion`，故问题是 Fins public contract owner 放错边界，不是 allowlist 太窄 | Slice 2 做一次物理 owner migration；禁止扩大 allowlist、兼容 re-export、lazy import、duplicate enum/protocol |
 | AR-F03 | `utils/smoke_web_ci.py::main` 的 standalone `configure_root=True` 是 operator logging 语义；同进程测试直接调用 `main` 后未恢复全局 logger state，导致后续两个 node 顺序依赖失败 | Slice 1 只在 `tests/tools/web/test_smoke_web_ci.py` 增加 in-process harness isolation；standalone product logging 零改动 |
 | AR-F04 | current compactor 成功发布 `context_compaction` schema v3 artifact；测试仍猜 `accepted_candidate.candidate_id == llm-compact:{run_id}`。Current runner-call manifest 已发布 `host_run_id`、`runner_call_kind=compactor_proposal` 及 `compactor_identity.compaction_request_digest`，compact artifact 发布同一 `compaction_request_digest` | Slice 1 用 manifest run identity -> request digest -> compact artifact digest equality 的唯一关联；禁止恢复 candidate_id、raw guess、fallback 或 loose scan |
-| AR-F05 | aggregate parent 到当前树的 219 个现存 changed production Python 中 210 个 line coverage `>=80%`，8 个低于 80%，`dayu/runtime/argparse_exit.py` 未命中；Slice 3真实public caption case又暴露`S3-STOP-F01`：Docling owner读取不存在的旧单数`caption`而丢失`TableItem.captions`同源文本 | Slice 3先在唯一Docling table projection owner修复accepted production defect，再继续owner-contract coverage；其余八个production owner保持零diff，最终仍要求219/219 >=80% |
+| AR-F05 | aggregate parent 到当前树的219个changed production Python仍有九个owner待fresh达到80%；`S3-STOP-F01`已在Docling table projection owner完成implementation。继续coverage时，真实public `TenKFormProcessor`暴露`S3-STOP-F02`：marker contract允许空字符串安全降级，但refresh又强制base/virtual table refs全等，合法SecProcessor-backed 10-K含表即构造失败 | Slice 3先在`sec_form_section_common.py`唯一owner实现原子virtual/base发布并关闭`S3-STOP-F02`；保留Docling delta，随后继续九owner coverage；其余七个production owner零diff，最终仍要求219/219 >=80% |
 | AR-F06 | coverage instrumentation 下同一 R05 scheduler close/promotion node复现；R05 已把真实 bug裁决给未来独立 Host scheduler/lifecycle work item | 不写代码、不 waiver、不标 resolved；canonical non-coverage 不排除，coverage 仅精确排除这一个 node |
 | AR-F07 | 当前远端无可用 Actions workflow/run/artifact，Darwin skip 不能证明 cmd.exe / Windows init | 本地 slices 不改 workflow、不伪造 PASS；最终 release 继续被真实 `windows-latest` evidence 阻塞 |
 | S1-SEC-F01 | fresh configured-secret scan 的唯一命中 owner 是 Host internal `USER_INPUT_ACCEPTED.effective_execution_config.config.runner_spec.headers`；Service 解析 secret，Host 冻结 exact execution truth。Tool Trace event filter 不消费该 event；audit、HostEvent、run-input / memory / compact 与日志 owner都没有透传该字段，fresh projection / output / review / diff scan 为零 | `CLOSED_AS_NO_CODE_BLOCKER`；内部 Config / Host durable 命中做 accepted classification，Slice 1 只补 owner-level negative tests与分 surface scan，不改 production、不增加 slice |
@@ -130,11 +134,29 @@ Slice 1 的 test-only harness 必须：
 - 不复制 `_DEFAULT_THIRD_PARTY_SUPPRESSIONS` 等 production 列表，不针对两个失败 logger写特例，不修改 `tests/conftest.py` 的全局 fixture。
 - 增加 harness contract test：预置 root 与至少一个 named logger 的非默认状态，分别覆盖成功和失败调用，断言调用后 registry/logger/handler identity 与状态完全一致。
 
+### 2.6 S3-STOP-F02 virtual-section projection owner
+
+问题动机与严重性成立，且root cause由同一公开调用链与同一数据事实直接闭合：`DocumentProcessor.get_full_text_with_table_markers()`约定不支持marker注入时返回空字符串并由上层安全降级；`SecProcessor`正确返回`""`；`_assign_tables_to_virtual_sections()`因此不产生mapping；同一次`_refresh_virtual_section_state()`却要求全部base table refs等于virtual table refs。任何“合法虚拟章节 + 至少一张base表格 + marker capability不可用”的SecProcessor-backed表单都必然在构造期失败，不是测试夹具、日志或coverage间接推断。
+
+唯一owner是`dayu/fins/processors/sec_form_section_common.py`内虚拟章节构建、刷新与table ownership state machine。修复语义固定如下：
+
+- 定义owner-private typed enum/state，成员名固定为`BUILDING`、`VIRTUAL_PUBLISHED`、`BASE_FALLBACK_PUBLISHED`。`_initialize_virtual_sections()`只负责把新实例初始化为`BUILDING`并建立候选；`_refresh_virtual_section_state()`是唯一terminal transition owner，只允许`BUILDING -> VIRTUAL_PUBLISHED | BASE_FALLBACK_PUBLISHED`、`VIRTUAL_PUBLISHED -> VIRTUAL_PUBLISHED`受约束刷新与`BASE_FALLBACK_PUBLISHED -> BASE_FALLBACK_PUBLISHED`幂等no-op。不得从`_virtual_sections`、空dict/list、异常、时间、日志或偶然顺序反推状态。
+- 虚拟章节projection是单一原子发布状态。refresh必须先在owner-local候选中完成section tree、base tables、raw marker material、table→section与section→tables全部校验；校验结束前不得清空、局部写入或向public consumer暴露`_virtual_sections`、`_virtual_section_by_ref`、`_table_ref_to_virtual_ref`的半套组合。
+- 五个public consumers逐一使用同一mode guard：`list_sections()`、`list_tables()`、`get_section_title()`、`read_section()`、`search()`在`mode != VIRTUAL_PUBLISHED`时都直接委托base processor对应public contract；只有`VIRTUAL_PUBLISHED`可消费virtual sections/index/mapping。当前consumer数量固定为五个，不沿用reviewer“六个”的错误计数。
+- base tables为空时，空mapping本身就是完整证明，合法虚拟章节发布`VIRTUAL_PUBLISHED`；不得因marker unsupported无意义地回退。base tables非空且marker缺失，或无矛盾raw marker proof无法为**每一个**public base table证明唯一virtual-section ownership时，整体发布`BASE_FALLBACK_PUBLISHED`：清空/禁用全部candidate virtual projection，五个public consumers统一消费底层processor同一套sections/tables/title/read/search contract。
+- 删除`_filter_table_refs_by_availability()`及其全部调用，不再静默过滤raw marker refs；删除`_assign_unmapped_tables_by_position()`及其调用，不再按最近前驱/第一个section补齐。候选构建必须保留raw marker refs与出现次数/范围归属证据，禁止在完整性与矛盾校验前丢弃信息。
+- 校验顺序固定为：先要求每张public base table具有非空、唯一`table_ref`，缺失或重复都`ValueError` fail-closed；再判定raw marker ref不在base refs中的dangling；再判定同一marker ref重复出现、落入多个section、section tree悬挂或table→section/section→tables双向矛盾。任一矛盾先`ValueError`，不得进入fallback；只有这些检查全部通过后，`base_refs - mapped_refs`非空才是incomplete proof并整体base fallback。incomplete与dangling同时存在时dangling优先fail-closed；无dangling但marker range/title不能唯一归属时属于incomplete，必须whole-base fallback。只有集合完全且双向一致才一次发布`VIRTUAL_PUBLISHED`。
+- virtual `list_tables()`只按已发布全量exact mapping重写每一张base table的`section_ref`；删除`fallback_ref`、`last_known_ref`与“底层已有virtual ref即保留”等下游补偿。base mode完全透传base tables，禁止用标题相似度、底层偶然`section_ref`、表格顺序、日志或其它启发式补缺。
+- `_initialize_virtual_sections()`内第一次`_refresh_virtual_section_state()`既是首次publication decision，也是当前public构造失败的真实入口；它与10-K/10-Q subclass第二次`_postprocess_virtual_sections()`/refresh复用同一typed终态。首次fallback必须清空candidate并发布`BASE_FALLBACK_PUBLISHED`，之后refresh不再读marker/base、不重建candidate、不抛第二次失败；virtual已成功发布时仍允许现有postprocess按identity约束刷新。当前`expand_ten_k_virtual_sections_content()`与`expand_ten_q_virtual_sections_content()`均由现有`if not full_text or not virtual_sections: return`保证空candidate zero-diff；plan锁定该直接证据并用public 10-K/10-Q re-entry验证，guard漂移才STOP，不扩form-common或subclass allowlist。
+- `DocumentProcessor` marker contract与`SecProcessor.get_full_text_with_table_markers() -> ""`保持零diff；不修改`sec_processor.py`，不新增DOM/raw HTML marker、capability schema、兼容分支或第二套table-owner resolver。
+
+该方案优于“把表格塞入第一/最近章节”或扩展SecProcessor marker能力：前者把未知业务归属伪装成事实，后者在已有同源base contract可安全复用时扩大了技术与schema边界。正确最小修复是在owner state machine内原子选择完整virtual projection或完整base projection。
+
 ## 3. Global scope lock
 
 ### 3.1 Implementation mutable production allowlist
 
-三个slices合计只允许下列production paths；Slice 1 production allowlist为空，Slice 3只因accepted `S3-STOP-F01`增加一个correction-only owner：
+三个slices合计只允许下列production paths；Slice 1 production allowlist为空，Slice 3的整体production allowlist精确包含已完成`S3-STOP-F01` owner与本次新增`S3-STOP-F02` owner：
 
 ```text
 # Slice 2 only
@@ -153,9 +175,10 @@ M dayu/service/host_assembly.py
 
 # Slice 3 correction only
 M dayu/documents/processors/docling_processor.py
+M dayu/fins/processors/sec_form_section_common.py
 ```
 
-任何额外 production path 都是 stop condition，不能以 pyright、Ruff、coverage、import cycle、测试便利或 README 同步为由自行扩域。
+本次第二次correction恢复implementation后只允许新增`sec_form_section_common.py` delta；现存Docling delta按§0 hash受保护，不得继续修改、回滚或重写。任何第三个Slice 3 production path都是stop condition，不能以pyright、Ruff、coverage、import cycle、测试便利或README同步为由自行扩域。
 
 ### 3.2 Implementation mutable test allowlist
 
@@ -187,7 +210,7 @@ M tests/host/test_effective_execution_config.py
 A tests/runtime/test_argparse_exit.py
 ```
 
-Slice 1 后五个新增 allowlist path 只允许加入 §2.2.1 / §4.1 定义的 configured-secret projection sentinel tests；不得借此修改 projection contract、重写现有测试或触碰 production。correction entry 已有 delta 的前三个 Slice 1 tests必须在 plan review与恢复 implementation entry前保持上述 SHA-256 不变；后续 implementation只能在 Controller重新授权后继续其既有 Slice 1 delta。同一路径 `tests/fins/test_fins_ingestion_tools.py` 可在 Slice 2 迁移 public owner import，并在 Slice 3 补 preprocess owner cases；每个 slice 的 diff 与 review 必须只包含该 slice 新增的语义。`tests/service/test_import_boundary.py` 是验证 oracle，不在 mutable allowlist，必须零 diff。
+Slice 1 后五个新增 allowlist path 只允许加入 §2.2.1 / §4.1 定义的 configured-secret projection sentinel tests；不得借此修改 projection contract、重写现有测试或触碰 production。correction entry 已有 delta 的前三个 Slice 1 tests必须在 plan review与恢复 implementation entry前保持上述 SHA-256 不变；后续 implementation只能在 Controller重新授权后继续其既有 Slice 1 delta。同一路径 `tests/fins/test_fins_ingestion_tools.py` 可在 Slice 2 迁移 public owner import，并在 Slice 3 补 preprocess owner cases；每个 slice 的 diff 与 review 必须只包含该 slice 新增的语义。第二次plan-correction entry的六个Slice 3路径按§0 exact hash受保护；重新授权后只能保留已有cases并在同一六路径内增量补owner/public反例，不得删除、改写或弱化已完成Docling caption matrix、preprocess/Host/runtime coverage与`S3-STOP-F02`最小复现。`tests/service/test_import_boundary.py` 是验证 oracle，不在 mutable allowlist，必须零 diff。
 
 ### 3.3 Slice 2 mutable validation-utility allowlist
 
@@ -203,8 +226,8 @@ M utils/smoke_host_public_awaiting_entrypoint.py
 - 当前 plan-only gate 不修改任何 README。
 - Slice 1：读取 `tests/README.md` 的更新约束并记录 `NO_UPDATE`；test fixture/harness/oracle不改变测试入口或最终用户工作流。
 - Slice 2：只允许按现有职责更新 `dayu/fins/README.md`，把文件树和 direct/awaiting public owner描述迁到新真源；这是代码路径变化后的必需同步。读取并裁决 `dayu/service/README.md`、`tests/README.md`、根 `README.md` 与 `dayu/README.md`，预期均 `NO_UPDATE`，因为没有用户可见命令、层级关系或 Service 行为变化。
-- Slice 3：恢复implementation后fresh读取根`README.md`、`dayu/README.md`与`tests/README.md`的更新约束。当前精确裁决为三者均`NO_UPDATE`：caption修复不改变最终用户安装/命令/工作区/排障流程，不改变跨包分层或`dayu.documents`层中立职责，也不新增测试层级、运行方式或维护规则；现有`tests/documents`说明已经覆盖Docling表格输出。若实现事实使任一README约束要求更新，立即STOP请Controller扩充精确README allowlist，不得预先扩域或先改后解释。
-- 除 `dayu/fins/README.md` 外，任何 README 被判定必须修改时先 STOP，请 Controller 扩充精确 allowlist；不得机械同步。
+- Slice 3：只允许按`dayu/fins/README.md`现有开发者手册职责更新Processors/关键机制中的稳定语义，说明virtual-section state machine只在marker完整证明全部base table ownership时发布virtual projection，否则整体消费base processor同源section/table/read contract，且不猜首/最近章节；不得写WU、测试清单或未来计划。根`README.md`=`NO_UPDATE`（无安装、CLI、工作区、输出或排障变化），`dayu/README.md`=`NO_UPDATE`（无跨包分层变化），`tests/README.md`=`NO_UPDATE`（仍在既有测试层级/运行方式内）。恢复implementation后fresh复核这些约束；若实现事实要求其它README，立即STOP请Controller扩充精确allowlist，不得先改后解释。
+- `dayu/fins/README.md`是Slice 2与Slice 3分别允许的同一路径；每个slice review必须区分本slice语义。除该路径外，任何README被判定必须修改时先STOP，请Controller扩充精确allowlist；不得机械同步。
 
 ### 3.5 Protected zero-diff paths
 
@@ -257,11 +280,10 @@ dayu/fins/ingestion/__init__.py
 
 除 §3.3 在 Slice 2 允许的单行 import 迁移外，所有其它 `utils/**` 路径在全部 slices、fix rounds、reviews 与 aggregate regression 中必须零 diff；`utils/smoke_host_public_awaiting_entrypoint.py` 的其它行也必须零 diff。
 
-6. AR-F05 production owners：`dayu/documents/processors/docling_processor.py`只在Slice 3 correction implementation / accepted-finding fix round按§4.3精确开放；其它slice、plan-only gate、review-only gate中仍零diff。其余八个owners在全部gate继续零diff：
+6. AR-F05 production owners：`dayu/documents/processors/docling_processor.py`与`dayu/fins/processors/sec_form_section_common.py`只在Slice 3按§4.3精确开放；其它slice、plan-only gate、review-only gate中仍零diff。第二次correction entry的Docling delta受保护，恢复implementation只新增`sec_form_section_common.py`实现。其余七个owners在全部gate继续零diff：
 
 ```text
 dayu/fins/pipelines/sec_6k_rules.py
-dayu/fins/processors/sec_form_section_common.py
 dayu/fins/processors/sec_report_form_common.py
 dayu/fins/processors/sec_section_build.py
 dayu/fins/processors/sec_table_extraction.py
@@ -277,9 +299,9 @@ dayu/runtime/argparse_exit.py
 .github/workflows/r12-init-windows.yml
 ```
 
-8. 所有design docs、control docs、既有plan/review/completion artifacts、除Slice 2唯一README allowlist外的全部README，以及开始时已有Controller-owned worktree changes。本S3 plan-correction gate只对本plan与固定新`docs/reviews/wu-semantic-ownership-01-aggregate-regression-fix-s3-plan-correction-codex.md`例外；该文档例外不延续成implementation allowlist。
+8. 所有design docs、control docs、既有plan-review/correction/validation/completion/continuation/Controller artifacts、除Slice 2/3共同精确README allowlist `dayu/fins/README.md`外的全部README，以及开始时已有Controller-owned worktree changes。本次S3第二次plan-review-fix gate只对本plan与固定新`docs/reviews/wu-semantic-ownership-01-aggregate-regression-fix-s3-second-production-defect-plan-review-fix-codex.md`例外；该artifact例外不延续成implementation allowlist。
 
-每个 slice 开始记录 `SLICE_BASE=$(git rev-parse HEAD)`、完整 `git status --short`、pre-existing tracked diff清单及每个pre-existing tracked/untracked path的SHA-256。implementation、fix、review结束均重新采集 `git diff --name-status "$SLICE_BASE"` 和untracked列表：先验证pre-existing集合的path/status/hash完全不变，再把该集合从当前工作树清单中扣除，剩余delta才允许与本节 production/test/validation-utility/README allowlists精确比对。本次S3 plan-correction gate必须以§0 entry status/hash保护集合做同样校验，只允许本plan被修改并新增固定plan-correction artifact，尤其六个Slice 3 test路径与全部Controller-owned/protected artifacts hash必须不变。发现额外路径立即停止，不先清理、不覆盖用户改动。
+每个 slice 开始记录 `SLICE_BASE=$(git rev-parse HEAD)`、完整 `git status --short`、pre-existing tracked diff清单及每个pre-existing tracked/untracked path的SHA-256。implementation、fix、review结束均重新采集 `git diff --name-status "$SLICE_BASE"` 和untracked列表：先验证pre-existing集合的path/status/hash完全不变，再把该集合从当前工作树清单中扣除，剩余delta才允许与本节 production/test/validation-utility/README allowlists精确比对。本次S3第二次plan-review-fix gate必须以§0 entry status/hash保护集合做同样校验，只允许本plan被修改并新增固定plan-review-fix artifact；Docling delta、六个Slice 3 test路径、continuation及全部correction/validation/review/Controller-owned protected artifacts hash必须不变。发现额外路径立即停止，不先清理、不覆盖用户改动。
 
 ## 4. Dependency order 与三个 implementation slices
 
@@ -417,17 +439,31 @@ python utils/smoke_host_public_awaiting_entrypoint.py \
 - Canonical non-coverage full suite必须 0 failed；AR-F06 scheduler node在非 coverage模式不得排除且必须通过。
 - Exact-exclusion aggregate coverage test run必须 0 failed；除明确留给 Slice 3 的九路径外，全部 aggregate-range production paths（含 Slice 2新 owner）line coverage `>=80%`，不得出现新的低覆盖路径。
 
-### 4.3 Slice 3 — S3-STOP-F01 owner correction + nine-path owner-test coverage closure（AR-F05）
+### 4.3 Slice 3 — S3-STOP-F01 protected delta + S3-STOP-F02 atomic projection correction + nine-path owner-test coverage closure（AR-F05）
 
 #### Correction implementation order / exact owner change
 
-恢复implementation后必须先关闭`S3-STOP-F01`，其失败复现变绿前不得继续其它coverage cases。Slice 3 correction-only production allowlist精确且只有：
+恢复implementation后必须先关闭`S3-STOP-F02`的owner/public matrix，其最小public复现与六类反例全部变绿前不得继续其它coverage cases。Slice 3整体production allowlist精确且只有：
 
 ```text
 M dayu/documents/processors/docling_processor.py
+M dayu/fins/processors/sec_form_section_common.py
 ```
 
-唯一允许的production call-path变化是Docling table projection boundary：
+其中Docling path是已完成、review-pending且受§0 entry hash保护的`S3-STOP-F01` delta；本次恢复implementation只允许在`sec_form_section_common.py`新增代码diff。实现顺序固定为：
+
+1. 在owner内定义private typed enum/state，成员精确为`BUILDING`、`VIRTUAL_PUBLISHED`、`BASE_FALLBACK_PUBLISHED`。`_initialize_virtual_sections()`只初始化`BUILDING`并建立candidate；只有`_refresh_virtual_section_state()`可提交terminal transition：首次从`BUILDING`选择virtual或base fallback，已发布virtual只允许在现有identity约束下刷新并保持`VIRTUAL_PUBLISHED`，已发布base fallback只允许幂等保持`BASE_FALLBACK_PUBLISHED`。不得用空dict/list、时间、日志、异常或偶然顺序反推mode。
+2. 显式把`_initialize_virtual_sections()`内首次`_refresh_virtual_section_state()`锁定为首次publication decision与当前公开构造失败入口。该调用必须在owner-local候选中完成section ref/parent-child、base table snapshot、raw marker与候选双向mapping验证，验证通过或作出fallback决定前不提前清空/写入published dict/list。它与10-K/10-Q subclass第二次postprocess/refresh共用同一typed终态，不得把修复误写成只处理第二次refresh。
+3. base tables为空时，以空table mapping发布合法`VIRTUAL_PUBLISHED`。base tables非空时只从`get_full_text_with_table_markers()`同源raw marker material建立proof；每张public base table必须有非空且唯一`table_ref`，candidate必须保留所有raw marker refs、出现次数与range/title归属证据，不调用、扩展或替代marker producer contract。
+4. validation order固定且不可交换：先对base table ref缺失/重复fail-closed；再对raw marker ref不在base refs中的dangling fail-closed；再对同一marker ref重复出现、落入多个section、section tree悬挂及table→section/section→tables矛盾fail-closed。上述矛盾检查全部通过后，才计算`base_refs - mapped_refs`：非空表示incomplete proof并whole-base fallback；为空且两集合完全、双向一致才允许virtual publication。incomplete + dangling优先fail-closed；无dangling但range/title不能唯一归属属于incomplete fallback，不得退回位置猜测或旧集合不等异常。
+5. base fallback必须清空/禁用`_virtual_sections`、`_virtual_section_by_ref`、`_table_ref_to_virtual_ref`全部candidate并最后发布`BASE_FALLBACK_PUBLISHED`；不得保留partial virtual sections/mapping。完整proof才在全部验证后更新每个section的`table_refs`，一次提交三个projection字段与`VIRTUAL_PUBLISHED`。
+6. `_assign_tables_to_virtual_sections()`改成只产生可验证的owner-local raw proof/candidate mapping或等价typed结果，不能在证明完整前就地污染published state。物理删除`_filter_table_refs_by_availability()`及其调用，禁止静默丢弃dangling marker证据；物理删除`_assign_unmapped_tables_by_position()`及其调用，禁止最近前驱/第一个section猜测。
+7. 当前public consumers精确为五个，并逐一使用`mode != VIRTUAL_PUBLISHED -> base processor`guard：`list_sections()`委托base sections；`list_tables()`委托base tables；`get_section_title(ref)`委托base title；`read_section(ref)`委托base read；`search(query, within_ref)`委托base search。只有`VIRTUAL_PUBLISHED`可消费virtual projection。virtual `list_tables()`对每张base table只使用已发布exact mapping，删除`fallback_ref`、`last_known_ref`及“底层已有virtual ref即保留”等补偿。
+8. 首次fallback清空candidate并发布terminal mode后，后续refresh必须在读取marker/base、identity计算或mapping构建前幂等no-op。当前`expand_ten_k_virtual_sections_content()`与`expand_ten_q_virtual_sections_content()`均以现有`if not full_text or not virtual_sections: return`开头，直接证明空candidate安全；锁定该zero-diff guard并用public 10-K/10-Q re-entry cases验证。若guard或行为漂移才STOP，不修改`ten_k_processor.py`、`ten_q_processor.py`、BS同族subclass、`ten_k_form_common.py`或`ten_q_form_common.py`，也不扩production/test allowlist。首次virtual发布成功时保留现有10-K refresh与10-Q object/ref identity约束。
+
+禁止修改`dayu/documents/processors/base.py`、`dayu/fins/processors/sec_processor.py`或新增capability/schema/raw DOM marker。`SecProcessor.get_full_text_with_table_markers() -> ""`继续是合法unsupported声明；base fallback复用它已经拥有的同源sections/tables/read_section，不新增compatibility wrapper或第二resolver。
+
+已完成的Docling production call path保持如下，只作为protected review scope，不在本次implementation继续编辑：
 
 ```text
 DoclingProcessor.__init__
@@ -452,25 +488,40 @@ DoclingProcessor.__init__
 6. 语法非法、不能被Docling `RefItem`模型接受的ref不是caption resolver的fail-safe输入：固定以项目`.venv`真实失败值`not-a-valid-cref`在`DoclingDocument.load_from_json()`边界验证，并按现有Docling/Pydantic JSON parsing error对外暴露。resolver禁止捕获`RuntimeError`或`except Exception`，禁止匹配异常文本，也禁止包住type narrowing/text读取/规范化/去重/连接的宽catch；`TypeError`、`ValueError`、`RuntimeError`及任何不属于第5项dangling-reference数据边界的异常必须继续暴露，显示真实contract或编程错误。不得为了“更稳”增加warning/log后忽略、默认空字符串或降级到context/header。
 7. `_TableBlock.caption`仍是唯一缓存投影，现有`list_tables()`、`read_table()`与`get_page_content().tables`继续直接消费同一值；不得在三个consumer各自解析、重算或修补。`TableSummary.caption`与`TableContent.caption`的`str | None` public schema不变，不做schema migration或兼容alias。
 
-除上述一个owner correction外，其余八个AR-F05 production owners及所有其它production路径仍严格零diff。随后只在§3.2六个测试文件中，从public/owner contract继续补齐下表分支；不得直接复制production算法到期望值，不得只调用private helper而没有业务可观察断言：
+`S3-STOP-F01`上述owner correction与8-node caption matrix已经implementation完成，本计划不把它标为reviewed/accepted，但必须按§0 hash原样保留。除Docling与本次`sec_form_section_common.py`两个owner外，其余七个AR-F05 production owners及所有其它production路径严格零diff。只在§3.2既有六个测试文件中从owner/public contract继续补齐分支；不得直接复制production算法到期望值，不得只调用private helper而没有业务可观察断言。
 
-| Production owner | Baseline line coverage | Test owner / required behavior families |
+下表coverage数字来自continuation停止前六文件focused feedback run，不是final aggregate签署，也不替代fresh运行。`sec_form_section_common.py`因focused suite选择变化显示36.61%，更证明不能沿用旧aggregate百分比宣称接近80%；恢复后仍以§6.2 fresh changed-production ledger为唯一exit证据：
+
+| Production owner | Continuation focused line coverage | Test owner / required behavior families |
 | --- | ---: | --- |
-| `dayu/documents/processors/docling_processor.py` | 63.46% | `tests/documents/test_processors.py`：先关闭S3-STOP-F01，并用真实Docling serialize/load覆盖单caption、多caption顺序/空白规范化/精确去重/连接、空列表、全空白、未知collection、越界ref、非文本ref及caption向list/read/page public结果传播；之后补payload sniff/support、section/table/page/search/full-text、records/markdown fallback、header/context、noise/default/dedup header、malformed/missing metadata fail-safe，全部只断言public processor结果 |
+| `dayu/documents/processors/docling_processor.py` | 71.19% | `tests/documents/test_processors.py`：保留已通过的S3-STOP-F01真实Docling serialize/load caption matrix；继续补payload sniff/support、section/table/page/search/full-text、records/markdown fallback、header/context、noise/default/dedup header、malformed/missing metadata fail-safe，全部只断言public processor结果 |
 | `dayu/fins/pipelines/sec_6k_rules.py` | 67.56% | `tests/fins/test_sec_pipeline_download.py`：candidate filename/type/rank、quarter/half-year/XBRL signals、current result与未来/会议/管理变化/资本动作/演示/运营更新等正负分类，最终断言选取/拒绝业务结果 |
-| `dayu/fins/processors/sec_form_section_common.py` | 78.23% | `tests/fins/test_processor_read_consistency.py`：virtual section构建/展开、structured/fallback headings、TOC/reference-guide抑制、table映射、boundary search、short/empty section与public read/search一致性 |
-| `dayu/fins/processors/sec_report_form_common.py` | 65.14% | 同上：line-preserving HTML、edgartools rebuild、statement dataframe、TOC cutoff、item marker order/refinement、inline reference与候选优先级，断言public report section/statement结果 |
-| `dayu/fins/processors/sec_section_build.py` | 77.56% | 同上：fast/full/single-section paths、body anchor、TOC cutoff、duplicate occurrence、table fingerprint与安全 text extraction，断言稳定 section顺序/范围/table ownership |
-| `dayu/fins/processors/sec_table_extraction.py` | 66.16% | 同上：dataframe/dict/object/HTML/Markdown sources、section消歧、headers/row headers、financial classification、records recovery、MultiIndex/ghost columns、numeric/footnote normalization，断言public table content与section ref |
-| `dayu/fins/tools/preprocess_tools.py` | 75.81% | `tests/fins/test_fins_ingestion_tools.py`：missing/invalid/valid `source_kind`、optional tuple/bool、start/cancel/failure/awaiting outcomes与schema contract |
-| `dayu/host/_execution_config_projection.py` | 76.43% | `tests/host/test_effective_execution_config.py`：optional/required JSON scalar矩阵、RunnerSpec/options/provider request/AgentPolicy round-trip、missing/wrong/unknown/tampered fields fail closed |
-| `dayu/runtime/argparse_exit.py` | 未命中 | 新建 `tests/runtime/test_argparse_exit.py`：int codes（含 0/2/负数）原样返回，`None`/字符串/其他非 int统一为 usage error 2；不改 helper |
+| `dayu/fins/processors/sec_form_section_common.py` | 36.61% | `tests/fins/test_processor_read_consistency.py`：先关闭S3-STOP-F02六类owner/public反例与fallback重入；再覆盖virtual section构建/展开、structured/fallback headings、TOC/reference-guide抑制、完整table映射、boundary search、short/empty section与public read/search一致性 |
+| `dayu/fins/processors/sec_report_form_common.py` | 22.12% | 同上：line-preserving HTML、edgartools rebuild、statement dataframe、TOC cutoff、item marker order/refinement、inline reference与候选优先级，断言public report section/statement结果 |
+| `dayu/fins/processors/sec_section_build.py` | 18.48% | 同上：fast/full/single-section paths、body anchor、TOC cutoff、duplicate occurrence、table fingerprint与安全 text extraction，断言稳定 section顺序/范围/table ownership |
+| `dayu/fins/processors/sec_table_extraction.py` | 12.51% | 同上：dataframe/dict/object/HTML/Markdown sources、section消歧、headers/row headers、financial classification、records recovery、MultiIndex/ghost columns、numeric/footnote normalization，断言public table content与section ref |
+| `dayu/fins/tools/preprocess_tools.py` | 91.94% | `tests/fins/test_fins_ingestion_tools.py`：保留已通过delta；仅在fresh 219 ledger仍不足时补missing/invalid/valid `source_kind`、optional tuple/bool、start/cancel/failure/awaiting outcomes与schema contract |
+| `dayu/host/_execution_config_projection.py` | 92.99% | `tests/host/test_effective_execution_config.py`：保留已通过optional/required JSON scalar、RunnerSpec/options/provider request/AgentPolicy round-trip与fail-closed delta；final fresh ledger复核 |
+| `dayu/runtime/argparse_exit.py` | 100.00% | `tests/runtime/test_argparse_exit.py`：保留已通过int codes与usage error 2 owner contract；不改helper，final fresh ledger复核 |
 
-以上是测试选择优先级，不授权为了命中行而构造不可能状态、mock-only hook、dead branch、production seam、`pragma: no cover`、coverage omit、动态 import或实现镜像。测试必须具备完整中文模块/类/函数 docstring与严格类型。当前Slice 3六路径test delta全部保留，不重写已通过的runtime/Host/preprocess cases；现有四路径实际delta及两个零diff授权路径必须先按§0 entry hash复核，再在同一allowlist内增量完成caption matrix与其余coverage cases。
+以上是测试选择优先级，不授权为了命中行而构造不可能状态、mock-only hook、dead branch、production seam、`pragma: no cover`、coverage omit、动态 import或实现镜像。测试必须具备完整中文模块/类/函数 docstring与严格类型。当前Slice 3六路径test delta全部保留；重新授权后先在`tests/fins/test_processor_read_consistency.py`增量完成S3-STOP-F02 matrix，不重写已通过Docling/runtime/Host/preprocess cases，再按fresh coverage missing lines继续同一allowlist内高价值public cases。
 
-#### S3-STOP-F01 public test oracle
+#### S3-STOP-F02 owner/public counterexample matrix
 
-所有caption cases必须构造真实`DoclingDocument` / `TableItem.captions` / `TextItem`，调用`save_as_json()`，再经`DoclingProcessor`真实load；禁止直接调用`_extract_table_caption()`、修改`_tables`、monkeypatch `RefItem.resolve`或伪造private block：
+以下六类反例必须全部进入`tests/fins/test_processor_read_consistency.py`，先于其余coverage cases执行。真实表单case从public constructor与public methods观察；owner harness只提供typed base processor/marker输入并最终断言public list/read结果，不暴露新production seam、不复制mapping算法：
+
+1. **Public 10-K + unsupported marker + base table**：保留现有`test_ten_k_public_processor_assigns_tables_without_marker_capability`最小合法HTML，不删除或改弱`supports(...) is True`前提。用同一source的public `SecProcessor`取得base oracle；逐值比较base/form的完整section ref序列、完整table ref序列、每张table的`section_ref`与每个base section的`read_section(ref)["tables"]`。再用每个base ref调用form的`get_section_title(ref)`、`read_section(ref)`与`search(..., within_ref=ref)`并与base结果逐值比较，证明ref命名空间、内容、搜索范围与table ownership全部同源。不得只比较长度、非空、内容摘要或“不抛异常”，也不得把表格塞进任意virtual ref。
+2. **Marker supported + complete mapping**：typed owner harness提供两virtual sections、唯一base table与包含该ref的完整marker material；refresh后public `list_sections()`发布virtual refs，`list_tables()`只按exact mapping重写到唯一virtual ref，`read_section(ref)["tables"]`包含同一ref，反向map/section map完整唯一。再次refresh应保持同一业务结果与10-Q identity contract。
+3. **Marker supported + incomplete proof**：至少覆盖两种无矛盾incomplete：(a) base有至少两表而marker只证明其中一表；(b) raw marker refs都属于base且无重复/dangling，但marker range/title不能把某个ref唯一归属到section。两者都不得发布半套virtual state或退回位置猜测/旧集合不等异常，必须whole-base fallback。fallback后按case 1同一oracle逐值比较section refs、table refs、table `section_ref`、`read_section(ref)["tables"]`，并通过base refs逐值验证title/read/search。
+4. **Duplicate / dangling / contradictory fail-closed**：分别覆盖缺失/重复base `table_ref`、marker出现非base dangling ref、同一marker ref重复/归属多个section、section parent/child或双向map矛盾；每类都必须在atomic commit前抛`ValueError`，不能留下半更新public state。另固定混合case：base refs含未映射项且raw marker同时含dangling ref时，dangling/contradiction检查必须优先fail-closed，不能被incomplete fallback吞掉。expected只断言稳定错误类别/业务片段，不复制内部遍历顺序。
+5. **Zero-table document**：public或typed owner case形成合法virtual sections、base `list_tables()==[]`且marker unsupported；必须继续发布virtual sections与空双向mapping，public list/read/search一致，证明“空marker”不是无条件fallback信号。
+6. **10-K/10-Q second postprocess idempotence / no re-entry**：至少覆盖public SecProcessor-backed `TenKFormProcessor`与`TenQFormProcessor`，并用既有四路径postprocess probe复核shared owner对BS同族没有行为漂移。先锁定两个form-common expand函数现有`if not full_text or not virtual_sections: return` zero-diff guard；首次refresh因unsupported/incomplete marker清candidate并发布base fallback后，subclass构造器第二次postprocess/refresh必须保持base section refs、table refs、table `section_ref`、title/read/search与`read_section(...)["tables"]`逐值不变，marker/base mapping call count不增加，无异常、无virtual/partial state重生；10-Q空identity multiset不得触发重建。完整mapping的既有10-K/10-Q virtual refresh与10-Q object/ref identity约束继续通过。
+
+矩阵必须同时证明“fallback是同源base publication”与“contradiction仍fail closed”。禁止以`try/except`只看构造成功、private字段单断言、首/最近章节expected、标题/顺序推断或mock-only hook替代public contract。
+
+#### S3-STOP-F01 protected public test oracle
+
+以下caption cases已经完成并通过；它们必须构造真实`DoclingDocument` / `TableItem.captions` / `TextItem`，调用`save_as_json()`，再经`DoclingProcessor`真实load。后续review把它们纳入完整Slice 3 diff，但本次恢复implementation不得直接调用`_extract_table_caption()`、修改`_tables`、monkeypatch `RefItem.resolve`、伪造private block或重写既有cases：
 
 1. **单caption与传播**：一个`TextItem(label=CAPTION)`经一个ref引用，断言`list_tables()[0]["caption"]`与`read_table("t_0001")["caption"]`相同；page fixture必须用current public `ProvenanceItem(page_no=1, bbox=BoundingBox(l=0.0, t=0.0, r=1.0, b=1.0), charspan=(0, 1))`构造table provenance，经真实serialize/load后断言`get_page_content(1)["tables"][0]["caption"]`相同；禁止写private state或伪造page cache。
 2. **多caption顺序/规范化/去重/连接**：至少三个refs，输入包含首尾空白、换行/制表/连续空格、一个规范化后完全重复值与一个不同值；只断言业务结果如`"Consolidated Results Unaudited"`，并通过反向排列的独立case证明顺序来自refs而非document text数组/集合排序。大小写不同的合法caption必须分别保留；测试不加入NBSP特例、casefold或Unicode normalization framework。
@@ -496,19 +547,21 @@ test_docling_json_processor_propagates_caption_to_public_table_views
 
 #### Unchanged trust / quota / deferred boundaries
 
-- Config与Host internal SQLite/EventLog仍是`ACCEPTED_TRUSTED_INTERNAL`；只允许§2.2.1的exact Config / Host effective-execution owner命中。Tool Trace、audit、public、LLM-facing、logs、其它outputs、diff/reviews仍逐surface `ZERO_REQUIRED`，Docling correction不改变或绕过该裁决。
+- Config与Host internal SQLite/EventLog仍是`ACCEPTED_TRUSTED_INTERNAL`；只允许§2.2.1的exact Config / Host effective-execution owner命中。Tool Trace、audit、public、LLM-facing、logs、其它outputs、diff/reviews仍逐surface `ZERO_REQUIRED`，两项Slice 3 owner correction都不得改变或绕过该裁决。
 - Gemini低预算测试账号仍固定为`EXPECTED_TEST_ACCOUNT_QUOTA / NO_CODE_ACTION / NON_BLOCKING`；不得因恢复Slice 3追加真实provider调用，或修改config/model/key/retry/quota/budget。
 - `AR-F06 = RETAINED / UNFIXED / UNWAIVED / CURRENT_NO_FIX`；canonical non-coverage必须真实运行scheduler node，coverage仍只允许§6.2精确一个deselect。`AR-F07 = PENDING_RELEASE_BLOCKER`，Darwin skip不能代替真实Windows evidence。
 - Issues 142/151/175/177/178、Topic 8/9与既有deferred/no-code destination不变；不得引入secret infrastructure、统一tool authorization framework、TruncationManager wiring、storage-state lifecycle或Fins hard-kill/process isolation。
 
 #### Stop condition
 
-已接受的`S3-STOP-F01`是本corrected slice唯一production例外。若修复需要第二个production path、raw JSON/private document internals、broad exception swallow、旧单数caption fallback、第二resolver、下游补偿、schema改动或README扩域，立即停止并交Controller。若caption matrix或其余新增owner-contract case再暴露新的production correctness/type/security defect，或只有修改其它production / 直接耦合不稳定private实现才能达到80%，保存最小复现、预期/实际、stack与coverage missing-line证据后停止；不得顺手扩域或降低threshold。
+已接受的`S3-STOP-F01`与`S3-STOP-F02`是本corrected slice仅有的两个production例外。出现任一情况立即停止并交Controller：需要第三个production path；需要修改DocumentProcessor/SecProcessor marker contract、增加DOM/raw HTML marker或capability schema；需要首/最近章节、标题/顺序/相似度猜测、兼容分支、下游fallback、第二owner resolver或broad exception swallow；无法在单一atomic refresh owner区分incomplete fallback与duplicate/dangling/contradictory fail-closed；10-K/10-Q二次postprocess必须改subclass才能避免重入；需要README扩到`dayu/fins/README.md`之外。若六类matrix或其余owner cases再暴露新的production correctness/type/security defect，或只有修改其它production/直接耦合不稳定private实现才能达到80%，保存最小复现、预期/实际、stack与coverage missing-line证据后停止；不得顺手扩域或降低threshold。
 
 #### Focused tests / coverage / real smoke
 
 ```bash
 source .venv/bin/activate
+pytest tests/fins/test_processor_read_consistency.py::test_ten_k_public_processor_assigns_tables_without_marker_capability -q
+pytest tests/fins/test_processor_read_consistency.py -k 'virtual_section and (fallback or mapping or refresh or postprocess)' -q
 pytest tests/documents/test_processors.py::test_docling_json_processor_projects_referenced_table_caption -q
 pytest tests/documents/test_processors.py -k 'docling and caption' -q
 pytest tests/documents/test_processors.py \
@@ -519,7 +572,7 @@ pytest tests/documents/test_processors.py \
   tests/runtime/test_argparse_exit.py -q
 ```
 
-Focused coverage先作为快速反馈，最终签署只采用 §6.2 fresh aggregate coverage。Slice 3还必须重跑真实 affected-owner paths：
+前两条先关闭S3-STOP-F02并验证六类matrix；Docling两条是受保护delta的fresh回归，不授权继续修改。Focused coverage只作快速反馈，最终签署只采用§6.2 fresh aggregate coverage。Slice 3还必须重跑真实affected-owner paths：
 
 ```bash
 python -m dayu.cli \
@@ -538,20 +591,22 @@ python utils/smoke_host_public_r03_semantic_ownership.py \
 
 #### Slice exit
 
-- `S3-STOP-F01`全部public caption oracle通过；owner diff只含§4.3列出的call-path变化，旧单数caption读取、fallback与第二resolver为零。
+- `S3-STOP-F01`全部public caption oraclefresh通过，protected Docling/test delta相对第二次correction entry语义未漂移；旧单数caption读取、fallback与第二resolver为零。
+- `S3-STOP-F02`六类owner/public反例全部通过：unsupported/incomplete marker原子base fallback、complete marker原子virtual publication、zero-table virtual publication、incomplete+dangling及其它duplicate/dangling/contradictory fail-closed、无dangling但range/title不能唯一归属的whole-base fallback，以及10-K/10-Q二次postprocess fallback幂等不重入。五个public consumers只消费同一typed mode；`_filter_table_refs_by_availability()`静默过滤、`list_tables()`首/最近章节补偿与`_assign_unmapped_tables_by_position()`均为零，DocumentProcessor/SecProcessor marker contract与两个form-common guard零diff。
+- Slice 3 production diff只含§3.1两个路径；相对本次entry的新production hunk只在`sec_form_section_common.py`。`dayu/fins/README.md`只同步已实现的稳定owner/fallback语义。
 - 九路径每个 fresh line coverage `>=80.00%`，AR-F05 closed。
 - Final aggregate-range ledger必须精确为 `219/219 >=80%`。预期集合变化是原 219 中删除 `dayu/fins/direct_stream.py`、新增 `dayu/fins/ingestion/awaiting_resolution.py`，总数仍为 219；任何其他增删都是 scope failure。
 - Canonical non-coverage suite、exact-exclusion coverage suite、full pyright、Ruff delta、build、scans、smokes全部满足 §6，不得仅凭 focused tests接受。
 
 ## 5. Per-slice mandatory review / fix / re-review state machine
 
-本次S3 corrected plan必须先完成独立的plan gate，且不得与implementation/code review合并：
+本次S3第二次corrected plan必须重新完成独立plan gate，且不得把第一次correction的review/re-review结论复用为本次通过，也不得与implementation/code review合并：
 
-1. AgentMiMo与AgentDS分别对**完整corrected plan与S3 correction artifact**做双路完整plan review；两路都必须挑战owner唯一性、多caption public语义、invalid/non-text ref边界、异常传播、tests oracle、allowlists、README与§6门禁，不能只review新增hunks或复用Controller裁决。
-2. Controller逐条裁决两路plan findings为accepted / rejected-with-reason / needs-more-evidence / deferred-with-owner；存在未裁决或blocking finding时不得implementation。
-3. AgentCodex只在本plan与固定plan-correction artifact内修复accepted findings；若finding要求production/test/README/utility改动或改变owner contract，先STOP，不在plan-fix gate实施代码。
-4. AgentMiMo与AgentDS分别对fix后的完整plan做双路完整re-review；只看fix diff不算re-review。两路必须确认所有accepted findings状态为已修复且没有新blocking finding。
-5. Controller明确接受corrected plan并发布新的Slice 3 implementation authorization后，才能修改Docling owner或继续测试。Plan review/re-review本身不授权stage/commit。
+1. AgentMiMo与AgentDS对immutable第二次corrected plan的双路完整plan review已经完成，artifact SHA-256分别为`6e747659183c0c59efed30e22129e3c5510802ae154be307d2d122f3449854dc`与`6c7556f20c78901b188f01649184b2df7cd479ab3d2facd3bf9a1c3af56ed822`；不得把它们误记为对本次fix后plan的re-review。
+2. Controller已在SHA-256=`725db848f7fb0eb9a2418a55ae90008b74131b5b360e8948415d3bb17b88daeb`的adjudication中合并接受`S3-P2-PF01`—`S3-P2-PF04`，reject MiMo 05独立finding并否定DS-F03“空列表未知”的事实判断；有效guard与测试证据已分别归入PF01/PF03。
+3. 本次AgentCodex只在本plan与固定`docs/reviews/wu-semantic-ownership-01-aggregate-regression-fix-s3-second-production-defect-plan-review-fix-codex.md`内修复四组accepted findings；production/test/README/utility/control与其它artifact保持zero-write。
+4. **唯一next gate**：Controller validation，以及AgentMiMo与AgentDS分别对fix后的**完整plan与本次fix artifact**做双路完整re-review；只看fix diff不算re-review。两路必须逐组确认`S3-P2-PF01`—`S3-P2-PF04`已修复、rejected/narrowed候选未复活且没有新blocking finding。
+5. Controller在validation与双路完整re-review均通过后明确接受plan并发布新的Slice 3 implementation authorization，才能修改`sec_form_section_common.py`或继续测试。Docling与现存test delta继续受保护；plan fix/validation/re-review本身不授权stage/commit。
 
 每个 slice 都必须独立完成以下顺序，前一 slice未接受不得开始下一 slice：
 
@@ -576,6 +631,7 @@ pytest tests/documents tests/tools tests/host tests/engine tests/runtime tests/s
 - Slice 1只允许 §4.1 已声明的单个 AR-F02 import-boundary中间失败；不能把该运行标为全绿。
 - Slice 2、Slice 3及最终 aggregate必须 exit 0、0 failed。AR-F06 scheduler node不 deselect、不 skip、不 retry。
 - pass count不得低于基线已通过 tests加本计划新增 cases；10 skips与5 deselected必须逐项保持现有平台/测试配置分类，不能新增未裁决 skip/deselect。
+- Slice 3不得把continuation中`204 passed` focused run或S3-STOP-F02的预期失败当作final evidence；owner修复后六测试路径、canonical suite与AR-F06 non-coverage node均须fresh重跑。已完成Docling 8-node matrix也必须fresh回归，但其entry delta不得为通过回归而重写。
 
 ### 6.2 Coverage 与 exact scheduler node exclusion
 
@@ -616,7 +672,8 @@ COVERAGE_FILE=workspace/tmp/wu-semantic-ownership-01-ar-fix-aggregate.coverage \
 - 从 `git diff --name-only --diff-filter=ACMR 3410d7422655c56bdf13c643f77c27f40b9d4550..FINAL_ACCEPTED_HEAD -- 'dayu/**/*.py'` 得到现存 changed production Python，排序、去重，必须恰好219个。
 - 对 coverage JSON 的每个路径按 `covered_lines / num_statements * 100` 计算 fresh **line** coverage；不得使用含 branch的 combined `percent_covered` 冒充 line coverage，不在 JSON即按0处理。
 - Slice 1/2必须输出 cumulative ledger；Slice 1只保留 AR-F02中间失败，Slice 1/2可把九个 AR-F05 paths标为 `OPEN_BY_SEQUENCE`，但不得出现其他 `<80%`。
-- Slice 3与最终 aggregate必须 `219/219 >=80.00%`；九路径及 Slice 2新增 public owner都单列 statements/covered/missing/percent。
+- Slice 3与最终 aggregate必须 `219/219 >=80.00%`；九路径及 Slice 2新增 public owner都单列 statements/covered/missing/percent。Docling与`sec_form_section_common.py`本来就在219集合中，本次两个owner的内容修改不得改变成员总数；任何额外增删均STOP。
+- `sec_form_section_common.py` ledger必须与S3-STOP-F02六类matrix的fresh通过结果同时报告；coverage到线不代表原子fallback contract已关闭。不得沿用continuation focused `36.61%`或stop-node `30.145719%`作为exit数据。
 
 ### 6.3 Full pyright / Ruff
 
@@ -645,6 +702,7 @@ git diff --cached --name-status
 - `git diff --cached --name-status`必须为空，除非后续 Controller在独立 gate明确授权 stage。
 - 扣除开始时pre-existing protected集合后，剩余name/status必须与当前slice production/test/validation-utility/README allowlists精确相等或为其子集；delete/add status也必须匹配。Slice 2 的 validation-utility delta 必须只有 `M utils/smoke_host_public_awaiting_entrypoint.py`，且只有 §3.3 授权的 import 行迁移。既有Controller-owned modified/untracked paths不得被扣除后遗忘：必须以开始/结束SHA-256证明内容未变，mtime不作为语义证据。
 - 不得删除、格式化、恢复或纳入既有工作区 changes。
+- 本次第二次plan-review-fix entry及后续re-review前必须逐项复核§0全部protected hashes；恢复implementation entry还须把Docling与六测试路径视为pre-existing accepted delta，只允许`sec_form_section_common.py`新增production hunk与六测试路径内的增量cases。continuation/correction/validation/review/Controller artifacts始终zero-write。
 
 ### 6.5 Build
 
@@ -674,11 +732,27 @@ rg -n 'schema_version.*commands|JSON argv|dayu-web|dayu-wechat|dayu-render' pypr
 
 Slice 2 与最终 aggregate 还必须 fresh 重跑 §4.2 的 direct-stream/awaiting owner scans：扫描根固定为 `dayu tests utils`，新 owner definitions 各唯一、consumer imports 只落在精确 allowlists，旧 `dayu.fins.direct_stream` 与 awaiting 三项语义的旧 private definition/import 均必须零命中。
 
+Slice 3与最终aggregate还必须fresh执行virtual-section owner scans：
+
+```bash
+rg -n '_filter_table_refs_by_availability|_assign_unmapped_tables_by_position|fallback_ref|last_known_ref' \
+  dayu/fins/processors/sec_form_section_common.py
+git diff --exit-code 48c6cc5ef74f273b1b592682ae9ab3e14cb48cbe -- \
+  dayu/documents/processors/base.py \
+  dayu/fins/processors/sec_processor.py \
+  dayu/fins/processors/ten_k_processor.py \
+  dayu/fins/processors/ten_q_processor.py \
+  dayu/fins/processors/bs_ten_k_processor.py \
+  dayu/fins/processors/bs_ten_q_processor.py
+```
+
+第一条必须零命中，证明silent raw-ref filter、最近/首章节补偿函数与consumer状态已删除；不得用改名保留同义过滤/猜测。第二条必须exit 0，证明marker producer contract和10-K/10-Q subclass没有被下游绕修。另对`sec_form_section_common.py`新增diff做语义scan，确认无标题相似度/顺序fallback、`hasattr/getattr`、`except Exception`或新warning/log分支；既有无关代码命中按entry diff分类，不得用全文件旧命中伪报新增。
+
 ### 6.7 README / security / deferred / no-code ledger
 
 每个 slice必须形成明确 ledger：
 
-- README：按 §3.4 读取目标 README约束、记录 `UPDATE`或`NO_UPDATE`及直接理由；除 Slice 2 `dayu/fins/README.md` 外不允许先改后解释。
+- README：按 §3.4 读取目标 README约束、记录`UPDATE`或`NO_UPDATE`及直接理由。Slice 2/3分别只允许`dayu/fins/README.md`内属于该slice已实现稳定语义的更新；Slice 3必须说明atomic virtual publication / whole-base fallback / no guessing，并证明根README、`dayu/README.md`、`tests/README.md`为`NO_UPDATE`。其它README不允许先改后解释。
 - Security：重跑 Doc path containment/output truncation、Web DNS/private/proxy/redirect/diagnostic、Host digest/EventLog/opaque ref、wait late-publication fence、Fins transaction/atomic swap/path/opaque id/direct validator、CLI POSIX quoting/init containment/process fencing相关既有矩阵。AR-F07 Windows项只能记 `PENDING_RELEASE_BLOCKER`。
 - Configured-secret scan 必须按 semantic owner分类，不能继续用跨全部surface的单一零命中规则：
   - secret集合只从current typed model config的 `api_key_ref` 解析当前环境中非空values；只输出 configured value count、各surface match count / matched path count与Host logical row count，不输出value、ref名称、header名称或命中正文。
@@ -751,12 +825,14 @@ push / PR / final closeout = NOT AUTHORIZED
 
 任一条件出现立即停止当前 slice并交 Controller：
 
-- 正确语义 owner与本计划判断不一致，或需要新增production/test/validation-utility/README/workflow path。
+- 正确语义 owner与本计划判断不一致，或需要新增allowlist外production/test/validation-utility/README/workflow path。
 - `S3-STOP-F01`修复无法只在Docling table projection boundary完成，或需要旧单数caption fallback、raw JSON/path parser、第二resolver、下游补偿、broad catch、private implementation mirroring/mock-only hook。
 - caption ref的当前Docling public contract与§4.3直接证据不一致；未知collection/越界不能在精确`resolve()`调用边界分类；非文本item无法用public `TextItem`类型判定；多caption public结果需要新的schema/consumer协商。
 - schema-valid root ref `#`不能在typed `RefItem.cref`边界以命名常量静默跳过，或需要调用`resolve()`、捕获`RuntimeError`、匹配异常文本、warning/log、raw parser/fallback/第二resolver才能处理。
-- 当前六个Slice 3 test路径或Controller-owned/protected artifact任一entry hash漂移；plan-only gate出现production/test/README/utility diff；staged state非空。
-- AR-F05再暴露`S3-STOP-F01`以外production defect，或只有private implementation mirroring/mock-only hook才能达到80%。
+- `S3-STOP-F02`无法只在`sec_form_section_common.py`的virtual-section publication owner关闭，或需要修改DocumentProcessor/SecProcessor marker contract、SEC/BS subclass、增加DOM/raw marker/capability schema、compatibility wrapper、第二resolver或第三个production path。
+- marker缺失/不完整时只能用首章节、最近章节、标题/顺序/相似度或底层偶然ref猜ownership；duplicate/dangling/contradictory不能与incomplete proof稳定区分并fail closed；zero-table不能保留合法virtual projection；10-K/10-Q二次postprocess在fallback后不能由同一owner幂等短路。
+- 当前Docling delta、六个Slice 3 test路径、continuation或Controller-owned/protected artifact任一entry hash漂移；plan-only gate出现production/test/README/utility diff；staged state非空。
+- AR-F05再暴露`S3-STOP-F01/F02`以外production defect，或只有private implementation mirroring/mock-only hook才能达到80%。
 - Service boundary必须扩大allowlist才可通过；出现import cycle并诱发lazy import/re-export/facade方案；`tests/cli/test_fins_commands.py` 或 public-awaiting utility 需要超出精确 import 迁移的改动。
 - Current compact artifact没有唯一manifest digest关联、出现重复owner-published association或schema与本计划直接证据不一致。
 - Logger state无法在test harness内完整恢复而必须改变standalone logging行为。
@@ -771,12 +847,13 @@ push / PR / final closeout = NOT AUTHORIZED
 
 - `AR-F06` 是真实 scheduler/lifecycle bug，不因本计划消失；本轮只保持其owner/destination，不修、不waive。
 - `AR-F07` 依赖真实remote Windows runner，不能在本地关闭。
-- `S3-STOP-F01`在corrected plan完成双路完整review/fix/re-review并获Controller重新授权前仍是blocking production correctness defect；本plan-only gate不把它标为fixed。
+- `S3-STOP-F01` implementation与8-node matrix已完成但仍是review-pending protected delta；本plan-only gate不把它标为reviewed/accepted，也不允许单独review/commit。
+- `S3-STOP-F02`是当前blocking production correctness defect；双路完整plan review与Controller裁决已完成，本次plan-only fix后仍须完成Controller validation、MiMo/DS双路完整re-review并获Controller重新授权，之前不得实施。
 - AR-F05大型SEC/Docling owner的80%门槛需要较多高价值边界cases；若测试揭示真实缺陷，进度可以停止，但不能牺牲owner boundary或测试质量。
 
 ## 10. Plan acceptance checklist
 
-- [ ] 本S3 plan-review-fix只修改本plan、既有S3 plan-correction artifact并新增固定plan-review-fix artifact；production/test/README/utility/workflow/control、MiMo/DS reviews与Controller artifacts零变化，六个Slice 3 test路径与全部protected dirty artifact SHA-256逐项不变，staged为空。
+- [ ] 本S3第二次plan-review fix只修改本plan并新增固定second-production-defect plan-review-fix artifact；production/test/README/utility/workflow/control、既有correction/validation/review/continuation/Controller artifacts零变化，Docling delta、六个Slice 3 test路径与全部protected dirty artifact SHA-256逐项不变，staged为空。
 - [ ] 三个slices且顺序固定，AR-F01—F05均有唯一closure owner与test oracle。
 - [ ] `S1-SEC-F01`关闭为no-code blocker；exact Config / Host internal effective-execution命中是accepted classification，Tool Trace、audit、public / LLM-facing、log、其它output、diff与review surface分别要求零明文。
 - [ ] Slice 1追加五个精确owner-test allowlist path与synthetic sentinel contract，不增加production path、不增加slice；测试明确保留Engine执行所需`RunnerSpec.headers`，只对projection做zero断言。
@@ -785,15 +862,20 @@ push / PR / final closeout = NOT AUTHORIZED
 - [ ] Direct-stream/awaiting definition、consumer 与stale-private scans在 Slice 2 与final aggregate均覆盖 `dayu tests utils`，旧 private import/definition零命中。
 - [ ] AR-F04只用current runner manifest + compaction request digest关联，无candidate_id/raw guess/fallback。
 - [ ] AR-F03只做in-process test harness isolation，standalone product logging零 diff。
-- [ ] `S3-STOP-F01`精确开放且只开放`M dayu/documents/processors/docling_processor.py`；其它八个AR-F05 owners零diff，219 changed-production集合不变。
+- [ ] Slice 3 production allowlist精确为`M dayu/documents/processors/docling_processor.py`与`M dayu/fins/processors/sec_form_section_common.py`；本次恢复只新增后者diff，Docling受保护，其余七个AR-F05 owners零diff，219 changed-production集合不变。
 - [ ] Caption resolver只消费`TableItem.captions`并用每个`RefItem.resolve(document)`读取同一DoclingDocument；旧单数caption `getattr`、`caption_text()`、raw JSON/private path、fallback与第二resolver为零。
 - [ ] Schema-valid root ref `#`只以命名模块常量和typed `RefItem.cref`在resolve前跳过；unknown collection/out-of-range只在单次resolve周围捕获`AttributeError`/`IndexError`且无warning/log；model-invalid loader test固定`not-a-valid-cref`，production不读取JSON alias `$ref`。
 - [ ] 多caption按refs顺序、现有whitespace normalizer、大小写敏感精确去重、首次保留、单空格连接形成唯一public caption；空/全空白/未知collection/越界/非文本边界与非数据异常传播规则完整。
 - [ ] Public tests全部经真实Docling serialize/load并断言`list_tables`、`read_table`与page table结果；不只测private helper。
-- [ ] 现有Slice 3 test delta完整保留；恢复implementation后先关闭S3-STOP-F01，再继续其余九owner coverage cases。
+- [ ] `S3-STOP-F02`由`sec_form_section_common.py`唯一owner以private typed `BUILDING / VIRTUAL_PUBLISHED / BASE_FALLBACK_PUBLISHED`原子选择完整virtual projection或完整base fallback；`_refresh_virtual_section_state()`是唯一terminal transition owner，DocumentProcessor/SecProcessor marker contract、两个form-common空candidate guard与10-K/10-Q subclass零diff。
+- [ ] 六类owner/public反例完整：public TenK unsupported marker/base table、complete marker、无矛盾incomplete（含range/title无法唯一归属）、duplicate/dangling/contradictory（含incomplete+dangling优先fail-closed）、zero table、10-K/10-Q二次postprocess fallback幂等不重入；fallback逐值验证base/form section refs、table refs、table `section_ref`、title/read/search及`read_section.tables`。
+- [ ] 五个且只有五个public consumers `list_sections/list_tables/get_section_title/read_section/search`只消费同一typed mode；`_filter_table_refs_by_availability`静默过滤、`list_tables`首/最近章节补偿与`_assign_unmapped_tables_by_position`均为零。
+- [ ] 现有Docling与Slice 3 test delta完整保留；恢复implementation后先关闭S3-STOP-F02，再继续九owner coverage cases。
 - [ ] Production/test/validation-utility/README allowlists与protected paths精确列出。
 - [ ] 每slice含focused tests、canonical suite、coverage、pyright、Ruff、diff、build、scans、README/security/deferred/no-code和真实smoke。
+- [ ] Slice 3按现有职责更新`dayu/fins/README.md`的atomic virtual/base publication稳定语义；根README、`dayu/README.md`与`tests/README.md`保持NO_UPDATE。
 - [ ] 每次coverage前exact `pytest --collect-only`唯一收集AR-F06完整node id；coverage只排除该精确单node；最终要求219/219 line coverage >=80%。
 - [ ] 每slice要求MiMo/DS完整code review、fix、完整re-review；全部slice后重新aggregate regression，再进入MiMo/DS aggregate deepreview。
 - [ ] AR-F06保持no-code residual，AR-F07保持Windows pending release blocker。
-- [ ] Corrected plan与plan-correction artifact经MiMo/DS双路完整plan review、Controller裁决、AgentCodex fix、MiMo/DS双路完整re-review及Controller新授权前不实施。
+- [ ] Config/Host SQLite/EventLog trusted internal与Tool Trace/audit/public/LLM/log zero-required不变；Gemini quota保持non-blocking no-code且无额外真实调用/配置变化；Issues 142/151/175/177/178、Topic 8/9与统一tool authorization不实施。
+- [ ] Immutable第二次corrected plan已经MiMo/DS双路完整plan review与Controller裁决；本次AgentCodex只修`S3-P2-PF01`—`PF04`。唯一next gate是Controller validation与MiMo/DS对完整fix后plan及fix artifact的双路完整re-review；Controller新授权前不实施。
