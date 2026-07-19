@@ -43,6 +43,18 @@ _FIXTURE_SOURCE: Path = (
 _WINDOWS_ARTIFACT_DIR_ENV: Final[str] = "DAYU_R11_WINDOWS_ARTIFACT_DIR"
 _WINDOWS_RECORDER_ARTIFACT_SUBDIRECTORY: Final[str] = "cmd-recorder"
 _WINDOWS_CLI_ARTIFACT_SUBDIRECTORY: Final[str] = "cli-storage"
+_WINDOWS_BATCH_HEADER_ORACLE: Final[tuple[str, ...]] = (
+    "@echo off",
+    "chcp 65001 >nul",
+    "setlocal DisableDelayedExpansion",
+)
+_WINDOWS_REGENERATION_PREFIX: Final[str] = "REM Regenerate: "
+_WINDOWS_RENDERED_COMMAND_SUFFIX: Final[str] = " %*"
+_WINDOWS_POST_COMMAND_LINES: Final[tuple[str, ...]] = (
+    "if errorlevel 1 exit /b %errorlevel%",
+    "exit /b 0",
+)
+_WINDOWS_REAL_SMOKE_COMPANY_NAME: Final[str] = "Apple Inc."
 _R11_WINDOWS_WORKFLOW_PATH: Final[Path] = (
     Path(__file__).resolve().parents[2]
     / ".github"
@@ -482,6 +494,72 @@ def test_windows_renderer_round_trips_fixed_argument_oracles() -> None:
     assert "\n" not in content.replace("\r\n", "")
 
 
+def test_windows_upload_company_oracle_fails_closed_on_non_business_evidence(
+    tmp_path: Path,
+) -> None:
+    """Windows company-name oracle 必须忽略注释并拒绝零条或多条业务命令。"""
+
+    script_path = tmp_path / "oracle.cmd"
+    command_prefix = ("python", "-m", "dayu.cli", "upload_filing")
+    regeneration_argv = (
+        "python",
+        "-m",
+        "dayu.cli",
+        "upload_filings_from",
+        "--company-name",
+        _WINDOWS_REAL_SMOKE_COMPANY_NAME,
+    )
+    valid_command = (
+        *command_prefix,
+        "--company-name",
+        _WINDOWS_REAL_SMOKE_COMPANY_NAME,
+    )
+    valid_content = upload_script.render_upload_script(
+        (valid_command,),
+        regeneration_argv=regeneration_argv,
+        platform="windows",
+    )
+    script_path.write_text(valid_content, encoding="utf-8", newline="")
+    assert _assert_single_windows_upload_company_name(
+        script_path=script_path,
+        expected_company_name=_WINDOWS_REAL_SMOKE_COMPANY_NAME,
+    )
+
+    invalid_command_sets = (
+        (command_prefix,),
+        (
+            (
+                "python",
+                "-m",
+                "dayu.cli",
+                "upload_material",
+                "--company-name",
+                _WINDOWS_REAL_SMOKE_COMPANY_NAME,
+            ),
+        ),
+        (valid_command, valid_command),
+        (
+            (
+                *valid_command,
+                "--company-name",
+                _WINDOWS_REAL_SMOKE_COMPANY_NAME,
+            ),
+        ),
+    )
+    for invalid_commands in invalid_command_sets:
+        invalid_content = upload_script.render_upload_script(
+            invalid_commands,
+            regeneration_argv=regeneration_argv,
+            platform="windows",
+        )
+        script_path.write_text(invalid_content, encoding="utf-8", newline="")
+        with pytest.raises(AssertionError):
+            _assert_single_windows_upload_company_name(
+                script_path=script_path,
+                expected_company_name=_WINDOWS_REAL_SMOKE_COMPANY_NAME,
+            )
+
+
 @pytest.mark.parametrize("forbidden", ("line\nfeed", "carriage\rreturn", "nul\x00byte"))
 def test_windows_renderer_rejects_arguments_that_escape_one_batch_line(
     forbidden: str,
@@ -855,6 +933,8 @@ def test_windows_generated_script_runs_real_cli_into_temp_storage(tmp_path: Path
             str(source_dir),
             "--action",
             "create",
+            "--company-name",
+            _WINDOWS_REAL_SMOKE_COMPANY_NAME,
             "--output",
             str(artifact_directory / "cli-generated-upload.cmd"),
         ),
@@ -866,6 +946,11 @@ def test_windows_generated_script_runs_real_cli_into_temp_storage(tmp_path: Path
         errors="strict",
     )
     script_path = artifact_directory / "cli-generated-upload.cmd"
+    assert generation.returncode == 0, generation.stderr
+    company_name_supplied = _assert_single_windows_upload_company_name(
+        script_path=script_path,
+        expected_company_name=_WINDOWS_REAL_SMOKE_COMPANY_NAME,
+    )
     execution = subprocess.run(
         ("cmd.exe", "/d", "/c", str(script_path)),
         cwd=Path(__file__).resolve().parents[2],
@@ -876,7 +961,6 @@ def test_windows_generated_script_runs_real_cli_into_temp_storage(tmp_path: Path
         errors="strict",
     )
 
-    assert generation.returncode == 0, generation.stderr
     assert execution.returncode == 0, execution.stderr
     assert "Fins result" in execution.stdout
     source_artifacts = tuple(
@@ -895,6 +979,7 @@ def test_windows_generated_script_runs_real_cli_into_temp_storage(tmp_path: Path
                 ).hexdigest(),
                 "source_artifact_count": len(source_artifacts),
                 "cmd_invocation": "cmd.exe /d /c",
+                "company_name_supplied": company_name_supplied,
             },
             ensure_ascii=False,
             indent=2,
@@ -955,6 +1040,94 @@ def _parse_single_windows_crt_argument(value: str) -> str:
             index += 1
     assert not in_quotes
     return "".join(result)
+
+
+def _assert_single_windows_upload_company_name(
+    *,
+    script_path: Path,
+    expected_company_name: str,
+) -> bool:
+    """验证唯一 Windows upload_filing 业务命令显式携带预期公司名。
+
+    :param script_path: 待执行的 Windows batch 脚本。
+    :param expected_company_name: 业务命令必须携带的精确公司名。
+    :returns: 逐 token 验证通过时返回 ``True``，供 oracle artifact 同源记录。
+    :raises AssertionError: CRLF、固定 header、命令数量、命令类型或公司名不满足契约时抛出。
+    :raises OSError: 读取脚本失败时透传。
+    :raises UnicodeDecodeError: 脚本不是严格 UTF-8 时抛出。
+    """
+
+    script_text = script_path.read_bytes().decode("utf-8", errors="strict")
+    assert script_text.endswith("\r\n")
+    physical_lines = tuple(script_text.removesuffix("\r\n").split("\r\n"))
+    assert all("\r" not in line and "\n" not in line for line in physical_lines)
+    header_size = len(_WINDOWS_BATCH_HEADER_ORACLE)
+    assert physical_lines[:header_size] == _WINDOWS_BATCH_HEADER_ORACLE
+
+    body_lines = physical_lines[header_size:]
+    assert len(body_lines) == 1 + 1 + len(_WINDOWS_POST_COMMAND_LINES)
+    regeneration_line, business_line, *post_command_lines = body_lines
+    assert regeneration_line.startswith(_WINDOWS_REGENERATION_PREFIX)
+    assert tuple(post_command_lines) == _WINDOWS_POST_COMMAND_LINES
+
+    business_argv = _parse_windows_batch_fixed_argv(business_line)
+    assert business_argv[:4] == ("python", "-m", "dayu.cli", "upload_filing")
+    company_name_indexes = tuple(
+        index
+        for index, argument in enumerate(business_argv)
+        if argument == "--company-name"
+    )
+    assert len(company_name_indexes) == 1
+    company_name_index = company_name_indexes[0]
+    assert company_name_index + 1 < len(business_argv)
+    assert business_argv[company_name_index + 1] == expected_company_name
+    return True
+
+
+def _parse_windows_batch_fixed_argv(value: str) -> tuple[str, ...]:
+    """按 batch percent/caret 与 Windows CRT 语义解析 renderer fixed argv。
+
+    :param value: 生成脚本中唯一业务命令的完整 CRLF physical line。
+    :returns: ``cmd.exe`` 与 CRT 逐 token 恢复后的 fixed argv。
+    :raises AssertionError: 行结构、token 边界或 quoting 不满足 renderer 契约时抛出。
+    """
+
+    assert value.endswith(_WINDOWS_RENDERED_COMMAND_SUFFIX)
+    fixed_command = value[: -len(_WINDOWS_RENDERED_COMMAND_SUFFIX)]
+    rendered_tokens: list[str] = []
+    index = 0
+    while index < len(fixed_command):
+        assert fixed_command.startswith('^"', index)
+        token_start = index
+        index += 2
+        while index < len(fixed_command):
+            slash_start = index
+            while index < len(fixed_command) and fixed_command[index] == "\\":
+                index += 1
+            slash_count = index - slash_start
+            if fixed_command.startswith('^"', index):
+                index += 2
+                if slash_count % 2 == 0:
+                    break
+                continue
+            assert index < len(fixed_command)
+            index += 1
+        else:
+            raise AssertionError("Windows batch fixed token is not closed")
+        rendered_tokens.append(fixed_command[token_start:index])
+        if index == len(fixed_command):
+            break
+        assert fixed_command[index] == " "
+        index += 1
+        assert index < len(fixed_command)
+
+    assert rendered_tokens
+    return tuple(
+        _parse_single_windows_crt_argument(
+            _decode_windows_batch_fixed_token(rendered_token)
+        )
+        for rendered_token in rendered_tokens
+    )
 
 
 def _decode_windows_batch_fixed_token(value: str) -> str:
