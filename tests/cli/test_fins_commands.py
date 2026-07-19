@@ -36,7 +36,7 @@ from dayu.fins.direct_events import (
     FinsResultStatus,
     FinsResultSummary,
 )
-from dayu.fins.direct_stream import ValidatedFinsEventStream
+from dayu.fins.direct_events import ValidatedFinsEventStream
 from dayu.fins.domain.enums import SourceKind
 from dayu.service.fins_direct import (
     FINS_DIRECT_EXIT_FAILURE,

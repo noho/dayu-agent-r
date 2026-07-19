@@ -84,7 +84,7 @@ from dayu.host.wait_adapter import (
     WaitPollerRuntimePolicy,
     WaitResumePolicy,
 )
-from dayu.fins.tools._ingestion_tool_helpers import AwaitingResolutionMode
+from dayu.fins.ingestion.awaiting_resolution import AwaitingResolutionMode
 from dayu.runtime.config_loader import (
     HostRuntimeConfig,
     RuntimeConfig,

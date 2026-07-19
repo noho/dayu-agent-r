@@ -33,6 +33,7 @@ from dayu.contracts import (
 from dayu.engine import AgentPolicy
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy
 from dayu.fins.direct_events import FinsOperationKind
+from dayu.fins.ingestion.awaiting_resolution import AwaitingResolutionMode
 from dayu.fins.ingestion.observation_handle import (
     FinsObservationHandle,
     FinsObservationSnapshot,
@@ -46,7 +47,6 @@ from dayu.service.fins_wait_adapter import (
 )
 from dayu.fins.ingestion_runtime import FinsIngestionRuntime
 from dayu.fins.tools.download_tools import DOWNLOAD_TOOL_NAME, FinsDownloadToolCallable
-from dayu.fins.tools._ingestion_tool_helpers import AwaitingResolutionMode
 from dayu.fins.tools.preprocess_tools import PREPROCESS_TOOL_NAME
 from dayu.fins.tools.upload_tools import UPLOAD_TOOL_NAME
 from dayu.contracts.tool_await import ToolAwaitKind

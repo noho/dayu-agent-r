@@ -22,7 +22,7 @@ from dayu.fins.direct_events import (
     FINS_RESULT_EXIT_SUCCESS,
     FinsOperationKind,
 )
-from dayu.fins.direct_stream import ValidatedFinsEventStream
+from dayu.fins.direct_events import ValidatedFinsEventStream
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ingestion_runtime import (
     FinsDownloadRequest,

@@ -5,8 +5,8 @@ from __future__ import annotations
 from typing import Final
 
 from dayu.contracts.tool_source import ToolBundleSourceKind, ToolBundleSourceRef
+from dayu.fins.ingestion.awaiting_resolution import parse_awaiting_resolution_mode
 from dayu.fins.service_runtime import DefaultFinsRuntime
-from dayu.fins.tools._ingestion_tool_helpers import parse_awaiting_resolution_mode
 from dayu.fins.tools.download_tools import build_fins_download_tool
 from dayu.fins.tools.provider import parse_fins_workspace_root_config
 from dayu.runtime.tools_discovery import (

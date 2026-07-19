@@ -21,7 +21,7 @@ from dayu.fins.direct_events import (
     FinsResultStatus,
     FinsResultSummary,
 )
-from dayu.fins.direct_stream import ValidatedFinsEventStream
+from dayu.fins.direct_events import ValidatedFinsEventStream
 
 _TERMINAL_RESULT_NOT_AVAILABLE_MESSAGE: Final[str] = (
     "Fins direct terminal result is not available before clean stream exhaustion"

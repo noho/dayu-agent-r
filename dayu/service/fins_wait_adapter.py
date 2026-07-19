@@ -36,8 +36,8 @@ from dayu.fins.ingestion.observation_handle import (
     FinsObservationStatus,
     parse_observation_handle_id_token,
 )
+from dayu.fins.ingestion.awaiting_resolution import AwaitingResolutionMode
 from dayu.fins.service_runtime import DefaultFinsRuntime
-from dayu.fins.tools._ingestion_tool_helpers import AwaitingResolutionMode
 from dayu.fins.tools.download_tools import DOWNLOAD_TOOL_NAME
 from dayu.fins.tools.preprocess_tools import PREPROCESS_TOOL_NAME
 from dayu.fins.tools.upload_tools import UPLOAD_TOOL_NAME

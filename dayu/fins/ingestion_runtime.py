@@ -43,7 +43,7 @@ from dayu.fins.direct_events import (
     FinsResultStatus,
     FinsResultSummary,
 )
-from dayu.fins.direct_stream import ValidatedFinsEventStream
+from dayu.fins.direct_events import ValidatedFinsEventStream
 from dayu.fins.direct_event_text import (
     direct_download_no_source_documents_message,
     direct_failure_message,

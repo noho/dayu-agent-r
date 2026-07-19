@@ -175,7 +175,8 @@ Fins ingestion 通过三个独立 awaiting provider 暴露 awaiting tools：
 三个 awaiting provider 都必须通过 effective spec 获得绝对 `workspace_root`。upload provider 启用时注册 `start_fins_upload`；上传工具只在工具边界校验本地路径存在、指向普通文件且文件非空。当前实现不把本地源文件授权建模为 upload provider 的配置职责；调用方仍需在进入工具前承担本地文件来源可信性与用户授权。工具调用只注册 lightweight observation handle 并返回 `ToolAwaitingOutcome(EXTERNAL_JOB)`，不等待长事务完成、不直接 resolve Host wait，也不把 handle 当作业务事实返回给模型。上传后的 source/blob/processed 写入仍必须通过 Fins workspace repository 完成。
 
 三个 awaiting provider 还必须显式提供 provider-owned
-`config.awaiting_resolution_mode`。Fins 私有共享 helper 是该字段的唯一 parser 与 enum owner，
+`config.awaiting_resolution_mode`。`dayu.fins.ingestion.awaiting_resolution` 是该字段、
+closed typed enum 与严格 parser 的唯一 public owner，
 只接受精确的 `poll`、`callback`、`manual`；缺失、`null`、非字符串、空串、大小写变体、
 前后空白和未知值都失败，不提供默认或 loose parsing。每个 provider 在创建 runtime/tool
 definition 前调用同一 parser；Service discovery 路径也在 enabled filtering 前调用该
@@ -449,10 +450,9 @@ dayu.fins
 ├── pipelines                 # source-specific ingestion pipeline；当前包含 SEC 与 CN/HK download / upload pipeline
 ├── processors                # 财报处理器、SEC 表单专项处理器、registry
 ├── tools                     # read tools、download/preprocess/upload awaiting tools、providers、read runtime
-├── direct_events.py          # direct 事件、类型化协议错误与结果契约所有者
-├── direct_stream.py          # ValidatedFinsEventStream 恰好一个且最后一个 RESULT 校验所有者
+├── direct_events.py          # direct 事件、结果、类型化协议错误与 ValidatedFinsEventStream 公共 owner
 ├── ingestion_runtime.py      # download/preprocess/upload direct stream、observation 与 legacy job runtime
-├── ingestion                 # direct stream、legacy job helper 与 lightweight observation contract
+├── ingestion                 # awaiting resolution、legacy job helper 与 lightweight observation contract
 ├── service_runtime.py        # DefaultFinsRuntime shared assembly root
 └── ticker_normalization.py   # ticker 标准化
 ```

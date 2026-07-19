@@ -63,8 +63,8 @@ from dayu.fins.ingestion_runtime import (
     FinsPreprocessRequest,
     FinsUploadRequest,
 )
+from dayu.fins.ingestion.awaiting_resolution import AwaitingResolutionMode
 from dayu.fins.tools.download_tools import DOWNLOAD_TOOL_NAME
-from dayu.fins.tools._ingestion_tool_helpers import AwaitingResolutionMode
 from dayu.fins.tools.preprocess_tools import PREPROCESS_TOOL_NAME
 from dayu.fins.tools.upload_tools import UPLOAD_TOOL_NAME
 

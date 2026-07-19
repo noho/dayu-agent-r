@@ -53,7 +53,7 @@ from dayu.fins.direct_events import (
     FinsEventDetail,
     FinsResultSummary,
 )
-from dayu.fins.direct_stream import ValidatedFinsEventStream
+from dayu.fins.direct_events import ValidatedFinsEventStream
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.domain.filing_semantics import FiscalPeriod
 from dayu.fins.resolver import FmpCompanyInfoResolver
