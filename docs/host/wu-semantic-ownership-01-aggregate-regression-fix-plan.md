@@ -2,16 +2,18 @@
 
 ## 0. Gate identity / verdict
 
-- 状态：`PLAN_ONLY / NOT_ACCEPTED / IMPLEMENTATION_NOT_AUTHORIZED`。
+- 状态：`PLAN_ONLY / LOCAL_TRUST_CORRECTED / DUAL_PLAN_REVIEW_PENDING / IMPLEMENTATION_NOT_AUTHORIZED`。
 - umbrella：`WU-SEMANTIC-OWNERSHIP-01`。本计划只处理既有 umbrella aggregate regression 的 Controller accepted findings，不创建新 WU，不改变原 WU 的目标、设计真源或 residual destination。
-- 当前基线：branch `phaseflow/host-issues-control`；HEAD `ed9bfa9fe071aba0227361c69a938010ce3abe09`；aggregate parent `3410d7422655c56bdf13c643f77c27f40b9d4550`。
-- 当前 plan-fix gate 的 entry plan SHA-256 已精确核对为 `a01e8772c49f975e2f66058a8febc470f063c900d169461494c506c43e14782e`；本轮只允许修改本文件，并新建 `docs/reviews/wu-semantic-ownership-01-aggregate-regression-fix-plan-review-fix-codex.md`。不得修改 product、test、README、workflow、control、reviewer/Controller artifact 或其它文件；不得 implementation、stage、commit、push、开 PR、运行 implementation tests、启动内部 subagent/reviewer 或 aggregate deepreview。
+- 当前 correction gate 基线：branch `phaseflow/host-issues-control`；HEAD `ffbf48c2cf5f701c627fda1ebcce7aa1813383ab`；aggregate parent 仍为 `3410d7422655c56bdf13c643f77c27f40b9d4550`。
+- 本次 local-trust correction 的 entry plan SHA-256 已精确核对为 `7e91421b8bc8c442dcf72e94c20eb84d4f27f2b9878b427481448d6f2f4ea714`。本 gate 只允许修改 `docs/host/design.md`、`docs/ui/design.md` 与本文件，并新建 `docs/reviews/wu-semantic-ownership-01-aggregate-regression-fix-local-trust-plan-correction-codex.md`；`docs/engine/design.md` 经直接核对无需修改。不得修改 product、test、README、workflow、control、其它 review / Controller artifact；不得 implementation、stage、commit、push、开 PR、运行 implementation tests、启动 subagent/reviewer 或 aggregate deepreview。
+- 当前三个 Slice 1 test delta 必须按 correction entry SHA-256 原样保护：`tests/service/test_host_admin.py`=`5acf57a06d1c7fee82a27ae0c3ccdfcddfe745a42439a514c0551665904f96db`，`tests/tools/web/test_smoke_web_ci.py`=`86968b937d4289d29427a2bd68934a074ca0499dfa3563ec326eae73f2432ee3`，`tests/host/test_public_compact_smoke.py`=`f60a1d6e190c948986be355fc66ad71cb64e207691e8a12646ea23cbdcc66169`。本 plan correction 不重写、格式化或运行这些测试。
 - 本计划固定三个 implementation slices，精确关闭 `AR-F01`—`AR-F05`。`AR-F06` 保持 `RETAINED / UNFIXED / UNWAIVED / CURRENT_NO_FIX`，`AR-F07` 保持 `PENDING_RELEASE_BLOCKER`。
-- 计划只有在 AgentMiMo 与 AgentDS 对本文件做双路完整 plan review、AgentCodex 修复全部 accepted plan findings、两路对完整修订版 re-review 均通过，并由 Controller 明确接受后，才可进入 Slice 1 implementation。
+- `S1-SEC-F01` 按 2026-07-19 用户产品裁决关闭为 no-code blocker：本地 Config 与 Host SQLite / EventLog 是同一受信任产品域，内部持久化 resolved provider headers / API key 不要求 production redesign；Tool Trace、audit、public / LLM-facing projection、日志、diff 与 review surface 仍要求 secret 明文为零。
+- 计划只有在 AgentMiMo 与 AgentDS 对本次完整修订版做双路完整 plan review、AgentCodex修复全部 accepted plan findings、两路完整 re-review 均通过，并由 Controller 明确接受后，才可恢复 Slice 1 implementation validation。
 
 ## 1. Source of truth 与已核对证据
 
-本计划已完整读取并按以下优先级裁决：
+本计划原始 accepted 版本已读取下列真源；本次 correction 又严格按用户指定顺序完整重读 `AGENTS.md`、两份 control、overdesign discussion、Host / Engine / Tool / Fins / UI 五份 design，随后完整读取 user-decision record、prior evidence / adjudication、两路 corrected design-truth reviews、accepted aggregate plan与其 commit validation、Slice 1 authorization / implementation artifact及五份 stop adjudication。精确读取清单与 SHA-256 记录在本 gate artifact。裁决优先级如下：
 
 1. `AGENTS.md`。
 2. `docs/host/issues-implementation-control.md` 当前工作区状态，尤其 current gate、aggregate adjudication 与 next-entry condition。
@@ -29,7 +31,11 @@
 9. `docs/reviews/wu-semantic-ownership-01-aggregate-regression-fix-plan-review-controller-adjudication.md` 对 `AR-PLAN-PF01..02` 的唯一本轮 plan-fix 授权；该文档已完整读取，SHA-256 为 `a5876c47c38c3d80091e20e7958932af8cdf2430f80ef8ee96e9b40a647eaa06`。
 10. 当前 HEAD 代码、测试、配置与 import graph。历史 artifact 只能证明历史运行；与当前代码冲突时，以当前代码和 Controller adjudication 为准。
 
-当前 plan-fix entry 工作区除本计划外已有以下 pre-existing protected changes。这些路径的 entry status/SHA-256 是本轮 exact protection baseline；本轮结束时必须逐项保持不变，所有后续 slice 与 review 也必须原样保护且不得 stage：
+11. 本次最高优先级 correction authority：`docs/reviews/wu-semantic-ownership-01-aggregate-regression-fix-s1-secret-finding-user-decision-controller-record.md`，SHA-256=`4a75899fbdb8244d93f1633b0be3f36e65d2ae211a3211f57f326289f6c3f12b`。它 supersede 旧的“Host 不接收 API key 明文 / EventLog 必须零 headers”设计冲突与 `S1-SEC-F01` production redesign 建议，但不 supersede Tool Trace、audit、public / LLM-facing projection 与日志的零明文要求。
+
+当前 correction 的 owner 结论是：ConfigLoader 仍只产生 typed config；Service / execution environment 解析 secret 并构造 resolved typed `RunnerSpec`；Host admission 持久化 exact effective execution canonical fact，dispatch / retry / replay / recovery 恢复该内部 truth；每个 Tool Trace、audit、HostEvent、memory / compact、runner-input / observation 与 log projection owner分别做显式安全字段选择。禁止 Host-safe / Engine-only split、header descriptor、secret resolver callback、secret manager或统一 tool authorization framework；本计划不扩张 CLI init secret 存储，也不进入 Issues 142、151、175、177、178。
+
+以下清单是原始 plan-fix gate 的历史 protection baseline，不替代本次 correction artifact 记录的 fresh workspace baseline；其中所有 Controller-owned / pre-existing changes 继续不得被修改或 stage：
 
 ```text
  M  93dd662e755b0f7bbfc8ad82045bc54ed61b94d7bf3df22f14c385b242e56100  docs/host/issues-implementation-control.md
@@ -60,6 +66,24 @@ Aggregate regression 不是重复验证。R01—R12 的 accepted evidence 只证
 | AR-F05 | aggregate parent 到当前树的 219 个现存 changed production Python 中 210 个 line coverage `>=80%`，8 个低于 80%，`dayu/runtime/argparse_exit.py` 未命中；没有可信 accepted evidence可补签 | Slice 3 只补 owner-contract tests；九个 production paths 默认且必须零 diff |
 | AR-F06 | coverage instrumentation 下同一 R05 scheduler close/promotion node复现；R05 已把真实 bug裁决给未来独立 Host scheduler/lifecycle work item | 不写代码、不 waiver、不标 resolved；canonical non-coverage 不排除，coverage 仅精确排除这一个 node |
 | AR-F07 | 当前远端无可用 Actions workflow/run/artifact，Darwin skip 不能证明 cmd.exe / Windows init | 本地 slices 不改 workflow、不伪造 PASS；最终 release 继续被真实 `windows-latest` evidence 阻塞 |
+| S1-SEC-F01 | fresh configured-secret scan 的唯一命中 owner 是 Host internal `USER_INPUT_ACCEPTED.effective_execution_config.config.runner_spec.headers`；Service 解析 secret，Host 冻结 exact execution truth。Tool Trace event filter 不消费该 event；audit、HostEvent、run-input / memory / compact 与日志 owner都没有透传该字段，fresh projection / output / review / diff scan 为零 | `CLOSED_AS_NO_CODE_BLOCKER`；内部 Config / Host durable 命中做 accepted classification，Slice 1 只补 owner-level negative tests与分 surface scan，不改 production、不增加 slice |
+
+### 2.2.1 Local trust / projection owner adjudication
+
+`S1-SEC-F01` 的 production redesign 动机不成立。用户已明确裁决本地 Config 与 Host SQLite / EventLog 属于同一受信任产品域；为了让 dispatch、retry、replay、recovery使用同一份 exact effective execution truth，Host 持久化 resolved `RunnerSpec.headers` 是 owner-correct 行为，不是新增泄露面。当前代码与 real output 的直接证据也只证明该内部路径有值，不能把它外推成 Tool Trace、audit 或 LLM-facing leak。
+
+本次只读 owner evidence 的 disposition 固定为：
+
+| Surface | 唯一 projection owner / direct boundary | 当前 verdict | Slice 1 validation |
+| --- | --- | --- | --- |
+| Host internal effective execution | `dayu/service/host_assembly.py::_render_headers` -> Host admission -> `dayu/host/_execution_config_projection.py::runner_spec_json` -> `USER_INPUT_ACCEPTED` -> dispatch / replay restore | `ACCEPTED_TRUSTED_INTERNAL`；允许 exact Config / Host internal owner path 命中 | 用 real configured-value scan做逻辑 row/path分类；不要求清零，不改 production |
+| Tool Trace hot / cold / query | `dayu/host/tool_trace.py::ToolTraceProjectionConsumer.event_filter` 与 typed extract / render helpers | `NO_CURRENT_LEAK`：filter 不包含 `USER_INPUT_ACCEPTED`，extract 不复制 effective execution config；fresh Tool Trace output scan为零 | synthetic sentinel canonical fact必须被filter跳过，hot / cold / query均零 sentinel |
+| Audit JSONL / query | `dayu/host/audit.py::build_audit_json_line` | `NO_CURRENT_LEAK`：固定字段只含refs / digests / summaries，不复制 payload；fresh audit scan为零 | source event payload含sentinel时，整行序列化仍为零 sentinel并保持exact key contract |
+| Public HostEvent / read API | `dayu/host/read_api.py::_host_event_from_row` / `_activity_from_row` | `NO_CURRENT_LEAK`：`USER_INPUT_ACCEPTED` 只成为无 activity 的typed progress，raw payload不进入DTO | public DTO / serialization零 sentinel |
+| LLM-facing run input / memory / compact | `dayu/host/run_input.py`、`dayu/host/memory.py`、`dayu/host/compact_material.py` 的 user-input field selectors | `NO_CURRENT_LEAK`：只读取 `display_text`；resolved `RunnerSpec` 仍可作为 Engine执行参数，但不是LLM message/material | 只扫描 `messages`、memory / compact material与runner-call observation，不得错误要求 Engine执行所需 `request.runner_spec.headers` 清零 |
+| Operator logs | 各 Host / Service / Engine logger callsite与既有 Engine diagnostic redaction owner | `NO_CURRENT_LEAK`：调用点记录ids / counts / refs / error classes，fresh log output scan为零；Topic 8现有redaction tests继续有效 | resolved runner header sentinel不进入caplog；不改变Engine exception redaction/truncation行为 |
+
+上述 verdict 来自当前代码与实物扫描，不是按字段名猜测。若 Slice 1 owner test 暴露真实 projection leak，必须立即停止并提交同一 umbrella 内的最小复现：修复边界只能是该行对应的唯一 source projection owner或其直接 typed input validation，不得在下游UI、adapter、scan脚本或测试fixture中做黑名单、字符串替换、fallback或兼容 repair。本 plan当前没有发现真实 leak，因此 production allowlist保持为空。
 
 ### 2.3 AR-F02 唯一 public Fins contract owner
 
@@ -131,6 +155,11 @@ M dayu/service/host_assembly.py
 M tests/service/test_host_admin.py
 M tests/tools/web/test_smoke_web_ci.py
 M tests/host/test_public_compact_smoke.py
+M tests/host/test_audit_sink.py
+M tests/host/test_tool_trace_projection.py
+M tests/host/test_host_activity_event_projection.py
+M tests/host/test_run_input_builder.py
+M tests/host/test_logging.py
 
 # Slice 2 only
 M tests/cli/test_fins_commands.py
@@ -149,7 +178,7 @@ M tests/host/test_effective_execution_config.py
 A tests/runtime/test_argparse_exit.py
 ```
 
-同一路径 `tests/fins/test_fins_ingestion_tools.py` 可在 Slice 2 迁移 public owner import，并在 Slice 3 补 preprocess owner cases；每个 slice 的 diff 与 review 必须只包含该 slice 新增的语义。`tests/service/test_import_boundary.py` 是验证 oracle，不在 mutable allowlist，必须零 diff。
+Slice 1 后五个新增 allowlist path 只允许加入 §2.2.1 / §4.1 定义的 configured-secret projection sentinel tests；不得借此修改 projection contract、重写现有测试或触碰 production。correction entry 已有 delta 的前三个 Slice 1 tests必须在 plan review与恢复 implementation entry前保持上述 SHA-256 不变；后续 implementation只能在 Controller重新授权后继续其既有 Slice 1 delta。同一路径 `tests/fins/test_fins_ingestion_tools.py` 可在 Slice 2 迁移 public owner import，并在 Slice 3 补 preprocess owner cases；每个 slice 的 diff 与 review 必须只包含该 slice 新增的语义。`tests/service/test_import_boundary.py` 是验证 oracle，不在 mutable allowlist，必须零 diff。
 
 ### 3.3 Slice 2 mutable validation-utility allowlist
 
@@ -240,15 +269,15 @@ dayu/runtime/argparse_exit.py
 .github/workflows/r12-init-windows.yml
 ```
 
-8. 所有 design docs、control docs、既有 plan/review/completion artifacts、除 Slice 2 唯一 README allowlist 外的全部 README，以及开始时已有 Controller-owned worktree changes。
+8. 本次 correction 被 Controller接受后的所有 design docs、control docs、既有 plan/review/completion artifacts、除 Slice 2 唯一 README allowlist外的全部 README，以及开始时已有 Controller-owned worktree changes。本 correction gate 对 `docs/host/design.md`、`docs/ui/design.md`、本 plan与固定新artifact的精确例外只用于写回用户裁决；不延续成 implementation allowlist。
 
-每个 slice 开始记录 `SLICE_BASE=$(git rev-parse HEAD)`、完整 `git status --short`、pre-existing tracked diff清单及每个pre-existing tracked/untracked path的SHA-256。implementation、fix、review结束均重新采集 `git diff --name-status "$SLICE_BASE"` 和untracked列表：先验证pre-existing集合的path/status/hash完全不变，再把该集合从当前工作树清单中扣除，剩余delta才允许与本节 production/test/validation-utility/README allowlists精确比对。本轮 plan-fix 必须先以 §1 的 entry status/hash 保护集合做同样校验，只允许 entry plan hash 变为 final plan hash、只允许新增固定 plan-fix artifact。发现额外路径立即停止，不先清理、不覆盖用户改动。
+每个 slice 开始记录 `SLICE_BASE=$(git rev-parse HEAD)`、完整 `git status --short`、pre-existing tracked diff清单及每个pre-existing tracked/untracked path的SHA-256。implementation、fix、review结束均重新采集 `git diff --name-status "$SLICE_BASE"` 和untracked列表：先验证pre-existing集合的path/status/hash完全不变，再把该集合从当前工作树清单中扣除，剩余delta才允许与本节 production/test/validation-utility/README allowlists精确比对。本次 correction gate 必须以新 artifact 的 entry status/hash 保护集合做同样校验，只允许 §0 列出的三份文档被修改并新增固定 correction artifact，尤其三个现有 test delta hash必须不变。发现额外路径立即停止，不先清理、不覆盖用户改动。
 
 ## 4. Dependency order 与三个 implementation slices
 
 依赖顺序固定为 Slice 1 -> Slice 2 -> Slice 3：先恢复 current schema/test oracle 和 in-process isolation，再迁 public Fins owner并让 canonical suite全绿，最后在稳定整合树补齐九路径 coverage。不得并行实现或把 AR-F05 测试混入前两个 slices。
 
-### 4.1 Slice 1 — current-schema / test-oracle closure（AR-F01、AR-F03、AR-F04）
+### 4.1 Slice 1 — current-schema / test-oracle closure + local-trust projection verification（AR-F01、AR-F03、AR-F04、S1-SEC-F01 no-code closure）
 
 #### Implementation
 
@@ -263,6 +292,14 @@ dayu/runtime/argparse_exit.py
    - 删除 candidate-id 常量、拼接和匹配；把 `_runner_call_manifest_for_run` 改为严格唯一定位，并从 `compactor_identity.compaction_request_digest` 取得关联 digest。
    - `_compact_artifact_for_run` 接收该 digest，以 current artifact kind/schema/digest严格唯一定位；保持 existing first/second run continuity assertions。
    - 新增 deterministic cases：正确 run/digest 成功；missing manifest、duplicate manifest、missing compact artifact、duplicate matching compact artifact、wrong/missing digest 均 fail closed。不得加 historical schema fixture。
+4. `S1-SEC-F01` 只做 owner-boundary verification，不修改任何 production path：
+   - 用一个不来自真实环境的 synthetic configured-secret sentinel 构造含 resolved `RunnerSpec.headers` 的 `USER_INPUT_ACCEPTED.effective_execution_config`，先断言 internal durable round-trip保留 exact value，证明测试没有把 accepted owner path误清零。
+   - `tests/host/test_tool_trace_projection.py` 必须通过 projection runner / consumer filter证明该 event不产生 hot row、cold JSONL或query material；不得只对最终字符串做字段名黑名单断言。
+   - `tests/host/test_audit_sink.py` 必须把同一 source event交给 `build_audit_json_line` / sink owner，断言 exact audit key contract保持且完整序列化零 sentinel。
+   - `tests/host/test_host_activity_event_projection.py` 必须通过 public HostEvent owner投影同一 event，断言 typed DTO / serialization零 sentinel，且未知/不可展示payload不被拼进activity。
+   - `tests/host/test_run_input_builder.py` 必须分别断言 LLM-facing `messages`、memory / compact material与runner-call observation零 sentinel；`AgentRunRequest.runner_spec.headers` 是 Engine执行所需的受信任 typed input，必须保留 sentinel，不得把它误判成LLM projection。
+   - `tests/host/test_logging.py` 必须让resolved runner header sentinel经过Host接受/dispatch或等价owner callsite，断言caplog零 sentinel。Engine已有exception diagnostic redaction / diagnostic payload tests只重跑，不修改Topic 8行为。
+   - 这些测试只允许source-owner白名单投影与完整serialization断言；禁止按 `Authorization`、`api_key` 等字段名列黑名单，禁止下游repair、mock-only bypass或改变accepted内部持久化。
 
 #### Focused tests / real smoke
 
@@ -274,6 +311,15 @@ pytest tests/tools/web/test_smoke_web_ci.py \
   tests/runtime/test_log.py::test_configure_does_not_touch_root_by_default \
   tests/fins/test_sec_downloader.py::test_sec_request_debug_logs_success_response -q
 pytest tests/host/test_public_compact_smoke.py -q
+pytest \
+  tests/host/test_audit_sink.py \
+  tests/host/test_tool_trace_projection.py \
+  tests/host/test_host_activity_event_projection.py \
+  tests/host/test_run_input_builder.py \
+  tests/host/test_logging.py -q
+pytest \
+  tests/engine/test_agent_phase2.py \
+  tests/engine/runners/openai/test_diagnostic_payload.py -q
 DAYU_RUN_REAL_COMPACTOR_SMOKE=1 pytest \
   tests/host/test_public_compact_smoke.py::test_real_compactor_public_opener_compacts_and_preserves_continuity \
   --basetemp=workspace/tmp/wu-semantic-ownership-01-ar-fix-s1-real-compactor -q -rs
@@ -291,6 +337,7 @@ Standalone Web smoke必须仍输出 `status=passed`、11 local required、4 diag
 #### Slice exit
 
 - AR-F01、AR-F03、AR-F04 全部 closed。
+- `S1-SEC-F01=CLOSED_AS_NO_CODE_BLOCKER`：internal Config / Host effective-execution命中按 §6.7 accepted classification记录；Tool Trace、audit、public HostEvent、LLM-facing material、日志、review与diff surface的owner tests / scans全部零 sentinel或零configured-value match。不得用“全局所有outputs零命中”重新打开已裁决的internal durable blocker。
 - Canonical non-coverage full suite必须运行；在 AR-F02 尚未实施的顺序点，只允许 `tests/service/test_import_boundary.py::test_service_does_not_import_forbidden_layers` 保持已知失败，原三个 F01/F03 failures及其他 node必须全绿。这个临时预期不是 waiver，Slice 2 exit后不得再存在。
 - Fresh aggregate coverage按 §6.2 exact scheduler exclusion运行；同样只允许 AR-F02 import-boundary失败，九个 AR-F05 paths继续登记 `OPEN_BY_SEQUENCE`，不得把中间数值签为最终 coverage PASS。
 
@@ -541,7 +588,13 @@ Slice 2 与最终 aggregate 还必须 fresh 重跑 §4.2 的 direct-stream/await
 
 - README：按 §3.4 读取目标 README约束、记录 `UPDATE`或`NO_UPDATE`及直接理由；除 Slice 2 `dayu/fins/README.md` 外不允许先改后解释。
 - Security：重跑 Doc path containment/output truncation、Web DNS/private/proxy/redirect/diagnostic、Host digest/EventLog/opaque ref、wait late-publication fence、Fins transaction/atomic swap/path/opaque id/direct validator、CLI POSIX quoting/init containment/process fencing相关既有矩阵。AR-F07 Windows项只能记 `PENDING_RELEASE_BLOCKER`。
-- Secret scan：只输出 configured secret count、match count与matched path count，不输出secret value；扫描本 slice outputs与diff，要求0 value match。测试数据中疑似 token必须是显式 synthetic值。
+- Configured-secret scan 必须按 semantic owner分类，不能继续用跨全部surface的单一零命中规则：
+  - secret集合只从current typed model config的 `api_key_ref` 解析当前环境中非空values；只输出 configured value count、各surface match count / matched path count与Host logical row count，不输出value、ref名称、header名称或命中正文。
+  - `ACCEPTED_TRUSTED_INTERNAL` 只允许两个精确owner：ConfigLoader管理的本地 Config source，以及Host internal SQLite / EventLog中 `USER_INPUT_ACCEPTED.effective_execution_config.config.runner_spec.headers` 的exact effective-execution canonical fact。SQLite物理file命中必须再以只读logical row / JSON path核对；所有logical命中必须是该event / path，logical other count必须为0。非零internal count不阻断release，也不要求清理、redact或production redesign。这个classification不授权改变`dayu-cli init` secret source storage。
+  - `ZERO_REQUIRED` surfaces固定为Tool Trace hot/cold/query、audit JSONL/query、public HostEvent / read model / outbox、memory / compact / evidence / runner-call observation等LLM-facing material、operator logs、其它smoke输出、git diff与review artifacts。每一类必须分别输出0 match / 0 matched path；不得把它们与internal SQLite合并计数后waive。
+  - 每个slice扫描本slice全部 `workspace/tmp/wu-semantic-ownership-01-ar-fix*` outputs、该slice artifact、当前git diff与相关review artifacts；final aggregate重新扫描三slice全部outputs与完整diff/reviews。binary SQLite只进入trusted-internal物理分类；audit / tool-trace文件、log、public / LLM artifacts与其余outputs进入各自zero-required分类。
+  - owner-level synthetic sentinel tests与real configured-value surface scan必须同时通过：synthetic值证明投影owner明确排除，real scan证明实际assembly输出没有旁路。测试数据中的疑似token必须是显式synthetic值，不能把真实configured value写进test、artifact、diff或review。
+  - 任一zero-required surface非零，或internal logical命中不在上述exact event / JSON path，立即按§9停止；不得按文件名、字段名黑名单、删除smoke output、改synthetic key或缩小scan root来“修复”结果。
 - Deferred：Issue 177、178、175、142/151仍由各自 owner保留；本计划不得引入 TruncationManager wiring、storage-state lifecycle output/TTL/retention/refresh、Fins hard-kill/process isolation或assets migration。
 - No-code：Topic 8与Codex F-13的 `dayu/engine/agent.py`、`dayu/engine/contracts/error_codes.py`零 diff；Topic 9不得引入统一 authorization框架、capability token、policy DSL或role model。
 - AR-F06：持续写作 `RETAINED / UNFIXED / UNWAIVED / CURRENT_NO_FIX`，不得用coverage exclusion改状态。
@@ -570,7 +623,7 @@ Darwin上的Windows nodes继续记真实 skip，不能算成功。HKEX external 
 2. §6.2 exact single-node exclusion coverage，coverage pytest 0 failed，final ledger `219/219 >=80%`。
 3. full pyright、full Ruff exact baseline delta、diff-check、allowlist/protected path hashes、staged state。
 4. wheel/sdist build及artifact hashes。
-5. 六组 scans、Slice 2 direct-stream/awaiting owner/stale scans、README/security/secret/deferred/no-code ledger；所有 owner/stale scans 都覆盖 `dayu tests utils`并证明旧 private import零命中。
+5. 六组 scans、Slice 2 direct-stream/awaiting owner/stale scans、README/security/configured-secret semantic-classification/deferred/no-code ledger；所有 owner/stale scans 都覆盖 `dayu tests utils`并证明旧 private import零命中，configured-secret scan必须把exact trusted internal owner与每个zero-required projection surface分开报告。
 6. Real Web、public awaiting、R03 semantic ownership、real compactor、Fins upload/download/process、live browser cleanup、POSIX generated script/CLI/init，及accepted immutable HKEX evidence复核。
 7. AR-F01—AR-F05逐项以当前命令和当前 tree标 `CLOSED`；AR-F06保持 no-code residual；AR-F07保持 pending external gate。
 
@@ -613,7 +666,8 @@ push / PR / final closeout = NOT AUTHORIZED
 - Logger state无法在test harness内完整恢复而必须改变standalone logging行为。
 - Canonical full suite在Slice 2后非零、public-awaiting smoke在owner迁移后非零、direct-stream/awaiting stale-private scans在 `dayu tests utils` 有命中、coverage除精确R05 node外还需排除任何node、219集合不是精确219或任何文件<80%。
 - Full pyright新增错误、Ruff baseline set扩散、protected zero-diff path变化、staged state非空或Controller-owned worktree hash漂移。
-- Security/secret/deferred/no-code scan出现新命中，build失败，真实smoke只有mock/skip才能通过。
+- Security/deferred/no-code scan出现新命中；configured-secret scan在任一Tool Trace、audit、public / LLM-facing、log、其它output、diff或review surface非零，或trusted-internal logical match超出exact Config / Host effective-execution owner；build失败；真实smoke只有mock/skip才能通过。
+- 任一§2.2.1 owner-level sentinel test失败，视为真实projection leak候选并立即停止。证据必须指出唯一失败owner（Tool Trace filter/extract、audit line builder、HostEvent projection、run-input / memory / compact selector或具体logger callsite）及最小输入/输出；不得新建sub-WU或额外slice。Controller若接受为真实leak，只能在同一umbrella内扩充该唯一source owner及其直接owner test的精确allowlist，再重审本三-slice plan；禁止字段名黑名单、下游UI / adapter repair、兼容分支或统一authorization框架。
 - Windows evidence缺失、artifact不完整或run未checkout最终accepted commit。
 
 已知 residual：
@@ -624,8 +678,10 @@ push / PR / final closeout = NOT AUTHORIZED
 
 ## 10. Plan acceptance checklist
 
-- [ ] 本 plan-fix gate 只存在 entry plan 的修订与固定 plan-fix artifact 的新建；product/test/README/workflow/control/reviewer/Controller artifacts及其它文件零变化，§1 的 protected status/hash逐项不变，staged为空。
+- [ ] 本 local-trust correction gate只修改Host/UI design与entry plan，并新增固定correction artifact；Engine design、product/test/README/workflow/control/其它review/Controller artifacts零变化，三个既有Slice 1 test delta SHA-256逐项不变，staged为空。
 - [ ] 三个slices且顺序固定，AR-F01—F05均有唯一closure owner与test oracle。
+- [ ] `S1-SEC-F01`关闭为no-code blocker；exact Config / Host internal effective-execution命中是accepted classification，Tool Trace、audit、public / LLM-facing、log、其它output、diff与review surface分别要求零明文。
+- [ ] Slice 1追加五个精确owner-test allowlist path与synthetic sentinel contract，不增加production path、不增加slice；测试明确保留Engine执行所需`RunnerSpec.headers`，只对projection做zero断言。
 - [ ] AR-F02不扩大Service allowlist，无compat re-export/lazy import/duplicate enum/protocol；Slice 2 test allowlist、focused tests 与direct consumer scan均覆盖 `tests/cli/test_fins_commands.py`。
 - [ ] Slice 2 的独立 validation-utility allowlist 只含 `M utils/smoke_host_public_awaiting_entrypoint.py`，只迁移 `AwaitingResolutionMode` import；owner迁移后fresh运行 public-awaiting smoke。
 - [ ] Direct-stream/awaiting definition、consumer 与stale-private scans在 Slice 2 与final aggregate均覆盖 `dayu tests utils`，旧 private import/definition零命中。

@@ -42,6 +42,20 @@ def _write_host_runtime(config_root: Path) -> None:
                         "payload_inline_threshold_bytes": 4096,
                         "worker_startup_timeout_seconds": 1.0,
                         "memory_projection_catch_up_batch_size": 50,
+                        "wait_poller_policy": {
+                            "enabled": True,
+                            "poll_interval_seconds": 1.0,
+                            "claim_ttl_seconds": 60.0,
+                            "claim_batch_size": 100,
+                            "backoff_initial_delay_seconds": 30.0,
+                            "backoff_multiplier": 2.0,
+                            "backoff_max_delay_seconds": 300.0,
+                            "not_ready_observe_interval_seconds": 1.0,
+                            "idle_poll_interval_seconds": 5.0,
+                            "adapter_call_timeout_seconds": 30.0,
+                            "close_drain_timeout_seconds": 5.0,
+                            "max_outstanding_adapter_calls": 8,
+                        },
                     }
                 },
             }
@@ -77,6 +91,10 @@ def test_prepare_host_admin_loads_only_host_runtime_without_models_or_secrets(
     ).resolve()
     assert result.options.sqlite_busy_timeout_seconds == 0.25
     assert result.options.sqlite_write_busy_retry_count == 5
+    assert result.options.sqlite_write_retry_initial_delay_seconds == 0.001
+    assert result.options.sqlite_write_retry_backoff_multiplier == 1.5
+    assert result.options.sqlite_write_retry_max_delay_seconds == 0.02
+    assert result.options.payload_inline_threshold_bytes == 4096
     assert not hasattr(result.options, "worker_factory")
     assert not hasattr(result.options, "lane_name")
     assert not hasattr(result.options, "tooling_options")

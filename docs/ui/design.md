@@ -62,8 +62,13 @@ OLD 只作为该用户工作流的产品行为参考；当前实现仍必须遵�
 `dayu-cli init` 的用户工作流对齐 OLD `/Users/leo/workspace/dayu-agent`，但配置字段与
 实现边界必须使用本仓库当前 schema 和分层。它不是只复制文件的非交互式命令；首次安装或
 重新配置时还负责引导用户选择 provider/model 方案、配置该方案需要的 API Key、更新 workspace
-scene manifest 的默认模型，并询问可选 Web/FMP/HuggingFace 配置。Secret 只写入用户明确选择的
-系统环境变量持久化位置，不写进 workspace JSON、Host durable state、日志或 LLM-facing 文本。
+scene manifest 的默认模型，并询问可选 Web/FMP/HuggingFace 配置。Init 只把 secret source value
+写入用户明确选择的系统环境变量持久化位置，不写进 workspace JSON、日志或 LLM-facing 文本；
+本节不新增第二套 init secret store，也不改造 CLI init 的 secret 存储流程。运行时仍由 Service
+从该环境位置解析 secret 并构造 resolved typed `RunnerSpec`；本地 Config 与 Host SQLite / EventLog
+属于同一受信任产品域，Host 可以把一次 Run 的 resolved headers / API key 作为 effective execution
+canonical fact 内部持久化，以支持 retry / replay / recovery。该内部 durable copy 不得进入 Tool Trace、
+audit、public HostEvent / UI 文本、memory / compact / evidence、其它 LLM-facing material 或 operator log。
 
 Init 把当前 package config 与 prompt assets 安装到 `<workspace_root>/config`。若当前产品包提供
 其它明确的 workspace bootstrap assets，init 同步安装；当前仓库没有 `dayu/assets`，不得仅为

@@ -23,7 +23,7 @@ from dayu.host.audit import (
     default_log_audit_sink_options,
 )
 from dayu.host.durable.audit import read_audit_sink_marker
-from dayu.host.durable.codec import sha256_digest_json
+from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import (
     EventClass,
@@ -72,6 +72,7 @@ _PURGE_TOMBSTONE_ID = "purge-tombstone-1"
 _PURGE_SESSION_ID = "session-purged-1"
 _PURGE_CLIENT_REQUEST_ID = "purge-request-1"
 _PURGE_REASON = "retention-request"
+_CONFIGURED_SECRET_SENTINEL = "synthetic-local-trust-sentinel-6f2b9d8c"
 
 
 def _purge_counts() -> PurgeDeleteCounts:
@@ -410,6 +411,70 @@ def test_jsonl_line_contains_required_audit_fields(tmp_path: Path) -> None:
     line_digest = fields_without_digest.pop("line_digest")
     assert line_digest == sha256_digest_json(fields_without_digest)
     assert marker_line_digest == line_digest
+
+
+def test_audit_projection_excludes_internal_effective_execution_value(
+    tmp_path: Path,
+) -> None:
+    """audit owner 不复制内部 effective execution 配置值。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: audit 行字段契约漂移或包含 synthetic sentinel 时抛出。
+    """
+
+    audit_path = tmp_path / "audit" / "effective-execution.jsonl"
+    payload: JsonValue = {
+        "display_text": "分析本期经营情况",
+        "effective_execution_config": {
+            "config": {
+                "runner_spec": {
+                    "headers": {
+                        "X-Synthetic-Execution-Value": _CONFIGURED_SECRET_SENTINEL,
+                    }
+                }
+            }
+        },
+    }
+    with open_host_durable_store(_options(tmp_path)) as store:
+        _append_event(
+            store.transaction_runner,
+            event_id="event-effective-execution",
+            event_type="USER_INPUT_ACCEPTED",
+            payload=payload,
+        )
+        _run_audit_once(store.transaction_runner, audit_path)
+
+    lines = _json_lines(audit_path)
+    assert len(lines) == 1
+    line = lines[0]
+    assert set(line) == {
+        "schema_version",
+        "event_sequence",
+        "event_id",
+        "event_type",
+        "event_class",
+        "occurred_at",
+        "session_id",
+        "run_id",
+        "attempt_id",
+        "execution_id",
+        "actor",
+        "principal",
+        "source",
+        "client_request_id",
+        "operation_context_refs",
+        "operation_context_digest",
+        "policy_decision_ref",
+        "policy_decision_summary",
+        "reason",
+        "payload_ref",
+        "payload_digest",
+        "line_digest",
+    }
+    assert line["event_type"] == "USER_INPUT_ACCEPTED"
+    serialized = canonical_json_dumps(cast(JsonValue, line))
+    assert _CONFIGURED_SECRET_SENTINEL not in serialized
 
 
 def test_marker_prevents_duplicate_append_when_checkpoint_replays(

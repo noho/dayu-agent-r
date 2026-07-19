@@ -40,6 +40,7 @@ from dayu.engine.contracts.messages import (
 )
 from dayu.engine.contracts.engine_events import runner_role_sequence_digest
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
+from dayu.host._execution_config_projection import effective_execution_config_json
 from dayu.host._event_payload import (
     payload_object as _payload_object,
     required_payload_text as _required_payload_text,
@@ -69,6 +70,7 @@ from dayu.host.durable.memory import (
     read_latest_memory_snapshot,
     write_memory_snapshot_with_checkpoint,
 )
+from dayu.host.dispatch import _effective_dispatch_decision_from_payload
 from dayu.host.durable.projection import read_projection_checkpoint
 from dayu.host.durable.liveness import (
     HostInstanceIdentity,
@@ -107,6 +109,7 @@ from dayu.host.durable.state import (
     WorkerKind,
     mark_dispatch_waiting_for_lane_row,
     mark_dispatching_after_lane_row,
+    read_run_by_id,
     serialize_run_start_reason,
 )
 from dayu.host.durable.errors import HostDurableError
@@ -129,6 +132,7 @@ from dayu.host.compaction import (
 )
 from dayu.host.compact_material import (
     RunInputMaterialBlock,
+    build_pre_dispatch_compact_material_view,
     run_input_material_block,
     selected_material_view_digest,
 )
@@ -191,6 +195,7 @@ from dayu.host.memory import (
     MemorySnapshotCursor,
     SelectedRecentWindowRole,
     build_conversation_memory_snapshot_from_events,
+    conversation_memory_snapshot_to_json_value,
     digest_memory_projection_policy,
 )
 from dayu.host.projection import ProjectionRunner
@@ -216,6 +221,7 @@ _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "run-input-test"})
 _INPUT_DIGEST = sha256_digest_json({"input": "current"})
 _POLICY_REF = "policy-snapshot-p5-s2"
+_CONFIGURED_SECRET_SENTINEL = "synthetic-local-trust-sentinel-6f2b9d8c"
 _DIGEST_A = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 _DIGEST_B = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 _R03_CITATION_OBJECT: dict[str, JsonValue] = {
@@ -1018,6 +1024,144 @@ def test_runner_call_manifest_is_bounded_and_does_not_inline_messages(
             assert message["content_size_bytes"] == entry["content_size_bytes"]
             assert entry["projection_artifact_ref"] == projection_ref
             assert entry["projection_artifact_digest"] == projection_digest
+
+
+def test_internal_execution_value_round_trips_without_llm_projection(
+    tmp_path: Path,
+) -> None:
+    """内部执行值保留到 Engine request，且不进入各 LLM-facing 投影。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: durable/Engine 丢值或任一 LLM-facing 投影泄漏时抛出。
+    """
+
+    header_name = "X-Synthetic-Execution-Value"
+    fallback_policy = _policy_snapshot()
+    effective_runner_spec = replace(
+        fallback_policy.runner_spec,
+        headers={header_name: _CONFIGURED_SECRET_SENTINEL},
+    )
+    effective_config = effective_execution_config_json(
+        runner_spec=effective_runner_spec,
+        runner_options=fallback_policy.runner_options,
+        agent_policy=fallback_policy.agent_policy,
+        runner_spec_source="synthetic-owner-test",
+        runner_options_source="synthetic-owner-test",
+        agent_policy_source="synthetic-owner-test",
+    )
+    input_payload = _user_input_payload("分析本期经营情况")
+    input_payload["effective_execution_config"] = effective_config
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=input_payload,
+        )
+        attempt_snapshot = _attempt_snapshot(seeded)
+        current_facts = DurableCurrentRunFactProvider(
+            store.transaction_runner
+        ).load_current_run_facts(attempt_snapshot)
+        durable_input_payload = store.transaction_runner.run_read(
+            lambda transaction: event_payload_object(
+                transaction,
+                current_facts.user_input_event,
+                payload_label="USER_INPUT_ACCEPTED",
+            )
+        )
+        dispatch_decision = _effective_dispatch_decision_from_payload(
+            durable_input_payload,
+            fallback_policy_snapshot=fallback_policy,
+        )
+
+        assert dispatch_decision.policy_snapshot.runner_spec.headers == {
+            header_name: _CONFIGURED_SECRET_SENTINEL
+        }
+        effective_attempt_snapshot = replace(
+            attempt_snapshot,
+            policy_snapshot_ref=(
+                dispatch_decision.policy_snapshot.policy_snapshot_ref
+            ),
+        )
+
+        request = create_no_tool_run_input_builder(
+            transaction_runner=store.transaction_runner,
+            policy_snapshot=dispatch_decision.policy_snapshot,
+        ).build(effective_attempt_snapshot)
+
+        assert request.runner_spec.headers == {
+            header_name: _CONFIGURED_SECRET_SENTINEL
+        }
+        for message in request.messages:
+            assert _CONFIGURED_SECRET_SENTINEL not in _message_content(message)
+
+        memory_policy = _memory_policy()
+        memory_consumer = ConversationMemoryProjectionConsumer(memory_policy)
+        ProjectionRunner(store.transaction_runner, (memory_consumer,)).run_once(
+            memory_consumer.consumer_id,
+            limit=50,
+        )
+        memory_snapshot = store.transaction_runner.run_read(
+            lambda transaction: read_latest_memory_snapshot(
+                transaction,
+                session_id=session_id,
+                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                policy_digest=digest_memory_projection_policy(memory_policy),
+            )
+        )
+        assert memory_snapshot is not None
+        memory_json = canonical_json_dumps(
+            conversation_memory_snapshot_to_json_value(memory_snapshot.snapshot)
+        )
+        assert _CONFIGURED_SECRET_SENTINEL not in memory_json
+
+        run = store.transaction_runner.run_read(
+            lambda transaction: read_run_by_id(transaction, seeded.run_id)
+        )
+        assert run is not None
+        compact_material = store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                EventLogStore(),
+                run=run,
+                current_display_text="分析本期经营情况",
+            )
+        )
+        assert compact_material.current_input_text == "分析本期经营情况"
+        assert _CONFIGURED_SECRET_SENTINEL not in repr(compact_material)
+
+        manifest_events = _events_by_type(
+            store.transaction_runner,
+            event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+        )
+        assert len(manifest_events) == 1
+        manifest_event = manifest_events[0]
+        hot_payload = _payload_object(manifest_event)
+        manifest = store.transaction_runner.run_read(
+            lambda transaction: event_payload_object(
+                transaction,
+                manifest_event,
+                payload_label="runner-call manifest",
+            )
+        )
+        projection_ref = manifest["runner_call_projection_artifact_ref"]
+        projection_digest = manifest["runner_call_projection_artifact_digest"]
+        assert isinstance(projection_ref, str)
+        assert isinstance(projection_digest, str)
+        runner_call_projection = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_json_payload(
+                transaction,
+                projection_ref,
+                expected_digest=projection_digest,
+            )
+        )
+        assert _CONFIGURED_SECRET_SENTINEL not in canonical_json_dumps(hot_payload)
+        assert _CONFIGURED_SECRET_SENTINEL not in canonical_json_dumps(manifest)
+        assert _CONFIGURED_SECRET_SENTINEL not in canonical_json_dumps(
+            runner_call_projection.payload
+        )
 
 
 def test_session_continuity_does_not_emit_unbudgeted_historical_raw_turns(

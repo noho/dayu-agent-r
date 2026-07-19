@@ -80,6 +80,8 @@ Phase 1 的 runtime 实施范围只包括 `lane` 与 `filelock` 的层中立基�
 
 ConfigLoader 是 scene / config hints 到 typed execution inputs 的前置配置能力。配置 schema 不沿用旧 `llm_models.json` / `run.json` 的混合职责；稳定配置视图拆分为 `models.json`、`execution_profiles.json`、`host_runtime.json`、`runtime_lanes.json` 与 `tool_discovery.json`，并删除旧 `dayu/config/llm_models.json` 与 `dayu/config/run.json`，不保留兼容读取路径。ConfigLoader 不拥有 scene 解释权，不解释 Host lifecycle，不读取 EventLog；配置中的 provider API key、环境变量引用或其它 provider 参数都按配置 schema 原样读取并进入 typed config view。Service / execution environment 负责决定如何使用、脱敏、保护或解析这些配置值。若 Service 无法把 scene hints 与 ConfigLoader 输出映射为当前环境支持的 `RunnerSpec`、`RunnerCallOptions`、`AgentPolicy` 或其它 typed input，必须在调用 Host 前失败。
 
+本地 Config 与 Host SQLite / EventLog 属于同一受信任产品域。Service / execution environment 仍是 secret 解析 owner：它从 typed config 与当前运行环境解析 provider secret，并把解析后的 headers / API key 作为完整 typed `RunnerSpec` 的执行字段交给 Host。Host 可以接收该 resolved typed input，并把一次 Run 实际采用的 effective `RunnerSpec` 原样冻结到内部 durable canonical fact，供 dispatch、retry、replay 与 recovery 使用。这个内部持久化副本不是 public contract，也不得被直接复用为 Tool Trace、audit、HostEvent、outbox、memory、compact、runner-call observation、LLM-facing 文本或日志的输出 payload；这些 projection 必须只从各自 owner 的显式安全字段派生，且不得包含 provider secret 明文。
+
 Config catalog 的 record id 由顶层 map key 提供，record 内不重复 `runtime_id`、`model_id`、`profile_id`、`execution_profile_id` 等 id 字段；typed config view 如需 id，由 ConfigLoader 从 map key 注入。`extends` 引用同一 catalog 的 map key；ConfigLoader validation 不接受重复 id 字段，避免 key / value 不一致和新旧 schema 并存。
 
 `models.json` 是模型目录，只表达 provider / model 能力与请求基础参数：runner kind、provider、model、endpoint、`api_key_ref`、headers、tool calling / streaming / stream usage capability、default timeout、max retries、SSE idle timeout / heartbeat、provider request extension、context window tokens 与 provider/model-specific `runtime_hints.runner_option_hints`。`runner_option_hint_id` 是 semantic call style selector，例如 `interactive`、`overview`、`audit`、`decision`、`write`、`infer` 与 `conversation_compaction`；具体 `temperature`、`top_p`、`stream` 等 RunnerCallOptions 值由 effective model 的 hint 表解释，不放入全局 execution profile。默认 config 不使用 `max_tokens` 限制模型输出；若未来需要输出 token cap，必须作为显式 per-run / provider adapter override 或 provider-specific public contract 重新设计，不能回到默认 model hint。
@@ -112,7 +114,7 @@ Scene manifest 支持 `extends`，但只允许单继承。`extends` 为空或单
 
 Phase 12 的 runtime assembly 边界由 `ScenePrepare`、`ConfigLoader` 与 `ToolsDiscovery` 三个独立组件组成。`ScenePrepare` 解释 scene manifest、读取 manifest 直接引用的 prompt fragment assets、接收 Service 传入的 typed context slot values，并输出已拼接 `system_messages`、tool selection、model hints、可选 agent policy override、fragment refs、source refs 与 content digest。`ConfigLoader` 原样读取 execution config、执行 overlay 与 typed validation，并输出层中立 typed config view。`ToolsDiscovery` 加载显式 provider callable 或 package entry point，聚合 provider 返回的 `ToolDefinition` 集合，输出业务 `ToolBundle`、source refs、content digest 与 provider report。三者互不替代：`ConfigLoader` 不解释 scene manifest，`ScenePrepare` 不做工具发现，`ToolsDiscovery` 不读取 scene manifest 或配置模型。
 
-Service / composition root 是三者输出进入 Host 的唯一映射方。Service 同时消费 `PreparedSceneInputs`、ConfigLoader 的 typed config view 与 ToolsDiscovery 的 discovered bundle，把它们显式映射为 `open_host` construction-time inputs、per-run request inputs、`RunnerSpec`、`RunnerCallOptions`、`AgentPolicy`、`HostToolingOptions` 或其它已冻结 typed input；映射失败必须在调用 Host 前失败。Service / execution environment 负责 provider client 创建、secret 使用 / 脱敏 / 保护、多 Run workflow、artifact、parser、replay、retry 与 stop policy。
+Service / composition root 是三者输出进入 Host 的唯一映射方。Service 同时消费 `PreparedSceneInputs`、ConfigLoader 的 typed config view 与 ToolsDiscovery 的 discovered bundle，把它们显式映射为 `open_host` construction-time inputs、per-run request inputs、resolved `RunnerSpec`、`RunnerCallOptions`、`AgentPolicy`、`HostToolingOptions` 或其它已冻结 typed input；映射失败必须在调用 Host 前失败。Service / execution environment 负责 provider client 创建、secret 解析 / 使用 / 脱敏 / 保护、多 Run workflow、artifact、parser、replay、retry 与 stop policy。Host 不重新读取 Config 或运行环境来解析 secret；它只消费 Service 已构造的 typed execution input。
 
 运行时 override 合并由 Service / composition root 执行，优先级固定为未来 UI 显式输入 > scene manifest hints > ConfigLoader typed config view > 代码默认值。该优先级只适用于 Host 外部装配阶段，Host 接收的仍然是最终 typed inputs，不解释 override provenance。当前 Host public contract 允许的 per-run override 仅限 `SubmitFollowupRequest` 的 `system_prompt`、`tool_names`、`runner_spec`、`runner_options` 与 `agent_policy`：`system_prompt` 承接 `ScenePrepare` 已装配的 system messages；`tool_names` 只在已发现业务 `ToolBundle` 内选择子集，`None` 表示使用全量业务工具，空集合表示禁用业务工具，非空集合表示显式白名单；`runner_spec`、`runner_options` 与 `agent_policy` 必须由 Service 映射为完整 typed value，不接受 patch dict、profile lookup、extra payload 或 raw config fragment。`SubmitFollowupRequest.user_prompt` 是调用方本次输入，不来自 scene / config；`behavior` 与 `target_run_id` 属于 Service / UI 请求控制，不属于 scene manifest 的稳定职责。
 
@@ -719,6 +721,8 @@ Host durable store 是本地治理真源。第一版使用 SQLite 承载以下 d
 - 小型 / 中型可恢复 payload 可以写入 SQLite payload table，并与引用它的 EventLog `canonical_fact` append 在同一 transaction 内提交。
 - projection checkpoint 不得先于对应 projection 持久化结果提交。
 
+Host SQLite / EventLog 是受信任内部 durable store。为冻结 exact effective execution，`USER_INPUT_ACCEPTED` 或等价 canonical fact 可以持久化 Service 已解析的 typed `RunnerSpec`，包括 resolved provider headers / API key；这是 retry / replay / recovery 的执行真源，不是新增 public projection。任何读取该 fact 的消费者都必须声明自己的 typed projection contract：dispatch / retry / replay / recovery 可以恢复完整执行配置，Tool Trace、audit、HostEvent / read API、outbox、memory / compact、LLM-facing runner input / observation 与 operator log 则只能选择各自安全字段，provider secret 明文必须为零。不得用字段名黑名单、下游字符串替换或展示层 repair 代替 owner 级白名单投影。
+
 状态迁移必须使用 CAS-style 条件更新。实现不得以“读出状态后无条件写回”的方式更新 Run / Attempt。
 
 durable store 语义分区：
@@ -941,7 +945,7 @@ P10.5 冻结的是后续真实生产系统 Service 使用的普通多轮生产�
 
 `open_host(options)` 的 options 只承载打开 Host、驱动 Host -> Engine 本地运行所需的 construction-time 参数。Host public API 保持朴素接口形式：内部运行真正需要外部提供的 durable store / payload / artifact roots、runner / worker factory、全量 business `ToolBundle`、ToolRuntime policy、compactor runner / storage config、context budget policy、memory catch-up、stream fanout / background supervisor 所需端口和运行目录等依赖，由调用方通过 typed function 参数显式传入；Host 不在 P10.5 引入 ConfigLoader、全局配置系统或 service locator。scheduler、wakeup、active worker registry、dispatch control 等 Host 内部接线由 `open_host` composition root 自行创建或连接，不作为 Service-facing 参数暴露。每次 Run 会变化的参数不得塞进 `open_host` options；它们必须进入对应 public request，例如普通 prompt / per-run tool selection / run-local instruction 进入 `SubmitFollowupRequest`，retry / replay 控制参数进入各自 request，后续若新增 per-run profile / target 也必须作为明确 request contract 讨论和冻结。
 
-一个 `open_host(options)` 表达一个 Host runtime environment 与默认 ordinary Run execution baseline。durable store、scheduler / worker wiring、memory / artifact roots、全量 business `ToolBundle`、Host policy 基线与默认 `RunnerSpec` / `RunnerCallOptions` / `AgentPolicy` 都属于 construction-time baseline。真实生产系统在同一个 Session 的不同 Run 中切换模型是正常需求；P10.5 不通过 `profile_id` / registry lookup 表达这件事，而是允许 `SubmitFollowupRequest` 直接携带可选 typed override 对象：`runner_spec?: RunnerSpec`、`runner_options?: RunnerCallOptions`、`agent_policy?: AgentPolicy`。字段省略时使用 `open_host(options)` 的默认 ordinary Run baseline；字段出现时使用该 Run 显式传入的 typed value。override 是按字段 partial merge，不是 all-or-nothing profile：例如只传 `runner_options` 时，`RunnerSpec` 与 `AgentPolicy` 仍取 opener baseline；只传 `runner_spec` 时，runner call options 与 agent policy 仍取 opener baseline。每个出现的 override 对象本身必须是完整 typed value，不能是 patch dict、增量字段包或 extra payload。Host 不接收 raw provider client、API key 明文、callable、无结构 dict override、extra payload 或 `policy_overrides`。`RunnerSpec.api_key_ref` 仍只是 secret 引用名，不是 secret 本体。Host admission / dispatch 必须校验并冻结每个 Run 的 effective runner spec / runner options / agent policy 到 Run / Attempt 可解释 snapshot 或 source refs，保证 retry / replay / recovery 能解释当时使用的执行配置。普通每 Run 其它可变项第一版包括显式 `system_prompt`、`user_prompt`、`tool_names` 以及必要的 `client_request_id`、actor / source refs 等 request metadata。后续若新增更细粒度 per-run override，也必须作为 typed request field 讨论并冻结。
+一个 `open_host(options)` 表达一个 Host runtime environment 与默认 ordinary Run execution baseline。durable store、scheduler / worker wiring、memory / artifact roots、全量 business `ToolBundle`、Host policy 基线与默认 `RunnerSpec` / `RunnerCallOptions` / `AgentPolicy` 都属于 construction-time baseline。真实生产系统在同一个 Session 的不同 Run 中切换模型是正常需求；P10.5 不通过 `profile_id` / registry lookup 表达这件事，而是允许 `SubmitFollowupRequest` 直接携带可选 typed override 对象：`runner_spec?: RunnerSpec`、`runner_options?: RunnerCallOptions`、`agent_policy?: AgentPolicy`。字段省略时使用 `open_host(options)` 的默认 ordinary Run baseline；字段出现时使用该 Run 显式传入的 typed value。override 是按字段 partial merge，不是 all-or-nothing profile：例如只传 `runner_options` 时，`RunnerSpec` 与 `AgentPolicy` 仍取 opener baseline；只传 `runner_spec` 时，runner call options 与 agent policy 仍取 opener baseline。每个出现的 override 对象本身必须是完整 typed value，不能是 patch dict、增量字段包或 extra payload。Host 不接收 raw provider client、callable、无结构 dict override、extra payload 或 `policy_overrides`；它可以接收 Service 已解析并封装进 typed `RunnerSpec.headers` 的 provider API key。`RunnerSpec.api_key_ref` 是 secret 来源引用名，不要求 `headers` 仍保持未解析。Host admission / dispatch 必须校验并把每个 Run 的 effective runner spec / runner options / agent policy 冻结到内部 durable canonical fact 或等价可恢复 snapshot，保证 retry / replay / recovery 使用并解释当时的准确执行配置；其中 resolved headers / API key 只属于受信任 Host internal durable state，不能进入 public / LLM-facing / log projection。普通每 Run 其它可变项第一版包括显式 `system_prompt`、`user_prompt`、`tool_names` 以及必要的 `client_request_id`、actor / source refs 等 request metadata。后续若新增更细粒度 per-run override，也必须作为 typed request field 讨论并冻结。
 
 LLM compactor 与 ordinary Run 共享同一个 Host runtime environment、durable store、memory / artifact roots、budget governance 与 canonical event / artifact 接线，但不共享每个 Run 的 execution override。Service / `open_host(options)` 只能提供 compactor runner、scene/baseline prompt、compactor AgentPolicy 与 storage 配置，例如 `compactor_runner_spec`、`compactor_runner_options`、Service 从 compactor scene 装配的 system prompt、Service 从 compactor scene 装配的完整 `AgentPolicy`、Service 从 `compactor_baseline.user_prompt_template_path` 读取的 user prompt template、context budget policy 与 compact artifact root；不能提供 `ContextCompactor` 实例、policy ref、candidate builder、quality check、artifact writer 或 repair callback。当前只有一套 Host compactor policy，因此 compactor policy id / version 是 Host 内部常量或 typed policy snapshot ref，只用于 EventLog / artifact / diagnostic 审计，不进入 Service-facing opener contract。Host 在 opener composition root 内部构造 Host-owned LLM compactor，并把它接入 Context Governance internal seam。`SubmitFollowupRequest.runner_spec` / `runner_options` / `agent_policy`、`tool_names`、`system_prompt` 不影响 compactor；compactor 不创建用户可见 Run，不产出 final answer，不使用 business ToolRuntime。后续如需多套 compactor policy，必须先作为 Host-recognized typed policy profile 重新设计 public contract，不能先暴露 raw string `policy_ref`，也不能借用 ordinary Run override、metadata 或 extra payload。
 
@@ -1717,6 +1721,8 @@ Sink semantic contract：
 
 Tool trace 是 EventLog 派生 projection，不是 Host durable truth。它必须支持冷热数据分离，避免把调试明细、长工具参数、长结果摘要和归档流混进 EventLog 或热查询表。
 
+Tool Trace 的 event filter 与 extract / render owner 必须显式白名单化；不得因为 source EventLog 内部 canonical fact 含 resolved `RunnerSpec` 就复制其 `effective_execution_config`、provider headers 或 API key。hot row、cold JSONL、readable summary 与 query 返回中的 provider secret 明文都必须为零。工具自身 source-owned request / result 文本仍按既有 Tool / LLM-facing 安全 contract 处理，不能把 configured provider secret 的排除责任退化为 header 字段名黑名单。
+
 存储口径：
 
 - 热数据使用结构化 JSON projection。热数据保存近期、可查询、可展示、可关联的 tool trace summary，例如 tool_call_id、tool name、normalized args digest、result digest、evidence anchors、truncate info、await info、policy decision、error code、duration、attempt refs。
@@ -1779,6 +1785,8 @@ Engine ingest rejected reason 的 runner-call link 子集固定为：
 ## 15. Audit
 
 Audit 不是事实真源；audit sink 消费 committed EventLog 生成 audit projection。
+
+Audit 的输出 owner 只能投影固定审计字段、operation context refs / digest、policy / reason 摘要与 payload ref / digest；不得复制 canonical payload、`effective_execution_config`、provider headers 或 API key。即使内部 EventLog 合法持久化 resolved execution config，audit JSONL、audit query / analyze 输出与相关 operator log 中的 provider secret 明文也必须为零。
 
 第一版 Audit 默认落地为 `LogAuditSink(JSONL)`：
 
@@ -1843,7 +1851,7 @@ audit projection 可以为了查询重组，但不能反向成为恢复、resume
 
 ## 16. Read Model / Host Event Stream / Outbox
 
-EventLog 是真源；Run result、Session timeline、Host event stream、audit、usage、tool trace、memory snapshot、outbox 都是 read model 或 projection。
+EventLog 是真源；Run result、Session timeline、Host event stream、audit、usage、tool trace、memory snapshot、outbox 都是 read model 或 projection。public HostEvent / read API、outbox、memory / compact / evidence 与任何 LLM-facing material 只能输出各自 typed owner 明确选择的业务字段，不得透传内部 effective execution snapshot、provider headers 或 API key；Host / Service / Engine operator logs 同样不得记录这些 secret 明文。
 
 公共读取语义：
 
@@ -3400,7 +3408,7 @@ CONTEXT_COMPACTION_REQUESTED(operation_id, trigger_source, budget snapshot, inpu
   -> CONTEXT_COMPACTED or CONTEXT_COMPACTION_FAILED
 ```
 
-`CONTEXT_COMPACTION_ATTEMPT_REJECTED` 是 Host governance diagnostic canonical fact，用于回答尝试次数、失败类别、是否 exhaust budget 和最终接受的是哪次 attempt。EventLog 不能包含 API key、headers、完整 raw prompt 或完整 provider payload；大 payload、raw candidate、provider error body 或 repair prompt 如需保留，必须写 artifact / diagnostic ref 并做敏感信息过滤。
+`CONTEXT_COMPACTION_ATTEMPT_REJECTED` 是 Host governance diagnostic canonical fact，用于回答尝试次数、失败类别、是否 exhaust budget 和最终接受的是哪次 attempt。内部 EventLog 可以在 effective execution canonical fact 中保存 resolved provider headers / API key，但 compact request、attempt rejection diagnostic、artifact、Tool Trace、audit、HostEvent、memory / evidence、LLM-facing material 与日志都不得包含这些 secret 明文。完整 raw prompt、完整 provider payload、大 raw candidate、provider error body 或 repair prompt 如需保留，必须写受控 artifact / diagnostic ref，并在进入任何 public、LLM-facing、audit、trace 或 log projection 前由其 source owner 做敏感信息过滤与有界化。
 
 HostEvent 暴露粒度必须比 EventLog 克制：`CONTEXT_COMPACTION_REQUESTED`、最终 `CONTEXT_COMPACTED`、最终 `CONTEXT_COMPACTION_FAILED` 应作为 Service-facing HostEvent 可观察；Host-level repair attempt rejected / retry scheduled 可以作为 typed diagnostic/progress HostEvent 暴露，但不得把每一次 Engine runner HTTP retry 变成 public HostEvent。低层 provider retry 只进入 runner log / aggregated diagnostics。
 

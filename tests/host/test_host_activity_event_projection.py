@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import pathlib
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import asdict
 from typing import cast
 
 import pytest
@@ -76,6 +77,7 @@ from dayu.host.payload_resolution import event_payload_object
 from dayu.host.read_api import _host_event_from_row
 
 _SESSION_SLOT = "activity-session"
+_CONFIGURED_SECRET_SENTINEL = "synthetic-local-trust-sentinel-6f2b9d8c"
 
 
 class _BlockingHandle:
@@ -213,6 +215,51 @@ class _MissingEventLogStore:
 
         del transaction, event_id
         return None
+
+
+def test_public_host_event_excludes_internal_effective_execution_value(
+    tmp_path: pathlib.Path,
+) -> None:
+    """public HostEvent/activity 不投影 Host 内部有效执行配置值。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: public DTO 包含 synthetic sentinel 时抛出。
+    """
+
+    event = _project_event(
+        tmp_path,
+        _row(
+            event_id="event-user-input-internal-config",
+            event_class=EventClass.CANONICAL_FACT,
+            session_id="session-direct",
+            run_id="run-direct",
+            event_type="USER_INPUT_ACCEPTED",
+            payload={
+                "display_text": "分析本期经营情况",
+                "effective_execution_config": {
+                    "config": {
+                        "runner_spec": {
+                            "headers": {
+                                "X-Synthetic-Execution-Value": (
+                                    _CONFIGURED_SECRET_SENTINEL
+                                )
+                            }
+                        }
+                    }
+                },
+            },
+        ),
+    )
+
+    assert event.kind is HostEventKind.PROGRESS
+    assert event.activity is None
+    assert event.final_answer is None
+    assert event.error_message is None
+    assert event.cancel_reason is None
+    assert event.thinking is None
+    public_dto_json = canonical_json_dumps(cast(JsonValue, asdict(event)))
+    assert _CONFIGURED_SECRET_SENTINEL not in public_dto_json
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -43,6 +44,7 @@ from dayu.runtime.log_levels import STREAM_DEBUG_LOG_LEVEL, VERBOSE_LOG_LEVEL
 
 _SECRET_PROMPT = "SECRET_FULL_PROMPT_DO_NOT_LOG"
 _SECRET_AUTH = "SECRET_AUTH_CLAIM_DO_NOT_LOG"
+_CONFIGURED_SECRET_SENTINEL = "synthetic-local-trust-sentinel-6f2b9d8c"
 
 
 class _OpenCancellationToken(CancellationToken):
@@ -146,6 +148,38 @@ async def test_local_proxy_accept_log_uses_counts_not_message_content(
     assert "message_count=1" in caplog.text
     assert snapshot.run_id in caplog.text
     assert _SECRET_PROMPT not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_local_proxy_logs_exclude_internal_effective_execution_value(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """LocalProxy operator 日志不记录 Engine request 的内部有效执行值。
+
+    :param caplog: pytest 日志捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: request 丢值或日志包含 synthetic sentinel 时抛出。
+    """
+
+    snapshot = _attempt_snapshot()
+    base_request = _agent_run_request(snapshot)
+    request = replace(
+        base_request,
+        runner_spec=replace(
+            base_request.runner_spec,
+            headers={
+                "X-Synthetic-Execution-Value": _CONFIGURED_SECRET_SENTINEL
+            },
+        ),
+    )
+    assert _CONFIGURED_SECRET_SENTINEL in request.runner_spec.headers.values()
+
+    with caplog.at_level(VERBOSE_LOG_LEVEL, logger="dayu.host.local_proxy"):
+        handle = await DefaultLocalEngineWorker().accept(snapshot, request)
+        await handle.close()
+
+    assert "host.local_proxy.accept" in caplog.text
+    assert _CONFIGURED_SECRET_SENTINEL not in caplog.text
 
 
 def test_memory_catchup_logs_cursors_and_counts(

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
-import sys
-import contextlib
-from collections.abc import Mapping, Sequence
+import logging
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, cast
+from typing import Protocol, cast
 
 import pytest
 
@@ -24,14 +25,359 @@ from dayu.contracts.tool_schema import (
     ToolTruncateSpec,
     ToolTruncationStrategy,
 )
-
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-
 from utils import smoke_web_ci as smoke
 
 JsonObject = dict[str, JsonValue]
+_LOGGER_HARNESS_EXISTING_NAME = "tests.smoke_web_ci.harness.existing"
+_LOGGER_HARNESS_NEW_NAME = "tests.smoke_web_ci.harness.created"
+_LOGGER_HARNESS_PLACEHOLDER_PARENT_NAME = (
+    "tests.smoke_web_ci.harness.placeholder_parent"
+)
+_LOGGER_HARNESS_DESCENDANT_NAME = (
+    f"{_LOGGER_HARNESS_PLACEHOLDER_PARENT_NAME}.descendant"
+)
+
+
+class _LogRecordFilter(Protocol):
+    """声明拥有 stdlib logging filter 方法的结构化对象。"""
+
+    def filter(self, record: logging.LogRecord, /) -> bool:
+        """判断是否允许当前日志记录。
+
+        :param record: 待判断的 stdlib 日志记录。
+        :returns: 允许记录时为真，否则为假。
+        :raises Exception: 结构化实现抛出的异常原样透传。
+        """
+
+        ...
+
+
+_LoggerFilter = (
+    logging.Filter
+    | Callable[[logging.LogRecord], bool]
+    | _LogRecordFilter
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _LoggerState:
+    """记录一个 concrete logger 的完整可恢复状态。
+
+    :param logger: 状态所属 logger 实例。
+    :param level: logger 的显式 level。
+    :param handlers: handler identity 与顺序。
+    :param filters: filter identity 与顺序。
+    :param propagate: 是否向父 logger 传播。
+    :param disabled: logger 是否禁用。
+    :param parent: logger 的精确父节点 identity。
+    """
+
+    logger: logging.Logger
+    level: int
+    handlers: tuple[logging.Handler, ...]
+    filters: tuple[_LoggerFilter, ...]
+    propagate: bool
+    disabled: bool
+    parent: logging.Logger | None
+
+
+@dataclass(frozen=True, slots=True)
+class _LoggingSnapshot:
+    """记录 root 与 logging registry 的完整恢复快照。
+
+    :param registry: 调用前的全局 logger registry 实例。
+    :param registry_entries: registry entry identity 与插入顺序。
+    :param root_state: root logger 状态。
+    :param logger_states: 调用前所有 concrete named logger 状态。
+    """
+
+    registry: dict[str, logging.Logger | logging.PlaceHolder]
+    registry_entries: tuple[
+        tuple[str, logging.Logger | logging.PlaceHolder], ...
+    ]
+    root_state: _LoggerState
+    logger_states: tuple[_LoggerState, ...]
+
+
+class _TrackingHandler(logging.Handler):
+    """记录 harness 是否关闭了本次调用新增的 handler。"""
+
+    def __init__(self) -> None:
+        """初始化未关闭的 tracking handler。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__()
+        self.was_closed = False
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """丢弃测试日志记录。
+
+        :param record: stdlib 日志记录。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+    def close(self) -> None:
+        """记录关闭动作并委托 stdlib handler 收尾。
+
+        :returns: ``None``。
+        :raises Exception: 底层 handler 关闭失败时透传。
+        """
+
+        self.was_closed = True
+        super().close()
+
+
+@dataclass(slots=True)
+class _RegistryMutatingSmokeMain:
+    """模拟会污染 root、named logger 与 registry 的 smoke 入口。
+
+    :param raises_error: 完成污染后是否抛出异常。
+    :param created_handlers: 本次调用创建的 tracking handlers。
+    :param reparented_descendant: fake 是否触发 descendant 重挂父节点。
+    """
+
+    raises_error: bool
+    created_handlers: list[_TrackingHandler] = field(default_factory=list)
+    reparented_descendant: bool = field(default=False, init=False)
+
+    def __call__(self, argv: Sequence[str] | None = None) -> int:
+        """污染 logging 全局状态并返回或抛出。
+
+        :param argv: smoke 参数；fake 不消费。
+        :returns: success fake 的固定退出码。
+        :raises RuntimeError: ``raises_error`` 为真时抛出。
+        """
+
+        del argv
+        root_logger = logging.getLogger()
+        existing_logger = logging.getLogger(_LOGGER_HARNESS_EXISTING_NAME)
+        created_logger = logging.getLogger(_LOGGER_HARNESS_NEW_NAME)
+        descendant_logger = logging.getLogger(_LOGGER_HARNESS_DESCENDANT_NAME)
+        placeholder_parent_logger = logging.getLogger(
+            _LOGGER_HARNESS_PLACEHOLDER_PARENT_NAME
+        )
+        self.reparented_descendant = (
+            descendant_logger.parent is placeholder_parent_logger
+        )
+        for index, logger in enumerate(
+            (
+                root_logger,
+                existing_logger,
+                created_logger,
+                placeholder_parent_logger,
+            ),
+            start=1,
+        ):
+            handler = _TrackingHandler()
+            self.created_handlers.append(handler)
+            logger.addHandler(handler)
+            logger.addFilter(logging.Filter(f"mutated.{index}"))
+            logger.setLevel(logging.DEBUG + index)
+            logger.propagate = not logger.propagate
+            logger.disabled = not logger.disabled
+        if self.raises_error:
+            raise RuntimeError("synthetic smoke failure")
+        return 17
+
+
+def _logger_state(logger: logging.Logger) -> _LoggerState:
+    """读取单个 concrete logger 的可恢复状态。
+
+    :param logger: 待读取 logger。
+    :returns: 包含 identity/order 与标量字段的状态。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return _LoggerState(
+        logger=logger,
+        level=logger.level,
+        handlers=tuple(logger.handlers),
+        filters=tuple(logger.filters),
+        propagate=logger.propagate,
+        disabled=logger.disabled,
+        parent=logger.parent,
+    )
+
+
+def _snapshot_logging_state() -> _LoggingSnapshot:
+    """快照 root 与当前 registry 中全部 concrete logger。
+
+    :returns: 可恢复的 logging 全局状态快照。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    registry = logging.Logger.manager.loggerDict
+    registry_entries = tuple(registry.items())
+    logger_states = tuple(
+        _logger_state(entry)
+        for _, entry in registry_entries
+        if isinstance(entry, logging.Logger)
+    )
+    return _LoggingSnapshot(
+        registry=registry,
+        registry_entries=registry_entries,
+        root_state=_logger_state(logging.getLogger()),
+        logger_states=logger_states,
+    )
+
+
+def _restore_logger_state(state: _LoggerState) -> None:
+    """恢复一个 concrete logger 的全部已快照字段。
+
+    :param state: 调用前 logger 状态。
+    :returns: ``None``。
+    :raises ValueError: 快照中的 level 非法时由 stdlib 透传。
+    """
+
+    state.logger.setLevel(state.level)
+    state.logger.handlers[:] = state.handlers
+    state.logger.filters[:] = state.filters
+    state.logger.propagate = state.propagate
+    state.logger.disabled = state.disabled
+
+
+def _restore_logging_state(snapshot: _LoggingSnapshot) -> None:
+    """恢复 logging registry，并卸载、关闭本次新增 handlers。
+
+    :param snapshot: 调用前完整 logging 快照。
+    :returns: ``None``。
+    :raises Exception: 新增 handler 关闭失败时透传。
+    """
+
+    current_registry = logging.Logger.manager.loggerDict
+    current_loggers = (
+        logging.getLogger(),
+        *(
+            entry
+            for entry in current_registry.values()
+            if isinstance(entry, logging.Logger)
+        ),
+    )
+    original_handler_ids = {
+        id(handler)
+        for state in (snapshot.root_state, *snapshot.logger_states)
+        for handler in state.handlers
+    }
+    new_handlers = {
+        id(handler): handler
+        for logger in current_loggers
+        for handler in logger.handlers
+        if id(handler) not in original_handler_ids
+    }
+    for logger in current_loggers:
+        for handler in tuple(logger.handlers):
+            if id(handler) in new_handlers:
+                logger.removeHandler(handler)
+    _restore_logger_state(snapshot.root_state)
+    for state in snapshot.logger_states:
+        _restore_logger_state(state)
+    logging.Logger.manager.loggerDict = snapshot.registry
+    snapshot.registry.clear()
+    snapshot.registry.update(snapshot.registry_entries)
+    # stdlib 在创建 concrete parent 时会重挂既有 child；registry identity
+    # 恢复完成后再回填 parent，才能恢复完整拓扑而不是仅恢复 registry 表面状态。
+    for state in (snapshot.root_state, *snapshot.logger_states):
+        state.logger.parent = state.parent
+    for handler in new_handlers.values():
+        handler.close()
+
+
+def _invoke_smoke_main(argv: Sequence[str]) -> int:
+    """在完整 logging 状态隔离边界内调用 in-process smoke。
+
+    :param argv: 传给 smoke CLI 的参数。
+    :returns: smoke 退出码。
+    :raises Exception: smoke 抛出的异常在完成状态恢复后原样透传。
+    """
+
+    snapshot = _snapshot_logging_state()
+    try:
+        return smoke.main(argv)
+    finally:
+        _restore_logging_state(snapshot)
+
+
+def _assert_logging_snapshot_restored(expected: _LoggingSnapshot) -> None:
+    """断言 registry、logger、handler 与 filter identity/order 完整恢复。
+
+    :param expected: 调用前 logging 快照。
+    :returns: ``None``。
+    :raises AssertionError: 任一全局 logging 状态漂移时抛出。
+    """
+
+    current = _snapshot_logging_state()
+    assert current.registry is expected.registry
+    assert current.registry_entries == expected.registry_entries
+    assert current.root_state == expected.root_state
+    assert current.logger_states == expected.logger_states
+
+
+@pytest.mark.parametrize("raises_error", [False, True])
+def test_in_process_smoke_harness_restores_complete_logging_state(
+    monkeypatch: pytest.MonkeyPatch,
+    raises_error: bool,
+) -> None:
+    """success/failure 调用后均恢复完整 logging identity/order/state。
+
+    :param monkeypatch: pytest 属性替换工具。
+    :param raises_error: fake smoke 是否抛出异常。
+    :returns: ``None``。
+    :raises AssertionError: 任一状态未恢复或 handler 关闭范围错误时抛出。
+    """
+
+    outer_snapshot = _snapshot_logging_state()
+    preexisting_root_handler = _TrackingHandler()
+    preexisting_named_handlers = (_TrackingHandler(), _TrackingHandler())
+    try:
+        root_logger = logging.getLogger()
+        descendant_logger = logging.getLogger(_LOGGER_HARNESS_DESCENDANT_NAME)
+        original_descendant_parent = descendant_logger.parent
+        placeholder_entry = logging.Logger.manager.loggerDict[
+            _LOGGER_HARNESS_PLACEHOLDER_PARENT_NAME
+        ]
+        assert isinstance(placeholder_entry, logging.PlaceHolder)
+        named_logger = logging.getLogger(_LOGGER_HARNESS_EXISTING_NAME)
+        root_logger.setLevel(37)
+        root_logger.handlers.insert(0, preexisting_root_handler)
+        root_logger.filters.insert(0, logging.Filter("root.preexisting"))
+        root_logger.propagate = False
+        root_logger.disabled = True
+        named_logger.setLevel(23)
+        named_logger.handlers[:] = preexisting_named_handlers
+        named_logger.filters[:] = [logging.Filter("named.preexisting")]
+        named_logger.propagate = False
+        named_logger.disabled = True
+        expected = _snapshot_logging_state()
+        fake_main = _RegistryMutatingSmokeMain(raises_error=raises_error)
+        monkeypatch.setattr(smoke, "main", fake_main)
+
+        if raises_error:
+            with pytest.raises(RuntimeError, match="synthetic smoke failure"):
+                _invoke_smoke_main(("--synthetic",))
+        else:
+            assert _invoke_smoke_main(("--synthetic",)) == 17
+
+        assert fake_main.reparented_descendant
+        _assert_logging_snapshot_restored(expected)
+        assert descendant_logger.parent is original_descendant_parent
+        assert (
+            logging.Logger.manager.loggerDict[
+                _LOGGER_HARNESS_PLACEHOLDER_PARENT_NAME
+            ]
+            is placeholder_entry
+        )
+        assert not preexisting_root_handler.was_closed
+        assert all(
+            not handler.was_closed for handler in preexisting_named_handlers
+        )
+        assert fake_main.created_handlers
+        assert all(handler.was_closed for handler in fake_main.created_handlers)
+    finally:
+        _restore_logging_state(outer_snapshot)
 
 
 def test_local_fixture_urls_and_pdf_fixture_are_stable() -> None:
@@ -1342,7 +1688,7 @@ def test_external_child_returncode_does_not_override_local_pass(
     monkeypatch.setattr(smoke, "_run_diagnostic_command", fake_runner)
     _patch_direct_assembly_and_search_cases(monkeypatch)
 
-    exit_code = smoke.main(
+    exit_code = _invoke_smoke_main(
         [
             "--output-dir",
             str(output_dir),
@@ -1430,7 +1776,7 @@ def test_external_parse_and_artifact_gap_do_not_override_local_pass(
     monkeypatch.setattr(smoke, "_run_diagnostic_command", fake_runner)
     _patch_direct_assembly_and_search_cases(monkeypatch)
 
-    exit_code = smoke.main(
+    exit_code = _invoke_smoke_main(
         [
             "--output-dir",
             str(output_dir),
@@ -1520,7 +1866,7 @@ def test_default_browser_case_samples_playwright_and_include_playwright_affects_
     monkeypatch.setattr(smoke, "_run_diagnostic_command", fake_runner)
     _patch_direct_assembly_and_search_cases(monkeypatch)
 
-    exit_code = smoke.main(
+    exit_code = _invoke_smoke_main(
         [
             "--output-dir",
             str(tmp_path / "out"),
@@ -1544,7 +1890,7 @@ def test_default_browser_case_samples_playwright_and_include_playwright_affects_
 def test_missing_external_file_returns_operator_input_error(tmp_path: Path) -> None:
     """显式传入不存在的 external URL 文件时应返回 operator input error。"""
 
-    exit_code = smoke.main(
+    exit_code = _invoke_smoke_main(
         [
             "--output-dir",
             str(tmp_path / "out"),
@@ -1606,7 +1952,7 @@ def test_invalid_external_file_returns_operator_input_error_before_local_diagnos
     monkeypatch.setattr(smoke, "_running_local_fixture_server", raising_server)
     monkeypatch.setattr(smoke, "_run_diagnostic_command", raising_runner)
 
-    exit_code = smoke.main(
+    exit_code = _invoke_smoke_main(
         [
             "--output-dir",
             str(output_dir),
@@ -1695,7 +2041,7 @@ def test_external_limit_and_summary_paths_are_predictable(
     monkeypatch.setattr(smoke, "_run_diagnostic_command", fake_runner)
     _patch_direct_assembly_and_search_cases(monkeypatch)
 
-    exit_code = smoke.main(
+    exit_code = _invoke_smoke_main(
         [
             "--output-dir",
             str(output_dir),

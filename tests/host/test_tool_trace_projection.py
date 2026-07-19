@@ -46,7 +46,10 @@ from dayu.host.durable.schema import (
     TOOL_CALL_ARGUMENTS_STORAGE_PAYLOAD_DESCRIPTOR,
     TOOL_CALL_SEMANTIC_QUERY_STORAGE_PAYLOAD_DESCRIPTOR,
 )
-from dayu.host.durable.tool_trace import read_tool_trace_hot_row
+from dayu.host.durable.tool_trace import (
+    read_tool_trace_by_run,
+    read_tool_trace_hot_row,
+)
 from dayu.host.durable.transaction import HostTransaction, HostTransactionRunner
 from dayu.host.evidence import (
     AcceptedEvidenceEnvelope,
@@ -81,6 +84,7 @@ _SIGNAL_FIELD_NAMES: tuple[str, ...] = (
     _FIELD_FAILURE_METADATA,
     _FIELD_PARTIAL_TOOL_CALL_SIGNAL,
 )
+_CONFIGURED_SECRET_SENTINEL = "synthetic-local-trust-sentinel-6f2b9d8c"
 
 
 class _AcceptedTraceCorruption(StrEnum):
@@ -766,6 +770,72 @@ def _cold_trace_summary_for_event(
     summary = matching[0]["trace_summary"]
     assert isinstance(summary, Mapping)
     return cast(Mapping[str, JsonValue], summary)
+
+
+def test_tool_trace_excludes_internal_effective_execution_value(
+    tmp_path: Path,
+) -> None:
+    """Tool Trace filter、hot、cold 与 query 均不投影 Host 内部执行配置值。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: Tool Trace 任一投影面包含 synthetic sentinel 时抛出。
+    """
+
+    cold_path = tmp_path / "trace" / "internal-config.jsonl"
+    with open_host_durable_store(_options(tmp_path)) as store:
+        row = _append_tool_event(
+            store.transaction_runner,
+            event_id="event-user-input-internal-config",
+            event_type="USER_INPUT_ACCEPTED",
+            payload={
+                "display_text": "分析本期经营情况",
+                "effective_execution_config": {
+                    "config": {
+                        "runner_spec": {
+                            "headers": {
+                                "X-Synthetic-Execution-Value": (
+                                    _CONFIGURED_SECRET_SENTINEL
+                                )
+                            }
+                        }
+                    }
+                },
+            },
+        )
+        run_id = row.run_id
+        assert isinstance(run_id, str)
+        consumer = ToolTraceProjectionConsumer(
+            ToolTraceSinkOptions(
+                cold_jsonl_path=cold_path,
+                create_parent_dirs=True,
+            )
+        )
+
+        assert not consumer.event_filter.matches(
+            projection_event_view_from_row(row)
+        )
+        _run_trace_once(store.transaction_runner, cold_path)
+
+        hot_row = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_hot_row(
+                transaction, row.event_id
+            )
+        )
+        query_page = store.transaction_runner.run_read(
+            lambda transaction: read_tool_trace_by_run(
+                transaction,
+                run_id,
+                after_event_sequence=0,
+                limit=10,
+            )
+        )
+
+        assert hot_row is None
+        assert query_page.rows == ()
+        assert _CONFIGURED_SECRET_SENTINEL not in repr(query_page)
+
+    assert _json_lines(cold_path) == ()
 
 
 @pytest.mark.parametrize(
