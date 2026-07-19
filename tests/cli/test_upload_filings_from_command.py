@@ -743,6 +743,8 @@ def test_posix_generated_script_runs_real_cli_into_temp_storage() -> None:
         check=False,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="strict",
     )
     script_path = storage / "upload_filings_AAPL.sh"
     execution = subprocess.run(
@@ -751,6 +753,8 @@ def test_posix_generated_script_runs_real_cli_into_temp_storage() -> None:
         check=False,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="strict",
     )
 
     assert generation.returncode == 0, generation.stderr
@@ -858,6 +862,8 @@ def test_windows_generated_script_runs_real_cli_into_temp_storage(tmp_path: Path
         check=False,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="strict",
     )
     script_path = artifact_directory / "cli-generated-upload.cmd"
     execution = subprocess.run(
@@ -866,6 +872,8 @@ def test_windows_generated_script_runs_real_cli_into_temp_storage(tmp_path: Path
         check=False,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="strict",
     )
 
     assert generation.returncode == 0, generation.stderr

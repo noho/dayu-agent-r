@@ -51,7 +51,9 @@ python -m pytest tests/cli/test_run_keys.py::test_new_running_key_monitor_uses_n
 真实 runner 证据。workflow 通过时的证据包包含 JUnit、生成脚本、recorder oracle、CLI storage oracle、stdout/stderr、环境、
 `cmd.exe /d /c ver` 输出与 `cmd.exe /?` 输出；失败时仍通过 `if: always()` 发布已经产生的诊断证据。
 CLI process owner 会在解析参数和输出前，把真实 stdout/stderr `TextIOWrapper` 明确配置为 strict UTF-8，保证 redirected
-init/upload 中文输出仍可编码；内存 capture 等非 OS wrapper 保持调用方自己的语义。
+init/upload 中文输出仍可编码；直接消费 Dayu CLI 或生成脚本所转发输出的测试 subprocess 同样显式使用
+`encoding="utf-8", errors="strict"` 解码，不依赖 Windows ambient code page。内存 capture 等非 OS wrapper 保持调用方自己的
+语义，纯 recorder、`reg.exe` 与 junction native 命令继续使用各自的平台输出契约。
 
 真实 init Windows gate 由 `.github/workflows/r12-init-windows.yml` 使用 Python 3.11 与
 `constraints/lock-windows-x64-py311.txt` 运行。它执行真实 FIRST→PRESERVE→OVERWRITE→

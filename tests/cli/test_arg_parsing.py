@@ -1099,21 +1099,24 @@ def test_main_returns_usage_error_when_log_file_is_empty(
     assert "must not be empty" in captured.err
 
 
-def test_python_module_help_runs() -> None:
-    """验证 ``python -m dayu.cli --help`` 使用同一 parser 并成功退出。
+def test_python_module_help_decodes_cli_output_as_strict_utf8() -> None:
+    """验证模块入口使用同一 parser，并按严格 UTF-8 消费中文输出。
 
     :returns: ``None``。
-    :raises AssertionError: 模块入口退出码或 help 输出不符合契约时抛出。
+    :raises AssertionError: 模块入口退出码、解码或 help 输出不符合契约时抛出。
     """
 
     result = subprocess.run(
         [sys.executable, "-m", "dayu.cli", "--help"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="strict",
         check=False,
     )
 
     assert result.returncode == EXIT_SUCCESS
+    assert "Dayu 财报分析命令行入口。" in result.stdout
     assert "dayu-cli" in result.stdout
     assert "interactive" in result.stdout
 

@@ -192,6 +192,8 @@ def _run_init(
         input=input_text,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="strict",
         timeout=_PROCESS_TIMEOUT_SECONDS,
         check=False,
     )
@@ -320,6 +322,8 @@ def _start_init_process(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="strict",
     )
     if process.stdin is None:
         raise AssertionError("init subprocess stdin pipe is missing")
