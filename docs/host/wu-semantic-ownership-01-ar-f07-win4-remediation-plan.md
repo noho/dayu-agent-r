@@ -789,7 +789,10 @@ implementation diff 只允许：
 | Slice | Allowed paths | Ownership purpose |
 | --- | --- | --- |
 | WIN4-RW-S1 | `tests/cli/test_upload_filings_from_command.py` | 删除 display consumer耦合，以 process + public Fins storage owner facts证明业务成功，保留 company-name/oracle/artifact integrity |
-| WIN4-RW-S2 | `dayu/cli/commands/init.py`; `tests/cli/test_init_command.py`; `README.md`; `tests/README.md` | 实现并测试 TTY/redirected secret-input owner contract，更新最终用户与 test-gate说明 |
+| WIN4-RW-S2 | `dayu/cli/commands/init.py`; `tests/cli/test_init_command.py`; `tests/cli/test_prompt_command.py`; `README.md`; `tests/README.md` | 实现并测试 TTY/redirected secret-input owner contract，更新最终用户与 test-gate说明；`test_prompt_command.py` 的 ownership 严格限于 `test_prompt_command_uses_init_generated_workspace_config` 的 strict typed TTY stdin fixture迁移 |
+
+`tests/cli/test_prompt_command.py` 的新增授权不是 prompt suite、runtime assembly或业务断言的范围扩张：只允许上述 exact node
+补齐 production实际读取的 `sys.stdin` TTY fake；同文件其它 prompt tests必须相对 `AMENDED_PLAN_BASE` 零 diff。
 
 明确禁止修改或新增：
 
@@ -825,11 +828,15 @@ JSON/private core、CLI output、workflow才能让 test通过，停止并回 Con
 
 Objective：让 CLI input owner根据 stdin capability选择 hidden TTY或 redirected logical-line读取，并锁定安全 failure语义。
 
-Exact changes：严格执行 §13.2.2；在 `tests/cli/test_init_command.py` 直接测试 owner。所有受影响既有 getpass tests必须把
+Exact changes：严格执行 §13.2.2；在 `tests/cli/test_init_command.py` 直接测试 owner。该文件所有受影响既有 getpass tests必须把
 production实际读取的 `sys.stdin` 替换为 test-owned、严格 typed TTY fake：其 `isatty()` 恒为 `True`，`readline()` 一旦被调用
-立即 assertion失败；不得 mock production `_read_secret_input`，不得修改或依赖 `sys.__stdin__`，也不得依赖本机/CI ambient TTY。
-redirected owner tests必须使用真实 `io.StringIO` 或等价的严格 typed stream，并显式保证 `isatty() == False`。不得在
-`_run_init()`、workflow或 Windows-only test注入 shim。
+立即 assertion失败。direct integration consumer
+`tests/cli/test_prompt_command.py::test_prompt_command_uses_init_generated_workspace_config` 只补同样严格的 test-owned
+`sys.stdin` TTY fake并锁定误入 `readline()` 立即失败；保留既有 getpass value序列、prompt/runtime assembly业务断言与执行顺序，
+不修改同文件其它 prompt tests。不得抽 compatibility/shared production seam或跨模块 facade，不得 mock production
+`_read_secret_input`，不得修改或依赖 `sys.__stdin__`，也不得依赖本机/CI ambient TTY。redirected owner tests必须使用真实
+`io.StringIO` 或等价的严格 typed stream，并显式保证 `isatty() == False`。不得在 `_run_init()`、workflow或 Windows-only
+test注入 shim。
 
 Dependencies：无 S1 代码依赖，但按 S1→S2 串行实施。只有两 slice均 accepted后才允许 aggregate validation和 remote rerun。
 
@@ -861,6 +868,10 @@ production seam，停止并回 Controller。
 - TTY：受影响既有 getpass tests使用 test-owned严格 typed `sys.stdin` fake，`isatty()` 恒为 `True`，`readline()` 被调用即
   assertion失败；只调用 hidden getpass，prompt与返回值传递不漂移，不 mock `_read_secret_input`，不依赖 `sys.__stdin__`
   或 ambient TTY。
+- direct integration consumer：
+  `tests/cli/test_prompt_command.py::test_prompt_command_uses_init_generated_workspace_config` 必须使用同一 capability contract的
+  test-owned strict typed TTY stdin fake，证明 init→prompt integration只走 hidden getpass且 `readline()` 误入立即失败；保留
+  既有 getpass value序列、generated workspace config、prompt/runtime assembly与路径断言，同文件其它 tests零 diff。
 - line endings：LF与CRLF各只移除一个 logical ending；空行得到空值；孤立 trailing `\r` 原样保留并有 bare-CR owner test；
   其它空白不 strip，禁止 `rstrip` 或等价的过度删除。
 - EOF：TTY `getpass.getpass()` 抛出的 `EOFError`与 redirected `readline() == ""`都转成同一 value-free
@@ -897,11 +908,14 @@ WIN4-RW-S2：
 
 ```bash
 pytest tests/cli/test_init_command.py -q
+pytest \
+  tests/cli/test_prompt_command.py::test_prompt_command_uses_init_generated_workspace_config \
+  -q
 pytest tests/cli/test_init_smoke.py -q
 ```
 
 至少单独选择新增 owner nodes运行一次，evidence中逐项报告 redirected/TTY test-owned stream、LF/CRLF/bare-CR、两种
-EOF表现、interrupt/order/non-disclosure结果。
+EOF表现、interrupt/order/non-disclosure结果，并单独报告 direct integration consumer 的 strict TTY/readline fail-fast结果。
 
 #### 13.6.2 Aggregate and broader regression
 
@@ -935,6 +949,7 @@ python -m pyright dayu/ tests/ utils/
 python -m ruff check \
   dayu/cli/commands/init.py \
   tests/cli/test_init_command.py \
+  tests/cli/test_prompt_command.py \
   tests/cli/test_upload_filings_from_command.py
 ```
 
@@ -959,7 +974,13 @@ git diff --cached --name-only
 
 implementation完成前 staged tree必须为空；相对 `AMENDED_PLAN_BASE` 的 code/test/README diff只能属于 §13.3。必须显式证明
 两个 workflow、`tests/cli/test_init_smoke.py`、`dayu/cli/output.py`、`dayu/cli/init_environment.py` 与全部 Fins production
-paths零 diff。
+paths零 diff。`tests/cli/test_prompt_command.py` 必须做 node-level diff review，只允许
+`test_prompt_command_uses_init_generated_workspace_config` 的 strict typed `sys.stdin` TTY fixture迁移；既有 getpass value序列、
+prompt/runtime业务断言与同文件其它 tests必须零 diff：
+
+```bash
+git diff --unified=0 AMENDED_PLAN_BASE -- tests/cli/test_prompt_command.py
+```
 
 README在修改前重新读取各自 `Agent更新约束`，实现后验证：
 
@@ -975,13 +996,16 @@ git diff -- README.md tests/README.md
 ```bash
 rg -n 'getpass\.getpass' dayu/cli/commands/init.py
 rg -n 'sys\.__stdin__|msvcrt|PowerShell|Start-Process|pty|PTY|JobObject|CREATE_NEW_PROCESS_GROUP|process.tree' \
-  dayu/cli/commands/init.py tests/cli/test_init_command.py tests/cli/test_upload_filings_from_command.py
+  dayu/cli/commands/init.py tests/cli/test_init_command.py tests/cli/test_prompt_command.py \
+  tests/cli/test_upload_filings_from_command.py
 rg -n 'shell\s*=\s*True|errors\s*=\s*[^,)]*replace|hasattr\(|getattr\(' \
-  dayu/cli/commands/init.py tests/cli/test_init_command.py tests/cli/test_upload_filings_from_command.py
+  dayu/cli/commands/init.py tests/cli/test_init_command.py tests/cli/test_prompt_command.py \
+  tests/cli/test_upload_filings_from_command.py
 git diff --unified=0 AMENDED_PLAN_BASE -- tests/cli/test_upload_filings_from_command.py | \
   rg '^\+.*(Fins (result|summary|progress|succeeded|failure|cancelled)|execution\.(stdout|stderr))'
 rg -n 'Issue 142|Issue 151|Issue 175|Issue 177|Issue 178|authorization|secret infrastructure' \
-  dayu/cli/commands/init.py tests/cli/test_init_command.py tests/cli/test_upload_filings_from_command.py
+  dayu/cli/commands/init.py tests/cli/test_init_command.py tests/cli/test_prompt_command.py \
+  tests/cli/test_upload_filings_from_command.py
 ```
 
 第一条必须只命中 `_read_secret_input()` 的 TTY分支一次；第二、三条相对 base新增命中为零，且第二条完整输出应为零；
