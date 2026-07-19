@@ -25,6 +25,7 @@ _DAYU_BLOCK_END: Final[str] = "# <<< dayu-cli init <<<"
 _EXPORT_PREFIX: Final[str] = "export "
 _NEW_PROFILE_MODE: Final[int] = 0o600
 _WINDOWS_SETX_TARGET: Final[str] = "setx"
+_WINDOWS_SETX_TIMEOUT_SECONDS: Final[float] = 30.0
 _WINDOWS_PLATFORM: Final[str] = "Windows"
 _LINUX_PLATFORM: Final[str] = "Linux"
 _DARWIN_PLATFORM: Final[str] = "Darwin"
@@ -196,7 +197,7 @@ class EnvironmentPersistenceResult:
 class EnvironmentPersistenceInterrupted(KeyboardInterrupt):
     """携带脱敏 OS store 写入真值的环境持久化中断。
 
-    ``result`` 只包含目标与环境变量名，不包含值或 ``setx`` captured output。
+    ``result`` 只包含目标与环境变量名，不包含值或 ``setx`` output。
 
     :param result: 中断时已经确认写入和尚未确认写入的名称真值。
     """
@@ -416,9 +417,13 @@ def _persist_windows_environment(plan: WindowsEnvironmentPersistencePlan) -> Env
             completed = subprocess.run(
                 ("setx", entry.name, entry.value),
                 shell=False,
-                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
                 text=False,
                 check=False,
+                timeout=_WINDOWS_SETX_TIMEOUT_SECONDS,
             )
         except KeyboardInterrupt:
             raise EnvironmentPersistenceInterrupted(
@@ -429,6 +434,8 @@ def _persist_windows_environment(plan: WindowsEnvironmentPersistencePlan) -> Env
                     retained_paths=(),
                 )
             ) from None
+        except subprocess.TimeoutExpired:
+            return _windows_failure_result(plan=plan, written_names=tuple(written_names), failed_index=index)
         except OSError:
             return _windows_failure_result(plan=plan, written_names=tuple(written_names), failed_index=index)
         if completed.returncode != 0:
@@ -771,7 +778,7 @@ def _interrupted_result(
     unwritten_names: tuple[str, ...],
     retained_paths: tuple[Path, ...],
 ) -> EnvironmentPersistenceResult:
-    """构造不携带 value/captured output 的中断结果。
+    """构造不携带 value/native output 的中断结果。
 
     :param target: POSIX profile path 或 Windows ``setx``。
     :param written_names: 已确认写入 OS store 的名称。

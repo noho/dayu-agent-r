@@ -8,9 +8,10 @@ import secrets
 import shlex
 import stat
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
-from typing import BinaryIO, NoReturn, cast
+from typing import BinaryIO, Final, NoReturn, cast
 
 import pytest
 
@@ -27,6 +28,23 @@ from dayu.cli.init_environment import (
     plan_environment_persistence,
 )
 
+_EXPECTED_WINDOWS_SETX_TIMEOUT_SECONDS: Final[float] = 30.0
+
+
+@dataclass(frozen=True, slots=True)
+class _SetxCall:
+    """一次 ``setx`` 调用的完整 argv 与 subprocess contract。"""
+
+    args: tuple[str, str, str]
+    shell: bool
+    stdin: int
+    stdout: int
+    stderr: int
+    close_fds: bool
+    text: bool
+    check: bool
+    timeout: float
+
 
 class _SetxRecorder:
     """记录 argument-safe ``setx`` 调用并提供确定返回码。"""
@@ -35,22 +53,25 @@ class _SetxRecorder:
         self,
         return_codes: tuple[int, ...],
         *,
-        raise_at: int | None = None,
+        os_error_at: int | None = None,
+        timeout_at: int | None = None,
         interrupt_at: int | None = None,
     ) -> None:
         """初始化记录器。
 
         :param return_codes: 各次已执行调用的返回码。
-        :param raise_at: 指定调用索引抛出 ``OSError``；``None`` 表示不抛出。
+        :param os_error_at: 指定调用索引抛出 ``OSError``；``None`` 表示不抛出。
+        :param timeout_at: 指定调用索引抛出含 raw argv 的 ``TimeoutExpired``；``None`` 表示不抛出。
         :param interrupt_at: 指定调用索引抛出 ``KeyboardInterrupt``；``None`` 表示不抛出。
         :returns: ``None``。
         :raises Exception: 不主动抛出异常。
         """
 
         self._return_codes = return_codes
-        self._raise_at = raise_at
+        self._os_error_at = os_error_at
+        self._timeout_at = timeout_at
         self._interrupt_at = interrupt_at
-        self.calls: list[tuple[tuple[str, str, str], bool, bool, bool, bool]] = []
+        self.calls: list[_SetxCall] = []
         self.environment_visible_during_calls: list[bool] = []
 
     def __call__(
@@ -58,35 +79,74 @@ class _SetxRecorder:
         args: tuple[str, str, str],
         *,
         shell: bool,
-        capture_output: bool,
+        stdin: int,
+        stdout: int,
+        stderr: int,
+        close_fds: bool,
         text: bool,
         check: bool,
+        timeout: float,
     ) -> subprocess.CompletedProcess[bytes]:
-        """模拟 ``subprocess.run`` 并记录不安全 flag 是否出现。
+        """模拟 ``subprocess.run`` 并记录完整 native process contract。
 
         :param args: ``setx`` argument tuple。
         :param shell: 是否启用 shell。
-        :param capture_output: 是否捕获子进程输出。
+        :param stdin: 子进程标准输入目标。
+        :param stdout: 子进程标准输出目标。
+        :param stderr: 子进程标准错误目标。
+        :param close_fds: 是否关闭非 stdio 文件描述符。
         :param text: 是否按文本解码输出。
         :param check: 是否由 subprocess 自动抛错。
-        :returns: 使用预设 return code 的 bytes ``CompletedProcess``。
-        :raises OSError: 当前索引等于 ``raise_at`` 时抛出。
+        :param timeout: 单次 ``setx`` 执行上限秒数。
+        :returns: 只含预设 return code 的 bytes ``CompletedProcess``。
+        :raises OSError: 当前索引等于 ``os_error_at`` 时抛出。
+        :raises subprocess.TimeoutExpired: 当前索引等于 ``timeout_at`` 时抛出。
         :raises KeyboardInterrupt: 当前索引等于 ``interrupt_at`` 时抛出。
         """
 
         call_index = len(self.calls)
-        self.calls.append((args, shell, capture_output, text, check))
+        self.calls.append(
+            _SetxCall(
+                args=args,
+                shell=shell,
+                stdin=stdin,
+                stdout=stdout,
+                stderr=stderr,
+                close_fds=close_fds,
+                text=text,
+                check=check,
+                timeout=timeout,
+            )
+        )
         self.environment_visible_during_calls.append(args[1] in os.environ)
         if self._interrupt_at == call_index:
             raise KeyboardInterrupt
-        if self._raise_at == call_index:
+        if self._timeout_at == call_index:
+            raise subprocess.TimeoutExpired(cmd=args, timeout=timeout)
+        if self._os_error_at == call_index:
             raise OSError("setx unavailable")
-        return subprocess.CompletedProcess(
-            args=args,
-            returncode=self._return_codes[call_index],
-            stdout=b"ignored stdout",
-            stderr=b"ignored stderr",
-        )
+        return subprocess.CompletedProcess(args=args, returncode=self._return_codes[call_index])
+
+
+def _expected_setx_call(entry: EnvironmentPersistenceEntry) -> _SetxCall:
+    """构造 owner contract 要求的完整 ``setx`` 调用记录。
+
+    :param entry: 预期写入的环境变量项。
+    :returns: 固定 argv、DEVNULL、handle 与 timeout contract。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    return _SetxCall(
+        args=("setx", entry.name, entry.value),
+        shell=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        text=False,
+        check=False,
+        timeout=_EXPECTED_WINDOWS_SETX_TIMEOUT_SECONDS,
+    )
 
 
 class _FaultingBinaryHandle:
@@ -1002,12 +1062,12 @@ def test_post_write_structure_verification_precedes_environment_injection(
     assert entry.value not in repr(error.value)
 
 
-def test_windows_uses_argument_tuple_binary_capture_and_injects_only_after_all_success(
+def test_windows_uses_argument_tuple_devnull_timeout_and_injects_only_after_all_success(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Windows 必须用安全 argv/flags，并在两个 setx 都成功后整批注入。
+    """Windows 必须用完整 native contract，并在两个 setx 都成功后整批注入。
 
     :param tmp_path: pytest 提供给 Windows plan builder 的临时 HOME。
     :param monkeypatch: 替换 setx runner 并隔离进程环境的 pytest fixture。
@@ -1030,10 +1090,7 @@ def test_windows_uses_argument_tuple_binary_capture_and_injects_only_after_all_s
     assert result.status is EnvironmentPersistenceStatus.SUCCESS
     assert result.written_names == (first.name, second.name)
     assert result.unwritten_names == ()
-    assert recorder.calls == [
-        (("setx", first.name, first.value), False, True, False, False),
-        (("setx", second.name, second.value), False, True, False, False),
-    ]
+    assert recorder.calls == [_expected_setx_call(first), _expected_setx_call(second)]
     assert recorder.environment_visible_during_calls == [False, False]
     assert os.environ[first.name] == first.value
     assert os.environ[second.name] == second.value
@@ -1043,19 +1100,19 @@ def test_windows_uses_argument_tuple_binary_capture_and_injects_only_after_all_s
         assert entry.value not in captured.err
 
 
-@pytest.mark.parametrize("failure_mode", ["return-code", "os-error"])
-def test_windows_partial_failure_reports_names_only_and_injects_nothing(
+@pytest.mark.parametrize("failure_at", (0, 1), ids=("first", "middle"))
+def test_windows_nonzero_reports_names_only_without_retry_or_injection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    failure_mode: str,
+    failure_at: int,
 ) -> None:
-    """Windows 中途失败只报告已写/未写名称，不注入已成功的前缀。
+    """Windows first/middle nonzero 只报告名称，不重试或注入。
 
     :param tmp_path: pytest 提供给 Windows plan builder 的临时 HOME。
     :param monkeypatch: 替换 setx runner 并隔离进程环境的 pytest fixture。
-    :param failure_mode: 以非零返回码或 ``OSError`` 构造的中途失败模式。
+    :param failure_at: 返回非零状态的调用索引。
     :returns: None。
-    :raises AssertionError: partial failure 名称、调用次数、零注入或脱敏不符合 contract 时抛出。
+    :raises AssertionError: failure 名称、调用 contract、零重试/注入或脱敏不符合 contract 时抛出。
     :raises EnvironmentPersistenceError: 合法 Windows persistence plan 构造失败时传播。
     """
 
@@ -1066,51 +1123,109 @@ def test_windows_partial_failure_reports_names_only_and_injects_nothing(
     )
     for entry in entries:
         monkeypatch.delenv(entry.name, raising=False)
-    recorder = (
-        _SetxRecorder((0, 1, 0))
-        if failure_mode == "return-code"
-        else _SetxRecorder((0, 0, 0), raise_at=1)
+    return_codes = tuple(
+        1 if index == failure_at else 0
+        for index in range(len(entries))
     )
+    recorder = _SetxRecorder(return_codes)
     monkeypatch.setattr(init_environment.subprocess, "run", recorder)
 
     result = persist_environment(_windows_plan(tmp_path, entries))
 
-    assert result.status is EnvironmentPersistenceStatus.PARTIAL_FAILURE
+    expected_status = (
+        EnvironmentPersistenceStatus.FAILURE
+        if failure_at == 0
+        else EnvironmentPersistenceStatus.PARTIAL_FAILURE
+    )
+    assert result.status is expected_status
     assert result.succeeded is False
-    assert result.written_names == (entries[0].name,)
-    assert result.unwritten_names == (entries[1].name, entries[2].name)
-    assert len(recorder.calls) == 2
+    assert result.written_names == tuple(entry.name for entry in entries[:failure_at])
+    assert result.unwritten_names == tuple(entry.name for entry in entries[failure_at:])
+    assert recorder.calls == [_expected_setx_call(entry) for entry in entries[: failure_at + 1]]
+    assert recorder.environment_visible_during_calls == [False] * (failure_at + 1)
     for entry in entries:
         assert entry.name not in os.environ
         assert entry.value not in repr(result)
 
 
-def test_windows_first_failure_has_failure_status_and_no_injection(
+def test_windows_os_error_reports_partial_names_without_retry_or_injection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Windows 首项失败应报告完整未写名称且不注入。
+    """Windows ``OSError`` 必须收口为 names-only partial failure。
 
     :param tmp_path: pytest 提供给 Windows plan builder 的临时 HOME。
     :param monkeypatch: 替换 setx runner 并隔离进程环境的 pytest fixture。
     :returns: None。
-    :raises AssertionError: failure 状态、完整未写名称、调用次数或零注入不符合 contract 时抛出。
+    :raises AssertionError: partial failure、调用 contract、零重试/注入或脱敏不符合 contract 时抛出。
     :raises EnvironmentPersistenceError: 合法 Windows persistence plan 构造失败时传播。
     """
 
-    entries = (_entry("OPENAI_API_KEY"), _entry("HF_TOKEN"))
+    entries = (
+        _entry("OPENAI_API_KEY"),
+        _entry("HF_TOKEN"),
+        _entry("FMP_API_KEY"),
+    )
     for entry in entries:
         monkeypatch.delenv(entry.name, raising=False)
-    recorder = _SetxRecorder((1, 0))
+    recorder = _SetxRecorder((0, 0, 0), os_error_at=1)
     monkeypatch.setattr(init_environment.subprocess, "run", recorder)
 
     result = persist_environment(_windows_plan(tmp_path, entries))
 
-    assert result.status is EnvironmentPersistenceStatus.FAILURE
-    assert result.written_names == ()
-    assert result.unwritten_names == tuple(entry.name for entry in entries)
-    assert len(recorder.calls) == 1
-    assert all(entry.name not in os.environ for entry in entries)
+    assert result.status is EnvironmentPersistenceStatus.PARTIAL_FAILURE
+    assert result.written_names == (entries[0].name,)
+    assert result.unwritten_names == (entries[1].name, entries[2].name)
+    assert recorder.calls == [_expected_setx_call(entries[0]), _expected_setx_call(entries[1])]
+    assert recorder.environment_visible_during_calls == [False, False]
+    for entry in entries:
+        assert entry.name not in os.environ
+        assert entry.value not in repr(result)
+
+
+def test_windows_timeout_hides_raw_argv_without_retry_or_injection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Windows timeout 含 raw argv 时仍只返回 names-only truth。
+
+    :param tmp_path: pytest 提供给 Windows plan builder 的临时 HOME。
+    :param monkeypatch: 替换 setx runner 并隔离进程环境的 pytest fixture。
+    :param capsys: 捕获并检查 stdout/stderr 脱敏的 pytest fixture。
+    :returns: None。
+    :raises AssertionError: timeout names truth、调用 contract、零重试/注入或脱敏不符合 contract 时抛出。
+    :raises EnvironmentPersistenceError: 合法 Windows persistence plan 构造失败时传播。
+    """
+
+    entries = (
+        _entry("OPENAI_API_KEY"),
+        _entry("HF_TOKEN"),
+        _entry("FMP_API_KEY"),
+    )
+    for entry in entries:
+        monkeypatch.delenv(entry.name, raising=False)
+    recorder = _SetxRecorder((0, 0, 0), timeout_at=1)
+    monkeypatch.setattr(init_environment.subprocess, "run", recorder)
+
+    result = persist_environment(_windows_plan(tmp_path, entries))
+    captured = capsys.readouterr()
+
+    assert result.status is EnvironmentPersistenceStatus.PARTIAL_FAILURE
+    assert result.written_names == (entries[0].name,)
+    assert result.unwritten_names == (entries[1].name, entries[2].name)
+    assert recorder.calls == [_expected_setx_call(entries[0]), _expected_setx_call(entries[1])]
+    assert recorder.environment_visible_during_calls == [False, False]
+    result_repr = repr(result)
+    for entry in entries:
+        raw_argv_repr = repr(("setx", entry.name, entry.value))
+        assert entry.name not in os.environ
+        assert entry.value not in result_repr
+        assert entry.value not in captured.out
+        assert entry.value not in captured.err
+        assert raw_argv_repr not in result_repr
+        assert raw_argv_repr not in captured.out
+        assert raw_argv_repr not in captured.err
 
 
 @pytest.mark.parametrize("interrupt_at", (0, 1, 2), ids=("first", "middle", "last"))
@@ -1145,7 +1260,8 @@ def test_windows_interrupt_reports_written_and_unwritten_names_without_values(
     assert result.status is EnvironmentPersistenceStatus.INTERRUPTED
     assert result.written_names == tuple(entry.name for entry in entries[:interrupt_at])
     assert result.unwritten_names == tuple(entry.name for entry in entries[interrupt_at:])
-    assert len(recorder.calls) == interrupt_at + 1
+    assert recorder.calls == [_expected_setx_call(entry) for entry in entries[: interrupt_at + 1]]
+    assert recorder.environment_visible_during_calls == [False] * (interrupt_at + 1)
     assert all(entry.name not in os.environ for entry in entries)
     for entry in entries:
         assert entry.value not in repr(captured.value)
@@ -1177,7 +1293,7 @@ def test_windows_environment_injection_interrupt_keeps_completed_store_truth(
     assert result.status is EnvironmentPersistenceStatus.INTERRUPTED
     assert result.written_names == tuple(entry.name for entry in entries)
     assert result.unwritten_names == ()
-    assert len(recorder.calls) == len(entries)
+    assert recorder.calls == [_expected_setx_call(entry) for entry in entries]
     assert environment == {}
     for entry in entries:
         assert entry.value not in repr(captured.value)
