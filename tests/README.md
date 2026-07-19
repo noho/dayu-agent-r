@@ -38,8 +38,9 @@ pytest tests/fins/test_upload_batch.py tests/cli/test_upload_filings_from_comman
 ```
 
 真实 Windows gate 由 `.github/workflows/r11-upload-script-windows.yml` 在 Python 3.11 / `windows-latest` 上运行。
-workflow 先用 `cmd.exe /d /c ver` 的 exit 0 证明真实 cmd execution capability，并把 `cmd.exe /?` 的
-实际 0/1 help exit 分类为诊断证据；help exit 不再代替 execution gate：
+workflow 用独立 `System.Diagnostics.Process` 精确捕获 stdout/stderr 与 exit code，先以
+`cmd.exe /d /c ver` 的 exact exit 0 证明真实 cmd execution capability，再要求 `cmd.exe /?` 的
+真实 help exit exact 1；它不全局忽略 PowerShell native failure，help exit 也不代替 execution gate：
 
 ```bash
 python -m pytest tests/cli/test_run_keys.py::test_new_running_key_monitor_uses_noop_for_non_posix_tty tests/cli/test_upload_filings_from_command.py::test_windows_cmd_script_round_trips_adversarial_argv_with_real_cmd tests/cli/test_upload_filings_from_command.py::test_windows_generated_script_runs_real_cli_into_temp_storage tests/cli/test_arg_parsing.py::test_upload_actions_default_to_auto_and_batch_rejects_delete -q
@@ -49,6 +50,8 @@ python -m pytest tests/cli/test_run_keys.py::test_new_running_key_monitor_uses_n
 `python -m dayu.cli -> Service -> Fins -> temp storage` 闭环；非 Windows 本地环境只会明确 skip，不能替代 workflow 的
 真实 runner 证据。workflow 通过时的证据包包含 JUnit、生成脚本、recorder oracle、CLI storage oracle、stdout/stderr、环境、
 `cmd.exe /d /c ver` 输出与 `cmd.exe /?` 输出；失败时仍通过 `if: always()` 发布已经产生的诊断证据。
+CLI process owner 会在解析参数和输出前，把真实 stdout/stderr `TextIOWrapper` 明确配置为 strict UTF-8，保证 redirected
+init/upload 中文输出仍可编码；内存 capture 等非 OS wrapper 保持调用方自己的语义。
 
 真实 init Windows gate 由 `.github/workflows/r12-init-windows.yml` 使用 Python 3.11 与
 `constraints/lock-windows-x64-py311.txt` 运行。它执行真实 FIRST→PRESERVE→OVERWRITE→

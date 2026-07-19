@@ -43,6 +43,12 @@ _FIXTURE_SOURCE: Path = (
 _WINDOWS_ARTIFACT_DIR_ENV: Final[str] = "DAYU_R11_WINDOWS_ARTIFACT_DIR"
 _WINDOWS_RECORDER_ARTIFACT_SUBDIRECTORY: Final[str] = "cmd-recorder"
 _WINDOWS_CLI_ARTIFACT_SUBDIRECTORY: Final[str] = "cli-storage"
+_R11_WINDOWS_WORKFLOW_PATH: Final[Path] = (
+    Path(__file__).resolve().parents[2]
+    / ".github"
+    / "workflows"
+    / "r11-upload-script-windows.yml"
+)
 _CAPTURED_BATCH_REQUESTS: list[UploadBatchPlanRequest] = []
 
 
@@ -447,7 +453,7 @@ def test_posix_script_round_trips_adversarial_argv_with_real_sh(tmp_path: Path) 
 
 
 def test_windows_renderer_round_trips_fixed_argument_oracles() -> None:
-    """平台无关 unit oracle 必须恢复 Windows CRT 参数并锁定 batch 安全头。"""
+    """独立 batch+CRT oracle 必须恢复 Windows fixed argv 并锁定安全头。"""
 
     arguments = (
         "",
@@ -460,8 +466,8 @@ def test_windows_renderer_round_trips_fixed_argument_oracles() -> None:
     )
     for argument in arguments:
         rendered = upload_script._quote_windows_batch_argument(argument)
-        after_batch_percent = rendered.replace("%%", "%")
-        assert _parse_single_windows_crt_argument(after_batch_percent) == argument
+        after_batch_parse = _decode_windows_batch_fixed_token(rendered)
+        assert _parse_single_windows_crt_argument(after_batch_parse) == argument
     content = upload_script.render_upload_script(
         (("python", "-m", "dayu.cli", "upload_filing", *arguments),),
         regeneration_argv=("python", "-m", "dayu.cli", "upload_filings_from", "%PATH%"),
@@ -474,6 +480,53 @@ def test_windows_renderer_round_trips_fixed_argument_oracles() -> None:
     assert "%%PATH%%" in content
     assert "setlocal EnableDelayedExpansion" not in content
     assert "\n" not in content.replace("\r\n", "")
+
+
+@pytest.mark.parametrize("forbidden", ("line\nfeed", "carriage\rreturn", "nul\x00byte"))
+def test_windows_renderer_rejects_arguments_that_escape_one_batch_line(
+    forbidden: str,
+) -> None:
+    """Windows renderer 必须 fail-closed 拒绝 NUL 与跨行 argv。
+
+    :param forbidden: 含 Windows batch 单行不能表达字符的 argv。
+    :returns: ``None``。
+    :raises AssertionError: renderer 接受 line injection 输入时抛出。
+    """
+
+    with pytest.raises(ValueError, match="NUL or line breaks"):
+        upload_script.render_upload_script(
+            (("python", forbidden),),
+            regeneration_argv=("python", "-m", "dayu.cli"),
+            platform="windows",
+        )
+    with pytest.raises(ValueError, match="NUL or line breaks"):
+        upload_script.render_upload_script(
+            (("python", "safe"),),
+            regeneration_argv=("python", forbidden),
+            platform="windows",
+        )
+
+
+def test_r11_workflow_uses_fail_closed_exact_cmd_process_probe() -> None:
+    """R11 必须按进程精确捕获 ver/help exit，且不得全局忽略 native failure。
+
+    :returns: ``None``。
+    :raises AssertionError: workflow 恢复 native pipeline 或弱化 exact exit 时抛出。
+    """
+
+    workflow = _R11_WINDOWS_WORKFLOW_PATH.read_text(encoding="utf-8")
+
+    assert "[System.Diagnostics.ProcessStartInfo]::new()" in workflow
+    assert "$startInfo.UseShellExecute = $false" in workflow
+    assert "$startInfo.RedirectStandardOutput = $true" in workflow
+    assert "$startInfo.RedirectStandardError = $true" in workflow
+    assert '-ArgumentList @("/d", "/c", "ver")' in workflow
+    assert '-ArgumentList @("/?")' in workflow
+    assert "if ($verExitCode -ne 0)" in workflow
+    assert "if ($cmdHelpExitCode -ne 1)" in workflow
+    assert "cmd.exe /? 2>&1 |" not in workflow
+    assert "$PSNativeCommandUseErrorActionPreference" not in workflow
+    assert "$ErrorActionPreference" not in workflow
 
 
 def test_publisher_preserves_old_target_and_cleans_temp_on_replace_failure(
@@ -730,7 +783,22 @@ def test_windows_cmd_script_round_trips_adversarial_argv_with_real_cmd(
         "    stream.write(json.dumps(sys.argv[2:], ensure_ascii=False) + '\\n')\n",
         encoding="utf-8",
     )
-    fixed = ("", "space value", "中文", 'quote"value', "trail\\", "%PATH%", "!", "&")
+    fixed = (
+        "",
+        "space value",
+        "中文",
+        'quote"value',
+        "trail\\",
+        "%PATH%",
+        "!",
+        "&",
+        "|",
+        "^",
+        "(",
+        ")",
+        "<",
+        ">",
+    )
     command = (sys.executable, str(recorder), str(output), *fixed)
     script = artifact_directory / "generated-upload.cmd"
     script.write_text(
@@ -752,8 +820,8 @@ def test_windows_cmd_script_round_trips_adversarial_argv_with_real_cmd(
 
     rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
     assert completed.returncode == 0, completed.stderr
-    assert rows == [[*fixed, *appended]]
     assert not marker.exists()
+    assert rows == [[*fixed, *appended]]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires real cmd.exe")
@@ -879,6 +947,35 @@ def _parse_single_windows_crt_argument(value: str) -> str:
             index += 1
     assert not in_quotes
     return "".join(result)
+
+
+def _decode_windows_batch_fixed_token(value: str) -> str:
+    """独立模拟 fixed token 的 batch percent 与 caret 解码。
+
+    本 oracle 只实现 production contract 使用的非递归 percent doubling 和
+    caret-protected metacharacter，不复用 renderer helper。
+
+    :param value: renderer 写入 batch body 的一个 fixed token。
+    :returns: ``cmd.exe`` 交给目标进程命令行的 CRT token。
+    :raises AssertionError: token 包含未闭合的 percent/caret escape 时抛出。
+    """
+
+    index = 0
+    decoded: list[str] = []
+    while index < len(value):
+        if value.startswith("%%", index):
+            decoded.append("%")
+            index += 2
+            continue
+        character = value[index]
+        if character == "^":
+            assert index + 1 < len(value)
+            decoded.append(value[index + 1])
+            index += 2
+            continue
+        decoded.append(character)
+        index += 1
+    return "".join(decoded)
 
 
 def _install_forbidden_direct_service(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -11,6 +11,7 @@ on:
       - "dayu/cli/init_catalog.py"
       - "dayu/cli/init_environment.py"
       - "dayu/cli/init_workspace.py"
+      - "dayu/cli/main.py"
       - "dayu/cli/run_keys.py"
       - "dayu/config/README.md"
       - "dayu/service/entrypoint_runtime.py"

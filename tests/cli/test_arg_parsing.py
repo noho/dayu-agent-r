@@ -510,6 +510,46 @@ def test_main_reports_missing_command_runner(
     assert "prompt" in captured.err
 
 
+def test_cli_standard_stream_owner_reconfigures_real_wrapper_to_strict_utf8() -> None:
+    """CLI 标准流 owner 必须让 redirected wrapper 可严格输出中文 UTF-8。
+
+    :returns: ``None``。
+    :raises AssertionError: wrapper 仍使用 legacy charmap 或替换错误时抛出。
+    """
+
+    raw_stream = io.BytesIO()
+    text_stream = io.TextIOWrapper(
+        raw_stream,
+        encoding="cp1252",
+        errors="strict",
+    )
+    try:
+        cli_main._configure_cli_standard_stream(text_stream)
+        text_stream.write("初始化完成：中文输出")
+        text_stream.flush()
+
+        assert text_stream.encoding == "utf-8"
+        assert text_stream.errors == "strict"
+        assert raw_stream.getvalue().decode("utf-8") == "初始化完成：中文输出"
+    finally:
+        text_stream.detach()
+
+
+def test_cli_standard_stream_owner_preserves_non_wrapper_capture() -> None:
+    """CLI 标准流 owner 不得把测试或调用方提供的内存 capture 伪装成 OS 流。
+
+    :returns: ``None``。
+    :raises AssertionError: 非 wrapper 流被替换或无法继续写入时抛出。
+    """
+
+    capture = io.StringIO()
+
+    cli_main._configure_cli_standard_stream(capture)
+    capture.write("中文")
+
+    assert capture.getvalue() == "中文"
+
+
 def test_main_maps_keyboard_interrupt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

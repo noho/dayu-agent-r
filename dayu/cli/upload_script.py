@@ -26,6 +26,12 @@ _UTF8_ENCODING: Final[str] = "utf-8"
 _WINDOWS_COMMENT_METACHARACTERS: Final[frozenset[str]] = frozenset(
     {'^', '&', '|', '<', '>', '(', ')', '"'}
 )
+_WINDOWS_BODY_METACHARACTERS: Final[frozenset[str]] = frozenset(
+    {'^', '&', '|', '<', '>', '(', ')'}
+)
+_WINDOWS_FORBIDDEN_ARGUMENT_CHARACTERS: Final[frozenset[str]] = frozenset(
+    {'\x00', '\r', '\n'}
+)
 
 
 class UploadScriptPublishError(RuntimeError):
@@ -179,9 +185,11 @@ def _render_windows_script(
     :param commands: 已定型命令 argv。
     :param regeneration_argv: 再生成 argv。
     :returns: UTF-8/CRLF 脚本文本。
-    :raises Exception: 不主动抛出异常。
+    :raises ValueError: argv 含 NUL 或换行、无法安全放入单条 batch 命令时抛出。
     """
 
+    for argument in regeneration_argv:
+        _validate_windows_batch_argument(argument)
     regeneration_text = " ".join(regeneration_argv)
     lines = [
         *_WINDOWS_HEADER,
@@ -196,31 +204,51 @@ def _render_windows_script(
 
 
 def _quote_windows_batch_argument(argument: str) -> str:
-    """同时满足 batch percent 与 Windows CRT 的单 argv quoting。
+    """同时满足 ``cmd.exe`` 与 Windows CRT 的单 argv quoting。
 
     :param argument: 原始 argv 元素。
-    :returns: 可写入 ``.cmd`` executable body 的双引号参数。
-    :raises Exception: 不主动抛出异常。
+    :returns: 可写入 ``.cmd`` executable body 的 caret 保护双引号参数。
+    :raises ValueError: 参数含 NUL 或换行、无法安全放入单条命令时抛出。
     """
 
-    escaped_percent = argument.replace("%", "%%")
-    rendered: list[str] = ['"']
+    _validate_windows_batch_argument(argument)
+    rendered: list[str] = ['^"']
     backslash_count = 0
-    for character in escaped_percent:
+    for character in argument:
         if character == "\\":
             backslash_count += 1
             continue
         if character == '"':
             rendered.append("\\" * (backslash_count * 2 + 1))
-            rendered.append('"')
+            rendered.append('^"')
             backslash_count = 0
             continue
         rendered.append("\\" * backslash_count)
-        rendered.append(character)
+        if character == "%":
+            rendered.append("%%")
+        elif character in _WINDOWS_BODY_METACHARACTERS:
+            rendered.append(f"^{character}")
+        else:
+            rendered.append(character)
         backslash_count = 0
     rendered.append("\\" * (backslash_count * 2))
-    rendered.append('"')
+    rendered.append('^"')
     return "".join(rendered)
+
+
+def _validate_windows_batch_argument(argument: str) -> None:
+    """拒绝会逃出单条 Windows batch 命令的 argv 字符。
+
+    :param argument: 待写入 executable body 或 regeneration 注释的 argv。
+    :returns: ``None``。
+    :raises ValueError: 参数含 NUL、回车或换行时抛出。
+    """
+
+    if any(
+        character in _WINDOWS_FORBIDDEN_ARGUMENT_CHARACTERS
+        for character in argument
+    ):
+        raise ValueError("Windows upload script argv must not contain NUL or line breaks")
 
 
 def _escape_windows_comment(value: str) -> str:

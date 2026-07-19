@@ -9,6 +9,7 @@ on:
       - "dayu/README.md"
       - "dayu/cli/arg_parsing.py"
       - "dayu/cli/commands/fins.py"
+      - "dayu/cli/main.py"
       - "dayu/cli/run_keys.py"
       - "dayu/cli/upload_script.py"
       - "dayu/fins/README.md"
@@ -54,20 +55,59 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force $env:DAYU_R11_WINDOWS_ARTIFACT_DIR | Out-Null
+          function Invoke-CmdEvidence {
+            param(
+              [string[]] $ArgumentList,
+              [string] $ArtifactPath
+            )
+
+            $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+            $startInfo.FileName = "cmd.exe"
+            $startInfo.UseShellExecute = $false
+            $startInfo.RedirectStandardOutput = $true
+            $startInfo.RedirectStandardError = $true
+            foreach ($argument in $ArgumentList) {
+              [void]$startInfo.ArgumentList.Add($argument)
+            }
+            $process = [System.Diagnostics.Process]::new()
+            $process.StartInfo = $startInfo
+            try {
+              [void]$process.Start()
+              $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+              $stderrTask = $process.StandardError.ReadToEndAsync()
+              $process.WaitForExit()
+              $stdout = $stdoutTask.GetAwaiter().GetResult()
+              $stderr = $stderrTask.GetAwaiter().GetResult()
+              [System.IO.File]::WriteAllText(
+                $ArtifactPath,
+                $stdout + $stderr,
+                [System.Text.UTF8Encoding]::new($false)
+              )
+              return $process.ExitCode
+            }
+            finally {
+              $process.Dispose()
+            }
+          }
+
           @(
             "os=$([System.Environment]::OSVersion.VersionString)"
             "platform=$([System.Environment]::OSVersion.Platform)"
             "python=$(python --version 2>&1)"
           ) | Set-Content -Path "$env:DAYU_R11_WINDOWS_ARTIFACT_DIR\environment.txt" -Encoding utf8
-          cmd.exe /d /c ver 2>&1 | Set-Content -Path "$env:DAYU_R11_WINDOWS_ARTIFACT_DIR\cmd-version.txt" -Encoding utf8
-          if ($LASTEXITCODE -ne 0) {
-            throw "cmd.exe execution failed with exit code $LASTEXITCODE"
+          $verExitCode = Invoke-CmdEvidence `
+            -ArgumentList @("/d", "/c", "ver") `
+            -ArtifactPath "$env:DAYU_R11_WINDOWS_ARTIFACT_DIR\cmd-version.txt"
+          "cmd_ver_exit_code=$verExitCode" | Add-Content -Path "$env:DAYU_R11_WINDOWS_ARTIFACT_DIR\environment.txt" -Encoding utf8
+          if ($verExitCode -ne 0) {
+            throw "cmd.exe execution failed with exit code $verExitCode"
           }
-          cmd.exe /? 2>&1 | Set-Content -Path "$env:DAYU_R11_WINDOWS_ARTIFACT_DIR\cmd-help.txt" -Encoding utf8
-          $cmdHelpExitCode = $LASTEXITCODE
+          $cmdHelpExitCode = Invoke-CmdEvidence `
+            -ArgumentList @("/?") `
+            -ArtifactPath "$env:DAYU_R11_WINDOWS_ARTIFACT_DIR\cmd-help.txt"
           "cmd_help_exit_code=$cmdHelpExitCode" | Add-Content -Path "$env:DAYU_R11_WINDOWS_ARTIFACT_DIR\environment.txt" -Encoding utf8
-          if ($cmdHelpExitCode -notin @(0, 1)) {
-            throw "cmd.exe help returned unclassified exit code $cmdHelpExitCode"
+          if ($cmdHelpExitCode -ne 1) {
+            throw "cmd.exe help returned unexpected exit code $cmdHelpExitCode"
           }
 
       - name: Run real cmd recorder and CLI storage gates
