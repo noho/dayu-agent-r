@@ -26,7 +26,7 @@ Exact paths：
 - Accepted/open、needs-evidence、design-contradiction、blocker、unclassified finding：0。
 - Remaining remediation sub-WU：0。
 - Security statement correctly records no unified tool authorization framework while retaining local permission/config and defense-in-depth mechanisms；trusted local config/Host SQLite/EventLog may contain configured credentials, but Tool Trace/audit/public/log/LLM/review evidence may not expose their plaintext values。
-- Residual `AR-F06` remains `RETAINED / UNFIXED / UNWAIVED / CURRENT_NO_FIX` with future Host scheduler/lifecycle owner；Issue 142、151、175、177、178 and existing Web/WeChat/render trackers retain their existing destinations。
+- 本条验证的历史 closeout commit 当时仍把 `AR-F06` 记为 retained residual；该分类已被后续基于 `docs/host/design.md`、startup recovery 代码链路与真实 close/reopen public-path smoke 的 Controller 复核 supersede。当前裁决为 `REJECTED_NOT_A_DEFECT / EXPECTED_HOST_CLOSE_AND_STARTUP_RECOVERY`，不再形成 WU residual 或 future fix owner。Issue 142、151、175、177、178 and existing Web/WeChat/render trackers 仅保留既有 deferred destinations，不属于本 WU residual。
 
 ## Remote gate lineage
 

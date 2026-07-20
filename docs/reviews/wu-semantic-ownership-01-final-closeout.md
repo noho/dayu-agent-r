@@ -12,7 +12,7 @@
 
 `PASS / FINAL-CLOSEOUT-PASS`。
 
-Topic 1-7 的 accepted code fixes、各 remediation sub-WU 的 accepted plan/code/aggregate findings、最终 aggregate regression findings、Windows evidence findings，以及 draft PR 179 deepreview finding 均已修复、验证并关闭。Topic 8-9 按权威裁决保持 no-code。当前 accepted/open、needs-evidence、design-contradiction、blocker、unclassified finding 均为 0；remaining remediation sub-WU 为 0。
+Topic 1-7 的 accepted code fixes、各 remediation sub-WU 的 accepted plan/code/aggregate findings、最终 aggregate regression findings、Windows evidence findings，以及 draft PR 179 deepreview finding 均已修复、验证并关闭。Topic 8-9 按权威裁决保持 no-code。当前 accepted/open、needs-evidence、design-contradiction、blocker、unclassified finding 均为 0；remaining remediation sub-WU 为 0；当前 WU residual risk 为 0。
 
 ## Product decisions closed
 
@@ -50,6 +50,7 @@ All units followed the required plan、dual plan review/fix/re-review、implemen
 ## Findings and review closeout
 
 - Aggregate regression `AR-F01` through `AR-F05`：closed。
+- `AR-F06`：`REJECTED_NOT_A_DEFECT / EXPECTED_HOST_CLOSE_AND_STARTUP_RECOVERY`。设计真源要求 Host close 停止 scheduler/promotion、不启动新 Attempt；durable `QUEUED` Run 在下一次 `open_host` startup recovery 中重新触发 promotion。代码复核与真实 public-path smoke 均确认同一 SQLite 中的 Run B 会在重启后进入 worker accept 并成功收口。因此它不是 scheduler/lifecycle residual，也不需要 future fix owner。
 - `AR-F07` and its Windows rounds `WIN2` through `WIN4`：closed by fresh non-skipped Windows evidence and current-code-head checks。
 - Draft PR finding `PR179-DR-F01`：closed at the Host ToolRuntime owner boundary by rejecting malformed governed decisions before LLM-readable outcome projection and removing the internal-code fallback。
 - AgentMiMo and AgentDS final PR re-reviews both returned PASS with finding/new/backflow/blocker/open/unclassified/pending all 0。
@@ -64,6 +65,7 @@ All units followed the required plan、dual plan review/fix/re-review、implemen
 - Read-only HKEX official cumulative smoke、public awaiting smoke、CLI/init/upload cross-platform tests and real browser/local smokes：PASS。
 - Explicit fresh Windows evidence：R11 run `29713519099` success，R12 run `29713522620` success；R11 `4/4`，R12 init `9/9`，embedded R11 `2/2`。
 - Accepted code head `7166ae1f13a3016b0e010703d1c220a0524699da` current-head checks：R11 run `29716162938` success，R12 run `29716162959` success。
+- AR-F06 定向复核：startup recovery / graceful-close recovery / terminal queue-promotion owner tests `3 passed`；额外 public-path smoke 验证关闭前 Run B 为 `QUEUED`，重启后 worker 按 `A -> B` 接收，A/B 最终均为 `SUCCEEDED`。
 - Gemini is a low-budget test account；quota/provider adherence is `EXPECTED_TEST_ACCOUNT_QUOTA / NO_CODE_ACTION / NON_BLOCKING`。
 
 ## Security-related behavior
@@ -76,20 +78,21 @@ This WU did not introduce a unified tool authorization framework. It did retain 
 - Config and Host-internal SQLite/EventLog belong to the same trusted local domain；configured API keys or headers may exist there。Plaintext configured credential/header values must not appear in Tool Trace、audit output、public/log/LLM-readable material or review evidence。
 - No permission schema、policy DSL、role/capability model、generic sandbox or replacement authorization WU was created。
 
-## Residual risks and owners
+## Current-scope residual reconciliation
 
-| Residual | Final status / owner |
+当前 WU residual risk 为 `0`。AR-F06 已按设计真源和真实执行链路拒绝为非缺陷；AR-F07 已由真实 Windows 证据关闭；没有 accepted finding 以“后续优化”名义转移。
+
+以下仅是本 WU 明确未实施的既有 scope destination，不属于本 WU residual：
+
+| Deferred / excluded capability | Existing owner / destination |
 | --- | --- |
-| `AR-F06` coverage-instrumented scheduler close/promotion node | `RETAINED / UNFIXED / UNWAIVED / CURRENT_NO_FIX`。Canonical non-coverage node passes；future Host scheduler/lifecycle owner must handle it when that owner boundary is changed。It is not reassigned to Issue 175 and does not create a new WU。 |
-| Doc output continuation | Existing Issue 177；not implemented here。 |
-| Web storage-state lifecycle | Existing Issue 178；not implemented here。 |
-| Fins Docling process isolation | Existing Issue 175；not implemented here。 |
-| Workspace migration | Existing Issue 142；not implemented here。 |
-| write/assets ownership | Existing Issue 151；not implemented here。 |
-| Web/WeChat/render real entrypoints | Existing trackers；placeholder surfaces were removed, real implementations were not added here。 |
-| Gemini quota | Expected test-account quota；no code action。 |
-
-These are owned residuals or explicit deferred product capabilities, not open accepted findings in this WU.
+| Doc output continuation | Issue 177 |
+| Web storage-state lifecycle | Issue 178 |
+| Fins Docling process isolation | Issue 175 |
+| Workspace migration | Issue 142 |
+| write/assets ownership | Issue 151 |
+| Web/WeChat/render real entrypoints | Existing trackers |
+| Gemini quota | Expected low-budget test-account condition；`NO_CODE / NON_BLOCKING` |
 
 ## Final controller state
 
