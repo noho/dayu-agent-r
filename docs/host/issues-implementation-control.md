@@ -154,20 +154,17 @@ git push -u github <branch>
 
 | 项目 | 当前值 |
 |---|---|
-| phase | Host issue-backed follow-up implementation backlog |
-| active work unit | None |
-| completed work unit | `WU-SEMANTIC-OWNERSHIP-01` 及其 overdesign remediation continuation；这是同一个 umbrella WU，不是替代 WU，也不是重新打开历史 sub-WU。 |
+| phase | `WU-SEMANTIC-OWNERSHIP-01` final-closeout transition |
+| active work unit | None；当前不在 PR #179 合并前提前启动独立 backlog WU。 |
+| completed work unit | `WU-SEMANTIC-OWNERSHIP-01` 及其 overdesign remediation continuation；final-closeout-pass。 |
 | gate | `final-closeout-pass` |
-| final artifact | `docs/reviews/wu-semantic-ownership-01-final-closeout.md` |
-| accepted code head | `7166ae1f13a3016b0e010703d1c220a0524699da`；Topic 1-7、R01-R12、aggregate regression、AR-F07 Windows 证据与 PR 179 review finding 均已关闭。 |
-| draft PR | [PR 179](https://github.com/noho/dayu-agent-r/pull/179) 保持 draft/open；本状态不授权 merge、mark ready、request reviewers、delete branch 或关闭 deferred issues。 |
-| findings | accepted/open、needs-evidence、design contradiction、blocker、unclassified finding 均为 `0`；remaining remediation sub-WU 为 `0`。 |
-| residual risk | 当前 WU residual 为 `0`。AR-F06 经 `docs/host/design.md` 与真实 public-path close/reopen smoke 复核，裁决为 `REJECTED_NOT_A_DEFECT / EXPECTED_HOST_CLOSE_AND_STARTUP_RECOVERY`：关闭期间不晋升 queued Run、重启后恢复执行正是设计语义。 |
-| deferred scope | Issue 142、151、175、177、178 及既有 Web/WeChat/render trackers 继续由原 owner 承接；它们是本 WU 明确未实施的既有能力，不是本 WU residual。Gemini 低预算是预期测试账号条件，状态为 `NO_CODE / NON_BLOCKING`。 |
-| validation | Final aggregate canonical `5260 passed / 10 skipped / 5 deselected`；coverage suite `5259 passed / 10 skipped / 6 deselected`，changed production files `219/219 >= 80%`；full pyright 0 errors；Ruff、diff、README、source/propagation/security scans通过；fresh Windows R11/R12 与 accepted-code-head current checks通过。AR-F06 定向复核另通过 3 项 owner/component tests，并以同一 SQLite 完成 `B: QUEUED -> reopen -> worker accepted -> SUCCEEDED` public-path smoke。 |
-| security | 未实现统一 tool authorization framework；保留现有 allowed paths、filesystem/network/storage/process containment、防御策略、resource budgets、atomic write/swap 与 fencing。Config 和 Host internal SQLite/EventLog 属于同一 trusted-local domain；Tool Trace、audit、public/log/LLM/review evidence 不得泄露 configured credential/header 明文。 |
-| blocking open questions | None |
-| next entry point | 由用户/maintainer 决定 draft PR 179 后续；merge 后先从 `main` 同步，再选择独立 backlog work unit。 |
+| draft PR | [PR #179](https://github.com/noho/dayu-agent-r/pull/179) 为 draft/open；用户将手工 merge。 |
+| selected next work unit | `WU-CLI-SMOKE-01-R1` Reasoning Delta Transient Live Stream Remediation；bug fix。 |
+| next gate | `goal confirmation` |
+| next goal | 删除 `REASONING_DELTA` 的 durable `PREVIEW` EventLog 持久化，恢复 accepted non-durable delta，并由 Host-owned transient live path 支持已 attach UI / Service / CLI 的实时 thinking 展示。 |
+| next non-goals | 不承诺 reasoning token replay；不把本问题交给 retention/purge 掩盖；不顺带实施 Tool Trace、audit、conversation memory 或 `WU-CLI-SMOKE-01-R2` UI enhancement。 |
+| blocking open questions | None；R1 的 transient ordering / identity 与现有 `HostEvent.event_sequence` 边界在该 WU plan gate 中基于设计真源收敛。 |
+| next entry point | 用户手工 merge PR #179 后，从 `main` 同步最新代码，再以本文档启动 `WU-CLI-SMOKE-01-R1` goal confirmation；确认后由 AgentCodex 进入 `plan` gate。 |
 
 
 ## 推进规则
@@ -219,15 +216,14 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 |---|---|---|---|
 | WU-ENG-02-S3-R1 | transferred-to-issue | WU-OBS-00B / GitHub Issue #119 under #70 analyzer | analyzer 实施时确认 usage observation projection signal 是否需要扩展 correlation fields。 |
 | WU-TOOLS-01-S1-R1 | transferred-to-issue | GitHub Issues #121 and #122 | SEC/Fins CI pipeline / smoke 与 CN/HK Docling CI pipeline / smoke 改由对应 issue 直接追踪；不再作为本文档默认 next work unit。 |
-| WU-TOOLS-01-F01-02-R1 | transferred-to-issue | GitHub Issue #129 | 设计 awaiting 两阶段启动后，才能扩展 Host wait adapter 或 Fins runtime activation contract。 |
-| WU-CLI-SMOKE-01-R1 | deferred-with-owner | WU-RET-03 / GitHub Issue #78 under #43 retention lane | `REASONING_DELTA` thinking text 当前作为 `PREVIEW` EventLog row 支持 live public watcher projection；它不进入 final answer、activity、transcript、outbox terminal projection 或 canonical replay。后续 purge / retention work unit 明确 PREVIEW row cleanup policy 时一并分类。 |
+| WU-CLI-SMOKE-01-R1 | deferred-with-owner | PR #179 merge 后的 selected next WU；不归 WU-RET-03 | 用户将本项提升为高严重度下一 WU：`f17ffcc8` 曾明确让 `REASONING_DELTA` 与其它 per-delta event 一样只做 live stream、默认不写 EventLog；`c1b546ac` 仅因当前 `watch_session_events` 轮询 EventLog，改为每个 delta 追加一条 durable `PREVIEW` row。实时 thinking 不天然要求持久化，retention 只能清理结果、不能修复 owner drift。PR #179 merge 并同步 `main` 后进入 goal confirmation。 |
 | WU-CLI-SMOKE-01-R2 | deferred-with-owner | Future CLI UI enhancement / user decision | `CliThinkingRenderer` 当前保留 160 字符单行运行态展示；如后续用户要求 Codex / Claude Code 风格可展开 thinking panel，再在 CLI UI adapter lane 设计，不阻塞 WU-CLI-SMOKE-01 draft PR。 |
 
 ## 当前 Work Units
 
 | Work Unit | 状态 | 主题 | Owner / Destination | 当前定位 |
 |---|---|---|---|---|
-| WU-TOOLS-01-F01-02-R1 | final-closeout-pass | Awaiting external job two-phase activation | GitHub Issue #129 / draft PR #162 | Final closeout 已完成；等待 maintainer/user 处理 draft PR #162。PR body 使用 `Closes #129`，merge 会自动关闭 issue。当前目标是 Host 支持 accepted-wait 后 activation hook，且 Fins download / preprocess / upload awaiting tools 本轮直接迁移到 prepare / activate；禁止过度设计。 |
+| WU-TOOLS-01-F01-02-R1 | completed | Awaiting external job two-phase activation | GitHub Issue #129 / PR #162 | PR #162 已于 2026-06-21 merge，merge commit 为 `ab60aa4d`；Issue #129 同步关闭。本 WU 已完成，不再是 active implementation entry point。 |
 | WU-TOOLS-AWAIT-FANOUT-01 | completed | Host ToolRuntime awaiting fanout governance hardening | GitHub Issue #111 / PR #161 | PR 161 merged on 2026-06-21; not an active implementation entry point. GitHub Issue #111 remains OPEN because PR #161 used `Refs #111` rather than `Closes #111`; this is issue hygiene, not a current tool governance blocker in this control doc. |
 | WU-TOOLS-01-F03-R4 | completed | Tools Discovery spec semantics cleanup | GitHub Issue #133 / PR #160 | PR 160 merged on 2026-06-21 and issue #133 is closed; not an active implementation entry point. |
 | WU-ENG-02-R1 | completed | Provider debugging correlation default enablement and fallback diagnostics | GitHub Issue #63 / PR #159 | PR 159 merged on 2026-06-20 and issue #63 is closed; not an active WU for this branch. |
@@ -244,21 +240,24 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 | WU-STRESS-SQLITE-01 | pending | SQLite multiprocess high-spec stress | GitHub Issue #38 | 现有 SQLite 多进程压力测试链路的慢盘 / Docker Linux 高规格版本 |
 | WU-LIFE-03 | completed | Active cancel watchdog | GitHub Issue #91 / #87 umbrella / PR #167 | PR 167 merged on 2026-07-04 and issue #91 closed automatically; not an active implementation entry point. 固定 Host-level active cancel watchdog、post-cancel timeout closeout、late terminal race 和 diagnostic 语义。只负责 Host truth / timeout closeout，不负责 tool/provider hard interrupt。 |
 | WU-LIFE-04 | completed | Tool execution deadline and #87 watchdog closeout | GitHub Issue #168 / #87 umbrella / PR #169 | PR 169 merged on 2026-07-04 and issue #168 closed automatically; not an active implementation entry point. #87 umbrella follow-up 已确认 `tool_execution_timeout_seconds` 是单次工具调用最长运行时间，取消/收口机制不得覆盖或延长该 deadline。`active_cancel_timeout_seconds` 已从 Host public API 与 internal local execution options 删除。Watchdog scan query optimization 已通过专用 `CANCELLING` Run 查询与 status sequence index 修复。clock/audit diagnostics 与 shared supervisor abstraction 不构成 WU-LIFE-04 之后仍未归属的代码 residual。剩余 #87 关闭前置是 WU-TOOLS-CANCEL-01；WU-TOOLS-CANCEL-01 完成后，#87 umbrella 可关闭。 |
-| WU-GOV-01 | pending | Host policy refusal terminal taxonomy | GitHub Issue #88 | 引入 `RunStatus.REJECTED` 表达权限、租户、额度、配额、速率限制、工具权限 / 审批等 Host policy refusal；compact failure 默认不迁移到 `REJECTED`。 |
-| WU-CTX-04 | pending-low | Run-level compaction concurrency boundary | GitHub Issue #112 | 低优先级设计核对：不引入 EventLog fencing；证明当前状态机 / request 计数 / stale recheck 足够，或在未来并发模型需要时设计 EventLog 外的最小 pointer / CAS。 |
+| WU-GOV-01 | deferred | Host policy refusal terminal taxonomy | GitHub Issue #88 / future tool-permission work | 用户裁决：不单独推进状态 taxonomy；等具体工具权限 / 审批能力进入排期时再一并进入 goal confirmation，避免在没有真实 policy consumer 时预先设计 `REJECTED` 迁移。 |
+| WU-CLI-SMOKE-01-R1 | selected-next | Reasoning delta transient live stream remediation | PR #179 merge 后启动 | 高严重度 EventLog amplification bug：恢复 `REASONING_DELTA` non-durable ingest，并建立 Host-owned transient live thinking path；当前不在 PR #179 merge 前提前进入 plan。 |
+| WU-CTX-04 | pending | Run-level compaction concurrency boundary | GitHub Issue #112 | 不再是下一 WU。初步证据仍保留：packaged profiles 允许 2 次 proactive compact，事务外 compactor 写回缺少 operation owner 校验；后续重新排期时按 bug-fix goal confirmation 进入。 |
 | WU-CTX-01 | pending | Provider tokenizer / sizing adapter | GitHub Issue #20 | provider/model-aware context sizing；仍有效，需先收敛 budget policy 设计表述 |
 | WU-WAIT-01 | completed | Callback endpoint / auth / replay | GitHub Issue #89 / PR #163 | PR 163 merged on 2026-07-01; not an active implementation entry point. 当前实现提供 Host wait callback typed boundary 与 Service framework-neutral mapper；不包含真实 HTTP route、secret backend、HMAC / bearer verifier、production poller、physical cancel、Engine contract 或 UI surface。 |
 | WU-WAIT-02 | completed | Production poller loop / backoff / fencing / retry | GitHub Issue #90 / PR #165 | PR 165 merged on 2026-07-03 and issue #90 closed automatically; not an active implementation entry point. |
 | WU-WAIT-03 | completed | External job physical cancel / revoke / abandon | GitHub Issue #92 / #87 umbrella / PR #166 | PR 166 merged on 2026-07-04 and issue #92 closed automatically; not an active implementation entry point. |
 | WU-TOOLS-CANCEL-01 | completed | Tool/provider blocking I/O cancellation hardening | follows WU-LIFE-04 / PR #170 | WU-LIFE-04 已完成；accepted plan commit 为 `4723ec61`，S1 accepted slice commit 为 `eda4be1a`，S2 partial hardening commit 为 `29003541`，typed execution capability plan commit 为 `8eddd26b`。S2A1 `contract / declaration / digest`、S2A2 `Host factory wiring`、S2B `Doc process-backed`、S2C `Fins read process-backed`、S2D `Web sync process-backed` 和 S2E `aggregate validation` 均已通过 implementation / validation、AgentMiMo / AgentDS review 或 aggregate deepreview、controller validation 与 controller adjudication。2026-07-05 用户裁决升级的五项必修 hardening：process envelope hint 结构化、Playwright cleanup smoke、Fins XBRL fixture breadth、process envelope contract single-source、process capsule grace tuning，均已通过 residual hardening plan、S1/S2A/S2B/S3/S4、aggregate review、accepted fix、re-review 与 controller adjudication 闭环。Final closeout artifact 为 `docs/reviews/wu-tools-cancel-01-residual-hardening-final-closeout.md`；final accepted commit 为 `ddbcef5b`。PR #170 已于 2026-07-05 merge，GitHub Issue #87 已关闭；WU-WAIT-04 成为下一 implementation entry point。 |
 | WU-WAIT-04 | final-closeout-pass | UI / Service production-grade awaiting E2E smoke | depends on #89 / #90 / #92 + WU-LIFE-03 + WU-LIFE-04 + WU-TOOLS-CANCEL-01 / PR #171 | dependent smoke；#89 / #90 / #92、WU-LIFE-03、WU-LIFE-04 与 WU-TOOLS-CANCEL-01 均已完成。Plan commit `35d947ea`、S1 accepted commit `503b2cf5`、S2 accepted commit `d3bdb2c3`。Final closeout artifact 为 `docs/reviews/wu-wait-04-final-closeout.md`。PR #171 was merged on 2026-07-06 with merge commit `19a600e0`; PR body has no `Closes` footer because this WU is not an independent GitHub issue owner. This work unit is no longer an active implementation entry point. |
-| WU-CLI-SMOKE-01 | final-closeout-pass | dayu-cli core usability smoke and behavior validation | No GitHub Issue yet / user裁决 immediate residual WU / draft PR #172 | 2026-07-06 用户裁决新增。PR #171 已 merge，进入条件已满足。目标是在不混入 WU-WAIT-04 的独立 PR 中确认 dayu-cli 主路径基本可用，并补齐 public-contract smoke、CLI behavior validation、workspace path regression checks 与 README / tests doc sync。Scope 只覆盖 dayu-cli `init` / `prompt` / `interactive` / Fins direct upload-download-process/session 主路径与工具治理观测；Web UI、GUI、WeChat、`write` 命令迁移、audit / Tool Trace analyzer、长期存储治理和 memory 强化均为非目标。Slice S1 accepted commit 为 `52e4fcd3`，aggregate deepreview 已通过，manual validation accepted MANUAL-01 / MANUAL-02 and discovered MANUAL-F01; MANUAL-F01 fix passed implementation review and controller adjudication. Display semantics follow-up accepted commit 为 `c1b546ac`，prompt / interactive `--thinking` / `--detail` 展示语义、thinking public projection、review / re-review、test-only follow-up 和 controller validation 均已闭环。Draft PR #172 已创建。PR review artifacts 为 `docs/reviews/pr-172-review-20260706-210832.md` 与 `docs/reviews/pr-172-review-ds.md`；PR review fix artifact 为 `docs/reviews/pr-172-review-fix-codex.md`；PR re-review artifacts 为 `docs/reviews/pr-172-rereview-mimo.md` 与 `docs/reviews/pr-172-rereview-ds.md`，均为 pass。Accepted PR review commit 为 `632c1f34`，并已 push。Final closeout artifact 为 `docs/reviews/wu-cli-smoke-01-final-closeout.md`。 |
+| WU-CLI-SMOKE-01 | completed | dayu-cli core usability smoke and behavior validation | PR #172 | PR #172 已于 2026-07-09 merge，merge commit 为 `3410d742`。主 WU 已完成；其 R1 / R2 仍按上方 residual table 的独立 owner 与排期处理。 |
 | WU-CM-10 | deferred | Conversation Memory eval benchmark | GitHub Issue #80 / #81 follow-up | deferred behind #81；post-#81 memory semantic contract 稳定后再实施 |
 | WU-CM-11 | deferred | User Profile Memory durable boundary and cross-session profile | GitHub Issue #115 / #81 child | deferred behind #81；#81 只固定 User Profile 不混入 session Conversation Memory 的边界，跨 session durable profile 独立后续实施 |
 
 ## WU-CLI-SMOKE-01 dayu-cli Core Usability Smoke and Behavior Validation
 
 ### 状态
+
+当前 authoritative 状态为 `completed`：PR #172 已于 2026-07-09 merge，merge commit 为 `3410d742`。下方长段落保留为当时的 gate / final-closeout 历史证据，其中 `final-closeout-pass`、draft PR 等措辞不再表示当前状态。
 
 `final-closeout-pass`。本 WU 是 2026-07-06 用户裁决要求加入的 immediate residual WU，当前没有独立 GitHub Issue owner；用户已确认无需新建 GitHub Issue。Draft PR #172 已创建：https://github.com/noho/dayu-agent-r/pull/172；PR body 不包含 `Closes` footer。Goal confirmation artifact 为 `docs/reviews/wu-cli-smoke-01-goal-confirmation.md`，其中包含自动 / 手工验证矩阵。Plan artifact 为 `docs/host/wu-cli-smoke-01-dayu-cli-core-usability-plan.md`；auto-validation artifact 为 `docs/reviews/wu-cli-smoke-01-auto-validation-codex.md`；raw evidence directory 为 `workspace/tmp/wu-cli-smoke-01-auto/`。Plan review artifacts 为 `docs/reviews/plan-review-20260706-163952.md` 与 `docs/reviews/plan-review-20260706-164108.md`；controller adjudication 为 `docs/reviews/wu-cli-smoke-01-plan-review-controller-adjudication.md`；plan fix artifact 为 `docs/reviews/wu-cli-smoke-01-plan-fix-codex.md`；plan re-review artifacts 为 `docs/reviews/plan-review-20260706-164905.md` 与 `docs/reviews/plan-review-20260706-164908.md`；plan re-review controller adjudication 为 `docs/reviews/wu-cli-smoke-01-plan-rereview-controller-adjudication.md`；accepted plan commit 为 `c0b79339`。AgentCodex 自动复现 `dayu-cli interactive` 在 idle `dayu>` prompt 下单次 Ctrl+C 直接退出的行为失败。Slice S1 implementation artifact 为 `docs/reviews/wu-cli-smoke-01-slice-s1-implementation-codex.md`；code review artifacts 为 `docs/reviews/code-review-20260706-170636.md` 与 `docs/reviews/code-review-20260706-170940.md`；controller adjudication 为 `docs/reviews/wu-cli-smoke-01-slice-s1-code-review-controller-adjudication.md`；accepted Slice S1 commit 为 `52e4fcd3`。Aggregate deepreview artifacts 为 `docs/reviews/code-review-20260706-171635.md` 与 `docs/reviews/code-review-20260706-171806.md`；controller adjudication 为 `docs/reviews/wu-cli-smoke-01-aggregate-deepreview-controller-adjudication.md`。Manual validation evidence artifact 为 `docs/reviews/wu-cli-smoke-01-manual-validation-evidence.md`：MANUAL-01 和 MANUAL-02 已部分通过，但 MANUAL-F01 blocked final closeout。MANUAL-F01 root-cause fix artifact 为 `docs/reviews/wu-cli-smoke-01-manual-validation-fix-codex.md`，记录 Host awaiting snapshot digest 修复、Python durable row codec invariant hardening、focused Host tests `94 passed`、真实 `dayu-cli prompt "下载Visa财报"` awaiting validation、pyright 和 `git diff --check` 通过；implementation review artifacts `docs/reviews/wu-cli-smoke-01-manual-fix-implementation-review-mimo.md` 与 `docs/reviews/wu-cli-smoke-01-manual-fix-implementation-review-ds.md` 均为 pass，controller adjudication `docs/reviews/wu-cli-smoke-01-manual-fix-controller-adjudication.md` accepted MANUAL-F01，accepted MANUAL-F01 fix commit 为 `164072b0`。Display semantics follow-up implementation / fix artifact 为 `docs/reviews/wu-cli-smoke-01-display-semantics-codex.md`；review artifacts 为 `docs/reviews/wu-cli-smoke-01-display-semantics-review-mimo.md` 与 `docs/reviews/wu-cli-smoke-01-display-semantics-review-ds.md`；re-review artifacts 为 `docs/reviews/wu-cli-smoke-01-display-semantics-rereview-mimo.md`、`docs/reviews/wu-cli-smoke-01-display-semantics-rereview-ds.md`、`docs/reviews/wu-cli-smoke-01-display-semantics-final-rereview-mimo.md`、`docs/reviews/wu-cli-smoke-01-display-semantics-final-rereview-ds.md`、`docs/reviews/wu-cli-smoke-01-display-semantics-prompt-lifecycle-rereview-mimo.md` 和 `docs/reviews/wu-cli-smoke-01-display-semantics-prompt-lifecycle-rereview-ds.md`，最终均为 pass；accepted display semantics commit 为 `c1b546ac`。PR review artifacts 为 `docs/reviews/pr-172-review-20260706-210832.md` 与 `docs/reviews/pr-172-review-ds.md`；PR review fix artifact 为 `docs/reviews/pr-172-review-fix-codex.md`；PR re-review artifacts 为 `docs/reviews/pr-172-rereview-mimo.md` 与 `docs/reviews/pr-172-rereview-ds.md`，均为 pass；accepted PR review commit 为 `632c1f34`，并已 push。Final closeout artifact 为 `docs/reviews/wu-cli-smoke-01-final-closeout.md`。该 WU 必须作为 WU-WAIT-04 之后的独立 PR 推进，不得混入 PR #171；用户 merge PR #172 后，应从 `main` 拉取最新代码，再按本文档 next entry point 选择下一 active backlog work unit。
 
@@ -310,7 +309,42 @@ Residual Risk Reconciliation 后，本表只保留仍存在的 residual risk；�
 - Accepted review findings 已修复：`--thinking` dead param、README/help 与实现不符、thinking on/off 缺测试、`REASONING_DELTA` 双重分类、interactive `--no-detail` 冗余 run view、interactive / prompt cancel path thinking renderer lifecycle，以及 prompt cancel caller wiring integration coverage。
 - AgentCodex reported validation：`tests/cli` `225 passed, 3 warnings`，Host / Service focused suite `126 passed, 3 warnings`，prompt / interactive / thinking renderer focused suite `66 passed, 3 warnings`，pyright `0 errors, 0 warnings, 0 informations`，`git diff --check` pass。
 - Controller reran final validation：`source .venv/bin/activate && pytest tests/cli -q` -> `225 passed, 3 warnings`；`source .venv/bin/activate && pytest tests/service/test_entrypoint_runtime.py tests/host/test_engine_ingest_mapping.py tests/host/test_host_activity_event_projection.py -q` -> `126 passed, 3 warnings`；`source .venv/bin/activate && pyright` -> `0 errors, 0 warnings, 0 informations`；`git diff --check` pass。
-- Remaining display semantics residual risks are classified below: PREVIEW row persistence is deferred to retention / purge storage governance; `CliThinkingRenderer` 160-character single-line truncation is deferred to future CLI UI enhancement if the user later wants expandable thinking display.
+- Remaining display semantics residual risks are classified below：R1 调查已证明实时 thinking 不要求 durable `PREVIEW` row；当前持久化只是在 `watch_session_events` 轮询 EventLog 的架构下复用既有 watcher，因此 owner 已纠正为 future Host transient live fanout / watcher contract remediation，不再归 retention / purge。R2 的 `CliThinkingRenderer` 160-character single-line truncation 继续归 future CLI UI enhancement。
+
+## WU-CLI-SMOKE-01-R1 Reasoning Delta Transient Live Stream Remediation
+
+### 状态
+
+用户在 2026-07-20 将本项选定为 PR #179 merge 后的下一 WU，并裁决为高严重度 EventLog amplification bug。当前不提前启动：PR #179 仍为 draft/open，用户将手工 merge；merge 后必须先从 `main` 同步，再进入本项 `goal confirmation`。
+
+### 直接证据与动机
+
+- `f17ffcc8` / WU-CLI-ACTIVITY-01 follow-up 已明确三类 per-delta EngineEvent（`CONTENT_DELTA`、`REASONING_DELTA`、`TOOL_CALL_DELTA`）只服务即时展示，默认 accepted 但不写 EventLog；其直接动机是避免 token/chunk 级 durable rows 放大 EventLog、拖慢 projection catch-up，并错误暗示 token-level durable replay。
+- `c1b546ac` 为实现 `--thinking` 展示，把 `REASONING_DELTA` 从 transient 分支移出并改为每个 delta 追加一条 `PREVIEW` EventLog row。当前 `watch_session_events` 又通过 EventLog cursor 轮询读取，因此持久化只是复用现有 watcher 的局部最小实现，不是实时 thinking 的业务要求。
+- 一次模型 Attempt 可以产生大量 reasoning chunks；当前是一条 delta 对应一条 SQLite EventLog row，并同时带来 event id、sequence、payload、索引和后续扫描成本。该放大随 token/chunk 数增长，不应等待 retention/purge 再清理。
+- `docs/host/design.md` 已承认未来多客户端 live token 展示需要另行设计 transient fanout，不能把主 EventLog durable replay 改成 token-level 保真。
+
+### 候选目标（下轮 goal confirmation）
+
+- 恢复 `REASONING_DELTA` accepted non-durable ingest；任意数量的 reasoning delta 均不追加 `PREVIEW`、canonical、diagnostic 或其它替代 EventLog row。
+- 在 Host lifecycle / governance owner 内提供 transient live thinking path，让已经 attach 的 Service / UI / CLI 继续实时接收 reasoning delta；不得让 Service 绕过 Host 直接消费 raw EngineEvent。
+- 明确 transient event 的运行态 identity、ordering、multi-watcher fanout、slow-consumer、detach 与 Host close 语义；不得伪造 durable `event_sequence`，不得把 transient cursor 解释为离线 replay cursor。
+- 保持 final answer、activity、outbox terminal、Conversation Memory、audit、Tool Trace 与 durable recovery 不消费 reasoning delta；断线或重启后不补放 token-level thinking。
+
+### 非目标
+
+- 不实现 reasoning token durable replay、历史 thinking 查询或跨 Host restart 恢复。
+- 不把 R1 下放给 retention / purge，也不通过缩短 retention、批量删除或 EventLog 压缩掩盖写入放大。
+- 不顺带实现 `WU-CLI-SMOKE-01-R2` 可展开 thinking panel，不修改模型是否启用 reasoning 的 provider / runner 配置。
+- 不重写普通 canonical HostEvent、outbox terminal delivery、activity projection、Tool Trace、audit 或 Conversation Memory。
+
+### 验收信号
+
+- 构造单个 Attempt 产生大量 `REASONING_DELTA`，断言 durable EventLog 中 reasoning delta row 为 `0`，且 final answer / terminal canonical facts 正常提交。
+- 已 attach 的一个或多个 live watcher 能按 Host-defined transient ordering 接收 thinking；`--thinking` 展示、`--no-thinking` 抑制、取消和 renderer close 行为保持正确。
+- 慢 watcher、提前 detach、Host close 与 worker terminal 不反压 EventLog append、不泄漏 task、不取消 Run、不产生伪 terminal fact。
+- 断线重连、Host restart 与离线 reader 不重放 reasoning delta；content/tool-call delta 既有 non-durable 行为不回归。
+- 受影响 Host / Service / CLI tests、单文件 coverage、pyright、`git diff --check`、README 触发检查与 EventLog source/propagation scans 通过。
 
 ## WU-WAIT-03 External Job Physical Cancel / Revoke / Abandon
 
@@ -403,6 +437,8 @@ GitHub Issue #90 当前为 OPEN。WU-WAIT-01 / GitHub Issue #89 已通过 PR #16
 ## WU-TOOLS-01-F01-02-R1 Awaiting External Job Two-Phase Activation
 
 ### 状态
+
+当前 authoritative 状态为 `completed`：PR #162 已于 2026-06-21 merge，merge commit 为 `ab60aa4d`；GitHub Issue #129 同步关闭。下方长段落保留为 merge 前的 gate / final-closeout 历史证据，其中 Issue OPEN、draft PR 和等待 merge 等措辞不再表示当前状态。
 
 GitHub Issue #129 当前为 OPEN。本条来自 `WU-TOOLS-01-F01-02` residual risk：Fins awaiting external job 当前存在 submit-before-accept 窗口。PR 161 / WU-TOOLS-AWAIT-FANOUT-01 已 merge，#111 的单 owner / fanout 语义已可作为本条设计依据。用户在 2026-06-21 goal confirmation 中确认本条进入 plan gate，并补充裁决：本 WU 必须一次到位实现 Host two-phase activation 支持，并让当前 Fins download / preprocess / upload awaiting tools 直接使用 two-phase；禁止引入过度设计。Plan artifact 为 `docs/host/wu-tools-01-f01-02-r1-plan.md`。Plan review artifacts 为 `docs/reviews/plan-review-20260621-180827.md` 与 `docs/reviews/plan-review-20260621-181350.md`，controller adjudication 为 `docs/reviews/wu-tools-01-f01-02-r1-plan-review-controller-adjudication.md`。Plan-fix artifact 为 `docs/reviews/wu-tools-01-f01-02-r1-plan-fix-codex.md`。Plan re-review artifacts 为 `docs/reviews/plan-review-20260621-182034.md` 与 `docs/reviews/plan-review-20260621-182047.md`，controller adjudication 为 `docs/reviews/wu-tools-01-f01-02-r1-plan-rereview-controller-adjudication.md`。两路 re-review 均通过，所有 accepted findings 已修复。Accepted plan commit 为 `478f5f77`。Slice 1 implementation artifact 为 `docs/reviews/wu-tools-01-f01-02-r1-slice1-implementation-codex.md`；focused test reported `34 passed` and pyright reported 0 errors. Slice 1 code review artifacts 为 `docs/reviews/wu-tools-01-f01-02-r1-slice1-code-review-mimo.md` 与 `docs/reviews/wu-tools-01-f01-02-r1-slice1-code-review-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-02-r1-slice1-code-review-controller-adjudication.md`。Fix artifact 为 `docs/reviews/wu-tools-01-f01-02-r1-slice1-fix-codex.md`；focused test reported `37 passed` and pyright reported 0 errors. Slice 1 code re-review artifacts 为 `docs/reviews/wu-tools-01-f01-02-r1-slice1-code-rereview-mimo.md` 与 `docs/reviews/wu-tools-01-f01-02-r1-slice1-code-rereview-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-02-r1-slice1-code-rereview-controller-adjudication.md`。Accepted Slice 1 commit 为 `e10f2e99`。Slice 2 implementation artifact 为 `docs/reviews/wu-tools-01-f01-02-r1-slice2-implementation-codex.md`；Fins focused tests reported `51 passed` and `68 passed`, pyright reported 0 errors. Slice 2 code review artifacts 为 `docs/reviews/wu-tools-01-f01-02-r1-slice2-code-review-mimo.md` 与 `docs/reviews/wu-tools-01-f01-02-r1-slice2-code-review-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-02-r1-slice2-code-review-controller-adjudication.md`。Fix artifact 为 `docs/reviews/wu-tools-01-f01-02-r1-slice2-fix-codex.md`；Fins focused tests reported `68 passed` and `51 passed`, pyright reported 0 errors. Slice 2 code re-review artifacts 为 `docs/reviews/wu-tools-01-f01-02-r1-slice2-code-rereview-mimo.md` 与 `docs/reviews/wu-tools-01-f01-02-r1-slice2-code-rereview-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-02-r1-slice2-code-rereview-controller-adjudication.md`。Accepted Slice 2 commit 为 `4f45f8de`。Slice 3 implementation artifact 为 `docs/reviews/wu-tools-01-f01-02-r1-slice3-implementation-codex.md`；Service test reported `52 passed`, focused Host/Fins tests reported `159 passed`, pyright reported 0 errors. Slice 3 code review artifacts 为 `docs/reviews/wu-tools-01-f01-02-r1-slice3-code-review-mimo.md` 与 `docs/reviews/wu-tools-01-f01-02-r1-slice3-code-review-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-02-r1-slice3-code-review-controller-adjudication.md`。Fix artifact 为 `docs/reviews/wu-tools-01-f01-02-r1-slice3-fix-codex.md`；Service test reported `52 passed`, focused Host/Fins tests reported `159 passed`, pyright reported 0 errors. Slice 3 code re-review artifacts 为 `docs/reviews/wu-tools-01-f01-02-r1-slice3-code-rereview-mimo.md` 与 `docs/reviews/wu-tools-01-f01-02-r1-slice3-code-rereview-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-02-r1-slice3-code-rereview-controller-adjudication.md`。Narrow fix artifact 为 `docs/reviews/wu-tools-01-f01-02-r1-slice3-rereview-fix-codex.md`；narrow code re-review artifacts 为 `docs/reviews/wu-tools-01-f01-02-r1-slice3-narrow-rereview-mimo.md` 与 `docs/reviews/wu-tools-01-f01-02-r1-slice3-narrow-rereview-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-02-r1-slice3-narrow-rereview-controller-adjudication.md`。两路 narrow re-review 均通过，S3-RR-F01 已关闭。Accepted Slice 3 commit 为 `80ab56ab`。Aggregate deepreview artifacts 为 `docs/reviews/wu-tools-01-f01-02-r1-aggregate-deepreview-mimo.md` 与 `docs/reviews/wu-tools-01-f01-02-r1-aggregate-deepreview-ds.md`；aggregate fix artifact 为 `docs/reviews/wu-tools-01-f01-02-r1-aggregate-fix-codex.md`；aggregate fix narrow re-review artifacts 为 `docs/reviews/wu-tools-01-f01-02-r1-aggregate-rereview-mimo.md` 与 `docs/reviews/wu-tools-01-f01-02-r1-aggregate-rereview-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-02-r1-aggregate-deepreview-controller-adjudication.md`。AGG-F01 已关闭，controller 裁决无当前 WU 未归属 residual risk。Accepted deepreview commit 为 `95f652de`。Draft PR #162 已创建：https://github.com/noho/dayu-agent-r/pull/162。`gh pr checks 162` reported no checks on branch `phase/wu-tools-01-f01-02-r1`。PR review artifacts 为 `docs/reviews/wu-tools-01-f01-02-r1-pr-review-mimo.md` 与 `docs/reviews/wu-tools-01-f01-02-r1-pr-review-ds.md`；controller adjudication 为 `docs/reviews/wu-tools-01-f01-02-r1-pr-review-controller-adjudication.md`。两路 PR review 均通过，无 accepted current fix。Accepted PR review commit 为 `50431ab2` 并已 push 到 draft PR #162。Final closeout artifact 为 `docs/reviews/wu-tools-01-f01-02-r1-final-closeout.md`。Issue closeout comment 已发布：https://github.com/noho/dayu-agent-r/issues/129#issuecomment-4762165431。PR body 使用 `Closes #129`，merge 会自动关闭 #129。当前进入 final-closeout-pass gate，等待用户 / maintainer 处理 draft PR #162；不得未经授权 mark ready、merge、close issue、request reviewers 或 delete branch。Merge PR #162 后，应从 `main` 拉取最新代码，再按本文档 next entry point 进入 WU-WAIT-01 / GitHub Issue #89。
 
@@ -1674,6 +1710,8 @@ GitHub Issue #88 当前为 OPEN。已裁决长期需要引入 `RunStatus.REJECTE
 
 本条是后续 policy / permission / tenancy / quota / rate-limit / tool approval feature 的状态机前向约束：这些 feature 在 plan / implementation 时必须先判断拒绝是否属于 `REJECTED`，避免先落成含糊的 `FAILED` 后再迁移。
 
+用户在 2026-07-20 裁决本 WU 不单独推进，等具体工具权限 / 审批能力进入排期时再一并进入 goal confirmation。当前状态为 `deferred`；不得在没有真实 tool-permission consumer、拒绝入口与用户动作语义时，仅为预留 taxonomy 提前修改 Run 状态机。
+
 ### 目标
 
 - 引入 `RunStatus.REJECTED`，用于表达 Host policy gate 明确拒绝接受 / 继续整个 Run，且该拒绝不是执行、compact、recovery、外部 job 或 worker lifecycle 尝试失败的结果。
@@ -1703,12 +1741,25 @@ GitHub Issue #88 当前为 OPEN。已裁决长期需要引入 `RunStatus.REJECTE
 
 GitHub Issue #112 当前为 OPEN。PR #150 / #152 后已重新裁决：当前正常路径下，同一 `run_id` 同一时间出现多个有效 compact commit 不是已知 bug，也不是普通执行路径下容易复现的问题。本条不要求当前实现 EventLog fencing，而是保留为低优先级设计核对项。
 
+用户在 2026-07-20 曾初步选定本条为下一 WU并触发直接证据核对，随后将下一 WU 改为高严重度 `WU-CLI-SMOKE-01-R1`。本条当前退回 `pending`，不进入 plan；下方证据与候选 bug-fix scope 保留，供后续重新排期时直接恢复 goal confirmation。
+
+2026-07-20 初步代码核对已经找到直接反例，Issue body 的“当前不是已知 bug”判断需要纠正：
+
+- packaged `execution_profiles.json` 的四个 profile 都把 `max_proactive_compactions_per_run` 配成 `2`；这不是只存在于测试构造器的未来配置。
+- proactive path 在短 transaction 中统计 request 数并追加 `CONTEXT_COMPACTION_REQUESTED`，随后释放 transaction，等待外部 compactor；这期间 Run 仍保持原 `ACCEPTED` / `QUEUED` status，input cursor 也可能不变。
+- 两个 Host scheduler 面向同一 SQLite / Run 时，可以先后各自看到 count 小于 2、各自提交 request，再并发执行 compactor。两次写回都只校验 Run status、input cursor 与 Session 是否仍允许 proactive compact，没有校验“哪个 operation 是当前唯一 owner”，因此两者都可能追加 `CONTEXT_COMPACTED`。
+- reactive path 在 request transaction 内同时关闭当前 Attempt 并把 Run 推进 `RECOVERING`，且 duplicate / attempt identity / terminal status gate 已提供唯一提交约束；当前直接反例集中在 proactive path，不应扩大成重写两条 compaction pipeline。
+- 即使把配置临时收紧为 1，也不能作为 root fix：第二个 scheduler 看到已有 in-flight request 时，当前分支会按 `proactive_compact_limit_reached` 失败收口 Run，仍会破坏第一个有效 operation。正确 owner 必须区分 active operation、accepted commit 与历史 request count。
+
+因此本 WU 后续重新排期时，应按当前并发正确性 bug fix 进入 goal confirmation，而不是回退为纯 design/test closeout。最小方案仍必须位于 Host durable operation owner boundary，EventLog 继续只记录 canonical facts，artifact 继续内容寻址且不可变。
+
 ### 目标
 
-- 明确当前 Host compaction 调度模型是否已经通过 Run / Attempt 状态机、compaction request 计数、事务外执行后的 stale result recheck，足以保证同一 `run_id` 不会产生多个有效 compact commit。
-- 若当前调度模型足够，补充或引用并发 / 重复触发测试与设计说明后关闭 #112。
-- 若未来引入更多 Host worker、并发 EngineEvent ingest、跨进程调度器或更复杂 compaction 触发路径，则在 EventLog 之外设计最小 durable pointer / CAS，例如 run-scoped current compact pointer 或 operation state row。
-- 保持 EventLog 只记录已经发生的 canonical facts，不承载 mutex、lease、owner token 或 fencing 语义。
+- 在外部 compactor 调用前，以 Host durable owner boundary 原子确定同一 `run_id` / input snapshot 的唯一 proactive operation owner；非 owner 不得启动重复 provider 调用，也不得把正在由 owner 处理的 Run 按 compact 次数耗尽失败收口。
+- owner 写回时必须以同一 durable operation identity / state 做 CAS 或等价原子校验；stale / superseded result 不得追加第二条有效 `CONTEXT_COMPACTED`。
+- `CONTEXT_COMPACTION_REQUESTED` 历史事实计数继续只表达 policy budget，不兼任 active operation ownership。operation 的 accepted / failed / cancelled / stale 收口必须可恢复、可测试，不留下永久 active pointer。
+- reactive path 当前已有 Attempt terminal + Run `RECOVERING` 唯一提交边界；只允许在确有共享 owner primitive 价值时复用最小契约，不重写 reactive pipeline。
+- 保持 EventLog 只记录已经发生的 canonical facts，不承载 mutex、lease、owner token 或 fencing 语义；compact artifact 继续内容寻址、不可变、可审计。
 
 ### 非目标
 
@@ -1719,10 +1770,11 @@ GitHub Issue #112 当前为 OPEN。PR #150 / #152 后已重新裁决：当前正
 
 ### 验收信号
 
-- 明确结论：当前实现是否需要额外 run-level compaction CAS。
-- 如果不需要：证明现有状态机、request 计数与 stale recheck 足以覆盖当前调度模型，并关闭 #112。
-- 如果需要：实现 EventLog 外的最小 durable pointer / CAS，并让 proactive / reactive 写回路径复用同一契约。
-- README 或设计文档同步说明：EventLog 不承载 fencing；compact artifact 是不可变审计产物；`run_id` 唯一当前 compact 视图只能是 projection / pointer。
+- 使用同一 SQLite 文件的两个独立 Host transaction runners / schedulers 并发 promotion 同一 Run 时，只有一个 contender 获得 proactive operation owner、只有一次 compactor 执行、只有一个 `CONTEXT_COMPACTION_REQUESTED` operation 和一个有效 `CONTEXT_COMPACTED` commit。
+- loser 观察到 active owner 时不启动 provider、不写 compact failure、不改变 Run 为 `FAILED`；owner accepted 后普通 dispatch 只创建一个 Attempt。
+- owner cancellation、failure、stale input / status 和 Host restart recovery 都有明确 durable 收口；不能因清理 active owner 而突破 policy request budget或重复接受旧结果。
+- 现有 reactive duplicate / Attempt identity / `RECOVERING` / max reactive count 行为不回归；若实现不需要修改 reactive path，plan 与测试必须明确证明该非改动边界。
+- EventLog 未新增 fencing / lease / lock 语义，compact artifact 未改为 `run_id` 覆盖文件；设计文档与 Host README 同步唯一 operation owner、request budget 和 canonical fact 的区别。
 
 ## WU-CTX-01 Provider Tokenizer / Sizing Adapter
 
